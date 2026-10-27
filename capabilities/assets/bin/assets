@@ -72,7 +72,8 @@ THE FILE STORE CONNECTION
   Selection: --connection <id> on the verbs that reach the bucket; unflagged,
   the default pointer, else the sole connection. Writing to the bucket is a
   write: a connection whose allow_write is false refuses `files add`,
-  `files link` and an `import` that has files to keep with exit 4 `read_only`.
+  `files link`, `files rm` and an `import` that has files to keep with exit 4
+  `read_only`.
 
 READING
   assets list
@@ -141,6 +142,16 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
       checked against their record on the way. Answers `linked`, `unlinked`,
       or `unchanged` - already so, nothing read or written - with the record
       it `replaced`.
+  assets files rm <name> [--yes] [--connection ID]
+      Delete the file: the object of every record the name has had, the
+      current one and those it replaced, is deleted from the bucket, then the
+      current record is retired, so the name leaves `files list`, export and
+      its document's `files`, and is free for a new file. The records stay,
+      retired, saying what was kept and when; no bytes do. Asks on the
+      terminal before deleting; without a terminal it is refused (exit 6
+      `confirmation_required`) unless --yes. Answers `removed` with the
+      record it `retired` and the storage keys it `deleted`. Not idempotent:
+      a repeat finds no unretired file (exit 3).
 
 FILES  (reading; `files list` reads the store only)
   assets files list
@@ -205,7 +216,8 @@ EXIT CODES
   5 the store or the file store cannot be reached
   6 input: a malformed name or version, a body that is not UTF-8 text, no
     project, no store configured, no file store connection
-    (`connections_required`), an incomplete connection
+    (`connections_required`), an incomplete connection, `files rm` without a
+    terminal or --yes (`confirmation_required`)
   7 stale_base: the version --base names is no longer the active one, or
     another write of the same name came first
   8 the bucket does not hold what the record says: `object_missing`, or
@@ -237,7 +249,7 @@ CRED_KEYS = [       # a file store connection names its own keys; only the file 
      "note": "S3 secret access key of the file store; a connection names its own key via "
              "secret_access_key_env"},
 ]
-WRITE_VERBS = {"save", "retire", "import", "files add", "files link"}
+WRITE_VERBS = {"save", "retire", "import", "files add", "files link", "files rm"}
 WRITE_DEFAULT = True    # the bucket, like the store, is the consumer's own
 DOCS_BASE = ""
 STATE = False
@@ -584,6 +596,14 @@ class _Bucket:
         self._request("PUT", key, body=data, payload_sha=sha256,
                       headers={"Content-Type": media_type})
 
+    def delete(self, key: str) -> None:
+        """Delete the object; one already gone is deleted as well."""
+        try:
+            self._request("DELETE", key)
+        except _BucketError as exc:
+            if exc.code != "not_found":
+                raise
+
     def get(self, key: str, *, size: int, sha256: str) -> bytes:
         """The object's bytes, checked against the size and sha256 its record
         carries; a mismatch is refused, never returned."""
@@ -635,7 +655,10 @@ class _Bucket:
 # key costs nothing and keeps a version from naming a document that is not there.
 # A file references the document it belongs to the same way; its bytes are in the
 # bucket, so the row is what says the file exists, and its size and sha256 are
-# what every read of the bytes is checked against.
+# what every read of the bytes is checked against. A file is deleted where its
+# bytes are - `files rm` deletes the object of every record of the name - and
+# its record is retired, not deleted: the store keeps refusing a delete, as for
+# documents, so the record of what was kept and when outlives the bytes.
 TABLES_MAJOR, TABLES_MINOR = 1, 1
 TABLE_STEPS = [
     ("0001-documents", """
@@ -1728,6 +1751,59 @@ def cmd_files_link(args) -> None:
            "replaced": str(seen["id"]), "file_store": bucket.cid})
 
 
+def _confirmed(act: str, question: str) -> bool:
+    """A yes typed on the terminal; never asked where nobody can answer."""
+    if not sys.stdin.isatty():
+        _die(6, "confirmation_required", f"{act} needs a yes, and there is no terminal "
+             "to ask on", "pass --yes")
+    sys.stderr.write(f"{question} [y/N] ")
+    sys.stderr.flush()
+    return sys.stdin.readline().strip().lower() in ("y", "yes")
+
+
+def cmd_files_rm(args) -> None:
+    project = _project(write=True)
+    name = _checked_file_name(args.name, project)
+    bucket, _why = _file_store(args.connection, "files rm", required=True)
+    conn = _open(_root())
+    seen = _current_file(conn, project, name)
+    if seen is None:
+        _die(3, "not_found", f"no unretired file {name!r} in this project",
+             f"`{NAME} files list` names the files there are")
+    if not args.yes and not _confirmed(
+            f"deleting the file {name!r}",
+            f"Delete the file {name!r} and every earlier version of it from bucket "
+            f"{bucket.bucket!r}? This cannot be undone."):
+        _die(6, "not_confirmed", f"the file {name!r} was not deleted",
+             "answer y, or pass --yes")
+    # Records are never deleted (the store refuses it), so a file leaves by its
+    # bytes leaving the bucket and its record being retired. The bytes go first:
+    # a refusal half way leaves the name current, so the same rm finishes it.
+    keys = [row["storage_key"] for row in _rows(
+        conn, "SELECT storage_key FROM assets_files WHERE project_id = %s AND name = %s "
+              "ORDER BY created_at", (project, name))]
+    try:
+        for key in keys:
+            bucket.delete(key)
+    except _BucketError as exc:
+        _bucket_refused(exc)
+    import psycopg
+    try:
+        with conn.transaction():
+            current = _current_file(conn, project, name, lock=True)
+            if current is None or current["id"] != seen["id"]:
+                raise _StaleFile(name)
+            row = _one(conn, "UPDATE assets_files SET retired_at = now() WHERE id = %s "
+                             f"RETURNING {FILE_COLUMNS}", (seen["id"],))
+    except _StaleFile:
+        _stale_file_refusal(name)
+    except psycopg.errors.CheckViolation as exc:
+        _refused_by_store(exc)
+    _emit({"file": _file_out(row, _document_name(conn, row["document_id"])),
+           "outcome": "removed", "retired": str(row["id"]), "deleted": keys,
+           "file_store": bucket.cid})
+
+
 def cmd_files_list(_args) -> None:
     project = _project(write=False)
     conn = _open(_root())
@@ -1926,6 +2002,10 @@ def _parser() -> _Parser:
     target.add_argument("--document")
     target.add_argument("--none", action="store_true")
     one.add_argument("--connection")
+    one = files.add_parser("rm")
+    one.add_argument("name")
+    one.add_argument("--yes", action="store_true")
+    one.add_argument("--connection")
     one = files.add_parser("get")
     one.add_argument("name")
     one.add_argument("--out", required=True)
@@ -1949,7 +2029,7 @@ def main() -> None:
      "history": cmd_history, "diff": cmd_diff, "search": cmd_search, "save": cmd_save,
      "retire": cmd_retire, "import": cmd_import, "export": cmd_export,
      "files add": cmd_files_add, "files link": cmd_files_link, "files get": cmd_files_get,
-     "files list": cmd_files_list}[verb](args)
+     "files rm": cmd_files_rm, "files list": cmd_files_list}[verb](args)
 
 
 if __name__ == "__main__":

@@ -295,3 +295,36 @@ def test_without_a_connection_only_the_file_verbs_need_one(world, tmp_path):  # 
     exported = world.ok(root, "export", str(tmp_path / "out"))
     assert exported["complete"] and exported["files"] == []
     assert _tree(tmp_path / "out") == {"plans/p.md": b"# P\n"}
+
+
+@needs_gateway
+def test_a_kept_file_is_deleted_from_the_bucket(world, gateway, tmp_path):  # noqa: F811
+    root = connected(world.project(), gateway)
+    world.ok(root, "save", "research/x", "--from", "-", stdin=b"# X\n")
+    first = world.ok(root, "files", "add", "research/x/me.png", "--from", "-", "--document",
+                     "research/x", stdin=PNG)["file"]
+    second = world.ok(root, "files", "add", "research/x/me.png", "--from", "-", "--document",
+                      "research/x", stdin=PNG + b"!")["file"]
+    world.ok(root, "files", "add", "research/x/keep.bin", "--from", "-", "--document", "research/x",
+             stdin=b"k")
+    unasked = world.run(root, "files", "rm", "research/x/me.png")
+    assert unasked.returncode == 6 and error(unasked)["code"] == "confirmation_required"
+    assert (gateway.bucket / second["storage_key"]).read_bytes() == PNG + b"!"
+    removed = world.ok(root, "files", "rm", "research/x/me.png", "--yes")
+    assert removed["outcome"] == "removed" and removed["retired"] == second["id"]
+    assert removed["deleted"] == [first["storage_key"], second["storage_key"]]
+    assert not (gateway.bucket / first["storage_key"]).exists()
+    assert not (gateway.bucket / second["storage_key"]).exists()
+    assert [f["name"] for f in world.ok(root, "files", "list")["files"]] == ["research/x/keep.bin"]
+    assert world.ok(root, "show", "research/x")["files"] == ["research/x/keep.bin"]
+    out = tmp_path / "exported"
+    assert world.ok(root, "export", str(out))["complete"]
+    assert not (out / "research" / "x" / "me.png").exists()
+    assert (out / "research" / "x" / "keep.bin").read_bytes() == b"k"
+    again = world.run(root, "files", "rm", "research/x/me.png", "--yes")
+    assert again.returncode == 3 and error(again)["code"] == "not_found"
+    switched = world.run(root, "files", "rm", "research/x/keep.bin", "--yes",
+                         CAPABILITIES_READ_ONLY="1")
+    assert switched.returncode == 4 and error(switched)["code"] == "read_only_switch"
+    readded = world.ok(root, "files", "add", "research/x/me.png", "--from", "-", stdin=b"new")
+    assert readded["outcome"] == "created"

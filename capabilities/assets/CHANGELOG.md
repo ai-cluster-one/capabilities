@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-10-27 — A kept file can be deleted
+
+`files rm <name>` deletes a file the project kept: the object of every record the name has had - the current one and every one it replaced - is deleted from the bucket, then the current record is retired, so the name leaves `files list`, `export` and its document's `files`, and is free for a new file. Records are still never deleted; a retired record of a removed file names bytes the bucket no longer holds. It asks on the terminal before deleting and is refused without one (exit 6 `confirmation_required`) unless `--yes`; a name with no unretired file is refused with exit 3 `not_found`. It answers `removed` with the record it `retired` and the storage keys it `deleted`. It is a write, under the write gate and the read-only switch.
+
 ## 2026-10-21 — A connection whose network flow died fails in seconds
 
 `assets` uses `capabilities-contract` 0.7.2. Its store connections give a network flow up once data sent on it has gone unacknowledged for 20 seconds (`tcp_user_timeout`), which keepalives cannot notice since none is sent while data waits, and send keepalives after 15 seconds idle, every 5 seconds, 3 probes: a connection whose flow stopped carrying packets without a FIN or a reset fails in about 20 seconds as a lost connection instead of waiting until the store ends the session, and a plain read that loses it that way runs once more on a new connection. A connection lost where `assets` catches nothing ends the command as `store_unreachable`, exit 5, as before.
