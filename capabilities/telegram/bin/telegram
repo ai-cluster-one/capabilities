@@ -922,6 +922,28 @@ def _load_config(wanted: str | None, session_flag: str | None,
     return cfg
 
 
+def _service_key_names(entry: dict | None) -> list[str]:
+    """The keys a connection's service reads beyond its app: the voice-call keys
+    its `gemini_secret_env` and `openai_secret_env` name, else GOOGLE_API_KEY and
+    OPENAI_API_KEY, as the service resolves them, and the transcription key."""
+    entry = entry or {}
+    return [entry.get("gemini_secret_env") or "GOOGLE_API_KEY",
+            entry.get("openai_secret_env") or "OPENAI_API_KEY",
+            "DEEPGRAM_API_KEY"]
+
+
+def _service_key_reports(entry: dict | None, have: list) -> list:
+    """One optional, masked row per key `_service_key_names` names that `have`
+    does not already report."""
+    seen = {k["key"] for k in have}
+    rows = []
+    for key in _service_key_names(entry):
+        if key not in seen:
+            seen.add(key)
+            rows.append(_key_report(key, True, False, *_resolve_env_key(key)))
+    return rows
+
+
 def _connections_report() -> dict:
     """The resolution report — every connection, every value, its winning tier
     and source, secrets masked. Local only: no network, no login attempt."""
@@ -933,6 +955,7 @@ def _connections_report() -> dict:
             value, tier, source = _resolve_env_key(k["key"])
             keys.append(_key_report(k["key"], k["secret"], k["required"],
                                     value, tier, source))
+        keys.extend(_service_key_reports(None, keys))
         report["default"] = "default"
         session = _resolve_env_key("TELEGRAM_SESSION")[0] or str(DEFAULT_SESSION)
         report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys,
@@ -959,6 +982,7 @@ def _connections_report() -> dict:
         keys.append(_key_report(secret_env, True, True, value, tier, source))
         session = entry.get("session") or str(_state_dir() / cid / "session")
         keys.append(_key_report("session", False, False, session, "connection", origin))
+        keys.extend(_service_key_reports(entry, keys))
         report["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
             "keys": keys,

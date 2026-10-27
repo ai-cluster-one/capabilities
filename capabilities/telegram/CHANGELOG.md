@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-27 — `telegram connections` reports the keys the service reads
+
+Every connection `telegram connections` reports now carries, after its app and session rows, one optional, masked row for each key its service reads: the Google key voice calls use (the connection's `gemini_secret_env`, else `GOOGLE_API_KEY`), the OpenAI key (`openai_secret_env`, else `OPENAI_API_KEY`) and `DEEPGRAM_API_KEY`, each with its winning tier and source - the agent's vault included - as for the other keys. A key that is unset is reported unset, and doctor's readiness gate is unchanged, since none of them is required. Without a connections registry the flat keys gain `GOOGLE_API_KEY` and `OPENAI_API_KEY`.
+
 ## 2026-10-27 — `telegram app-check` answers outside any project
 
 `app-check` is a machine read, beside `connections` and `doctor`: `MACHINE_READS` declares it, so outside any project it reads no project's or the global policy, answers to the machine ceiling, and prints Telegram's verdict on the machine's app - or, with `--connection`, on the app a globally declared connection signs in through, read-only - where it used to exit 4 `not_enabled` unless telegram was enabled globally. It touches no account and no session. Inside a project it passes the policy gate as before. Help says so.
