@@ -159,9 +159,118 @@ def test_the_writing_verbs_are_refused_under_the_read_only_switch(lab):
     lab.ok("key", "generate")
     _fed(lab, "tok-1", "secrets", "set", "API_TOKEN")
     for args in (("key", "change"), ("secrets", "rm", "API_TOKEN"),
-                 ("secrets", "raw", "--set"), ("secrets", "set", "API_TOKEN")):
+                 ("secrets", "raw", "--set"), ("secrets", "set", "API_TOKEN"),
+                 ("secrets", "move")):
         result = _feed(lab, "X=1", *args, CAPABILITIES_READ_ONLY="1")
         code, error = _error(result)
         assert (code, error["code"]) == (4, "read_only_switch"), args
     result = lab.run("secrets", "show", "API_TOKEN", CAPABILITIES_READ_ONLY="1")
     assert result.stdout == "tok-1\n"
+
+
+# A capability that reads KEYS through the cascade: the project's .env.local,
+# then .env, then - where it reads the vault - the agent's vault, here asked
+# through the manager's own `secrets show`.
+_READER = '''#!{python}
+import json, subprocess, sys
+from pathlib import Path
+KEYS, VAULT, CODE = {keys!r}, {vault!r}, {code!r}
+if CODE:
+    sys.stderr.write(json.dumps({{"error": {{"code": CODE, "message": "no"}}}}) + "\\n")
+    sys.exit(4)
+def env(path):
+    out = {{}}
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            if "=" in line and not line.startswith("#"):
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip("'")
+    return out
+rows = []
+for key in KEYS:
+    found = None
+    for name in (".env.local", ".env"):
+        value = env(Path.cwd() / name).get(key)
+        if value:
+            found = (value, "project", str(Path.cwd() / name))
+            break
+    if found is None and VAULT:
+        shown = subprocess.run([sys.executable, {manager!r}, "secrets", "show", key],
+                               capture_output=True, text=True)
+        if shown.returncode == 0:
+            found = (shown.stdout[:-1], "vault", "vault:agent")
+    value, tier, source = found or (None, None, None)
+    rows.append({{"key": key, "secret": True, "required": True, "set": bool(value),
+                 "tier": tier, "source": source,
+                 "value": ("…" + value[-4:]) if value else None}})
+print(json.dumps({{"connections": {{"main": {{"keys": rows}}}}}}))
+'''
+
+
+def _reader(lab: Lab, name: str, keys: list, vault: bool = True, code: str = "") -> None:
+    home = lab.tmp / "registry" / name
+    home.mkdir(parents=True, exist_ok=True)
+    script = home / name
+    script.write_text(_READER.format(python=sys.executable, keys=keys, vault=vault,
+                                     code=code, manager=str(MANAGER)))
+    script.chmod(0o755)
+
+
+def test_move_takes_only_the_keys_every_reader_reads_from_the_vault(lab):
+    lab.ok("key", "generate")
+    env_local = lab.project / ".env.local"
+    env_local.write_text(env_local.read_text() + "# a comment\nMOVED_TOKEN='tok-moved'\n"
+                         "OLD_TOKEN=tok-old\nNOBODY=x-nobody\nSPLIT=a-one\n")
+    (lab.project / ".env").write_text("MOVED_TOKEN='tok-moved'\nSPLIT=b-two\n")
+    _reader(lab, "fresh", ["MOVED_TOKEN", "OLD_TOKEN", "SPLIT"])
+    _reader(lab, "stale", ["OLD_TOKEN"], vault=False)
+    _reader(lab, "gated", ["NOBODY"], code="connection_not_granted")
+    before_local = env_local.read_text()
+
+    moved = lab.ok("secrets", "move")
+    assert moved["moved"] == [{"name": "MOVED_TOKEN", "readers": ["fresh"],
+                               "files": [str(env_local), str(lab.project / ".env")]}]
+    reasons = {k["name"]: k["reason"] for k in moved["kept"]}
+    assert reasons["OLD_TOKEN"].startswith("stale could not read it from the vault")
+    assert reasons["NOBODY"] == "no installed capability's connections read it here"
+    assert reasons["SPLIT"] == ".env.local and .env hold different values for it"
+    assert "read before the vault" in reasons[KEY_ENV]
+    assert "read before the vault" in reasons["AGENTKIT_DB_URL"]
+    assert moved["not_reading"] == [{"capability": "gated", "code": "connection_not_granted"}]
+    assert moved["unread"] == []
+    # The files keep every other line as it was; only the moved key's lines go.
+    assert env_local.read_text() == before_local.replace("MOVED_TOKEN='tok-moved'\n", "")
+    assert (lab.project / ".env").read_text() == "SPLIT=b-two\n"
+    assert lab.run("secrets", "show", "MOVED_TOKEN").stdout == "tok-moved\n"
+    # A key that stayed is not left in the vault.
+    assert [s["name"] for s in lab.ok("secrets", "list")["secrets"]] == ["MOVED_TOKEN"]
+    assert "tok-" not in json.dumps(moved)
+
+    # Run again, nothing is left that may move, and nothing changes.
+    again = lab.ok("secrets", "move")
+    assert again["moved"] == [] and env_local.read_text() == before_local.replace(
+        "MOVED_TOKEN='tok-moved'\n", "")
+
+
+def test_move_keeps_a_key_the_vault_holds_otherwise_and_every_key_when_a_report_fails(lab):
+    lab.ok("key", "generate")
+    env_local = lab.project / ".env.local"
+    env_local.write_text(env_local.read_text() + "API_TOKEN=tok-file\n")
+    _fed(lab, "tok-vault", "secrets", "set", "API_TOKEN")
+    _reader(lab, "fresh", ["API_TOKEN"])
+    kept = lab.ok("secrets", "move")
+    assert kept["moved"] == [] and {k["name"]: k["reason"] for k in kept["kept"]}[
+        "API_TOKEN"] == "the vault already holds a different value for it"
+    assert lab.run("secrets", "show", "API_TOKEN").stdout == "tok-vault\n"
+    broken = lab.tmp / "registry" / "broken" / "broken"
+    broken.parent.mkdir(parents=True)
+    broken.write_text("#!/bin/sh\nexit 1\n")
+    broken.chmod(0o755)
+    lab.ok("secrets", "rm", "API_TOKEN")
+    blocked = lab.ok("secrets", "move")
+    assert blocked["moved"] == [] and blocked["unread"] == [
+        {"capability": "broken", "problem": "connections exited 1"}]
+    assert "whether it is read is not known" in {
+        k["name"]: k["reason"] for k in blocked["kept"]}["API_TOKEN"]
+    assert "API_TOKEN=tok-file" in env_local.read_text()
+    assert lab.ok("secrets", "list")["secrets"] == []

@@ -69,8 +69,8 @@ ENVIRONMENT
                        import, disable, enable, inherit, init, key generate,
                        key set, key change, node add, node remove, node seen,
                        node set, place (but its report), quarantine, relabel,
-                       secrets set, secrets rm, secrets raw --set, set, store
-                       set, store unset and unplace.
+                       secrets set, secrets rm, secrets raw --set, secrets
+                       move, set, store set, store unset and unplace.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENT_ENCRYPTION_KEY
                        the agent's one encryption key, which opens its vault
@@ -474,6 +474,25 @@ VAULT VERBS
         from stdin is saved as a whole - each name set where its value
         changed, each readable name the text leaves out removed - and the
         unreadable rows are kept and reported (unreadable_kept).
+  secrets move
+        Move the agent's keys from the project's .env.local and .env into its
+        vault, each only where every capability that reads it here reads it
+        from the vault once the file no longer holds it. A reader is an
+        installed capability whose `connections --json` here resolves the key
+        from one of those files, the per-key resolution its doctor gates on;
+        each key is sealed (files still win, so this changes nothing), removed
+        from its files, and every reader asked again. A key some reader then
+        does not resolve from the vault with the same value goes back on its
+        own line and out of the vault as it was. Answers moved [{name, files,
+        readers}] and kept [{name, files, reason}], one reason per key that
+        stays: no capability reads it here, it is read before the vault can be
+        (the key, the id, the store setting), the two files or the vault hold
+        another value, a reader did not read it from the vault, or a
+        capability's report could not be read (unread), which keeps every key.
+        A key a capability reads from the machine's credentials.env or
+        shared.env is kept, since every agent on the machine reads it there.
+        not_reading names the capabilities that refuse to resolve a connection
+        here. The cascade's order does not change.
   Without a key here, key-bound verbs exit 6 key_missing; with a key that is
   not the one the agent's vault is kept under, 6 key_mismatch. A project with
   no id exits 6 no_project_identity, an agent the store does not register 6
@@ -2035,7 +2054,8 @@ READ_ONLY_REFUSED_VERBS = ("agent convert", "agent set", "allow", "connections i
                            "key generate", "key set", "node add", "node remove",
                            "node set", "place", "quarantine", "references export",
                            "references import", "references retire", "references save",
-                           "relabel", "secrets raw --set", "secrets rm", "secrets set",
+                           "relabel", "secrets move", "secrets raw --set", "secrets rm",
+                           "secrets set",
                            "service move", "service restart", "service start",
                            "service stop",
                            "set", "store set", "store unset", "unplace")
@@ -8572,14 +8592,223 @@ def _vault_public(entries: list) -> list:
     return [{k: v for k, v in e.items() if k != "_row"} for e in entries]
 
 
+# `secrets move`: the agent's keys from its .env files into its vault, each
+# only where every capability that reads it here reads it from the vault once
+# the file no longer holds it - which is what a capability's doctor gates on,
+# since its readiness gate reads the same per-key resolution `connections`
+# reports. Files still win in the cascade, so sealing first changes nothing.
+VAULT_MOVE_FILES = (".env.local", ".env")
+VAULT_MOVE_TIMEOUT = 60
+
+
+def _vault_move_reachers(name: str) -> bool:
+    """A name read before the vault can be: the agent's key, its id, the store
+    setting, and the manager's own settings."""
+    return (name in (_vault_module().KEY_ENV, PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV)
+            or name.startswith(("AGENTKIT_", "CAPABILITIES_")))
+
+
+def _vault_move_lines(text: str, names) -> str:
+    """`text` without the lines that set any of `names`, every other line kept."""
+    return "".join(line for line in text.splitlines(keepends=True) if not any(
+        re.match(r"^\s*(export\s+)?" + re.escape(name) + r"\s*=", line) for name in names))
+
+
+def _vault_move_reports(root: Path) -> tuple[dict, list, list]:
+    """Each installed capability's `connections --json` in the agent's folder:
+    ({capability: report}, [{capability, code}] for a capability that refuses
+    to resolve any connection here, [{capability, problem}] for one whose
+    answer could not be read)."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+    names = sorted(_installed())
+
+    def ask(name):
+        return name, _run_script(_script_path(name), ["connections", "--json"], cwd=root,
+                                 env=env, timeout=VAULT_MOVE_TIMEOUT)
+
+    reports, refusing, unread = {}, [], []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for name, (rc, stdout, stderr) in pool.map(ask, names):
+            if rc == 0:
+                try:
+                    report = json.loads(stdout)
+                except ValueError:
+                    report = None
+                if isinstance(report, dict) and isinstance(report.get("connections"), dict):
+                    reports[name] = report
+                else:
+                    unread.append({"capability": name, "problem": "its connections report "
+                                   "is not a JSON object with connections"})
+                continue
+            code = None
+            for line in reversed(stderr.splitlines()):
+                try:
+                    code = json.loads(line)["error"]["code"]
+                    break
+                except (ValueError, KeyError, TypeError):
+                    continue
+            if rc in (3, 4, 6) and isinstance(code, str):
+                refusing.append({"capability": name, "code": code})
+            else:
+                unread.append({"capability": name,
+                               "problem": f"connections exited {rc}"
+                               + (f" ({code})" if code else "")})
+    return reports, refusing, unread
+
+
+def _vault_move_reads(reports: dict) -> dict:
+    """{env key: [(capability, connection, tier, source, value, vault note)]}
+    for every key a capability's connections name, the value masked as
+    reported and the tier None where it did not resolve."""
+    reads: dict = {}
+    for name, report in reports.items():
+        for cid, entry in sorted(report["connections"].items()):
+            for key in (entry.get("keys") if isinstance(entry, dict) else None) or []:
+                if isinstance(key, dict) and isinstance(key.get("key"), str):
+                    reads.setdefault(key["key"], []).append(
+                        (name, cid, key.get("tier") if key.get("set") else None,
+                         key.get("source"), key.get("value"), key.get("vault")))
+    return reads
+
+
+def _vault_move(root: Path) -> dict:
+    vault = _vault_module()
+    key = _vault_require_key(root)
+    agent_id = _kernel_agent_id(root)
+    paths = {fname: root / fname for fname in VAULT_MOVE_FILES}
+    texts = {fname: p.read_text() for fname, p in paths.items() if p.is_file()}
+    values = {fname: _parse_env_file(paths[fname]) for fname in texts}
+    here = {str(p.resolve()): fname for fname, p in paths.items()}
+
+    reports, refusing, unread = _vault_move_reports(root)
+    reads = _vault_move_reads(reports)
+    kept: dict[str, dict] = {}
+
+    def keep(name, files, reason):
+        kept.setdefault(name, {"name": name, "files": files, "reason": reason})
+
+    # Keys a capability takes from the machine's files serve every agent here.
+    for name, rows in sorted(reads.items()):
+        for _cap, _cid, tier, source, _value, _note in rows:
+            if tier == "user" and source:
+                keep(name, [source], "kept in the machine's file, which every agent on this "
+                     "machine reads; this command moves only the agent's own .env files")
+
+    candidates: dict[str, list[str]] = {}
+    for fname in VAULT_MOVE_FILES:
+        for name in values.get(fname, {}):
+            candidates.setdefault(name, []).append(fname)
+    readers: dict[str, list] = {}
+    for name, files in sorted(candidates.items()):
+        shown = [str(paths[f]) for f in files]
+        held = {values[f][name] for f in files}
+        rows = [r for r in reads.get(name, [])
+                if r[2] == "project" and r[3] and str(Path(r[3]).resolve()) in here]
+        if _vault_move_reachers(name):
+            keep(name, shown, "read before the vault can be: the agent's key, its id, the "
+                 "store setting or the manager's own settings")
+        elif len(held) > 1:
+            keep(name, shown, ".env.local and .env hold different values for it")
+        elif not values[files[0]][name]:
+            keep(name, shown, "its value is empty")
+        elif unread:
+            keep(name, shown, "whether it is read is not known: "
+                 + "; ".join(f"{u['capability']} {u['problem']}" for u in unread))
+        elif not rows:
+            keep(name, shown, "no installed capability's connections read it here")
+        else:
+            try:
+                vault.check_name(name)
+            except vault.VaultError as exc:
+                keep(name, shown, exc.message)
+                continue
+            readers[name] = rows
+
+    sealed: list[str] = []
+    if readers:
+        def seal(conn, agent_id):
+            _vault_key_matches(conn, agent_id, key)
+            fp = vault.fingerprint(key)
+            held = {r["name"]: r for r in vault.rows(conn, agent_id)}
+            made, actor = [], _vault_actor()
+            for name in sorted(readers):
+                value = values[candidates[name][0]][name]
+                row = held.get(name)
+                if row is not None and row["key_fingerprint"] != fp:
+                    keep(name, [str(paths[f]) for f in candidates[name]],
+                         "the vault holds it sealed under another key; set it again or "
+                         "remove it there first")
+                elif row is not None and vault.unseal(
+                        key, agent_id, name, row["ciphertext"]) != value:
+                    keep(name, [str(paths[f]) for f in candidates[name]],
+                         "the vault already holds a different value for it")
+                elif row is None:
+                    vault.put(conn, key, agent_id, name, value, updated_by=actor)
+                    made.append(name)
+            return made
+
+        sealed, _setting = _kernel_run(root, seal)
+    trial = sorted(n for n in readers if n not in kept)
+
+    moved: list[str] = []
+    if trial:
+        try:
+            for fname, text in texts.items():
+                stripped = _vault_move_lines(text, trial)
+                if stripped != text:
+                    _atomic_write_text(paths[fname], stripped)
+            after_reports, _refusing, after_unread = _vault_move_reports(root)
+            after = _vault_move_reads(after_reports)
+            for name in trial:
+                failed = None
+                for cap, cid, _tier, _source, value, _note in readers[name]:
+                    now = [r for r in after.get(name, []) if r[0] == cap and r[1] == cid]
+                    if not now or now[0][2] is None:
+                        note = now[0][5] if now and now[0][5] else None
+                        failed = (f"{cap} could not read it from the vault"
+                                  + (f": {note}" if note else ""))
+                    elif now[0][2] != "vault":
+                        failed = f"{cap} then resolves it from {now[0][2]}, not the vault"
+                    elif now[0][4] != value:
+                        failed = f"{cap} reads another value from the vault"
+                    if failed:
+                        break
+                if failed:
+                    keep(name, [str(paths[f]) for f in candidates[name]], failed)
+                else:
+                    moved.append(name)
+        finally:
+            # The files end as they were less what moved, so a key that stays is
+            # back on its own line, as it was.
+            for fname, text in texts.items():
+                final = _vault_move_lines(text, moved)
+                if paths[fname].read_text() != final:
+                    _atomic_write_text(paths[fname], final)
+    back = [n for n in sealed if n not in moved]
+    if back:
+        _kernel_run(root, lambda conn, agent_id: vault.remove(conn, agent_id, back))
+    return {"ok": True, "agent": agent_id,
+            "moved": [{"name": n, "files": [str(paths[f]) for f in candidates[n]],
+                       "readers": sorted({r[0] for r in readers[n]})} for n in moved],
+            "kept": [kept[n] for n in sorted(kept)],
+            "not_reading": refusing, "unread": unread}
+
+
 def cmd_secrets(rest: list[str]) -> None:
     vault = _vault_module()
     sub = rest[0] if rest else None
     args = rest[1:]
-    if sub not in ("list", "show", "set", "rm", "raw"):
-        _die(6, "input", "secrets needs a subcommand: list, show, set, rm or raw",
+    if sub not in ("list", "show", "set", "rm", "raw", "move"):
+        _die(6, "input", "secrets needs a subcommand: list, show, set, rm, raw or move",
              "run `capabilities help`")
     root = _require_project()
+
+    if sub == "move":
+        if args:
+            _die(6, "input", "secrets move takes nothing more")
+        _read_only_gate("secrets move")
+        _emit(_vault_move(root))
+        return
 
     def name_of(value: str) -> str:
         try:
