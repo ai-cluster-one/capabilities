@@ -449,8 +449,22 @@ Contract commands (the same on every capability):
   whatsapp connections                         Where every connection's values
                                                resolve from (tier, source, secrets
                                                masked). Local only — no network.
+                                               Each connection carries `session`
+                                               {live, account}: `live` is true when
+                                               the engine's session on this machine
+                                               holds a linked device and the
+                                               service here has not recorded it
+                                               logged out; `account` is the account
+                                               the device is linked as, else the
+                                               connection's recorded identity, else
+                                               its expected_account_id, or null. A
+                                               waha connection's session is held by
+                                               the WAHA server, so `live` is null
+                                               and `reason` is `waha_server`.
   whatsapp stub                                One-line awareness text.
-  whatsapp manifest --json                     Machine-readable declaration.
+  whatsapp manifest --json                     Machine-readable declaration;
+                                               `connections.device_bound` is true:
+                                               a connection is a linked device.
   whatsapp guide [<topic>]                     Guide topics / one guide body,
                                                fetched live from the docs base.
   whatsapp ids list|get <l>|set <l> <v>|rm <l> The project identifiers envelope
@@ -1041,12 +1055,43 @@ def _connections_report() -> dict:
                                     value, tier, source))
         report["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "keys": keys}
+            "keys": keys,
+            "session": _session_state(cid, entry, engine)}
     return report
 
 
 def _cmd_connections() -> None:
     _emit(_connections_report())
+
+
+def _session_state(cid: str, entry: dict, engine: str) -> dict:
+    """Whether this connection's session lives on this machine, and whose it
+    is, from local files alone: no network, and the account's home is found as
+    `_account_home` finds it without adopting anything. A bridge connection's
+    session lives on the WAHA server, so this machine cannot say: `live` is
+    null with `reason` `waha_server`. An in-house one is live when the engine's
+    session here holds a linked device and the service here has not recorded
+    it logged out; `account` is the account the device is linked as, else the
+    one the connection records, else its expected_account_id."""
+    held = _connection_identity(entry)
+    bound = _digits(entry.get("expected_account_id"))
+    if engine == ENGINE_WAHA:
+        return {"live": None, "account": (held or {}).get("id") or bound,
+                "reason": "waha_server"}
+    if engine != ENGINE_INHOUSE:     # refused by name wherever it is used
+        return {"live": False, "account": (held or {}).get("id") or bound}
+    key = bound or _digits(entry.get("number"))
+    root = _state_dir()
+    home = root / (key or cid)
+    if key and not home.exists() and (root / cid).is_dir() \
+            and _home_account(root / cid) in (None, key):
+        home = root / cid
+    device = _engine_device(home / "session.db")
+    health = _json_file(home / "service" / "health.json")
+    logged_out = isinstance(health, dict) and health.get("state") == "logged_out"
+    linked = _digits(str(_bare_jid(device[0])).split("@", 1)[0]) if device else None
+    return {"live": device is not None and not logged_out,
+            "account": linked or (held or {}).get("id") or bound}
 
 
 def _auth_headers(config) -> dict:
@@ -8677,8 +8722,11 @@ def _selection_flags(parser, *, suppress: bool = False) -> None:
 def main():
     _gate()                      # every verb passes the effective policy gate first
     if (sys.argv[1:2] or [""])[0] == "manifest":
-        # The contract's manifest plus the bundled service it declares.
-        _emit({**_manifest_core(), "service": SERVICE})
+        # The contract's manifest plus the bundled service it declares. A
+        # connection is a device linked to the account, not a portable value.
+        core = _manifest_core()
+        _emit({**core, "connections": {**core["connections"], "device_bound": True},
+               "service": SERVICE})
         sys.exit(0)
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
     parser = argparse.ArgumentParser(

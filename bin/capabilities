@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.26.0,<1",
+#     "capabilities-contract>=0.28.0,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -964,12 +964,51 @@ PROJECT VERBS (run inside a consuming project)
         when a node counts as live.
         Answers {ok, project, agent_id, node, last_seen_at, store}. Exit 6
         node_unknown for a node not registered.
+  node state
+        What each of this agent's nodes last said of itself, as its row of
+        capabilities_node_states holds it, one row per machine shared by
+        every agent on it: {ok, project, agent_id, nodes [{node, label,
+        reachable, load_1, load_5, load_15, cpu_count, memory_used_bytes,
+        memory_limit_bytes, disk_used_bytes, disk_total_bytes, booted_at,
+        uptime_seconds, boot_line, image_version, claude_login,
+        claude_account, codex_login, codex_account, gh_login, gh_account,
+        reported_at, fresh_until, sessions [{capability, connection, live,
+        account, checked_at}]}], store}. A row stands for its node for 90
+        seconds after it is written (fresh_until, the store's time):
+        reachable is whether that has not yet passed, by the store's now,
+        and a node that never wrote one reads unreachable with every field
+        null. Memory is the container's under a memory limit, its usage less
+        the file cache it can give back, else the machine's; disk is the
+        filesystem holding the home; booted_at is the container's start on a
+        container node, the machine's boot otherwise. boot_line and
+        image_version are what an agent-node image says of itself, through
+        the files AGENT_NODE_STATE_FILE and AGENT_NODE_VERSION_FILE name;
+        null off the image. Each tool's login is signed_in, signed_out,
+        absent (not on PATH) or unknown (its answer could not be read), from
+        its own status answer - `claude auth status --json`, `codex login
+        status`, `gh auth status --json hosts` for github.com - with the
+        account it states only while signed in; no token is read or kept.
+        sessions are this agent's on that node: for each installed
+        capability whose manifest declares connections.device_bound, every
+        connection whose `connections --json` answer in the agent's folder
+        there carries a session {live, account}.
+  node state report
+        Write this node's state once: the row `node state` reads, and the
+        sessions of every agent the store links to this node whose folder
+        here is bound to it, each capability's set replaced and those of an
+        agent or capability no longer asked here dropped. The node is the
+        one this process runs on (`node id`); a node reports itself and no
+        other. `node run` writes it every 15 seconds and right after a
+        reconcile that changed a job. Answers {ok, project, agent_id, node,
+        state, sessions, store}, state and sessions as `node state` gives
+        them for this node. Exit 6 node_unknown for a node not registered.
   node rekey <old id> [<new id>] [--dry-run]
         Move a node from the id it is known by - a node registered before
         ids keeps the name it had as its id - to its own: this machine's id
         (`node id`), or the one given. In one transaction the registry row
-        takes the new id, every agent's link to it follows, and every column
-        of the store that names a node moves with it: the policy, grant,
+        takes the new id, every agent's link to it follows, as do its state
+        row and device sessions (`node state`), and every column of the
+        store that names a node moves with it: the policy, grant,
         identifier and settings rows for that node, the service leases,
         sessions, runs, definitions, executions and memory entries recorded
         under it (only the node part of agentrooms' lease holder); the
@@ -988,8 +1027,8 @@ PROJECT VERBS (run inside a consuming project)
         The agent and node verbs but `node id` need the project's id (exit 6
         no_project_identity: run init) and a database that resolves for the
         project (exit 6 store_not_configured, 5 when it cannot be reached);
-        set, add, remove, seen and rekey exit 4 under the read-only switch,
-        but for rekey --dry-run.
+        set, add, remove, seen, state report and rekey exit 4 under the
+        read-only switch, but for rekey --dry-run.
   node run --supervisor <dir> [--every N] [--services <name,...>]
         The node's service manager: one per node and OS user, run as a
         program of the Supervisor whose configuration includes <dir>/*.conf
@@ -1014,7 +1053,11 @@ PROJECT VERBS (run inside a consuming project)
         seconds (default 60, 5 to 3600) and within seconds of a placement
         change, announced by the manager's placement writes, and answers a
         `service restart` for one of its programs. It reports the node seen
-        on each reconcile. While the store cannot be read it changes no job,
+        on each reconcile, and writes this node's state (`node state
+        report`) every 15 seconds, apart from its reconcile interval, and
+        right after a reconcile that changed a job, asking the tools'
+        sign-ins and the sessions again every 60 seconds; a write that fails
+        is said once on stderr and changes nothing else. While the store cannot be read it changes no job,
         and at its first start it writes none until it has read the store. A
         placed service it will not run - not installed, no deploy or machine
         command, quarantined, a machine service outside --services, or its
@@ -3419,9 +3462,15 @@ def _validate_fields(where: str, fields, setting: bool = False) -> list[str]:
 def _validate_connections_declaration(declared) -> list[str]:
     if declared is None:
         return []
-    if not isinstance(declared, dict) or set(declared) != {"fields", "setup", "link"}:
-        return ["connections is not null or an object of fields, setup and link"]
+    if not isinstance(declared, dict) or set(declared) - {"device_bound"} != {
+            "fields", "setup", "link"}:
+        return ["connections is not null or an object of fields, setup and link, "
+                "with an optional device_bound"]
     problems: list[str] = []
+    if not isinstance(declared.get("device_bound", False), bool):
+        # Whether a connection's session is bound to the device it was linked
+        # on, so each node reports it (`node state`).
+        problems.append("connections.device_bound is not a boolean")
     if declared["fields"] is not None:
         problems += _validate_fields("connections.fields", declared["fields"])
         if isinstance(declared["fields"], list):
@@ -10040,7 +10089,10 @@ class _KernelRefusal(Exception):
 # Every column of the store that names a node by its id, apart from the
 # links (capabilities_agent_nodes), which follow the registry's id through
 # their foreign key: `node rekey` moves each in one transaction. `prefix` is a
-# column holding `<node>:<more>`, of which only the node part moves. A
+# column holding `<node>:<more>`, of which only the node part moves; `foreign
+# key` is a column that, as the links do, follows the registry's id by its
+# own foreign key, so the rekey counts and checks it and moves none of it
+# itself (a merge drops the old id's rows with its registry row). A
 # capability that adds a column naming a node adds it here.
 NODE_REFERENCES = (
     ("agentrooms_leases", "node", "whole"),
@@ -10053,6 +10105,8 @@ NODE_REFERENCES = (
     ("automations_runs", "environment", "whole"),
     ("capabilities_connection_grants", "node", "whole"),
     ("capabilities_identifiers", "node", "whole"),
+    ("capabilities_node_sessions", "node", "foreign key"),
+    ("capabilities_node_states", "node", "foreign key"),
     ("capabilities_policy", "node", "whole"),
     ("capabilities_service_instances", "node", "whole"),
     ("capabilities_settings", "node", "whole"),
@@ -10291,6 +10345,303 @@ def _node_launcher_text(job: dict, manager: str) -> str:
     return f"#!/bin/sh\n# {NODE_LAUNCHD_MARK}\nexec {shlex.join(command)}\n"
 
 
+# ---------------------------------------------------------------- node state
+#
+# Each node writes what it says of itself into the store, one row per machine
+# (capabilities_node_states), and per agent whether each device-bound
+# connection holds a live session here (capabilities_node_sessions): `node
+# state report` once, `node run` on its own beat. The row stands for the node
+# for the contract's NODE_STATE_FRESH_SECONDS; after that it reads unreachable.
+# The tools' sign-ins and the sessions are each tool's and capability's own
+# answer, which takes a process each, so they are asked on a slower cadence.
+
+NODE_STATE_BEAT_SECONDS = 15
+NODE_STATE_PROBE_SECONDS = 60
+NODE_STATE_TOOL_TIMEOUT = 15
+NODE_STATE_SESSION_TIMEOUT = 60
+# What an agent-node image says of itself: the file holding its version, and
+# the file its boot path writes its one line of what it is doing to.
+NODE_IMAGE_VERSION_FILE_ENV = "AGENT_NODE_VERSION_FILE"
+NODE_BOOT_LINE_FILE_ENV = "AGENT_NODE_STATE_FILE"
+NODE_STATE_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _node_first_line(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    try:
+        with open(path, errors="replace") as handle:
+            line = handle.readline().strip()
+    except OSError:
+        return None
+    return line or None
+
+
+def _node_int(text: str | None) -> int | None:
+    try:
+        return int(str(text).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _node_memory_stat(path: Path, key: str) -> int:
+    try:
+        for line in path.read_text().splitlines():
+            name, _, value = line.partition(" ")
+            if name == key:
+                return _node_int(value) or 0
+    except OSError:
+        pass
+    return 0
+
+
+def _node_linux_memory() -> tuple[int | None, int | None]:
+    """(used, limit) in bytes: the cgroup's where it limits this node below the
+    machine's memory - its usage less the file cache it can give back - else
+    the machine's, from /proc/meminfo."""
+    info: dict[str, int] = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            name, _, rest = line.partition(":")
+            value = _node_int(rest.split()[0]) if rest.split() else None
+            if value is not None:
+                info[name] = value * 1024
+    except OSError:
+        pass
+    total, available = info.get("MemTotal"), info.get("MemAvailable")
+    cgroup = Path("/sys/fs/cgroup")
+    for limit_file, usage_file, inactive in (
+            ("memory.max", "memory.current", "inactive_file"),
+            ("memory/memory.limit_in_bytes", "memory/memory.usage_in_bytes",
+             "total_inactive_file")):
+        try:
+            limit = _node_int((cgroup / limit_file).read_text())
+            usage = _node_int((cgroup / usage_file).read_text())
+        except OSError:
+            continue
+        if limit and usage is not None and (total is None or limit < total):
+            stat_file = cgroup / Path(usage_file).parent / "memory.stat"
+            return max(usage - _node_memory_stat(stat_file, inactive), 0), limit
+        break
+    if total is None:
+        return None, None
+    return (total - available if available is not None else None), total
+
+
+def _node_mac_memory() -> tuple[int | None, int | None]:
+    """(used, physical) in bytes on a Mac: active, wired and compressed pages."""
+    limit = _node_int(_node_command(["sysctl", "-n", "hw.memsize"]))
+    text = _node_command(["vm_stat"]) or ""
+    size = re.search(r"page size of (\d+) bytes", text)
+    pages = {name.strip(): int(value) for name, value in
+             re.findall(r"^([^:\n]+):\s+(\d+)\.?$", text, re.MULTILINE)}
+    if not size or not pages:
+        return None, limit
+    used = sum(pages.get(name, 0) for name in
+               ("Pages active", "Pages wired down", "Pages occupied by compressor"))
+    return used * int(size.group(1)), limit
+
+
+def _node_command(argv: list[str], timeout: int = 10) -> str | None:
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
+def _node_booted_at():
+    """When this node started: the container's start - its PID 1's - on a
+    container node, the machine's boot otherwise; None where it does not say."""
+    from datetime import datetime, timezone
+    if sys.platform == "darwin":
+        found = re.search(r"sec = (\d+)", _node_command(["sysctl", "-n", "kern.boottime"])
+                          or "")
+        return datetime.fromtimestamp(int(found.group(1)), timezone.utc) if found else None
+    try:
+        boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text()
+                    .splitlines() if line.startswith("btime "))
+    except (OSError, StopIteration, ValueError, IndexError):
+        return None
+    if Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+        try:
+            fields = Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()
+            # Field 22 of the line, the process's start in clock ticks after boot.
+            return datetime.fromtimestamp(
+                boot + int(fields[19]) / os.sysconf("SC_CLK_TCK"), timezone.utc)
+        except (OSError, IndexError, ValueError):
+            return None
+    return datetime.fromtimestamp(boot, timezone.utc)
+
+
+def _node_facts() -> dict:
+    """What this node says of itself that costs no process to learn, in the
+    store tier's node_state_put terms; each None where the machine does not say."""
+    try:
+        load = list(os.getloadavg())
+    except OSError:
+        load = None
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count()
+    used, limit = _node_mac_memory() if sys.platform == "darwin" else _node_linux_memory()
+    try:
+        # The home, or the nearest folder above it that exists.
+        home = next(p for p in (Path.home(), *Path.home().parents) if p.exists())
+        disk = shutil.disk_usage(home)
+        disk_used, disk_total = disk.used, disk.total
+    except (OSError, StopIteration):
+        disk_used = disk_total = None
+    return {"load": load, "cpu_count": cpus or None, "memory_used_bytes": used,
+            "memory_limit_bytes": limit or None, "disk_used_bytes": disk_used,
+            "disk_total_bytes": disk_total or None, "booted_at": _node_booted_at(),
+            "boot_line": _node_first_line(os.environ.get(NODE_BOOT_LINE_FILE_ENV)),
+            "image_version": _node_first_line(os.environ.get(NODE_IMAGE_VERSION_FILE_ENV))}
+
+
+def _node_tool(argv: list[str]) -> tuple[int, str, str] | None:
+    """(exit code, stdout, stderr) of a tool's own status answer, or None
+    where it could not be had."""
+    try:
+        done = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=NODE_STATE_TOOL_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return done.returncode, done.stdout, done.stderr
+
+
+def _node_tool_logins() -> dict[str, tuple[str, str | None]]:
+    """Whether claude, codex and gh are signed in here and as whom, each from
+    the tool's own status answer, never from its credential files: absent
+    where the tool is not on PATH, unknown where its answer cannot be read.
+    Nothing but the account a tool states is kept, never a token."""
+    logins: dict[str, tuple[str, str | None]] = {}
+    # Claude Code: `claude auth status --json` says loggedIn and the email.
+    tool = shutil.which("claude")
+    answer = _node_tool([tool, "auth", "status", "--json"]) if tool else None
+    state: tuple[str, str | None] = ("absent", None) if not tool else ("unknown", None)
+    if answer is not None:
+        try:
+            body = json.loads(answer[1])
+        except ValueError:
+            body = None
+        if isinstance(body, dict) and isinstance(body.get("loggedIn"), bool):
+            email = body.get("email")
+            state = (("signed_in", email if isinstance(email, str) and email else None)
+                     if body["loggedIn"] else ("signed_out", None))
+    logins["claude"] = state
+    # Codex: `codex login status` exits 0 signed in, and says "Not logged in"
+    # otherwise; only an email address in its text is taken as the account.
+    tool = shutil.which("codex")
+    answer = _node_tool([tool, "login", "status"]) if tool else None
+    state = ("absent", None) if not tool else ("unknown", None)
+    if answer is not None:
+        code, text = answer[0], answer[1] + "\n" + answer[2]
+        if "not logged in" in text.lower():
+            state = ("signed_out", None)
+        elif code == 0 and "logged in" in text.lower():
+            found = NODE_STATE_EMAIL_RE.search(text)
+            state = ("signed_in", found.group(0) if found else None)
+    logins["codex"] = state
+    # The GitHub CLI: `gh auth status --json hosts`, the active github.com login.
+    tool = shutil.which("gh")
+    answer = _node_tool([tool, "auth", "status", "--json", "hosts"]) if tool else None
+    state = ("absent", None) if not tool else ("unknown", None)
+    if answer is not None:
+        try:
+            body = json.loads(answer[1])
+        except ValueError:
+            body = None
+        hosts = body.get("hosts") if isinstance(body, dict) else None
+        if isinstance(hosts, dict):
+            entries = [e for e in hosts.get("github.com") or [] if isinstance(e, dict)]
+            entry = next((e for e in entries if e.get("active")), entries[0] if entries else None)
+            if entry is None:
+                state = ("signed_out", None)
+            elif entry.get("state") == "success":
+                login = entry.get("login")
+                state = ("signed_in", login if isinstance(login, str) and login else None)
+            elif entry.get("state") == "error":
+                state = ("signed_out", None)
+    logins["gh"] = state
+    return logins
+
+
+def _device_bound_capabilities() -> list[str]:
+    """The installed capabilities whose manifest snapshot declares their
+    connections bound to the device they are linked on."""
+    found = []
+    for name in _installed():
+        manifest = _read_json(CAP_HOME / name / "manifest.json")
+        connections = manifest.get("connections") if isinstance(manifest, dict) else None
+        if isinstance(connections, dict) and connections.get("device_bound") is True:
+            found.append(name)
+    return found
+
+
+def _node_device_sessions(folders: dict[str, Path]) -> dict[tuple[str, str], list | None]:
+    """For each agent's folder here and each device-bound capability, the
+    capability's own answer of whether each connection holds a live session
+    on this node: {(agent, capability): [(connection, live, account)]}, None
+    where the capability could not answer, so what it said last stands."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+    out: dict[tuple[str, str], list | None] = {}
+    for capability in _device_bound_capabilities():
+        for agent_id, folder in sorted(folders.items()):
+            rc, stdout, _err = _run_script(_script_path(capability), ["connections", "--json"],
+                                           cwd=folder, env=env,
+                                           timeout=NODE_STATE_SESSION_TIMEOUT)
+            try:
+                report = json.loads(stdout) if rc == 0 else None
+            except ValueError:
+                report = None
+            conns = report.get("connections") if isinstance(report, dict) else None
+            if not isinstance(conns, dict):
+                out[(agent_id, capability)] = None
+                continue
+            rows = []
+            for cid, entry in sorted(conns.items()):
+                session = entry.get("session") if isinstance(entry, dict) else None
+                if isinstance(session, dict) and isinstance(session.get("live"), bool):
+                    account = session.get("account")
+                    rows.append((cid, session["live"],
+                                 account if isinstance(account, str) and account else None))
+            out[(agent_id, capability)] = rows
+    return out
+
+
+def _node_agent_folder(root: Path, own: str | None, agent_id: str,
+                       folder: str | None) -> Path | None:
+    """The folder on this node bound to `agent_id`, as its link records it,
+    or None. The folder this process runs in is its own agent's folder here,
+    recorded or not: a box records none, since no `capabilities init` reaches
+    the store there."""
+    path = Path(folder) if folder else None
+    if (path is None or _folder_agent_id(path) != agent_id) and agent_id == own:
+        path = root
+    if path is None or _folder_agent_id(path) != agent_id:
+        return None
+    return path
+
+
+def _node_state_write(conn, here: str, facts: dict, logins: dict | None,
+                      sessions: dict | None) -> dict:
+    """Write this node's state row and, where `sessions` holds them, the
+    sessions each agent's device-bound capabilities answered, dropping those
+    of an agent or capability no longer asked here. Answers {reported_at,
+    fresh_until}."""
+    store = _store_module()
+    stamp = store.node_state_put(conn, here, **facts, logins=logins)
+    if sessions is not None:
+        for (agent_id, capability), rows in sorted(sessions.items()):
+            if rows is not None:
+                store.node_sessions_put(conn, agent_id, here, capability, rows)
+        store.node_sessions_prune(conn, here, sorted(sessions))
+    return stamp
+
+
 class _NodeManager:
     """`node run` on a node whose supervisor is Supervisor: each job is a
     program file in the include directory its configuration names, applied
@@ -10319,6 +10670,15 @@ class _NodeManager:
         # whose rows in capabilities_service_instances this process wrote.
         self.unrun: dict[tuple[str, str], tuple[str, str]] = {}
         self.unrun_now: dict[tuple[str, str], tuple[str, str]] = {}
+        # This node's state, written on its own beat and right after a
+        # reconcile that changed a job; the tools' sign-ins and the agents'
+        # sessions, each a process to ask, on the slower probe cadence.
+        self.folders: dict[str, Path] = {}
+        self.moved = False
+        self.state_due = 0.0
+        self.probe_due = 0.0
+        self.logins: dict | None = None
+        self.sessions: dict | None = None
 
     def say(self, message: str) -> None:
         sys.stderr.write(f"[capabilities node {self.here}] {message}\n")
@@ -10391,13 +10751,8 @@ class _NodeManager:
         own = _folder_agent_id(self.root)
         for agent_id, folder, slug in agents:
             slugs[agent_id] = slug
-            path = Path(folder) if folder else None
-            if (path is None or _folder_agent_id(path) != agent_id) and agent_id == own:
-                # The folder this process runs in is its own agent's folder on
-                # this node, recorded or not: a box records none, since no
-                # `capabilities init` reaches the store there.
-                path = self.root
-            if path is None or _folder_agent_id(path) != agent_id:
+            path = _node_agent_folder(self.root, own, agent_id, folder)
+            if path is None:
                 self.say_once(f"agent:{agent_id}", folder,
                               f"agent {agent_id} records no folder on this node that is "
                               f"bound to it ({folder or 'none'}), so none of its services "
@@ -10405,6 +10760,7 @@ class _NodeManager:
                 continue
             self.said.pop(f"agent:{agent_id}", None)
             folders[agent_id] = path
+        self.folders = folders
         jobs: dict[str, dict] = {}
         unrun: dict[tuple[str, str], tuple[str, str]] = {}
         for agent_id, capability in placed:
@@ -10530,6 +10886,7 @@ class _NodeManager:
         if answer is None:
             return False
         agents, placed = answer
+        self.moved = False
         self.agents = [row[0] for row in agents]
         desired = self.desired(agents, placed)
         self.record_unrun(self.unrun_now)
@@ -10546,6 +10903,7 @@ class _NodeManager:
             self.write_job(job, path, text)
             self.changed.add(name)
             self.pending_apply = True
+            self.moved = True
             self.say(f"runs {job['capability']} for "
                      f"{', '.join(job['agents']) if job.get('machine') else job['agent_id']} "
                      f"here as job {name}")
@@ -10554,6 +10912,7 @@ class _NodeManager:
                 continue
             if self.remove_job(name, path):
                 self.pending_apply = True
+                self.moved = True
                 self.say(f"stops job {name}: its service is no longer placed here")
         self.jobs = desired
         self.read_once = True
@@ -10634,6 +10993,40 @@ class _NodeManager:
         self.say(f"restarted job {name}, as asked" if ok
                  else f"could not restart job {name}: {said[:300]}")
 
+    def report_state(self) -> None:
+        """Write this node's state; the tools and the sessions are asked again
+        once the probe cadence has passed, the sessions only once the store
+        has been read and the agents' folders here are known. A write that
+        fails is said once and changes nothing else."""
+        now = time.monotonic()
+        self.state_due = now + NODE_STATE_BEAT_SECONDS
+        self.moved = False
+        if self.logins is None or now >= self.probe_due:
+            self.probe_due = now + NODE_STATE_PROBE_SECONDS
+            self.logins = _node_tool_logins()
+            self.sessions = _node_device_sessions(self.folders) if self.read_once else None
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            self.say_once("state", getattr(exc, "slug", type(exc).__name__),
+                          f"cannot write this node's state: {getattr(exc, 'message', exc)}")
+            return
+        try:
+            with conn.transaction():
+                _node_state_write(conn, self.here, _node_facts(), self.logins, self.sessions)
+        except Exception as exc:
+            self.say_once("state", type(exc).__name__,
+                          "cannot write this node's state: "
+                          + " ".join(f"{type(exc).__name__}: {exc}".split())[:300])
+            return
+        finally:
+            conn.close()
+        # Sessions written once are not written again until they are asked again.
+        self.sessions = None
+        if self.said.get("state") is not None:
+            self.say("writes this node's state again")
+        self.said["state"] = None
+
     def run(self, stopping: dict) -> None:
         next_reconcile = 0.0
         while not stopping["now"]:
@@ -10646,6 +11039,8 @@ class _NodeManager:
                 self.apply()
             for name in restarts:
                 self.restart(name)
+            if self.moved or time.monotonic() >= self.state_due:
+                self.report_state()
             deadline = time.monotonic() + NODE_RUN_FOLLOW_SECONDS
             while not stopping["now"] and time.monotonic() < deadline:
                 time.sleep(0.2)
@@ -12998,6 +13393,78 @@ def cmd_service(args: list[str]) -> None:
     verbs[sub](args[1:])
 
 
+def _node_state_answer(row: dict) -> dict:
+    return {key: (_store_module()._stamp(value) if key.endswith("_at") or key == "fresh_until"
+                  else value) for key, value in row.items()}
+
+
+def _node_state_verb(root: Path, args: list[str]) -> None:
+    """`node state`: the state rows of this agent's nodes; `node state report`:
+    write this node's own, once."""
+    store = _store_module()
+    if args[:1] == ["report"]:
+        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "node state report")
+        if pos:
+            _die(6, "input", "node state report takes no positional argument: a node "
+                 "reports itself")
+        _read_only_gate("node state report")
+        here = _this_node()["id"]
+
+        def links(conn, agent_id):
+            if not conn.execute("SELECT 1 FROM capabilities_agent_nodes WHERE agent_id = %s "
+                                "AND node = %s", (agent_id, here)).fetchone():
+                raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {here}",
+                                     f"register it with `capabilities node add {here} "
+                                     "--label <label> --kind mac|server`")
+            return agent_id, conn.execute(
+                "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
+                "ORDER BY agent_id", (here,)).fetchall()
+        try:
+            (agent_id, linked), _setting = _kernel_run(root, links)
+        except _KernelRefusal as exc:
+            _die(6, exc.code, exc.message, exc.hint)
+        own = _folder_agent_id(root)
+        folders = {linked_id: path for linked_id, folder in linked
+                   if (path := _node_agent_folder(root, own, linked_id, folder)) is not None}
+        facts, logins = _node_facts(), _node_tool_logins()
+        sessions = _node_device_sessions(folders)
+
+        def write(conn, agent_id):
+            _node_state_write(conn, here, facts, logins, sessions)
+            return (store.node_states(conn, [here])[0],
+                    store.node_sessions(conn, agent_id, [here]))
+        (row, own_sessions), setting = _kernel_run(root, write)
+        _emit({"ok": True, "project": str(root), "agent_id": agent_id, "node": here,
+               "state": _node_state_answer(row),
+               "sessions": [_node_state_answer(s) for s in own_sessions],
+               "store": _kernel_store_report(setting)})
+        return
+    pos, _opts = _kernel_options(args, set(), {"--json"}, "node state")
+    if pos:
+        _die(6, "input", "node state takes no positional argument but report",
+             "capabilities node state [report]")
+
+    def read(conn, agent_id):
+        nodes = _node_rows(conn, agent_id)
+        ids = [n["node"] for n in nodes]
+        states = {r["node"]: r for r in store.node_states(conn, ids)}
+        sessions = store.node_sessions(conn, agent_id, ids)
+        out = []
+        for node in nodes:
+            state = states.get(node["node"]) or dict.fromkeys(
+                ("node", *store.NODE_STATE_COLUMNS, "uptime_seconds"))
+            entry = {"node": node["node"], "label": node["label"],
+                     "reachable": bool(state.pop("reachable", False))}
+            entry.update({k: v for k, v in _node_state_answer(state).items() if k != "node"})
+            entry["sessions"] = [_node_state_answer({k: v for k, v in s.items() if k != "node"})
+                                 for s in sessions if s["node"] == node["node"]]
+            out.append(entry)
+        return agent_id, out
+    (agent_id, nodes), setting = _kernel_run(root, read)
+    _emit({"ok": True, "project": str(root), "agent_id": agent_id, "nodes": nodes,
+           "store": _kernel_store_report(setting)})
+
+
 def cmd_node(args: list[str]) -> None:
     sub = args[0] if args else None
     if sub == "id":
@@ -13036,9 +13503,12 @@ def cmd_node(args: list[str]) -> None:
         _emit(_node_rekey(root, pos[0].strip(), pos[1].strip() if len(pos) > 1 else None,
                           "--dry-run" in opts))
         return
+    if sub == "state":
+        _node_state_verb(root, args[1:])
+        return
     if sub not in ("add", "set", "remove", "seen"):
-        _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, id, rekey, run "
-             "or supervise",
+        _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, state, id, "
+             "rekey, run or supervise",
              "run `capabilities help`")
     _read_only_gate(f"node {sub}")
     if sub == "seen":
@@ -13352,6 +13822,8 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                              "WHERE id = %s", (new, old))
             for hit in plan:
                 column = _rekey_ident(hit["column"])
+                if hit["how"] == "foreign key":
+                    continue
                 if hit["how"] == "prefix":
                     conn.execute(f"UPDATE {qualified(hit['table'])} SET {column} = "
                                  f"%s || substr({column}, %s) WHERE {column} LIKE %s",

@@ -368,10 +368,24 @@ I/O contract:
 
 Contract commands (the same on every capability):
   telegram stub                                 One-line awareness text.
-  telegram manifest --json                      Machine-readable declaration.
+  telegram manifest --json                      Machine-readable declaration;
+                                                 `connections.device_bound` is
+                                                 true: a connection is a session
+                                                 minted on one device.
   telegram connections                          Where every connection's values
                                                  resolve from — tier, source,
                                                  secrets masked (local, no network).
+                                                 Each connection carries `session`
+                                                 {live, account}: `live` is true
+                                                 when its session file on this
+                                                 machine holds an auth key and the
+                                                 signed-in account Telethon keeps
+                                                 beside it, and no service here
+                                                 recorded it unauthorized since it
+                                                 last started; `account` is the
+                                                 account the connection records
+                                                 (the one login/doctor verified,
+                                                 else expected_account_id), or null.
   telegram guide [<topic>]                      Guide topics / one guide body,
                                                  fetched live from the docs base.
   telegram ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
@@ -905,7 +919,9 @@ def _connections_report() -> dict:
             keys.append(_key_report(k["key"], k["secret"], k["required"],
                                     value, tier, source))
         report["default"] = "default"
-        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys}
+        session = _resolve_env_key("TELEGRAM_SESSION")[0] or str(DEFAULT_SESSION)
+        report["connections"]["default"] = {"allow_write": WRITE_DEFAULT, "keys": keys,
+                                            "session": _session_state(session, None)}
         return report
     conns = reg["connections"]
     report["default"] = reg.get("default") or \
@@ -930,12 +946,69 @@ def _connections_report() -> dict:
         keys.append(_key_report("session", False, False, session, "connection", origin))
         report["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "keys": keys}
+            "keys": keys,
+            "session": _session_state(session, entry)}
     return report
 
 
 def _cmd_connections() -> None:
     _emit(_connections_report())
+
+
+def _session_signed_in(path: Path) -> bool:
+    """Whether a Telethon session file holds a signed-in login, read from the
+    file alone. An auth key is minted at the first connect, before anyone signs
+    in, so it is asked for beside the row Telethon keeps only for a signed-in
+    client: itself, under entity id 0. The file is opened read-only and never
+    created."""
+    if not path.is_file():
+        return False
+    try:
+        with contextlib.closing(sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1.0)) as db:
+            key = db.execute("SELECT 1 FROM sessions WHERE length(auth_key) > 0"
+                             " LIMIT 1").fetchone()
+            me = db.execute("SELECT 1 FROM entities WHERE id = 0 LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return False
+    return key is not None and me is not None
+
+
+def _service_says_unauthorized(stem: Path, entry: dict | None) -> bool:
+    """Whether a service on this machine running this session recorded that
+    Telegram no longer accepts it: its health file - beside the session, or the
+    one the account's owner record names - says `session_authorized: false`
+    for this session. The next service start clears the record."""
+    healths = [stem.parent / "service" / "health.json"]
+    try:
+        account_id = int((entry or {}).get("expected_account_id"))
+    except (TypeError, ValueError):
+        account_id = 0
+    if account_id > 0:
+        owner = _json_file(_service_control_paths(account_id)["owner"])
+        if isinstance(owner, dict) and owner.get("health_file"):
+            healths.append(Path(str(owner["health_file"])))
+    for health in healths:
+        record = _json_file(health)
+        if not isinstance(record, dict) or record.get("session_authorized") is not False:
+            continue
+        named = record.get("auth_session_path")
+        if named is None or Path(str(named)).resolve() == stem.resolve():
+            return True
+    return False
+
+
+def _session_state(session: str, entry: dict | None) -> dict:
+    """Whether this connection's session lives on this machine, and whose it
+    is: `live` is true when its session file holds a signed-in login and no
+    service here recorded it unauthorized; `account` is the account the
+    connection records - the one a login or doctor verified, else the bound
+    expected_account_id. Local reads only, no network."""
+    path = _session_file(session)
+    stem = path.with_name(path.name[:-len(".session")])
+    live = _session_signed_in(path) and not _service_says_unauthorized(stem, entry)
+    identity = _connection_identity(entry) if entry is not None else None
+    return {"live": live, "account": identity["id"] if identity else None}
 
 
 def _session_file(session: str) -> Path:
@@ -2424,6 +2497,9 @@ def cmd_transcribe(json_path: str, force: bool, model: str) -> dict:
 
 def _manifest_payload() -> dict:
     payload = {**_manifest_core(), "service_state_version": SERVICE_STATE_VERSION}
+    # A connection is a session a login minted on one device, not a value that
+    # can be carried to another machine.
+    payload["connections"] = {**payload["connections"], "device_bound": True}
     if SERVICE:
         payload["service"] = SERVICE
     return payload

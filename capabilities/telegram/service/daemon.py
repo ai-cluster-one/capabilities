@@ -6368,6 +6368,7 @@ async def run_session(client):
             f"session not authorized — exec in and run: telegram login --connection {CONNECTION}")
     me = await client.get_me()
     write_health(
+        session_authorized=True,
         expected_account_id=EXPECTED_ACCOUNT_ID,
         actual_account_id=int(me.id),
         actual_account=(getattr(me, "username", None)
@@ -10640,7 +10641,7 @@ async def main():
             except (KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except NotAuthorized as e:
-                write_health("unhealthy", last_error=str(e))
+                write_health("unhealthy", last_error=str(e), session_authorized=False)
                 log(f"{e} — container stays up; retrying in 15s")
                 await asyncio.sleep(15)
             except SessionUnhealthy as e:

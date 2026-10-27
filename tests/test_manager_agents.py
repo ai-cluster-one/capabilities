@@ -588,6 +588,112 @@ def test_a_node_reports_itself_seen_and_no_other(lab):
     assert lab.refused("node", "seen", nid("box-two"), **node_env("box-one"))[0] == 6
 
 
+def _state_tools(lab: Lab) -> dict:
+    """The environment of a node whose tools answer as the test says - Claude
+    Code signed in, the GitHub CLI signed out, Codex not installed - whose
+    image names its version and boot line, and whose registry holds one
+    capability whose connections are device-bound."""
+    tools = lab.tmp / "tools"
+    tools.mkdir()
+    for name, body in (
+            ("claude", "printf '%s\\n' '{\"loggedIn\": true, \"email\": \"lab@example.test\"}'"),
+            ("gh", "printf '%s\\n' '{\"hosts\": {}}'; exit 1")):
+        (tools / name).write_text(f"#!/bin/sh\n{body}\n")
+        (tools / name).chmod(0o755)
+    image = lab.tmp / "image"
+    image.mkdir()
+    (image / "VERSION").write_text("0.0.12\n")
+    (image / "agent-node.state").write_text("running agent lab as node box-one\n")
+    registry = lab.tmp / "registry" / "phonelink"
+    registry.mkdir(parents=True)
+    (registry / "manifest.json").write_text(json.dumps({
+        "name": "phonelink",
+        "connections": {"fields": None, "setup": [], "link": [], "device_bound": True}}))
+    # Its connections, as it answers them in the folder it is asked in.
+    (registry / "phonelink").write_text(
+        "#!/bin/sh\n[ \"$1 $2\" = 'connections --json' ] || exit 2\n"
+        "printf '%s\\n' '{\"connections\": {\"main\": {\"session\": "
+        "{\"live\": true, \"account\": \"+10000000000\"}}, \"spare\": {\"session\": "
+        "{\"live\": false, \"account\": null}}, \"remote\": {\"session\": {\"live\": null}}}}'\n")
+    (registry / "phonelink").chmod(0o755)
+    return {"PATH": str(tools), "AGENT_NODE_VERSION_FILE": str(image / "VERSION"),
+            "AGENT_NODE_STATE_FILE": str(image / "agent-node.state")}
+
+
+def test_a_node_reports_its_state_and_the_agent_reads_every_nodes(lab):
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server")
+    lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server")
+    here = {**node_env("box-one"), **_state_tools(lab)}
+
+    reported = lab.ok("node", "state", "report", **here)
+    assert (reported["node"], reported["agent_id"]) == (nid("box-one"), PROJECT_ID)
+    state = reported["state"]
+    assert state["reachable"] is True and state["fresh_until"] > state["reported_at"]
+    assert (state["claude_login"], state["claude_account"]) == ("signed_in", "lab@example.test")
+    assert (state["gh_login"], state["gh_account"]) == ("signed_out", None)
+    assert (state["codex_login"], state["codex_account"]) == ("absent", None)
+    assert state["image_version"] == "0.0.12"
+    assert state["boot_line"] == "running agent lab as node box-one"
+    assert state["cpu_count"] >= 1 and state["load_1"] >= 0
+    assert 0 <= state["memory_used_bytes"] and state["memory_limit_bytes"] > 0
+    assert 0 < state["disk_used_bytes"] < state["disk_total_bytes"]
+    assert state["booted_at"] and state["uptime_seconds"] >= 0
+    assert [(s["capability"], s["connection"], s["live"], s["account"])
+            for s in reported["sessions"]] == [("phonelink", "main", True, "+10000000000"),
+                                               ("phonelink", "spare", False, None)]
+
+    nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
+    assert set(nodes) == {nid("box-one"), nid("box-two")}
+    one, two = nodes[nid("box-one")], nodes[nid("box-two")]
+    assert one["label"] == "box-one" and one["reachable"] is True
+    assert {k: one[k] for k in state if k != "uptime_seconds"} == \
+        {k: v for k, v in state.items() if k != "uptime_seconds"}
+    assert [s["connection"] for s in one["sessions"]] == ["main", "spare"]
+    assert two["reachable"] is False and two["reported_at"] is None and two["sessions"] == []
+    # Off the image the node says nothing of an image.
+    bare = {**here}
+    del bare["AGENT_NODE_VERSION_FILE"], bare["AGENT_NODE_STATE_FILE"]
+    again = lab.ok("node", "state", "report", **bare)["state"]
+    assert (again["image_version"], again["boot_line"]) == (None, None)
+    assert again["reported_at"] >= state["reported_at"]
+
+    # Once fresh_until has passed by the store's clock, the node reads unreachable.
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_node_states SET reported_at = now() - "
+            "interval '2 minutes', fresh_until = now() - interval '1 second' "
+            "WHERE node = %s RETURNING node", (nid("box-one"),))
+    assert {n["node"]: n["reachable"] for n in lab.ok("node", "state")["nodes"]} == {
+        nid("box-one"): False, nid("box-two"): False}
+
+    code, error = lab.refused("node", "state", "report", **node_env("box-three"))
+    assert (code, error["code"]) == (6, "node_unknown")
+    assert lab.refused("node", "state", "report", "x", **here)[0] == 6
+    assert lab.refused("node", "state", "report", CAPABILITIES_READ_ONLY="1",
+                       **here)[1]["code"] == "read_only_switch"
+    assert lab.run("node", "state", CAPABILITIES_READ_ONLY="1").returncode == 0
+
+
+def test_a_nodes_state_follows_it_through_a_rekey(lab):
+    lab.ok("agent", "show")
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id) VALUES (%s) ON CONFLICT DO NOTHING "
+            "RETURNING id", (PROJECT_ID,))
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_nodes (id, label, kind) VALUES "
+            "('box-one', 'box-one', 'server') RETURNING id")
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agent_nodes (agent_id, node, is_master) "
+            "VALUES (%s, 'box-one', true) RETURNING node", (PROJECT_ID,))
+    old = {"AGENT_NODE_ID": "box-one", **_state_tools(lab)}
+    lab.ok("node", "state", "report", **old)
+    planned = lab.ok("node", "rekey", "box-one", nid("box-one"), "--dry-run")
+    assert {(r["table"], r["rows"], r["how"]) for r in planned["rows"]} >= {
+        ("capabilities_node_states", 1, "foreign key"),
+        ("capabilities_node_sessions", 2, "foreign key")}
+    lab.ok("node", "rekey", "box-one", nid("box-one"))
+    assert lab.sql(f"SELECT node FROM {SCHEMA}.capabilities_node_states") == [(nid("box-one"),)]
+    assert lab.sql(f"SELECT DISTINCT node FROM {SCHEMA}.capabilities_node_sessions") == [
+        (nid("box-one"),)]
+    [node] = lab.ok("node", "state")["nodes"]
+    assert node["node"] == nid("box-one") and node["reachable"] is True
+
+
 def test_writes_are_refused_under_the_read_only_switch(lab):
     lab.ok("node", "add", nid("x"), "--label", "x", "--kind", "mac")
     for args in (("agent", "set", "--name", "X"),

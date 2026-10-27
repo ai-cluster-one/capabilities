@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-27 — `whatsapp connections` says whether each connection's session is on this machine
+
+Every connection `whatsapp connections` reports carries `session`, `{"live": <bool or null>, "account": <text or null>}`, read from local files alone. For an in-house connection `live` is true when the engine's session in the account's home holds a linked device and the service's health there does not record it `logged_out`; the home is found as the other verbs find it, without creating or adopting one. `account` is the account the device is linked as, else the identity the connection records, else its `expected_account_id`. A waha connection's session lives on the WAHA server, not this machine, so its `live` is null with `reason` `waha_server`, and nothing is asked of the server. The manifest's `connections` block declares `device_bound: true`: a connection is a device linked to the account, not a value that moves to another machine.
+
 ## 2026-10-26 — The service follows queued messages by their version, and holds no listening connection
 
 A queued message raises its account's version of the `whatsapp_outbox` channel in the store's change versions, in the same transaction as its row (store step `0022-outbox-versions`, schema 1.4), through a trigger on `whatsapp_messages`, so a row written by any release moves it. The same trigger sends the `whatsapp_outbox` notification, so a listener of an earlier release on another machine still wakes as before; `send` no longer sends it itself. The assistant service no longer listens: it polls the account's version on its own store connection at most once a second and wakes the sender when it moved, so a row queued by another process goes out within about a second, with the half-second poll behind it, and the service holds no session connection for it. A row queued in the service's own process still wakes the sender at once.

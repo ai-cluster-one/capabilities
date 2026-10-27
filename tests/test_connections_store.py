@@ -1672,6 +1672,64 @@ def test_node_run_runs_its_own_agents_services_where_the_store_records_no_folder
     assert node_run.returncode == 0, err
 
 
+def test_node_run_writes_this_nodes_state_on_its_beat_and_after_a_change(lab, tmp_path):
+    """The node's state row is written at start, right after a reconcile that
+    changed a job, and on its own beat apart from the reconcile interval; a
+    write the store refuses is said once and node run goes on."""
+    here = _service_lab(lab)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    job = tmp_path / "jobs" / f"coolify.{PROJECT_ID}.conf"
+
+    def stamp():
+        found = _rows(lab, "SELECT reported_at FROM capabilities_node_states "
+                           f"WHERE node = '{NODE}'")
+        return found[0][0] if found else None
+
+    def after(moment):
+        return lambda: (lambda now: now if now and now > moment else None)(stamp())
+
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor",
+                                 str(tmp_path / "jobs"), "--every", "300"],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        first = _wait_for(stamp, 30)
+        assert first is not None
+        # A placement writes a job, and the state follows it, not the beat.
+        _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+        assert _wait_for(job.exists, 15)
+        changed = _wait_for(after(first), 5)
+        assert changed is not None and (changed - first).total_seconds() < 12
+        # Nothing changes: the beat writes it again, well inside the reconcile.
+        beat = _wait_for(after(changed), 20)
+        assert beat is not None
+        # A store that refuses the write: said once, whatever the beats.
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("ALTER TABLE lab.capabilities_node_states "
+                         "ADD CONSTRAINT refuse_writes CHECK (false) NOT VALID")
+        import time
+        time.sleep(32)
+        assert stamp() == beat and job.exists()
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("ALTER TABLE lab.capabilities_node_states DROP CONSTRAINT refuse_writes")
+        assert _wait_for(after(beat), 20) is not None
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+    assert err.count("cannot write this node's state") == 1, err
+    assert err.count("writes this node's state again") == 1, err
+    [row] = _rows(lab, "SELECT cpu_count > 0, memory_limit_bytes > 0, disk_total_bytes > 0, "
+                       "booted_at IS NOT NULL, fresh_until > reported_at "
+                       f"FROM capabilities_node_states WHERE node = '{NODE}'")
+    assert row == (True, True, True, True, True)
+
+
 def test_node_run_records_a_placed_service_it_will_not_run_and_keeps_a_listed_machine_one(
         lab, tmp_path):
     """A machine service placed here runs under node run when its --services
@@ -1934,6 +1992,9 @@ def test_node_run_on_a_mac_keeps_a_launchd_agent_per_service_placed_here(lab, tm
         assert f"node supervise coolify --agent {PROJECT_ID}\n" in text
         assert "coolify service run" not in text
         assert ["bootstrap", domain, str(plist)] in _logged(calls)
+        # The node's state is written on a Mac's node manager as on a box's.
+        assert _wait_for(lambda: _rows(lab, "SELECT 1 FROM capabilities_node_states "
+                                            f"WHERE node = '{NODE}'"), 20)
 
         # Taken down by hand: the next reconcile loads it again.
         (loaded / label).unlink()
