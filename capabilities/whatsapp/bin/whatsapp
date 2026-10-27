@@ -2057,12 +2057,37 @@ def _linked_by(home: Path) -> dict | None:
     return None
 
 
+def _holder_gone(held: dict) -> bool:
+    """Whether the connection a home records as its holder is known to be
+    removed, so the record holds nobody. Another project's own connection is
+    seen only through the store; in files it cannot be told gone, and neither
+    can anything when the records do not answer."""
+    try:
+        adapter = _records()
+        if held["owner"] is None:
+            return (held["connection"] not in adapter.resolve_scope(
+                        NAME, "connection", "global")
+                    and held["connection"] not in adapter.connections(
+                        NAME, include_disabled=True))
+        if held["owner"] == adapter.project_id \
+                and held["connection"] in adapter.connections(
+                    NAME, include_disabled=True):
+            return False
+        if adapter.mode_of("connection") == "store":
+            return adapter.connection_owner(NAME, held["connection"]) != held["owner"]
+        return held["owner"] == adapter.project_id
+    except (StoreError, AttributeError):
+        return False
+
+
 def _record_linked_by(cfg: dict, *, adopt: bool = False) -> None:
     """Record that this connection linked its home's device. With `adopt`, only
-    where the home records none: a home linked before the record existed is
-    taken by the first connection that opens it."""
+    where the home records nobody: a home linked before the record existed, or
+    whose holder was removed (a rename), is taken by the first connection that
+    opens it."""
     home = Path(cfg["home"]).expanduser()
-    if adopt and _linked_by(home) is not None:
+    held = _linked_by(home)
+    if adopt and held is not None and not _holder_gone(held):
         return
     with contextlib.suppress(OSError):
         _write_json(home / LINKED_BY, {"connection": cfg["id"],
@@ -2078,7 +2103,8 @@ def _refuse_number_linked(number, cid: str, owner) -> None:
     Nothing is written before the refusal. `owner` is the project whose own
     connection `cid` is, or a callable answering it, asked only when the
     connection names match. A home linked before the record existed, and not
-    opened since, records no connection and is not refused."""
+    opened since, records no connection and is not refused, nor is one whose
+    recorded connection was removed: a rename leaves one connection for it."""
     key = _digits(number)
     if not key:
         return
@@ -2089,6 +2115,8 @@ def _refuse_number_linked(number, cid: str, owner) -> None:
     if held["connection"] == cid:
         if (owner() if callable(owner) else owner) == held["owner"]:
             return
+    if _holder_gone(held):
+        return
     whose = (f"project {held['owner']}'s connection" if held["owner"]
              else "the machine's shared connection")
     raise _Refusal(

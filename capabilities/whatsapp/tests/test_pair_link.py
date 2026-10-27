@@ -253,6 +253,17 @@ class NumberLinked(unittest.TestCase):
         refusal = self.refusal(lambda: self.wa.cmd_pair(args))
         self.assertEqual(refusal.code, "already_paired")
 
+    def test_a_rename_is_not_refused_and_takes_the_record(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.wa._contract_connection(["remove", "test", "--machine"])
+            self.wa._cmd_connection(
+                ["add", "renamed", "--machine", "--field", f"number={ACCOUNT}"])
+        self.assertIn("renamed", self.registry())
+        self.wa._record_linked_by({"id": "renamed", "home": str(self.state / ACCOUNT)},
+                                  adopt=True)
+        self.assertEqual(self.wa._linked_by(self.state / ACCOUNT),
+                         {"connection": "renamed", "owner": None})
+
     def test_an_unrecorded_home_is_not_refused(self):
         (self.state / ACCOUNT / self.wa.LINKED_BY).unlink()
         with contextlib.redirect_stdout(io.StringIO()):
