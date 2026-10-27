@@ -364,12 +364,19 @@ def _fetch_rclone() -> str:
         binary = zipfile.ZipFile(io.BytesIO(archive)).read(f"{stem}/{RCLONE}")
     except (KeyError, zipfile.BadZipFile) as e:
         raise RuntimeError(f"{stem}.zip holds no {stem}/{RCLONE}: {e}") from None
-    PROGRAMS_DIR.mkdir(parents=True, exist_ok=True)
     target = PROGRAMS_DIR / RCLONE
     partial = PROGRAMS_DIR / f".{RCLONE}.{os.getpid()}.partial"
-    partial.write_bytes(binary)
-    partial.chmod(0o755)
-    os.replace(partial, target)
+    try:
+        PROGRAMS_DIR.mkdir(parents=True, exist_ok=True)
+        partial.write_bytes(binary)
+        partial.chmod(0o755)
+        os.replace(partial, target)
+    except OSError as e:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(f"could not write {target}: {e}") from None
     return str(target)
 
 

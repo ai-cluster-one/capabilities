@@ -64,11 +64,18 @@ def _fetch_ffmpeg() -> None:
     if process.returncode != 0 or source is None or not source.is_file():
         detail = (process.stderr or process.stdout).strip()[-300:]
         raise RuntimeError(f"fetching {FFMPEG_WHEEL} through uv failed: {detail}")
-    PROGRAMS_DIR.mkdir(parents=True, exist_ok=True)
     partial = PROGRAMS_DIR / f".ffmpeg.{os.getpid()}.partial"
-    shutil.copyfile(source, partial)
-    partial.chmod(0o755)
-    os.replace(partial, PROGRAMS_DIR / "ffmpeg")
+    try:
+        PROGRAMS_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, partial)
+        partial.chmod(0o755)
+        os.replace(partial, PROGRAMS_DIR / "ffmpeg")
+    except OSError as exc:
+        try:
+            partial.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(f"could not write {PROGRAMS_DIR / 'ffmpeg'}: {exc}") from None
 
 
 async def ensure_ffmpeg() -> str | None:

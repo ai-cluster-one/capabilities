@@ -132,7 +132,7 @@
     },
     "rclonec": {
       "path": "capabilities/rclonec",
-      "payload_sha256": "a4f1012a2ee3e6fe2354990a4cd31073b299a9f5af16fdf8dd0ac6bd3d1750d2",
+      "payload_sha256": "d193a1d00e179bd829b87abbf82ca89414b84d8e8edfe7a5b49b9d9f1f7eb722",
       "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`."
     },
     "resend": {
@@ -177,7 +177,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "6b0283cba9fd7353764cd0449b1c8a3d2d773e3a43c00e5575052d4d2999272f",
+      "payload_sha256": "f698f2c49afdef8dfb6ce33ff0337887f6b950468a911f5174393a143858c703",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
