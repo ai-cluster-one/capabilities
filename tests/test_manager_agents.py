@@ -1330,6 +1330,8 @@ def test_build_composes_the_context_from_the_documents_in_the_store(lab, tmp_pat
          [("Other", "Not this agent's.", "inline", 1, "\n# Other\n", True)]),
         (None, "SHARED", False, [(*shared, True)]),
     ])
+    # The global document takes the folder's place once the agent enables it.
+    _enable_context_documents(lab, PROJECT_ID, ["SHARED"])
     # A document the store holds is named by the command that reads it, not
     # by a file path.
     from_store = from_folder.replace(
@@ -1351,6 +1353,57 @@ def test_build_composes_the_context_from_the_documents_in_the_store(lab, tmp_pat
     shutil.rmtree(project / "context")
     shutil.rmtree(tmp_path / "global")
     assert build() == from_store
+
+
+def _enable_context_documents(lab: Lab, project: str, names: list[str]) -> None:
+    """The `context` capability's enablements, as its ledger's step makes the
+    table: `project` enables each global document of `names`."""
+    with lab.cluster.connect(lab.database) as conn:
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {SCHEMA}.context_enablements (project_id text "
+                     f"NOT NULL, document_id uuid NOT NULL REFERENCES {SCHEMA}.context_documents "
+                     "(id), enabled_at timestamptz NOT NULL DEFAULT now(), enabled_by text "
+                     "NOT NULL, PRIMARY KEY (project_id, document_id))")
+        conn.execute(f"INSERT INTO {SCHEMA}.context_enablements (project_id, document_id, "
+                     f"enabled_by) SELECT %s, id, 'tester@lab' FROM {SCHEMA}.context_documents "
+                     "WHERE project_id IS NULL AND retired_at IS NULL AND name = ANY(%s)",
+                     (project, names))
+
+
+def test_build_composes_a_global_document_once_the_agent_enables_it(lab, tmp_path):
+    # One agent bound through ContextKit with its context in the store, one
+    # bound by its id alone with its context in a folder.
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    bare = Folder(lab, tmp_path / "bare")
+    (bare.path / "context" / "identity").mkdir(parents=True)
+    (bare.path / "context" / "identity" / "MISSION.md").write_text(
+        _context_text(*_CONTEXT_FILES["identity/MISSION"]))
+    _seed_context_documents(lab, [
+        (PROJECT_ID, "identity/MISSION", False, [(*_CONTEXT_FILES["identity/MISSION"], True)]),
+        (None, "SHARED", False, [("Shared", "Enabled.", "inline", 5, "\n# Shared\n", True)]),
+        (None, "UNUSED", False, [("Unused", "Not enabled.", "inline", 6, "\n# Unused\n", True)]),
+        (None, "identity/MISSION", False,
+         [("Theirs", "Shadowed.", "inline", 1, "\n# Theirs\n", True)]),
+    ])
+
+    def build(run) -> str:
+        result = run("build", "--print")
+        assert result.returncode == 0, result.stderr
+        assert "# Mission" in result.stdout
+        return result.stdout
+
+    for run in (lab.run, bare.run):
+        before = build(run)
+        assert not {"# Shared", "# Unused", "# Theirs"} & set(before.splitlines())
+    for agent in (PROJECT_ID, BARE_ID):
+        _enable_context_documents(lab, agent, ["SHARED", "identity/MISSION"])
+    for run in (lab.run, bare.run):
+        enabled = build(run)
+        assert "## Global Source: `context show SHARED --global`" in enabled
+        assert "# Shared" in enabled.splitlines()
+        assert not {"# Unused", "# Theirs"} & set(enabled.splitlines())
 
 
 def test_a_document_that_does_not_read_leaves_the_build_on_the_folder(lab):

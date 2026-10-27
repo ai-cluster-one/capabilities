@@ -57,7 +57,7 @@
     },
     "context": {
       "path": "capabilities/context",
-      "payload_sha256": "d040e1f1b9a03979246216bde6fb00e14d684b70128b08db9907a95dc5e9c13e",
+      "payload_sha256": "378d795ecd315eba837975b7432801c4436829ae85ccdf01e323f7cc3ba08e24",
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte."
     },
     "coolify": {

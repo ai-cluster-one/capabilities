@@ -216,7 +216,8 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     lab.ok("list", "--json")
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'context' ORDER BY step")]
-    assert steps == ["0001-documents", "0002-versions", "0003-versions-guard"]
+    assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
+                     "0005-enablements"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["context_versions_active"]
@@ -359,10 +360,138 @@ def test_global_documents_are_apart_from_the_projects_and_retire_frees_a_name(la
     assert count == 2
 
 
+OTHER_ID = "prj_" + "0f0e0d0c0b0a"
+
+
+def _other(lab: Lab, project_id: str = OTHER_ID) -> Path:
+    """A second project beside the lab's, in the same store."""
+    folder = lab.tmp / project_id
+    if not folder.exists():
+        (folder / ".git").mkdir(parents=True)
+        (folder / "capabilities").mkdir()
+        (folder / "capabilities" / "project.json").write_text(json.dumps(
+            {"schema": "capabilities.project.v1", "slug": "other", "id": project_id}))
+        (folder / "capabilities" / "settings.json").write_text(json.dumps(
+            {"capabilities": {"context": {"enabled": True}}}))
+    return folder
+
+
+def _in(lab: Lab, folder: Path, *args: str, stdin: str | None = None):
+    return subprocess.run([sys.executable, str(CLI), *args], cwd=folder, env=lab.env(),
+                          input=stdin, text=True, capture_output=True, timeout=180)
+
+
+def _error(result) -> tuple[int, dict]:
+    line = next(line for line in reversed(result.stderr.splitlines())
+                if line.startswith('{"error"'))
+    return result.returncode, json.loads(line)["error"]
+
+
+def test_only_the_author_project_changes_a_global_document_or_hands_it_on(lab):
+    mission = FILES["identity/MISSION.md"]
+    saved = lab.ok("save", "identity/MISSION", "--global", "--from", "-", stdin=mission)
+    assert (saved["outcome"], saved["author"]) == ("created", PROJECT_ID)
+    other = _other(lab)
+    changed = mission.replace("Keep it whole.", "Theirs.")
+    shared = lab.tmp / "shared"
+    (shared / "identity").mkdir(parents=True)
+    (shared / "identity" / "MISSION.md").write_text(changed)
+    for args, stdin in ((("save", "identity/MISSION", "--global", "--from", "-"), changed),
+                        (("import", str(shared), "--global"), None),
+                        (("retire", "identity/MISSION", "--global"), None),
+                        (("transfer", "identity/MISSION", "--to", OTHER_ID), None)):
+        code, error = _error(_in(lab, other, *args, stdin=stdin))
+        assert (code, error["code"]) == (4, "not_author"), args
+    assert lab.ok("show", "identity/MISSION", "--global") == mission
+
+    handed = lab.ok("transfer", "identity/MISSION", "--to", OTHER_ID)
+    assert (handed["from"], handed["author"], handed["changed"]) == (PROJECT_ID, OTHER_ID, True)
+    assert lab.refused("save", "identity/MISSION", "--global", "--from", "-",
+                       stdin=changed)[1]["code"] == "not_author"
+    assert lab.refused("retire", "identity/MISSION", "--global")[1]["code"] == "not_author"
+    assert json.loads(_in(lab, other, "save", "identity/MISSION", "--global", "--from", "-",
+                          stdin=changed).stdout)["outcome"] == "versioned"
+    assert _in(lab, other, "retire", "identity/MISSION", "--global").returncode == 0
+
+    # A global document saved before documents had authors has none, and the
+    # first project that writes it becomes its author.
+    lab.ok("save", "guidelines/OLD", "--global", "--from", "-", stdin=mission)
+    lab.sql(f"UPDATE {SCHEMA}.context_documents SET author_project_id = NULL "
+            "WHERE name = 'guidelines/OLD'")
+    assert lab.ok("list", "--global", "--json")["documents"][0]["author"] is None
+    claimed = json.loads(_in(lab, other, "save", "guidelines/OLD", "--global", "--from", "-",
+                             stdin=changed).stdout)
+    assert (claimed["outcome"], claimed["author"]) == ("versioned", OTHER_ID)
+    assert lab.refused("retire", "guidelines/OLD", "--global")[0] == 4
+
+
+def test_a_global_document_reaches_a_project_once_it_enables_it_and_its_own_shadows_it(lab):
+    lab.ok("save", "shared/RULES", "--global", "--from", "-", stdin=FILES["identity/MISSION.md"])
+    lab.ok("save", "identity/MISSION", "--global", "--from", "-",
+           stdin=FILES["guidelines/STYLE.md"])
+    other = _other(lab)
+    _in(lab, other, "save", "identity/MISSION", "--from", "-", stdin=FILES["identity/MISSION.md"])
+
+    def listed() -> dict:
+        result = _in(lab, other, "list", "--json")
+        assert result.returncode == 0, result.stderr
+        return {item["name"]: item for item in json.loads(result.stdout)["documents"]}
+
+    assert set(listed()) == {"identity/MISSION"}
+    assert "shadows_global" not in listed()["identity/MISSION"]
+    enabled = json.loads(_in(lab, other, "enable", "shared/RULES").stdout)
+    assert (enabled["enabled"], enabled["changed"], enabled["author"]) == (True, True, PROJECT_ID)
+    assert json.loads(_in(lab, other, "enable", "shared/RULES").stdout)["changed"] is False
+    shadowed = json.loads(_in(lab, other, "enable", "identity/MISSION").stdout)
+    assert shadowed["shadowed_by_project_document"] is True
+    found = listed()
+    assert set(found) == {"identity/MISSION", "shared/RULES"}
+    assert (found["shared/RULES"]["origin"], found["shared/RULES"]["author"]) == (
+        "global", PROJECT_ID)
+    assert (found["identity/MISSION"]["origin"], found["identity/MISSION"]["title"],
+            found["identity/MISSION"]["shadows_global"]) == ("own", "Mission", True)
+    marks = {item["name"]: item["enabled"] for item in json.loads(
+        _in(lab, other, "list", "--global", "--json").stdout)["documents"]}
+    assert marks == {"identity/MISSION": True, "shared/RULES": True}
+    assert {item["name"]: item["enabled"] for item in lab.ok(
+        "list", "--global", "--json")["documents"]} == {"identity/MISSION": False,
+                                                        "shared/RULES": False}
+    # The lab's own list holds none of them: it enabled nothing.
+    assert lab.ok("list", "--json")["count"] == 0
+
+    gone = json.loads(_in(lab, other, "disable", "shared/RULES").stdout)
+    assert (gone["enabled"], gone["changed"]) == (False, True)
+    assert json.loads(_in(lab, other, "disable", "shared/RULES").stdout)["changed"] is False
+    assert set(listed()) == {"identity/MISSION"}
+    assert _error(_in(lab, other, "enable", "nothing/HERE"))[0] == 3
+
+
+def test_a_global_write_refuses_text_that_looks_like_a_secret(lab):
+    key = "sk-ant-" + "Q7" * 15
+    leaky = FILES["identity/MISSION.md"].replace("Keep it whole.", f"Use {key} to call it.")
+    code, error = lab.refused("save", "identity/MISSION", "--global", "--from", "-", stdin=leaky)
+    assert (code, error["code"]) == (6, "secret_like_text")
+    assert "line 10 looks like an API key" in error["message"] and key not in json.dumps(error)
+    shared = lab.tmp / "shared"
+    shutil.copytree(lab.context, shared)
+    (shared / "guidelines" / "DB.md").write_text(FILES["identity/MISSION.md"].replace(
+        "Keep it whole.", "AGENTKIT_DB_URL=postgresql://agent:hunter2pass@db.example/x"))
+    code, error = lab.refused("import", str(shared), "--global")
+    assert (code, error["code"]) == (6, "secret_like_text")
+    assert "guidelines/DB.md: line 10 looks like a password in a URL" in error["message"]
+    assert lab.ok("list", "--global", "--json")["count"] == 0
+    # A placeholder is no secret, and a project's own document is not screened.
+    (shared / "guidelines" / "DB.md").write_text(FILES["identity/MISSION.md"].replace(
+        "Keep it whole.", "postgresql://agent:${AGENTKIT_DB_PASSWORD}@db.example/x"))
+    assert lab.ok("import", str(shared), "--global")["counts"] == {"created": 4}
+    assert lab.ok("save", "identity/MISSION", "--from", "-", stdin=leaky)["changed"] is True
+
+
 def test_the_read_only_switch_refuses_every_write(lab):
     lab.ok("import")
     for args in (("save", "identity/MISSION", "--from", "-"), ("retire", "identity/MISSION"),
-                 ("import",)):
+                 ("import",), ("transfer", "identity/MISSION", "--to", "prj_x"),
+                 ("enable", "identity/MISSION"), ("disable", "identity/MISSION")):
         code, error = lab.refused(*args, stdin=FILES["identity/MISSION.md"],
                                   CAPABILITIES_READ_ONLY="1")
         assert (code, error["code"]) == (4, "read_only_switch")

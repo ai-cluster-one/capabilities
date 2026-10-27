@@ -19,7 +19,8 @@ writes answer JSON.
 
 A document belongs to the project the command runs in, by the project's
 durable id. --global addresses the global documents instead, which belong to
-no project; every verb takes it.
+no project and reach one only once it enables them (GLOBAL DOCUMENTS below);
+every reading and writing verb takes it.
 
 Documents live in the PostgreSQL the project resolves (STORE). Without a
 store there are none: every verb that reads or writes them exits 6
@@ -44,7 +45,12 @@ THE FILE FORM
 
 READING  (plain text by default; --json gives the structured answer)
   context list [--global] [--json]
-      Every document with its active version: name, load, order, title.
+      Every document of the project with its active version: name, load,
+      order, title - and every global document it has enabled, marked global
+      with its author, unless a document of its own has the same name: that
+      one is listed instead, marked as shadowing it. --json gives each its
+      `origin`, `own` or `global`. With --global, every global document with
+      its author; run in a project, --json marks each `enabled` or not for it.
   context show <name> [--version ID] [--global] [--json]
       The active version, or the version ID names, in the file form. --json
       adds the version id, who saved it, when, and its note; the version id
@@ -86,6 +92,41 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
       Documents in the store with no file in DIR are left as they are. Safe
       to repeat.
 
+GLOBAL DOCUMENTS
+  A global document belongs to no project: it is written once for every
+  agent in the store, and reaches a project only once that project enables
+  it. The project that first saves it with --global is its author, and only
+  the current author saves or imports a new version of it, retires it, or
+  hands it on; any other project is refused (exit 4 `not_author`). A global
+  document saved before documents had authors has none until a project
+  writes it, which makes that project its author. Writing a global document
+  needs a project, its author; reading one needs none. A project that
+  enables one composes its active version into the context the manager
+  builds, and a document of its own with the same name shadows it.
+
+  Every agent that enables a global document reads it, so a --global save
+  or import refuses text that looks like a secret - a private key, a
+  provider's key or token, a JSON web token, a password in a URL, or a
+  password, secret, token or key assigned a value - naming the line and the
+  kind, never the value (exit 6 `secret_like_text`). Personal data is not
+  detected: keeping it out stays with the author.
+
+  context transfer <name> --to PROJECT_ID
+      Make the project PROJECT_ID the global document's author. Run by its
+      current author alone; the receiver cannot take it.
+  context enable <name>
+  context disable <name>
+      Switch the global document of that name on or off for this agent.
+      Enabled, it is in `list` and in the context `capabilities build`
+      composes, at its active version, unless a document of the agent's own
+      has the same name; recorded with who enabled it and when, and
+      disabling removes the record. Answers `enabled`, the author, and
+      `shadowed_by_project_document` where a document of its own shadows
+      it. Safe to repeat: answers `"changed": false`.
+
+  transfer, enable and disable are writes (exit 4 `read_only_switch` under
+  CAPABILITIES_READ_ONLY).
+
 EXPORTING
   context export [DIR] [--global]
       Write each document's active version into DIR as <name>.md in the file
@@ -97,9 +138,11 @@ EXPORTING
   Every write and export reports each document's outcome.
 
 STORE
-  The tables are context_documents (one row per document: project, name,
-  created, retired) and context_versions (one row per version), in the schema
-  the project's store setting names, migrated under the `context` ledger: the
+  The tables are context_documents (one row per document: project, or none
+  and its author project for a global one, name, created, retired),
+  context_versions (one row per version) and context_enablements (one row
+  per global document a project has enabled), in the schema the project's
+  store setting names, migrated under the `context` ledger: the
   AGENTKIT_DB_* keys in the project's .env.local and .env, then the same keys
   in the environment, then the machine's store setting that `capabilities
   store set` writes. One version per document is active, which the store
@@ -125,10 +168,12 @@ I/O
 EXIT CODES
   0 success
   3 not found - no document of that name, no version of that id
-  4 policy - context not enabled, the read-only switch
+  4 policy - context not enabled, the read-only switch, a change to a global
+    document by a project that is not its author
   5 store - unreachable or busy
   6 input - a malformed argument or file, no store configured, no project or
-    project identity, a folder that does not resolve
+    project identity, a folder that does not resolve, text that looks like a
+    secret in a global document
   7 stale - the base a save names is no longer the active version
 """
 
@@ -150,7 +195,7 @@ SCOPE = "project"
 CRED_KEYS: list = []
 # Every verb that changes the store's documents; each is refused under the
 # read-only switch. `export` reads the store and writes only the folder named.
-WRITE_VERBS = {"save", "retire", "import"}
+WRITE_VERBS = {"save", "retire", "import", "transfer", "enable", "disable"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/context/guides/")
@@ -184,7 +229,7 @@ def _cmd_connections() -> None:
 # versions reference their document by a foreign key: both tables are this
 # capability's own and a document is retired rather than deleted, so the key
 # never blocks a write and refuses only a version of no document.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 0
+LEDGER_MAJOR, LEDGER_MINOR = 1, 1
 _NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
 LEDGER_STEPS = [
     ("0001-documents", f"""
@@ -260,6 +305,41 @@ LEDGER_STEPS = [
         FOR EACH ROW EXECUTE FUNCTION context_versions_guard();
     CREATE TRIGGER context_versions_truncate BEFORE TRUNCATE ON context_versions
         FOR EACH STATEMENT EXECUTE FUNCTION context_versions_guard();
+    """),
+    # A global document's author is the one project that saves, retires and
+    # hands it on, as a global routine's is. One saved before this step has
+    # none until a project writes it, so the step adds a column and refuses
+    # no row a store already holds.
+    ("0004-global", """
+    ALTER TABLE context_documents ADD COLUMN author_project_id text
+        CHECK (author_project_id <> '');
+    ALTER TABLE context_documents ADD CONSTRAINT context_documents_project_author
+        CHECK (project_id IS NULL OR author_project_id IS NULL);
+    COMMENT ON COLUMN context_documents.project_id IS
+        'The project''s declared id; NULL for a global document, which belongs to no project and reaches one only once that project enables it.';
+    COMMENT ON COLUMN context_documents.author_project_id IS
+        'For a global document, the project that alone saves its versions, retires it and hands authorship on; NULL for a project document, and for a global one saved before documents had authors until a project writes it.';
+    """),
+    # A project takes a global document up by enabling it, and composes its
+    # active version. Disabling deletes the row. The row names the global
+    # document itself, so one retired and saved again under its name is a new
+    # document that each project enables again.
+    ("0005-enablements", """
+    CREATE TABLE context_enablements (
+        project_id   text NOT NULL CHECK (project_id <> ''),
+        document_id  uuid NOT NULL REFERENCES context_documents (id),
+        enabled_at   timestamptz NOT NULL DEFAULT now(),
+        enabled_by   text NOT NULL CHECK (enabled_by <> ''),
+        PRIMARY KEY (project_id, document_id)
+    );
+    COMMENT ON TABLE context_enablements IS
+        'A global document a project has enabled: the project lists it and composes its active version unless a document of its own has the same name. Disabling deletes the row.';
+    COMMENT ON COLUMN context_enablements.project_id IS
+        'The declared id of the project that enabled the document.';
+    COMMENT ON COLUMN context_enablements.document_id IS
+        'The global document enabled: a context_documents row with no project.';
+    COMMENT ON COLUMN context_enablements.enabled_by IS
+        'Who enabled it: user@node.';
     """),
 ]
 
@@ -366,6 +446,12 @@ def _scope(is_global: bool, write: bool) -> str | None:
     """The project id the documents belong to, or None for the global ones."""
     if is_global:
         return None
+    return _here(write)
+
+
+def _here(write: bool) -> str:
+    """The project the command runs in: the documents' owner, or the author
+    of a global one."""
     if _project_root() is None:
         _die(6, "no_project", f"{NAME} keeps a project's documents; run it inside a project",
              "cd into the project, set CLAUDE_PROJECT_DIR, or pass --global")
@@ -374,6 +460,14 @@ def _scope(is_global: bool, write: bool) -> str | None:
         _die(6, "no_project_identity", "this project has no durable id",
              "run `capabilities init` in the project")
     return str(project)
+
+
+def _reader() -> str | None:
+    """The project a global read runs in, where there is one: none is needed
+    to read a global document."""
+    if _project_root() is None or not _project_id(write=False):
+        return None
+    return _here(write=False)
 
 
 def _scope_label(project: str | None) -> str:
@@ -461,7 +555,8 @@ _VERSION_COLUMNS = ("v.id, v.document_id, v.title, v.description, v.load, v.posi
 
 
 def _document(conn, project: str | None, name: str, lock: bool = False) -> dict | None:
-    return _one(conn, "SELECT id, project_id, name, created_at, created_by FROM context_documents "
+    return _one(conn, "SELECT id, project_id, name, created_at, created_by, author_project_id "
+                "FROM context_documents "
                 "WHERE coalesce(project_id, '') = %s AND name = %s AND retired_at IS NULL"
                 + (" FOR UPDATE" if lock else ""), (project or "", name))
 
@@ -473,6 +568,48 @@ def _need_document(conn, project: str | None, name: str, lock: bool = False) -> 
         _die(3, "not_found", f"no {where} document {name!r}",
              f"`{NAME} list{' --global' if project is None else ''}` shows the documents")
     return found
+
+
+def _authored(document: dict, project: str) -> None:
+    """Refuse a change to a global document by any project but its author; one
+    with no author yet is changed by the project that writes it."""
+    if document["author_project_id"] not in (None, project):
+        _die(4, "not_author", f"the global document {document['name']!r} is authored by "
+             f"{document['author_project_id']}, not by this project ({project})",
+             "only its author project saves it, retires it or hands it on with "
+             f"`{NAME} transfer`")
+
+
+# What a global document must not hold, since every agent that enables it
+# reads it: each kind is named, never the value. A value that starts as a
+# placeholder (`$`, `<`, `{`, `*`) is not one.
+_SECRET_KINDS = [
+    ("a private key", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----")),
+    ("a cloud access key", re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])")),
+    ("a code host token",
+     re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})")),
+    ("a chat workspace token", re.compile(r"(?<![A-Za-z0-9])xox[abposr]-[A-Za-z0-9-]{10,}")),
+    ("an API key", re.compile(r"(?<![A-Za-z0-9])sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}")),
+    ("a cloud API key", re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}")),
+    ("a JSON web token",
+     re.compile(r"(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("a password in a URL",
+     re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/:@]+:(?![$<{*])[^\s/@]+@")),
+    ("a credential assigned a value",
+     re.compile(r"(?i)(?<![A-Za-z0-9])(?:password|passwd|secret|token|api[_-]?key|access[_-]?key)"
+                r"(?![A-Za-z0-9])[\"']?\s*[:=]\s*[\"']?"
+                r"(?=[A-Za-z0-9_/+=.-]*[0-9])(?=[A-Za-z0-9_/+=.-]*[A-Za-z])[A-Za-z0-9_/+=.-]{12,}")),
+]
+
+
+def _secret_like(text: str) -> str | None:
+    """Where `text` looks like it holds a secret, as `line N looks like <kind>`;
+    None where it does not."""
+    for number, line in enumerate(text.split("\n"), start=1):
+        for kind, pattern in _SECRET_KINDS:
+            if pattern.search(line):
+                return f"line {number} looks like {kind}"
+    return None
 
 
 def _active(conn, document_id) -> dict | None:
@@ -516,25 +653,62 @@ def _version_view(version: dict, with_body: bool = True) -> dict:
 
 # ── reading ─────────────────────────────────────────────────────────────────
 
+# A global document a project has enabled and holds no document of its own
+# name for: the documents it sees are its own and these. The manager's build
+# composes by the same rule.
+_ENABLED_GLOBAL = ("d.project_id IS NULL AND EXISTS (SELECT 1 FROM context_enablements e "
+                   "WHERE e.document_id = d.id AND e.project_id = %(project)s) "
+                   "AND NOT EXISTS (SELECT 1 FROM context_documents o "
+                   "WHERE o.project_id = %(project)s AND o.name = d.name "
+                   "AND o.retired_at IS NULL)")
+
+
 def cmd_list(args) -> None:
-    project = _scope(args.is_global, write=False)
+    if args.is_global:
+        scope, project = None, _reader()
+        where = "d.project_id IS NULL"
+    else:
+        scope = project = _scope(False, write=False)
+        where = f"(d.project_id = %(project)s OR ({_ENABLED_GLOBAL}))"
     with _store() as conn:
-        rows = _rows(conn, "SELECT d.name, v.id, v.title, v.load, v.position, v.created_at "
+        rows = _rows(conn, "SELECT d.name, d.project_id IS NULL AS global, d.author_project_id, "
+                     "v.id, v.title, v.load, v.position, v.created_at, "
+                     "EXISTS (SELECT 1 FROM context_enablements e WHERE e.document_id = d.id "
+                     "AND e.project_id = %(project)s) AS enabled, "
+                     "(d.project_id IS NOT NULL AND EXISTS (SELECT 1 FROM context_documents g "
+                     "JOIN context_enablements e ON e.document_id = g.id "
+                     "AND e.project_id = d.project_id WHERE g.project_id IS NULL "
+                     "AND g.name = d.name AND g.retired_at IS NULL)) AS shadows_global "
                      "FROM context_documents d JOIN context_versions v "
                      "ON v.document_id = d.id AND v.active "
-                     "WHERE coalesce(d.project_id, '') = %s AND d.retired_at IS NULL "
-                     "ORDER BY d.name", (project or "",))
+                     f"WHERE d.retired_at IS NULL AND {where} ORDER BY d.name",
+                     {"project": project or ""})
     if args.json:
-        _emit({"scope": _scope_label(project), "project": project, "count": len(rows),
-               "documents": [{"name": r["name"], "version": str(r["id"]), "title": r["title"],
-                              "load": r["load"], "order": r["position"],
-                              "saved_at": _moment(r["created_at"])} for r in rows]})
+        listed = []
+        for r in rows:
+            item = {"name": r["name"], "version": str(r["id"]), "title": r["title"],
+                    "load": r["load"], "order": r["position"],
+                    "saved_at": _moment(r["created_at"]),
+                    "origin": "global" if r["global"] else "own"}
+            if r["global"]:
+                item["author"] = r["author_project_id"]
+                if project is not None:
+                    item["enabled"] = r["enabled"]
+            elif r["shadows_global"]:
+                item["shadows_global"] = True
+            listed.append(item)
+        _emit({"scope": _scope_label(scope), "project": project, "count": len(rows),
+               "documents": listed})
         return
     if not rows:
-        _emit(f"no {_scope_label(project)} documents")
+        _emit(f"no {_scope_label(scope)} documents")
         return
     width = max(len(r["name"]) for r in rows)
     _emit("\n".join(f"{r['name']:<{width}}  {r['load']:<6} {r['position']:>5}  {r['title']}"
+                    + (f"  (global, by {r['author_project_id'] or 'no author'})"
+                       if r["global"] else "")
+                    + ("  (shadows a global document)" if r["shadows_global"] else "")
+                    + ("  (enabled)" if args.is_global and project and r["enabled"] else "")
                     for r in rows))
 
 
@@ -604,18 +778,26 @@ def cmd_diff(args) -> None:
 # ── writing ─────────────────────────────────────────────────────────────────
 
 def _save_version(conn, project: str | None, name: str, fields: dict, base: str | None,
-                  note: str | None, by: str) -> dict:
+                  note: str | None, by: str, author: str | None = None) -> dict:
     """Add `fields` as the document's active version inside the caller's
     transaction, the head row locked so saves of one document run one at a
-    time. The outcome is created, versioned or unchanged."""
+    time. A global document, `project` None, is saved by its `author` project
+    alone, a new one is authored by it, and one with no author yet becomes
+    its. The outcome is created, versioned or unchanged."""
     document = _document(conn, project, name, lock=True)
+    if document is not None and project is None:
+        _authored(document, author)
+        if document["author_project_id"] is None:
+            _rows(conn, "UPDATE context_documents SET author_project_id = %s WHERE id = %s",
+                  (author, document["id"]))
     if document is None:
         if base is not None:
             _die(7, "stale_base", f"--base names a version of {name!r}, which is no longer a "
                  "document", f"`{NAME} list` shows the documents; save without --base to "
                  "start it again")
-        document = _one(conn, "INSERT INTO context_documents (project_id, name, created_by) "
-                        "VALUES (%s, %s, %s) RETURNING id, name", (project, name, by))
+        document = _one(conn, "INSERT INTO context_documents (project_id, name, created_by, "
+                        "author_project_id) VALUES (%s, %s, %s, %s) RETURNING id, name",
+                        (project, name, by, author if project is None else None))
         active = None
     else:
         active = _active(conn, document["id"])
@@ -641,9 +823,16 @@ def _save_version(conn, project: str | None, name: str, fields: dict, base: str 
             "base": str(active["id"]) if active is not None else None}
 
 
+def _refuse_secret(where: str, found: str) -> NoReturn:
+    _die(6, "secret_like_text", f"{where}: {found}; a global document is read by every "
+         "agent that enables it", "take the value out and name where it is kept instead - "
+         "a connection or the vault; personal data stays out by the author's care")
+
+
 def cmd_save(args) -> None:
     name = _check_name(args.name)
     project = _scope(args.is_global, write=True)
+    author = _here(write=True) if args.is_global else None
     try:
         text = (sys.stdin.read() if args.source == "-"
                 else _read_text(Path(args.source)))
@@ -653,10 +842,17 @@ def cmd_save(args) -> None:
     except Unreadable as exc:
         _die(6, "not_canonical", f"--from {args.source} is not the file form: {exc}",
              f"`{NAME} help` shows the file form; `{NAME} show {name}` prints one")
+    if args.is_global:
+        found = _secret_like(text)
+        if found:
+            _refuse_secret(f"--from {args.source}", found)
     note = args.note.strip() if args.note and args.note.strip() else None
     with _store() as conn:
         with conn.transaction():
-            outcome = _save_version(conn, project, name, fields, args.base, note, _actor())
+            outcome = _save_version(conn, project, name, fields, args.base, note, _actor(),
+                                    author=author)
+    if args.is_global:
+        outcome["author"] = author
     _emit({"scope": _scope_label(project), "project": project,
            "changed": outcome["outcome"] != "unchanged", **outcome})
 
@@ -664,13 +860,67 @@ def cmd_save(args) -> None:
 def cmd_retire(args) -> None:
     name = _check_name(args.name)
     project = _scope(args.is_global, write=True)
+    author = _here(write=True) if args.is_global else None
     with _store() as conn:
         with conn.transaction():
             document = _need_document(conn, project, name, lock=True)
+            if args.is_global:
+                _authored(document, author)
             _rows(conn, "UPDATE context_documents SET retired_at = now() WHERE id = %s",
                   (document["id"],))
     _emit({"name": name, "scope": _scope_label(project), "project": project,
            "retired": True, "document": str(document["id"])})
+
+
+_PROJECT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def cmd_transfer(args) -> None:
+    name = _check_name(args.name)
+    project = _here(write=True)
+    to = args.to.strip()
+    if not _PROJECT_ID_RE.fullmatch(to):
+        _die(6, "input", f"--to {args.to!r} is no project id",
+             "name the receiving project by its declared id, as `capabilities path --json` "
+             "shows it")
+    with _store() as conn:
+        with conn.transaction():
+            document = _need_document(conn, None, name, lock=True)
+            _authored(document, project)
+            changed = document["author_project_id"] != to
+            if changed:
+                _rows(conn, "UPDATE context_documents SET author_project_id = %s WHERE id = %s",
+                      (to, document["id"]))
+    _emit({"name": name, "scope": "global", "from": project, "author": to, "changed": changed})
+
+
+def cmd_enable(args) -> None:
+    name = _check_name(args.name)
+    project = _here(write=True)
+    with _store() as conn:
+        with conn.transaction():
+            document = _need_document(conn, None, name)
+            added = _one(conn, "INSERT INTO context_enablements (project_id, document_id, "
+                         "enabled_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING "
+                         "RETURNING enabled_at", (project, document["id"], _actor()))
+            shadowed = _document(conn, project, name) is not None
+    found = {"name": name, "scope": "global", "project": project, "enabled": True,
+             "changed": added is not None, "author": document["author_project_id"]}
+    if shadowed:
+        found["shadowed_by_project_document"] = True
+    _emit(found)
+
+
+def cmd_disable(args) -> None:
+    name = _check_name(args.name)
+    project = _here(write=True)
+    with _store() as conn:
+        with conn.transaction():
+            document = _need_document(conn, None, name)
+            gone = _rows(conn, "DELETE FROM context_enablements WHERE project_id = %s "
+                         "AND document_id = %s RETURNING document_id", (project, document["id"]))
+    _emit({"name": name, "scope": "global", "project": project, "enabled": False,
+           "changed": bool(gone), "author": document["author_project_id"]})
 
 
 def _folder(given: str | None, is_global: bool) -> Path:
@@ -712,19 +962,28 @@ def _files(folder: Path) -> tuple[list, list]:
 
 def cmd_import(args) -> None:
     project = _scope(args.is_global, write=True)
+    author = _here(write=True) if args.is_global else None
     folder = _folder(args.dir, args.is_global)
     if not folder.is_dir():
         _die(6, "input", f"{folder} is not a folder")
     files, skipped = _files(folder)
-    read, refused = [], []
+    read, refused, secret = [], [], []
     for name, path, rel in files:
         if not _NAME_RE.fullmatch(name) or name.endswith(".md"):
             refused.append({"path": rel, "reason": "its path makes no document name"})
             continue
         try:
-            read.append((name, parse(_read_text(path))))
+            text = _read_text(path)
+            read.append((name, parse(text)))
         except (OSError, Unreadable) as exc:
             refused.append({"path": rel, "reason": str(exc)})
+            continue
+        found = _secret_like(text) if args.is_global else None
+        if found:
+            secret.append(f"{rel}: {found}")
+    if secret and not refused:
+        _refuse_secret(f"{len(secret)} of {len(files)} files under {folder}, so nothing was "
+                       "imported", "; ".join(secret))
     if refused:
         sys.stderr.write(json.dumps({"refused": refused}, ensure_ascii=False) + "\n")
         _die(6, "not_canonical", f"{len(refused)} of {len(files)} files under {folder} do not "
@@ -737,7 +996,7 @@ def cmd_import(args) -> None:
         with conn.transaction():
             for name, fields in read:
                 outcomes.append(_save_version(conn, project, name, fields, None,
-                                              f"imported from {name}.md", by))
+                                              f"imported from {name}.md", by, author=author))
     counts: dict = {}
     for item in outcomes + skipped:
         counts[item["outcome"]] = counts.get(item["outcome"], 0) + 1
@@ -858,6 +1117,11 @@ def _parser() -> argparse.ArgumentParser:
     save.add_argument("--base")
     save.add_argument("--note")
     verb("retire").add_argument("name")
+    transfer = sub.add_parser("transfer", add_help=False, allow_abbrev=False)
+    transfer.add_argument("name")
+    transfer.add_argument("--to", required=True)
+    for switch in ("enable", "disable"):
+        verb(switch).add_argument("name")
     verb("import").add_argument("dir", nargs="?")
     verb("export").add_argument("dir", nargs="?")
     return parser
@@ -893,7 +1157,8 @@ def main() -> None:
         return
     {"list": cmd_list, "show": cmd_show, "history": cmd_history, "diff": cmd_diff,
      "save": cmd_save, "retire": cmd_retire, "import": cmd_import,
-     "export": cmd_export}[args.cmd](args)
+     "export": cmd_export, "transfer": cmd_transfer, "enable": cmd_enable,
+     "disable": cmd_disable}[args.cmd](args)
 
 
 if __name__ == "__main__":

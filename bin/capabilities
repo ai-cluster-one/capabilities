@@ -862,7 +862,9 @@ PROJECT VERBS (run inside a consuming project)
         store_unreachable, agent_unknown), the config is valid
         (contextkit_config_invalid) and sets no [sources] entry (exit 6
         setting_retired, naming it: global context lives in the store
-        through `context`), and .contextkit/ holds only config.toml,
+        through `context` - its author project imports it with --global
+        and this agent enables each document it uses), and .contextkit/
+        holds only config.toml,
         README.md, generated/ with generated context alone, and
         icon-*.png (exit 6 contextkit_folder_not_empty, naming the rest;
         icon_ambiguous for more than one icon the row would take). It then
@@ -1419,9 +1421,13 @@ PROJECT VERBS (run inside a consuming project)
         this process. When the agent keeps
         context documents in its store (the `context` capability's tables),
         the inline and stub context is composed from their active versions,
-        read-only, instead of the context folder - global documents too when
-        the binding names global context and the store holds them - with a
-        warning while the folder is still there; a store that does not answer,
+        read-only, instead of the context folder, with a warning while the
+        folder is still there. The global documents the agent has enabled
+        (`context enable`) are composed beside its own, for every agent
+        with a store, unless a document of its own has the same name; for
+        a binding that names a global context folder they take its place
+        once the agent has enabled any, and the folder is read until then.
+        A store that does not answer,
         or a stored document that does not read, leaves the folder in use with
         a warning. Likewise, when the agent keeps routines in its store (the
         `routine` capability's tables), the routine index lists their active
@@ -2903,8 +2909,7 @@ def _layers_in_store(root: Path, layers: dict) -> set[str]:
     routines where the store holds one, its assets where the store holds an
     asset document or file. A layer whose store does not answer is not among
     them, so its folder stands as the answer."""
-    reads = {"context": lambda: _ck_context_held(_ck_stored_rows(root, False),
-                                                 layers["context"]),
+    reads = {"context": lambda: _ck_context_held(_ck_stored_rows(root), layers["context"]),
              "routines": lambda: _ck_stored_routine_rows(root) is not None,
              "assets": lambda: bool(_ck_stored_assets(root))}
     held = set()
@@ -9968,9 +9973,11 @@ def _agent_convert(root: Path) -> dict:
              f"{config_file} sets {named}, which an agent without a ContextKit binding "
              "has no home for: its layers keep their own names in its body root, and "
              "global context lives in the store through the `context` capability",
-             "remove the [sources] entries (move global context into the store with "
-             "`context` first), then run `capabilities agent convert` again; the agent "
-             "stays bound and working until then")
+             "move global context into the store first: in the project that will author "
+             "it, `context import <global folder> --global`; in this agent, `context enable "
+             "<name>` for each document it uses, then `capabilities build` shows them "
+             "composed; then remove the [sources] entries and run `capabilities agent "
+             "convert` again; the agent stays bound and working until then")
     binding = _ck_binding(root)
     had_env_id = _env_file_project_id(root)[0] is not None
     agent_id = _project_id_state(root)["id"]
@@ -21145,19 +21152,28 @@ def _ck_store_read(root: Path, query) -> list[tuple] | None:
         conn.close()
 
 
-def _ck_stored_rows(root: Path, want_global: bool) -> list[tuple] | None:
+def _ck_stored_rows(root: Path) -> list[tuple] | None:
     """The active versions of this project's unretired context documents in its
-    store - and of the global ones when `want_global` - as (global, name, title,
-    description, load, position, body), read in a read-only transaction, and
-    empty where the store holds none or has no such tables; None where the agent
-    has no store to keep them in: no store, or no project id."""
-    rows = _ck_store_read(root, lambda conn, project: conn.execute(
-        "SELECT d.project_id IS NULL, d.name, v.title, v.description, v.load, v.position, "
-        "v.body FROM context_documents d JOIN context_versions v "
-        "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
-        "AND (d.project_id = %s OR (%s AND d.project_id IS NULL))",
-        (project, want_global)).fetchall())
-    return rows
+    store, and of the global ones it has enabled and holds no document of the
+    same name for, as (global, name, title, description, load, position, body),
+    read in a read-only transaction, and empty where the store holds none or
+    has no such tables; None where the agent has no store to keep them in: no
+    store, or no project id. A store whose context tables predate enabling
+    reads the project's own alone."""
+    def query(conn, project):
+        enabling = conn.execute("SELECT to_regclass('context_enablements') IS NOT NULL"
+                                ).fetchone()[0]
+        enabled = (" OR (d.project_id IS NULL AND EXISTS (SELECT 1 FROM context_enablements e "
+                   "WHERE e.document_id = d.id AND e.project_id = %(project)s) "
+                   "AND NOT EXISTS (SELECT 1 FROM context_documents o "
+                   "WHERE o.project_id = %(project)s AND o.name = d.name "
+                   "AND o.retired_at IS NULL))") if enabling else ""
+        return conn.execute(
+            "SELECT d.project_id IS NULL, d.name, v.title, v.description, v.load, v.position, "
+            "v.body FROM context_documents d JOIN context_versions v "
+            "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
+            f"AND (d.project_id = %(project)s{enabled})", {"project": project}).fetchall()
+    return _ck_store_read(root, query)
 
 
 def _ck_context_held(rows: list[tuple] | None, context_dir: Path) -> bool:
@@ -21184,30 +21200,37 @@ def _ck_stored_assets(root: Path) -> bool | None:
 
 def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
                        store: dict) -> dict | None:
-    """The context items this agent keeps in its store, as {"project": [...],
-    "global": [...] or None where the store holds no global document}; None
-    where the build reads the folder - the agent has no store, its store holds
-    no project document while the context folder is there, the store already
-    failed earlier in this build (nothing is tried, and its warning stands), the
+    """The context items this agent keeps in its store, as {"project": [...] or
+    None where the build reads the context folder, "global": [...] or None
+    where the agent has enabled no global document}; None where the build
+    reads the folders - the agent has no store, the store already failed
+    earlier in this build (nothing is tried, and its warning stands), the
     store did not answer, or a document does not read, either of which adds a
-    warning. An agent whose store answers and that has no context folder lives
-    in the store, so its context is what the store holds, even nothing."""
+    warning. The project's own come from the store where it holds one, or
+    where no context folder is there: an agent whose store answers and that
+    has no context folder lives in the store, so its context is what the
+    store holds, even nothing."""
     if store["failed"]:
         return None
-    want_global = binding["global_context"] is not None
-    code, rows, err = _ck_in_process(lambda: _ck_stored_rows(root, want_global))
+    code, rows, err = _ck_in_process(lambda: _ck_stored_rows(root))
     if code != 0:
         detail = _ck_one_line(err)[:300]
         warnings.append("context documents not read from the store, so the context folder "
                         f"is used: exited {code}" + (f": {detail}" if detail else ""))
         return None
-    context_dir = root / binding["layers"]["context"]
-    if not _ck_context_held(rows, context_dir):
+    if rows is None:
         return None
+    context_dir = root / binding["layers"]["context"]
+    held = _ck_context_held(rows, context_dir)
     found: dict = {"project": [], "global": []}
     errors: list[str] = []
     for is_global, name, title, description, load, position, body in rows:
-        base = binding["global_context"] if is_global else context_dir
+        if not is_global and not held:
+            continue
+        # A global document has no file; its place names the binding's global
+        # folder where there is one, for the build's order and its warnings.
+        base = (binding["global_context"] or root / "global-context") if is_global \
+            else context_dir
         path = base / f"{name}.md"
         text = (f"---\ntitle: {title}\ndescription: {description}\n"
                 f"load: {load}\norder: {position}\n---\n{body}")
@@ -21222,6 +21245,8 @@ def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
         return None
     for items in found.values():
         items.sort(key=lambda item: (item["order"], item["rel"].as_posix()))
+    if not held:
+        found["project"] = None
     if not found["global"]:
         found["global"] = None
     return found
@@ -21589,7 +21614,7 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings, stored_routines)
                         if onboarding and onboarding["status"] == "pending" else "")
     stored = _ck_stored_context(root, binding, warnings, store)
-    if stored is None:
+    if stored is None or stored["project"] is None:
         project_files = _ck_collect_context(root, root / context_dir, "project")
     else:
         project_files = stored["project"]
@@ -21597,7 +21622,10 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
             warnings.append(f"context documents are read from the store; the context folder "
                             f"`{context_dir.as_posix()}/` is no longer read and can be removed")
     if stored is not None and stored["global"] is not None:
-        global_files = stored["global"]
+        # A document of the agent's own shadows the global one of its name.
+        own = {item["path"].relative_to(root / context_dir).with_suffix("").as_posix()
+               for item in project_files}
+        global_files = [item for item in stored["global"] if item["stored"] not in own]
     else:
         global_files = (_ck_collect_context(root, binding["global_context"], "global")
                         if binding["global_context"] is not None else [])
