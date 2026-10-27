@@ -115,11 +115,16 @@ Store
 
 State
   $XDG_STATE_HOME/whatsapp/<account>/     named for the account, not for the
-                                          connection: an alias can be renamed
-                                          without losing the session or the
-                                          capture, and two aliases for one
-                                          account share one home
+                                          connection: a connection can be
+                                          renamed without losing the session
+                                          or the capture
         session.db     the engine's own — device, keys, contacts, LID map
+        linked-by.json the connection that linked the device, and the project
+                       whose own connection it is (null: the machine's shared
+                       one); `connection add` and `pair` refuse another
+                       connection the same number (exit 6 number_linked,
+                       naming it under `holder`), and another project is given
+                       that connection by a grant
         raw/           history chunks exactly as received, written before parsing
         media/         downloaded attachments, keyed by message id
         lock           held for the duration of any connected verb, and by
@@ -791,6 +796,56 @@ _contract_bind(globals(), "store")
 
 _contract_bind(globals(), "connections")
 
+_contract_connection = _cmd_connection
+
+
+def _cmd_connection(argv: list[str]) -> None:
+    """The contract's `connection add|remove`, refusing first an add that names
+    an account another connection already links on this machine
+    (deviations.md): one account is reached through one connection."""
+    if argv[:1] == ["add"]:
+        _refuse_added_number(argv[1:])
+    _contract_connection(argv)
+
+
+def _refuse_added_number(argv: list[str]) -> None:
+    """Refuse `connection add` the number or account id it gives, read from
+    argv and from the JSON object on stdin, which is handed on unread. What is
+    malformed is left to the contract's own refusals."""
+    given, words = {}, []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--field", "--env", "--identity", "--display-name"):
+            if arg == "--field" and i + 1 < len(argv) and "=" in argv[i + 1]:
+                key, value = argv[i + 1].split("=", 1)
+                given[key.strip()] = value
+            i += 2
+            continue
+        if arg.startswith("--field=") and "=" in arg[len("--field="):]:
+            key, value = arg[len("--field="):].split("=", 1)
+            given[key.strip()] = value
+        else:
+            words.append(arg)
+        i += 1
+    if "--stdin" in words:
+        text = sys.stdin.read()
+        sys.stdin = io.StringIO(text)
+        try:
+            document = json.loads(text) if text.strip() else {}
+        except ValueError:
+            document = None
+        if isinstance(document, dict):
+            given.update(document)
+    names = [w for w in words if not w.startswith("--")]
+    if len(names) != 1:
+        return
+    scope = "global" if {"--global", "--machine"} & set(words) else "project"
+    for key in ("expected_account_id", "number"):
+        if isinstance(given.get(key), (str, int)) and not isinstance(given[key], bool):
+            _refuse_number_linked(str(given[key]), names[0],
+                                  lambda: _connection_owner(names[0], scope))
+
 
 class _Refusal(Exception):
     """A handled failure, raised rather than exited.
@@ -801,12 +856,14 @@ class _Refusal(Exception):
     instead of ending the run at the first."""
 
     def __init__(self, exit_code: int, code: str, message: str,
-                 hint: str | None = None):
+                 hint: str | None = None, fields: dict | None = None):
         super().__init__(message)
         self.exit_code = exit_code
         self.code = code
         self.message = message
         self.hint = hint
+        # What a caller needs to act on, beside the code (deviations.md).
+        self.fields = fields or {}
 
     def as_result(self) -> dict:
         out = {"ok": False, "category": self.exit_code, "error": self.message}
@@ -1946,14 +2003,14 @@ def _account_home(key: str, cid: str) -> Path:
     """Where one account's session and files live: under the account's own
     identity.
 
-    A connection id is an alias the consuming project chooses and may rename,
+    A connection id is a name the consuming project chooses and may rename,
     while the session and the capture belong to the account. Naming the home
-    after the alias made a rename read as an account that had never paired,
-    orphaned the session under the old name, and let two aliases for one
-    account build two captures of it. Naming it after the account means the
-    alias moves freely, and two aliases for one account arrive at one home —
-    which is what lets several projects share one capture instead of each
-    building its own.
+    after the connection made a rename read as an account that had never
+    paired, and orphaned the session under the old name. Naming it after the
+    account means the name moves freely. One account is reached through one
+    connection: the home records which one linked it (`_linked_by`), a second
+    connection for the same number is refused (`_refuse_number_linked`), and
+    another project reaches the account through a grant on that connection.
 
     A home still sitting under an old alias is adopted the first time that
     alias resolves, and only when it holds this account or holds none at all.
@@ -1969,6 +2026,80 @@ def _account_home(key: str, cid: str) -> Path:
         with contextlib.suppress(OSError):
             legacy.rename(home)
     return home
+
+
+# Which connection linked the device in an account's home, and the project whose
+# own connection it is (null for one the machine shares), kept in the home.
+LINKED_BY = "linked-by.json"
+
+
+def _connection_owner(cid: str, scope: str | None = None) -> str | None:
+    """The project whose own connection `cid` is, as the records keep it, or
+    None for one the machine shares. `scope` is where a connection about to be
+    added is written; without it, where `cid` resolves."""
+    try:
+        adapter = _records()
+        entry = adapter.connections(NAME, include_disabled=True).get(cid)
+        if entry is not None and adapter.mode_of("connection") == "store":
+            return adapter.connection_owner(NAME, cid)
+        if scope is None:
+            scope = (entry or {}).get("scope", ("global",))[0]
+        return adapter.project_id if scope in ("project", "store") else None
+    except (StoreError, AttributeError):
+        return None
+
+
+def _linked_by(home: Path) -> dict | None:
+    """The connection a home's device was linked for, as the home records it."""
+    held = _json_file(home / LINKED_BY)
+    if isinstance(held, dict) and isinstance(held.get("connection"), str):
+        return {"connection": held["connection"], "owner": held.get("owner")}
+    return None
+
+
+def _record_linked_by(cfg: dict, *, adopt: bool = False) -> None:
+    """Record that this connection linked its home's device. With `adopt`, only
+    where the home records none: a home linked before the record existed is
+    taken by the first connection that opens it."""
+    home = Path(cfg["home"]).expanduser()
+    if adopt and _linked_by(home) is not None:
+        return
+    with contextlib.suppress(OSError):
+        _write_json(home / LINKED_BY, {"connection": cfg["id"],
+                                       "owner": _connection_owner(cfg["id"])})
+
+
+def _refuse_number_linked(number, cid: str, owner) -> None:
+    """Refuse connection `cid` the account `number`, where another connection
+    already links that account on this machine.
+
+    One account is reached through one connection; another project is given
+    that connection by a grant rather than adding its own for the same number.
+    Nothing is written before the refusal. `owner` is the project whose own
+    connection `cid` is, or a callable answering it, asked only when the
+    connection names match. A home linked before the record existed, and not
+    opened since, records no connection and is not refused."""
+    key = _digits(number)
+    if not key:
+        return
+    home = _state_dir() / key
+    held = _linked_by(home)
+    if held is None or _home_account(home) is None:
+        return
+    if held["connection"] == cid:
+        if (owner() if callable(owner) else owner) == held["owner"]:
+            return
+    whose = (f"project {held['owner']}'s connection" if held["owner"]
+             else "the machine's shared connection")
+    raise _Refusal(
+        6, "number_linked",
+        f"WhatsApp number {key} is already linked on this machine through "
+        f"{whose} {held['connection']!r}, and one account is reached through "
+        f"one connection",
+        f"ask whoever holds connection {held['connection']!r} to give this "
+        f"project access to it, and use that connection instead of adding "
+        f"another one for the same number",
+        fields={"account": key, "holder": held})
 
 
 def _connection_home(cfg: dict) -> Path:
@@ -2885,6 +3016,8 @@ class Session:
         if account["id"] and not held:
             with _writing(self.db):
                 _set_meta(self.db, "account_id", account["id"])
+        if account["id"]:
+            _record_linked_by(self.cfg, adopt=True)
         return account
 
     def refresh_identities(self, *, max_age: int = 6 * 3600) -> int:
@@ -3733,6 +3866,8 @@ def _wm_pair(cfg: dict, args) -> None:
     number = _digits(args.number or cfg.get("number"))
     if not number and not args.qr and _EVENTS_ON[0]:
         number = _digits(_event_answer("phone_needed"))
+        _refuse_number_linked(number, cfg["id"],
+                              lambda: _connection_owner(cfg["id"]))
     if not number and not args.qr:
         _refuse(6, "no_number",
              "pairing by code needs the account's phone number",
@@ -3777,6 +3912,7 @@ def _wm_pair(cfg: dict, args) -> None:
             if cfg.get("unbound"):
                 bound = _bind_link(cfg, session)
             account = session.require_account()
+            _record_linked_by(cfg)
             _event("linked", account=account)
             _event("progress", message="capturing the one-time history burst",
                    hold_seconds=args.hold)
@@ -6341,6 +6477,11 @@ def cmd_health(args):
 def cmd_pair(args):
     reg, _ = _connections_registry()
     cid, entry = _select_connection(reg, getattr(args, "connection", None))
+    held = entry if isinstance(entry, dict) else {}
+    for number in {_digits(held.get("expected_account_id")),
+                   _digits(held.get("number")),
+                   _digits(getattr(args, "number", None))} - {None, ""}:
+        _refuse_number_linked(number, cid, lambda: _connection_owner(cid))
     with _first_link(cid, entry):
         cfg, problem = _build_cfg(cid, entry, getattr(args, "session", None),
                                   pairing=True)
@@ -6420,7 +6561,7 @@ def _connection_verb(sub: str, cid: str, *options: str) -> tuple[bool, dict]:
     out, err = io.StringIO(), io.StringIO()
     try:
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            _cmd_connection([sub, cid, scope, *options])
+            _contract_connection([sub, cid, scope, *options])
         ok = True
     except SystemExit as exc:
         ok = not exc.code
@@ -9099,6 +9240,21 @@ def main():
         _emit(result)
 
 
+def _die_with_fields(refusal: _Refusal) -> NoReturn:
+    """`_die` for a refusal that carries fields beside its code, written into
+    the same envelope (deviations.md)."""
+    err: dict = {"code": refusal.code, "message": refusal.message}
+    if refusal.hint:
+        err["hint"] = refusal.hint
+    err.update(refusal.fields)
+    if _EVENTS_ON[0]:
+        sys.stdout.write(json.dumps({"event": "error", "exit": refusal.exit_code,
+                                     "error": err}, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False) + "\n")
+    sys.exit(refusal.exit_code)
+
+
 def _run() -> NoReturn:
     """One exit for every path.
 
@@ -9111,6 +9267,8 @@ def _run() -> NoReturn:
         main()
     except _Refusal as refusal:
         try:
+            if refusal.fields:
+                _die_with_fields(refusal)
             _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
         except SystemExit as exc:
             code = exc.code if isinstance(exc.code, int) else 1

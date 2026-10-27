@@ -64,3 +64,7 @@ the parser version, and an account whose rows were built at an older version has
 the chunks it kept re-parsed rather than its rows altered in place. The chunks
 are written before anything parses them precisely so this is possible;
 enrichment lives in its own table and is never touched by the rebuild.
+
+## `connection add` refuses a number another connection links, and the refusal names the holder
+
+The contract's `connection add` is answered the same way by every capability, and its refusals carry `code`, `message`, `hint` and `status` alone. This one wraps the bound verb with one refusal before it, exit 6 `number_linked`, when the number or account id the add gives is one whose device another connection already links on this machine, and `pair` refuses the same way. One WhatsApp account is reached through one connection, and another project is given that connection by a grant; the account's home on this machine is what records which connection linked it, and the contract has no step where a capability checks an entry before it is written. The refusal carries `account` and `holder`, `{connection, owner}`, beside its code, so a client can offer the holding connection instead of reading names out of the message. Everything else `connection add` does, and every other refusal, is the contract's own.

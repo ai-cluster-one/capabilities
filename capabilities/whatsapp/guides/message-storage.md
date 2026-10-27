@@ -8,7 +8,7 @@ Two places hold messages, and the split between them is the point. The **store**
 
 The store is the Postgres database the project resolves: the `AGENTKIT_DB_*` keys in the project's `.env.local` / `.env`, else those in the process environment, else the machine's store setting (`capabilities store set` writes it); `capabilities store show` shows which one answers. The capability keeps its capture there in tables of its own, every one named `whatsapp_*` and created on first use, and they are never edited by hand. Without a database there is nowhere to capture to, so every verb that reads or writes the capture refuses as a configuration error; `help` and `contract` still answer.
 
-The capture is keyed by the account, not by the project or the connection, because it is minted by one human's linked device: several projects on one database consuming the same account share one capture rather than each building their own, and two accounts never mix.
+The capture is keyed by the account, not by the project or the connection, because it is minted by one human's linked device: one connection reaches the account, other projects on one database are given that connection by a grant and read the same capture rather than each building their own, and two accounts never mix.
 
 The user state home keeps what is not rows: the engine's own login session, the raw history chunks, and the attachments fetched so far, in a folder named for the account.
 

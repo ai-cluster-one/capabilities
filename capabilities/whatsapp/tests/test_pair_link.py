@@ -190,5 +190,76 @@ class PairLink(unittest.TestCase):
         self.assertIn("test", self.registry())
 
 
+class NumberLinked(unittest.TestCase):
+    """One account is reached through one connection: once `test` has linked
+    ACCOUNT, another connection for that number is refused, naming `test`,
+    before anything is written, and `test` itself is answered as before."""
+
+    pair, registry = PairLink.pair, PairLink.registry
+
+    def setUp(self):
+        PairLink.setUp(self)
+        code, _ = self.pair(FakeSession)
+        self.assertIsNone(code)
+        self.state = self.home / "state" / "whatsapp"
+
+    def refusal(self, call):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            try:
+                call()
+            except self.wa._Refusal as refusal:
+                return refusal
+        self.fail(f"not refused: {err.getvalue()}")
+
+    def test_the_link_records_the_connection(self):
+        self.assertEqual(self.wa._linked_by(self.state / ACCOUNT),
+                         {"connection": "test", "owner": None})
+
+    def test_add_of_a_linked_number_is_refused_naming_the_holder(self):
+        refusal = self.refusal(lambda: self.wa._cmd_connection(
+            ["add", "other", "--machine", "--field", f"number={ACCOUNT}"]))
+        self.assertEqual((refusal.exit_code, refusal.code), (6, "number_linked"))
+        self.assertEqual(refusal.fields, {"account": ACCOUNT, "holder": {
+            "connection": "test", "owner": None}})
+        self.assertNotIn("--", refusal.hint)
+        self.assertNotIn("other", self.registry())
+
+    def test_add_reads_the_number_from_stdin(self):
+        stdin = io.StringIO(json.dumps({"expected_account_id": ACCOUNT}))
+        with mock.patch.object(sys, "stdin", stdin):
+            refusal = self.refusal(lambda: self.wa._cmd_connection(
+                ["add", "other", "--machine", "--stdin"]))
+        self.assertEqual(refusal.code, "number_linked")
+        self.assertNotIn("other", self.registry())
+
+    def test_pair_of_another_connection_is_refused_before_anything_is_written(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.wa._contract_connection(
+                ["add", "other", "--machine", "--field", f"number={ACCOUNT}"])
+        before = sorted(p.name for p in self.state.iterdir())
+        args = types.SimpleNamespace(
+            connection="other", session=None, qr=False, number=None, days=None,
+            full=False, hold=1, wait=False, recreate=False, yes=False, events=False)
+        refusal = self.refusal(lambda: self.wa.cmd_pair(args))
+        self.assertEqual(refusal.code, "number_linked")
+        self.assertEqual(refusal.fields["holder"]["connection"], "test")
+        self.assertEqual(sorted(p.name for p in self.state.iterdir()), before)
+
+    def test_the_holder_itself_is_still_already_paired(self):
+        args = types.SimpleNamespace(
+            connection="test", session=None, qr=False, number=None, days=None,
+            full=False, hold=1, wait=False, recreate=False, yes=False, events=False)
+        refusal = self.refusal(lambda: self.wa.cmd_pair(args))
+        self.assertEqual(refusal.code, "already_paired")
+
+    def test_an_unrecorded_home_is_not_refused(self):
+        (self.state / ACCOUNT / self.wa.LINKED_BY).unlink()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.wa._cmd_connection(
+                ["add", "other", "--machine", "--field", f"number={ACCOUNT}"])
+        self.assertIn("other", self.registry())
+
+
 if __name__ == "__main__":
     unittest.main()
