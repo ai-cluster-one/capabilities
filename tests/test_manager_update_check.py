@@ -190,6 +190,75 @@ def test_an_unreachable_source_is_one_rows_error_and_exit_5(tmp_path: Path) -> N
     assert _error(missing)["code"] == "not_found"
 
 
+def _sync_answer(changes: list[dict]) -> str:
+    return json.dumps({"schema": {"version": "preview"}, "target": "script",
+                       "sync": {"action": "check", "changes": changes},
+                       "lock": None, "dry_run": True})
+
+
+def _uv_standing_in_for_the_resolver(tmp: Path, env: dict[str, str]) -> Path:
+    """A uv whose resolver offers a newer contract library until an `update`
+    has synced it, logging each contract-library sync; every other call goes
+    to the real uv."""
+    real = shutil.which("uv", path=env["PATH"])
+    root = tmp / "fake-uv"
+    root.mkdir()
+    (root / "behind.json").write_text(_sync_answer([
+        {"name": "capabilities-contract", "version": "0.23.1", "action": "uninstalled"},
+        {"name": "capabilities-contract", "version": "0.30.0", "action": "installed"},
+        {"name": "pynacl", "version": "1.6.2", "action": "installed"},
+    ]))
+    (root / "current.json").write_text(_sync_answer([]))
+    uv = root / "uv"
+    uv.write_text(f"""#!/bin/sh
+case " $* " in
+  *" sync "*"--upgrade-package capabilities-contract"*)
+    echo "$*" >> "{root}/log"
+    case " $* " in
+      *" --dry-run "*)
+        if [ -e "{root}/synced" ]; then cat "{root}/current.json"; else cat "{root}/behind.json"; fi
+        exit 0;;
+    esac
+    touch "{root}/synced"
+    exit 0;;
+esac
+exec "{real}" "$@"
+""")
+    uv.chmod(0o755)
+    env["PATH"] = str(root) + os.pathsep + env["PATH"]
+    return root
+
+
+def test_an_environment_on_an_older_contract_library_is_an_update_until_update_moves_it(
+    tmp_path: Path,
+) -> None:
+    env = _env(tmp_path)
+    cap_home = Path(env["CAPABILITIES_HOME"])
+    _install_from_copy(tmp_path, env)
+    fake = _uv_standing_in_for_the_resolver(tmp_path, env)
+    before = _tree(cap_home)
+
+    behind = _ok(["update", "--check", "resend"], env, tmp_path)
+    row = _row(behind, "resend")
+    assert row["available"]["catalog_sha256"] == row["installed"]["catalog_sha256"]
+    assert row["contract_library"] == {"installed": "0.23.1", "available": "0.30.0"}
+    assert row["update_available"] is True
+    assert behind["update_available"] is True
+    assert _tree(cap_home) == before
+    asked = (fake / "log").read_text().splitlines()
+
+    _ok(["update", "resend"], env, tmp_path)
+    synced = (fake / "log").read_text().splitlines()[len(asked):]
+    assert asked == [f"{line} --dry-run --output-format json" for line in synced]
+    assert len(asked) == 2
+
+    current = _ok(["update", "--check", "resend"], env, tmp_path)
+    row = _row(current, "resend")
+    assert "contract_library" not in row
+    assert row["update_available"] is False
+    assert current["update_available"] is False
+
+
 def _write_release(tmp: Path) -> tuple[Path, dict]:
     release = tmp / "incoming"
     manager = release / "bin" / "capabilities"

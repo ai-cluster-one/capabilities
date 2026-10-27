@@ -26,7 +26,7 @@ On every machine that runs agents, update the manager and the capabilities, and 
 capabilities self-update
 capabilities update
 capabilities self-update --check   # update_available false
-capabilities update --check        # update_available false
+capabilities update --check        # update_available false: every payload and contract library current
 ```
 
 A migration refuses with `payload_outdated` while any installed capability is older than the manager's contract; `capabilities update` is the fix.

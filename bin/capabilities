@@ -194,15 +194,22 @@ MACHINE VERBS
         that capability's doctor raises as its one supervisor line; the next
         install or update of it that lands removes the record.
   update --check [<name>] [--json]
-        Report, for every installed capability or the one named, whether its
-        recorded source carries a different payload. Writes no registry entry,
-        snapshot or skill; the only thing it may bring forward is a registered
-        source's cache, the tree `search` reads. Payloads are compared by their
-        catalogue hash - the generated catalogue's payload_sha256, recomputed for
-        the installed copy - and versions are the newest heading of each change
-        log, null where none can be read. JSON {checked: [{name, source,
+        Report, for every installed capability or the one named, whether
+        `update` would change it: its recorded source carries a different
+        payload, or an environment it runs in holds an older capabilities-contract
+        than the release `update` would bring it to. Writes no registry entry,
+        snapshot, skill or environment; the only things it may bring forward are
+        a registered source's cache, the tree `search` reads, and uv's own
+        package cache. Payloads are compared
+        by their catalogue hash - the generated catalogue's payload_sha256,
+        recomputed for the installed copy - and versions are the newest heading
+        of each change log, null where none can be read. The contract library
+        is asked of uv as a dry run of the sync `update` runs, so a release its
+        resolver does not admit, an environment not made yet, or no uv on PATH
+        leaves it current. JSON {checked: [{name, source,
         installed {catalog_sha256, version, source_commit?},
-        available {catalog_sha256, version} | null, update_available,
+        available {catalog_sha256, version} | null,
+        contract_library? {installed, available}, update_available,
         error? {code, message, hint?}}], update_available}; the top-level
         update_available is true when any row's is. A source that cannot be
         reached or read leaves that row's available null and update_available
@@ -4231,6 +4238,24 @@ def _activate_payload(name: str, stage: Path) -> Path:
         return activate()
 
 
+def _contract_library_paths(script: Path) -> list[Path]:
+    """The paths uv keys an installed capability's environments by: the
+    registry script and every link on PATH that points at it."""
+    paths = [script]
+    for bin_dir in _link_dirs():
+        link = bin_dir / script.name
+        if link.is_symlink() and link.resolve() == script.resolve():
+            paths.append(link)
+    return paths
+
+
+def _contract_library_sync(uv: str, path: Path) -> list[str]:
+    """The uv call that brings one environment's contract library to the
+    newest release the script's declared range admits."""
+    return [uv, "sync", "--quiet", "--script", str(path),
+            "--upgrade-package", CONTRACT_LIBRARY, "--refresh-package", CONTRACT_LIBRARY]
+
+
 def _refresh_contract_library(script: Path) -> None:
     """Bring the contract library in an installed capability's environment to
     the newest release its declared range admits. uv keeps a script's
@@ -4243,16 +4268,10 @@ def _refresh_contract_library(script: Path) -> None:
     uv = shutil.which("uv")
     if uv is None:
         return
-    paths = [script]
-    for bin_dir in _link_dirs():
-        link = bin_dir / script.name
-        if link.is_symlink() and link.resolve() == script.resolve():
-            paths.append(link)
-    for path in paths:
+    for path in _contract_library_paths(script):
         try:
             proc = subprocess.run(
-                [uv, "sync", "--quiet", "--script", str(path),
-                 "--upgrade-package", CONTRACT_LIBRARY, "--refresh-package", CONTRACT_LIBRARY],
+                _contract_library_sync(uv, path),
                 capture_output=True, text=True, timeout=300, env=_snapshot_env())
         except (OSError, subprocess.TimeoutExpired) as exc:
             _warn(f"{path}: {CONTRACT_LIBRARY} was not refreshed: {exc}")
@@ -4260,6 +4279,38 @@ def _refresh_contract_library(script: Path) -> None:
         if proc.returncode != 0:
             detail = (proc.stderr.strip().splitlines() or ["uv sync failed"])[-1]
             _warn(f"{path}: {CONTRACT_LIBRARY} was not refreshed: {detail}")
+
+
+def _contract_library_behind(script: Path) -> dict | None:
+    """What `_refresh_contract_library` would move, asked of uv as a dry run of
+    the same call.
+
+    {installed, available} for the oldest environment that holds an older
+    contract library than the release uv would bring it to; None where
+    `update` would leave every environment where it is - no uv, a resolver
+    that admits nothing newer, an environment not made yet - or where uv
+    cannot answer."""
+    from packaging.version import InvalidVersion, Version
+    uv = shutil.which("uv")
+    if uv is None:
+        return None
+    behind = None
+    for path in _contract_library_paths(script):
+        try:
+            proc = subprocess.run(
+                [*_contract_library_sync(uv, path), "--dry-run", "--output-format", "json"],
+                capture_output=True, text=True, timeout=300, env=_snapshot_env())
+            changes = json.loads(proc.stdout)["sync"]["changes"] if proc.returncode == 0 else []
+            moved = {change["action"]: Version(change["version"]) for change in changes
+                     if change.get("name") == CONTRACT_LIBRARY}
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError,
+                AttributeError, InvalidVersion):
+            continue
+        held, newest = moved.get("uninstalled"), moved.get("installed")
+        if held is not None and newest is not None and held < newest:
+            if behind is None or held < Version(behind["installed"]):
+                behind = {"installed": str(held), "available": str(newest)}
+    return behind
 
 
 def _payload_sha256(reg: Path, script: str | None = None) -> str:
@@ -4732,7 +4783,10 @@ def cmd_update_check(name: str | None) -> None:
             row["available"] = {
                 "catalog_sha256": available_sha,
                 "version": version_reader() if behind else installed["version"]}
-            row["update_available"] = behind
+            library = _contract_library_behind(_script_path(n))
+            if library is not None:
+                row["contract_library"] = library
+            row["update_available"] = behind or library is not None
         rows.append(row)
     _emit({"checked": rows,
            "update_available": any(row["update_available"] for row in rows)})
