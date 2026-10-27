@@ -63,6 +63,9 @@ class Fake:
         self.memory = 2 << 30
         self.image_config = {"Env": ["PATH=/usr/bin"], "Volumes": None}
         self.containers = "abc123\n"
+        # The Coolify projects `projects` lists; one read by a uuid not among
+        # them answers with a test and a production environment.
+        self.projects: list[dict] = []
 
     def __call__(self, argv, root, *, stdin=None, timeout=120, check=True, env=None):
         self.calls.append({"argv": list(argv), "stdin": stdin})
@@ -79,8 +82,21 @@ class Fake:
             if "--connection" in args:
                 i = args.index("--connection")
                 del args[i:i + 2]
+            if args == ["projects"]:
+                return json.dumps([{k: v for k, v in row.items() if k != "environments"}
+                                   for row in self.projects])
+            if args[:2] == ["projects", "create"]:
+                self.projects.append({"uuid": "prj-made", "name": args[2],
+                                      "environments": [{"name": "production"}]})
+                return json.dumps({"uuid": "prj-made"})
+            if args[:3] == ["projects", "environment", "create"]:
+                project = next(row for row in self.projects if row["uuid"] == args[3])
+                project["environments"].append({"name": args[4]})
+                return json.dumps({"uuid": "env-made"})
             if args[:1] == ["projects"]:
-                return json.dumps({"environments": [{"name": "test"}, {"name": "production"}]})
+                project = next((row for row in self.projects if row["uuid"] == args[1]), None)
+                return json.dumps(project or {"environments": [{"name": "test"},
+                                                               {"name": "production"}]})
             if args[:2] == ["service", "create"]:
                 return json.dumps({"uuid": "svc-new", "domains": []})
             if args[:1] == ["services"]:
@@ -1168,3 +1184,118 @@ def test_update_reports_a_node_that_did_not_come_back(lab, capsys, health, state
         lab.m.cmd_node_update(update_args(wait=0))
     assert failed.value.code == "node_not_raised" and failed.value.exit_code == 5
     assert json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def add_args(**extra):
+    return SimpleNamespace(**{"node": "box1", "server": "srv-uuid", "version": "0.0.1",
+                              "memory": "2g", "project": None, "environment": "production",
+                              "services": "", "connection": None, "wait": 0, "events": True,
+                              **extra})
+
+
+@pytest.fixture
+def stream(lab):
+    lab.m._EVENTS_ON[0] = True
+    yield
+    lab.m._EVENTS_ON[0] = False
+
+
+def steps(out):
+    return [(e["step"], e["state"]) for e in events(out) if e["event"] == "step"]
+
+
+def test_add_takes_a_node_from_nothing_to_raised_and_says_each_step(lab, stream, capsys):
+    lab.m.cmd_node_add(add_args(services="tasks"))
+
+    said = capsys.readouterr().out
+    assert steps(said) == [(name, state) for name in (
+        "project", "environment", "create", "container", "id", "key_pair", "encryption_key",
+        "secrets", "place", "store", "raised") for state in ("started", "done")]
+    checks = {e["step"]: e for e in events(said) if e.get("state") == "done"}
+    # No project carried the agent's name: one is made, with its environment.
+    assert checks["project"]["check"] == {"uuid": "prj-made", "name": "lab-agent",
+                                          "created": True}
+    assert checks["environment"]["check"] == {"name": "production", "created": False}
+    assert checks["create"]["check"] == {"node": BOX1, "resource": "svc-new", "created": True}
+    assert checks["place"]["service"] == "tasks"
+    [create] = [c["argv"] for c in lab.fake.of("coolify") if c["argv"][3:5] == ["service",
+                                                                                "create"]]
+    assert create[create.index("--project") + 1] == "prj-made"
+    assert create[create.index("--environment") + 1] == "production"
+    assert lab.fake.rows[BOX1]["public_key"] == KEY
+    [done] = [e for e in events(said) if e["event"] == "done"]
+    result = done["result"]
+    assert result["ok"] is True and result["created"] is True
+    assert result["project"] == {"uuid": "prj-made", "name": "lab-agent"}
+    assert result["placed"] == ["tasks"] and result["resource"] == "svc-new"
+    assert "bot-secret" not in said
+
+
+def test_add_makes_the_environment_a_given_project_lacks(lab, stream, capsys):
+    lab.fake.projects.append({"uuid": "prj-uuid", "name": "other",
+                              "environments": [{"name": "production"}]})
+    lab.m.cmd_node_add(add_args(project="prj-uuid", environment="staging"))
+
+    made = [c["argv"][3:] for c in lab.fake.of("coolify") if "create" in c["argv"]]
+    assert made[0] == ["projects", "environment", "create", "prj-uuid", "staging"]
+    assert ["projects", "create"] not in [argv[:2] for argv in made]
+    checks = {e["step"]: e["check"] for e in events(capsys.readouterr().out)
+              if e.get("state") == "done"}
+    assert checks["project"]["created"] is False
+    assert checks["environment"] == {"name": "staging", "created": True}
+
+
+def test_add_again_after_a_failure_keeps_what_is_done_and_resumes(lab, stream, capsys):
+    # The container never comes up: the node is made and the add stops there.
+    lab.fake.containers = ""
+    with pytest.raises(lab.m.NodeFailure) as failed:
+        lab.m.cmd_node_add(add_args())
+    assert failed.value.code == "node_not_running"
+    said = capsys.readouterr().out
+    assert steps(said)[-1] == ("container", "failed")
+    [failure] = [e for e in events(said) if e.get("state") == "failed"]
+    assert failure["error"]["code"] == "node_not_running"
+
+    # Then it comes up, but the agent does not rise in time.
+    lab.fake.containers = "abc123\n"
+    lab.fake.state = "idle: waiting for store-setting"
+    with pytest.raises(lab.m.NodeFailure) as failed:
+        lab.m.cmd_node_add(add_args())
+    assert failed.value.code == "node_not_raised"
+    assert steps(capsys.readouterr().out)[-1] == ("raised", "failed")
+
+    # The third run finds the project, the environment and the node done.
+    lab.fake.state = "running agent prj_00000000a1a1 as node box1"
+    lab.m.cmd_node_add(add_args())
+    said = capsys.readouterr().out
+    checks = {e["step"]: e["check"] for e in events(said) if e.get("state") == "done"}
+    assert checks["project"] == {"uuid": "prj-made", "name": "lab-agent", "created": False}
+    assert checks["create"] == {"node": BOX1, "resource": "svc-new", "created": False}
+    assert [e for e in events(said) if e["event"] == "done"][0]["result"]["ok"] is True
+    made = [c["argv"][3:5] for c in lab.fake.of("coolify") if "create" in c["argv"]]
+    assert made == [["projects", "create"], ["service", "create"]]
+    assert list(lab.fake.rows) == [BOX1]
+
+
+def test_add_refuses_before_writing_what_it_could_not_finish(lab, monkeypatch, capsys):
+    lab.fake.rows["a1a1a1a1a1a1"] = {"node": "a1a1a1a1a1a1", "label": "box1",
+                                     "coolify_connection": "infra",
+                                     "coolify_server": "other-srv",
+                                     "coolify_resource": "svc-old"}
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_add(add_args(events=False))
+    assert refused.value.code == "node_exists"
+    lab.fake.rows.clear()
+    _agent_key(lab, monkeypatch, matches=False)
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_add(add_args(events=False))
+    assert refused.value.code == "key_mismatch"
+    assert not [c for c in lab.fake.of("coolify") if "create" in c["argv"]]
+    assert not lab.fake.of("ssh")
+
+
+def test_add_without_events_prints_the_answer_alone(lab, capsys):
+    lab.m.cmd_node_add(add_args(events=False))
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["ok"] is True and answer["node"] == BOX1
+    assert answer["environment"] == "production" and answer["created"] is True

@@ -46,6 +46,25 @@ def test_projects_create():
         assert result == response
 
 
+def test_projects_environment_create():
+    """projects environment create posts the name to the project's environments."""
+    calls = []
+
+    def mock_request(c, method, path, params=None, json_body=None):
+        calls.append({"method": method, "path": path, "body": json_body})
+        return {"uuid": "env-uuid-789"}
+
+    with patch.object(coolify_module, '_request', side_effect=mock_request):
+        result = coolify_module.cmd_projects_environment_create(None, "project-uuid-123", "staging")
+
+    assert calls == [{"method": "POST", "path": "/projects/project-uuid-123/environments",
+                      "body": {"name": "staging"}}]
+    assert result == {"uuid": "env-uuid-789"}
+    assert coolify_module._projects_call(
+        ["environment", "create", "project-uuid-123", "staging"], None) == (
+        "environment", "project-uuid-123", "staging")
+
+
 def test_app_create_public_git():
     """app create with public git repository."""
     response = {"uuid": "app-uuid-123", "name": "My App"}
@@ -307,6 +326,7 @@ if __name__ == "__main__":
 
     tests = [
         ("projects create", test_projects_create),
+        ("projects environment create", test_projects_environment_create),
         ("app create with public git", test_app_create_public_git),
         ("app create with registry image", test_app_create_registry_image),
         ("service create encodes compose", test_service_create),

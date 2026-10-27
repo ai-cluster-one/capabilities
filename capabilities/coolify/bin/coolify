@@ -110,6 +110,10 @@ COMMANDS
       Create a new project. Returns the project_uuid and default environment.
       `projects create --name <name>` still works for one release, with a
       warning on stderr. Write verb - requires allow_write.
+  projects environment create <uuid> <name>
+      Create the environment <name> in project <uuid> (POST
+      /projects/{uuid}/environments). Returns the new environment's uuid.
+      Write verb - requires allow_write.
   resources
       Flat list of every deployable resource (uuid, name, type, status) —
       the lookup an agent runs to find the uuid to act on.
@@ -1132,6 +1136,11 @@ def cmd_projects_create(c, name: str, description: str | None):
     return result
 
 
+def cmd_projects_environment_create(c, uuid: str, name: str):
+    """Create one environment in an existing project."""
+    return _request(c, "POST", f"/projects/{uuid}/environments", json_body={"name": name})
+
+
 APP_PATCH_FIELDS = (
     ("name", "name"),
     ("domains", "domains"),
@@ -1866,6 +1875,11 @@ def _projects_call(operands: list, name_flag: str | None) -> tuple:
               "next release; use `projects create <name>`")
     if not operands:
         return "list", None, None
+    if operands[0] == "environment":
+        if len(operands) != 4 or operands[1] != "create":
+            _die(6, "input", "projects environment takes create <uuid> <name>",
+                 "coolify projects environment create <uuid> <name>")
+        return "environment", operands[2], operands[3]
     if operands[0] == "delete":
         if len(operands) != 2:
             _die(6, "input", "projects delete requires one uuid")
@@ -2167,7 +2181,7 @@ def main() -> None:
         args.cmd in {"deploy", "start", "stop", "restart", "service", "database",
                      "storage"}
         or (args.cmd == "app" and args.app_cmd != "rollback-images")
-        or (projects_call is not None and projects_call[0] in {"create", "delete"})
+        or (projects_call is not None and projects_call[0] in {"create", "delete", "environment"})
         or (args.cmd == "env" and args.env_cmd != "list")
     )
 
@@ -2188,6 +2202,8 @@ def main() -> None:
             action, uuid, name = projects_call
             if action == "create":
                 out(cmd_projects_create(c, name, args.description))
+            elif action == "environment":
+                out(cmd_projects_environment_create(c, uuid, name))
             elif action == "delete":
                 out(cmd_delete(c, "projects", uuid, args))
             else:

@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-27 — `projects environment create`
+
+`projects environment create <uuid> <name>` creates the environment `<name>` in an existing project through `POST /projects/<uuid>/environments` and answers what Coolify returns, the new environment's uuid. A write verb, refused with exit 4 on a read-only connection. Nothing else changes.
+
 ## 2026-10-26 — `service set-compose`
 
 `service set-compose <uuid> --compose <file|->` replaces a Coolify service's whole stored Compose document with the one given, base64-encoded, through `PATCH /services/<uuid>`, without reading the stored one, so a token without read:sensitive can write it. The caller owns the document: what it leaves out, a volume included, is gone from the service. Nothing restarts until `coolify deploy <uuid>`. It answers uuid, written and next; an empty document exits 6. A write verb, refused with exit 4 on a read-only connection.

@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-27 — `node add` takes a node from nothing to raised, step by step
+
+`deployment node add <label> --server <uuid> --version <tag> [--memory <size>] [--services <name,...>] [--project <uuid>] [--environment <name>] [--connection <id>] [--wait <s>] [--events]` runs the whole path of adding a node on a server Coolify already runs: the Coolify project (given, else the one named after the agent, created when missing), the environment in it (created when missing, through `coolify projects environment create`), the node of the standard image as `node create` makes it, a wait until its container runs, then enrolment as `node enrol` does it. With `--events` each step is a `step` JSON line, started then done with its check or failed with its error, and the stream ends in `done` or `error`. A step that finds its work done keeps it, so running the same command again resumes after a failure. `node create` and `node enrol` answer and refuse as before.
+
 ## 2026-10-27 — `node login <node>` signs a tool or a device in on a node, as events
 
 `deployment node login <node> claude|codex|gh --events` runs the tool's own headless sign-in (`claude auth login`, `codex login --device-auth`, `gh auth login --web` for github.com) in the node's container, reached as `node exec` reaches it, and speaks it as JSON lines on stdout: `link {url}`, `code {code}` (codex, gh), `code_needed` where claude asks for the page's code back (one line on stdin), `waiting`, then `done {result {ok, node, tool}}` or `error {exit, error {code, message}}` - `login_failed` with the tool's last words and exit code, `input_closed`, `node_unreachable`. SIGTERM, SIGINT or SIGHUP cancels it: the tool on the node is stopped and the stream ends in `cancelled` (exit 6).
