@@ -9,8 +9,10 @@ test_manager_agents, which skips without `initdb`, `pg_ctl` or psycopg.
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import sys
+import time
 
 import pytest
 from test_manager_agents import MANAGER, PROJECT_ID, SCHEMA, Lab, cluster  # noqa: F401
@@ -169,12 +171,13 @@ def test_the_writing_verbs_are_refused_under_the_read_only_switch(lab):
 
 
 # A capability that reads KEYS through the cascade: the project's .env.local,
-# then .env, then - where it reads the vault - the agent's vault, here asked
-# through the manager's own `secrets show`.
+# then .env, read by the library's rule, then - where it reads the vault - the
+# agent's vault, here asked through the manager's own `secrets show`. With
+# PAUSE it waits, once its keys have left the files, until it is ended.
 _READER = '''#!{python}
-import json, subprocess, sys
+import json, subprocess, sys, time
 from pathlib import Path
-KEYS, VAULT, CODE = {keys!r}, {vault!r}, {code!r}
+KEYS, VAULT, CODE, PAUSE = {keys!r}, {vault!r}, {code!r}, {pause!r}
 if CODE:
     sys.stderr.write(json.dumps({{"error": {{"code": CODE, "message": "no"}}}}) + "\\n")
     sys.exit(4)
@@ -184,7 +187,7 @@ def env(path):
         for line in path.read_text().splitlines():
             if "=" in line and not line.startswith("#"):
                 k, v = line.split("=", 1)
-                out[k.strip()] = v.strip().strip("'")
+                out[k.strip()] = v.strip().strip('"').strip("'")
     return out
 rows = []
 for key in KEYS:
@@ -199,20 +202,25 @@ for key in KEYS:
                                capture_output=True, text=True)
         if shown.returncode == 0:
             found = (shown.stdout[:-1], "vault", "vault:agent")
+    if PAUSE and (found is None or found[1] != "project"):
+        Path(PAUSE).touch()
+        time.sleep(20)
     value, tier, source = found or (None, None, None)
     rows.append({{"key": key, "secret": True, "required": True, "set": bool(value),
                  "tier": tier, "source": source,
-                 "value": ("…" + value[-4:]) if value else None}})
+                 "value": (("…" + value[-4:]) if len(value) >= 8 else "****")
+                 if value else None}})
 print(json.dumps({{"connections": {{"main": {{"keys": rows}}}}}}))
 '''
 
 
-def _reader(lab: Lab, name: str, keys: list, vault: bool = True, code: str = "") -> None:
+def _reader(lab: Lab, name: str, keys: list, vault: bool = True, code: str = "",
+            pause: str = "") -> None:
     home = lab.tmp / "registry" / name
     home.mkdir(parents=True, exist_ok=True)
     script = home / name
     script.write_text(_READER.format(python=sys.executable, keys=keys, vault=vault,
-                                     code=code, manager=str(MANAGER)))
+                                     code=code, pause=pause, manager=str(MANAGER)))
     script.chmod(0o755)
 
 
@@ -220,16 +228,19 @@ def test_move_takes_only_the_keys_every_reader_reads_from_the_vault(lab):
     lab.ok("key", "generate")
     env_local = lab.project / ".env.local"
     env_local.write_text(env_local.read_text() + "# a comment\nMOVED_TOKEN='tok-moved'\n"
-                         "OLD_TOKEN=tok-old\nNOBODY=x-nobody\nSPLIT=a-one\n")
+                         "OLD_TOKEN=tok-old\nNOBODY=x-nobody\nSPLIT=a-one\n"
+                         'OPEN_QUOTE="tok-open\n')
     (lab.project / ".env").write_text("MOVED_TOKEN='tok-moved'\nSPLIT=b-two\n")
-    _reader(lab, "fresh", ["MOVED_TOKEN", "OLD_TOKEN", "SPLIT"])
+    _reader(lab, "fresh", ["MOVED_TOKEN", "OLD_TOKEN", "SPLIT", "OPEN_QUOTE"])
     _reader(lab, "stale", ["OLD_TOKEN"], vault=False)
     _reader(lab, "gated", ["NOBODY"], code="connection_not_granted")
     before_local = env_local.read_text()
 
     moved = lab.ok("secrets", "move")
     assert moved["moved"] == [{"name": "MOVED_TOKEN", "readers": ["fresh"],
-                               "files": [str(env_local), str(lab.project / ".env")]}]
+                               "files": [str(env_local), str(lab.project / ".env")]},
+                              {"name": "OPEN_QUOTE", "readers": ["fresh"],
+                               "files": [str(env_local)]}]
     reasons = {k["name"]: k["reason"] for k in moved["kept"]}
     assert reasons["OLD_TOKEN"].startswith("stale could not read it from the vault")
     assert reasons["NOBODY"] == "no installed capability's connections read it here"
@@ -239,17 +250,46 @@ def test_move_takes_only_the_keys_every_reader_reads_from_the_vault(lab):
     assert moved["not_reading"] == [{"capability": "gated", "code": "connection_not_granted"}]
     assert moved["unread"] == []
     # The files keep every other line as it was; only the moved key's lines go.
-    assert env_local.read_text() == before_local.replace("MOVED_TOKEN='tok-moved'\n", "")
+    left = before_local.replace("MOVED_TOKEN='tok-moved'\n", "").replace(
+        'OPEN_QUOTE="tok-open\n', "")
+    assert env_local.read_text() == left
     assert (lab.project / ".env").read_text() == "SPLIT=b-two\n"
     assert lab.run("secrets", "show", "MOVED_TOKEN").stdout == "tok-moved\n"
+    # The vault holds the value its reader read, not the line's text.
+    assert lab.run("secrets", "show", "OPEN_QUOTE").stdout == "tok-open\n"
     # A key that stayed is not left in the vault.
-    assert [s["name"] for s in lab.ok("secrets", "list")["secrets"]] == ["MOVED_TOKEN"]
+    assert [s["name"] for s in lab.ok("secrets", "list")["secrets"]] == [
+        "MOVED_TOKEN", "OPEN_QUOTE"]
     assert "tok-" not in json.dumps(moved)
 
     # Run again, nothing is left that may move, and nothing changes.
     again = lab.ok("secrets", "move")
-    assert again["moved"] == [] and env_local.read_text() == before_local.replace(
-        "MOVED_TOKEN='tok-moved'\n", "")
+    assert again["moved"] == [] and env_local.read_text() == left
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+def test_move_stopped_during_its_trial_puts_the_lines_back(lab, signum):
+    lab.ok("key", "generate")
+    env_local = lab.project / ".env.local"
+    env_local.write_text(env_local.read_text() + "OLD_TOKEN=tok-old-12345\n")
+    before = env_local.read_text()
+    paused = lab.tmp / "paused"
+    _reader(lab, "stale", ["OLD_TOKEN"], vault=False, pause=str(paused))
+    run = subprocess.Popen([sys.executable, str(MANAGER), "secrets", "move"],
+                           cwd=lab.project, env=lab.env(), text=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 60
+    while not paused.exists() and run.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert paused.exists() and "OLD_TOKEN" not in env_local.read_text()
+    run.send_signal(signum)
+    # The lines are back as soon as the stop arrives, before the run has ended.
+    deadline = time.monotonic() + 10
+    while env_local.read_text() != before and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert env_local.read_text() == before
+    run.communicate(timeout=120)
+    assert run.returncode == 128 + signum
 
 
 def test_move_keeps_a_key_the_vault_holds_otherwise_and_every_key_when_a_report_fails(lab):

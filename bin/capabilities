@@ -8672,12 +8672,15 @@ def _vault_move_reads(reports: dict) -> dict:
 
 
 def _vault_move(root: Path) -> dict:
+    import signal
     vault = _vault_module()
     key = _vault_require_key(root)
     agent_id = _kernel_agent_id(root)
     paths = {fname: root / fname for fname in VAULT_MOVE_FILES}
     texts = {fname: p.read_text() for fname, p in paths.items() if p.is_file()}
-    values = {fname: _parse_env_file(paths[fname]) for fname in texts}
+    # Each value as the capabilities that read these files read it - the library's
+    # rule, not the manager's - so what is sealed is what they read before.
+    values = {fname: vault._env_file(paths[fname]) for fname in texts}
     here = {str(p.resolve()): fname for fname, p in paths.items()}
 
     reports, refusing, unread = _vault_move_reports(root)
@@ -8751,7 +8754,29 @@ def _vault_move(root: Path) -> dict:
     trial = sorted(n for n in readers if n not in kept)
 
     moved: list[str] = []
+
+    def restore():
+        # The files end as they were less what moved, so a key that stays is
+        # back on its own line, as it was.
+        for fname, text in texts.items():
+            final = _vault_move_lines(text, moved)
+            if paths[fname].read_text() != final:
+                _atomic_write_text(paths[fname], final)
+
+    def stopped(signum, _frame):
+        # A stop during the trial puts the lines back before it ends the run;
+        # a key left sealed is harmless, since the files still win.
+        for each in stops:
+            signal.signal(each, signal.SIG_IGN)
+        restore()
+        for each, handler in stops.items():
+            signal.signal(each, handler)
+        raise SystemExit(128 + signum)
+
+    stops: dict = {}
     if trial:
+        for each in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            stops[each] = signal.signal(each, stopped)
         try:
             for fname, text in texts.items():
                 stripped = _vault_move_lines(text, trial)
@@ -8778,12 +8803,9 @@ def _vault_move(root: Path) -> dict:
                 else:
                     moved.append(name)
         finally:
-            # The files end as they were less what moved, so a key that stays is
-            # back on its own line, as it was.
-            for fname, text in texts.items():
-                final = _vault_move_lines(text, moved)
-                if paths[fname].read_text() != final:
-                    _atomic_write_text(paths[fname], final)
+            restore()
+            for each, handler in stops.items():
+                signal.signal(each, handler)
     back = [n for n in sealed if n not in moved]
     if back:
         _kernel_run(root, lambda conn, agent_id: vault.remove(conn, agent_id, back))
