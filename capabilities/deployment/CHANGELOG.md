@@ -1,5 +1,13 @@
 # deployment — change log
 
+## 2026-10-27 — `node login <node>` signs a tool or a device in on a node, as events
+
+`deployment node login <node> claude|codex|gh --events` runs the tool's own headless sign-in (`claude auth login`, `codex login --device-auth`, `gh auth login --web` for github.com) in the node's container, reached as `node exec` reaches it, and speaks it as JSON lines on stdout: `link {url}`, `code {code}` (codex, gh), `code_needed` where claude asks for the page's code back (one line on stdin), `waiting`, then `done {result {ok, node, tool}}` or `error {exit, error {code, message}}` - `login_failed` with the tool's last words and exit code, `input_closed`, `node_unreachable`. SIGTERM, SIGINT or SIGHUP cancels it: the tool on the node is stopped and the stream ends in `cancelled` (exit 6).
+
+`deployment node login <node> <capability> [--connection <id>] [--method <id>] --events` signs a device-bound connection (telegram, whatsapp) in on the node as a new device through the capability's own link ceremony, passed on as it speaks it, after one `devices` event naming the agent's other nodes the store reports holding a live session for the connection and the service's device limit (4 for WhatsApp). It never replaces a session: a node already live for the connection is refused (`already_signed_in`), `--recreate` is never passed, and a connection with no `expected_account_id` that another node holds a session for is refused (`connection_unbound`, naming the account to bind) since a failed first link would remove the shared connection.
+
+`deployment node login claude|codex [--target <name>] [--print-command]` is unchanged; a harness other than claude or codex there is now refused with exit 6 `input` rather than by the argument parser.
+
 ## 2026-10-27 — `node update --memory` changes a node's memory limit
 
 `deployment node update <node> --version <tag> --memory <size>` writes the node's Compose document with that memory limit instead of the one its container runs with, and redeploys the node, also when it already runs the tag; before, a node kept the limit `node create` gave it unless its Compose was edited by hand. The size is taken as `node create` takes it, and a malformed one is refused with exit 6 `input` before anything changes. A size equal to the running limit changes nothing, and without `--memory` the running limit is kept as before. The answer's `memory` is the limit written.

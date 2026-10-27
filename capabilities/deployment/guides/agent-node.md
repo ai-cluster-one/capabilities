@@ -61,7 +61,7 @@ The key, the secrets and the store password travel on standard input and are nev
 
 ## Log in on the node
 
-No login is handed to a node: a person makes each one on it, once, and it stays on the node's volumes. No `deployment` verb does it for a node made by `node create` yet (`deployment node login` serves a `deployment/targets/` application); open a terminal into the container yourself:
+No login is handed to a node: a person makes each one on it, once, and it stays on the node's volumes. From this machine, `deployment node login <node> claude|codex|gh --events` runs the tool's own headless sign-in in the node's container and speaks it as JSON lines: `link` with the page to open, `code` with the code to enter there (codex, gh), `code_needed` where claude asks for the page's code to be pasted back as one line on standard input, `waiting`, then `done` or `error` with the reason; SIGTERM, SIGINT or SIGHUP cancels it and stops the tool on the node. At a terminal, open one into the container yourself:
 
 ```sh
 ssh -t root@<server-address> docker exec -it <container> claude auth login
@@ -73,6 +73,8 @@ The container is the one Docker labels `com.docker.compose.project=<resource>` a
 `gh auth login` works the same way: the image carries the GitHub CLI from `agent-node` 0.0.2, and 0.0.1 does not, so on an older node check with `gh --version` in the container. Its login is kept under `~/.config`, on the config volume.
 
 A login that speaks JSON events instead of a terminal runs from this machine with `deployment node exec <node> -- <command>`, which reaches the same container over SSH and `docker exec -i` with no terminal: `deployment node exec box1 -- telegram login --events` or `deployment node exec box1 -- whatsapp pair --events` streams each event line back unchanged, forwards what you type on standard input, and exits with the command's own code.
+
+`deployment node login box1 whatsapp --events` (or `telegram`, `--connection <id>`, `--method <id>`) runs that same ceremony as a new device on the node and never replaces a session: a node already live for the connection is refused, and so is a connection that binds no `expected_account_id` while another node holds a session for it, because a first link that failed would take the shared connection out again. Before the ceremony it says, in a `devices` event, which of the agent's other nodes hold a live session for the connection and how many devices the service links to one account (four for WhatsApp); cancelling it stops the ceremony on the node, which takes back what a first link made.
 
 ## Move a service onto the node
 

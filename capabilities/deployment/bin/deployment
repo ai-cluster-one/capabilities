@@ -444,6 +444,42 @@ USAGE
   deployment node login claude|codex [--target <name>] [--print-command]
       SSH with a terminal into the application's agent container for subscription
       login. --print-command prepares the command without attempting login.
+  deployment node login <node> claude|codex|gh --events
+      Run the tool's own headless sign-in in the node's container (`claude
+      auth login`, `codex login --device-auth`, `gh auth login --web` for
+      github.com), and speak it as JSON lines on stdout:
+      link {url}, the page to open; code {code}, the code to enter there
+      (codex, gh); code_needed, where the tool asks for the code the page
+      gives to be pasted back (claude), answered by one line on stdin;
+      waiting, while the tool waits for the sign-in to finish; then done
+      {result {ok, node, tool}} or error {exit, error {code, message}},
+      message the reason: login_failed with the tool's last words and its
+      exit code, input_closed (exit 6) when stdin closes while code_needed
+      waits, node_unreachable (255). Each event carries node and tool; the
+      tool's own output goes to stderr. SIGTERM, SIGINT or SIGHUP cancels
+      it: the tool on the node is stopped and the stream ends in error
+      cancelled (exit 6). Each node is signed in on its own.
+  deployment node login <node> <capability> [--connection <id>]
+                        [--method <id>] --events
+      Sign a device-bound connection (`connections.device_bound`, as
+      telegram's and whatsapp's are) in on the node as a new device: the
+      capability's own link ceremony from its manifest on the node (the
+      first, or --method's id), run there with --connection as through
+      `node exec`, its events passed on as it speaks them and stdin handed
+      to it line by line. It never replaces a session: a node that already
+      holds a live session for the connection is refused (exit 6
+      already_signed_in) and --recreate is never passed. A connection that
+      binds no expected_account_id while another of the agent's nodes holds
+      a session for it is refused (exit 6 connection_unbound, naming the
+      account to bind), since a first link that failed would take the
+      shared connection out again. Before the ceremony one event devices
+      {node, capability, connection, in_use [{node, label, account, live}],
+      limit}: in_use the agent's other nodes the store reports holding a
+      live session for it (`capabilities node state`), limit how many
+      devices the service links to one account besides the phone (4 for
+      whatsapp), else null. --connection may be left out where the
+      capability has one connection. Cancel as above: the ceremony on the
+      node gets SIGTERM, so a first link takes back what it made.
   deployment node sync [--target <name>]
       Fetch node-<target>, rebase and push; abort conflicts and report diverged.
       Optional target.mirror receives the synced branch. Host-agents compiles
@@ -8273,6 +8309,18 @@ def cmd_logs(args):
 
 
 def cmd_node_login(args):
+    # With two words the first names the node: `node login <node> <tool>`.
+    if any(getattr(args, key, None) for key in ("tool", "events", "connection", "method")):
+        if getattr(args, "tool", None) is None:
+            raise NodeFailure("input", "node login --events needs the node: "
+                              "node login <node> <tool> --events", 6)
+        if not getattr(args, "events", False):
+            raise NodeFailure("input", "node login <node> speaks its sign-in as events; "
+                              "pass --events", 6)
+        _node_login_events(args)
+        return
+    if args.harness not in ("claude", "codex"):
+        raise NodeFailure("input", f"node login takes claude or codex, not {args.harness!r}", 6)
     root = _root()
     target = _node_target(root, args.target)
     host = _node_host(root, target, write=True)
@@ -9220,6 +9268,298 @@ def cmd_node_exec(args):
     raise SystemExit(subprocess.call(command, cwd=root))
 
 
+# Each tool's own headless sign-in, as `node login <node> <tool> --events` runs
+# it on the node, and what in its output is the code to enter at the link and
+# the prompt that asks for a code to be pasted back. None of them needs a
+# terminal: gh writes its code and link on stderr, codex its link and code on
+# lines of their own, claude its link and then the paste prompt with no newline.
+NODE_LOGIN_TOOLS = {
+    "claude": {"argv": ["claude", "auth", "login"],
+               "paste": re.compile(r"Paste code here[^>\n]*> ?")},
+    "codex": {"argv": ["codex", "login", "--device-auth"],
+              "code": re.compile(r"one-time code[^\n]*\n\s*([A-Z0-9]{4,}-[A-Z0-9]{4,})\s")},
+    "gh": {"argv": ["gh", "auth", "login", "--hostname", "github.com",
+                    "--git-protocol", "https", "--web", "--skip-ssh-key"],
+           "code": re.compile(r"one-time code: ([A-Z0-9]{4,}-[A-Z0-9]{4,})")},
+}
+NODE_LOGIN_LINK = re.compile(r"https://\S+(?=\s)")
+_NODE_LOGIN_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# How many devices a service lets one account link besides the phone, where it
+# limits them: WhatsApp links at most four.
+NODE_DEVICE_LIMITS = {"whatsapp": 4}
+
+# Run in the node's container around a sign-in. It hands the command the
+# frames this machine sends - `D<line>` one line of input, `E` the end of it -
+# and when the channel itself closes, as it does when the sign-in is cancelled
+# here or this machine goes away, or the runner is itself sent SIGTERM, SIGINT
+# or SIGHUP, it stops the command with SIGTERM (SIGKILL after 20 seconds), so
+# nothing is left signing in on the node.
+_NODE_LOGIN_RUNNER = """
+import os, signal, subprocess, sys, threading
+child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, start_new_session=True)
+def stop():
+    try:
+        os.killpg(child.pid, signal.SIGTERM)
+        child.wait(20)
+    except subprocess.TimeoutExpired:
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
+for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(sig, lambda *_: threading.Thread(target=stop, daemon=True).start())
+def relay():
+    while True:
+        frame = sys.stdin.buffer.readline()
+        if not frame:
+            break
+        try:
+            if frame[:1] == b"D":
+                child.stdin.write(frame[1:])
+                child.stdin.flush()
+            elif frame[:1] == b"E":
+                child.stdin.close()
+        except (OSError, ValueError):
+            pass
+    stop()
+threading.Thread(target=relay, daemon=True).start()
+code = child.wait()
+# Not sys.exit: the relay may still be reading stdin, which shutdown would wait on.
+os._exit(code if code >= 0 else 128 - code)
+"""
+
+
+class _NodeLoginChannel:
+    """One command run in the node's container under the sign-in runner, its
+    standard input carried as the runner's frames. Closing the channel, which
+    a SIGTERM, SIGINT or SIGHUP here does, cancels the command on the node."""
+
+    def __init__(self, root, host, container, argv, *, capture):
+        import threading
+        command = _node_ssh_argv(host) + [shlex.join(
+            ["docker", "exec", "-i", container, "python3", "-c", _NODE_LOGIN_RUNNER, *argv])]
+        self.proc = subprocess.Popen(command, cwd=root, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE if capture else None,
+                                     stderr=subprocess.STDOUT if capture else None)
+        self.lock = threading.Lock()
+        self.cancelled: str | None = None
+
+    def send(self, frame: bytes) -> None:
+        with self.lock:
+            try:
+                self.proc.stdin.write(frame)
+                self.proc.stdin.flush()
+            except (OSError, ValueError):
+                pass
+
+    def line(self, text: str) -> None:
+        self.send(b"D" + text.rstrip("\r\n").encode() + b"\n")
+
+    def close(self) -> None:
+        try:
+            self.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+    def __enter__(self):
+        import signal
+        def cancel(signum, _frame):
+            self.cancelled = self.cancelled or signal.Signals(signum).name
+            self.close()
+        self.previous = {sig: signal.signal(sig, cancel)
+                         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
+        return self
+
+    def __exit__(self, *exc):
+        import signal
+        for sig, handler in self.previous.items():
+            signal.signal(sig, handler)
+        if exc[0] is not None:
+            self.close()
+            try:
+                self.proc.wait(30)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+        return False
+
+    def forward_stdin(self) -> None:
+        """Hand every line on this process's standard input to the command, and
+        its end as the end of the command's."""
+        import threading
+        def pump():
+            for line in sys.stdin:
+                self.line(line)
+            self.send(b"E")
+        threading.Thread(target=pump, daemon=True).start()
+
+
+def _node_login_json(root, host, container, argv):
+    out = _agent_node_exec(root, host, container, argv)
+    try:
+        answer = json.loads(out)
+    except ValueError:
+        raise NodeFailure("node_command_failed", f"`{shlex.join(argv)}` on the node "
+                          "answered no JSON", 5) from None
+    return answer if isinstance(answer, dict) else {}
+
+
+def _node_login_tool(root, host, container, node, tool):
+    """Run the tool's headless sign-in on the node and speak it as events."""
+    import codecs
+    import threading
+    spec = NODE_LOGIN_TOOLS[tool]
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    seen, said = "", set()
+    input_closed = []
+
+    def answer():
+        line = sys.stdin.readline()
+        if not line:
+            input_closed.append(True)
+            channel.close()
+            return
+        channel.line(line)
+        _event("waiting", node=node, tool=tool)
+
+    with _NodeLoginChannel(root, host, container, spec["argv"], capture=True) as channel:
+        while True:
+            chunk = os.read(channel.proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            # The tool's own words stay readable, on stderr, beside the events.
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.flush()
+            seen += _NODE_LOGIN_ANSI.sub("", decoder.decode(chunk))
+            link = NODE_LOGIN_LINK.search(seen)
+            if link and "link" not in said:
+                said.add("link")
+                _event("link", node=node, tool=tool, url=link.group(0))
+            code = spec.get("code") and spec["code"].search(seen)
+            if code and "code" not in said:
+                said.add("code")
+                _event("code", node=node, tool=tool, code=code.group(1))
+            if spec.get("paste") and "link" in said and "paste" not in said \
+                    and spec["paste"].search(seen):
+                said.add("paste")
+                _event("code_needed", node=node, tool=tool)
+                threading.Thread(target=answer, daemon=True).start()
+            if not spec.get("paste") and "waiting" not in said and "link" in said \
+                    and (not spec.get("code") or "code" in said):
+                said.add("waiting")
+                _event("waiting", node=node, tool=tool)
+        rc = channel.proc.wait()
+    if rc == 0:
+        _emit({"ok": True, "node": node, "tool": tool})
+        return
+    if channel.cancelled:
+        raise NodeFailure("cancelled", f"the {tool} sign-in on node {node} was cancelled "
+                          f"({channel.cancelled}) before it completed", 6)
+    if input_closed:
+        raise NodeFailure("input_closed", "standard input closed while code_needed waited "
+                          "for an answer", 6)
+    if rc == 255:
+        raise NodeFailure("node_unreachable", f"node {node} could not be reached over SSH", 255)
+    # The paste prompt ends in no newline, so the tool's last words follow it.
+    if spec.get("paste"):
+        seen = spec["paste"].sub("\n", seen)
+    said_last = next((l.strip() for l in reversed(seen.splitlines()) if l.strip()), "")
+    raise NodeFailure("login_failed", f"the {tool} sign-in on node {node} failed (exit {rc})"
+                      + (f": {said_last[-500:]}" if said_last else ""), rc)
+
+
+def _node_login_device(root, host, container, node, capability, wanted, method_id):
+    """Sign a device-bound connection in on the node as a new device, through
+    the capability's own `--events` ceremony, which this passes on as it
+    speaks it. Before it: refuse a node that already holds a live session for
+    the connection, and a connection that binds no account while another node
+    holds a session for it, since a first link that fails or is cancelled
+    takes the connection out again; then say which of the agent's nodes hold
+    one, and how many the service allows."""
+    manifest = _node_login_json(root, host, container, [capability, "manifest", "--json"])
+    declared = manifest.get("connections")
+    if not isinstance(declared, dict) or declared.get("device_bound") is not True:
+        raise NodeFailure("not_device_bound", f"{capability}'s connections on node {node} "
+                          "are not device-bound; node login signs in claude, codex, gh, or "
+                          "a capability whose connections are", 6)
+    methods = [m for m in declared.get("link") or []
+               if isinstance(m, dict) and isinstance(m.get("argv"), list) and m["argv"]]
+    method = next((m for m in methods if method_id in (None, m.get("id"))), None)
+    if method is None:
+        raise NodeFailure("input", f"{capability} has no link method {method_id!r}; it has "
+                          + (", ".join(str(m.get("id")) for m in methods) or "none"), 6)
+    entries = _node_login_json(root, host, container,
+                               [capability, "connections", "--json"]).get("connections")
+    entries = entries if isinstance(entries, dict) else {}
+    if wanted is None:
+        if len(entries) != 1:
+            raise NodeFailure("connection_required", f"{capability} on node {node} has "
+                              f"{len(entries)} connections; name one with --connection: "
+                              + (", ".join(sorted(entries)) or "none"), 6)
+        wanted = next(iter(entries))
+    entry = entries.get(wanted)
+    if not isinstance(entry, dict):
+        raise NodeFailure("connection_unknown", f"{capability} on node {node} has no "
+                          f"connection {wanted!r}", 6)
+    session = entry.get("session") if isinstance(entry.get("session"), dict) else {}
+    if session.get("live") is True:
+        raise NodeFailure("already_signed_in", f"node {node} already holds a live {capability} "
+                          f"session for {wanted!r}"
+                          + (f" ({session['account']})" if session.get("account") else ""), 6)
+    bound = any(isinstance(k, dict) and k.get("key") == "expected_account_id" and k.get("set")
+                for k in entry.get("keys") or [])
+    elsewhere = []
+    for other in _manager(root, "node", "state").get("nodes") or []:
+        if other.get("node") == node:
+            continue
+        for held in other.get("sessions") or []:
+            if (held.get("capability"), held.get("connection")) == (capability, wanted) \
+                    and isinstance(held.get("live"), bool):
+                elsewhere.append({"node": other.get("node"), "label": other.get("label"),
+                                  "account": held.get("account"), "live": held["live"]})
+    if elsewhere and not bound:
+        account = next((d["account"] for d in elsewhere if d["account"]), None)
+        raise NodeFailure("connection_unbound", f"{wanted!r} binds no account and node "
+                          f"{elsewhere[0]['node']} holds a {capability} session for it; a "
+                          "first link here that failed would take the connection out from "
+                          "under it. Bind it first: `" + shlex.join(
+                              [capability, "connection", "add", wanted, "--replace", "--field",
+                               f"expected_account_id={account or '<account>'}"])
+                          + "` at the scope that holds it", 6)
+    _event("devices", node=node, capability=capability, connection=wanted,
+           in_use=[d for d in elsewhere if d["live"]],
+           limit=NODE_DEVICE_LIMITS.get(capability))
+    argv = [*method["argv"], "--connection", wanted]
+    with _NodeLoginChannel(root, host, container, argv, capture=False) as channel:
+        channel.forward_stdin()
+        rc = channel.proc.wait()
+    raise SystemExit(rc)
+
+
+def _node_login_events(args):
+    """`node login <node> <claude|codex|gh|capability> --events`."""
+    if args.target or args.print_command:
+        raise NodeFailure("input", "node login <node> takes neither --target nor "
+                          "--print-command", 6)
+    root = _root()
+    node = _agent_node_name(args.harness)
+    _agent_node_project(root)
+    tool = args.tool
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", tool or ""):
+        raise NodeFailure("input", f"node login signs in claude, codex, gh or a "
+                          f"device-bound capability, not {tool!r}", 6)
+    if tool in NODE_LOGIN_TOOLS and (args.connection or args.method):
+        raise NodeFailure("input", f"--connection and --method name a device-bound "
+                          f"connection; {tool} has none", 6)
+    row = _agent_node_row(root, node)
+    if row is None:
+        raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
+    _target, host, container = _agent_node_reach(root, row, write=True)
+    if tool in NODE_LOGIN_TOOLS:
+        _node_login_tool(root, host, container, row["node"], tool)
+    else:
+        _node_login_device(root, host, container, row["node"], tool, args.connection,
+                           args.method)
+
+
 def cmd_node_remove(args):
     root = _root()
     node = _agent_node_name(args.node)
@@ -9682,8 +10022,12 @@ def main(argv: list[str] | None = None) -> None:
         if verb == "status":
             p.add_argument("--json", action="store_true")
         if verb == "login":
-            p.add_argument("harness", choices=("claude", "codex"))
+            p.add_argument("harness")
+            p.add_argument("tool", nargs="?")
             p.add_argument("--print-command", action="store_true")
+            p.add_argument("--events", action="store_true")
+            p.add_argument("--connection")
+            p.add_argument("--method")
         p.set_defaults(fn=fn)
 
     args, extra = parser.parse_known_args(argv)
@@ -9701,6 +10045,9 @@ def main(argv: list[str] | None = None) -> None:
     if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog", "handover")
             and not previews):
         _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
+    # A sign-in asked for events speaks them from here on, refusals included.
+    if args.cmd == "node" and args.node_cmd == "login" and args.events:
+        _events_begin()
     if args.cmd == "node" and args.node_cmd in ("sync", "login", "create", "enrol",
                                              "update", "remove", "exec"):
         _read_only_gate(f"`deployment node {args.node_cmd}`")

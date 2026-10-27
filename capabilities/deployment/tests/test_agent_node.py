@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import shlex
 from pathlib import Path
@@ -743,6 +744,189 @@ def test_exec_refuses_an_unknown_node_and_a_missing_command(lab, monkeypatch):
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=[]))
     assert refused.value.code == "input"
+
+
+@pytest.fixture
+def signin(lab, monkeypatch, tmp_path):
+    """A node whose container is this machine: `ssh` is `sh -c`, `docker exec
+    -i <container>` runs the rest here, and the tools and capabilities it runs
+    are scripts in a folder put first on PATH. The real sign-in runner runs."""
+    lab.fake.rows[BOX1] = {"node": BOX1, "label": "box1", "coolify_resource": "svc-new"}
+    bin_dir = tmp_path / "node-bin"
+    bin_dir.mkdir()
+
+    def tool(name, body):
+        path = bin_dir / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+
+    tool("docker", 'shift; [ "$1" = -i ] && shift; shift; exec "$@"\n')
+    monkeypatch.setenv("PATH", f"{bin_dir}:{lab.m.os.environ['PATH']}")
+    monkeypatch.setattr(lab.m, "_agent_node_reach",
+                        lambda root, row, write: ({}, {"address": "node.invalid"}, "c1"))
+    monkeypatch.setattr(lab.m, "_node_ssh_argv", lambda host, **kw: ["sh", "-c"])
+    sessions = []
+
+    def run(argv, root, **kw):
+        if argv[:3] == ["capabilities", "node", "state"]:
+            return SimpleNamespace(returncode=0, stderr="", stdout=json.dumps({"nodes": [
+                {"node": BOX1, "label": "box1", "sessions": []},
+                {"node": "a1a1a1a1a1a1", "label": "mac", "sessions": sessions}]}))
+        if argv[0] == "capabilities":
+            return lab.fake(argv, root, **kw)
+        return lab.node_run(argv, root, **kw)
+
+    monkeypatch.setattr(lab.m, "_node_run", run)
+    lab.m._EVENTS_ON[0] = True
+    yield SimpleNamespace(tool=tool, sessions=sessions, dir=tmp_path)
+    lab.m._EVENTS_ON[0] = False
+
+
+def login_args(tool, **extra):
+    return SimpleNamespace(**{"harness": "box1", "tool": tool, "events": True, "target": None,
+                              "print_command": False, "connection": None, "method": None,
+                              **extra})
+
+
+def events(out):
+    return [json.loads(line) for line in out.splitlines() if line.startswith("{")]
+
+
+def test_login_on_a_node_speaks_the_tools_link_code_and_wait_as_events(lab, signin, capfd):
+    signin.tool("gh", 'echo "! First copy your one-time code: AB12-CD34" >&2\n'
+                      'echo "Open this URL to continue in your web browser: '
+                      'https://github.com/login/device" >&2\n'
+                      'echo "$*" > "$(dirname "$0")/../gh-argv"\n')
+    lab.m.cmd_node_login(login_args("gh"))
+    out = capfd.readouterr()
+    said = events(out.out)
+    assert [e["event"] for e in said] == ["link", "code", "waiting", "done"]
+    assert said[0] == {"event": "link", "node": BOX1, "tool": "gh",
+                       "url": "https://github.com/login/device"}
+    assert said[1]["code"] == "AB12-CD34"
+    assert said[3]["result"] == {"ok": True, "node": BOX1, "tool": "gh"}
+    assert (signin.dir / "gh-argv").read_text().split() == [
+        "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web",
+        "--skip-ssh-key"]
+    # The tool's own words are kept, on stderr.
+    assert "one-time code" in out.err
+
+
+def test_claude_asks_for_the_code_back_and_gets_the_line_on_stdin(lab, signin, capfd,
+                                                                  monkeypatch):
+    signin.tool("claude", 'echo "If the browser didn\'t open, visit: '
+                          'https://claude.example/oauth?code=true&state=s"\n'
+                          'printf "Paste code here if prompted > "\n'
+                          'read code; echo "$code" > "$(dirname "$0")/../pasted"\n'
+                          'echo "Login successful."\n')
+    monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO("abc#def\n"))
+    lab.m.cmd_node_login(login_args("claude"))
+    said = events(capfd.readouterr().out)
+    assert [e["event"] for e in said] == ["link", "code_needed", "waiting", "done"]
+    assert said[0]["url"] == "https://claude.example/oauth?code=true&state=s"
+    assert (signin.dir / "pasted").read_text() == "abc#def\n"
+
+
+def test_a_sign_in_that_fails_says_why_with_the_tools_exit_code(lab, signin, capfd):
+    signin.tool("codex", 'printf "1. Open this link\\n   \\033[94mhttps://auth.example/'
+                         'device\\033[0m\\n2. Enter this one-time code\\n   '
+                         '\\033[94mWXYZ-23456\\033[0m\\n"\n'
+                         'echo "Error logging in: device code expired" >&2; exit 3\n')
+    with pytest.raises(lab.m.NodeFailure) as failed:
+        lab.m.cmd_node_login(login_args("codex"))
+    said = events(capfd.readouterr().out)
+    assert [e["event"] for e in said] == ["link", "code", "waiting"]
+    assert said[0]["url"] == "https://auth.example/device" and said[1]["code"] == "WXYZ-23456"
+    assert (failed.value.code, failed.value.exit_code) == ("login_failed", 3)
+    assert failed.value.message.endswith("Error logging in: device code expired")
+
+
+def test_cancelling_a_sign_in_stops_the_tool_on_the_node(lab, signin, capfd):
+    import signal
+    import threading
+    signin.tool("gh", 'trap \'echo stopped > "$(dirname "$0")/../stopped"; exit 143\' TERM\n'
+                      'echo "Open this URL: https://github.com/login/device" >&2\n'
+                      'while :; do sleep 0.1; done\n')
+    timer = threading.Timer(1.0, lab.m.os.kill, (lab.m.os.getpid(), signal.SIGTERM))
+    timer.start()
+    try:
+        with pytest.raises(lab.m.NodeFailure) as failed:
+            lab.m.cmd_node_login(login_args("gh"))
+    finally:
+        timer.cancel()
+    assert (failed.value.code, failed.value.exit_code) == ("cancelled", 6)
+    assert (signin.dir / "stopped").read_text() == "stopped\n"
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+WHATSAPP = {"connections": {"device_bound": True, "link": [
+    {"id": "qr", "argv": ["whatsapp", "pair", "--qr", "--events"]},
+    {"id": "code", "argv": ["whatsapp", "pair", "--events"]}]}}
+
+
+def whatsapp_tool(signin, *, live=False, bound=True):
+    connections = {"connections": {"main": {
+        "keys": [{"key": "expected_account_id", "set": bound}],
+        "session": {"live": live, "account": "15550001111" if live else None}}}}
+    signin.tool("whatsapp", f"""case "$1" in
+manifest) echo '{json.dumps(WHATSAPP)}';;
+connections) echo '{json.dumps(connections)}';;
+*) echo "$*" > "$(dirname "$0")/../ceremony"; read number
+   echo '{{"event": "pairing_code", "code": "ABCD-EFGH"}}'; echo "$number" > "$(dirname "$0")/../number"; exit 7;;
+esac
+""")
+
+
+def test_a_device_sign_in_runs_the_capabilitys_ceremony_and_says_the_devices_in_use(
+        lab, signin, capfd, monkeypatch):
+    whatsapp_tool(signin)
+    signin.sessions.append({"capability": "whatsapp", "connection": "main", "live": True,
+                            "account": "15550001111"})
+    signin.sessions.append({"capability": "telegram", "connection": "main", "live": True,
+                            "account": "42"})
+    monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO("15550001111\n"))
+    with pytest.raises(SystemExit) as exited:
+        lab.m.cmd_node_login(login_args("whatsapp", method="code"))
+    said = events(capfd.readouterr().out)
+    assert said == [{"event": "devices", "node": BOX1, "capability": "whatsapp",
+                     "connection": "main", "limit": 4,
+                     "in_use": [{"node": "a1a1a1a1a1a1", "label": "mac",
+                                 "account": "15550001111", "live": True}]},
+                    {"event": "pairing_code", "code": "ABCD-EFGH"}]
+    # The capability's own exit code, its ceremony with the connection, no --recreate.
+    assert exited.value.code == 7
+    assert (signin.dir / "ceremony").read_text().split() == [
+        "pair", "--events", "--connection", "main"]
+    assert (signin.dir / "number").read_text() == "15550001111\n"
+
+
+def test_a_device_sign_in_never_replaces_a_session(lab, signin, capfd):
+    whatsapp_tool(signin, live=True)
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_login(login_args("whatsapp"))
+    assert refused.value.code == "already_signed_in"
+    # Nor takes a connection another node signs in through out from under it.
+    whatsapp_tool(signin, bound=False)
+    signin.sessions.append({"capability": "whatsapp", "connection": "main", "live": True,
+                            "account": "15550001111"})
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_login(login_args("whatsapp"))
+    assert refused.value.code == "connection_unbound"
+    assert "expected_account_id=15550001111" in refused.value.message
+    assert not (signin.dir / "ceremony").exists()
+    assert not events(capfd.readouterr().out)
+
+
+def test_node_login_refuses_what_it_cannot_sign_in(lab, signin, capfd):
+    signin.tool("tasks", "echo '{\"connections\": {}}'\n")
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_login(login_args("tasks"))
+    assert refused.value.code == "not_device_bound"
+    for args in (login_args("gh", events=False), login_args(None),
+                 login_args("gh", connection="main"), login_args("Bad Tool")):
+        with pytest.raises(lab.m.NodeFailure) as refused:
+            lab.m.cmd_node_login(args)
+        assert refused.value.code == "input"
 
 
 def update_args(**extra):
