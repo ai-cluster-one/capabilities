@@ -140,10 +140,11 @@ def fresh_schema():
 
 def rows(conn, schema: str, table: str) -> list[tuple]:
     """Every row of `table`, without the worker and profile versions and the
-    node a raise records, which the previous store never held."""
+    node a raise records, and the line a task is on, which the previous store
+    never held."""
     found = conn.execute(f"select * from {schema}.{table} order by id")
     kept = [at for at, column in enumerate(found.description)
-            if column.name not in ("worker_id", "profile_id", "node")]
+            if column.name not in ("worker_id", "profile_id", "node", "line")]
     return [tuple(row[at] for at in kept) for row in found.fetchall()]
 
 
@@ -209,7 +210,7 @@ def test_the_tables_are_declared_for_the_contracts_migrate():
                                                     "0002-tables", "0003-workers",
                                                     "0004-profiles", "0005-workers-history",
                                                     "0006-execution-node", "0007-hooks", "0008-workers-announce",
-                            "0009-change-versions", "0010-service-presence"]
+                            "0009-change-versions", "0010-service-presence", "0011-lines"]
     owner, profile_steps, _major, _minor = mod._profile_tables()
     assert owner == "harness" and [one for one, _sql in profile_steps] == ["0001-profiles"]
     assert (major, minor) == (mod.STORE_MAJOR, mod.STORE_MINOR)
@@ -224,12 +225,12 @@ def test_a_fresh_store_gets_every_table_under_the_tasks_prefix(fresh_schema):
     done = migrate(fresh_schema)
     assert done.applied == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                             "0004-profiles", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
-                            "0009-change-versions", "0010-service-presence"]
+                            "0009-change-versions", "0010-service-presence", "0011-lines"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == [
             "harness_profiles", "schema_ledger", "schema_version", "tasks_activities",
-            "tasks_changes", "tasks_executions", "tasks_hooks", "tasks_presences",
-            "tasks_tasks", "tasks_workers"]
+            "tasks_changes", "tasks_executions", "tasks_hooks", "tasks_line_states",
+            "tasks_lines", "tasks_presences", "tasks_tasks", "tasks_workers"]
         assert conn.execute("select to_regnamespace('tasks')").fetchone()[0] is None
     assert migrate(fresh_schema).applied == []
 
@@ -245,7 +246,7 @@ def test_the_previous_store_is_moved_whole_into_the_bound_schema(old_store):
     done = migrate(old_store)
     assert done.applied == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                             "0004-profiles", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
-                            "0009-change-versions", "0010-service-presence"]
+                            "0009-change-versions", "0010-service-presence", "0011-lines"]
 
     with raw() as conn:
         for old, new in TABLES.items():
@@ -287,7 +288,9 @@ def test_a_moved_store_and_a_fresh_one_are_the_same_store(old_store, fresh_schem
     assert {name for name, _def in moved["functions"]} == {
         "tasks_touch_updated_at", "tasks_notify_claimable", "tasks_notify_watch",
         "tasks_workers_keep_history", "tasks_hooks_keep_history",
-        "tasks_hooks_notify_declaration", "tasks_workers_notify_declaration"}
+        "tasks_hooks_notify_declaration", "tasks_workers_notify_declaration",
+        "tasks_lines_keep_history", "tasks_lines_one_line_per_worker",
+        "tasks_lines_notify_declaration", "tasks_line_states_notify"}
     assert all(name.startswith("tasks_") for _table, name, _kind, _def in moved["constraints"])
     assert all(name.startswith("tasks_") for _table, name, _def in moved["triggers"])
 
@@ -460,7 +463,7 @@ def test_migrate_status_then_migrate_then_status(tmp_path, fresh_schema):
                                                                  "pending")
     assert first["pending"] == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                                 "0004-profiles", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
-                            "0009-change-versions", "0010-service-presence"]
+                            "0009-change-versions", "0010-service-presence", "0011-lines"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == []
     done = cli(lab, "migrate")
@@ -469,7 +472,7 @@ def test_migrate_status_then_migrate_then_status(tmp_path, fresh_schema):
                                                   "0002-tables", "0003-workers",
                                                   "0004-profiles", "0005-workers-history",
                                                   "0006-execution-node", "0007-hooks", "0008-workers-announce",
-                            "0009-change-versions", "0010-service-presence"]
+                            "0009-change-versions", "0010-service-presence", "0011-lines"]
     # The library's table went first, under its own ledger, and said so.
     assert json.loads(done.stderr.strip().splitlines()[0]) == {"migrated": {
         "owner": "harness", "schema": fresh_schema, "applied": ["0001-profiles"]}}
@@ -496,7 +499,7 @@ def test_an_ordinary_call_brings_missing_tables_up_once(tmp_path, fresh_schema):
                                   "applied": ["0001-move-from-schema-tasks", "0002-tables",
                                               "0003-workers", "0004-profiles",
                                               "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
-                            "0009-change-versions", "0010-service-presence"]}}]
+                            "0009-change-versions", "0010-service-presence", "0011-lines"]}}]
     again = cli(lab, "list")
     assert again.returncode == 0 and again.stderr == ""
 

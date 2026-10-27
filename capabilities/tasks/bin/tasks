@@ -61,6 +61,18 @@ READING
   tasks hooks show <name> [--version ID]
                                   one hook whole, its body included
   tasks hooks history <name>      every version of it, oldest first
+  tasks lines list                this project's lines: each active one with its
+                                  description and its workers, in order
+  tasks lines show <line> [--version ID]
+                                  one line whole, and `text`, the document a
+                                  save takes
+  tasks lines history <line>      every version of it, oldest first
+  tasks lines status [<line>] [--json]
+                                  each line's state and its workers in order,
+                                  and for each worker how many tasks are due to
+                                  it, its raises running now with their node,
+                                  and its oldest due task with its wait. See
+                                  LINES
   tasks profiles list             the harness profiles this project's workers
                                   can name, each as it resolves
   tasks profiles show <name> [--version ID] [--global]
@@ -96,6 +108,12 @@ WRITING  (needs allow_write on the connection; exit 4 otherwise)
                                                 first needs --description. See
                                                 HOOKS
   tasks hooks retire <name> [--base ID]         take a hook out of the project
+  tasks lines save <line> <file|-> [--base ID]  save a line's new version; see
+                                                LINES
+  tasks lines retire <line> [--base ID]         take a line out of the project
+  tasks lines pause <line> --reason TEXT        start no new turn on its workers,
+                                                on every service of the project
+  tasks lines resume <line>                     let them start turns again
   tasks profiles save <name> <file|-> [--base ID] [--global]
                                                 save a profile's new version;
                                                 see PROFILES
@@ -327,6 +345,8 @@ WORKERS
                                   # turn is one that never started
     park_hint: one sentence added to the handback, or the escalation, at the
                                   `attempts` ceiling
+    max_parallel: 1               # optional; turns of this worker the service
+                                  # runs at once - see SERVICE
     hooks:                        # optional, either or both - see HOOKS
       before: [lane-check, quota]         # stored hooks, asked before a claim
       after: scripts/follow.sh            # a command line, told how each
@@ -691,6 +711,64 @@ HOOKS
   of it: a task's time held back counts again only from a hold after the
   moment. The worker's `after` hook may hold the lane longer, never shorter.
 
+LINES
+  A line is a named conveyor: the group of workers that produces one kind of
+  result. It is kept in the store, in the project it belongs to, as versions
+  the way a worker is: one row per version and one active version per name. It
+  is written as a YAML document and saved by its name with `tasks lines save
+  <line> <file>`:
+
+    description: one sentence     # what this line produces
+    workers: [triage, build, review]   # its workers, in order
+
+  Any other key is refused, exit 6 `line_invalid`, and so is a name given
+  twice or a list naming none. A line is the one place a worker's line is
+  said: a worker names no line. The store refuses a worker that another active
+  line of the project already names, exit 6 `conflict`. A worker no line names
+  is on the default line, `default`, which is no saved line and holds every
+  worker of a project that declares none; such a project works as it always
+  did. A worker named that the project does not have yet is a warning.
+
+  A save identical to the active version creates none and answers `created:
+  false`; otherwise it replaces the version `--base ID` names, or the one
+  active at the save, and is refused, exit 6 `conflict`, when another save
+  came first. `retire` clears the active version, and its workers are on the
+  default line again. No version is ever edited or deleted, so `history`
+  shows every one. `show` answers `spec` and `text`, the document a save takes.
+  Nothing working under a raise saves or retires a line, exit 4 `policy`. A
+  save or a retire is announced by the store as a worker's is, and a running
+  service takes it up with no reload.
+
+  A task carries `line`, null on the default line, which `add --line` and `set
+  --line` write (FIELDS). A worker's claim takes only the tasks of its own
+  line - `run`, `run --key`, the service's turns, and what `run` without
+  --apply reports - with its assignee and `takes` narrowing as ever inside the
+  line; a task named with --key on another line is refused, exit 6. A claim
+  by hand with `tasks claim` names no worker and reads no line. A task another
+  project assigned here by a grant is taken by the worker whose grant names
+  that project, whatever line it carries there, and the task taking it in
+  lands on that worker's line as anything a turn creates does. `doctor` does
+  not count two workers on two lines as taking the same task.
+
+  `tasks lines pause <line> --reason TEXT` holds a line - a saved one or
+  `default` - in the store: no service of the project, on any machine, starts
+  a new turn on a worker of it, and turns already running finish. `tasks lines
+  resume <line>` lets it run again. The state is a row of its own, not a
+  version of the line, with who set it, when, and why; a running service
+  follows it within a second, with no reload. It is the store-wide hold, and
+  `tasks service pause` is the hold on this machine only: a service starts no
+  new turn on a worker either one holds. `tasks run <worker> --apply` by hand
+  is held by neither.
+
+  `tasks lines status [<line>]` is the congestion read, a JSON answer as every
+  answer is: for each line, the saved ones and then `default`, its `state`
+  (`running` or `paused`, with `reason`, `set_by` and `set_at` once set), its
+  `description`, and its `workers` in order, each with `due`, how many tasks
+  its claim would select now; `running`, its raises whose lease is live, each
+  with its task and `node`; and `oldest_due`, the due task that has waited
+  longest, with `due_since` and the wait. A worker the project does not have,
+  or cannot read, carries `problem` instead.
+
 ESCALATION
   A project names, in the `escalation` table of its tasks settings (the
   project's service/config.toml, or its rows for an agent whose records moved
@@ -862,9 +940,10 @@ SERVICE
                                   lift the pause, on every lane or on the named
                                   lanes
   tasks service status            the lanes, the running turns, the pause, the
-                                  next wake and the store connections; for each
-                                  paused lane, `pause.waited`: its oldest due
-                                  task and how long it has waited
+                                  lines paused in the store, the next wake and
+                                  the store connections; for each paused lane,
+                                  `pause.waited`: its oldest due task and how
+                                  long it has waited
   tasks service logs [--tail 100] the end of the service log
   tasks service harness [--json]  the harness tools (claude, codex) of every
                                   lane's profile, resolved as a turn resolves
@@ -986,6 +1065,9 @@ SERVICE
     [lanes.implementation]        # one table per worker, by its name
     max_parallel = 1              # turns of this worker at once; default 1
 
+  A worker's own `max_parallel` (WORKERS) is how many of its turns run at
+  once; a `[lanes.<worker>]` table is read as that cap only while the worker
+  names none, and `doctor` and `service doctor` name such a table.
   Any other key is refused, and so is a lane naming no worker declared here. A
   worker this capability cannot read refuses the whole declaration, as
   `doctor` does. A lane whose turn takes nothing, or fails before claiming,
@@ -1076,6 +1158,15 @@ SERVICE
   paused service still answers `service doctor` ok, so a supervisor probing it
   does not restart it. `tasks run <worker> --apply` by hand is not held by the
   pause. Under the read-only switch both verbs are refused.
+
+  That pause holds this machine only. A line paused in the store with `tasks
+  lines pause` (LINES) holds every service of the project, and the daemon
+  starts no new turn on a worker of it either, reading it as it starts, at
+  every poll, and within a second of the store announcing it. `service
+  status` and `service doctor` show both: `pause`, this machine's, and
+  `line_pause`, the lines the store holds paused now and the lanes they hold,
+  with the daemon's own reading under `daemon`; and each lane a hold covers
+  says which under `held_by`, `service_pause`, `line_pause` or both.
 
   `init`, `start` and `run` need tasks enabled for this project itself;
   enabled globally is not asking for a daemon here. `start` and `run` need a
@@ -1313,6 +1404,14 @@ FIELDS  (add and set take the same set)
                         it; the claim scan escalates a task that keeps one (see
                         DEAD ENDS). `show` and every `list` and `search` row
                         print it as the task's `blocked_by`.
+  --line NAME           the line the task is worked on (LINES): a line of this
+                        project, or `default`, the line of every worker no line
+                        names, which a task naming none is on. A claim by a
+                        worker takes only its own line's tasks. `add` by a
+                        worker lands on that worker's line, and a worker's `set
+                        --line`, or its `add` on another line, is refused unless
+                        its `writes` grants `line` (WORKER SCOPE). Refused with
+                        exit 3 for a name that is no line here.
   --clear FIELD         empty a field outright; repeatable. Clearable: objective,
                         description, assignee, pickup, unique-key, blocked-by.
                         Type, title and status cannot be cleared. A field not
@@ -1460,8 +1559,9 @@ WORKER SCOPE
     metadata    the metadata keys it may write over or remove; `blocked_by`
                 among them answers for the task's `blocked_by` field
     tags        the tags it may remove
+    line        the lines it may put a task on: `default` or a line's name
 
-  `new` names status, type, assignee and pickup only. Two rules read it, and
+  `new` names status, type, assignee, pickup and line only. Two rules read it, and
   only two: a field a scope does not list may not be written in that scope,
   and `"*"` - alone or in the list - means any value, emptying a field
   included. Adding is never configured and always allowed, on every task: an
@@ -1938,7 +2038,7 @@ SETTINGS = {'homes': [{'scope': 'project',
            'scope': 'machine',
            'apply': 'reload'}]}
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
-               "release", "run", "workers", "profiles", "hooks"}
+               "release", "run", "workers", "profiles", "hooks", "lines"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/tasks/guides/")
@@ -3266,8 +3366,8 @@ _WORKER_HINT = ("a worker records what it found on the task - an activity, a tag
 # worker scope answers for in each. `add` creates, so it removes nothing, and
 # names no tags or metadata to take away.
 _WRITE_SCOPES = ("held", "other", "new")
-_WRITE_FIELDS = ("status", "type", "assignee", "pickup", "metadata", "tags")
-_NEW_FIELDS = ("status", "type", "assignee", "pickup")
+_WRITE_FIELDS = ("status", "type", "assignee", "pickup", "metadata", "tags", "line")
+_NEW_FIELDS = ("status", "type", "assignee", "pickup", "line")
 ANY = "*"
 
 # The fence a worker whose file declares no `writes` is held to, in the language
@@ -3294,7 +3394,12 @@ _CLAIMED_FROM = "claimed_from"
 # save - and those stay the holder's alone whatever a file declares.
 _OP_FIELDS = {"status": "status", "type": "type", "assignee": "assignee",
               "pickup": "pickup", "untag": "tags", "meta-rm": "metadata",
-              "meta-overwrite": "metadata", "set": None}
+              "meta-overwrite": "metadata", "line": "line", "set": None}
+
+_WORKER_LINE_REFUSAL = ("a worker may not move a task to another line, or create one "
+                        "on a line other than its own, unless its `writes` grants "
+                        "`line`; which line work runs on is a person's or the "
+                        "supervisor's decision")
 
 
 def _permits(allowed, value) -> bool:
@@ -3342,6 +3447,8 @@ def _default_refusal(kind: str, scope: str, value: str | None) -> str:
                 "only the task its raise names")
     if kind == "type":
         return _WORKER_TYPE_REFUSAL
+    if kind == "line":
+        return _WORKER_LINE_REFUSAL
     return _WORKER_HELD_ONLY["set" if kind in ("assignee", "pickup") else kind]
 
 
@@ -3362,6 +3469,7 @@ def _declared_refusal(kind: str, scope: str, value: str | None, allowed) -> str:
                     else f"remove metadata from {where}"),
         "meta-overwrite": (f"write over the metadata key {value} on {where}" if value
                            else f"write over metadata on {where}"),
+        "line": f"put {where} on line {value or DEFAULT_LINE}",
     }[kind]
     rule = (f"its worker's `writes.{scope}.{field}` allows only "
             f"{', '.join(allowed)}" if isinstance(allowed, list) and allowed
@@ -3477,7 +3585,8 @@ def _execution_lookup(cur):
 
     def lookup(execution_id: str) -> dict | None:
         if execution_id not in seen:
-            cur.execute(f"""select id, task_id, status, to_jsonb(e) -> 'metrics' as metrics
+            cur.execute(f"""select id, task_id, status, worker,
+                                   to_jsonb(e) -> 'metrics' as metrics
                               from {SCHEMA}.tasks_executions e
                              where id::text = %s""", (execution_id,))
             rows = _rows(cur)
@@ -3487,12 +3596,51 @@ def _execution_lookup(cur):
     return lookup
 
 
+def _line_named(cur, project: str, given: str) -> str | None:
+    """The line `--line` names, as the task's `line` stores it: None for the
+    default line, else an active line of this project. Exits on any other."""
+    given = given.strip()
+    if given == DEFAULT_LINE:
+        return None
+    if not _WORKER_NAME.fullmatch(given):
+        _die(6, "input", f"{given!r} is not a line name: lowercase letters, digits, "
+             "`-` and `_`, starting with a letter or digit")
+    cur.execute(f"""select 1 from {SCHEMA}.tasks_lines
+                     where project_id = %s and name = %s and active""", (project, given))
+    if not cur.fetchone():
+        _die(3, "not_found", f"no line named {given!r} in this project",
+             f"`{NAME} lines list` shows this project's lines; `{DEFAULT_LINE}` is the "
+             "line of every worker no line names")
+    return given
+
+
+def _created_on_line(lookup, given: str | None, named: str | None) -> str | None:
+    """The line a task a worker creates lands on: the line of the worker its
+    raise names, unless `--line` named another, which its `new` scope must
+    grant. `given` is what --line said, or None; `named` is that line as
+    stored."""
+    row = lookup(_worker_execution())
+    try:
+        own = _line_of(row["worker"]) if row and row.get("worker") else None
+    except Refusal as refused:
+        _die(refused.exit_code, refused.code, refused.message, refused.hint)
+    if given is None or named == own:
+        return own
+    writes = _bound_writes(row)
+    allowed = _write_scope(DEFAULT_WRITES if writes is None else writes, "new").get("line")
+    if not _permits(allowed, named or DEFAULT_LINE):
+        _die(4, "policy", _WORKER_LINE_REFUSAL if writes is None
+             else _declared_refusal("line", "new", named or DEFAULT_LINE, allowed),
+             _WORKER_HINT)
+    return named
+
+
 def cmd_add(entry, args: list[str]) -> None:
     """Create one task. `--key` makes it re-runnable: a key this project already
     holds creates nothing, changes nothing, and reports the task that holds it. A
     key is unique within a project, so another project holding it is no reason
     to refuse."""
-    opts = _flags(args, _SCALARS + ("key", "actor", "blocked-by"))
+    opts = _flags(args, _SCALARS + ("key", "actor", "blocked-by", "line"))
     if not opts.get("type") or not opts.get("title"):
         _die(6, "input", "add needs --type and --title",
              "the goal belongs in --objective, the reasoning in --description")
@@ -3527,8 +3675,17 @@ def cmd_add(entry, args: list[str]) -> None:
             # believe what it sent. The name a wait needs is asked after the
             # coercion, so a `waiting` that became a draft is not refused for an
             # assignee a draft does not need.
-            coerced = _worker_new(values, _execution_lookup(cur))
+            lookup = _execution_lookup(cur)
+            coerced = _worker_new(values, lookup)
             _wait_has_a_name(values["status"], values.get("assignee"))
+        # The line it is worked on: the one --line names, and for a worker its
+        # own unless its `new` scope grants another. The default line is null.
+        line = (_line_named(cur, values["project_id"], opts["line"])
+                if "line" in opts else None)
+        if worker:
+            line = _created_on_line(lookup, opts.get("line"), line)
+        if line is not None:
+            values["line"] = line
         # A task is created where it can move: never in progress, which only a
         # claim writes, and never open on a worker that does not take it there.
         if values["status"] == "in_progress":
@@ -3555,6 +3712,8 @@ def cmd_add(entry, args: list[str]) -> None:
         row = _rows(cur)[0]
         conn.commit()
         answer = {"created": row["id"], **{k: row[k] for k in ("type", "title", "status")}}
+        if values.get("line"):
+            answer["line"] = values["line"]
         if coerced:
             answer["coerced"] = coerced
         _emit(_accepted(answer, judged))
@@ -3576,7 +3735,7 @@ def cmd_set(entry, args: list[str]) -> None:
     project a task is assigned to may make on another project's task. Handing a
     waiting task back or on from there returns it to `todo` at once, so the
     project that raised it picks it up."""
-    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor", "blocked-by"),
+    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor", "blocked-by", "line"),
                   multi=("clear",), takes=1)
     if not opts["_loose"]:
         _die(6, "input", "set needs a task", f"{NAME} set <uuid|unique_key> [fields]")
@@ -3594,7 +3753,7 @@ def cmd_set(entry, args: list[str]) -> None:
         values[_COLUMN[field]] = [] if field == "blocked-by" else None
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0], writing=True,
-                       answering=list(values) == ["assignee"])
+                       answering=list(values) == ["assignee"] and "line" not in opts)
         lookup = _execution_lookup(cur)
         if "status" in values:
             _worker_gate(f"status:{values['status']}", tid, lookup)
@@ -3604,6 +3763,11 @@ def cmd_set(entry, args: list[str]) -> None:
             _worker_gate(f"assignee:{values['assignee'] or ''}", tid, lookup)
         if "pickup_at" in values:
             _worker_gate("pickup", tid, lookup)
+        if "line" in opts:
+            # Moving a task to another line is a person's or the supervisor's:
+            # a worker does it only where its `writes` grants `line`.
+            _worker_gate(f"line:{opts['line'].strip()}", tid, lookup)
+            values["line"] = _line_named(cur, _writing_project(), opts["line"])
         if values.get("blocked_by") == []:
             # Emptying the blockers removes them whatever the task carries, so
             # it is judged before the task is read; giving blockers is judged
@@ -3614,7 +3778,7 @@ def cmd_set(entry, args: list[str]) -> None:
         # one answers for the rest of the verb rather than leaving a field
         # nobody asked about open on somebody else's task.
         if not values or set(values) - {"status", "type", "assignee", "pickup_at",
-                                        "blocked_by"}:
+                                        "blocked_by", "line"}:
             _worker_gate("set", tid, lookup)
         # Only a claim puts a task in progress, because only a claim opens the
         # raise that holds it there; a worker's own fence already refuses it.
@@ -4193,6 +4357,11 @@ def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, l
         clauses += ["project_id = any(%s)", "assignee = %s",
                     f"not {_taken_in_clause(f'{SCHEMA}.tasks_tasks')}"]
         params = [*params, list(granted), project, project]
+    if "line" in opts and granted is None:
+        # A worker's claim takes only its own line's tasks, null being the
+        # default line's; a claim by hand names no worker and reads no line.
+        clauses.append("line is not distinct from %s")
+        params = [*params, opts["line"]]
     if opts.get("only_id"):
         # The one task a worker's `before` hook let through: the claim takes it
         # only while every other condition of the ask still holds.
@@ -4333,6 +4502,12 @@ def _key_refusal(task: dict, due: bool, opts: dict,
                     "on this one's trail and by handing its assignee back")
     elif accept is not None:
         accept = [entry for entry in accept if entry.get("accepts_from") is None]
+    if "line" in opts and not (owner and PROJECT and owner != PROJECT) \
+            and task.get("line") != opts["line"]:
+        return (f"{key} is on line {task.get('line') or DEFAULT_LINE}, and worker "
+                f"{opts.get('worker')!r} is on line {opts['line'] or DEFAULT_LINE}",
+                f"a worker takes only its own line's tasks; `{NAME} set {key} --line "
+                "<line>` moves the task, or run a worker of its line")
     statuses = (sorted({one for entry in accept for one in entry["status"]})
                 if accept else ["todo"])
     if task["status"] not in statuses:
@@ -4842,7 +5017,8 @@ DEFAULT_WORKER = "default"
 # The keys a worker's front matter may carry. Anything else is refused: a key
 # nothing reads is a declaration doing nothing, and it reads as if it did.
 _WORKER_KEYS = ("enabled", "description", "takes", "tags", "assignee", "on_request",
-                "writes", "profile", "routines", "limits", "park_hint", "hooks")
+                "writes", "profile", "routines", "limits", "park_hint", "hooks",
+                "max_parallel")
 
 # A worker's hooks: commands of the project's own that `run` starts around a
 # turn, and the seconds each may take. `before` is asked about each task a claim
@@ -6148,8 +6324,12 @@ def _unimported_refusal(files: list[Path]) -> tuple:
 
 # The active worker rows this process read, per schema and project. A command
 # reads them once; the service reads them again whenever it fingerprints or
-# loads its declaration, so a reload takes the versions saved since.
+# loads its declaration, so a reload takes the versions saved since. The active
+# line rows are read with them, in the same transaction, since a line is where
+# a worker's membership is kept: what a worker is and which line it is on are
+# read as one answer.
 _WORKER_ROWS: dict = {}
+_LINE_ROWS: dict = {}
 
 
 def _stored_workers(fresh: bool = False, waiting: bool | None = None) -> list[dict]:
@@ -6177,13 +6357,58 @@ def _stored_workers(fresh: bool = False, waiting: bool | None = None) -> list[di
                 rows = [dict(row) for row in cur.fetchall()]
             except psycopg.errors.UndefinedTable:
                 rows = []
+                conn.rollback()
+            try:
+                cur.execute(f"""select id, name, spec, created_at, created_by
+                                  from {SCHEMA}.tasks_lines
+                                 where project_id = %s and active
+                                 order by name""", (project,))
+                lines = [dict(row) for row in cur.fetchall()]
+            except psycopg.errors.UndefinedTable:
+                lines = []
             conn.rollback()
         _WORKER_ROWS[key] = rows
+        _LINE_ROWS[key] = lines
     return _WORKER_ROWS[key]
 
 
 def _forget_workers() -> None:
     _WORKER_ROWS.pop((SCHEMA, PROJECT), None)
+    _LINE_ROWS.pop((SCHEMA, PROJECT), None)
+
+
+# The line every worker no active line names is on, and the name a task's null
+# line is read and written as.
+DEFAULT_LINE = "default"
+
+
+def _stored_lines(fresh: bool = False, waiting: bool | None = None) -> list[dict]:
+    """Every active line version of this project, by name, read with its
+    workers by `_stored_workers`. A process outside any project has none, and
+    so does a store whose tables do not hold lines yet. Raises Refusal."""
+    if not PROJECT:
+        return []
+    key = (SCHEMA, PROJECT)
+    if fresh or key not in _LINE_ROWS:
+        _stored_workers(fresh=True, waiting=waiting)
+        # A reading of workers that is not the store's own holds no lines.
+        _LINE_ROWS.setdefault(key, [])
+    return _LINE_ROWS[key]
+
+
+def _line_workers(spec) -> list[str]:
+    """The workers a line's spec names, in its order."""
+    named = spec.get("workers") if isinstance(spec, dict) else None
+    return [str(one) for one in named] if isinstance(named, list) else []
+
+
+def _line_of(name: str) -> str | None:
+    """The active line this project names the worker on, or None for the
+    default line. Raises Refusal."""
+    for row in _stored_lines():
+        if name in _line_workers(row["spec"]):
+            return row["name"]
+    return None
 
 
 # The active hook rows this process read, per schema and project, read once by
@@ -6783,6 +7008,24 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
         wrong("its `park_hint` is one sentence")
         hint = ""
 
+    # How many turns of this worker the service runs at once. Unsaid, the
+    # service settings' `[lanes.<worker>] max_parallel` still answers, then 1.
+    parallel = settings.get("max_parallel")
+    if parallel is not None and (isinstance(parallel, bool) or not isinstance(parallel, int)
+                                 or parallel < 1):
+        wrong("its `max_parallel` is a whole number of at least 1")
+        parallel = None
+
+    # The line is the line's to say, never the worker's: the active line that
+    # names it, or the default line. A project that declares no line has one
+    # line holding every worker, and its worker carries none, so its claims
+    # read no line at all, as they always did.
+    try:
+        line = {"line": _line_of(name)} if _stored_lines() else {}
+    except Refusal as refused:
+        wrong(f"the line it is on could not be read: {refused.message}")
+        line = {}
+
     body = body.strip()
     if enabled and not body:
         wrong("its body is empty: the body is the worker's instruction")
@@ -6799,6 +7042,7 @@ def _read_worker(name: str, found: dict) -> tuple[dict | None, list[tuple]]:
             "profile": profile, "knobs": knobs, "profile_source": origin,
             "routines": routines, "limits": limits, "park_hint": hint.strip(),
             "hooks": hooks, "body": body, "missing": missing, "deprecated": deprecated,
+            "max_parallel": parallel, **line,
             "handler": _handler(profile) if profile is not None else None}, []
 
 
@@ -7000,13 +7244,19 @@ def _worker_filters(worker: dict, declared: dict) -> list[dict]:
 def _overlaps(enabled: list[dict], declared: dict) -> list[tuple[dict, dict, str]]:
     """Every pair of enabled workers whose filters could select the same task,
     with the sentence that refuses it. A task is taken by exactly one enabled
-    worker; two filters naming a type in common read as they always have."""
+    worker; two filters naming a type in common read as they always have.
+    Workers on two lines never select the same task of this project, since a
+    claim takes only its own line's; their grants still meet."""
     found: list = []
     for at, one in enumerate(enabled):
         for other in enabled[at + 1:]:
             said: list[str] = []
+            apart = one.get("line") != other.get("line")
             for mine in _worker_filters(one, declared):
                 for theirs in _worker_filters(other, declared):
+                    if apart and (mine.get("accepts_from") is None
+                                  or theirs.get("accepts_from") is None):
+                        continue
                     if not _could_share(mine, theirs):
                         continue
                     shared = sorted(set(mine.get("type") or []) & set(theirs.get("type") or []))
@@ -7486,6 +7736,377 @@ def _import_workers_unasked() -> None:
         "commit": "the removed files are deletions for this project to commit"}},
         ensure_ascii=False) + "\n")
     sys.stderr.flush()
+
+
+# --- Lines --------------------------------------------------------------------
+
+# A line is a named conveyor: the ordered group of workers that produces one kind
+# of result. It is kept as versions the way a worker is - a save guarded on the
+# version the writer read, an identical save creating none, a retire clearing
+# `active` - and it is the one place a worker's line is said. Whether a line
+# runs or is paused is a row of `tasks_line_states`, written in place, which
+# every service of the project follows.
+
+_LINE_KEYS = ("description", "workers")
+_LINE_STATES = ("running", "paused")
+
+
+def _parse_line(text: str, where: str) -> dict:
+    """A line document - YAML with `description` and `workers` - as the spec a
+    save stores, or the Refusal saying why it is none."""
+    import yaml
+    try:
+        spec = yaml.safe_load(text) if text.strip() else None
+    except yaml.YAMLError as exc:
+        raise Refusal(6, "line_invalid", f"{where} could not be read: {exc}")
+    if not isinstance(spec, dict):
+        raise Refusal(6, "line_invalid",
+                      f"{where}: a line is a mapping of `description` and `workers`")
+    wrong: list[str] = []
+    for unknown in sorted(set(map(str, spec)) - set(_LINE_KEYS)):
+        wrong.append(f"it names {unknown!r}, which nothing reads")
+    description = spec.get("description")
+    if not isinstance(description, str) or not description.strip():
+        wrong.append("its `description` is one sentence saying what this line produces")
+    workers = spec.get("workers")
+    if (not isinstance(workers, list) or not workers
+            or not all(isinstance(one, str) for one in workers)):
+        wrong.append("its `workers` is the list of the workers on it, in order, "
+                     "naming one at least")
+        workers = []
+    for one in workers:
+        if not _WORKER_NAME.fullmatch(one):
+            wrong.append(f"{one!r} is not a worker name")
+    twice = sorted({one for one in workers if workers.count(one) > 1})
+    if twice:
+        wrong.append(f"it names {', '.join(map(repr, twice))} more than once")
+    if wrong:
+        raise Refusal(6, "line_invalid", f"{where}: " + "; ".join(wrong),
+                      f"`{NAME} help` LINES states the shape")
+    return {"description": description.strip(), "workers": list(workers)}
+
+
+def _line_text(spec: dict) -> str:
+    import yaml
+    return yaml.safe_dump(spec, sort_keys=False, allow_unicode=True)
+
+
+def _line_answer(row: dict, *, whole: bool = True) -> dict:
+    answer = {"line": row["name"], "version": str(row["id"]), "active": row["active"],
+              "created_at": _stamp(row["created_at"]), "created_by": row["created_by"]}
+    if whole:
+        answer.update(spec=row["spec"], text=_line_text(row["spec"]))
+    return answer
+
+
+def _active_line(cur, project: str, name: str, lock: bool = False) -> dict | None:
+    cur.execute(f"""select * from {SCHEMA}.tasks_lines
+                     where project_id = %s and name = %s and active
+                     {"for update" if lock else ""}""", (project, name))
+    rows = _rows(cur)
+    return rows[0] if rows else None
+
+
+def _save_line_version(cur, project: str, name: str, spec: dict,
+                       base: str | None) -> tuple[dict, bool]:
+    """Save one line version inside the caller's transaction, and whether one
+    was created, as `_save_version` saves a worker's. The store refuses a worker
+    another active line of the project already names."""
+    import psycopg
+    active = _active_line(cur, project, name, lock=True)
+    if base is not None and (active is None or str(active["id"]) != base):
+        _die(6, "conflict",
+             f"line {name!r} is no longer at version {base}: "
+             + (f"{active['id']} is active" if active else "it has no active version"),
+             f"read it again with `{NAME} lines show {name}` and save over that")
+    if active and active["spec"] == spec:
+        return active, False
+    if active:
+        cur.execute(f"""update {SCHEMA}.tasks_lines set active = false
+                         where id = %s and active""", (str(active["id"]),))
+        if cur.rowcount != 1:
+            _die(6, "conflict", f"line {name!r} was saved by someone else first",
+                 f"read it again with `{NAME} lines show {name}`")
+    try:
+        cur.execute(f"""insert into {SCHEMA}.tasks_lines
+                          (project_id, name, spec, active, created_by)
+                        values (%s, %s, %s::jsonb, true, %s)
+                        returning *""",
+                    (project, name, json.dumps(spec), _actor()))
+    except psycopg.errors.UniqueViolation:
+        _die(6, "conflict", f"line {name!r} was saved by someone else first",
+             f"read it again with `{NAME} lines show {name}`")
+    except psycopg.errors.ExclusionViolation as exc:
+        _die(6, "conflict", exc.diag.message_primary or str(exc),
+             f"take the worker off that line first; `{NAME} lines list` shows every line")
+    return _rows(cur)[0], True
+
+
+def _lines_write_gate(action: str) -> None:
+    """A line says which tasks its workers claim, so nothing working under a
+    raise changes one, as nothing there changes a worker."""
+    if _worker_execution():
+        _die(4, "policy",
+             f"`lines {action}` is refused under a raise: a line decides which tasks "
+             "its workers claim, and a turn does not redraw what it is fenced by",
+             "a person saves lines, outside any turn")
+
+
+def _line_states(cur, project: str) -> dict:
+    """Every line state row of this project, by line."""
+    cur.execute(f"""select line, state, reason, set_by, set_at
+                      from {SCHEMA}.tasks_line_states where project_id = %s""", (project,))
+    return {row["line"]: {"state": row["state"], "reason": row["reason"],
+                          "set_by": row["set_by"], "set_at": _stamp(row["set_at"])}
+            for row in _rows(cur)}
+
+
+def _paused_lines(cur, project: str) -> dict:
+    """The lines of this project a pause holds, by line, each with its reason,
+    who set it and when: the store-wide hold every service honours."""
+    return {line: {k: v for k, v in state.items() if k != "state"}
+            for line, state in _line_states(cur, project).items()
+            if state["state"] == "paused"}
+
+
+def cmd_lines(entry, args: list[str]) -> None:
+    """The project's lines: their definitions kept as versions, whether each
+    runs, and how congested each worker on it is."""
+    opts = _flags(args, **_FORM_ARGS["lines"])
+    loose = opts["_loose"]
+    usage = (f"{NAME} lines list | show <line> [--version ID] | history <line> | "
+             "save <line> <file|-> [--base ID] | retire <line> [--base ID] | "
+             "pause <line> --reason TEXT | resume <line> | status [<line>] [--json]")
+    actions = {"list": (0, 0), "show": (1, 1), "history": (1, 1), "save": (2, 2),
+               "retire": (1, 1), "pause": (1, 1), "resume": (1, 1), "status": (0, 1)}
+    if not loose or loose[0] not in actions:
+        _die(6, "input", "lines needs an action" if not loose
+             else f"unknown lines action {loose[0]!r}", usage)
+    action, rest = loose[0], loose[1:]
+    least, most = actions[action]
+    if not least <= len(rest) <= most:
+        _die(6, "input", f"lines {action} takes {most} argument(s)", usage)
+    if action in ("save", "retire"):
+        _lines_write_gate(action)
+    project = _writing_project()
+    if action == "list":
+        _lines_list(entry, project)
+        return
+    if action == "status":
+        _lines_status(entry, project, rest[0] if rest else None)
+        return
+    name = rest[0]
+    if action in ("pause", "resume"):
+        _line_hold(entry, project, name, action, opts.get("reason"))
+        return
+    if not _WORKER_NAME.fullmatch(name) or name == DEFAULT_LINE:
+        _die(6, "input", f"{name!r} is not a line name: lowercase letters, digits, `-` "
+             f"and `_`, starting with a letter or digit, and not `{DEFAULT_LINE}`, "
+             "the line of every worker no line names")
+    if action == "save":
+        try:
+            spec = _parse_line(_read_input(rest[1]), rest[1])
+        except Refusal as refused:
+            _die(refused.exit_code, refused.code, refused.message, refused.hint)
+        with _connect(entry) as conn, conn.cursor() as cur:
+            cur.execute(f"""select name, spec from {SCHEMA}.tasks_lines
+                             where project_id = %s and active and name <> %s""",
+                        (project, name))
+            for row in _rows(cur):
+                taken = sorted(set(spec["workers"]) & set(_line_workers(row["spec"])))
+                if taken:
+                    conn.rollback()
+                    _die(6, "conflict",
+                         f"worker {taken[0]!r} is on line {row['name']!r} already: a worker "
+                         "is on one line of its project",
+                         f"take it off {row['name']!r} first, with `{NAME} lines save "
+                         f"{row['name']}`")
+            row, created = _save_line_version(cur, project, name, spec, opts.get("base"))
+            conn.commit()
+        answer = {**_line_answer(row, whole=False), "created": created}
+        try:
+            declared = ({row["name"] for row in _stored_workers(fresh=True)}
+                        | {path.stem for path in _shipped_workers_dir().glob("*.md")})
+        except Refusal:
+            declared = None
+        absent = [one for one in spec["workers"] if declared is not None and one not in declared]
+        if absent:
+            answer["warning"] = (f"{', '.join(map(repr, absent))} "
+                                 f"{'is' if len(absent) == 1 else 'are'} no worker of this "
+                                 "project yet; a line names a worker by its name, and holds "
+                                 "it once it is saved")
+        _emit(answer)
+        return
+    with _connect(entry) as conn, conn.cursor() as cur:
+        if action == "retire":
+            active = _active_line(cur, project, name, lock=True)
+            if active is None or (opts.get("base") and str(active["id"]) != opts["base"]):
+                conn.rollback()
+                _die(3 if active is None else 6, "not_found" if active is None else "conflict",
+                     f"line {name!r} has no active version" if active is None
+                     else f"line {name!r} is no longer at version {opts['base']}",
+                     f"`{NAME} lines list` shows this project's lines")
+            cur.execute(f"""update {SCHEMA}.tasks_lines set active = false
+                             where id = %s and active""", (str(active["id"]),))
+            conn.commit()
+            _emit({"line": name, "retired": str(active["id"])})
+            return
+        if action == "history":
+            cur.execute(f"""select * from {SCHEMA}.tasks_lines
+                             where project_id = %s and name = %s
+                             order by created_at asc, id asc""", (project, name))
+            rows = _rows(cur)
+            conn.commit()
+            if not rows:
+                _die(3, "not_found", f"no line named {name!r} was ever saved here",
+                     f"`{NAME} lines list` shows this project's lines")
+            _emit({"line": name, "versions": [_line_answer(r, whole=False) for r in rows]})
+            return
+        if opts.get("version"):
+            cur.execute(f"""select * from {SCHEMA}.tasks_lines
+                             where project_id = %s and name = %s and id::text = %s""",
+                        (project, name, opts["version"]))
+            rows = _rows(cur)
+            row = rows[0] if rows else None
+        else:
+            row = _active_line(cur, project, name)
+        conn.commit()
+    if row is None:
+        _die(3, "not_found", f"no line named {name!r}"
+             + (f" at version {opts['version']}" if opts.get("version") else "") + " here",
+             f"`{NAME} lines list` shows this project's lines")
+    _emit(_line_answer(row))
+
+
+def _lines_list(entry, project: str) -> None:
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select * from {SCHEMA}.tasks_lines
+                         where project_id = %s and active order by name""", (project,))
+        rows = _rows(cur)
+        conn.commit()
+    _emit({"lines": [{"line": row["name"], "version": str(row["id"]),
+                      "description": row["spec"].get("description"),
+                      "workers": _line_workers(row["spec"]),
+                      "updated_at": _stamp(row["created_at"]),
+                      "updated_by": row["created_by"]} for row in rows]})
+
+
+def _line_hold(entry, project: str, name: str, action: str, reason: str | None) -> None:
+    """Pause a line, or let it run again: a row of `tasks_line_states`, which
+    every service of the project follows wherever it runs. A line is a declared
+    one or `default`; a line retired while paused may still be resumed."""
+    reason = (reason or "").strip() or None
+    if action == "pause" and reason is None:
+        _die(6, "input", "lines pause needs --reason",
+             f"{NAME} lines pause <line> --reason TEXT")
+    if action == "resume" and reason is not None:
+        _die(6, "input", "unknown flag --reason", f"{NAME} lines resume <line>")
+    if name != DEFAULT_LINE and not _WORKER_NAME.fullmatch(name):
+        _die(6, "input", f"{name!r} is not a line name")
+    with _connect(entry) as conn, conn.cursor() as cur:
+        known = name == DEFAULT_LINE or _active_line(cur, project, name) is not None
+        before = _line_states(cur, project).get(name)
+        if not known and (action == "pause" or before is None):
+            conn.rollback()
+            _die(3, "not_found", f"no line named {name!r} in this project",
+                 f"`{NAME} lines list` shows this project's lines; `{DEFAULT_LINE}` is the "
+                 "line of every worker no line names")
+        state = "paused" if action == "pause" else "running"
+        cur.execute(f"""insert into {SCHEMA}.tasks_line_states as s
+                          (project_id, line, state, reason, set_by)
+                        values (%s, %s, %s, %s, %s)
+                        on conflict (project_id, line) do update
+                           set state = excluded.state, reason = excluded.reason,
+                               set_by = excluded.set_by, set_at = now()
+                        returning state, reason, set_by, set_at""",
+                    (project, name, state, reason, _actor()))
+        row = _rows(cur)[0]
+        conn.commit()
+    _emit({"line": name, "state": row["state"], "reason": row["reason"],
+           "set_by": row["set_by"], "set_at": _stamp(row["set_at"]),
+           "changed": (before or {}).get("state", "running") != row["state"]})
+
+
+def _running_raises(cur, worker: str, project: str) -> list[dict]:
+    """The raises of this worker of this project running now: open, their lease
+    still live, each with the node it runs on."""
+    cur.execute(f"""select e.id, e.task_id, t.unique_key, e.node, e.started_at,
+                           e.lease_until
+                      from {SCHEMA}.tasks_executions e
+                      join {SCHEMA}.tasks_tasks t on t.id = e.task_id
+                     where {_raised_here_clause('e', 't')} and e.worker = %s
+                       and e.status = 'running' and {_a_raise()}
+                       and (e.lease_until is null or e.lease_until >= now())
+                     order by e.started_at""", (project, project, worker))
+    return [{"execution": str(row["id"]), "task": _address(row),
+             "task_id": str(row["task_id"]), "node": row["node"],
+             "started_at": _stamp(row["started_at"]),
+             "lease_until": _stamp(row["lease_until"])} for row in _rows(cur)]
+
+
+def _due_count(cur, worker: dict, project: str, tz) -> int:
+    """How many tasks this worker's claim would select now, over every ask."""
+    found: set = set()
+    for ask in _asks(worker):
+        where, params = _selection(ask, project, tz)
+        cur.execute(f"select id from {SCHEMA}.tasks_tasks{where}", params)
+        found |= {str(row["id"]) for row in _rows(cur)}
+    return len(found)
+
+
+def _lines_status(entry, project: str, wanted: str | None) -> None:
+    """The congestion read: every line - each declared one and `default` - with
+    its state and its workers in order, and for each worker how many tasks are
+    due to it, the raises it runs now and the oldest due task with its wait."""
+    declared = _declarations()
+    tz = _zone(entry)
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select * from {SCHEMA}.tasks_lines
+                         where project_id = %s and active order by name""", (project,))
+        rows = _rows(cur)
+        states = _line_states(cur, project)
+        named = {one for row in rows for one in _line_workers(row["spec"])}
+        lines = [(row["name"], row["spec"].get("description"), _line_workers(row["spec"]))
+                 for row in rows]
+        lines.append((DEFAULT_LINE, None, [name for name in sorted(declared)
+                                           if name not in named]))
+        if wanted is not None:
+            lines = [one for one in lines if one[0] == wanted]
+            if not lines:
+                conn.rollback()
+                _die(3, "not_found", f"no line named {wanted!r} in this project",
+                     f"`{NAME} lines list` shows this project's lines")
+        answer = []
+        for name, description, members in lines:
+            state = states.get(name) or {"state": "running"}
+            row: dict = {"line": name, **state}
+            if description:
+                row["description"] = description
+            row["workers"] = [_worker_congestion(cur, one, declared, project, tz)
+                              for one in members]
+            answer.append(row)
+        conn.commit()
+    _emit({"lines": answer})
+
+
+def _worker_congestion(cur, name: str, declared: dict, project: str, tz) -> dict:
+    """One worker of a line as `lines status` reads it."""
+    if name not in declared:
+        return {"worker": name, "problem": f"no worker named {name!r} in this project"}
+    worker, problems = _read_worker(name, declared[name])
+    if problems:
+        return {"worker": name,
+                "problem": "; ".join(sentence for _c, _s, sentence in problems)}
+    row = {"worker": name, "enabled": worker["enabled"]}
+    if worker["catch_all"]:
+        taken, unknowable = _others_take(name, declared)
+        if unknowable:
+            return {**row, "problem": _unknowable_refusal(name, unknowable)}
+        worker["not_types"] = sorted(taken)
+    row["due"] = _due_count(cur, worker, project, tz)
+    row["running"] = _running_raises(cur, name, project)
+    row["oldest_due"] = _oldest_due(cur, worker, project, tz)
+    return row
 
 
 # --- Profiles in the store ----------------------------------------------------
@@ -8087,7 +8708,7 @@ A task you create carries only what `writes.new` allows: {new}. A status it does
 
 _SCOPE_LABELS = {"status": "status", "type": "type", "assignee": "assignee",
                  "pickup": "pickup", "metadata": "writing over or removing the metadata keys",
-                 "tags": "removing the tags"}
+                 "tags": "removing the tags", "line": "line"}
 
 
 def _scope_words(entries: dict) -> str:
@@ -8224,8 +8845,9 @@ def _key_types(worker: dict) -> dict:
     """What a task named with --key has to be for this worker to take it: a status
     and a type one of its filters takes, or todo and a type it runs on request,
     or for the catch-all todo and any type no other enabled worker does."""
+    line = {"line": worker["line"]} if "line" in worker else {}
     if worker["catch_all"]:
-        return {"refuse_types": list(worker.get("not_types") or [])}
+        return {"refuse_types": list(worker.get("not_types") or []), **line}
     accept = [{"status": list(one["status"]), "type": one["type"],
                "accepts_from": one.get("accepts_from")}
               for one in worker["filters"]]
@@ -8235,7 +8857,7 @@ def _key_types(worker: dict) -> dict:
     granted = sorted({project for one in worker["filters"]
                       for project in one.get("accepts_from") or []})
     return {"accept_types": list(worker["types"]) + list(worker["on_request"]),
-            "accept": accept, **({"grants": granted} if granted else {})}
+            "accept": accept, **({"grants": granted} if granted else {}), **line}
 
 
 def _asks(worker: dict) -> list[dict]:
@@ -8243,10 +8865,14 @@ def _asks(worker: dict) -> list[dict]:
     by filter as `takes` lists them, and within a filter one ask per type in the
     order it names them, or one ask for any type when it names none. The catch-all
     asks once, for any type no other enabled worker takes."""
+    # A worker claims only the tasks of its own line, the default line's being
+    # those that name none; a grant's ask takes another project's tasks, whose
+    # line is that project's, and its selection reads no line.
+    line = {"line": worker["line"]} if "line" in worker else {}
     if worker["catch_all"]:
         return [{**_selector_filters(worker),
                  "not_types": list(worker.get("not_types") or []),
-                 "cool_down": worker["limits"]["cool_down_seconds"]}]
+                 "cool_down": worker["limits"]["cool_down_seconds"], **line}]
     asks: list[dict] = []
     for one in worker["filters"]:
         narrowing: dict = {}
@@ -8259,6 +8885,7 @@ def _asks(worker: dict) -> list[dict]:
         if one.get("accepts_from") is not None:
             narrowing["accepts_from"] = list(one["accepts_from"])
         narrowing["cool_down"] = worker["limits"]["cool_down_seconds"]
+        narrowing.update(line)
         for kind in one["type"] or [None]:
             asks.append({**narrowing, **({"type": kind} if kind else {})})
     return asks
@@ -10374,6 +11001,10 @@ CLAIMABLE_CHANNEL = "tasks_claimable"
 # listens to both.
 DECLARATION_CHANNEL = "tasks_declaration"
 
+# The store raises this channel's version when a line of a project is paused or
+# resumed, so every service of the project holds or lets go of its workers.
+LINES_CHANNEL = "tasks_lines"
+
 # The store notifies this channel on every change `watch` reports, one trigger
 # per table a change can land in, and names the kind of change in the payload.
 WATCH_CHANNEL = "tasks_watch"
@@ -10717,9 +11348,13 @@ def _service_fingerprint_parts() -> tuple[str, str | None]:
                             front.get("hooks") if isinstance(front, dict) else None)})
         hooks = ({row["name"]: str(row["id"]) for row in
                   _stored_hooks(fresh=True, waiting=False)} if named else {})
+        lines = _stored_lines(waiting=False)
     except Exception:
         return held, None
     store: list = [["worker", row["name"], "store", str(row["id"])] for row in rows]
+    # The active version of every line, which says the line each worker claims
+    # on; a project that declares none fingerprints as it always did.
+    store += [["line", row["name"], str(row["id"])] for row in lines]
     store += profiles(documents + [(f"worker {row['name']!r}", row["spec"]) for row in rows],
                       active)
     # The version of every stored hook a worker names, so a hook saved or
@@ -10777,6 +11412,7 @@ def _service_declaration(settings: dict | None = None) -> dict:
     # when it could not read them, the store is away and is not waited for.
     _stored_workers(waiting=False)
     _stored_profiles(waiting=False)
+    _stored_lines(waiting=False)
     declared = _declarations()
     unknown = sorted(set(settings["lanes"]) - set(declared))
     if unknown:
@@ -10804,8 +11440,12 @@ def _service_declaration(settings: dict | None = None) -> dict:
             idle.append({"worker": name,
                          "why": "it runs only on request, named with --key"})
             continue
-        cap = settings["lanes"].get(name, _LANE_DEFAULTS)["max_parallel"]
-        lanes.append({"worker": name, "max_parallel": cap, "spec": worker})
+        # The worker's own `max_parallel`, and while it names none the service
+        # settings' `[lanes.<worker>]` table, read as its fallback.
+        cap = (worker["max_parallel"] if worker["max_parallel"] is not None
+               else settings["lanes"].get(name, _LANE_DEFAULTS)["max_parallel"])
+        lanes.append({"worker": name, "max_parallel": cap, "line": worker.get("line"),
+                      "spec": worker})
     if problems:
         raise Refusal(6, "worker_invalid",
                       f"{len(problems)} problem(s) among the workers of this project: "
@@ -10815,7 +11455,8 @@ def _service_declaration(settings: dict | None = None) -> dict:
 
 
 def _lane_rows(declaration: dict) -> list[dict]:
-    return [{"worker": lane["worker"], "max_parallel": lane["max_parallel"]}
+    return [{"worker": lane["worker"], "max_parallel": lane["max_parallel"],
+             **({"line": lane["line"]} if lane.get("line") else {})}
             for lane in declaration["lanes"]]
 
 
@@ -11138,17 +11779,18 @@ class _ServiceHost:
         return conn
 
     def follower(self):
-        """What follows the versions of the claimable and declaration channels
-        for every project of this store's schema: one row per project each, read
-        in one query."""
-        return _db().Follower([CLAIMABLE_CHANNEL, DECLARATION_CHANNEL],
+        """What follows the versions of the claimable, declaration and line
+        channels for every project of this store's schema: one row per project
+        each, read in one query."""
+        return _db().Follower([CLAIMABLE_CHANNEL, DECLARATION_CHANNEL, LINES_CHANNEL],
                               application_name=NAME, setting=self.setting)
 
     def changes(self, follower, conn) -> list[dict]:
         """What moved since the follower last read, polled on `conn`, as the
         notifications an earlier release heard: the schema, the project and
         which kind of change, so the daemon routes them as it routed those."""
-        kinds = {CLAIMABLE_CHANNEL: "claimable", DECLARATION_CHANNEL: "declaration"}
+        kinds = {CLAIMABLE_CHANNEL: "claimable", DECLARATION_CHANNEL: "declaration",
+                 LINES_CHANNEL: "line_state"}
         return [{"schema": self.schema, "project": scope, "kind": kinds[channel]}
                 for (channel, scope) in _follow(follower, conn) if channel in kinds]
 
@@ -11225,6 +11867,18 @@ class _ServiceHost:
 
     def sweep_due(self, conn) -> bool:
         return _service_sweep_due(conn)
+
+    def line_holds(self, conn) -> dict:
+        """The lines of this project a pause holds, by line, each with its
+        reason, who set it and when. A store whose tables hold no line states
+        yet holds none."""
+        import psycopg
+        with conn.cursor() as cur:
+            try:
+                return _paused_lines(cur, _writing_project())
+            except psycopg.errors.UndefinedTable:
+                conn.rollback()
+                return {}
 
     def next_moment(self, conn, cool_downs: dict | None = None) -> float | None:
         return _service_next_moment(conn, cool_downs)
@@ -12345,7 +12999,7 @@ def _service_status(module) -> dict:
                     "poll_seconds",
                     "max_parallel", "shutdown_grace_seconds",
                     "lanes", "idle", "turns", "deferred", "next_wake", "last_wake",
-                    "reload_error", "stopping"):
+                    "reload_error", "stopping", "line_pause"):
             answer[key] = published.get(key)
         answer["current"] = _fingerprint_current(module.read_fingerprint(state),
                                                  _service_fingerprint_parts())
@@ -12363,6 +13017,54 @@ def _service_status(module) -> dict:
     answer["idle"] = declaration["idle"]
     answer["pause"] = _pause_block(module, state, _workers_of(answer["lanes"]), None)
     return answer
+
+
+def _line_pause_read(answer: dict, wanted: str | None) -> None:
+    """Add to a service status the lines the store holds paused, read now, and
+    say for each lane which hold keeps it from starting a turn: `service_pause`,
+    this machine's pause, `line_pause`, the store's pause of its line, or both.
+    A running daemon's own reading stays under `line_pause.daemon`. A store that
+    cannot be asked is said in the block, and the rest of the status stands."""
+    import contextlib
+    import io
+
+    import psycopg
+    seen = answer.get("line_pause")
+    block: dict = {"lines": {}, "holding": []}
+    if isinstance(seen, dict):
+        block["daemon"] = seen
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            reg, _f = _connections_registry()
+            _conn_id, entry = _select_connection(reg, wanted)
+            setting = _store_setting(True, root=_project_here())
+            globals().update(SCHEMA=setting.schema, PROJECT_IDENTITY=_project_id_state(),
+                             PROJECT=_declared_project())
+            with _connect(entry, raising=True, waiting=False, migrating=False,
+                          setting=setting) as conn, conn.cursor() as cur:
+                try:
+                    block["lines"] = _paused_lines(cur, _writing_project())
+                except psycopg.errors.UndefinedTable:
+                    pass
+                conn.rollback()
+    except (Refusal, SystemExit, Exception) as exc:  # the status answers regardless
+        block["error"] = (exc.message if isinstance(exc, Refusal)
+                          else f"the store could not be asked: {exc}")
+        if isinstance(seen, dict):
+            block["lines"] = seen.get("lines") or {}
+    local = set((answer.get("pause") or {}).get("holding") or [])
+    for row in answer.get("lanes") or []:
+        if not isinstance(row, dict):
+            continue
+        on_line = (row.get("line") or DEFAULT_LINE) in block["lines"]
+        held_by = (["service_pause"] if row.get("worker") in local else []) \
+            + (["line_pause"] if on_line else [])
+        row.pop("held_by", None)
+        if held_by:
+            row["held_by"] = held_by
+        if on_line:
+            block["holding"].append(row.get("worker"))
+    answer["line_pause"] = block
 
 
 def _paused_waits(answer: dict, wanted: str | None) -> None:
@@ -12593,7 +13295,11 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
                                       + retired)
     # A paused service is working as asked: reported, never a problem, so a
     # supervisor that restarts on a failing probe leaves it paused and running.
+    # Both holds are shown: this machine's pause, and the lines the store holds
+    # paused for every service of the project.
     answer["pause"] = status["pause"]
+    _line_pause_read(status, wanted)
+    answer["line_pause"] = status["line_pause"]
     serving, stale = _service_serving_problems(module, status)
     problems += serving
     if stale is not None:
@@ -13017,6 +13723,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
     elif verb == "status":
         _flags(rest, ())
         answer = _service_status(_service_module())
+        _line_pause_read(answer, wanted)
         _paused_waits(answer, wanted)
         _emit(answer)
     elif verb == "pause":
@@ -13047,7 +13754,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 8
+STORE_MINOR = 9
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -13781,6 +14488,165 @@ comment on column tasks_presences.expires_at is
     'When the row stops saying the project is served unless renewed first.';
 """
 
+# A line is a named conveyor: the group of workers that produces one kind of
+# result. Its definition is kept as versions the way a worker is, and it is the
+# one home of membership - a worker's spec names no line - so the store refuses
+# a worker on two active lines of one project. Whether a line runs or is paused
+# is runtime state in a table of its own, keyed by the line's name, so pausing
+# creates no version; a change to it is announced on `tasks_lines`, which a
+# running service follows beside the claimable and declaration channels. A
+# task's line is a column of its own, null on the default line every worker no
+# line names stays on. The foreign keys stay out: a state names a line by name,
+# the default line included, which has no definition row, and a task keeps the
+# name of a line retired under it.
+_LINES = r"""
+create table tasks_lines (
+  id          uuid        not null default gen_random_uuid(),
+  project_id  text        not null constraint tasks_lines_project_id_check check (project_id <> ''),
+  name        text        not null constraint tasks_lines_name_check
+                            check (name ~ '^[a-z0-9][a-z0-9_-]{0,63}$' and name <> 'default'),
+  spec        jsonb       not null constraint tasks_lines_spec_check
+                            check (jsonb_typeof(spec -> 'workers') = 'array'),
+  active      boolean     not null default true,
+  created_at  timestamptz not null default now(),
+  created_by  text,
+  constraint tasks_lines_pkey primary key (id)
+);
+
+comment on table tasks_lines is
+  'One row is one version of a line: a named conveyor, the ordered group of workers '
+  'that produces one kind of result. A change never edits a row: it inserts a new '
+  'version and clears active on the version the writer read, in one transaction. A '
+  'name with no active version is no line; `default` is the implicit line of every '
+  'worker no active line names, and no row.';
+comment on column tasks_lines.spec is
+  'The line as written, validated whole by tasks on write: its description and its '
+  'ordered workers, the one place a worker''s line is said.';
+comment on column tasks_lines.created_by is
+  'Who saved this version, as the CLI resolved it.';
+
+create unique index tasks_lines_one_active_idx
+  on tasks_lines (project_id, name) where active;
+create index tasks_lines_name_idx
+  on tasks_lines (project_id, name, created_at);
+
+-- A line version is history: only active may move, as for a worker.
+create function tasks_lines_keep_history() returns trigger as $$
+begin
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a line version is never edited or deleted: % on tasks_lines is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_lines_history';
+end;
+$$ language plpgsql;
+
+create trigger tasks_lines_keep_history_row before update or delete on tasks_lines
+    for each row execute function tasks_lines_keep_history();
+create trigger tasks_lines_keep_history_truncate before truncate on tasks_lines
+    for each statement execute function tasks_lines_keep_history();
+
+-- A worker is on one active line of its project at most. Writers of one
+-- project's lines take its lock in turn, so two saves naming one worker on two
+-- lines cannot both see the other absent.
+create function tasks_lines_one_line_per_worker() returns trigger as $$
+declare
+    worker  text;
+    held_on text;
+begin
+    perform pg_advisory_xact_lock(hashtext('tasks_lines'), hashtext(new.project_id));
+    execute format('select w.name, l.name '
+                   '  from jsonb_array_elements_text($1) as w(name) '
+                   '  join %I.tasks_lines l on l.project_id = $2 and l.active and l.id <> $3 '
+                   '                       and l.spec -> ''workers'' ? w.name '
+                   ' limit 1', tg_table_schema)
+        into worker, held_on using new.spec -> 'workers', new.project_id, new.id;
+    if worker is not null then
+        raise exception 'worker % is on line % already: a worker is on one line of its project', worker, held_on
+          using errcode = 'exclusion_violation', constraint = 'tasks_lines_one_line_per_worker';
+    end if;
+    return new;
+end;
+$$ language plpgsql;
+
+create trigger tasks_lines_one_line_per_worker before insert or update on tasks_lines
+    for each row when (new.active) execute function tasks_lines_one_line_per_worker();
+
+-- A line saved or retired moves the workers' membership, which the service
+-- runs by, so it is announced on tasks_declaration as a worker is.
+create function tasks_lines_notify_declaration() returns trigger as $$
+begin
+    perform pg_notify('tasks_declaration', json_build_object(
+        'schema', tg_table_schema, 'project', new.project_id,
+        'kind', 'line', 'line', new.name)::text);
+    if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+        execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                       'values (%L, $1, 1) on conflict (channel, scope) '
+                       'do update set version = c.version + 1',
+                       tg_table_schema, 'tasks_declaration')
+            using new.project_id;
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+
+create constraint trigger tasks_lines_notify_declaration after insert or update on tasks_lines
+    deferrable initially deferred
+    for each row execute function tasks_lines_notify_declaration();
+
+create table tasks_line_states (
+  project_id  text        not null constraint tasks_line_states_project_id_check
+                            check (project_id <> ''),
+  line        text        not null constraint tasks_line_states_line_check check (line <> ''),
+  state       text        not null constraint tasks_line_states_state_check
+                            check (state in ('running', 'paused')),
+  reason      text,
+  set_by      text,
+  set_at      timestamptz not null default now(),
+  constraint tasks_line_states_pkey primary key (project_id, line)
+);
+
+comment on table tasks_line_states is
+  'Whether a line of a project runs or is paused: runtime state, overwritten in '
+  'place, so a pause creates no line version. A line with no row runs. Every '
+  'service of the project starts no new turn on a worker of a paused line.';
+comment on column tasks_line_states.line is
+  'The line by its name: an active line of the project, or `default`, the line of '
+  'every worker no line names.';
+comment on column tasks_line_states.reason is
+  'Why the line was paused, as `tasks lines pause --reason` said it; null once resumed.';
+comment on column tasks_line_states.set_by is
+  'Who set the state, as the CLI resolved it.';
+
+-- A pause or a resume is announced on tasks_lines, with its notification beside
+-- it, so a running service holds or lets go of the line without a restart.
+create function tasks_line_states_notify() returns trigger as $$
+begin
+    perform pg_notify('tasks_lines', json_build_object(
+        'schema', tg_table_schema, 'project', new.project_id,
+        'kind', 'line_state', 'line', new.line)::text);
+    if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+        execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                       'values (%L, $1, 1) on conflict (channel, scope) '
+                       'do update set version = c.version + 1',
+                       tg_table_schema, 'tasks_lines')
+            using new.project_id;
+    end if;
+    return null;
+end;
+$$ language plpgsql;
+
+create constraint trigger tasks_line_states_notify after insert or update on tasks_line_states
+    deferrable initially deferred
+    for each row execute function tasks_line_states_notify();
+
+alter table tasks_tasks add column line text
+  constraint tasks_tasks_line_check check (line <> '');
+comment on column tasks_tasks.line is
+  'The line the task is worked on, by its name; null is the default line. A claim '
+  'takes a task of this project only for a worker of the same line.';
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
@@ -13792,6 +14658,7 @@ STORE_STEPS = [
     ("0008-workers-announce", _WORKERS_ANNOUNCE),
     ("0009-change-versions", _CHANGE_VERSIONS),
     ("0010-service-presence", _SERVICE_PRESENCE),
+    ("0011-lines", _LINES),
 ]
 
 
@@ -13902,7 +14769,8 @@ def cmd_doctor(wanted: str | None) -> None:
 
 def _deprecations(workers: list[dict]) -> list[str]:
     """Every key this project still sets that is read as another now: a
-    worker's, and the service settings' retry delay, each with what it reads as."""
+    worker's, the service settings' retry delay, and a lane's `max_parallel`
+    there, each with what it reads as."""
     said = [f"worker {row['worker']}: {one}" for row in workers
             for one in row.get("deprecated") or []]
     if _service_retry_delay() is not None:
@@ -13910,6 +14778,13 @@ def _deprecations(workers: list[dict]) -> list[str]:
                     "cool-down of every worker that names none; the service no longer "
                     "waits on it, so set limits.cool_down_seconds on the workers and "
                     "remove it")
+    _path, raw, _error = _service_settings_document()
+    lanes = (raw or {}).get("lanes")
+    for name in sorted(lanes) if isinstance(lanes, dict) else []:
+        if isinstance(lanes[name], dict) and "max_parallel" in lanes[name]:
+            said.append(f"{_service_settings_where()}: its lanes.{name}.max_parallel is read "
+                        f"as worker {name}'s max_parallel while the worker names none; set "
+                        f"max_parallel on the worker and remove the [lanes.{name}] table")
     return said
 
 
@@ -13944,6 +14819,7 @@ _FORM_ARGS = {
     "workers": {"names": ("version", "base"), "bools": ("apply",), "takes": 3},
     "hooks": {"names": ("version", "base", "description"), "takes": 3},
     "profiles": {"names": ("version", "base"), "bools": ("apply", "global"), "takes": 3},
+    "lines": {"names": ("version", "base", "reason"), "bools": ("json",), "takes": 3},
 }
 
 
@@ -13968,6 +14844,8 @@ def _reads_only(verb: str, rest: list[str]) -> bool:
         return opts["_loose"][:1] == ["show"]
     if verb == "hooks":
         return opts["_loose"][:1] in (["list"], ["show"], ["history"])
+    if verb == "lines":
+        return opts["_loose"][:1] in (["list"], ["show"], ["history"], ["status"])
     if verb in ("workers", "profiles"):
         action = opts["_loose"][:1]
         return action in (["list"], ["show"], ["history"]) or (
@@ -14037,7 +14915,7 @@ def main() -> None:
         "claim": cmd_claim, "release": cmd_release, "run": cmd_run,
         "runs": cmd_runs, "history": cmd_history,
         "watch": cmd_watch, "workers": cmd_workers, "profiles": cmd_profiles,
-        "hooks": cmd_hooks,
+        "hooks": cmd_hooks, "lines": cmd_lines,
         "accepts": cmd_accepts,
     }
     handler = handlers.get(verb)

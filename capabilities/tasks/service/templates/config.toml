@@ -15,7 +15,7 @@ max_parallel = 2
 # ending them. A stop without it leaves them running.
 shutdown_grace_seconds = 60
 
-# One table per worker whose cap is not 1, named by the worker:
-#
-# [lanes.<worker>]
-# max_parallel = 1
+# A worker's own cap is `max_parallel` in the worker, saved with
+# `tasks workers save`. A table per worker, `[lanes.<worker>]` with
+# `max_parallel`, is still read for a worker that names none, and `tasks doctor`
+# names it.

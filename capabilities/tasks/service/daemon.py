@@ -64,7 +64,11 @@ It starts no turn on a lane the pause holds. The pause is a file in its state
 directory, written by `service pause` and `service resume` whether or not a
 daemon runs, and read on every pass of the loop; it is runtime state, not part
 of the declaration, so it moves no fingerprint and outlives a restart. Turns
-already running are not touched by it.
+already running are not touched by it. That pause holds this machine only; a
+line paused in the store - `lines pause`, from anywhere - holds every service
+of the project, and this one starts no turn on a worker of that line either.
+It reads the lines held as it starts, at every poll and whenever the store's
+versions say a line was paused or resumed.
 
 Its turns outlive it. Each runs in a session of its own with its output on
 files, and settles its own task, so however the daemon stops - a stop, a
@@ -113,6 +117,8 @@ FINGERPRINT_FILE = "daemon.fingerprint"
 STATUS_FILE = "daemon.json"
 LOG_FILE = "daemon.log"
 PAUSE_FILE = "paused.json"
+# The line of every worker no line names, as a line pause names it.
+DEFAULT_LINE = "default"
 END_TURNS_FILE = "end-turns.json"
 TURNS_DIR = "turns"
 RECEIPT_ENV = "TASKS_TURN_RECEIPT"
@@ -647,6 +653,12 @@ class ProjectSlot:
         self.rotation = 0
         self.reload_error: str | None = None
         self.pause: dict = {"all": None, "lanes": {}}
+        # The lines of the project paused in the store, by line, as last read,
+        # whether to read them again before the next pass, and why the last
+        # reading failed.
+        self.line_pause: dict = {}
+        self.line_check = True
+        self.line_error: str | None = None
         # Why the project may not be served, as ("refused" | "error", reason),
         # from the last check; and that check's answer for this pass, None
         # until it is asked.
@@ -751,13 +763,10 @@ class ProjectSlot:
             "poll_seconds": self.settings()["poll_seconds"],
             "max_parallel": self.settings()["max_parallel"],
             "shutdown_grace_seconds": self.settings()["shutdown_grace_seconds"],
-            "lanes": [{"project": self.slug, "worker": lane["worker"],
-                       "max_parallel": lane["max_parallel"],
-                       "running": sum(1 for t in self.turns.values()
-                                      if t.worker == lane["worker"]),
-                       "held_until_poll": lane["worker"] in self.held}
-                      for lane in self.lanes()],
-            "pause": {**self.pause, "holding": self.holding()},
+            "lanes": [self._lane_row(lane) for lane in self.lanes()],
+            "pause": {**self.pause, "holding": self.local_holding()},
+            "line_pause": {"lines": self.line_pause, "holding": self.line_holding(),
+                           **({"error": self.line_error} if self.line_error else {})},
             "idle": self.declaration.get("idle", []),
             "turns": [turn.row() for turn in self.turns.values()],
             "deferred": [{"task": r["task"], "task_id": tid, "until": _at(r["until"] - now)}
@@ -941,7 +950,12 @@ class ProjectSlot:
                 and payload.get("schema") == self.host.schema)
 
     def notified(self, payload: dict) -> None:
-        if payload.get("kind") in ("declaration", "hook", "worker"):
+        if payload.get("kind") == "line_state":
+            # A line was paused or resumed: read which lines are held before
+            # the next pass.
+            self.line_check = True
+            return
+        if payload.get("kind") in ("declaration", "hook", "worker", "line"):
             # A stored worker or hook was saved or retired: the declaration is asked
             # again before the next pass, and taken up when it moved.
             self.declaration_check = True
@@ -973,8 +987,73 @@ class ProjectSlot:
 
     # --- the pause -------------------------------------------------------------
 
-    def holding(self) -> list[str]:
+    def local_holding(self) -> list[str]:
+        """The lanes this machine's pause holds."""
         return holding(self.pause, [lane["worker"] for lane in self.lanes()])
+
+    def line_holding(self) -> list[str]:
+        """The lanes whose line is paused in the store."""
+        return [lane["worker"] for lane in self.lanes()
+                if (lane.get("line") or DEFAULT_LINE) in self.line_pause]
+
+    def holding(self) -> list[str]:
+        """The lanes that start no new turn: those either hold covers."""
+        held = set(self.local_holding()) | set(self.line_holding())
+        return [lane["worker"] for lane in self.lanes() if lane["worker"] in held]
+
+    def _lane_row(self, lane: dict) -> dict:
+        row = {"project": self.slug, "worker": lane["worker"],
+               "max_parallel": lane["max_parallel"],
+               "running": sum(1 for t in self.turns.values() if t.worker == lane["worker"]),
+               "held_until_poll": lane["worker"] in self.held}
+        if lane.get("line"):
+            row["line"] = lane["line"]
+        # Which hold keeps it from starting a turn: this machine's pause, the
+        # store's pause of its line, or both.
+        held_by = ([*(["service_pause"] if lane["worker"] in self.local_holding() else []),
+                    *(["line_pause"] if lane["worker"] in self.line_holding() else [])])
+        if held_by:
+            row["held_by"] = held_by
+        return row
+
+    def take_up_line_pause(self) -> None:
+        """Read which lines the store holds, when the store announced a change,
+        at the poll, as the slot starts and after a reload, and act on what
+        moved: a lane newly held starts no turn from now on, and a lane let go
+        is a wake. A store that cannot be asked keeps what was read last."""
+        question = getattr(self.host, "line_holds", None)
+        if question is None:
+            self.line_check = False
+        if not self.line_check or not self.served():
+            return
+        try:
+            found = self.ask(question)
+        except (Exception, SystemExit) as exc:
+            why = _why(exc)
+            if why != self.line_error:
+                self.log(f"cannot read which lines are paused in the store, keeping what "
+                         f"was read last: {why}")
+            self.line_error = why
+            return
+        self.line_check = False
+        self.line_error = None
+        if found == self.line_pause:
+            return
+        before = set(self.holding())
+        paused = sorted(set(found) - set(self.line_pause))
+        lifted = sorted(set(self.line_pause) - set(found))
+        self.line_pause = found
+        for line in paused:
+            entry = found[line] or {}
+            workers = [lane["worker"] for lane in self.lanes()
+                       if (lane.get("line") or DEFAULT_LINE) == line]
+            self.log(f"line {line} paused in the store by {entry.get('set_by')}"
+                     + (f": {entry['reason']}" if entry.get("reason") else "")
+                     + (f"; starting no turn on {', '.join(workers)}" if workers else ""))
+        for line in lifted:
+            self.log(f"line {line} resumed in the store")
+        if before - set(self.holding()):
+            self.wakes.add("resume")
 
     def _take_up_pause(self) -> None:
         """Read the pause and act on what moved: a lane newly held starts no
@@ -982,9 +1061,9 @@ class ProjectSlot:
         found = read_pause(self.state_dir)
         if found == self.pause:
             return
-        before = set(self.holding())
+        before = set(self.local_holding())
         self.pause = found
-        after = self.holding()
+        after = self.local_holding()
         lifted = sorted(before - set(after))
         if after and set(after) != before:
             running = sum(1 for t in self.turns.values() if t.worker in after)
@@ -1297,6 +1376,7 @@ class ProjectSlot:
         self.declaration = declaration
         self.reload_error = None
         self.held.clear()
+        self.line_check = True
         self.next_poll = min(self.next_poll,
                              time.monotonic() + self.settings()["poll_seconds"])
         _write_atomic(self.state_dir / FINGERPRINT_FILE, declaration["fingerprint"] + "\n")
@@ -1506,6 +1586,7 @@ class Dispatcher:
         for slot in self.slots:
             if now >= slot.next_poll:
                 slot.wakes.add("poll")
+                slot.line_check = True
                 slot.next_poll = now + slot.settings()["poll_seconds"]
                 # What was held back is asked again on the clock, and a listener
                 # that was lost is opened again.
@@ -1526,6 +1607,11 @@ class Dispatcher:
                     and now >= store.requery_at:
                 self._reconnect(store)
         self._ping(time.monotonic())
+        # The lines the store holds paused are read once the connections are
+        # asked for again, so a reading never opens the question connection a
+        # reconnect would have, and the reconnect still wakes the slot.
+        for slot in self.slots:
+            slot.take_up_line_pause()
         candidates = []
         for slot in self.slots:
             if slot.next_moment is not None and now >= slot.next_moment:
@@ -1689,6 +1775,7 @@ class Dispatcher:
             for slot in self.on(store):
                 slot.wakes.add("relisten")
                 slot.declaration_check = True
+                slot.line_check = True
         store.listen_error = None
         store.relisten_at = None
         store.relisten_delay = RELISTEN_FIRST_SECONDS
@@ -2042,6 +2129,7 @@ class MachineDispatcher(Dispatcher):
             "state", "reason", "fingerprint", "reload_error", "wake_by", "lanes", "idle",
             "turns", "deferred", "next_wake", "last_wake", "waiting_for_cap")})
         row["pause"] = found["pause"]
+        row["line_pause"] = found["line_pause"]
         row["store"] = slot.store.name
         return row
 
