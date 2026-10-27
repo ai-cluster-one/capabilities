@@ -881,6 +881,53 @@ def test_a_node_allowed_to_write_writes_the_shared_rows_as_the_master_does(moved
     assert _document(lab) == {"window_days": 3}
 
 
+def test_a_node_allowed_to_write_writes_a_row_it_holds_of_its_own_there(moved, tmp_path):
+    lab = moved
+    _register(lab, SERVER, "--may-write")
+    on_server = node_env(SERVER_LABEL)
+    # Rows naming the server, as a node allowed to write left them before it
+    # wrote the shared rows.
+    lab.ok(MEMORY, "settings", "set", "window_days", "5")
+    lab.sql("INSERT INTO capabilities_settings (agent_id, capability, node, path, value, "
+            "updated_by) VALUES (%s, 'memory', %s, %s, '6'::jsonb, 'seed')",
+            (PROJECT_ID, SERVER, ["window_days"]))
+    lab.sql("INSERT INTO capabilities_settings_documents (agent_id, capability, node, "
+            "generation) VALUES (%s, 'memory', %s, 1)", (PROJECT_ID, SERVER))
+    lab.sql("INSERT INTO capabilities_identifiers (agent_id, capability, node, label, value) "
+            "VALUES (%s, 'coolify', %s, 'team', '\"server-team\"')", (PROJECT_ID, SERVER))
+    # An edit keeps the server's own value off the shared document.
+    editor = tmp_path / "editor.py"
+    editor.write_text("import json, sys\n"
+                      "p = sys.argv[1]\n"
+                      "d = json.load(open(p))\n"
+                      "d['block_chars'] = 4100\n"
+                      "json.dump(d, open(p, 'w'))\n")
+    result = lab.run(MEMORY, "settings", "edit", "--scope", "project", "--yes",
+                     EDITOR=f"{sys.executable} {editor}", **on_server)
+    assert result.returncode == 0, result.stderr
+    assert _document(lab) == {"window_days": 5, "block_chars": 4100}
+    assert _document(lab, node=SERVER) == {"window_days": 6}
+    # A key it holds of its own it changes and removes there; the shared value stays.
+    out = lab.ok(MEMORY, "settings", "set", "window_days", "8", **on_server)
+    assert (out["previous"], out["node"]) == (6, SERVER)
+    assert lab.ok(MEMORY, "settings", "get", "window_days", **on_server) == 8
+    assert lab.ok(MEMORY, "settings", "get", "window_days") == 5
+    lab.ok(MEMORY, "settings", "unset", "window_days", **on_server)
+    assert lab.ok(MEMORY, "settings", "get", "window_days", **on_server) == 5
+    assert _document(lab) == {"window_days": 5, "block_chars": 4100}
+    # Holding none of its own any more, it writes the shared value.
+    lab.ok(MEMORY, "settings", "set", "window_days", "7", **on_server)
+    assert lab.ok(MEMORY, "settings", "get", "window_days") == 7
+    lab.ok(COOLIFY, "ids", "set", "team", "new-team", **on_server)
+    assert lab.ok(COOLIFY, "ids", "get", "team", **on_server) == "new-team"
+    assert lab.sql("SELECT node, value FROM capabilities_identifiers") \
+        == [(SERVER, "new-team")]
+    lab.ok(COOLIFY, "ids", "rm", "team", **on_server)
+    lab.ok(COOLIFY, "ids", "set", "team", "shared-team", **on_server)
+    assert lab.sql("SELECT node, value FROM capabilities_identifiers") \
+        == [(None, "shared-team")]
+
+
 def test_an_edit_another_node_wrote_under_is_refused_and_read_again_it_lands(moved, tmp_path):
     lab = moved
     _register(lab, SERVER, "--may-write")
