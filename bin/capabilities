@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.29.0,<1",
+#     "capabilities-contract>=0.31.0,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -1009,7 +1009,8 @@ PROJECT VERBS (run inside a consuming project)
         gh_needed, gh_override, gh_expected, logins_checked_at, reported_at,
         fresh_until, sessions [{capability, connection, live, account,
         checked_at, needed, override, expected}], attention [{kind, tool |
-        capability and connection, reason}], health}], store}. A row stands
+        capability and connection, reason}], health, update {available,
+        checked_at, offer, last_run}}], store}. A row stands
         for its node for 90
         seconds after it is written (fresh_until, the store's time):
         reachable is whether that has not yet passed, by the store's now,
@@ -1050,7 +1051,60 @@ PROJECT VERBS (run inside a consuming project)
         not_live or not_reported. A login that is unknown is not raised.
         health is red where the node is not reachable, else yellow where
         attention is not empty, else green. Nothing that is not expected
-        raises anything.
+        raises anything. update is what the node last checked of its
+        updates (`node update --check`), null until it has: available, when
+        (checked_at) and offer {components [{kind, name, installed,
+        available, entries}], errors}; last_run is its latest update run
+        (capabilities_node_updates) {id, node, state, requested_at,
+        requested_by, started_at, finished_at, reason, versions_before,
+        versions_after, doctors}, null where it has none.
+  node update [--check | --node <node>]
+        A node updates only when asked. --check, on this node: what is
+        newer than what it runs, as `self-update --check` and `update
+        --check` answer - a manager release, a capability payload, or the
+        capabilities-contract an environment of an installed capability
+        holds - each component behind as {kind (manager, capability or
+        contract_library), name, installed, available, entries}, entries
+        the change-log entries newer than installed (`changelog`); a source
+        that cannot be asked is listed under errors. It writes that onto
+        this node's row of capabilities_node_states (update_available,
+        update_offer, update_checked_at), which its regular state write
+        leaves alone, and updates nothing: {ok, project, agent_id, node,
+        update_available, offer {components, errors}, checked_at, store}.
+        --node <node>, one of this agent's nodes by id or label: asks that
+        node to update, a requested row of capabilities_node_updates its
+        `node run` takes up within seconds: {ok, project, agent_id, node,
+        requested {id, state, requested_at, requested_by, ...}, store}; exit
+        6 update_pending while one is requested or running for that node,
+        which the store holds to one. Without either, this node now: it
+        takes up the row asked for it, or makes its own, marks it running,
+        and runs `capabilities self-update` then `capabilities update`,
+        each through the manager the links select then, and asks the doctor
+        of every service placed here - for every agent the store links to
+        this node whose folder here is bound to it, each service it places
+        here, its declared doctor in that agent's folder as `node supervise`
+        asks it; a machine service's machine doctor once, in this folder; a
+        service that declares none is undeclared. Where a step fails or a
+        doctor answers anything but ready or degraded, it returns the node
+        by itself to what it ran before - each manager link to the release
+        it selected (releases stay under ~/.capabilities/.manager/releases),
+        every capability payload from the copy it kept, and each
+        environment's capabilities-contract to the version it held - asks
+        the doctors again and ends rolled_back, its reason naming the step
+        or the doctor with its message; nothing is restarted. Where the node
+        cannot be returned it ends failed, saying what is left. Where
+        something moved and every doctor answers, it ends updated and asks
+        the node's manager to restart each placed service (as `service
+        restart`), so it runs the new release; where nothing moved, current.
+        The run's row keeps versions_before, versions_after and doctors
+        {after_update, after_rollback?}, and availability is checked again
+        after it. One run at a time on a node (exit 6 node_update_running);
+        a row a run that stopped left running is closed failed (interrupted)
+        by the next. Answers {ok, project, agent_id, node, update {id, state,
+        reason, ...}, interrupted, availability, store}; rolled_back and
+        failed exit 6 update_rolled_back and update_failed with that answer
+        as the error's detail. Exit 6 node_unknown for a node the agent does
+        not have; 4 under the read-only switch.
   node expect <node> sign-in <claude|codex|gh> on|off|default
   node expect <node> session <capability> <connection> on|off|default
         Set the owner's word on whether a tool's sign-in, or a device-bound
@@ -1086,8 +1140,8 @@ PROJECT VERBS (run inside a consuming project)
         ids keeps the name it had as its id - to its own: this machine's id
         (`node id`), or the one given. In one transaction the registry row
         takes the new id, every agent's link to it follows, as do its state
-        row and device sessions (`node state`), and every column of the
-        store that names a node moves with it: the policy, grant,
+        row, device sessions and update runs (`node state`), and every
+        column of the store that names a node moves with it: the policy, grant,
         identifier and settings rows for that node, the service leases,
         sessions, runs, definitions, executions and memory entries recorded
         under it (only the node part of agentrooms' lease holder); the
@@ -1106,8 +1160,8 @@ PROJECT VERBS (run inside a consuming project)
         The agent and node verbs but `node id` need the project's id (exit 6
         no_project_identity: run init) and a database that resolves for the
         project (exit 6 store_not_configured, 5 when it cannot be reached);
-        set, add, remove, seen, state report, expect and rekey exit 4 under the
-        read-only switch, but for rekey --dry-run.
+        set, add, remove, seen, state report, expect, update and rekey exit 4
+        under the read-only switch, but for rekey --dry-run.
   node run --supervisor <dir> [--every N] [--services <name,...>]
         The node's service manager: one per node and OS user, run as a
         program of the Supervisor whose configuration includes <dir>/*.conf
@@ -1137,7 +1191,15 @@ PROJECT VERBS (run inside a consuming project)
         right after a reconcile that changed a job, asking the tools'
         sign-ins, the sessions and the harness of the services placed here
         again every 60 seconds; a write that fails
-        is said once on stderr and changes nothing else. While the store cannot be read it changes no job,
+        is said once on stderr and changes nothing else. It never updates
+        unasked: a requested row of capabilities_node_updates for this node,
+        seen within seconds on its channel and on each reconcile, runs
+        `node update` as a child of its own session beside the loop, which
+        goes on writing the state; it checks for updates (`node update
+        --check`) once the last check is an hour old, first looking two
+        minutes after it starts. After a run that moved the manager on PATH
+        to another release it stops, exit 75, so its supervisor starts it
+        again on that release, every job running on. While the store cannot be read it changes no job,
         and at its first start it writes none until it has read the store. A
         placed service it will not run - not installed, no deploy or machine
         command, quarantined, a machine service outside --services, or its
@@ -4756,6 +4818,14 @@ def _single_script_catalogue_sha256(name: str, content: bytes) -> str:
 
 def cmd_update_check(name: str | None) -> None:
     """Answer what `update` would change, changing nothing."""
+    result = _update_check_answer(name)
+    _emit(result)
+    if any("error" in row for row in result["checked"]):
+        sys.exit(5)
+
+
+def _update_check_answer(name: str | None) -> dict:
+    """What `update --check` answers: {checked, update_available}."""
     if name:
         _reject_reserved_capability_name(name)
     targets = [name] if name else sorted(_installed())
@@ -4788,10 +4858,8 @@ def cmd_update_check(name: str | None) -> None:
                 row["contract_library"] = library
             row["update_available"] = behind or library is not None
         rows.append(row)
-    _emit({"checked": rows,
-           "update_available": any(row["update_available"] for row in rows)})
-    if any("error" in row for row in rows):
-        sys.exit(5)
+    return {"checked": rows,
+            "update_available": any(row["update_available"] for row in rows)}
 
 
 # ---------------------------------------------------------------- change logs
@@ -4896,7 +4964,14 @@ def _active_manager_root() -> Path | None:
 
 def cmd_changelog(name: str | None, kind: str, show_all: bool,
                   from_ref: str | None, source_id: str | None) -> None:
-    """Print what changed for someone who already holds the thing.
+    """Print what changed for someone who already holds the thing."""
+    _emit(_changelog_answer(name, kind, show_all, from_ref, source_id))
+
+
+def _changelog_answer(name: str | None, kind: str, show_all: bool,
+                      from_ref: str | None, source_id: str | None) -> dict:
+    """What `changelog` answers: what changed for someone who already holds
+    the thing.
 
     One reader for every log. The installed version is the newest entry of the
     installed copy's own log, so what is new is every published entry above
@@ -4963,7 +5038,7 @@ def cmd_changelog(name: str | None, kind: str, show_all: bool,
               "entries": shown}
     if note:
         result["note"] = note
-    _emit(result)
+    return result
 
 
 def _manager_release_manifest_bytes(manifest: dict) -> bytes:
@@ -5308,7 +5383,12 @@ def cmd_self_update(from_ref: str | None = None) -> None:
 
 
 def cmd_self_update_check(from_ref: str | None = None) -> None:
-    """Answer whether `self-update` would switch the manager, switching nothing.
+    """Answer whether `self-update` would switch the manager, switching nothing."""
+    _emit(_self_update_check_answer(from_ref))
+
+
+def _self_update_check_answer(from_ref: str | None = None) -> dict:
+    """What `self-update --check` answers, switching nothing.
 
     A release is named by the sha256 of its normalised manifest, the name
     `self-update` stages it under, so two releases are the same release exactly
@@ -5354,7 +5434,7 @@ def cmd_self_update_check(from_ref: str | None = None) -> None:
                     "version": _changelog_version_at(release / MANAGER_CHANGELOG_REL),
                 }
     behind = installed is None or installed["release"] != available_release
-    _emit({
+    return {
         "installed": installed,
         "available": {
             "release": available_release,
@@ -5363,7 +5443,7 @@ def cmd_self_update_check(from_ref: str | None = None) -> None:
             "source": source,
         },
         "update_available": behind,
-    })
+    }
 
 
 def _capability_tier(name: str) -> str:
@@ -10549,6 +10629,7 @@ NODE_REFERENCES = (
     ("capabilities_node_session_expectations", "node", "foreign key"),
     ("capabilities_node_sessions", "node", "foreign key"),
     ("capabilities_node_states", "node", "foreign key"),
+    ("capabilities_node_updates", "node", "foreign key"),
     ("capabilities_policy", "node", "whole"),
     ("capabilities_service_instances", "node", "whole"),
     ("capabilities_settings", "node", "whole"),
@@ -11200,6 +11281,15 @@ class _NodeManager:
         self.placed: list[tuple] = []
         self.needed: dict[str, list[str]] | None = None
         self.harness: dict[tuple[str, str], list[str]] = {}
+        # Updates of this node: a run only where a row asks for one, seen on
+        # its channel and on each reconcile, and the check on its cadence,
+        # each as a `node update` child so the loop goes on beside it.
+        self.update_child: subprocess.Popen | None = None
+        self.update_kind: str | None = None
+        self.update_from: str | None = None
+        self.update_asked = True
+        self.check_due = time.monotonic() + NODE_UPDATE_FIRST_CHECK_SECONDS
+        self.restart_self = False
 
     def say(self, message: str) -> None:
         sys.stderr.write(f"[capabilities node {self.here}] {message}\n")
@@ -11470,7 +11560,8 @@ class _NodeManager:
             {(NODE_PLACEMENT_CHANNEL, agent_id) for agent_id in self.agents}
             | {(NODE_RESTART_CHANNEL, f"{agent_id}/{job['capability']}/{self.here}")
                for job in self.jobs.values()
-               for agent_id in (job.get("agents") or [job["agent_id"]])}))
+               for agent_id in (job.get("agents") or [job["agent_id"]])}
+            | {(NODE_UPDATE_CHANNEL, self.here)}))
         if keys == self.follow_keys or not keys:
             return
         db = self.db
@@ -11498,6 +11589,8 @@ class _NodeManager:
         except Exception:
             return False, []
         placement = any(channel == NODE_PLACEMENT_CHANNEL for channel, _scope in moved)
+        if any(channel == NODE_UPDATE_CHANNEL for channel, _scope in moved):
+            self.update_asked = True
         restarts = []
         for channel, scope in moved:
             if channel != NODE_RESTART_CHANNEL:
@@ -11553,23 +11646,163 @@ class _NodeManager:
             self.say("writes this node's state again")
         self.said["state"] = None
 
+    def manager_target(self) -> str | None:
+        """The file the manager on PATH runs now, through its link."""
+        found = shutil.which("capabilities")
+        return str(Path(found).resolve()) if found else None
+
+    def update_requested(self) -> bool:
+        """Whether a row asks this node to update; False where the store
+        cannot say, to look again on the next reconcile."""
+        try:
+            conn = self._connect()
+        except Exception:
+            return False
+        try:
+            with conn.transaction():
+                return conn.execute(
+                    "SELECT 1 FROM capabilities_node_updates WHERE node = %s "
+                    "AND state = 'requested'", (self.here,)).fetchone() is not None
+        except Exception:
+            return False
+        finally:
+            conn.close()
+
+    def check_age(self) -> float | None:
+        """Seconds since this node's update availability was last checked, by
+        the store's clock; None where it never was or the store cannot say."""
+        try:
+            conn = self._connect()
+        except Exception:
+            return None
+        try:
+            with conn.transaction():
+                found = conn.execute(
+                    "SELECT extract(epoch FROM now() - update_checked_at) "
+                    "FROM capabilities_node_states WHERE node = %s", (self.here,)).fetchone()
+        except Exception:
+            return None
+        finally:
+            conn.close()
+        return float(found[0]) if found and found[0] is not None else None
+
+    def start_update(self, kind: str) -> None:
+        """Run `node update` (kind `update`) or `node update --check` as a
+        child, its output kept under the node's state folder. An update runs
+        in a session of its own, so it ends even where node run is stopped."""
+        logs = _STATE_HOME / "capabilities" / "node" / "update"
+        try:
+            logs.mkdir(parents=True, exist_ok=True)
+            out = open(logs / f"{kind}.out", "w")
+            err = open(logs / f"{kind}.err", "w")
+        except OSError as exc:
+            self.say_once("update", str(exc), f"cannot keep the update's output: {exc}")
+            return
+        argv = [self.manager, "node", "update", *(["--check"] if kind == "check" else [])]
+        self.update_from = self.manager_target()
+        try:
+            self.update_child = subprocess.Popen(
+                argv, cwd=str(self.root), stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                start_new_session=kind == "update")
+        except OSError as exc:
+            self.say_once("update", str(exc), f"cannot run `node update`: {exc}")
+            return
+        finally:
+            out.close()
+            err.close()
+        self.update_kind = kind
+        if kind == "update":
+            self.say("updates this node, as a row of capabilities_node_updates asks")
+
+    def reap_update(self) -> tuple[str, int] | None:
+        """(kind, exit code) of the `node update` child that ended since the
+        last look, else None."""
+        child = self.update_child
+        if child is None or child.poll() is None:
+            return None
+        self.update_child = None
+        return self.update_kind or "", child.returncode
+
+    def update_ended(self, ended: tuple[str, int], stopping: dict) -> None:
+        """Say how a `node update` child ended; after a run that moved the
+        manager to another release, stop so the supervisor starts node run
+        again on it, every job running on."""
+        kind, code = ended
+        err = _STATE_HOME / "capabilities" / "node" / "update" / f"{kind}.err"
+        try:
+            said = _node_update_error(err.read_text(), code)
+        except OSError:
+            said = f"exited {code}"
+        if kind == "check":
+            self.say_once("check", None if code == 0 else said,
+                          "" if code == 0 else f"the update check did not answer: {said}")
+            return
+        self.check_due = time.monotonic() + NODE_UPDATE_CHECK_SECONDS
+        self.say("the update ended: " + ("updated or current" if code == 0 else said))
+        if self.manager_target() != self.update_from:
+            self.say("the manager on PATH is another release now: stops so its supervisor "
+                     "starts node run again on it")
+            self.restart_self = True
+            stopping["now"] = True
+
+    def tend_update(self) -> None:
+        """Start the update a row asks for, else the check once it is due;
+        one child at a time, and never an update no row asked for."""
+        if self.update_child is not None or not self.read_once:
+            return
+        if self.update_asked:
+            self.update_asked = False
+            if self.update_requested():
+                self.start_update("update")
+                return
+        now = time.monotonic()
+        if now < self.check_due:
+            return
+        age = self.check_age()
+        if age is not None and age < NODE_UPDATE_CHECK_SECONDS:
+            self.check_due = now + NODE_UPDATE_CHECK_SECONDS - age
+            return
+        self.check_due = now + NODE_UPDATE_CHECK_SECONDS
+        self.start_update("check")
+
+    def stop_check(self) -> None:
+        """A check still running when node run stops is stopped with it; an
+        update runs on to its end."""
+        child = self.update_child
+        if child is not None and self.update_kind == "check" and child.poll() is None:
+            child.terminate()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+
     def run(self, stopping: dict) -> None:
         next_reconcile = 0.0
         while not stopping["now"]:
+            # A run that just ended asked its restarts before it ended, so
+            # the poll after this look sees them.
+            ended = self.reap_update()
             placement, restarts = self.poll()
             if placement or time.monotonic() >= next_reconcile:
                 self.reconcile()
                 self.refollow()
+                self.update_asked = True
                 next_reconcile = time.monotonic() + self.every
             elif self.pending_apply and self.read_once:
                 self.apply()
             for name in restarts:
                 self.restart(name)
+            if ended is not None:
+                self.update_ended(ended, stopping)
+            else:
+                self.tend_update()
             if self.moved or time.monotonic() >= self.state_due:
                 self.report_state()
             deadline = time.monotonic() + NODE_RUN_FOLLOW_SECONDS
             while not stopping["now"] and time.monotonic() < deadline:
                 time.sleep(0.2)
+        self.stop_check()
 
 
 class _LaunchdNodeManager(_NodeManager):
@@ -11743,6 +11976,8 @@ def _node_run(args: list[str]) -> None:
     manager.record_unrun({})
     manager.say("stops; every job keeps running under the supervisor")
     lock.close()
+    if manager.restart_self:
+        sys.exit(NODE_UPDATE_RESTART_EXIT)
 
 
 def _node_search_path() -> str:
@@ -12482,12 +12717,14 @@ def _supervise_refusal_of(lines: list) -> dict:
     return {}
 
 
-def _supervise_readiness(command: list[str], root: Path, timeout: int) -> dict:
+def _supervise_readiness(command: list[str], root: Path, timeout: int,
+                         env: dict | None = None) -> dict:
     """Whether a running service can do its work here, in its declared
     doctor's words: `ready`, `degraded` (ready, with settings it skipped on
     this node) or `unusable`, with the problem and its code. The words are the
     contract's: the exit code, the error envelope on stderr, and the body's
-    `ok`, `problem` and `skipped_settings`."""
+    `ok`, `problem` and `skipped_settings`. `env` is the doctor's environment,
+    this process's where None."""
     if not command:
         return {"state": "unusable", "code": "doctor_undeclared",
                 "problem": "the service declares no doctor, so whether it can do its "
@@ -12495,7 +12732,7 @@ def _supervise_readiness(command: list[str], root: Path, timeout: int) -> dict:
     shown = shlex.join(command)
     try:
         done = subprocess.run(command, cwd=str(root), stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=timeout)
+                              capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired:
         return {"state": "unusable", "code": "doctor_timeout",
                 "problem": f"{shown} did not answer in {timeout}s"}
@@ -14001,7 +14238,10 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
 
         def write(conn, agent_id):
             _node_state_write(conn, here, facts, logins, sessions, sorted(folders), needed)
-            return ({**store.node_states(conn, [here])[0],
+            # What it wrote: the update availability is the check's, not this write's.
+            written = {k: v for k, v in store.node_states(conn, [here])[0].items()
+                       if k not in store.NODE_UPDATE_OFFER_COLUMNS}
+            return ({**written,
                      **_node_state_logins(store, store.node_logins(conn, agent_id, [here]), here)},
                     store.node_sessions(conn, agent_id, [here]))
         (row, own_sessions), setting = _kernel_run(root, write)
@@ -14022,16 +14262,23 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         logins = store.node_logins(conn, agent_id, ids)
         sessions = store.node_sessions(conn, agent_id, ids)
         words = store.node_expectations(conn, agent_id, ids)
+        runs = {r["node"]: r for r in store.node_updates(conn, ids)}
         placed = conn.execute(
             "SELECT node, capability FROM capabilities_policy WHERE agent_id = %s "
             "AND node = ANY (%s) AND enabled AND service", (agent_id, ids)).fetchall()
         out = []
         for node in nodes:
             state = states.get(node["node"]) or dict.fromkeys(
-                ("node", *store.NODE_STATE_COLUMNS, "uptime_seconds"))
+                ("node", *store.NODE_STATE_COLUMNS, *store.NODE_UPDATE_OFFER_COLUMNS,
+                 "uptime_seconds"))
             state = {**state, **_node_state_logins(store, logins, node["node"])}
             entry = {"node": node["node"], "label": node["label"],
                      "reachable": bool(state.pop("reachable", False))}
+            entry["update"] = {"available": state.pop("update_available", None),
+                               "checked_at": store._stamp(state.pop("update_checked_at",
+                                                                    None)),
+                               "offer": state.pop("update_offer", None),
+                               "last_run": _node_update_answer(runs.get(node["node"]))}
             entry.update({k: v for k, v in _node_state_answer(state).items() if k != "node"})
             entry["sessions"] = [_node_state_answer({k: v for k, v in s.items() if k != "node"})
                                  for s in sessions if s["node"] == node["node"]]
@@ -14095,6 +14342,480 @@ def _node_expect_verb(root: Path, args: list[str]) -> None:
            "store": _kernel_store_report(setting)})
 
 
+# ---------------------------------------------------------------- node updates
+#
+# A node never updates unasked. Its manager checks on a cadence what is newer
+# - a manager release, a capability payload, the contract library a
+# capability's environment holds - and writes that onto the node's state row;
+# an update runs only for a row of capabilities_node_updates that asks for it,
+# or when `node update` is run on the node itself. A run updates the manager
+# and every installed capability, asks the doctor of every service placed
+# here, and where a step or a doctor fails returns the node to what it ran
+# before - the manager release its links selected, every payload, and each
+# environment's contract library - and asks the doctors again.
+
+NODE_UPDATE_CHANNEL = "capabilities_node_update"
+NODE_UPDATE_CHECK_SECONDS = 3600
+# node run's first look at whether a check is due, after it starts: a node
+# run that restarts again and again does not ask the source each time.
+NODE_UPDATE_FIRST_CHECK_SECONDS = 120
+NODE_UPDATE_STEP_TIMEOUT_SECONDS = 1800
+# node run's exit after an update moved the manager to another release, so
+# its supervisor starts it again whatever the program's autorestart says.
+NODE_UPDATE_RESTART_EXIT = 75
+NODE_UPDATE_GREEN = ("ready", "degraded", "undeclared")
+NODE_UPDATE_CONTRACT_HEADING = re.compile(re.escape(CONTRACT_LIBRARY) + r" (\d+\.\d+\.\d+)")
+
+
+def _node_update_dir() -> Path:
+    """Where a run keeps the payloads it may have to put back, by run id."""
+    return CAP_HOME / ".manager" / "node-update"
+
+
+def _node_update_answer(row: dict | None) -> dict | None:
+    if row is None:
+        return None
+    return {key: (str(value) if key == "id" else _store_module()._stamp(value)
+                  if key.endswith("_at") else value) for key, value in row.items()}
+
+
+def _node_update_error(stderr: str, code: int) -> str:
+    """A failed step's own words: its error envelope, else its last line."""
+    for line in reversed(stderr.strip().splitlines()):
+        try:
+            error = json.loads(line)["error"]
+            return f"{error.get('code')}: {error.get('message')}"
+        except (ValueError, KeyError, TypeError, AttributeError):
+            continue
+    lines = stderr.strip().splitlines()
+    return lines[-1][:300] if lines else f"exited {code}"
+
+
+def _node_update_contract_entries(installed: str, available: str) -> list[dict]:
+    """The contract library's change-log entries newer than `installed`, up to
+    `available`, as its published log names their versions."""
+    from packaging.version import InvalidVersion, Version
+    log, _error = _captured(_changelog_answer, None, "contract", True, None, None)
+    out = []
+    for entry in (log or {}).get("entries") or []:
+        found = NODE_UPDATE_CONTRACT_HEADING.search(entry["heading"])
+        try:
+            if found and Version(installed) < Version(found.group(1)) <= Version(available):
+                out.append(entry)
+        except InvalidVersion:
+            continue
+    return out
+
+
+def _node_update_offer() -> tuple[bool, dict]:
+    """(whether an update is available, what is newer and what it brings):
+    {components [{kind, name, installed, available, entries}], errors}, each
+    component a manager release, a capability payload or the contract library
+    an environment holds that `self-update` and `update` would move, as their
+    --check answers, its entries the change-log entries newer than installed.
+    A source that cannot be asked is an error beside them."""
+    components: list[dict] = []
+    errors: list[dict] = []
+    manager, error = _captured(_self_update_check_answer, None)
+    if error is not None:
+        errors.append({"kind": "manager", "name": "capabilities", "error": error})
+    elif manager["update_available"]:
+        log, _error = _captured(_changelog_answer, None, "manager", False, None, None)
+        components.append({"kind": "manager", "name": "capabilities",
+                           "installed": (manager["installed"] or {}).get("version"),
+                           "available": manager["available"]["version"],
+                           "entries": (log or {}).get("entries") or []})
+    checked, error = _captured(_update_check_answer, None)
+    if error is not None:
+        errors.append({"kind": "capability", "name": None, "error": error})
+        checked = {"checked": []}
+    library: dict[str, dict] = {}
+    for row in checked["checked"]:
+        if "error" in row:
+            errors.append({"kind": "capability", "name": row["name"], "error": row["error"]})
+            continue
+        if row["available"]["catalog_sha256"] != row["installed"]["catalog_sha256"]:
+            log, _error = _captured(_changelog_answer, row["name"], "capability", False,
+                                    None, None)
+            components.append({"kind": "capability", "name": row["name"],
+                               "installed": row["installed"]["version"],
+                               "available": row["available"]["version"],
+                               "entries": (log or {}).get("entries") or []})
+        if row.get("contract_library"):
+            library[row["name"]] = row["contract_library"]
+    if library:
+        from packaging.version import Version
+        installed = min((v["installed"] for v in library.values()), key=Version)
+        available = max((v["available"] for v in library.values()), key=Version)
+        components.append({"kind": "contract_library", "name": CONTRACT_LIBRARY,
+                           "installed": installed, "available": available,
+                           "capabilities": sorted(library),
+                           "entries": _node_update_contract_entries(installed, available)})
+    return bool(components), {"components": components, "errors": errors}
+
+
+def _node_update_link_paths() -> list[Path]:
+    """The manager's links on this machine: the primary one and every other
+    one `self-update` relinks."""
+    links = [_bin_dir() / "capabilities"]
+    links += [d / "capabilities" for d in _manager_link_dirs()]
+    return list(dict.fromkeys(links))
+
+
+def _contract_library_held(path: Path) -> tuple[str | None, str | None]:
+    """(interpreter, version) of the contract library in the environment uv
+    runs `path` in, asked of uv without changing it; (None, None) where uv
+    has made none yet or cannot say."""
+    uv = shutil.which("uv")
+    if uv is None:
+        return None, None
+    try:
+        proc = subprocess.run([uv, "sync", "--quiet", "--script", str(path), "--dry-run",
+                               "--output-format", "json"], capture_output=True, text=True,
+                              timeout=300, env=_snapshot_env())
+        answer = json.loads(proc.stdout)["sync"]
+        python = answer["environment"]["python"]["path"]
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError):
+        return None, None
+    if answer.get("action") == "create" or not Path(python).exists():
+        return None, None
+    try:
+        held = subprocess.run(
+            [python, "-c", "import importlib.metadata as m; "
+                           f"print(m.version({CONTRACT_LIBRARY!r}))"],
+            capture_output=True, text=True, timeout=60, env=_snapshot_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return python, None
+    return python, (held.stdout.strip() or None) if held.returncode == 0 else None
+
+
+def _node_update_versions(keep: Path | None = None) -> tuple[dict, dict]:
+    """What this node runs now: {manager {links, release, version},
+    capabilities {name: {payload_sha256, version}}, contract_library {path:
+    version}}, and each environment's interpreter by path. With `keep`, each
+    capability's payload is copied there too, to put it back."""
+    links = {}
+    for link in _node_update_link_paths():
+        try:
+            links[str(link)] = os.readlink(link)
+        except OSError:
+            links[str(link)] = None
+    root = _active_manager_root()
+    manager = {"links": links, "release": str(root) if root else None,
+               "version": _changelog_version_at(root / MANAGER_CHANGELOG_REL) if root else None}
+    capabilities, libraries, pythons = {}, {}, {}
+    paths = [Path(link) for link, target in links.items() if target]
+    for name, meta in _installed().items():
+        reg = _registry_dir(name)
+        capabilities[name] = {"payload_sha256": meta.get("payload_sha256") or _payload_sha256(reg),
+                              "version": _changelog_version_at(reg / CHANGELOG_NAME)}
+        if keep is not None:
+            keep.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(reg, keep / name, symlinks=True)
+        paths += _contract_library_paths(_script_path(name))
+    for path in dict.fromkeys(paths):
+        python, version = _contract_library_held(path)
+        if python is not None:
+            libraries[str(path)], pythons[str(path)] = version, python
+    return {"manager": manager, "capabilities": capabilities,
+            "contract_library": libraries}, pythons
+
+
+def _node_update_moved(before: dict, after: dict) -> list[str]:
+    """What differs between two answers of _node_update_versions, in words.
+    An environment uv made only since `before` is not something the node ran
+    before, so only the environments `before` holds are compared."""
+    moved = []
+    if before["manager"]["links"] != after["manager"]["links"]:
+        moved.append("the manager release")
+    for name in sorted(set(before["capabilities"]) | set(after["capabilities"])):
+        if before["capabilities"].get(name) != after["capabilities"].get(name):
+            moved.append(f"{name}'s payload")
+    for path, version in sorted(before["contract_library"].items()):
+        if after["contract_library"].get(path) != version:
+            moved.append(f"the {CONTRACT_LIBRARY} of {path}")
+    return moved
+
+
+def _node_update_rollback(before: dict, pythons: dict, keep: Path) -> list[str]:
+    """Return this node to `before`: each manager link to the release it
+    selected, each capability's payload from `keep`, and each environment's
+    contract library to the version it held. Answers what could not be put
+    back, in words."""
+    problems = []
+    for link, target in before["manager"]["links"].items():
+        path = Path(link)
+        try:
+            current = os.readlink(path) if path.is_symlink() else None
+        except OSError:
+            current = None
+        if current == target:
+            continue
+        try:
+            if target is None:
+                path.unlink(missing_ok=True)
+                continue
+            temporary = path.with_name(f".{path.name}.node-update-{secrets.token_hex(8)}")
+            temporary.symlink_to(target)
+            os.replace(temporary, path)
+        except OSError as exc:
+            problems.append(f"the manager link {link}: {exc}")
+    now, _pythons = _node_update_versions()
+    for name, held in sorted(before["capabilities"].items()):
+        if now["capabilities"].get(name) == held:
+            continue
+        kept = keep / name
+        if not kept.is_dir():
+            problems.append(f"{name}'s payload: no copy was kept")
+            continue
+        _done, error = _captured(_activate_payload, name, kept)
+        if error is not None:
+            problems.append(f"{name}'s payload: {error.get('message')}")
+    for name in sorted(set(now["capabilities"]) - set(before["capabilities"])):
+        problems.append(f"{name} was not installed before")
+    now, now_pythons = _node_update_versions()
+    uv = shutil.which("uv")
+    for path, version in sorted(before["contract_library"].items()):
+        if now["contract_library"].get(path) == version or version is None:
+            continue
+        python = now_pythons.get(path) or pythons.get(path)
+        if uv is None or python is None:
+            problems.append(f"the {CONTRACT_LIBRARY} of {path}: no environment to put "
+                            f"{version} back in")
+            continue
+        try:
+            done = subprocess.run([uv, "pip", "install", "--quiet", "--python", python,
+                                   f"{CONTRACT_LIBRARY}=={version}"], capture_output=True,
+                                  text=True, timeout=300, env=_snapshot_env())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            problems.append(f"the {CONTRACT_LIBRARY} of {path}: {exc}")
+            continue
+        if done.returncode != 0:
+            problems.append(f"the {CONTRACT_LIBRARY} of {path}: "
+                            + _node_update_error(done.stderr, done.returncode))
+    return problems
+
+
+def _node_update_placed(root: Path, here: str) -> tuple[dict[str, Path], list[tuple]]:
+    """(the folders here bound to the agents the store links to this node,
+    the (agent, capability) of each service those agents place here)."""
+    def read(conn, _agent_id):
+        return (conn.execute("SELECT agent_id, folder FROM capabilities_agent_nodes "
+                             "WHERE node = %s ORDER BY agent_id", (here,)).fetchall(),
+                conn.execute("SELECT agent_id, capability FROM capabilities_policy "
+                             "WHERE node = %s AND enabled AND service "
+                             "ORDER BY agent_id, capability", (here,)).fetchall())
+    (linked, placed), _setting = _kernel_run(root, read)
+    own = _folder_agent_id(root)
+    folders = {agent_id: path for agent_id, folder in linked
+               if (path := _node_agent_folder(root, own, agent_id, folder)) is not None}
+    return folders, [(a, c) for a, c in placed if a in folders]
+
+
+def _node_update_doctors(root: Path, folders: dict[str, Path],
+                         placed: list[tuple]) -> list[dict]:
+    """The doctor of every service placed here, asked as `node supervise`
+    asks it: an agent's service in that agent's folder, a machine service
+    once, in this folder. A service that declares no doctor is `undeclared`."""
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("CLAUDE_PROJECT_DIR", PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV)}
+    answers, machines = [], set()
+    for agent_id, capability in placed:
+        _command, why = _node_service_command(capability)
+        if why is not None and _node_machine_command(capability):
+            if capability in machines:
+                continue
+            machines.add(capability)
+            entry = {"capability": capability, "machine": True}
+            doctor, where = _supervise_machine_command(capability)[1], root
+        else:
+            entry = {"capability": capability, "agent_id": agent_id}
+            doctor, where = _supervise_doctor(capability), folders[agent_id]
+        if not doctor:
+            answers.append({**entry, "state": "undeclared"})
+            continue
+        said = _supervise_readiness(doctor, where, SUPERVISE_PROBE_TIMEOUT_SECONDS, env)
+        answers.append({**entry, "state": said["state"],
+                        **{k: said[k] for k in ("code", "problem") if said.get(k)}})
+    return answers
+
+
+def _node_update_red(doctors: list[dict]) -> str | None:
+    red = [d for d in doctors if d["state"] not in NODE_UPDATE_GREEN]
+    if not red:
+        return None
+    return "; ".join(
+        f"the doctor of {d['capability']}"
+        + (" (machine)" if d.get("machine") else f" for {d['agent_id']}")
+        + f" answered {d['state']}"
+        + (f" ({d['code']})" if d.get("code") else "")
+        + (f": {d['problem']}" if d.get("problem") else "") for d in red)
+
+
+def _node_update_step(argv: list[str], root: Path) -> str | None:
+    """Run one step of the update - the manager the links select now, with
+    `argv` - and answer why it failed, or None."""
+    link = _bin_dir() / "capabilities"
+    manager = str(link) if link.exists() else str(Path(__file__).resolve())
+    try:
+        done = subprocess.run([manager, *argv], cwd=str(root), stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True,
+                              timeout=NODE_UPDATE_STEP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        return f"{' '.join(argv)} did not end in {NODE_UPDATE_STEP_TIMEOUT_SECONDS}s"
+    except OSError as exc:
+        return f"{' '.join(argv)} could not be run: {exc}"
+    if done.returncode != 0:
+        return f"{' '.join(argv)} failed: {_node_update_error(done.stderr, done.returncode)}"
+    return None
+
+
+def _node_update_run(root: Path, here: str, run_id: str) -> dict:
+    """Update this node now and answer the outcome: {state, reason,
+    versions_before, versions_after, doctors}."""
+    keep = _node_update_dir() / str(run_id)
+    shutil.rmtree(keep, ignore_errors=True)
+    folders, placed = _node_update_placed(root, here)
+    before, pythons = _node_update_versions(keep=keep)
+    failed = (_node_update_step(["self-update"], root)
+              or _node_update_step(["update"], root))
+    after, _pythons = _node_update_versions()
+    doctors = {"after_update": _node_update_doctors(root, folders, placed)}
+    moved = _node_update_moved(before, after)
+    red = _node_update_red(doctors["after_update"])
+    outcome = {"versions_before": before, "doctors": doctors}
+    if failed is None and (red is None or not moved):
+        shutil.rmtree(keep, ignore_errors=True)
+        if moved:
+            asked = set()
+            for agent_id, capability in placed:
+                machine = (_node_service_command(capability)[1] is not None
+                           and bool(_node_machine_command(capability)))
+                if machine and capability in asked:
+                    continue
+                asked.add(capability)
+                _announce(root, NODE_RESTART_CHANNEL, f"{agent_id}/{capability}/{here}")
+        return {**outcome, "state": "updated" if moved else "current",
+                "reason": ("moved " + ", ".join(moved)) if moved
+                else "nothing newer to run" + (f"; {red}" if red else ""),
+                "versions_after": after}
+    why = failed or red
+    problems = _node_update_rollback(before, pythons, keep)
+    restored, _pythons = _node_update_versions()
+    doctors["after_rollback"] = _node_update_doctors(root, folders, placed)
+    left = _node_update_moved(before, restored)
+    if problems or left:
+        return {**outcome, "state": "failed", "versions_after": restored,
+                "reason": f"{why}; the node could not be returned to what it ran before: "
+                          + "; ".join(problems or [f"{item} differs" for item in left])}
+    shutil.rmtree(keep, ignore_errors=True)
+    return {**outcome, "state": "rolled_back", "versions_after": restored, "reason": why}
+
+
+def _node_update_check_write(root: Path, here: str) -> dict:
+    """Check what is newer for this node and write it onto its state row,
+    which a node that has written none yet gets now. Answers {update_available,
+    offer, checked_at}."""
+    store = _store_module()
+    available, offer = _node_update_offer()
+
+    def write(conn, _agent_id):
+        said = store.node_update_offer_put(conn, here, available=available, offer=offer)
+        if said is None:
+            store.node_state_put(conn, here, **_node_facts())
+            said = store.node_update_offer_put(conn, here, available=available, offer=offer)
+        return said
+    said, _setting = _kernel_run(root, write)
+    return {"update_available": available, "offer": offer,
+            "checked_at": store._stamp(said["update_checked_at"])}
+
+
+def _node_update_linked(root: Path, here: str) -> str:
+    """The agent id, where the store links it to this node; else exit 6."""
+    def linked(conn, agent_id):
+        if not conn.execute("SELECT 1 FROM capabilities_agent_nodes WHERE agent_id = %s "
+                            "AND node = %s", (agent_id, here)).fetchone():
+            raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {here}",
+                                 f"register it with `capabilities node add {here} "
+                                 "--label <label> --kind mac|server`")
+        return agent_id
+    try:
+        agent_id, _setting = _kernel_run(root, linked)
+    except _KernelRefusal as exc:
+        _die(6, exc.code, exc.message, exc.hint)
+    return agent_id
+
+
+def _node_update_verb(root: Path, args: list[str]) -> None:
+    """`node update [--check | --node <node>]`."""
+    import fcntl
+    pos, opts = _kernel_options(args, {"--node"}, {"--check", "--json"}, "node update")
+    if pos or ("--node" in opts and "--check" in opts):
+        _die(6, "input", "node update takes no positional argument, and --check or --node, "
+             "not both", "capabilities node update [--check | --node <node>]")
+    _read_only_gate("node update")
+    store = _store_module()
+    if "--node" in opts:
+        ref = opts["--node"].strip()
+
+        def ask(conn, agent_id):
+            node = _node_ref(conn, agent_id, ref)
+            try:
+                return agent_id, store.node_update_request(conn, node, by=_vault_actor())
+            except store.StoreError as exc:
+                raise _KernelRefusal(exc.slug, exc.message, exc.hint) from None
+        try:
+            (agent_id, run), setting = _kernel_run(root, ask)
+        except _KernelRefusal as exc:
+            _die(6, exc.code, exc.message, exc.hint)
+        _emit({"ok": True, "project": str(root), "agent_id": agent_id, "node": run["node"],
+               "requested": _node_update_answer(run), "store": _kernel_store_report(setting)})
+        return
+    here = _this_node()["id"]
+    agent_id = _node_update_linked(root, here)
+    setting = _db_module().resolve_setting(root)
+    if "--check" in opts:
+        _emit({"ok": True, "project": str(root), "agent_id": agent_id, "node": here,
+               **_node_update_check_write(root, here), "store": _kernel_store_report(setting)})
+        return
+    lock_path = _node_update_dir() / ".lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(lock_path, "w")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        _die(6, "node_update_running", "an update of this node is running already",
+             "`capabilities node state` shows it; it ends on its own")
+    except OSError as exc:
+        _die(5, "node_update_unwritable", f"cannot keep the update's lock: {exc}")
+    actor = _vault_actor()
+    (taken, setting) = _kernel_run(root, lambda conn, _a: store.node_update_claim(
+        conn, here, by=actor))
+    run = taken["run"]
+    try:
+        outcome = _node_update_run(root, here, str(run["id"]))
+    except (Exception, SystemExit) as exc:
+        reason = (f"the run stopped: {type(exc).__name__}: {exc}" if isinstance(exc, Exception)
+                  else "the run stopped on an error it could not get past")
+        outcome = {"state": "failed", "reason": reason}
+    row, setting = _kernel_run(root, lambda conn, _a: store.node_update_finish(
+        conn, run["id"], **outcome))
+    availability, error = _captured(_node_update_check_write, root, here)
+    answer = {"ok": outcome["state"] in ("updated", "current"), "project": str(root),
+              "agent_id": agent_id, "node": here, "update": _node_update_answer(row),
+              "interrupted": [str(i) for i in taken["interrupted"]],
+              "availability": availability if error is None else {"error": error},
+              "store": _kernel_store_report(setting)}
+    lock.close()
+    if outcome["state"] in ("updated", "current"):
+        _emit(answer)
+        return
+    _service_fail(f"update_{outcome['state']}",
+                  f"the update of node {here} ended {outcome['state']}: {outcome['reason']}",
+                  "`capabilities node state` shows the run; nothing was restarted",
+                  answer)
+
+
 def cmd_node(args: list[str]) -> None:
     sub = args[0] if args else None
     if sub == "id":
@@ -14139,9 +14860,12 @@ def cmd_node(args: list[str]) -> None:
     if sub == "expect":
         _node_expect_verb(root, args[1:])
         return
+    if sub == "update":
+        _node_update_verb(root, args[1:])
+        return
     if sub not in ("add", "set", "remove", "seen"):
         _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, state, "
-             "expect, id, rekey, run or supervise",
+             "expect, update, id, rekey, run or supervise",
              "run `capabilities help`")
     _read_only_gate(f"node {sub}")
     if sub == "seen":

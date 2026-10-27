@@ -221,7 +221,7 @@ def dry_runs_change_nothing(w: World, version: str) -> dict:
     dry = w.answer(result)
     assert dry["applied"] is False and dry["would_write"] is True
     assert dry["tables_to_upgrade"]["capabilities"]["from"] == version
-    assert dry["tables_to_upgrade"]["capabilities"]["to"] == "1.16"
+    assert dry["tables_to_upgrade"]["capabilities"]["to"] == "1.17"
     assert "tables_upgraded" not in dry
     assert {r["capability"] for r in dry["plan"]["policy"]} == {"coolify", "memory"}
     assert store_snapshot(w) == before
@@ -275,10 +275,10 @@ def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(wor
                                                          "steps": [last]}
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply"))
     assert applied["state"] == "migrated" and applied["changed"] is True
-    assert applied["tables_upgraded"]["version"] == "1.16"
+    assert applied["tables_upgraded"]["version"] == "1.17"
     assert applied["tables_upgraded"]["steps"][0].startswith("0014")
     assert world.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
-        == [(1, 16)]
+        == [(1, 17)]
     # Each capability's own tables, as its install migrated them.
     for name in ("automations", "tasks", "whatsapp", "memory"):
         result = world.cap(root, name, "migrate")
