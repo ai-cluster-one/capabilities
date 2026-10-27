@@ -188,6 +188,11 @@ MACHINE VERBS
         {ok, applied, version} or {ok: false, exit, error}. A refusal - no
         store configured, store unreachable or busy, the capability
         quarantined - leaves the payload installed; its first call migrates.
+        An update of a capability that stops, here or in the release that
+        reconciles this machine, is recorded as
+        $CAPABILITIES_HOME/.update-failed/<name>.json {name, at, error}, which
+        that capability's doctor raises as its one supervisor line; the next
+        install or update of it that lands removes the record.
   update --check [<name>] [--json]
         Report, for every installed capability or the one named, whether its
         recorded source carries a different payload. Writes no registry entry,
@@ -1794,6 +1799,9 @@ _CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 _DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
 SOURCE_WORKSPACE_ROOT = CAP_HOME / "sources"
+# Where an update of a capability that failed is recorded, one <name>.json each,
+# for that capability's doctor to raise (capabilities-contract, core tier).
+UPDATE_FAILED_DIR = CAP_HOME / ".update-failed"
 LEGACY_SOURCE_WORKSPACE_ROOT = Path.home() / "capabilities-sources"
 SOURCES_FILE = _CONFIG_HOME / "capabilities" / "sources.json"
 SOURCE_CACHE_ROOT = _CACHE_HOME / "capabilities" / "sources"
@@ -4412,6 +4420,7 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
         shutil.rmtree(stage, ignore_errors=True)
         raise
     reg = _registry_dir(name)
+    (UPDATE_FAILED_DIR / f"{name}.json").unlink(missing_ok=True)
     link = _symlink(name, script)
     _refresh_contract_library(script)
     migrated = _migrate_tables(name, script, manifest)
@@ -4481,6 +4490,47 @@ def cmd_uninstall(name: str, purge_credentials: bool) -> None:
     _emit(result)
 
 
+class _Tee(io.TextIOBase):
+    def __init__(self, *streams):
+        self._streams = streams
+
+    def write(self, text: str) -> int:
+        for stream in self._streams:
+            stream.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        for stream in self._streams:
+            stream.flush()
+
+
+@contextmanager
+def _update_recorded(name: str):
+    """Record an update of `name` that stops, for its doctor to raise, and drop
+    the record once one lands: `UPDATE_FAILED_DIR/<name>.json` holds
+    {name, at, error}, the error as the manager reported it."""
+    path = UPDATE_FAILED_DIR / f"{name}.json"
+    errors = io.StringIO()
+    try:
+        with redirect_stderr(_Tee(sys.stderr, errors)):
+            yield
+    except SystemExit:
+        error = {"code": "update_failed", "message": "the update stopped without a reason"}
+        for line in reversed(errors.getvalue().splitlines()):
+            try:
+                error = json.loads(line)["error"]
+                break
+            except (ValueError, KeyError, TypeError):
+                continue
+        _write_json(path, {"name": name, "at": _utc_now(), "error": error})
+        raise
+    except Exception as exc:
+        _write_json(path, {"name": name, "at": _utc_now(),
+                           "error": {"code": "update_failed", "message": str(exc)}})
+        raise
+    path.unlink(missing_ok=True)
+
+
 def cmd_update(name: str | None) -> None:
     if name:
         _reject_reserved_capability_name(name)
@@ -4490,33 +4540,39 @@ def cmd_update(name: str | None) -> None:
     results = []
     for n in targets:
         _assert_payload_mutable(n)
-        meta = _read_json(_registry_dir(n) / "meta.json") or {}
-        source_id = meta.get("source_id")
-        provenance = {}
-        if source_id:
-            source, provenance = _source_install_ref(n, source_id)
-        else:
-            source = meta.get("source")
-        before = meta.get("payload_sha256")
-        if before is None and _script_path(n).exists():
-            before = _sha256(_script_path(n))
-        content, source, bundle_dir, temp_root = _resolve_source(n, source)
-        stage, manifest = _prepare_payload(n, content, bundle_dir, temp_root, source)
-        after = _payload_sha256(stage)
-        _write_json(stage / "meta.json", {
-            "name": n, "source": source, "source_type": "directory" if bundle_dir else "script",
-            "sha256": _sha256(stage / n), "payload_sha256": after,
-            **provenance,
-        })
-        script = _activate_payload(n, stage)
-        _refresh_contract_library(script)
-        entry = {"name": n, "changed": before != after}
-        migrated = _migrate_tables(n, script, manifest)
-        if migrated is not None:
-            entry["migrate"] = migrated
-        results.append(entry)
+        with _update_recorded(n):
+            results.append(_update_one(n))
     _sync_skill()
     _emit({"updated": results})
+
+
+def _update_one(n: str) -> dict:
+    """Update one installed capability from its recorded source."""
+    meta = _read_json(_registry_dir(n) / "meta.json") or {}
+    source_id = meta.get("source_id")
+    provenance = {}
+    if source_id:
+        source, provenance = _source_install_ref(n, source_id)
+    else:
+        source = meta.get("source")
+    before = meta.get("payload_sha256")
+    if before is None and _script_path(n).exists():
+        before = _sha256(_script_path(n))
+    content, source, bundle_dir, temp_root = _resolve_source(n, source)
+    stage, manifest = _prepare_payload(n, content, bundle_dir, temp_root, source)
+    after = _payload_sha256(stage)
+    _write_json(stage / "meta.json", {
+        "name": n, "source": source, "source_type": "directory" if bundle_dir else "script",
+        "sha256": _sha256(stage / n), "payload_sha256": after,
+        **provenance,
+    })
+    script = _activate_payload(n, stage)
+    _refresh_contract_library(script)
+    entry = {"name": n, "changed": before != after}
+    migrated = _migrate_tables(n, script, manifest)
+    if migrated is not None:
+        entry["migrate"] = migrated
+    return entry
 
 
 def _captured(fn, *args):
@@ -25117,9 +25173,10 @@ def _source_release(
             current_identity = current[1] if current is not None else None
             if current_identity == action["before"]:
                 if kind == "update":
-                    result = _activate_released_capability(
-                        name, repo, source_id, remote_url, branch, candidate
-                    )
+                    with _update_recorded(name):
+                        result = _activate_released_capability(
+                            name, repo, source_id, remote_url, branch, candidate
+                        )
                 else:
                     result = _remove_released_capability(name)
             elif kind == "remove" and not _registry_dir(name).exists():
