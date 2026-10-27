@@ -394,8 +394,8 @@ POST_INSTALL: list[dict] = []
 # block carries no entry and stays far below it.
 CONTRIBUTION = {"path": "state/context.md", "max_bytes": 32768}
 SERVICE = {
-    # How many nodes run it at once (service.placement). Writes and consolidation take
-    # advisory locks in the store, so any node it is placed on may run it.
+    # How many nodes run it at once (service.placement). Writes take a transaction
+    # lock and consolidation a lease in the store, so any node it is placed on may run it.
     "placement": "shared",
     "name": "memory",
     "summary": ("Keeps each served project's memory block rendered as the store announces "
@@ -1080,14 +1080,17 @@ def cmd_groom(args) -> None:
     project = _project(write=bool(args.apply or args.undo))
     root = _root()
     settings = _settings()
-    # A session connection: the pass's lock is held across its transactions.
+    # A session connection: the pass's lease is held across its transactions,
+    # beside the session lock an earlier release keeps passes out by.
     with _guarded(), _open_store(root, session=True) as store:
         if args.undo:
             out = store.undo_pass(project, args.undo, actor=_actor(), node=node_name())
             out["context"] = _render_here(store, project, root, "`memory groom --undo`")
             _emit(out)
             return
-        if args.apply and not store.try_groom_lock(project):
+        if args.apply and not store.try_groom_lock(
+                project, settings["groom_timeout_seconds"] + engine.GROOM_LEASE_GRACE_SECONDS,
+                node=node_name()):
             _die(7, "groom_running", "another grooming pass holds this project's memory",
                  "it ends on its own; run it again afterwards")
         try:

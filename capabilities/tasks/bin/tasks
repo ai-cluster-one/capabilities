@@ -5744,11 +5744,17 @@ _LANDING_HINT = (f"assign it to a worker that takes it there, or to a person; "
 # own transaction, so no task stands assigned to a project that will never
 # consider it.
 
-# The advisory lock a running service holds for each project it serves, on
-# the connection it listens on. `pg_locks` shows it to every session of the
-# database, so any project, on any machine, can tell whether one runs; it goes
-# with the connection, so a service that died holds nothing.
+# A running service says it serves each project by its row in
+# `tasks_presences`, which lapses `PRESENCE_SECONDS` after the service last
+# renewed it (the daemon renews it well inside that), so any project, on any
+# machine, can tell whether one runs and a service that died says nothing once
+# its row lapses. A service of an
+# earlier release says it only by the advisory lock it holds on the connection
+# it keeps; `pg_locks` shows that lock to every session of the database, so it
+# is read as well, and a service of this release takes it too, for an earlier
+# release that reads only the lock.
 _PRESENCE_CLASS = 31324
+PRESENCE_SECONDS = 180
 
 
 def _presence_key(schema: str, project: str) -> str:
@@ -5757,14 +5763,17 @@ def _presence_key(schema: str, project: str) -> str:
 
 def _serving(cur, project: str) -> bool:
     """Whether a tasks service serving `project` on this store is running."""
-    cur.execute("""select exists (
+    cur.execute(f"""select exists (
+                       select 1 from {SCHEMA}.tasks_presences
+                        where project_id = %s and expires_at > now())
+                    or exists (
                        select 1 from pg_locks
                         where locktype = 'advisory' and objsubid = 2
                           and database = (select oid from pg_database
                                            where datname = current_database())
                           and classid = %s::oid
                           and objid::bigint = (hashtext(%s)::bigint & 4294967295)) as serving""",
-                (_PRESENCE_CLASS, _presence_key(SCHEMA, project)))
+                (project, _PRESENCE_CLASS, _presence_key(SCHEMA, project)))
     return bool(cur.fetchone()["serving"])
 
 
@@ -11027,6 +11036,9 @@ class _ServiceHost:
         # questions and every turn this host starts reach it.
         self.setting = _store_setting(root=self.root)
         self.schema = self.setting.schema
+        # This service's row in `tasks_presences`, for as long as it serves.
+        import uuid as _uuid
+        self.presence = _uuid.uuid4()
 
     def scope(self, environment: Mapping[str, str]) -> ProjectScope:
         return ProjectScope(self.root, environment, schema=self.schema,
@@ -11140,15 +11152,33 @@ class _ServiceHost:
                         local_settings={"statement_timeout":
                                         str(int(timeout_seconds * 1000))})
 
-    def present(self, conn, on: bool = True) -> None:
+    def present(self, conn, on: bool = True, renew: bool = False) -> None:
         """Say on `conn`, the connection the daemon holds, that a service
-        serves this project, or no longer does: the advisory lock any project
-        reads from `pg_locks` before it assigns a task here. Taken, never waited
-        for, so a second service serving the same project elsewhere blocks
-        nothing."""
-        function = "pg_try_advisory_lock" if on else "pg_advisory_unlock"
-        conn.execute(f"select {function}(%s, hashtext(%s))",
-                     (_PRESENCE_CLASS, _presence_key(self.schema, self.project)))
+        serves this project, or no longer does: this service's row in
+        `tasks_presences`, which any project reads before it assigns a task
+        here, beside the advisory lock an earlier release reads from
+        `pg_locks`. The lock is taken, never waited for, so a second service
+        serving the same project elsewhere blocks nothing; `renew` only moves
+        the row's expiry on, the lock already held."""
+        key = (_PRESENCE_CLASS, _presence_key(self.schema, self.project))
+        rows = f"{self.schema}.tasks_presences"
+        if not on:
+            conn.execute(f"delete from {rows} where project_id = %s and holder = %s",
+                         (self.project, self.presence))
+            conn.execute("select pg_advisory_unlock(%s, hashtext(%s))", key)
+            return
+        if not renew:
+            conn.execute("select pg_try_advisory_lock(%s, hashtext(%s))", key)
+        conn.execute(f"delete from {rows} where project_id = %s and expires_at <= now()",
+                     (self.project,))
+        conn.execute(f"""insert into {rows} as p
+                             (project_id, holder, node, lock_pid, expires_at)
+                         values (%s, %s, %s, pg_backend_pid(),
+                                 now() + make_interval(secs => %s))
+                         on conflict (project_id, holder) do update
+                            set lock_pid = excluded.lock_pid, renewed_at = now(),
+                                expires_at = excluded.expires_at""",
+                     (self.project, self.presence, node_name(), PRESENCE_SECONDS))
 
     @staticmethod
     def ping(conn) -> None:
@@ -12960,7 +12990,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 7
+STORE_MINOR = 8
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -13667,6 +13697,33 @@ create constraint trigger tasks_workers_notify_declaration after insert or updat
     for each row execute function tasks_workers_notify_declaration();
 """
 
+# Whether a tasks service serves a project, said by a row the service renews
+# rather than only by an advisory lock that lives as long as one session.
+# `lock_pid` names the session that also holds that lock, the presence an
+# earlier release says and reads, so the store shows whether a service of an
+# earlier release still serves: a lock holder no row names.
+_SERVICE_PRESENCE = r"""
+create table tasks_presences (
+    project_id  text not null check (project_id <> ''),
+    holder      uuid not null,
+    node        text check (node <> ''),
+    lock_pid    integer,
+    renewed_at  timestamptz not null default now(),
+    expires_at  timestamptz not null,
+    primary key (project_id, holder)
+);
+comment on table tasks_presences is
+    'A running tasks service serving a project: one row per service, renewed while it runs '
+    'and removed when it stops; a row past expires_at says nothing.';
+comment on column tasks_presences.holder is
+    'The service process serving the project; only it renews or removes the row.';
+comment on column tasks_presences.lock_pid is
+    'pg_backend_pid() of the session holding the presence advisory lock an earlier release '
+    'says and reads presence by.';
+comment on column tasks_presences.expires_at is
+    'When the row stops saying the project is served unless renewed first.';
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
@@ -13677,6 +13734,7 @@ STORE_STEPS = [
     ("0007-hooks", _HOOKS_TABLE),
     ("0008-workers-announce", _WORKERS_ANNOUNCE),
     ("0009-change-versions", _CHANGE_VERSIONS),
+    ("0010-service-presence", _SERVICE_PRESENCE),
 ]
 
 

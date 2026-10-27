@@ -157,6 +157,11 @@ ROUND_TRIP_SECONDS = QUESTION_TIMEOUT_SECONDS + 15
 # for this long.
 PING_SECONDS = 120.0
 
+# How often the row that says each served project is served is renewed on the
+# listener: well inside the time after which the host lets it lapse, so a
+# missed renewal or two does not lapse it.
+PRESENCE_RENEW_SECONDS = 60.0
+
 # Wakes that may start a turn only to have its claim run the sweeps: a lapsed
 # lease and an ended wait are put back by a claim and by nothing else, and no
 # write announces either. Starting one on every wake would spin on a sweep that
@@ -464,6 +469,7 @@ class Store:
         self.relisten_at: float | None = None
         self.relisten_delay = RELISTEN_FIRST_SECONDS
         self.listener_pinged = 0.0
+        self.presence_renewed = 0.0
         # What follows the store's change versions, read on the listener: kept
         # across a lost listener, so the first read after it reports what moved
         # meanwhile. A store whose versions do not read says why, once.
@@ -1428,6 +1434,8 @@ class Dispatcher:
         for slot in self.slots:
             slot.unpublish()
         for store in self.stores():
+            for slot in self.on(store):
+                self._present(store, slot, on=False)
             self._drop_listener(store)
             self._drop_query(store)
         for slot in self.slots:
@@ -1672,7 +1680,7 @@ class Dispatcher:
             self._relisten_later(store)
             return
         store.opened()
-        store.listener_pinged = time.monotonic()
+        store.listener_pinged = store.presence_renewed = time.monotonic()
         for slot in self.on(store):
             self._present(store, slot)
         if store.listen_error is not None:
@@ -1695,15 +1703,21 @@ class Dispatcher:
             # The versions as they stand now: what moves after this is a wake.
             self._follow(store)
 
-    def _present(self, store: Store, slot: ProjectSlot, on: bool = True) -> None:
+    def _present(self, store: Store, slot: ProjectSlot, on: bool = True,
+                 renew: bool = False) -> None:
         """Say on the store's listener that this daemon serves the slot's
-        project, or no longer does. A listener lost takes it along, and the
-        next one says it again."""
+        project, or no longer does, or say it again before it lapses
+        (`renew`). A listener lost takes the lock along, and the next one says
+        it again."""
         present = getattr(slot.host, "present", None)
         if store.listener is None or present is None:
             return
         try:
-            present(store.listener, on)
+            with store.host.bounded(store.listener, ROUND_TRIP_SECONDS):
+                if renew:
+                    present(store.listener, on, renew=True)
+                else:
+                    present(store.listener, on)
         except Exception as exc:
             slot.log(f"cannot say on the store that this project is served: {_why(exc)}")
 
@@ -1875,9 +1889,15 @@ class Dispatcher:
 
     def _ping(self, now: float) -> None:
         """A round trip on each held connection that is due one, so a proxy in
-        front of the store sees it in use. A ping that fails is that connection
-        lost."""
+        front of the store sees it in use, and on each listener the renewal of
+        the rows that say its projects are served. A ping that fails is that
+        connection lost."""
         for store in self.stores():
+            if store.listener is not None \
+                    and now - store.presence_renewed >= PRESENCE_RENEW_SECONDS:
+                store.presence_renewed = now
+                for slot in self.on(store):
+                    self._present(store, slot, renew=True)
             if store.listener is not None and now - store.listener_pinged >= PING_SECONDS:
                 store.listener_pinged = now
                 try:

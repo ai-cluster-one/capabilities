@@ -66,6 +66,23 @@ def test_dry_run_shows_the_checked_plan_and_changes_nothing(world, tmp_path):
     assert turn["cwd"] == str(root)
 
 
+def test_a_second_pass_does_not_start_while_one_holds_the_lease(world, tmp_path):
+    import psycopg
+    from _cli import DSN, project_id
+    root = world.project("p")
+    ids = seed(world, root)
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"INSERT INTO {world.schema}.memory_groom_leases "
+                     "(project_id, holder, expires_at) "
+                     "VALUES (%s, gen_random_uuid(), now() + interval '1 hour')",
+                     (project_id(root),))
+    before = world.ok(root, "status")["last_event"]
+    done = world.run(root, "groom", "--apply",
+                     FAKE_GROOM_PLAN=plan_file(tmp_path, good_plan(ids)))
+    assert done.returncode == 7 and error(done)["code"] == "groom_running"
+    assert world.ok(root, "status")["last_event"] == before
+
+
 def test_apply_then_undo(world, tmp_path):
     root = world.project("p")
     ids = seed(world, root)

@@ -117,7 +117,7 @@
     },
     "memory": {
       "path": "capabilities/memory",
-      "payload_sha256": "2113e94437659b192c3503787b4f7cdd8958bc604c72bda74e52e637e31246b7",
+      "payload_sha256": "c112c9372b78a1e4ee16eb905879a0ab1f298e920a52b897aed1bbe18bcdf801",
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
     },
     "notion": {
@@ -172,7 +172,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "bfb41b4548890e83b1c4c848c95d7daf6e2ad255d4b070d63d6850850e1d28a2",
+      "payload_sha256": "b1acbbadfcf9cd21eb7be48c39b7a85d567cd055436744c7745e8a967c740fd3",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

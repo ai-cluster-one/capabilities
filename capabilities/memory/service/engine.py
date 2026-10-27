@@ -40,7 +40,7 @@ from typing import Any, Callable, Iterable
 
 LEDGER_OWNER = "memory"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 1
+LEDGER_MINOR = 2
 CHANNEL = "memory_changed"
 
 LEDGER_STEPS = [
@@ -159,7 +159,38 @@ LEDGER_STEPS = [
         RETURN NULL;
     END $$;
     """),
+    # The grooming pass's lease: one row per project while a pass holds it, so
+    # a second pass is kept out by a row rather than by a lock that lives only
+    # as long as one session. `lock_pid` names the session that also holds the
+    # older session lock, so the store shows whether a pass of an earlier
+    # release - a lock holder no row names - is still about.
+    ("0006-groom-lease", """
+    CREATE TABLE memory_groom_leases (
+        project_id  text PRIMARY KEY CHECK (project_id <> ''),
+        holder      uuid NOT NULL,
+        node        text CHECK (node <> ''),
+        lock_pid    integer,
+        taken_at    timestamptz NOT NULL DEFAULT now(),
+        expires_at  timestamptz NOT NULL
+    );
+    COMMENT ON TABLE memory_groom_leases IS
+        'The grooming pass that holds a project''s memory: one row while it runs, taken only '
+        'when none is held or the one held has expired, and removed when the pass ends.';
+    COMMENT ON COLUMN memory_groom_leases.holder IS
+        'The pass holding the lease; only it renews or removes the row.';
+    COMMENT ON COLUMN memory_groom_leases.lock_pid IS
+        'pg_backend_pid() of the session that also holds the earlier session advisory lock '
+        'while releases that only take that lock may still run.';
+    COMMENT ON COLUMN memory_groom_leases.expires_at IS
+        'When the lease lapses unless removed first: the pass''s deadline, so a pass that '
+        'was killed leaves nothing that outlasts it.';
+    """),
 ]
+
+# How long a grooming pass's lease outlasts its model deadline: past the
+# minute the service gives a pass before ending it, and the apply and render
+# after the model answers.
+GROOM_LEASE_GRACE_SECONDS = 120
 
 STATUSES = ("active", "superseded", "dropped")
 WRITE_KINDS = ("add", "supersede", "drop", "pin", "unpin", "purge")
@@ -406,6 +437,7 @@ class Store:
         self.application_name = application_name
         self.session = session
         self.conn = None
+        self._groom_holder = None
 
     @property
     def schema(self) -> str:
@@ -799,14 +831,50 @@ class Store:
         movable = [r for r in rows if not r["pinned"] and r["created_at"] >= since]
         return movable, pinned
 
-    def try_groom_lock(self, project: str) -> bool:
-        """The store lock that keeps a second pass for this project out, on any
-        machine, for as long as this connection holds it."""
-        row = self.one("SELECT pg_try_advisory_lock(hashtext('memory groom ' || %s), "
-                       "hashtext(%s)) AS got", (self.schema, project))
-        return bool(row["got"])
+    def try_groom_lock(self, project: str, seconds: float, node: str | None = None) -> bool:
+        """Take the lease that keeps a second pass for this project out, on any
+        machine, for `seconds` at most: its row in `memory_groom_leases`, taken
+        when none is held or the one held has expired.
+
+        A release before the lease kept the pass out by a session advisory lock
+        alone, and may still run somewhere, so the pass takes that lock first
+        and the row only once it holds it: either kind of pass keeps the other
+        out. The lock is held on this connection until `groom_unlock`, so a pass
+        needs a session connection."""
+        locked = self.one("SELECT pg_try_advisory_lock(hashtext('memory groom ' || %s), "
+                          "hashtext(%s)) AS got", (self.schema, project))
+        if not locked["got"]:
+            return False
+        holder = uuid.uuid4()
+        try:
+            row = self.one(
+                "INSERT INTO memory_groom_leases AS l (project_id, holder, node, lock_pid, "
+                "expires_at) VALUES (%s, %s, %s, pg_backend_pid(), "
+                "now() + make_interval(secs => %s)) "
+                "ON CONFLICT (project_id) DO UPDATE SET holder = excluded.holder, "
+                "node = excluded.node, lock_pid = excluded.lock_pid, taken_at = now(), "
+                "expires_at = excluded.expires_at WHERE l.expires_at <= now() "
+                "RETURNING holder", (project, holder, node, float(seconds)))
+        except BaseException:
+            self._groom_unlock_session(project)
+            raise
+        if row is None:
+            self._groom_unlock_session(project)
+            return False
+        self._groom_holder = holder
+        return True
 
     def groom_unlock(self, project: str) -> None:
+        """Give back the lease and the session lock `try_groom_lock` took."""
+        holder = self._groom_holder
+        self._groom_holder = None
+        with contextlib.suppress(Exception):
+            if holder is not None:
+                self.one("DELETE FROM memory_groom_leases WHERE project_id = %s "
+                         "AND holder = %s RETURNING holder", (project, holder))
+        self._groom_unlock_session(project)
+
+    def _groom_unlock_session(self, project: str) -> None:
         with contextlib.suppress(Exception):
             self.one("SELECT pg_advisory_unlock(hashtext('memory groom ' || %s), "
                      "hashtext(%s)) AS done", (self.schema, project))

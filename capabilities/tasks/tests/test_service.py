@@ -546,20 +546,40 @@ def test_the_store_notifies_and_the_daemon_wakes_for_its_own_project_only(
 @needs_store
 def test_a_running_daemon_is_seen_as_serving_its_project(project, store):
     """Another project reads whether a service serves this one, before it
-    assigns a task here: the daemon says so on the connection it listens on,
-    and says nothing once it is gone."""
-    entry, _schema, _conn = store
+    assigns a task here: the daemon says so by its row, which it renews, and
+    by the lock an earlier release reads, and says nothing once it is gone."""
+    entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
 
     def serving() -> bool:
         with mod._connect(entry) as conn, conn.cursor() as cur:
             return mod._serving(cur, HERE)
 
+    def rows() -> list:
+        return conn.execute(f"select project_id, lock_pid, expires_at > now() as live "
+                            f"from {schema}.tasks_presences").fetchall()
+
+    def locks() -> int:
+        return conn.execute("select count(*) from pg_locks where locktype = 'advisory' "
+                            "and classid = %s::oid", (mod._PRESENCE_CLASS,)).fetchone()[0]
+
     assert serving() is False
     with Harness(project, entry) as h:
         h.dispatcher.step()
         assert serving() is True
-    assert serving() is False
+        listener = h.daemon.store.listener
+        pid = listener.execute("select pg_backend_pid() as p").fetchone()["p"]
+        assert rows() == [(HERE, pid, True)] and locks() == 1
+        # The row alone says it: an earlier release's lock is not what it rests on.
+        listener.execute("select pg_advisory_unlock(%s, hashtext(%s))",
+                         (mod._PRESENCE_CLASS, mod._presence_key(schema, HERE)))
+        assert locks() == 0 and serving() is True
+        # A row past its expiry says nothing, and the daemon renews it in time.
+        conn.execute(f"update {schema}.tasks_presences set expires_at = now()")
+        assert serving() is False
+        h.dispatcher._ping(time.monotonic() + h.service.PRESENCE_RENEW_SECONDS)
+        assert rows() == [(HERE, pid, True)] and serving() is True
+    assert serving() is False and rows() == []
 
 
 @needs_store

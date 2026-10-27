@@ -209,23 +209,70 @@ def test_a_plan_whose_entries_changed_is_skipped(store):
 
 
 def test_one_pass_at_a_time_per_project(store):
-    """The pass's lock is a session lock, so a pass holds it on a session
-    connection; a transaction connection refuses to take one."""
+    """A pass holds its project's lease row, beside the session lock an earlier
+    release keeps passes out by, so a second pass does not start while either
+    is held; a transaction connection refuses to take the lock."""
     from capabilities_contract import db
     one = E.Store(store.setting, session=True).open()
     other = E.Store(store.setting, session=True).open()
     try:
-        assert one.try_groom_lock(P)
-        assert not other.try_groom_lock(P)
-        assert other.try_groom_lock(OTHER)
+        assert one.try_groom_lock(P, 600, node="node-a")
+        [lease] = store.rows("SELECT * FROM memory_groom_leases")
+        assert lease["project_id"] == P and lease["node"] == "node-a"
+        assert lease["lock_pid"] == one.one("SELECT pg_backend_pid() AS p")["p"]
+        assert not other.try_groom_lock(P, 600)
+        assert other.try_groom_lock(OTHER, 600)
+        other.groom_unlock(OTHER)
         one.groom_unlock(P)
-        assert other.try_groom_lock(P)
+        assert store.rows("SELECT * FROM memory_groom_leases") == []
+        assert other.try_groom_lock(P, 600)
+        other.groom_unlock(P)
         with pytest.raises(db.DbError) as refused:
-            store.try_groom_lock(P)
+            store.try_groom_lock(P, 600)
         assert refused.value.slug == "session_state"
+        assert store.rows("SELECT * FROM memory_groom_leases") == []
     finally:
         one.close()
         other.close()
+
+
+def test_the_lease_keeps_a_pass_out_without_the_session_lock(store):
+    """The row alone keeps a second pass out until it expires, so the guard
+    does not rest on the session that took it."""
+    one = E.Store(store.setting, session=True).open()
+    other = E.Store(store.setting, session=True).open()
+    try:
+        assert one.try_groom_lock(P, 600)
+    finally:
+        one.close()  # the session lock goes with it; the row stays
+    try:
+        assert not other.try_groom_lock(P, 600)
+        store.one("UPDATE memory_groom_leases SET expires_at = now() - interval '1 second' "
+                  "RETURNING project_id")
+        assert other.try_groom_lock(P, 600)
+    finally:
+        other.close()
+
+
+def test_a_pass_of_an_earlier_release_and_this_one_keep_each_other_out(store):
+    """An earlier release takes only the session lock: while it holds it no
+    lease is taken, and while a lease holder holds it the earlier pass is
+    refused its lock."""
+    old = E.Store(store.setting, session=True).open()
+    new = E.Store(store.setting, session=True).open()
+    take = ("SELECT pg_try_advisory_lock(hashtext('memory groom ' || %s), hashtext(%s)) "
+            "AS got")
+    try:
+        assert old.one(take, (store.schema, P))["got"]
+        assert not new.try_groom_lock(P, 600)
+        assert store.rows("SELECT * FROM memory_groom_leases") == []
+        old.one("SELECT pg_advisory_unlock(hashtext('memory groom ' || %s), hashtext(%s)) "
+                "AS done", (store.schema, P))
+        assert new.try_groom_lock(P, 600)
+        assert not old.one(take, (store.schema, P))["got"]
+    finally:
+        old.close()
+        new.close()
 
 
 def test_adopt_carries_once_per_key(store):

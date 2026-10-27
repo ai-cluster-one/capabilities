@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-10-27 — A grooming pass is kept to one per project by a lease row
+
+`memory groom --apply` now keeps a second pass of the same project out by its row in the new `memory_groom_leases` table (ledger step `0006-groom-lease`, schema 1.2): taken when none is held or the one held has expired, it lasts `groom_timeout_seconds` plus two minutes and is removed when the pass ends, so a pass that was killed holds nothing past its deadline. The pass still takes the session advisory lock an earlier release keeps passes out by, first, and records the session that holds it in the row's `lock_pid`, so a pass of either release keeps the other out, and the store shows whether a pass of an earlier release is still about: a holder of that lock that no row names. A second pass is refused as before, exit 7 `groom_running`. A release at 1.1 reads the 1.2 tables as a newer minor.
+
 ## 2026-10-26 — The service follows the store's change versions and holds no listening session
 
 Every event written to `memory_events` now also raises its project's version of the `memory_changed` channel in the store's change versions (`schema_channel`), through the trigger, in the writer's own transaction (ledger step `0005-changed-versions`, schema 1.1), so an event any release writes moves it. The same trigger keeps sending the `memory_changed` notification for a service of an earlier release that still listens. The service no longer opens its `memory-listen` session connection: it reads the versions once a second on its working connection with the library's `Follower` and renders a changed project after the half-second debounce, about a second after the write. A release at 1.0 reads the 1.1 tables as current. `service status` shows each store's `following`; `listening` stays in the row and is false.
