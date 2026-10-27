@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.24,<1",
+#     "capabilities-contract>=0.27,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.10.1",
 #     "pyyaml>=6",
@@ -951,7 +951,7 @@ SERVICE
 
   The daemon outlives the store being away. Its running turns are left to
   finish, and it asks for each connection it lost, or could not open, again
-  after 1s, then at a doubling interval of at most 30s, until the store
+  after about 1s, then at a doubling interval of at most 30s, until the store
   answers; with the connection back it asks the store for work at once.
   A connection the path dropped under it is lost as well: a question not
   answered within 45s has its connection severed, so neither the daemon nor
@@ -1808,12 +1808,14 @@ STORE
   proves nothing either way.
 
   A command that cannot reach the store does not give up at once. It asks
-  again after 1s, then at a doubling interval of at most 30s, for
+  again when the connection library next dials the store - after about 1s,
+  then at a doubling interval of at most 30s - for
   TASKS_STORE_RETRY_SECONDS - 180 unless set, resolved as a connection value
   is, from the project's .env.local and .env, the user tier, then the
   environment - and says so once on stderr, `{"store_away": {"error",
   "asking_again_for_seconds"}}`; only when that window is spent does it exit 5
-  `unreachable`, as it would have at once. So a network that drops for a minute
+  `unreachable`, as it would have at once, and its last ask dials the store
+  even when the library's pause carries it past the window's end. So a network that drops for a minute
   or two costs a worker's `tasks` calls, and `tasks run` itself, the wait and
   not the turn. 0 gives up at the first failure. A store that answers and
   refuses - a role, a password or a database it does not know - is not away,
@@ -2069,10 +2071,14 @@ def _db():
 def _store_refusal(exc) -> "Refusal":
     """The library's refusal as this capability states it: a store setting that
     cannot be used exits 6, a store that cannot be reached, is busy or refuses
-    the migration exits 5, and a store that is not reached is `unreachable`."""
-    return Refusal(6 if exc.slug in _STORE_SETTING_SLUGS else 5,
-                   "unreachable" if exc.slug == "store_unreachable" else exc.slug,
-                   exc.message, exc.hint)
+    the migration exits 5, and a store that is not reached is `unreachable`.
+    It keeps the library's `dials_again_at`, when the store will be dialled
+    again, for a caller that asks again on that schedule."""
+    refusal = Refusal(6 if exc.slug in _STORE_SETTING_SLUGS else 5,
+                      "unreachable" if exc.slug == "store_unreachable" else exc.slug,
+                      exc.message, exc.hint)
+    refusal.dials_again_at = exc.dials_again_at
+    return refusal
 
 
 # The store this invocation resolved for itself, kept by `main` for the rest of
@@ -2181,8 +2187,9 @@ def _tables_status(conn, owner: str = NAME):
 # machine's own .env.local can say it.
 _STORE_RETRY_ENV = "TASKS_STORE_RETRY_SECONDS"
 _STORE_RETRY_DEFAULT = 180
-# The first wait between two asks, doubled after each that fails, up to the
-# longest - the pace the service asks again at.
+# The first wait between two asks for a session connection, which the library
+# does not pause, doubled after each that fails, up to the longest - the pace
+# the service asks again at.
 _STORE_RETRY_FIRST = 1.0
 _STORE_RETRY_LONGEST = 30.0
 
@@ -2237,13 +2244,17 @@ def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None 
     connections already resolved, else the one in force now. A caller that
     only reports where the tables stand passes `migrating` False.
 
-    A store that is away is asked for again, after 1s and then at a doubling
-    interval of at most 30s, until the window `_store_retry_seconds` gives is
-    spent, and only then refused: a command, and a turn with it, waits out a
-    network that dropped for a minute rather than ending on it. The first wait
-    says so on stderr, once. `waiting` decides it, and unsaid it waits exactly
-    when it would otherwise exit: a caller passing `raising` keeps asking on a
-    schedule of its own and is told at once."""
+    A store that is away is asked for again when the library next dials it -
+    after about 1s and then at a doubling interval of at most 30s, the pause it
+    keeps per process - until the window `_store_retry_seconds` gives is spent,
+    and only then refused: a command, and a turn with it, waits out a network
+    that dropped for a minute rather than ending on it. The last ask dials the
+    store, even when the library's pause carries it past the window's end. A
+    session connection, which the library does not pause, is asked for again
+    on the same doubling interval kept here. The first wait says so on stderr,
+    once. `waiting` decides it, and unsaid it waits exactly when it would
+    otherwise exit: a caller passing `raising` is told at once, with when the
+    library dials again."""
     try:
         from psycopg.rows import dict_row
     except ImportError:  # pragma: no cover - the shebang installs it
@@ -2272,6 +2283,13 @@ def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None 
                         "asking_again_for_seconds": window}},
                         ensure_ascii=False) + "\n")
                     sys.stderr.flush()
+                if exc.dials_again_at is not None:
+                    # The library's pause is the schedule, and the last ask is
+                    # the one it dials, past the window's end if need be.
+                    time.sleep(max(0.0, exc.dials_again_at - time.monotonic()))
+                    if exc.dials_again_at >= deadline:
+                        deadline = 0.0
+                    continue
                 # The last ask is at the end of the window rather than before it.
                 time.sleep(min(delay, remaining))
                 delay = min(delay * 2, _STORE_RETRY_LONGEST)

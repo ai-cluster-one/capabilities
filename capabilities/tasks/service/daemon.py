@@ -470,9 +470,11 @@ class Store:
         self.follower = None
         self.follow_error: str | None = None
         # The same for the connection questions go on, and when the last thing
-        # went over it.
+        # went over it; whether the store's refusal of it has been said in this
+        # outage.
         self.query = None
         self.query_error: str | None = None
+        self.query_refused = False
         self.requery_at: float | None = None
         self.requery_delay = RELISTEN_FIRST_SECONDS
         self.query_used = 0.0
@@ -1778,8 +1780,10 @@ class Dispatcher:
     def ask(self, store: Store, question, *, scope=None, at_once: bool = False):
         """Put one question to the store on the connection questions go on, and
         answer what it answers. The connection is opened when there is none,
-        outside every scope, unless the doubling interval since it was lost has
-        not come round, in which case the question is refused at once;
+        outside every scope, unless the moment to ask for it again has not come
+        round - when the library dials the store again after refusing it, or the
+        doubling interval since it was lost - in which case the question is
+        refused at once;
         `at_once` asks for it regardless. The question itself runs inside
         `scope()` when one is given. A question that loses its connection, or
         runs past the store's timeout, drops it and plans the next attempt; any
@@ -1811,17 +1815,25 @@ class Dispatcher:
 
     def _open_query(self, store: Store) -> None:
         """Open the connection questions go on, or plan the next attempt and
-        refuse the question. A failure is said once, not on every attempt."""
+        refuse the question. The next attempt is when the library dials the
+        store again, the one schedule it keeps for a store that did not answer;
+        a refusal that names no such moment is asked again at the doubling
+        interval. A refusal is said once in an outage, not on every attempt."""
         try:
             store.query = store.host.open_query(QUESTION_TIMEOUT_SECONDS)
         except (Exception, SystemExit) as exc:
             store.query = None
             why = _why(exc)
-            if why != store.query_error:
+            if not store.query_refused:
+                store.query_refused = True
                 self.store_log(store, f"cannot connect to the store to ask it for work, "
                                       f"asking again: {why}")
             store.query_error = why
-            self._requery_later(store)
+            dials_again_at = getattr(exc, "dials_again_at", None)
+            if dials_again_at is not None:
+                store.requery_at = dials_again_at
+            else:
+                self._requery_later(store)
             raise StoreAway(why) from exc
         store.opened()
         store.query_used = time.monotonic()
@@ -1829,6 +1841,7 @@ class Dispatcher:
         if store.query_error is not None:
             self.store_log(store, "connected to the store again for its questions")
         store.query_error = None
+        store.query_refused = False
 
     def _reconnect(self, store: Store) -> None:
         """The interval since the question connection was lost has come round:

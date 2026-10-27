@@ -1178,17 +1178,41 @@ def test_the_questions_of_every_pass_go_on_the_one_working_connection(
 
 @needs_store
 def test_a_question_connection_the_store_refuses_is_asked_for_again_on_the_doubling_interval(
-        project, store, relay, capsys):
-    """The store takes no new connection: the daemon keeps its listener, and the
-    pass a notification wakes asks for a connection for its questions at a
-    doubling interval, and the moment it has one asks for the work it missed."""
+        project, store, relay, capsys, monkeypatch):
+    """The store takes no new connection and the working connection the
+    questions go on is lost: the daemon keeps its listener, and the pass a
+    notification wakes asks for a connection for its questions when the
+    library dials the store again - its one doubling pause - and the moment it
+    has one asks for the work it missed, having said the refusal once."""
+    from capabilities_contract.db import _connect as library
     entry, schema, conn = store
     write_settings(project, "version = 1\npoll_seconds = 3600\n")
     through = _cli.store_setting(schema, host="127.0.0.1", port=relay.port)
     h = quick(Harness(project, entry, through))
-    attempts = []
+    monkeypatch.setattr(library, "RECONNECT_FIRST_SECONDS", 0.2)
+    monkeypatch.setattr(library, "RECONNECT_LONGEST_SECONDS", 0.8)
+    # The working connection is proven as it is lent, as one idle for longer
+    # than the library's ping interval is, so its loss is met as it is lent.
+    monkeypatch.setattr(library, "PING_AFTER_SECONDS", 0)
+    attempts, opened, refused = [], [], []
     open_query = h.host.open_query
-    h.host.open_query = lambda seconds: attempts.append(time.monotonic()) or open_query(seconds)
+
+    def timed(seconds):
+        # The wait between attempts is the library's: from the end of one to the
+        # start of the next, whatever each spent trying to connect.
+        began = time.monotonic()
+        try:
+            question = open_query(seconds)
+            opened.append(backend(question))
+            return question
+        except Exception as exc:
+            refused.append((began, time.monotonic(), getattr(exc, "dials_again_at", None),
+                            getattr(exc, "message", "")))
+            raise
+        finally:
+            attempts.append((began, time.monotonic()))
+
+    h.host.open_query = timed
     with h:
         h.dispatcher.step()
         store_ = h.daemon.store
@@ -1196,18 +1220,24 @@ def test_a_question_connection_the_store_refuses_is_asked_for_again_on_the_doubl
         assert store_.query is None
         listening = backend(store_.listener)
         relay.refuse()
+        conn.execute("select pg_terminate_backend(%s)", (opened[0],))
         add(entry, capsys, "alpha")
         h.steps(lambda: store_.query_error is not None, seconds=5)
         assert "notify" in h.daemon.last_wake["reasons"]
-        h.settle(3.0)
+        h.settle(4.0)
         assert h.running() == 0
         [row] = h.daemon.status()["stores"]
         assert row["listening"] is True and row["error"]
-        # Asked again 0.2s after it was refused, then after 0.4s, then 0.8s from then on.
-        gaps = gaps_of(attempts[1:])
-        assert len(gaps) >= 4 and gaps[0] < gaps[1] < gaps[2], gaps
-        assert 0.1 < gaps[0] < 0.35 and 0.3 < gaps[1] < 0.6, gaps
-        assert all(0.6 < gap < 1.2 for gap in gaps[2:]), gaps
+        # Asked again the moment the library dials again, so every ask dials:
+        # after half to all of 0.2s, then of 0.4s, then of 0.8s from then on.
+        assert len(attempts) == 1 + len(refused)
+        assert not any("not dialled again" in said for *_t, said in refused), refused
+        for (_b, _e, dials, _s), (began, *_rest) in zip(refused, refused[1:]):
+            assert 0 <= began - dials < 0.1, refused
+        gaps = [round(nxt[0] - prev[1], 2) for prev, nxt in zip(refused, refused[1:])]
+        assert len(gaps) >= 4, gaps
+        assert 0.08 < gaps[0] < 0.3 and 0.18 < gaps[1] < 0.5, gaps
+        assert all(0.38 < gap < 0.95 for gap in gaps[2:]), gaps
 
         relay.up()
         h.steps(lambda: h.running("alpha") == 1, seconds=5)
