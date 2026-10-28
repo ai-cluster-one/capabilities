@@ -2388,6 +2388,28 @@ def test_node_run_serves_a_shared_placement_by_the_machine_job_and_an_own_one_by
         node_run.communicate(timeout=60)
 
 
+def test_a_leave_naming_shared_leaves_a_machine_service_placed_before_modes(lab):
+    """A released node manager's machine supervisor runs `<name> service
+    leave` for each agent it serves when it stops, which now unplaces naming
+    shared. A placement written before modes records none, so that leave
+    leaves it placed and the restart after an update serves the agent again."""
+    here = _service_lab(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify" / "manifest.json"
+    registry.write_text(json.dumps({"name": "coolify", "service": {
+        "name": "svc", "summary": "s", "verbs": [], "placement": "exclusive",
+        "machine": {"schema": "capabilities.service.machine.v1",
+                    "command": ["coolify", "service", "run", "--machine"],
+                    "doctor": ["coolify", "service", "doctor", "--machine"]}}}))
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.capabilities_policy SET mode = NULL")
+    kept = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, "--mode", "shared",
+                        extra=here))
+    assert kept["changed"] is False and kept["mode"] == "shared" and "note" in kept
+    assert _modes(lab) == [(NODE, True, None)]
+    gone = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
+    assert gone["changed"] is True and gone["placed_on"] == []
+
 def test_one_service_at_a_time_serves_an_agent_on_a_node_under_its_service_lease(
         lab, tmp_path):
     """The node's machine service and the agent's own service each take the
@@ -2502,6 +2524,12 @@ def test_node_install_places_shared_each_agent_on_a_machine_list_here(lab, tmp_p
     here = _service_lab(lab, placement="shared")
     _both_commands(lab)
     bin_dir, _calls, _loaded = _stand_in_launchctl(lab, tmp_path)
+    # No old agent to hand over, whatever deployment this machine has.
+    (bin_dir / "deployment").write_text(f"""#!{sys.executable}
+import json
+print(json.dumps({{"ok": True, "agents": []}}))
+""")
+    (bin_dir / "deployment").chmod(0o755)
     env = {**here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
     listing = lab["config"] / "coolify" / "service" / "projects.json"
     listing.parent.mkdir(parents=True)

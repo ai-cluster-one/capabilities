@@ -651,10 +651,10 @@ POLICY VERBS
         no_machine_service). A row that records no mode - written before
         modes, or by enable --node - is served as before: by the agent's own
         service where <name> declares a project command, else by the machine
-        service. unplace --mode takes the service off only where it is placed
-        in that mode, and otherwise changes nothing and says so (note); this
-        is how `<name> service leave` takes off the shared placement its join
-        wrote.
+        service. unplace --mode takes the service off only where its
+        placement records that mode, and otherwise - a row from before modes
+        included - changes nothing and says so (note); this is how `<name>
+        service leave` takes off the shared placement its join wrote.
         A service's descriptor declares how many nodes run it at once
         (service.placement): exclusive, the default, runs on one node at a
         time, so place takes it off every other node in the same write - this
@@ -16981,7 +16981,8 @@ def _service_place(name: str, placed: bool, node: str, serving: str | None = Non
     is taken off every other in the same write. The placement records its mode,
     `serving`: without one, a service already placed on the node keeps the mode
     it is served in and a new placement takes the default. Unplacing with a
-    mode takes the service off only where it is placed in that mode."""
+    mode takes the service off only where its placement records that mode, so
+    a placement from before modes is left to an unplace that names none."""
     root = _require_project()
     _ensure_envelope(root)
     verb = "place" if placed else "unplace"
@@ -17003,11 +17004,16 @@ def _service_place(name: str, placed: bool, node: str, serving: str | None = Non
         held = _placement_mode(name, row[1]) if row is not None and row[0] else None
         if placed:
             serving = serving or held or _placement_mode_default(name)
-        if not placed and serving is not None and held is not None and held != serving:
-            # Placed here in the other mode: that placement is not this one's to take.
+        if not placed and serving is not None and held is not None and row[1] != serving:
+            # Placed here in the other mode, or before modes: that placement is
+            # not this one's to take. A released node manager's leave reaches
+            # here naming shared on a placement it never wrote a mode on.
             answer = {"node": node, "changed": False, "unplaced": []}
             note = (f"{name}'s service is placed on {node} as {held}, not {serving}, so it "
-                    "stays placed")
+                    "stays placed" if row[1] in PLACEMENT_MODES else
+                    f"{name}'s service is placed on {node} from before placements recorded "
+                    f"a mode, so an unplace naming {serving} leaves it placed; "
+                    f"`capabilities unplace {name} --node {node}` takes it off")
         else:
             answer = adapter.place(name, node, placed, exclusive=mode == "exclusive",
                                    actor="capabilities")
