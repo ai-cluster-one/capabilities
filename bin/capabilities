@@ -8920,9 +8920,11 @@ VAULT_MOVE_TIMEOUT = 60
 
 def _vault_move_reachers(name: str) -> bool:
     """A name read before the vault can be: the agent's key, its id, the store
-    setting, and the manager's own settings."""
-    return (name in (_vault_module().KEY_ENV, PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV)
-            or name.startswith(("AGENTKIT_", "CAPABILITIES_")))
+    setting, and the manager's own settings. A capability's own key is not one
+    of them, whatever its name begins with."""
+    return (name in (_vault_module().KEY_ENV, PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV,
+                     CONTEXT_PROMPT_ENV)
+            or name.startswith("AGENTKIT_"))
 
 
 def _vault_move_lines(text: str, names) -> str:

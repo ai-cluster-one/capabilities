@@ -132,7 +132,7 @@
     },
     "rclonec": {
       "path": "capabilities/rclonec",
-      "payload_sha256": "d193a1d00e179bd829b87abbf82ca89414b84d8e8edfe7a5b49b9d9f1f7eb722",
+      "payload_sha256": "b422ccc292b08d59ef6f3ef7ba089f13061f95c143afa6b31d61f33651bc9eac",
       "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`."
     },
     "resend": {

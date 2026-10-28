@@ -267,6 +267,29 @@ def test_move_takes_only_the_keys_every_reader_reads_from_the_vault(lab):
     assert again["moved"] == [] and env_local.read_text() == left
 
 
+def test_move_takes_a_capability_key_named_like_the_manager_and_keeps_the_managers_own(lab):
+    lab.ok("key", "generate")
+    env_local = lab.project / ".env.local"
+    env_local.write_text(env_local.read_text() + "CAPABILITIES_MAIL_TOKEN=tok-mail\n"
+                         "CAPABILITIES_TRACKER_TOKEN=tok-tracker\n"
+                         "CAPABILITIES_PROJECT_ID_ROOT=" + str(lab.project) + "\n")
+    assert "CAPABILITIES_PROJECT_ID=" in env_local.read_text()
+    # Even a capability that names the manager's own settings does not move them.
+    _reader(lab, "fresh", ["CAPABILITIES_MAIL_TOKEN", "CAPABILITIES_TRACKER_TOKEN",
+                           "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT",
+                           "AGENTKIT_DB_URL", KEY_ENV])
+    moved = lab.ok("secrets", "move")
+    assert [m["name"] for m in moved["moved"]] == ["CAPABILITIES_MAIL_TOKEN",
+                                                    "CAPABILITIES_TRACKER_TOKEN"]
+    assert all(m["readers"] == ["fresh"] for m in moved["moved"])
+    reasons = {k["name"]: k["reason"] for k in moved["kept"]}
+    for name in ("CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT",
+                 "AGENTKIT_DB_URL", "AGENTKIT_DB_SCHEMA", KEY_ENV):
+        assert "read before the vault" in reasons[name], name
+    assert "CAPABILITIES_MAIL_TOKEN" not in env_local.read_text()
+    assert lab.run("secrets", "show", "CAPABILITIES_MAIL_TOKEN").stdout == "tok-mail\n"
+
+
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
 def test_move_stopped_during_its_trial_puts_the_lines_back(lab, signum):
     lab.ok("key", "generate")

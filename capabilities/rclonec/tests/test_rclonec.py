@@ -288,6 +288,17 @@ def test_connections_report_masks_every_secret(project):
     assert report["connections"]["r2"]["allow_write"] is True
 
 
+def test_connections_report_names_each_secret_by_its_env_key(project):
+    """The key a secret row names is the env key it resolves from, as every
+    capability's report names it, so a reader of the report can find it there."""
+    report = module._connections_report()
+    secrets = {cid: [k["key"] for k in c["keys"] if k["secret"]]
+               for cid, c in report["connections"].items()}
+    assert secrets == {"gd": ["GD_SA_JSON"], "r2": ["R2_KEY", "R2_SECRET"]}
+    gd = next(k for k in report["connections"]["gd"]["keys"] if k["secret"])
+    assert (gd["tier"], gd["source"]) == ("project", str(project / ".env"))
+
+
 # --- a failure is reported as something a reader can act on ------------------
 
 RCLONE_OAUTH_REFUSAL = '''2026/09/19 16:30:38 CRITICAL: Failed to create file system for "gd:": couldn't find root directory ID: Get "https://www.googleapis.com/drive/v3/files/root?alt=json": oauth2: cannot fetch token: 401 Unauthorized

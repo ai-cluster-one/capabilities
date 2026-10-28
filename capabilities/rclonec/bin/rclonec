@@ -242,7 +242,7 @@ def _connections_report() -> dict:
             rows.append(_key_report("secret_env", False, True, None, None, None))
         for opt, env_key in sorted(secrets.items()):
             value, tier, source = _resolve_env_key(env_key)
-            rows.append(_key_report(f"{opt} ({env_key})", True, True, value, tier, source))
+            rows.append(_key_report(env_key, True, True, value, tier, source))
         report["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
             "remote": f"{cid}:",

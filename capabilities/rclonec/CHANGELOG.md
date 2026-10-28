@@ -1,5 +1,9 @@
 # rclonec — change log
 
+## 2026-10-28 — `rclonec connections` names each secret by the env key it resolves from
+
+A secret row in `rclonec connections` now names the env key under `secret_env` as its `key`, as every capability's report does, where it used to read `<option> (<ENV_KEY>)`. A reader that looks a key up by name - `capabilities secrets move` among them - therefore finds rclonec reading it, so rclonec's keys move into the agent's vault like any other, and a key the vault could not be read for carries the vault's note on why. The option a key fills is still the connection's `secret_env`. Nothing else changes.
+
 ## 2026-10-27 — `rclonec` fetches rclone itself on first use where none is on PATH, and declares it in its manifest
 
 Where `rclone` is not on PATH, the first command that needs it - a forwarded command, `doctor`, or the write gate asking `rclone help flags` - fetches rclone's own standalone build for this platform (linux or macOS, amd64 or arm64) from the latest release on `downloads.rclone.org`, checks it against that release's `SHA256SUMS`, and keeps it at `$XDG_STATE_HOME/rclonec/programs/rclone`, as the user and without root or a package manager; every later run uses it. An `rclone` on PATH is still used first and nothing is fetched then. A fetch that fails exits 5 `rclone_not_found` as before, naming what failed, and `doctor` reports it under `rclone.error`. `rclonec manifest` now carries `programs`, naming rclone and what stops without it, so `capabilities doctor` can say it is missing.
