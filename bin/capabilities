@@ -65,12 +65,13 @@ ENVIRONMENT
                        it starts under the read-only switch: every capability
                        reads but changes nothing (write verbs, project-record
                        writes and service activation exit 4), and this manager
-                       refuses agent convert, agent set, allow, connections
-                       import, disable, enable, inherit, init, key generate,
-                       key set, key change, node add, node remove, node seen,
-                       node set, place (but its report), quarantine, relabel,
-                       secrets set, secrets rm, secrets raw --set, secrets
-                       move, set, store set, store unset and unplace.
+                       refuses agent convert (but --dry-run), agent set,
+                       allow, connections import, disable, enable, inherit,
+                       init, key generate, key set, key change, node add, node
+                       remove, node seen, node set, place (but its report),
+                       quarantine, relabel, secrets set, secrets rm, secrets
+                       raw --set, secrets move, set, store set, store unset
+                       and unplace.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENT_ENCRYPTION_KEY
                        the agent's one encryption key, which opens its vault
@@ -875,7 +876,7 @@ PROJECT VERBS (run inside a consuming project)
         {path, changed}, init, store}, init being what `init --id` answers.
         `capabilities node remove <node>` in the folder removes the node
         again; the folder's files stay. Exit 4 under the read-only switch.
-  agent convert
+  agent convert [--dry-run]
         Turn a ContextKit-bound agent into one bound by its id alone, as one
         change. It first checks, writing nothing when it refuses: the id
         resolves (an [identity] id is moved into .env.local), a store
@@ -888,11 +889,18 @@ PROJECT VERBS (run inside a consuming project)
         holds only config.toml,
         README.md, generated/ with generated context alone, and
         icon-*.png (exit 6 contextkit_folder_not_empty, naming the rest;
-        icon_ambiguous for more than one icon the row would take). It then
-        carries [body] root into the row's body_root (null for .),
-        [collaboration] mode into collaboration_mode where set, [onboarding]
-        into the onboarding columns and the icon into the row where the row
-        has none; builds the context at .capabilities-generated/context.md,
+        icon_ambiguous for more than one icon the row would take and none
+        named by [identity] icon; icon_invalid for an icon that is missing
+        or no PNG). The row's copy is the one that counts: it then fills
+        only the row's empty fields from the binding - [body] root into
+        body_root (null for .), [collaboration] mode into
+        collaboration_mode where set, [onboarding] into the onboarding
+        columns, [identity] name and description, and the icon
+        ([identity] icon, else the one icon-*.png) - in the statement that
+        writes them, so a value the store holds is never overwritten, and
+        names every field where the binding holds another value than the
+        row, which keeps its own; builds the context at
+        .capabilities-generated/context.md,
         points every wired host's link at it and brings the wired hosts'
         hooks to `capabilities session-start` as `hooks install` does;
         removes the old generated output; writes the manager's block of
@@ -903,10 +911,18 @@ PROJECT VERBS (run inside a consuming project)
         builds (a context file the build refuses, a file it did not
         generate at the new output) puts the binding, the host files, the
         .gitignore and the row's values back as it found them. Answers {ok, project,
-        agent_id, changed, carried, removed, untracked, staged, wrote,
-        hosts, build, agent}. Run where no ContextKit binding is left, it
-        changes nothing and answers changed false with a message. Exit 4
-        under the read-only switch.
+        agent_id, changed, carried, differs, removed, untracked, staged,
+        wrote, hosts, build, agent}: carried the fields it filled, differs
+        [{field, file, store}] the fields the row kept against the
+        binding (onboarding as {status, routine}, the icon as icon_sha).
+        --dry-run runs the same checks and refuses the same way, writes
+        nothing - the id left where it is, the row, the binding and the
+        host files as they are - and answers {ok, project, agent_id,
+        dry_run, changed: false, fill, differs}: fill the fields a real run
+        would fill, with the values it would write (the icon as icon_sha).
+        Run where no ContextKit binding is left, it changes nothing and
+        answers changed false with a message. Exit 4 under the read-only
+        switch, except --dry-run.
   agent rekey [<new id>] [--dry-run]
         Move this project's agent from the id it is bound to to a new one:
         the id given (twelve lowercase hex characters, the form every new
@@ -9573,11 +9589,12 @@ def cmd_agent(args: list[str]) -> None:
 
         _emit(_agent_set(root, values))
     elif sub == "convert":
-        _read_only_gate("agent convert")
-        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "agent convert")
+        pos, opts = _kernel_options(args[1:], set(), {"--dry-run", "--json"}, "agent convert")
         if pos:
             _die(6, "input", "agent convert takes no positional argument")
-        _emit(_agent_convert(root.resolve()))
+        if "--dry-run" not in opts:
+            _read_only_gate("agent convert")
+        _emit(_agent_convert(root.resolve(), "--dry-run" in opts))
     elif sub == "rekey":
         pos, opts = _kernel_options(args[1:], set(), {"--dry-run", "--json"}, "agent rekey")
         if len(pos) > 1:
@@ -10050,15 +10067,94 @@ def _restore_path_states(root: Path, states: dict) -> None:
         output_dir.rmdir()
 
 
-def _agent_convert(root: Path) -> dict:
+def _convert_identity(root: Path, raw: dict, ck_dir: Path) -> dict:
+    """The [identity] name, description and icon a binding holds, checked as
+    ContextKit checks them: {name?, description?, icon? (the file it names)}."""
+    section = raw.get("identity")
+    if section is None:
+        return {}
+    if not isinstance(section, dict):
+        _die(6, "contextkit_config_invalid",
+             "invalid [identity]: expected a table of id, name, description and icon",
+             "repair the project context binding, then convert")
+    found: dict = {}
+    for key in ("name", "description"):
+        if section.get(key) is not None:
+            found[key] = _ck_identity_text(section[key], f"identity.{key}",
+                                           CK_IDENTITY_LIMITS[key], "contextkit_config_invalid")
+    icon = section.get("icon")
+    if icon is not None:
+        rel = Path(icon.strip()) if isinstance(icon, str) and icon.strip() else None
+        if rel is None or rel.is_absolute() or ".." in rel.parts or rel.suffix.lower() != ".png":
+            _die(6, "contextkit_config_invalid", f"invalid identity.icon: {icon}",
+                 f"the icon is a PNG file inside {_ck_rel(root, ck_dir)}/, named relative to it")
+        found["icon"] = ck_dir / rel
+    return found
+
+
+def _convert_compare(row: dict, has_icon: bool, held: dict) -> tuple[dict, list[dict]]:
+    """What the binding holds against the agent's row: the fields the row has
+    empty, which take the file's value, and every field where the row holds
+    another value, which stays - the store's copy is the one that counts."""
+    def empty(value) -> bool:
+        return value is None or value == ""
+
+    fill: dict = {}
+    differs: list[dict] = []
+    for key, value in held.items():
+        if key == "onboarding":
+            stored = {"status": row.get("onboarding_status"),
+                      "routine": row.get("onboarding_routine")}
+            if empty(stored["status"]):
+                fill[key] = value
+            elif stored != value:
+                differs.append({"field": key, "file": value, "store": stored})
+        elif key == "icon_sha":
+            if not has_icon:
+                fill[key] = value
+            elif row.get("icon_sha") != value:
+                differs.append({"field": key, "file": value, "store": row.get("icon_sha")})
+        elif empty(row.get(key)):
+            if value is not None:
+                fill[key] = value
+        elif row.get(key) != value:
+            differs.append({"field": key, "file": value, "store": row.get(key)})
+    return fill, differs
+
+
+def _agent_fill(root: Path, values: dict) -> dict:
+    """Write `values` (column: value) into this agent's row only where the row
+    holds none, in the statement that writes, so a value the store gained
+    meanwhile is never overwritten; answer the row."""
+    def write(conn, agent_id):
+        assignments, params = [], []
+        for column, value in values.items():
+            guard = ("icon" if column in ("icon", "icon_sha") else
+                     "onboarding_status" if column.startswith("onboarding_") else column)
+            held = f"{guard} IS NULL" if guard == "icon" else f"coalesce({guard}, '') = ''"
+            assignments.append(f"{column} = CASE WHEN {held} THEN %s ELSE {column} END")
+            params.append(value)
+        if assignments:
+            conn.execute(f"UPDATE capabilities_agents SET {', '.join(assignments)}, "
+                         "updated_at = now() WHERE id = %s", (*params, agent_id))
+        return _agent_row(conn, agent_id)
+
+    agent, setting = _kernel_run(root, write)
+    return {"agent": agent, "store": _kernel_store_report(setting)}
+
+
+def _agent_convert(root: Path, dry_run: bool = False) -> dict:
     """`agent convert`: turn a ContextKit-bound agent into one bound by its id
-    alone, as one change, refusing before anything is written."""
+    alone, as one change, refusing before anything is written. Its row takes
+    from the binding only what it holds empty; with `dry_run` it answers what
+    it would fill and where the file and the row differ, and writes nothing."""
     import tomllib
     if not _contextkit_managed(root):
         if _project_id_state(root)["id"]:
             return {"ok": True, "project": str(root), "changed": False,
                     "message": "this agent has no ContextKit binding to convert; nothing changed",
-                    "carried": {}, "removed": [], "untracked": [], "wrote": []}
+                    "carried": {}, "fill": {}, "differs": [], "removed": [], "untracked": [],
+                    "wrote": [], **({"dry_run": True} if dry_run else {})}
         _die(6, "not_contextkit_bound",
              f"{root} has neither a ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
              f"nor a project id ({PROJECT_ID_ENV}), so there is no agent to convert",
@@ -10085,7 +10181,7 @@ def _agent_convert(root: Path) -> dict:
              "convert` again; the agent stays bound and working until then")
     binding = _ck_binding(root)
     had_env_id = _env_file_project_id(root)[0] is not None
-    agent_id = _project_id_state(root)["id"]
+    agent_id = _project_id_state(root, move=not dry_run)["id"]
     if not agent_id:
         _die(6, "no_project_identity",
              f"{root} has no id: neither the environment, its .env.local or .env nor "
@@ -10128,43 +10224,59 @@ def _agent_convert(root: Path) -> dict:
         _hooks_host_file(root / CODEX_HOOKS_REL, "Codex hooks")
     if "claude" in hosts:
         _hooks_host_file(root / ".claude" / "settings.json", "Claude settings")
+    identity = _convert_identity(root, raw, ck_dir)
     found = _convert_preflight_store(root, agent_id)
     row = found["row"]
-    values: dict = {"body_root": (None if binding["body_root"] == Path(".")
-                                  else binding["body_root"].as_posix())}
+    # Everything the binding holds that the agent's row has a column for.
+    held: dict = {"body_root": (None if binding["body_root"] == Path(".")
+                                else binding["body_root"].as_posix())}
     collaboration = raw.get("collaboration")
     if isinstance(collaboration, dict) and "mode" in collaboration:
-        values["collaboration_mode"] = binding["collaboration_mode"]
-    if binding["onboarding"] and not row.get("onboarding_status"):
-        values["onboarding_status"] = binding["onboarding"]["status"]
-        values["onboarding_routine"] = binding["onboarding"]["routine"]
-    icon_sha = None
-    if icons and not found["has_icon"]:
-        if len(icons) > 1:
-            _die(6, "icon_ambiguous",
-                 f"{ck_dir} holds {len(icons)} icons and the agent's row none: "
-                 f"{', '.join(_ck_rel(root, icon) for icon in icons)}",
-                 "keep the agent's icon alone there (or set it with `capabilities agent set "
-                 "--icon`), then convert")
-        data = icons[0].read_bytes()
-        if not data.startswith(PNG_SIGNATURE):
-            _die(6, "icon_invalid", f"{icons[0]} is not a PNG file",
+        held["collaboration_mode"] = binding["collaboration_mode"]
+    if binding["onboarding"]:
+        held["onboarding"] = binding["onboarding"]
+    for key in ("name", "description"):
+        if key in identity:
+            held[key] = identity[key]
+    # The icon [identity] names, else the one icon the folder holds; several
+    # and none named are ambiguous only where the row has none to keep.
+    icon_file = identity.get("icon")
+    if icon_file is not None and not icon_file.is_file():
+        _die(6, "icon_invalid", f"identity.icon names {_ck_rel(root, icon_file)}, which is not there",
+             "restore the icon or remove identity.icon, then convert")
+    if icon_file is None and len(icons) == 1:
+        icon_file = icons[0]
+    elif icon_file is None and len(icons) > 1 and not found["has_icon"]:
+        _die(6, "icon_ambiguous",
+             f"{ck_dir} holds {len(icons)} icons and the agent's row none: "
+             f"{', '.join(_ck_rel(root, icon) for icon in icons)}",
+             "keep the agent's icon alone there (or set it with `capabilities agent set "
+             "--icon`), then convert")
+    icon_data = None
+    if icon_file is not None:
+        icon_data = icon_file.read_bytes()
+        if not icon_data.startswith(PNG_SIGNATURE):
+            _die(6, "icon_invalid", f"{icon_file} is not a PNG file",
                  "replace or remove it, then convert")
-        icon_sha = hashlib.sha256(data).hexdigest()
-        values.update(icon=data, icon_sha=icon_sha)
+        held["icon_sha"] = hashlib.sha256(icon_data).hexdigest()
+    fill, differs = _convert_compare(row, found["has_icon"], held)
+    values: dict = {key: fill[key] for key in fill if key not in ("onboarding", "icon_sha")}
+    if "onboarding" in fill:
+        values["onboarding_status"] = fill["onboarding"]["status"]
+        values["onboarding_routine"] = fill["onboarding"]["routine"]
+    if "icon_sha" in fill:
+        values.update(icon=icon_data, icon_sha=fill["icon_sha"])
     git = (root / ".git").exists() and _ck_git(root, "rev-parse", "--git-dir").returncode == 0
+    if dry_run:
+        return {"ok": True, "project": str(root), "agent_id": agent_id, "dry_run": True,
+                "changed": False, "fill": fill, "differs": differs}
 
     # Everything is checked: the change is made. What it changes is kept, so a
     # refusal while it builds leaves the agent bound and as it was.
     states = _path_states(root, _convert_touched())
     previous = {key: (None if key == "icon" else row.get(key)) for key in values}
-    answer = _agent_set(root, values)
-    carried = {key: values[key] for key in ("body_root", "collaboration_mode") if key in values}
-    if "onboarding_status" in values:
-        carried["onboarding"] = {"status": values["onboarding_status"],
-                                 "routine": values["onboarding_routine"]}
-    if icon_sha:
-        carried["icon_sha"] = icon_sha
+    answer = _agent_fill(root, values)
+    carried = dict(fill)
     old_output = root / binding["output"]
     old_target = old_output.resolve()
     aside = root / f".contextkit.converting-{os.getpid()}"
@@ -10188,7 +10300,8 @@ def _agent_convert(root: Path) -> dict:
         _ENVELOPE_HOME.pop(root, None)
         _BODY_ROOT.pop(root, None)
         _restore_path_states(root, states)
-        _ck_in_process(lambda: _agent_set(root, previous))
+        if previous:
+            _ck_in_process(lambda: _agent_set(root, previous))
         raise
     removed = [f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/"]
     if not old_output.is_relative_to(ck_dir) and _ck_generated(old_output):
@@ -10229,7 +10342,7 @@ def _agent_convert(root: Path) -> dict:
     if not had_env_id and _env_file_project_id(root)[0]:
         wrote.append(str(root / ".env.local"))
     return {"ok": True, "project": str(root), "agent_id": agent_id, "changed": True,
-            "carried": carried, "removed": removed, "untracked": untracked,
+            "carried": carried, "differs": differs, "removed": removed, "untracked": untracked,
             "staged": git and bool(untracked or gitignore["changed"]), "wrote": wrote,
             "hosts": hosts, "build": build, "agent": answer["agent"]}
 

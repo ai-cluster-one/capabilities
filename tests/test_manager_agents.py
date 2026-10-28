@@ -1852,6 +1852,45 @@ def test_agent_convert_carries_a_bound_agent_into_its_row_as_one_change(lab, tmp
     assert folder.git("status", "--porcelain").splitlines() == status
 
 
+def test_agent_convert_fills_only_what_the_row_holds_empty_and_names_each_difference(
+        lab, tmp_path):
+    import hashlib
+    config = BOUND_CONFIG + ('\n[identity]\nname = "File Name"\n'
+                             'description = "Written in the file"\n')
+    folder = _bound_agent(lab, tmp_path / "held", config)
+    root = folder.path
+    folder.ok("agent", "set", "--collaboration-mode", "ask")
+    env_before = (root / ".env.local").read_text()
+
+    def row():
+        return lab.sql(f"SELECT name, description, collaboration_mode, body_root, "
+                       f"onboarding_status, icon_sha FROM {SCHEMA}.capabilities_agents "
+                       "WHERE id = %s", (BARE_ID,))[0]
+
+    before = row()
+    sha = hashlib.sha256(_png()).hexdigest()
+    differs = [{"field": "collaboration_mode", "file": "direct", "store": "ask"},
+               {"field": "name", "file": "File Name", "store": "Bound"}]
+    fill = {"body_root": "agent", "onboarding": {"status": "pending", "routine": "welcome"},
+            "description": "Written in the file", "icon_sha": sha}
+
+    planned = folder.ok("agent", "convert", "--dry-run")
+    assert (planned["dry_run"], planned["changed"]) == (True, False)
+    assert planned["fill"] == fill
+    assert sorted(planned["differs"], key=lambda d: d["field"]) == differs
+    assert row() == before
+    assert (root / ".contextkit" / "config.toml").read_text() == config
+    assert not (root / ".capabilities-generated").exists()
+    assert (root / ".env.local").read_text() == env_before
+    assert folder.git("status", "--porcelain") == ""
+
+    converted = folder.ok("agent", "convert")
+    assert converted["carried"] == fill
+    assert sorted(converted["differs"], key=lambda d: d["field"]) == differs
+    assert row() == ("Bound", "Written in the file", "ask", "agent", "pending", sha)
+    assert not (root / ".contextkit").exists()
+
+
 def test_agent_convert_refuses_before_writing_anything(lab, tmp_path):
     def unchanged(folder: Folder, config: str) -> None:
         assert (folder.path / ".contextkit" / "config.toml").read_text() == config
