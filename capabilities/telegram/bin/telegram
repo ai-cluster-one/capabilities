@@ -42,7 +42,11 @@ own, else the machine-level ~/.config/telegram/connections.json (the natural
 home for a personal account); where this project keeps its own, and in what
 order they are read, "Where connections live" below says. An entry may name an app of its own - its id literally and
 its hash by env-key indirection - and otherwise signs in through the machine's;
-each owns a per-connection session:
+each owns a per-connection session, kept on each machine at
+<state-dir>/<id>/session. A `session` path the entry records is one machine's
+path, since every machine reading the record sees it: it is used where a session
+already lives there or where it lies under this machine's home, and elsewhere the
+connection's session is this machine's own <state-dir>/<id>/session:
 
   {
     "default": "marvin",
@@ -450,7 +454,9 @@ Exit codes:
      no store configured for the service or its jobs, a profile the
      service settings name that does not resolve or fit, a worker still
      named where a profile is (run `telegram service migrate-profiles`), or
-     an account another connection already holds (`number_linked`)
+     an account another connection already holds (`number_linked`), or a
+     file this machine cannot open or make, such as the session's folder
+     (`local_file_error`, naming the path)
 
 Quirks worth knowing:
   - This is a full-account MTProto session — a personal user account, so it
@@ -532,7 +538,8 @@ CONN_FIELDS = [{'key': 'api_id',
   'env': 'TELEGRAM_{ID}_API_HASH'},
  {'key': 'session',
   'label': 'Session file',
-  'help': 'The session path without extension; <state-dir>/<id>/session when empty.',
+  'help': 'The session path without extension, used on the machine where it lies; '
+          '<state-dir>/<id>/session when empty and on every other machine.',
   'type': 'path',
   'required': False},
  {'key': 'expected_account_id',
@@ -1114,8 +1121,7 @@ def _build_cfg(cid: str, entry: dict | None,
                    or str(DEFAULT_SESSION))
         allow_write = WRITE_DEFAULT
     else:
-        session = (session_flag or entry.get("session")
-                   or str(_state_dir() / cid / "session"))
+        session = session_flag or _connection_session(cid, entry)
         allow_write = bool(entry.get("allow_write", WRITE_DEFAULT))
     try:
         expected_raw = entry.get("expected_account_id") if isinstance(entry, dict) else None
@@ -1127,6 +1133,21 @@ def _build_cfg(cid: str, entry: dict | None,
     return {"id": cid, "api_id": api_id_int, "api_hash": api_hash,
             "session": session, "allow_write": allow_write,
             "expected_account_id": expected_account_id}, None
+
+
+def _connection_session(cid: str, entry: dict) -> str:
+    """Where a named connection's session lives on this machine. A connection
+    record is read by every machine that reaches its store, so a `session` path
+    it carries is the path of the machine that set it: it is kept where a session
+    already lives there or where it lies under this machine's home, and anywhere
+    else the session is this machine's own <state-dir>/<id>/session."""
+    recorded = entry.get("session")
+    if recorded:
+        path = Path(str(recorded)).expanduser()
+        if (not path.is_absolute() or _session_file(str(path)).exists()
+                or path.is_relative_to(Path.home())):
+            return str(recorded)
+    return str(_state_dir() / cid / "session")
 
 
 def _require_account_connection(cfg: dict, *, allow_discovery: bool = False) -> None:
@@ -1207,7 +1228,7 @@ def _connections_report() -> dict:
             keys.append(_key_report("TELEGRAM_API_ID", False, True, value, tier, source))
         value, tier, source = _resolve_env_key(secret_env)
         keys.append(_key_report(secret_env, True, True, value, tier, source))
-        session = entry.get("session") or str(_state_dir() / cid / "session")
+        session = _connection_session(cid, entry)
         keys.append(_key_report("session", False, False, session, "connection", origin))
         keys.extend(_service_key_reports(entry, keys))
         report["connections"][cid] = {
@@ -1584,7 +1605,7 @@ def _first_link(wanted: str | None, session_flag: str | None):
         yield
         return
     folder = _state_dir() / cid
-    session = _session_file(entry.get("session") or str(folder / "session"))
+    session = _session_file(_connection_session(cid, entry))
     if session.exists():
         yield
         return
@@ -4141,7 +4162,7 @@ def _service_session_stem(root: Path, wanted: str | None,
     if entry is None:
         session = session_flag or _resolve_env_key("TELEGRAM_SESSION")[0] or str(DEFAULT_SESSION)
     else:
-        session = session_flag or entry.get("session") or str(_state_dir() / cid / "session")
+        session = session_flag or _connection_session(cid, entry)
     path = Path(str(session)).expanduser()
     if not path.is_absolute():
         path = root / path
@@ -5764,7 +5785,12 @@ def _connection_command(args, connection_flag: str | None,
              status=getattr(e, "code", None))
     except ValueError as e:
         _die(6, "invalid_input", str(e))
-    except (ConnectionError, OSError) as e:
+    except OSError as e:
+        # A file this machine cannot open or make - the session's folder, say -
+        # names its path; a failure reaching Telegram names none.
+        if e.filename is not None and not isinstance(e, ConnectionError):
+            _die(6, "local_file_error", f"cannot use {e.filename} on this machine: {e}",
+                 "a local file error, not a network one: make the path usable here")
         _die(5, "network_error", f"network error reaching Telegram: {e}", "check connectivity")
     finally:
         if temporary is not None:

@@ -124,5 +124,90 @@ class SessionStateTests(unittest.TestCase):
         self.assertIs(self.cli._manifest_payload()["connections"]["device_bound"], True)
 
 
+class MachineLocalSessionTests(unittest.TestCase):
+    """A connection record is read by every machine that reaches the store, so
+    a session path it carries is one machine's path: another machine signs the
+    connection in under its own state home, and the machine that set the path
+    keeps it."""
+
+    def setUp(self):
+        self.cli = import_cli()
+        self.addCleanup(restore_modules, self.cli)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.state = self.tmp / "state" / "telegram"
+        self.home = self.tmp / "home"
+        # As a Mac wrote it: a path in that machine's home, which this one lacks.
+        self.elsewhere = self.tmp / "Users" / "someone" / ".config" / "telegram" / "session"
+        self.conns = {"personal": {"expected_account_id": 1001,
+                                   "session": str(self.elsewhere)}}
+        reg = {"default": "personal", "connections": self.conns,
+               "sources": {"personal": str(self.tmp / "connections.json")}}
+        keys = {"TELEGRAM_API_ID": "12345", "TELEGRAM_API_HASH": "hash"}
+        for target, value in (("_connections_registry", lambda: (reg, None)),
+                              ("_state_dir", lambda: self.state),
+                              ("_STATE_HOME", self.tmp / "state"),
+                              ("_resolve_env_key", lambda key: (keys.get(key), None, None))):
+            patcher = mock.patch.object(self.cli, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(Path, "home", lambda: self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def session(self) -> str:
+        return self.cli._load_config("personal", None)["session"]
+
+    def reported(self) -> str:
+        keys = self.cli._connections_report()["connections"]["personal"]["keys"]
+        return next(k["value"] for k in keys if k["key"] == "session")
+
+    def test_another_machines_path_resolves_under_this_machines_state_home(self):
+        own = str(self.state / "personal" / "session")
+        self.assertEqual(self.session(), own)
+        self.assertEqual(self.reported(), own)
+        self.assertEqual(self.cli._service_session_stem(self.tmp, "personal", None)[1],
+                         Path(own))
+        self.assertFalse((self.tmp / "Users").exists())
+
+    def test_the_machine_holding_the_session_keeps_its_path(self):
+        write_session(self.elsewhere, signed_in_as=1001)
+        self.assertEqual(self.session(), str(self.elsewhere))
+        self.assertEqual(self.reported(), str(self.elsewhere))
+        self.assertEqual(self.cli._connections_report()["connections"]["personal"]["session"],
+                         {"live": True, "account": "1001"})
+
+    def test_a_path_in_this_machines_home_is_kept_before_its_first_login(self):
+        mine = self.home / ".config" / "telegram" / "session"
+        self.conns["personal"]["session"] = str(mine)
+        self.assertEqual(self.session(), str(mine))
+
+    def test_a_flag_still_overrides_the_connection(self):
+        flag = str(self.tmp / "flag" / "session")
+        self.assertEqual(self.cli._load_config("personal", flag)["session"], flag)
+
+    def failure(self, error: BaseException) -> tuple[int, dict]:
+        async def fail(cfg):
+            raise error
+        args = __import__("types").SimpleNamespace(cmd="login", phone=None, events=False)
+        err = __import__("io").StringIO()
+        with mock.patch.object(self.cli, "cmd_login_qr", fail), \
+                mock.patch.object(self.cli, "_refuse_account_held", lambda *a: None), \
+                __import__("contextlib").redirect_stderr(err):
+            with self.assertRaises(SystemExit) as raised:
+                self.cli._connection_command(args, "personal", None)
+        return raised.exception.code, json.loads(err.getvalue().strip().splitlines()[-1])["error"]
+
+    def test_a_local_file_error_is_not_reported_as_the_network(self):
+        code, error = self.failure(PermissionError(13, "Permission denied", "/Users"))
+        self.assertEqual((code, error["code"]), (6, "local_file_error"))
+        self.assertIn("/Users", error["message"])
+        self.assertNotIn("network", error["message"].lower())
+
+    def test_a_failure_reaching_telegram_is_still_the_network(self):
+        code, error = self.failure(ConnectionError("Connection to Telegram failed 5 time(s)"))
+        self.assertEqual((code, error["code"]), (5, "network_error"))
+
+
 if __name__ == "__main__":
     unittest.main()

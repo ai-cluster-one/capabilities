@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-28 — A connection's session path set on one machine no longer sends another machine's login there, and a local file error is no longer reported as the network
+
+A connection record is read by every machine that reaches its store, so a `session` path it carries is the path of the machine that set it. Each verb now resolves a named connection's session on the machine it runs on: the recorded path where a session already lives there or where it lies under this machine's home, and anywhere else `<state-dir>/<id>/session`, so signing a connection in on a node writes the session under that node's own state home rather than failing on another machine's folder. The machine that set the path keeps using it, and `telegram connections` reports the path each machine actually uses. A verb that cannot open or make a local file - such as the session's folder - exits 6 `local_file_error` naming the path, where it used to exit 5 `network_error` "network error reaching Telegram"; a failure reaching Telegram is still `network_error`.
+
 ## 2026-10-28 — `migrate` works on a store reached through a transaction pooler alone
 
 `telegram migrate` and `telegram migrate status` apply and read the harness runner's profile table on a transaction connection, so a store whose one address is a transaction pooler (such as Supabase's on port 6543) is migrated and reported as any other; before, that step opened a session connection, which such a store refuses. Declares `capabilities-contract>=0.33,<1`.
