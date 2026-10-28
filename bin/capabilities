@@ -653,8 +653,11 @@ POLICY VERBS
         service where <name> declares a project command, else by the machine
         service. unplace --mode takes the service off only where its
         placement records that mode, and otherwise - a row from before modes
-        included - changes nothing and says so (note); this is how `<name>
-        service leave` takes off the shared placement its join wrote.
+        included - changes nothing and says so (note). A place answers
+        placed_before, what the node's row held before it: null where the
+        service was not placed there, else the mode it recorded, unrecorded
+        for a row from before modes; this is how `<name> service join` knows
+        the shared placement it wrote, which its leave alone takes off.
         A service's descriptor declares how many nodes run it at once
         (service.placement): exclusive, the default, runs on one node at a
         time, so place takes it off every other node in the same write - this
@@ -671,8 +674,9 @@ POLICY VERBS
         localhost, 127.0.0.0/8 or ::1, which on that node reaches the node
         itself; the placement is written all the same.
         JSON {placed|unplaced, node, placement, changed, placed_on [nodes],
-        unplaced_from?, enabled_on_node?, warning?, gate, mode, note?}. Exit 3
-        when <name> is not installed, 6 no_service when it bundles none.
+        unplaced_from?, enabled_on_node?, warning?, gate, mode, note?,
+        placed_before? (place only)}. Exit 3 when <name> is not installed, 6
+        no_service when it bundles none.
   place <name> --all [--mode shared|own]
         Put a shared service on every node of this project's agent (`node
         list`), each node's placement recording its mode as place --node
@@ -1327,8 +1331,9 @@ PROJECT VERBS (run inside a consuming project)
         answered as machine_handover {services, agents, error?}). Before
         that, every agent it serves that is on a machine service's list here
         (`<name> service join`'s, service.machine.projects) and not placed on
-        this node in mode shared is placed so (`capabilities place <name>
-        --node <this node> --mode shared` in its folder), answered as joined
+        this node in mode shared is placed so (`<name> service join` again in
+        its folder, which writes that placement as the join's own, so its
+        leave takes it off), answered as joined
         [{service, agent_id, folder, node, mode, error?}] (would_join without
         --apply); a service one fails for keeps its old machine agent, and the
         command exits 6 handover_incomplete. An old agent's service placed
@@ -12527,13 +12532,37 @@ def _node_install_joined(folders: list[tuple[str, Path]], placed: list[tuple], h
             entry = {"service": name, "agent_id": agent_id, "folder": str(path),
                      "node": here, "mode": "shared"}
             if apply:
-                answer, said = _node_install_manager(path, "place", name, "--node", here,
-                                                     "--mode", "shared")
-                if answer is None:
+                said = _node_install_join(path, name)
+                if said is not None:
                     entry["error"] = said
                     failed.add(name)
             out.append(entry)
     return out, failed
+
+
+def _node_install_join(path: Path, name: str) -> str | None:
+    """Join the agent in `path` to `name`'s machine service again, which writes
+    its shared placement on this node as the join's own; None where it was
+    written, else what was said."""
+    executable = shutil.which(name)
+    if not executable:
+        return f"{name} is not on PATH"
+    env = _snapshot_env()
+    env.pop(PLACEMENT_LIST_ONLY_ENV, None)
+    rc, out, err = _run_script(Path(executable), ["service", "join"], cwd=path, env=env,
+                               timeout=180)
+    try:
+        answer = json.loads(out) if rc == 0 else None
+    except ValueError:
+        answer = None
+    placement = answer.get("placement") if isinstance(answer, dict) else None
+    if isinstance(placement, dict) and placement.get("written") is True:
+        return None
+    if isinstance(placement, dict) and isinstance(placement.get("error"), dict):
+        return str(placement["error"].get("message") or placement["error"].get("code"))
+    if answer is not None:
+        return f"`{name} service join` wrote no placement"
+    return (err or out).strip()[-1000:] or f"exit {rc}"
 
 
 def _node_install(args: list[str]) -> None:
@@ -17030,6 +17059,10 @@ def _service_place(name: str, placed: bool, node: str, serving: str | None = Non
                     "placement": mode, "changed": answer["changed"],
                     "placed_on": on, "gate": gate_source,
                     "mode": serving if placed else (held if note else serving or held)}
+    if placed:
+        # What the row held before, so a join knows the placement it wrote.
+        result["placed_before"] = (None if held is None else row[1]
+                                   if row[1] in PLACEMENT_MODES else "unrecorded")
     if answer["unplaced"]:
         result["unplaced_from"] = answer["unplaced"]
     if answer.get("enabled_on_node"):

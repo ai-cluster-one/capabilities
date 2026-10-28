@@ -343,7 +343,8 @@ if os.environ.get("REFUSE_PLACE"):
     sys.stderr.write(json.dumps({{"error": {{"code": "node_read_only",
                                              "message": "not on this node"}}}}) + "\\n")
     sys.exit(6)
-print(json.dumps({{"changed": True, "placed_on": ["lab-node"]}}))
+before = os.environ.get("PLACED_BEFORE") or None
+print(json.dumps({{"changed": True, "placed_on": ["lab-node"], "placed_before": before}}))
 """)
     (bin_dir / "capabilities").chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
@@ -387,9 +388,57 @@ print(json.dumps({{"changed": True, "placed_on": ["lab-node"]}}))
     # A manager from before placement modes is not asked to place at all.
     (bin_dir / "capabilities").write_text(f"#!{sys.executable}\nprint('  place <name>')\n")
     monkeypatch.delenv("REFUSE_PLACE")
-    code, left = leave(root, capsys)
-    assert code == 0 and left["left"] is True
-    assert left["placement"]["error"]["code"] == "manager_predates_modes"
+    code, again = join(root, capsys)
+    assert code == 0 and again["joined"] is False
+    assert again["placement"]["error"]["code"] == "manager_predates_modes"
+
+
+def test_leave_takes_off_only_the_shared_placement_its_join_wrote(
+        joining, capsys, monkeypatch, tmp_path):
+    """A placement the node already held - shared, or from before modes, as a
+    node manager from before CAPABILITIES_SERVICE_LIST_ONLY finds it when it
+    joins an agent it serves - is not the join's, so a leave, that manager's
+    own when it stops for an update included, leaves it placed."""
+    calls = tmp_path / "manager.log"
+    bin_dir = tmp_path / "manager-bin"
+    bin_dir.mkdir()
+    (bin_dir / "capabilities").write_text(f"""#!{sys.executable}
+import json, os, sys
+with open({str(calls)!r}, "a") as log:
+    log.write(json.dumps(sys.argv[1:]) + "\\n")
+if sys.argv[1:] == ["help"]:
+    print("  place <name> --node <node> [--mode shared|own]")
+    sys.exit(0)
+print(json.dumps({{"changed": False, "placed_on": ["lab-node"],
+                  "placed_before": os.environ.get("PLACED_BEFORE") or None}}))
+""")
+    (bin_dir / "capabilities").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("AGENT_NODE_ID", "lab-node")
+    monkeypatch.delenv("CAPABILITIES_SERVICE_LIST_ONLY", raising=False)
+    monkeypatch.setattr(mod, "_records_in_store", lambda: True)
+    root = write_project(joining / "orchard", project_id=ORCHARD_ID, slug="orchard",
+                         worker="w", kind="orchard", entry=entry_for())
+    unplace = ["unplace", "tasks", "--node", "lab-node", "--mode", "shared"]
+
+    def unplaced() -> int:
+        return sum(json.loads(line) == unplace for line in calls.read_text().splitlines())
+
+    for before in ("unrecorded", "shared"):
+        monkeypatch.setenv("PLACED_BEFORE", before)
+        assert join(root, capsys)[1]["placement"]["written"] is True
+        code, left = leave(root, capsys)
+        assert code == 0 and left["left"] is True and unplaced() == 0
+        assert left["placement"]["written"] is False
+        assert "capabilities unplace tasks --node lab-node" in left["placement"]["note"]
+    # One the join placed is its own, and its leave takes it off, once.
+    monkeypatch.setenv("PLACED_BEFORE", "own")
+    join(root, capsys)
+    monkeypatch.setenv("PLACED_BEFORE", "shared")
+    join(root, capsys)
+    assert leave(root, capsys)[1]["placement"]["written"] is True and unplaced() == 1
+    join(root, capsys)
+    assert leave(root, capsys)[1]["placement"]["written"] is False and unplaced() == 1
 
 
 # --- The machine process, in this process ------------------------------------

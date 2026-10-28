@@ -1216,6 +1216,10 @@ SERVICE
   manager could not write it; the list is written either way. A join or
   leave the node manager runs for the agents whose leases it holds sets
   CAPABILITIES_SERVICE_LIST_ONLY=1 and writes no placement.
+  A leave takes off only a placement its join wrote, one this node's row did
+  not already hold in mode shared or from before modes; any other it leaves
+  placed, answering placement {written: false, note} that names `capabilities
+  unplace`.
 
   The machine process is `tasks service run --machine`, what a supervisor
   runs, or `start --machine`. Exactly one runs per machine, by the lock in its
@@ -12746,17 +12750,24 @@ def _project_answer(project: str, entry: dict) -> dict:
 # placement is the one record of who is served, and the manager alone writes
 # it. A join or leave the node manager runs for the leases it holds sets
 # CAPABILITIES_SERVICE_LIST_ONLY=1 and writes none.
+# A leave takes off only a placement its own join wrote - one the node's row
+# did not already hold in mode shared or from before modes - which the join
+# records beside the list, never on it, so a machine process from before
+# placements reads the list it always has. A node manager from before
+# CAPABILITIES_SERVICE_LIST_ONLY joins and leaves without it; its leave, when it
+# stops for an update, thereby takes off nothing it did not write.
 
 _PLACEMENT_LIST_ONLY_ENV = "CAPABILITIES_SERVICE_LIST_ONLY"
 
 
-def _shared_placement(verb: str, root, scoped: str | None = None) -> dict | None:
+def _shared_placement(verb: str, root, scoped: str | None = None,
+                      project: str | None = None) -> dict | None:
     """What the manager answered placing (join) or unplacing (leave) this
     agent's shared service on this node, {written, node, mode, changed?,
-    placed_on?, error?}, or None where nothing is written: a project whose
+    placed_on?, error?, note?}, or None where nothing is written: a project whose
     records are not in the store, a folder that is gone, or the node manager's
-    own join or leave. `scoped`, a project's id, asks it of that project's
-    folder from another, and of none where the folder is bound to another id
+    own join or leave. `project` is the agent's id; `scoped`, a project's id in
+    its place, asks it of that project's folder from another, and of none where the folder is bound to another id
     now. It never fails the verb, whose list is already written: a
     placement that cannot be written is answered with why, and said on stderr."""
     import contextlib
@@ -12792,6 +12803,12 @@ def _shared_placement(verb: str, root, scoped: str | None = None) -> dict | None
     except Exception as exc:
         return _placement_unwritten(verb, None, getattr(exc, "slug", "node_unidentified"),
                                     getattr(exc, "message", str(exc)))
+    project = scoped or project
+    if verb == "leave" and project not in _join_placements():
+        return {"written": False, "node": node, "mode": "shared",
+                "note": f"no join here placed {NAME}'s service on {node}, so leave leaves "
+                        f"its placement as it is; `capabilities unplace {NAME} --node "
+                        f"{node}` takes it off"}
     argv = [manager, "place" if verb == "join" else "unplace", NAME, "--node", node,
             "--mode", "shared"]
     try:
@@ -12814,8 +12831,47 @@ def _shared_placement(verb: str, root, scoped: str | None = None) -> dict | None
         answer = json.loads(done.stdout)
     except ValueError:
         answer = {}
+    if verb == "leave":
+        _join_placement_mark(project, False)
+    elif answer.get("placed_before", "unrecorded") not in ("shared", "unrecorded"):
+        # Placed by this join, not found placed so: its leave takes it off.
+        _join_placement_mark(project, True)
     return {"written": True, "node": node, "mode": "shared",
             "changed": answer.get("changed"), "placed_on": answer.get("placed_on")}
+
+
+_JOIN_PLACEMENTS = "placed-by-join.json"
+
+
+def _join_placements() -> set:
+    """The projects whose shared placement on this node a join here wrote."""
+    try:
+        body = json.loads((_machine_state_dir() / _JOIN_PLACEMENTS).read_text())
+    except (OSError, ValueError):
+        return set()
+    listed = body.get("projects") if isinstance(body, dict) else None
+    return {p for p in listed if isinstance(p, str)} if isinstance(listed, list) else set()
+
+
+def _join_placement_mark(project, placed: bool) -> None:
+    """Record that a join here wrote `project`'s shared placement, or that
+    its leave took it off, whole under a lock of its own."""
+    import fcntl
+
+    if not project:
+        return
+    state = _machine_state_dir()
+    state.mkdir(parents=True, exist_ok=True)
+    with (state / "placed-by-join.lock").open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        projects = _join_placements()
+        if (project in projects) == placed:
+            return
+        projects = projects | {project} if placed else projects - {project}
+        path = state / _JOIN_PLACEMENTS
+        spare = path.with_name(f".{path.name}.{os.getpid()}")
+        spare.write_text(json.dumps({"version": 1, "projects": sorted(projects)}) + "\n")
+        os.replace(spare, path)
 
 
 def _placement_unwritten(verb: str, node, code: str, message: str) -> dict:
@@ -12875,14 +12931,14 @@ def cmd_service_join(wanted: str | None, args: list[str]) -> None:
                                "joined_by": _actor()}
             _write_machine_projects(listed, path)
     if already is not None:
-        placement = _shared_placement("join", root)
+        placement = _shared_placement("join", root, project=project)
         _emit({**already, **({"placement": placement} if placement else {})})
         return
     module = _service_module()
     state = _project_state_dir(slug)
     if state.is_dir():
         module.log_line(state, slug, f"joined the machine service, by {listed[project]['joined_by']}")
-    placement = _shared_placement("join", root)
+    placement = _shared_placement("join", root, project=project)
     _emit({"joined": True, "project": _project_answer(project, listed[project]),
            "list": str(path), **({"placement": placement} if placement else {})})
 
@@ -12920,7 +12976,7 @@ def cmd_service_leave(args: list[str]) -> None:
             entry = listed.pop(project)
             _write_machine_projects(listed, path)
     if not found:
-        placement = _shared_placement("leave", _project_here()) if here else None
+        placement = _shared_placement("leave", _project_here(), project=here) if here else None
         _emit({"left": False, "reason": "not on the machine service's list",
                "project": {"id": here} if here else {"named": named}, "list": str(path),
                **({"placement": placement} if placement else {})})
@@ -12929,7 +12985,7 @@ def cmd_service_leave(args: list[str]) -> None:
     state = _project_state_dir(entry["slug"])
     if state.is_dir():
         module.log_line(state, entry["slug"], f"left the machine service, by {_actor()}")
-    placement = (_shared_placement("leave", _project_here()) if here else
+    placement = (_shared_placement("leave", _project_here(), project=here) if here else
                  _shared_placement("leave", entry["root"], scoped=project))
     _emit({"left": True, "project": _project_answer(project, entry), "list": str(path),
            **({"placement": placement} if placement else {})})

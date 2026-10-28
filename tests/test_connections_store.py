@@ -2312,12 +2312,15 @@ def test_a_placement_records_its_mode_shared_by_default_where_a_machine_service_
     _both_commands(lab)
     placed = _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
     assert placed["mode"] == "shared" and placed["changed"] is True
+    assert placed["placed_before"] is None
     assert _modes(lab) == [(NODE, True, "shared")]
     # Placed again without a mode, it keeps the one it has.
     again = _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
     assert again["mode"] == "shared" and again["changed"] is False
+    assert again["placed_before"] == "shared"
     own = _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "own", extra=here))
     assert own["mode"] == "own" and own["changed"] is True
+    assert own["placed_before"] == "shared"
     assert _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))["mode"] == "own"
     report = _ok(_manager(lab, "place", "coolify", extra=here))
     assert report["modes"] == {NODE: "own"} and report["served_by"] == []
@@ -2403,12 +2406,19 @@ def test_a_leave_naming_shared_leaves_a_machine_service_placed_before_modes(lab)
     _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("UPDATE lab.capabilities_policy SET mode = NULL")
+    # A join placing it again is told the placement is not its own.
+    again = _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "shared",
+                         extra=here))
+    assert again["placed_before"] == "unrecorded"
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.capabilities_policy SET mode = NULL")
     kept = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, "--mode", "shared",
                         extra=here))
     assert kept["changed"] is False and kept["mode"] == "shared" and "note" in kept
     assert _modes(lab) == [(NODE, True, None)]
     gone = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
     assert gone["changed"] is True and gone["placed_on"] == []
+
 
 def test_one_service_at_a_time_serves_an_agent_on_a_node_under_its_service_lease(
         lab, tmp_path):
@@ -2530,6 +2540,18 @@ import json
 print(json.dumps({{"ok": True, "agents": []}}))
 """)
     (bin_dir / "deployment").chmod(0o755)
+    # Its join, run again in the agent's folder, writes the shared placement.
+    joins = tmp_path / "joins.log"
+    (bin_dir / "coolify").write_text(f"""#!{sys.executable}
+import json, os, subprocess, sys
+with open({str(joins)!r}, "a") as log:
+    log.write(json.dumps([sys.argv[1:], os.getcwd(),
+                          os.environ.get("CAPABILITIES_SERVICE_LIST_ONLY")]) + "\\n")
+done = subprocess.run([{str(MANAGER)!r}, "place", "coolify", "--node", {NODE!r},
+                       "--mode", "shared"], capture_output=True, text=True)
+print(json.dumps({{"joined": False, "placement": {{"written": done.returncode == 0}}}}))
+""")
+    (bin_dir / "coolify").chmod(0o755)
     env = {**here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
     listing = lab["config"] / "coolify" / "service" / "projects.json"
     listing.parent.mkdir(parents=True)
@@ -2544,12 +2566,16 @@ print(json.dumps({{"ok": True, "agents": []}}))
     preview = _ok(_manager(lab, "node", "install", extra=env))
     assert preview["would_join"] == [entry]
     assert _modes(lab) == [(NODE, True, "own")]
+    assert not joins.exists()
     done = _ok(_manager(lab, "node", "install", "--apply", extra=env))
     assert done["joined"] == [entry]
     assert _modes(lab) == [(NODE, True, "shared")]
     again = _ok(_manager(lab, "node", "install", "--apply", extra=env))
     assert "joined" not in again and "would_join" not in again
     assert _modes(lab) == [(NODE, True, "shared")]
+    assert [(argv, os.path.realpath(cwd), only) for argv, cwd, only in
+            map(json.loads, joins.read_text().splitlines())] == [
+        (["service", "join"], os.path.realpath(lab["project"]), None)]
 
 
 def test_a_start_or_place_without_a_node_on_a_mac_beside_a_server_says_where_it_lands(lab):
