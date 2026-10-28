@@ -1730,6 +1730,82 @@ def test_node_run_writes_this_nodes_state_on_its_beat_and_after_a_change(lab, tm
     assert row == (True, True, True, True, True)
 
 
+
+def test_a_slow_probe_does_not_hold_back_the_state_beat_on_a_mac(lab, tmp_path):
+    """On a node whose tools - or whose many agents' sessions - take long to
+    answer, the state row is still written at start and on every beat, and
+    the sign-ins follow as soon as they are answered."""
+    here = _service_lab(lab)
+    bin_dir, _calls, _loaded = _stand_in_launchctl(lab, tmp_path)
+    for tool, said in (("claude", '{"loggedIn": true, "email": "someone@example.com"}'),
+                       ("codex", "Not logged in"), ("gh", '{"hosts": {}}')):
+        (bin_dir / tool).write_text(f"#!/bin/sh\nsleep 12\necho '{said}'\n")
+        (bin_dir / tool).chmod(0o755)
+    env = {**lab["env"], **here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+
+    def stamps():
+        return _rows(lab, "SELECT reported_at, claude_login FROM capabilities_node_states s "
+                          "LEFT JOIN capabilities_node_logins l USING (node) "
+                          f"WHERE s.node = '{NODE}'")
+
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--launchd", "--every", "300"],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        # The tools take 36s to answer; the row does not wait for them.
+        [(first, login)] = _wait_for(stamps, 10)
+        assert login is None
+        again = _wait_for(lambda: [row for row in stamps() if row[0] > first], 20)
+        assert again and again[0][1] is None
+        signed = _wait_for(lambda: [row for row in stamps() if row[1] == "signed_in"], 45)
+        assert signed
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+
+
+def test_node_run_restarts_onto_the_manager_on_path_once_it_is_another_release(
+        lab, tmp_path):
+    """The manager on PATH moving to another release by any route - not only
+    a `node update` of its own - stops node run with its restart exit, so its
+    supervisor starts it again on the new release."""
+    here = _service_lab(lab)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    releases = {}
+    for release in ("old", "new"):
+        (tmp_path / release).mkdir()
+        releases[release] = tmp_path / release / "capabilities"
+        shutil.copy2(MANAGER, releases[release])
+    link = bin_dir / "capabilities"
+    link.symlink_to(releases["old"])
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    node_run = subprocess.Popen([str(link), "node", "run", "--supervisor",
+                                 str(tmp_path / "jobs"), "--every", "300"],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(lambda: _rows(lab, "SELECT 1 FROM capabilities_node_states "
+                                            f"WHERE node = '{NODE}'"), 30)
+        import time
+        time.sleep(3)
+        assert node_run.poll() is None
+        # Another release lands on PATH by a route other than node update.
+        moved = bin_dir / ".capabilities.tmp"
+        moved.symlink_to(releases["new"])
+        os.replace(moved, link)
+        node_run.wait(timeout=20)
+    finally:
+        if node_run.poll() is None:
+            node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 75, err
+    assert "the manager on PATH is another release now" in err
+
 def test_node_run_and_each_supervisor_keep_their_last_lines_in_the_store(lab, tmp_path):
     """What a service's supervisor and the service print on stderr, and what
     node run prints, read from the store as the node's log, with what reads as

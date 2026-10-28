@@ -11417,11 +11417,13 @@ class _NodeManager:
         self.unrun_now: dict[tuple[str, str], tuple[str, str]] = {}
         # This node's state, written on its own beat and right after a
         # reconcile that changed a job; the tools' sign-ins and the agents'
-        # sessions, each a process to ask, on the slower probe cadence.
+        # sessions, each a process to ask, on the slower probe cadence, in a
+        # thread of their own so a slow answer never holds the beat back.
         self.folders: dict[str, Path] = {}
         self.moved = False
         self.state_due = 0.0
         self.probe_due = 0.0
+        self.probe: tuple | None = None
         self.logins: dict | None = None
         self.sessions: dict | None = None
         # What each agent's placed services need signed in here, asked with
@@ -11438,6 +11440,9 @@ class _NodeManager:
         self.update_asked = True
         self.check_due = time.monotonic() + NODE_UPDATE_FIRST_CHECK_SECONDS
         self.restart_self = False
+        # The release this process runs, to stop when the manager on PATH
+        # moves to another one by any route.
+        self.started_on = self.manager_target()
         # What it prints, kept for this node's log in the store.
         self.log = _NodeLogTail()
 
@@ -11760,21 +11765,55 @@ class _NodeManager:
         self.say(f"restarted job {name}, as asked" if ok
                  else f"could not restart job {name}: {said[:300]}")
 
+    def start_probe(self) -> None:
+        """Ask the tools, and once the store has been read and the agents'
+        folders here are known the sessions and what the placed services
+        need, in a thread of its own: on a node with many agents that takes
+        longer than a beat."""
+        import threading
+        self.probe_due = time.monotonic() + NODE_STATE_PROBE_SECONDS
+        folders, placed, harness = dict(self.folders), list(self.placed), dict(self.harness)
+        read = self.read_once
+        answer: dict = {}
+
+        def ask() -> None:
+            answer["logins"] = _node_tool_logins()
+            if read:
+                answer["sessions"] = _node_device_sessions(folders)
+                answer["needed"], answer["harness"] = _node_needed_sign_ins(
+                    folders, placed, harness)
+
+        thread = threading.Thread(target=ask, name="node-state-probe", daemon=True)
+        self.probe = (thread, answer)
+        thread.start()
+
+    def probed(self) -> bool:
+        """Whether a probe has answered since it was last taken."""
+        return self.probe is not None and not self.probe[0].is_alive()
+
+    def take_probe(self) -> None:
+        """Take what the probe that ended answered, to be written now."""
+        if not self.probed():
+            return
+        _thread, answer = self.probe
+        self.probe = None
+        if "logins" in answer:
+            self.logins = answer["logins"]
+        self.sessions = answer.get("sessions")
+        if "needed" in answer:
+            self.needed, self.harness = answer["needed"], answer["harness"]
+
     def report_state(self) -> None:
-        """Write this node's state; the tools and the sessions are asked again
-        once the probe cadence has passed, the sessions only once the store
-        has been read and the agents' folders here are known. A write that
-        fails is said once and changes nothing else."""
+        """Write this node's state, with what the tools and the sessions
+        answered last; they are asked again once the probe cadence has
+        passed, and what they answer is written as soon as it comes. A write
+        that fails is said once and changes nothing else."""
         now = time.monotonic()
         self.state_due = now + NODE_STATE_BEAT_SECONDS
         self.moved = False
-        if self.logins is None or now >= self.probe_due:
-            self.probe_due = now + NODE_STATE_PROBE_SECONDS
-            self.logins = _node_tool_logins()
-            self.sessions = _node_device_sessions(self.folders) if self.read_once else None
-            if self.read_once:
-                self.needed, self.harness = _node_needed_sign_ins(self.folders, self.placed,
-                                                                  self.harness)
+        self.take_probe()
+        if self.probe is None and now >= self.probe_due:
+            self.start_probe()
         try:
             conn = self._connect()
         except Exception as exc:
@@ -11939,6 +11978,20 @@ class _NodeManager:
         self.check_due = now + NODE_UPDATE_CHECK_SECONDS
         self.start_update("check")
 
+    def follow_release(self, stopping: dict) -> None:
+        """Stop, so the supervisor starts node run again on it, once the
+        manager on PATH is another release than this process runs, however it
+        moved; while a `node update` runs, its end says so instead."""
+        if stopping["now"] or self.update_child is not None:
+            return
+        target = self.manager_target()
+        if target is None or self.started_on is None or target == self.started_on:
+            return
+        self.say("the manager on PATH is another release now: stops so its supervisor "
+                 "starts node run again on it")
+        self.restart_self = True
+        stopping["now"] = True
+
     def stop_check(self) -> None:
         """A check still running when node run stops is stopped with it; an
         update runs on to its end."""
@@ -11971,7 +12024,8 @@ class _NodeManager:
                 self.update_ended(ended, stopping)
             else:
                 self.tend_update()
-            if self.moved or time.monotonic() >= self.state_due:
+            self.follow_release(stopping)
+            if self.moved or self.probed() or time.monotonic() >= self.state_due:
                 self.report_state()
             deadline = time.monotonic() + NODE_RUN_FOLLOW_SECONDS
             while not stopping["now"] and time.monotonic() < deadline:
