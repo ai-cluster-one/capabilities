@@ -323,6 +323,75 @@ def test_leave_in_the_project_and_from_anywhere(joining, capsys):
     assert (code, error["code"]) == (6, "input")
 
 
+def test_join_and_leave_write_the_shared_placement_of_a_store_mode_project(
+        joining, capsys, monkeypatch, tmp_path):
+    """In a project whose records are in the store, join places its service on
+    this node to be served by the machine service and leave takes that off,
+    each through the manager; the node manager's own join writes none, and a
+    placement the manager refuses is answered, never fatal."""
+    calls = tmp_path / "manager.log"
+    bin_dir = tmp_path / "manager-bin"
+    bin_dir.mkdir()
+    (bin_dir / "capabilities").write_text(f"""#!{sys.executable}
+import json, os, sys
+with open({str(calls)!r}, "a") as log:
+    log.write(json.dumps([sys.argv[1:], os.getcwd()]) + "\\n")
+if sys.argv[1:] == ["help"]:
+    print("  place <name> --node <node> [--mode shared|own]")
+    sys.exit(0)
+if os.environ.get("REFUSE_PLACE"):
+    sys.stderr.write(json.dumps({{"error": {{"code": "node_read_only",
+                                             "message": "not on this node"}}}}) + "\\n")
+    sys.exit(6)
+print(json.dumps({{"changed": True, "placed_on": ["lab-node"]}}))
+""")
+    (bin_dir / "capabilities").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("AGENT_NODE_ID", "lab-node")
+    monkeypatch.delenv("CAPABILITIES_SERVICE_LIST_ONLY", raising=False)
+    root = write_project(joining / "orchard", project_id=ORCHARD_ID, slug="orchard",
+                         worker="w", kind="orchard", entry=entry_for())
+    # A project whose records are files writes no placement.
+    code, answer = join(root, capsys)
+    assert code == 0 and answer["joined"] is True and "placement" not in answer
+    assert leave(root, capsys)[1]["left"] is True and not calls.exists()
+
+    monkeypatch.setattr(mod, "_records_in_store", lambda: True)
+    written = {"written": True, "node": "lab-node", "mode": "shared", "changed": True,
+               "placed_on": ["lab-node"]}
+    code, answer = join(root, capsys)
+    assert code == 0 and answer["joined"] is True and answer["placement"] == written
+    monkeypatch.setenv("CAPABILITIES_SERVICE_LIST_ONLY", "1")
+    code, again = join(root, capsys)
+    assert code == 0 and again["joined"] is False and "placement" not in again
+    monkeypatch.delenv("CAPABILITIES_SERVICE_LIST_ONLY")
+    code, left = leave(root, capsys)
+    assert code == 0 and left["left"] is True and left["placement"] == written
+    join(root, capsys)
+    code, left = leave(None, capsys, "--machine", "--project", "orchard")
+    assert code == 0 and left["left"] is True and left["placement"] == written
+
+    monkeypatch.setenv("REFUSE_PLACE", "1")
+    code, answer = join(root, capsys)
+    assert code == 0 and answer["joined"] is True
+    assert answer["placement"]["written"] is False
+    assert answer["placement"]["error"]["code"] == "placement_refused"
+    assert ORCHARD_ID in mod._read_machine_projects()
+    logged = [json.loads(line) for line in calls.read_text().splitlines()
+              if json.loads(line)[0] != ["help"]]
+    place = ["place", "tasks", "--node", "lab-node", "--mode", "shared"]
+    unplace = ["unplace", "tasks", "--node", "lab-node", "--mode", "shared"]
+    assert [argv for argv, _cwd in logged] == [place, unplace, place, unplace, place]
+    assert {os.path.realpath(cwd) for _argv, cwd in logged} == {os.path.realpath(root)}
+
+    # A manager from before placement modes is not asked to place at all.
+    (bin_dir / "capabilities").write_text(f"#!{sys.executable}\nprint('  place <name>')\n")
+    monkeypatch.delenv("REFUSE_PLACE")
+    code, left = leave(root, capsys)
+    assert code == 0 and left["left"] is True
+    assert left["placement"]["error"]["code"] == "manager_predates_modes"
+
+
 # --- The machine process, in this process ------------------------------------
 
 @pytest.fixture

@@ -2,7 +2,7 @@
   "capabilities": {
     "agentrooms": {
       "path": "capabilities/agentrooms",
-      "payload_sha256": "553f7d13337f2414b864aa943464d7167057df457bc11a1280e9d367d084fbef",
+      "payload_sha256": "b360154ba4f83a4974c09009b83e851e779de1bd5bc30007bbf744139ada98b5",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
     "agenttemplates": {
@@ -27,7 +27,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "e0ba7ef67878f208a74fd4ff8a4e2dddb7fc93d2ebede658cd39faf91a75aee4",
+      "payload_sha256": "246ea378a2eeea4218555880bf0ed48801b4258f04fefb3694e8ab6eb9ceab24",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -117,7 +117,7 @@
     },
     "memory": {
       "path": "capabilities/memory",
-      "payload_sha256": "c6edcfd0d4dfa6f545399f77880d5abe8a1bb36a20459092bcdfae562bdd4dca",
+      "payload_sha256": "7d448cc9d8f41f01546d779a7a5e814d1bf5f6dcc4a7537aaecf767bf3dd7f77",
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
     },
     "notion": {
@@ -172,7 +172,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "5cb4a1b425556389822d85b92aa85a1f9f130e4d78ed5dacb6ba0c4bd9e98b1d",
+      "payload_sha256": "552efc1fa86b49138e4a8ec22510843e49e7709a96eb8c0b47fb58d240ef1123",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

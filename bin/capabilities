@@ -637,10 +637,24 @@ POLICY VERBS
         --node (store mode only) remove that scope's row for that one node;
         where that row placed the service, it stops there and the answer says
         so (unplaced, warning).
-  place <name> --node <node>
-  unplace <name> --node <node>
+  place <name> --node <node> [--mode shared|own]
+  unplace <name> --node <node> [--mode shared|own]
         Store mode only: put this project's bundled service of <name> on that
         node, or take it off, changing nothing about where <name> is usable.
+        The placement records which service serves the agent there, its mode:
+        shared, the node's one machine service of <name>, which the node
+        manager runs once for every agent placing it so, or own, the agent's
+        own service. Without --mode a service already placed on the node
+        keeps its mode, and a new placement is shared where <name>'s installed
+        service declares a machine command (service.machine.command), else
+        own; shared where it declares none is refused (exit 6
+        no_machine_service). A row that records no mode - written before
+        modes, or by enable --node - is served as before: by the agent's own
+        service where <name> declares a project command, else by the machine
+        service. unplace --mode takes the service off only where it is placed
+        in that mode, and otherwise changes nothing and says so (note); this
+        is how `<name> service leave` takes off the shared placement its join
+        wrote.
         A service's descriptor declares how many nodes run it at once
         (service.placement): exclusive, the default, runs on one node at a
         time, so place takes it off every other node in the same write - this
@@ -657,11 +671,12 @@ POLICY VERBS
         localhost, 127.0.0.0/8 or ::1, which on that node reaches the node
         itself; the placement is written all the same.
         JSON {placed|unplaced, node, placement, changed, placed_on [nodes],
-        unplaced_from?, enabled_on_node?, warning?, gate}. Exit 3 when <name>
-        is not installed, 6 no_service when it bundles none.
-  place <name> --all
+        unplaced_from?, enabled_on_node?, warning?, gate, mode, note?}. Exit 3
+        when <name> is not installed, 6 no_service when it bundles none.
+  place <name> --all [--mode shared|own]
         Put a shared service on every node of this project's agent (`node
-        list`); an exclusive one is refused (exit 6 placement_exclusive).
+        list`), each node's placement recording its mode as place --node
+        does; an exclusive one is refused (exit 6 placement_exclusive).
         Every node is checked before anything is written: where any would
         refuse - disabled there, or a row this node may not write - nothing
         is written and the error's detail.refused names each node, code and
@@ -669,7 +684,8 @@ POLICY VERBS
         that fails part-way exits non-zero with detail {placed [nodes],
         failed}, and running the command again finishes it. Exit 6 no_nodes
         when the agent has no registered node. JSON {placed, nodes [nodes],
-        placement, changed, placed_on [nodes], enabled_on_nodes?, gate}.
+        placement, changed, placed_on [nodes], enabled_on_nodes?, gate,
+        modes {node: mode}}.
   place <name>
         Store mode only, and allowed under the read-only switch: where the
         service is placed beside the node running it, writing nothing. JSON
@@ -683,7 +699,17 @@ POLICY VERBS
         shared service takes no lease: holder and lease are null and agrees
         is null. Where this machine is not a server (its node's kind) and the
         agent has a server node, the answer also carries a warning, said on
-        stderr too, that it placed nothing, naming the agent's nodes.
+        stderr too, that it placed nothing, naming the agent's nodes. It also
+        answers modes {node: mode}, each placed node's mode, and served_by
+        [{node, mode, acquired_at, renewed_at, expires_at, live}]: the
+        service lease of each node, capabilities_service_leases, naming which
+        mode's service serves the agent there. Every service that serves an
+        agent on a node - its own service, or the node's machine service -
+        takes and renews that lease every reconcile, for three reconciles,
+        and a service of the other mode on that node serves the agent only
+        once it has run out or been given up, so no agent is served twice on
+        a node; it is apart from the lease above, which keeps an exclusive
+        service on one node.
 
 PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex] [--with-layers | --with-template | --id <id>]
@@ -1222,10 +1248,14 @@ PROJECT VERBS (run inside a consuming project)
         on this node (`place`), it keeps one Supervisor program in <dir>,
         named <capability>.<agent id>, running `node supervise` in the
         agent's folder; a service no longer placed here loses its program.
-        A service with no project command that declares a machine one
-        (service.machine) has one program for the node instead, named
+        A service placed here in mode shared, whose installed service declares
+        a machine command (service.machine) - with a project command of its
+        own or without one - has one program for the node instead, named
         <capability>.machine, running `node supervise <name> --machine` in
-        this folder while any agent here places it.
+        this folder while any agent here places it so; one placed in mode own
+        keeps its agent's program. A placement recording no mode is run as
+        before modes: by its agent's program where the service declares a
+        project command, else by the machine program.
         --services limits it to those capabilities, the ones this
         Supervisor's box carries; a service placed here outside them that
         declares a project command is left to whatever runs it, such as a
@@ -1257,7 +1287,8 @@ PROJECT VERBS (run inside a consuming project)
         again on that release, every job running on. While the store cannot be read it changes no job,
         and at its first start it writes none until it has read the store. A
         placed service it will not run - not installed, no deploy or machine
-        command, quarantined, a machine service outside --services, or its
+        command (a shared placement of a service declaring no machine command
+        included), quarantined, a machine service outside --services, or its
         agent's folder not bound to it - is named once on stderr and keeps
         this node's row in capabilities_service_instances, unusable, its
         problem saying why and its code service_not_runnable, quarantined,
@@ -1290,10 +1321,19 @@ PROJECT VERBS (run inside a consuming project)
         first placed on this node (`capabilities place <name> --node <this
         node>` there), so the migration stops no service that was running;
         where that fails the folder's agents are not handed over. The machine
-        services it will run here - placed on this node by an agent it serves,
-        declaring a machine command and no project command - hand their old
-        machine agents over too (`deployment machine handover <name> ...`,
-        once, answered as machine_handover {services, agents, error?}). Without
+        services it will run here - placed on this node in mode shared by an
+        agent it serves, declaring a machine command - hand their old machine
+        agents over too (`deployment machine handover <name> ...`, once,
+        answered as machine_handover {services, agents, error?}). Before
+        that, every agent it serves that is on a machine service's list here
+        (`<name> service join`'s, service.machine.projects) and not placed on
+        this node in mode shared is placed so (`capabilities place <name>
+        --node <this node> --mode shared` in its folder), answered as joined
+        [{service, agent_id, folder, node, mode, error?}] (would_join without
+        --apply); a service one fails for keeps its old machine agent, and the
+        command exits 6 handover_incomplete. An old agent's service placed
+        here before its handover is placed in mode own where it declares a
+        project command, as it ran. Without
         --apply it changes nothing and answers what it would do, which is how
         a machine's migration is announced before it runs. Answers {applied,
         project, agent_id, node, served [{agent_id, folder}], left [{agent_id,
@@ -1339,7 +1379,12 @@ PROJECT VERBS (run inside a consuming project)
         lease; a refusal names the holder and expiry on stderr, and it keeps
         checking, so it takes over once the lease expires or is released.
         With no database resolvable no lease can be taken, and it runs as the
-        gate says. Each reconcile it also reports this node seen (`node
+        gate says. Placed, it also takes or renews the agent's service lease
+        on this node as its own service (capabilities_service_leases, mode
+        own); while the node's machine service of <name> holds it live for
+        the agent (mode shared), it runs nothing, leaves that service's leases
+        and instance row alone, and checks again every reconcile. Each
+        reconcile it also reports this node seen (`node
         seen`); a report that fails is said once on stderr and changes nothing
         else. While the service is placed here it keeps this node's row in
         capabilities_service_instances: its state - starting, ready, unusable,
@@ -1371,25 +1416,30 @@ PROJECT VERBS (run inside a consuming project)
         learns that this manager supervises the service it is handed, where an
         older one refuses the option and the runner supervises it itself.
   node supervise <name> --machine [--every N] [--restart POLICY]
-        What a node-run job runs for a service with no project command that
-        declares one per machine (service.machine.command): one process on
-        this node for every agent here that places it. Each reconcile it reads
-        those agents from the store, takes each one's lease where the service
-        is exclusive, puts each agent whose lease it holds on the service's own
-        list (`<name> service join` in its folder) and takes off those it put
-        there that it no longer holds (`service leave`), and runs the machine
-        command while any agent is on it, under the restart policy and exit-4
-        hold above, probing it with service.machine.doctor. It writes one row
-        per placed agent: from what `<name> service status --machine` says of
-        that agent (served ready, paused held, refused or error unusable),
-        waiting for an agent whose lease another node holds. Where a machine
-        process it did not start runs <name> here - an agent of `deployment
-        machine sync`, or one started by hand - it starts none beside it,
-        changes no list and writes each row waiting (machine_process_elsewhere),
-        its problem naming the command that ends it: `deployment machine
-        handover <name>` where launchd runs capabilities.machine.<name>, else
-        `<name> service stop --machine`. Stopping, it stops the
-        process and takes off the list every agent it put there. Its record
+        What a node-run job runs for a service that declares one per machine
+        (service.machine.command): one process on this node for every agent
+        here that places it in mode shared. Each reconcile it reads those
+        agents from the store, takes each one's service lease on this node
+        (mode shared; an agent whose own service holds it live is left to
+        that service, its row and lines untouched) and its lease where the
+        service is exclusive, puts each agent whose leases it holds on the
+        service's own list (`<name> service join` in its folder, with
+        CAPABILITIES_SERVICE_LIST_ONLY=1, so it writes no placement) and takes
+        off those it put there that it no longer holds (`service leave`,
+        likewise), giving up the agent's service lease once it is off, and
+        runs the machine command while any agent is on it, under the restart
+        policy and exit-4 hold above, probing it with service.machine.doctor.
+        It writes one row per placed agent: from what `<name> service status
+        --machine` says of that agent (served ready, paused held, refused or
+        error unusable), waiting for an agent whose lease another node holds.
+        Where a machine process it did not start runs <name> here - an agent
+        of `deployment machine sync`, or one started by hand - it starts none
+        beside it, changes no list and writes each row waiting
+        (machine_process_elsewhere), its problem naming the command that ends
+        it: `deployment machine handover <name>` where launchd runs
+        capabilities.machine.<name>, else `<name> service stop --machine`. Stopping, it stops the process,
+        takes off the list every agent it put there and gives up their
+        service leases. Its record
         is under $XDG_STATE_HOME/capabilities/node/machine/.
   service start <name> [--node <node>] [--wait S]
   service move <name> --node <node> [--wait S]
@@ -8681,9 +8731,10 @@ NODE_KINDS = ("mac", "server")
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
-def _kernel_open(root: Path):
+def _kernel_open(root: Path, placement: bool = False):
     """(connection, setting) for the project's store with the contract's tables
-    migrated, or the store's refusal. The caller closes the connection."""
+    migrated, and with `placement` the manager's own steps after them, or the
+    store's refusal. The caller closes the connection."""
     db = _db_module()
     store = _store_module()
     try:
@@ -8695,8 +8746,8 @@ def _kernel_open(root: Path):
     import psycopg
     try:
         major, minor = store.STORE_TABLES_VERSION
-        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
-                   major=major, minor=minor)
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps()
+                   + (PLACEMENT_STEPS if placement else []), major=major, minor=minor)
     except db.DbError as exc:
         conn.close()
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
@@ -8718,11 +8769,12 @@ def _kernel_agent_id(root: Path) -> str:
     return agent_id
 
 
-def _kernel_run(root: Path, work):
+def _kernel_run(root: Path, work, placement: bool = False):
     """Run `work(conn, agent_id)` in one transaction against the project's store
-    and answer what it returns, with the store's errors as the manager's exits."""
+    and answer what it returns, with the store's errors as the manager's exits;
+    `placement` applies the manager's own steps first."""
     agent_id = _kernel_agent_id(root)
-    conn, setting = _kernel_open(root)
+    conn, setting = _kernel_open(root, placement)
     import psycopg
     try:
         with conn.transaction():
@@ -10866,6 +10918,7 @@ NODE_REFERENCES = (
     ("capabilities_node_updates", "node", "foreign key"),
     ("capabilities_policy", "node", "whole"),
     ("capabilities_service_instances", "node", "whole"),
+    ("capabilities_service_leases", "node", "whole"),
     ("capabilities_settings", "node", "whole"),
     ("capabilities_settings_changes", "node", "whole"),
     ("capabilities_settings_documents", "node", "whole"),
@@ -11586,10 +11639,8 @@ class _NodeManager:
         conn = db.connect(application_name=self.store.STORE_OWNER, setting=self.setting,
                           transaction=True)
         if not self.migrated:
-            major, minor = self.store.STORE_TABLES_VERSION
             try:
-                db.migrate(conn, self.store.STORE_OWNER, self.store.record_table_steps(),
-                           major=major, minor=minor)
+                _placement_migrate(conn, db)
             except Exception:
                 conn.close()
                 raise
@@ -11597,9 +11648,9 @@ class _NodeManager:
         return conn
 
     def read_store(self) -> tuple[list[tuple], list[tuple]] | None:
-        """(agents [(agent_id, folder, slug)], placed [(agent_id, capability)]) as the
-        store holds them for this node, reporting the node seen; None where the
-        store cannot be read, said once."""
+        """(agents [(agent_id, folder, slug)], placed [(agent_id, capability,
+        mode)]) as the store holds them for this node, reporting the node seen;
+        None where the store cannot be read, said once."""
         try:
             conn = self._connect()
         except Exception as exc:
@@ -11614,7 +11665,7 @@ class _NodeManager:
                     "LEFT JOIN capabilities_agents a ON a.id = l.agent_id "
                     "WHERE l.node = %s ORDER BY l.agent_id", (self.here,)).fetchall()
                 placed = conn.execute(
-                    "SELECT p.agent_id, p.capability FROM capabilities_policy p "
+                    "SELECT p.agent_id, p.capability, p.mode FROM capabilities_policy p "
                     "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
                     "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
                     "ORDER BY p.agent_id, p.capability", (self.here,)).fetchall()
@@ -11652,7 +11703,7 @@ class _NodeManager:
         self.folders = folders
         jobs: dict[str, dict] = {}
         unrun: dict[tuple[str, str], tuple[str, str]] = {}
-        for agent_id, capability in placed:
+        for agent_id, capability, recorded in placed:
             if agent_id not in folders:
                 unrun[(agent_id, capability)] = (
                     "agent_folder_unbound",
@@ -11661,9 +11712,14 @@ class _NodeManager:
             key = f"service:{agent_id}/{capability}"
             _command, why = _node_service_command(capability)
             code = "service_not_runnable"
-            machine = why is not None and bool(_node_machine_command(capability))
+            # The placement's mode decides which service serves it: the node's
+            # machine service (shared) or the agent's own.
+            machine = _placement_runs_machine(capability, recorded)
             if machine:
                 why = None
+            elif _placement_mode(capability, recorded) == "shared" and capability in _installed():
+                why = (f"it is placed to be served by {capability}'s machine service "
+                       "(shared), and its service declares no machine command")
             if not machine and self.only is not None and capability not in self.only:
                 # Placed here and run by something else on this node, such as a
                 # container of its own, which keeps its own row.
@@ -11777,7 +11833,7 @@ class _NodeManager:
         agents, placed = answer
         self.moved = False
         self.agents = [row[0] for row in agents]
-        self.placed = list(placed)
+        self.placed = [(agent_id, capability) for agent_id, capability, _mode in placed]
         desired = self.desired(agents, placed)
         self.record_unrun(self.unrun_now)
         present = self.written()
@@ -12377,21 +12433,11 @@ def _node_install_placements(path: Path, agents: list, here: str,
     where the node manager would run them - an exclusive one placed nowhere, a
     shared one not on this node - each placed on this node where `apply`.
     Answers ([{service, node, placement}], error or None); placing stops at
-    the first that fails."""
-    me = [sys.executable, str(Path(__file__).resolve())]
-
+    the first that fails. An old agent ran a service of its own folder, so one
+    that declares a project command is placed to run as its own (mode own), as
+    it ran."""
     def run(*argv: str) -> tuple[dict | None, str]:
-        try:
-            proc = subprocess.run([*me, *argv], cwd=path, env=_snapshot_env(), text=True,
-                                  capture_output=True, timeout=120)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            return None, str(exc)
-        try:
-            answer = json.loads(proc.stdout) if proc.returncode == 0 else None
-        except ValueError:
-            answer = None
-        return (answer if isinstance(answer, dict) else None,
-                (proc.stderr or proc.stdout).strip()[-1000:] or f"exit {proc.returncode}")
+        return _node_install_manager(path, *argv)
 
     placing: list[dict] = []
     seen: set[str] = set()
@@ -12408,12 +12454,86 @@ def _node_install_placements(path: Path, agents: list, here: str,
         mode = report.get("placement") or "exclusive"
         if (bool(on) if mode == "exclusive" else here in on):
             continue
+        serving = "own" if _node_service_command(name)[1] is None else None
         if apply:
-            placed, said = run("place", name, "--node", here)
+            placed, said = run("place", name, "--node", here,
+                               *(["--mode", serving] if serving else []))
             if placed is None:
                 return placing, f"could not place {name}'s service on {here}: {said}"
         placing.append({"service": name, "node": here, "placement": mode})
     return placing, None
+
+
+def _node_install_manager(path: Path, *argv: str) -> tuple[dict | None, str]:
+    """This manager's answer to `argv` run in `path`, or None and what it said."""
+    me = [sys.executable, str(Path(__file__).resolve())]
+    try:
+        proc = subprocess.run([*me, *argv], cwd=path, env=_snapshot_env(), text=True,
+                              capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, str(exc)
+    try:
+        answer = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except ValueError:
+        answer = None
+    return (answer if isinstance(answer, dict) else None,
+            (proc.stderr or proc.stdout).strip()[-1000:] or f"exit {proc.returncode}")
+
+
+def _machine_list_ids(name: str) -> list[str] | None:
+    """The ids of the projects on `name`'s machine service list on this
+    machine (`service.machine.projects`, which its `service join` and `leave`
+    write), or None where it keeps none or it cannot be read."""
+    machine = (_installed_service(name) or {}).get("machine")
+    listing = machine.get("projects") if isinstance(machine, dict) else None
+    if not isinstance(listing, str) or not listing.startswith("$XDG_CONFIG_HOME/"):
+        return None
+    path = _CONFIG_HOME / listing[len("$XDG_CONFIG_HOME/"):]
+    try:
+        if path.suffix == ".toml":
+            import tomllib
+            body = tomllib.loads(path.read_text())
+        elif path.suffix == ".json":
+            body = json.loads(path.read_text())
+        else:
+            return None
+    except (OSError, ValueError):
+        return None
+    projects = body.get("projects") if isinstance(body, dict) else None
+    return sorted(str(k) for k in projects) if isinstance(projects, dict) else None
+
+
+def _node_install_joined(folders: list[tuple[str, Path]], placed: list[tuple], here: str,
+                         apply: bool) -> tuple[list[dict], set[str]]:
+    """Every agent the node manager will serve that is on a machine service's
+    list here - joined with `<name> service join` before joining wrote a
+    placement - placed on this node to be served by that machine service
+    (mode shared) where it is not already, each where `apply`. Answers
+    ([{service, agent_id, folder, node, mode, error?}], the services one
+    failed for); an agent placed so already is left out, so running it again
+    changes nothing."""
+    served = dict(folders)
+    modes = {(agent_id, capability): _placement_mode(capability, recorded)
+             for agent_id, capability, recorded in placed}
+    out: list[dict] = []
+    failed: set[str] = set()
+    for name in sorted(_installed()):
+        if not _service_machine_argv(name) or _machine_state(name) == "quarantined":
+            continue
+        for agent_id in _machine_list_ids(name) or []:
+            path = served.get(agent_id)
+            if path is None or modes.get((agent_id, name)) == "shared":
+                continue
+            entry = {"service": name, "agent_id": agent_id, "folder": str(path),
+                     "node": here, "mode": "shared"}
+            if apply:
+                answer, said = _node_install_manager(path, "place", name, "--node", here,
+                                                     "--mode", "shared")
+                if answer is None:
+                    entry["error"] = said
+                    failed.add(name)
+            out.append(entry)
+    return out, failed
 
 
 def _node_install(args: list[str]) -> None:
@@ -12437,12 +12557,12 @@ def _node_install(args: list[str]) -> None:
         return agent_id, conn.execute(
             "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
             "ORDER BY agent_id", (here,)).fetchall(), conn.execute(
-            "SELECT p.agent_id, p.capability FROM capabilities_policy p "
+            "SELECT p.agent_id, p.capability, p.mode FROM capabilities_policy p "
             "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
             "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
             "ORDER BY p.agent_id, p.capability", (here,)).fetchall()
 
-    (agent_id, links, placed), setting = _kernel_run(root, read)
+    (agent_id, links, placed), setting = _kernel_run(root, read, placement=True)
     if agent_id not in {linked for linked, _folder in links}:
         _die(6, "agent_not_on_node",
              f"agent {agent_id} does not live on node {here}, so a node manager here "
@@ -12497,13 +12617,21 @@ def _node_install(args: list[str]) -> None:
         if "error" in entry:
             failed.append(entry)
         handovers.append(entry)
+    # An agent on a machine service's list here is placed to be served by
+    # that machine service, before its old machine agent is handed over.
+    joined, joined_failed = _node_install_joined(folders, placed, here, apply)
+    placed = [row for row in placed
+              if (row[0], row[1]) not in {(e["agent_id"], e["service"]) for e in joined}]
+    placed += [(e["agent_id"], e["service"], "shared") for e in joined if "error" not in e]
     # The machine services the node manager will run here, as `node run`
     # chooses them, hand their old machine agents (`deployment machine sync`'s)
-    # over the same way, once for the machine.
+    # over the same way, once for the machine; not one an agent on its list
+    # could not be placed for, which its old agent goes on serving.
     served = {linked for linked, _path in folders}
-    machine = sorted({capability for linked, capability in placed if linked in served
-                      and _node_service_command(capability)[1] is not None
-                      and _node_machine_command(capability)
+    machine = sorted({capability for linked, capability, recorded in placed
+                      if linked in served
+                      and _placement_runs_machine(capability, recorded)
+                      and capability not in joined_failed
                       and _machine_state(capability) != "quarantined"})
     machine_handover: dict | None = None
     if machine and deployment:
@@ -12537,6 +12665,8 @@ def _node_install(args: list[str]) -> None:
               "store": _kernel_store_report(setting)}
     if machine_handover is not None:
         result["machine_handover"] = machine_handover
+    if joined:
+        result["joined" if apply else "would_join"] = joined
     if not apply:
         result["next"] = "capabilities node install --apply"
         _emit(result)
@@ -12561,6 +12691,13 @@ def _node_install(args: list[str]) -> None:
                       + ", ".join(e["folder"] for e in failed) + " were not all handed over",
                       "run `deployment handover` in that folder; until it hands an agent "
                       "over, the node manager's job for that service waits for it", result)
+    if joined_failed:
+        _service_fail("handover_incomplete",
+                      "the node manager is loaded, and the agents on the machine lists of "
+                      + ", ".join(sorted(joined_failed)) + " were not all placed here, so "
+                      "their old machine agents were not handed over",
+                      "settle the error named for each under joined and run `capabilities "
+                      "node install --apply` again", result)
     if machine_handover is not None and "error" in machine_handover:
         _service_fail("handover_incomplete",
                       "the node manager is loaded, and the machine agents of "
@@ -12939,6 +13076,99 @@ class _SuperviseLease(_SuperviseStore):
         return self.mine_until is not None and time.monotonic() < self.mine_until
 
 
+class _SuperviseNodeLease(_SuperviseStore):
+    """Which service serves one agent's capability on this node, in the
+    store's `capabilities_service_leases`: a row per (agent, capability, node)
+    naming the mode of the service that holds it - the agent's own service, or
+    the node's one machine service of the capability - and when that hold
+    expires. The holder renews it every reconcile; a service of the other mode
+    takes it only once it has expired or been released, so no agent is served
+    twice on a node. It is apart from the exclusive service's lease
+    (`_SuperviseLease`), which keeps a service on one node at a time.
+
+    With no database resolvable for the project, or no id, no lease can be
+    taken and it answers `unavailable`, so the service runs as the gate says."""
+
+    def __init__(self, root: Path, project: str | None, node: str, mode: str, ttl: int):
+        super().__init__(root)
+        self.project, self.node, self.mode, self.ttl = project, node, mode, ttl
+        self.mine_until: float | None = None
+        self.maybe_held = True
+
+    def _migrate(self, conn, db) -> None:
+        _placement_migrate(conn, db)
+
+    @staticmethod
+    def _holding(row, mode: str) -> dict:
+        if row is None:
+            return {"state": "free", "mode": None}
+        holder, acquired, renewed, expires, live = row
+        return {"state": ("held" if holder == mode else
+                          "held_elsewhere" if live else "free"),
+                "mode": holder, "acquired_at": _supervise_iso(acquired),
+                "renewed_at": _supervise_iso(renewed),
+                "expires_at": _supervise_iso(expires), "live": bool(live)}
+
+    def acquire(self, capability: str) -> dict:
+        """Take or renew this mode's hold, unless the other mode's is live."""
+        if not self.project:
+            return {"state": "unavailable", "error": {
+                "code": "project_undeclared", "message": "the project declares no id"}}
+
+        def work(conn):
+            row = conn.execute(
+                "INSERT INTO capabilities_service_leases AS l "
+                "(project_id, capability, node, mode, expires_at) "
+                "VALUES (%s, %s, %s, %s, now() + %s * interval '1 second') "
+                "ON CONFLICT (project_id, capability, node) DO UPDATE "
+                "SET mode = EXCLUDED.mode, expires_at = EXCLUDED.expires_at, "
+                "renewed_at = now(), acquired_at = CASE WHEN l.mode = EXCLUDED.mode "
+                "THEN l.acquired_at ELSE now() END "
+                "WHERE l.mode = EXCLUDED.mode OR l.expires_at <= now() "
+                "RETURNING mode, acquired_at, renewed_at, expires_at, true",
+                (self.project, capability, self.node, self.mode, self.ttl)).fetchone()
+            if row is None:
+                row = conn.execute(
+                    "SELECT mode, acquired_at, renewed_at, expires_at, expires_at > now() "
+                    "FROM capabilities_service_leases WHERE project_id = %s "
+                    "AND capability = %s AND node = %s",
+                    (self.project, capability, self.node)).fetchone()
+            return self._holding(row, self.mode)
+        found = self._run(work)
+        if found.get("state") == "held":
+            self.mine_until = time.monotonic() + self.ttl
+            self.maybe_held = True
+        elif found.get("state") == "unreachable":
+            self.maybe_held = True
+        else:
+            self.mine_until = None
+            self.maybe_held = found.get("state") not in ("held_elsewhere", "free")
+        return found
+
+    def release(self, capability: str) -> dict:
+        """Give up this mode's hold, so the other mode's service may take it."""
+        if not self.project:
+            return {"state": "unavailable"}
+
+        def work(conn):
+            gone = conn.execute(
+                "DELETE FROM capabilities_service_leases WHERE project_id = %s "
+                "AND capability = %s AND node = %s AND mode = %s",
+                (self.project, capability, self.node, self.mode)).rowcount
+            return {"state": "free", "released": bool(gone)}
+        found = self._run(work)
+        if found.get("state") != "unreachable":
+            self.mine_until = None
+            self.maybe_held = False
+        return found
+
+    def release_if_held(self, capability: str) -> dict:
+        """`release`, unless this mode is known not to hold the lease."""
+        if not self.maybe_held:
+            return {"state": "free", "released": False}
+        return self.release(capability)
+
+
 class _SuperviseInstance(_SuperviseStore):
     """This node's row of what it runs of one service, in the store's
     `capabilities_service_instances`, which the contract's ledger owns:
@@ -13175,6 +13405,11 @@ class _Supervisor:
         project_id = _folder_agent_id(root)
         self.lease = _SuperviseLease(root, project_id or f"path:{root}", self.node,
                                      every * SUPERVISE_LEASE_TTL_RECONCILES)
+        # The agent's lease on this node, which the machine service of the
+        # capability holds instead while it serves the agent here (yielded).
+        self.node_lease = _SuperviseNodeLease(root, project_id, self.node, "own",
+                                              every * SUPERVISE_LEASE_TTL_RECONCILES)
+        self.yielded: dict | None = None
         self.records = None
         self.child: subprocess.Popen | None = None
         self.child_started: float | None = None
@@ -13485,6 +13720,9 @@ class _Supervisor:
                          "in the store")
             self.instance_failing = "project_undeclared"
             return
+        if self.yielded is not None:
+            # The service serving the agent here keeps its row and its lines.
+            return
         row = self.instance_row()
         found = (self.instance.drop(self.name) if row is None
                  else self.instance.put(self.name, row))
@@ -13565,9 +13803,30 @@ class _Supervisor:
             lease = self.lease.release_if_held(self.name, self.lease_state)
             self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
             self.converge()
+            self.node_lease.release_if_held(self.name)
             self.write_instance()
             self.save()
             return
+        if placed:
+            # One service at a time serves the agent on this node: while the
+            # node's machine service of it holds the agent's lease here, this
+            # one runs nothing and leaves that service's leases and row alone.
+            hold = self.node_lease.acquire(self.name)
+            if hold.get("state") == "held_elsewhere":
+                self.yielded = hold
+                self.placed, self.want = placed, False
+                self.held_down = False
+                self.reason = (f"{self.name} is served on {self.node} by its machine service "
+                               f"({hold.get('mode')}), which holds the agent's lease here until "
+                               f"{hold.get('expires_at')}; checking again every reconcile")
+                self.say_once(("yielded", hold.get("mode")), self.reason)
+                self.converge()
+                # Both run on this node, so the exclusive lease names this node
+                # for either: it is the serving one's now.
+                self.lease.mine_until, self.lease.maybe_held = None, False
+                self.save()
+                return
+        self.yielded = None
         shared = placed and _supervise_placement(self.name) == "shared"
         if shared:
             # A shared service runs on every node it is placed on, so it takes
@@ -13625,6 +13884,7 @@ class _Supervisor:
             self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
             if self.lease_state.get("released"):
                 self.say(f"released the lease for {self.name}")
+            self.node_lease.release_if_held(self.name)
         self.probe_if_due()
         self.write_instance()
         self.save()
@@ -13658,8 +13918,13 @@ class _Supervisor:
         if self.lease.mine_until is not None:
             self.lease_state = self.lease.release(self.name)
         self.lease.close()
+        if self.yielded is None:
+            self.node_lease.release_if_held(self.name)
+        self.node_lease.close()
         if self.instance is not None:
-            self.instance.drop(self.name)
+            # The row of a service another one serves here is that one's.
+            if self.yielded is None:
+                self.instance.drop(self.name)
             self.instance.close()
         self.save()
 
@@ -13713,10 +13978,11 @@ def _supervise(root: Path, name: str, command: list[str], restart: str, every: i
 
 
 # A service that runs once per machine for every project that joins it (its
-# descriptor declares `service.machine` and no project command of its own) is
-# supervised once per node: one process, `node supervise <name> --machine`,
-# started by the node manager when any agent on this node places the service
-# here. It takes each placed agent's lease, puts each agent it holds on the
+# descriptor declares `service.machine`) is supervised once per node for the
+# agents that place it here in mode shared: one process, `node supervise
+# <name> --machine`, started by the node manager when any agent on this node
+# places the service so. It takes each such agent's service lease on this node
+# and, where the service is exclusive, its lease, puts each agent it holds on the
 # service's own list through the service's `service join` verb and takes it off
 # with `service leave`, runs the service's machine command while any agent is
 # on it, and writes one instance row per agent from what the service says of
@@ -13746,28 +14012,27 @@ def _supervise_machine_command(name: str) -> tuple[list[str], list[str]]:
 
 
 class _SupervisePlacement(_SuperviseStore):
-    """The agents that live on this node and place one service here, as the
-    store holds them, read the way the node manager reads them."""
+    """The agents that live on this node and place one service here to be
+    served by its machine service (mode shared), as the store holds them,
+    read the way the node manager reads them."""
 
     def __init__(self, root: Path, node: str):
         super().__init__(root)
         self.node = node
 
     def _migrate(self, conn, db) -> None:
-        store = _store_module()
-        major, minor = store.STORE_TABLES_VERSION
-        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
-                   major=major, minor=minor)
+        _placement_migrate(conn, db)
 
     def placed(self, capability: str) -> dict:
         def work(conn):
             rows = conn.execute(
-                "SELECT l.agent_id, l.folder FROM capabilities_policy p "
+                "SELECT l.agent_id, l.folder, p.mode FROM capabilities_policy p "
                 "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
                 "AND l.node = p.node WHERE p.node = %s AND p.capability = %s "
                 "AND p.enabled AND p.service ORDER BY l.agent_id",
                 (self.node, capability)).fetchall()
-            return {"agents": [(agent_id, folder) for agent_id, folder in rows]}
+            return {"agents": [(agent_id, folder) for agent_id, folder, mode in rows
+                               if _placement_mode(capability, mode) == "shared"]}
         return self._run(work)
 
 
@@ -13796,6 +14061,10 @@ class _MachineSupervisor(_Supervisor):
         self.list_failing: dict[str, str] = {}
         self.foreign: dict | None = None
         self.served: dict[str, dict] = {}
+        # Each agent's lease on this node, and the agents whose own service
+        # holds it instead, which this process leaves to that service.
+        self.node_leases: dict[str, _SuperviseNodeLease] = {}
+        self.yielded: dict[str, dict] = {}
 
     def say(self, message: str) -> None:
         line = f"[capabilities supervise {self.name} --machine] {message}"
@@ -13868,8 +14137,11 @@ class _MachineSupervisor(_Supervisor):
         executable = shutil.which(self.name)
         if folder is None or not executable:
             return False
+        # The list follows the leases this process holds; the placement is a
+        # person's, so this join or leave writes none.
         rc, out, err = _run_script(Path(executable), ["service", verb], cwd=folder,
-                                   env=_snapshot_env(), timeout=120)
+                                   env={**_snapshot_env(), PLACEMENT_LIST_ONLY_ENV: "1"},
+                                   timeout=120)
         said = _supervise_refusal_of(err.splitlines())
         failing = None if rc == 0 else (said.get("message") or (err or out).strip()[-300:]
                                         or f"exit {rc}")
@@ -13924,12 +14196,23 @@ class _MachineSupervisor(_Supervisor):
             return
         self.foreign = None
         admitted = set()
+        yielded = {}
         for agent_id in sorted(set(self.agents) | set(self.leases)):
             lease = self.leases.get(agent_id)
             if agent_id not in self.agents:
                 if lease is not None:
                     self.lease_states[agent_id] = lease.release_if_held(
                         self.name, self.lease_states.get(agent_id, {}))
+                continue
+            # One service at a time serves an agent on this node: while its
+            # own service holds the agent's lease here, this one leaves it be.
+            hold = self.node_lease_of(agent_id).acquire(self.name)
+            if hold.get("state") == "held_elsewhere":
+                yielded[agent_id] = hold
+                if lease is not None:
+                    # Both run on this node, so the exclusive lease names
+                    # this node for either: it is the serving one's now.
+                    lease.mine_until, lease.maybe_held = None, False
                 continue
             if not self.exclusive:
                 admitted.add(agent_id)
@@ -13953,6 +14236,18 @@ class _MachineSupervisor(_Supervisor):
         for agent_id in sorted(admitted - set(self.joined)):
             if self.list_verb("join", agent_id):
                 self.joined[agent_id] = str(self.agents[agent_id])
+        # An agent it serves no longer gives up its lease here once it is off
+        # the list, so its own service may take it.
+        for agent_id in sorted(set(self.node_leases) - admitted - set(yielded)
+                               - set(self.joined)):
+            self.node_leases[agent_id].release_if_held(self.name)
+            if agent_id not in self.agents:
+                self.node_leases.pop(agent_id).close()
+        for agent_id, hold in sorted(yielded.items()):
+            if agent_id not in self.yielded:
+                self.say(f"{agent_id} is served here by its own {self.name} service, which "
+                         f"holds its lease until {hold.get('expires_at')}; leaves it be")
+        self.yielded = yielded
         self.admitted = admitted
         want = bool(admitted) and self.refusal is None
         if not want:
@@ -13970,6 +14265,14 @@ class _MachineSupervisor(_Supervisor):
                        if isinstance(row, dict)} if self.running() else {}
         self.write_instance()
         self.save()
+
+    def node_lease_of(self, agent_id: str) -> "_SuperviseNodeLease":
+        lease = self.node_leases.get(agent_id)
+        if lease is None:
+            lease = self.node_leases[agent_id] = _SuperviseNodeLease(
+                self.root, agent_id, self.node, "shared",
+                self.every * SUPERVISE_LEASE_TTL_RECONCILES)
+        return lease
 
     def record_error(self) -> None:
         """Put the failure on the lease of every agent this node holds."""
@@ -14025,6 +14328,9 @@ class _MachineSupervisor(_Supervisor):
         # The one process's lines go to every agent that places it here.
         lines = self.log.take()
         for agent_id in sorted(set(self.agents) | set(self.instances)):
+            if agent_id in self.yielded:
+                # Its own service serves it here and keeps its row and lines.
+                continue
             instance = self.instances.get(agent_id)
             if instance is None:
                 instance = self.instances[agent_id] = _SuperviseInstance(
@@ -14084,6 +14390,10 @@ class _MachineSupervisor(_Supervisor):
         for agent_id, lease in self.leases.items():
             if lease.mine_until is not None:
                 self.lease_states[agent_id] = lease.release(self.name)
+            lease.close()
+        for agent_id, lease in self.node_leases.items():
+            if agent_id not in self.yielded and agent_id not in self.joined:
+                lease.release_if_held(self.name)
             lease.close()
         self.agents = {}
         self.write_instance()
@@ -14981,18 +15291,18 @@ def _node_update_rollback(before: dict, pythons: dict, keep: Path) -> list[str]:
 
 def _node_update_placed(root: Path, here: str) -> tuple[dict[str, Path], list[tuple]]:
     """(the folders here bound to the agents the store links to this node,
-    the (agent, capability) of each service those agents place here)."""
+    the (agent, capability, mode) of each service those agents place here)."""
     def read(conn, _agent_id):
         return (conn.execute("SELECT agent_id, folder FROM capabilities_agent_nodes "
                              "WHERE node = %s ORDER BY agent_id", (here,)).fetchall(),
-                conn.execute("SELECT agent_id, capability FROM capabilities_policy "
+                conn.execute("SELECT agent_id, capability, mode FROM capabilities_policy "
                              "WHERE node = %s AND enabled AND service "
                              "ORDER BY agent_id, capability", (here,)).fetchall())
-    (linked, placed), _setting = _kernel_run(root, read)
+    (linked, placed), _setting = _kernel_run(root, read, placement=True)
     own = _folder_agent_id(root)
     folders = {agent_id: path for agent_id, folder in linked
                if (path := _node_agent_folder(root, own, agent_id, folder)) is not None}
-    return folders, [(a, c) for a, c in placed if a in folders]
+    return folders, [(a, c, m) for a, c, m in placed if a in folders]
 
 
 def _node_update_doctors(root: Path, folders: dict[str, Path],
@@ -15003,9 +15313,8 @@ def _node_update_doctors(root: Path, folders: dict[str, Path],
     env = {k: v for k, v in os.environ.items()
            if k not in ("CLAUDE_PROJECT_DIR", PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV)}
     answers, machines = [], set()
-    for agent_id, capability in placed:
-        _command, why = _node_service_command(capability)
-        if why is not None and _node_machine_command(capability):
+    for agent_id, capability, recorded in placed:
+        if _placement_runs_machine(capability, recorded):
             if capability in machines:
                 continue
             machines.add(capability)
@@ -15071,9 +15380,8 @@ def _node_update_run(root: Path, here: str, run_id: str) -> dict:
         shutil.rmtree(keep, ignore_errors=True)
         if moved:
             asked = set()
-            for agent_id, capability in placed:
-                machine = (_node_service_command(capability)[1] is not None
-                           and bool(_node_machine_command(capability)))
+            for agent_id, capability, recorded in placed:
+                machine = _placement_runs_machine(capability, recorded)
                 if machine and capability in asked:
                     continue
                 asked.add(capability)
@@ -16467,13 +16775,145 @@ def _service_placement(service: dict) -> str:
     return "shared" if service.get("placement") == "shared" else "exclusive"
 
 
+# Which service serves an agent's placed service on a node, the placement's
+# mode: `shared`, the node's one machine service of the capability, serving
+# every agent there that places it so, or `own`, the agent's own service.
+PLACEMENT_MODES = ("shared", "own")
+# A join or leave the node manager's machine supervisor runs, with this set to
+# 1, puts the agent on the service's list or takes it off and changes no
+# placement: only a person's join or leave writes one.
+PLACEMENT_LIST_ONLY_ENV = "CAPABILITIES_SERVICE_LIST_ONLY"
+# The manager's own steps in the contract's ledger, after the library's: they
+# extend its tables under its owner, so they are named apart from its numbered
+# steps, and the manager applies them where it reads or writes what they make.
+# Never edit one once released; add a step.
+PLACEMENT_STEPS = [
+    ("manager-0001-placement-mode",
+     "ALTER TABLE capabilities_policy"
+     " ADD COLUMN mode text CHECK (mode IN ('shared', 'own'));"
+     " ALTER TABLE capabilities_policy ADD CONSTRAINT capabilities_policy_mode"
+     "  CHECK (mode IS NULL OR (agent_id IS NOT NULL AND node IS NOT NULL));"
+     " COMMENT ON COLUMN capabilities_policy.mode IS"
+     " 'Which service serves the agent''s service of this capability on the node the row"
+     " names: shared, the node''s one machine service of the capability, or own, the"
+     " agent''s own service. Only an agent''s row naming a node carries one. Null where no"
+     " writer recorded one: the manager serves it as before modes, by the agent''s own"
+     " service where the capability declares a project command, else by the machine"
+     " service.'"),
+    ("manager-0002-service-leases",
+     "CREATE TABLE capabilities_service_leases ("
+     " project_id text NOT NULL CHECK (project_id <> ''),"
+     " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9_-]*$'),"
+     " node text NOT NULL CHECK (node <> ''),"
+     " mode text NOT NULL CHECK (mode IN ('shared', 'own')),"
+     " acquired_at timestamptz NOT NULL DEFAULT now(),"
+     " renewed_at timestamptz NOT NULL DEFAULT now(),"
+     " expires_at timestamptz NOT NULL,"
+     " PRIMARY KEY (project_id, capability, node));"
+     " COMMENT ON TABLE capabilities_service_leases IS"
+     " 'Which service serves an agent''s capability on a node: one row per agent,"
+     " capability and node, taken and renewed every reconcile by the service that serves"
+     " the agent there, so a service of the other mode on that node does not serve it"
+     " while the row is live. Apart from deployment_service_leases, which keeps an"
+     " exclusive service on one node at a time.';"
+     " COMMENT ON COLUMN capabilities_service_leases.mode IS"
+     " 'The service holding it: own, the agent''s own service on the node, or shared, the"
+     " node''s one machine service of the capability.';"
+     " COMMENT ON COLUMN capabilities_service_leases.expires_at IS"
+     " 'When the hold runs out unless renewed; past it the row holds nothing, and a"
+     " service of the other mode may take it.'"),
+]
+
+
+def _placement_migrate(conn, db=None) -> None:
+    """The contract's tables and the manager's own steps after them."""
+    db = db or _db_module()
+    store = _store_module()
+    major, minor = store.STORE_TABLES_VERSION
+    db.migrate(conn, store.STORE_OWNER, store.record_table_steps() + PLACEMENT_STEPS,
+               major=major, minor=minor)
+
+
+def _service_machine_argv(name: str) -> list[str]:
+    """The machine command `name`'s installed service declares
+    (`service.machine.command`), whether or not it declares a project command
+    too, else []."""
+    service = _installed_service(name) if name in _installed() else None
+    machine = service.get("machine") if isinstance(service, dict) else None
+    command = machine.get("command") if isinstance(machine, dict) else None
+    return (list(command) if isinstance(command, list) and command
+            and all(isinstance(v, str) and v for v in command) else [])
+
+
+def _placement_mode_default(name: str) -> str:
+    """The mode a new placement of `name` takes: shared where its installed
+    service declares a machine command, else own."""
+    return "shared" if _service_machine_argv(name) else "own"
+
+
+def _placement_mode(name: str, recorded) -> str:
+    """The mode a placement row of `name` is served in: the one it records,
+    else as before modes - the agent's own service where the capability
+    declares a project command, else the machine service where it declares
+    one, else its own."""
+    if recorded in PLACEMENT_MODES:
+        return recorded
+    return "shared" if _node_machine_command(name) else "own"
+
+
+def _placement_runs_machine(name: str, recorded) -> bool:
+    """Whether a placement row of `name` is served by the node's machine
+    service: its mode is shared and the installed service declares one."""
+    return _placement_mode(name, recorded) == "shared" and bool(_service_machine_argv(name))
+
+
+def _placement_mode_check(name: str, mode: str | None) -> None:
+    """Refuse a mode `name` cannot be served in: shared where its installed
+    service declares no machine command."""
+    if mode is None:
+        return
+    if mode not in PLACEMENT_MODES:
+        _die(6, "input", f"--mode takes one of {', '.join(PLACEMENT_MODES)}, not {mode!r}")
+    if mode == "shared" and not _service_machine_argv(name):
+        _die(6, "no_machine_service",
+             f"{name}'s service declares no machine command (service.machine.command), so "
+             "no machine service of it can serve an agent: it runs only as each agent's "
+             "own service",
+             f"place it with --mode own, or without --mode: `capabilities place {name} "
+             "--node <node>`")
+
+
+def _placement_row(root: Path, name: str, node: str) -> tuple | None:
+    """(service, recorded mode) of this project's row of `name` naming `node`,
+    or None where it has none; the manager's steps applied first."""
+    def read(conn, agent_id):
+        return conn.execute(
+            "SELECT service, mode FROM capabilities_policy WHERE agent_id = %s "
+            "AND capability = %s AND node = %s", (agent_id, name, node)).fetchone()
+    found, _setting = _kernel_run(root, read, placement=True)
+    return tuple(found) if found is not None else None
+
+
+def _placement_mode_set(root: Path, name: str, node: str, mode: str) -> bool:
+    """Record `mode` on this project's row of `name` naming `node`; whether it
+    changed."""
+    def write(conn, agent_id):
+        return conn.execute(
+            "UPDATE capabilities_policy SET mode = %s, updated_at = now() "
+            "WHERE agent_id = %s AND capability = %s AND node = %s "
+            "AND mode IS DISTINCT FROM %s", (mode, agent_id, name, node, mode)).rowcount > 0
+    changed, _setting = _kernel_run(root, write, placement=True)
+    return bool(changed)
+
+
 def _place_service(name: str, placed: bool, node: str | None,
-                   every: bool = False) -> None:
+                   every: bool = False, serving: str | None = None) -> None:
     """Place this project's bundled service of `name` on a node, or take it off,
     leaving where the capability is usable as it is. An exclusive service
     placed on one node is taken off every other in the same write. `every`
     places a shared service on every node of the agent; `place` with neither
-    reports where the service is placed beside the node holding its lease."""
+    reports where the service is placed beside the node holding its lease.
+    `serving` is the placement's mode (`--mode`)."""
     root = _require_project()
     # The report writes nothing, so it scaffolds no envelope either.
     if node is not None or every or not placed:
@@ -16483,6 +16923,9 @@ def _place_service(name: str, placed: bool, node: str | None,
         _die(6, "input", "place takes --node <node> or --all, not both")
     if node is None and not (placed or every):
         _die(6, "input", f"{verb} needs --node <node>")
+    if node is None and not every and serving is not None:
+        _die(6, "input", "--mode places: `place <name>` alone reports and takes none",
+             f"capabilities place {name} --node <node> --mode {serving}")
     if name not in _installed():
         _die(3, "not_installed", f"{name} is not installed",
              f"run `capabilities install {name}`")
@@ -16495,12 +16938,16 @@ def _place_service(name: str, placed: bool, node: str | None,
              f"{name}'s service is exclusive: it runs on one node at a time, so it "
              "is placed on one node, not on every node",
              f"move it with `capabilities place {name} --node <node>`")
+    if placed:
+        _placement_mode_check(name, serving)
+    elif serving is not None and serving not in PLACEMENT_MODES:
+        _die(6, "input", f"--mode takes one of {', '.join(PLACEMENT_MODES)}, not {serving!r}")
     if node is None:
         adapter = _records_for(root)
         try:
             _require_node_store(root, adapter)
             if every:
-                _emit(_place_everywhere(name, root, adapter))
+                _emit(_place_everywhere(name, root, adapter, serving))
             else:
                 report = _placement_report(name, root, adapter, mode)
                 beside = _nodes_beside_a_server(root)
@@ -16523,15 +16970,18 @@ def _place_service(name: str, placed: bool, node: str | None,
         finally:
             adapter.close()
         return
-    result = _service_place(name, placed, node)
+    result = _service_place(name, placed, node, serving)
     _announce_placement(root)
     _emit(result)
 
 
-def _service_place(name: str, placed: bool, node: str) -> dict:
+def _service_place(name: str, placed: bool, node: str, serving: str | None = None) -> dict:
     """Place this project's service of `name` on `node`, or take it off, and
     answer what `place --node` answers. An exclusive service placed on one node
-    is taken off every other in the same write."""
+    is taken off every other in the same write. The placement records its mode,
+    `serving`: without one, a service already placed on the node keeps the mode
+    it is served in and a new placement takes the default. Unplacing with a
+    mode takes the service off only where it is placed in that mode."""
     root = _require_project()
     _ensure_envelope(root)
     verb = "place" if placed else "unplace"
@@ -16542,12 +16992,27 @@ def _service_place(name: str, placed: bool, node: str) -> dict:
     if service is None:
         _die(6, "no_service", f"{name} bundles no service, so there is nothing to {verb}")
     mode = _service_placement(service)
+    if placed:
+        _placement_mode_check(name, serving)
     adapter = _records_for(root)
+    note = None
     try:
         node = _gate_node(node, root, adapter)
         _stamp_policy(adapter, root, "project")
-        answer = adapter.place(name, node, placed, exclusive=mode == "exclusive",
-                               actor="capabilities")
+        row = _placement_row(root, name, node)
+        held = _placement_mode(name, row[1]) if row is not None and row[0] else None
+        if placed:
+            serving = serving or held or _placement_mode_default(name)
+        if not placed and serving is not None and held is not None and held != serving:
+            # Placed here in the other mode: that placement is not this one's to take.
+            answer = {"node": node, "changed": False, "unplaced": []}
+            note = (f"{name}'s service is placed on {node} as {held}, not {serving}, so it "
+                    "stays placed")
+        else:
+            answer = adapter.place(name, node, placed, exclusive=mode == "exclusive",
+                                   actor="capabilities")
+        if placed and _placement_mode_set(root, name, answer["node"], serving):
+            answer["changed"] = True
         on = adapter.placed_nodes(name)
         gate_source = _gate_source(adapter, root, "project")
         loopback = _loopback_warning(name, [node], adapter) if placed else None
@@ -16557,28 +17022,37 @@ def _service_place(name: str, placed: bool, node: str) -> dict:
         adapter.close()
     result: dict = {("placed" if placed else "unplaced"): name, "node": node,
                     "placement": mode, "changed": answer["changed"],
-                    "placed_on": on, "gate": gate_source}
+                    "placed_on": on, "gate": gate_source,
+                    "mode": serving if placed else (held if note else serving or held)}
     if answer["unplaced"]:
         result["unplaced_from"] = answer["unplaced"]
     if answer.get("enabled_on_node"):
         result["enabled_on_node"] = True
+    if note:
+        result["note"] = note
     if loopback:
         result["warning"] = loopback
         _warn(loopback)
     return result
 
 
-def _place_everywhere(name: str, root: Path, adapter) -> dict:
+def _place_everywhere(name: str, root: Path, adapter, serving: str | None = None) -> dict:
     """Place a shared service on every node of the agent. Every node is checked
     before anything is written, and one that would refuse refuses the whole
     command; the writes are then one per node, so a write that fails part-way
-    names the nodes it placed, and running it again finishes the job."""
+    names the nodes it placed, and running it again finishes the job. Each
+    node's placement records `serving`, or without it keeps the mode a service
+    already placed there is served in, a new one taking the default."""
     store = _store_module()
     actor = "capabilities"
     _stamp_policy(adapter, root, "project")
 
     def survey(conn, agent_id):
         nodes = [row["node"] for row in _node_rows(conn, agent_id)]
+        modes = {node: _placement_mode(name, recorded) for node, recorded in conn.execute(
+            "SELECT node, mode FROM capabilities_policy WHERE agent_id = %s "
+            "AND capability = %s AND node IS NOT NULL AND service",
+            (agent_id, name)).fetchall()}
         disabled = {node for (node,) in conn.execute(
             "SELECT node FROM capabilities_policy WHERE agent_id = %s AND capability = %s "
             "AND node IS NOT NULL AND NOT enabled", (agent_id, name)).fetchall()}
@@ -16595,9 +17069,9 @@ def _place_everywhere(name: str, root: Path, adapter) -> dict:
             except store.StoreError as exc:
                 refused.append({"node": node, "code": exc.slug, "message": exc.message,
                                 "exit": _store_error_exit(exc)})
-        return agent_id, nodes, refused
+        return agent_id, nodes, refused, modes
 
-    (agent_id, nodes, refused), _setting = _kernel_run(root, survey)
+    (agent_id, nodes, refused, modes), _setting = _kernel_run(root, survey, placement=True)
     if not nodes:
         _die(6, "no_nodes", f"agent {agent_id} has no registered node to place {name} on",
              "register its nodes with `capabilities node add <node> --kind mac|server`")
@@ -16625,12 +17099,15 @@ def _place_everywhere(name: str, root: Path, adapter) -> dict:
                 "detail": {"placed": done, "failed": node}}}, ensure_ascii=False) + "\n")
             sys.exit(_store_error_exit(exc))
         done.append(node)
-        changed = changed or answer["changed"]
+        modes[node] = serving or modes.get(node) or _placement_mode_default(name)
+        moved = _placement_mode_set(root, name, answer["node"], modes[node])
+        changed = changed or answer["changed"] or moved
         if answer.get("enabled_on_node"):
             enabled_on.append(node)
     result: dict = {"placed": name, "nodes": nodes, "placement": "shared",
                     "changed": changed, "placed_on": adapter.placed_nodes(name),
-                    "gate": _gate_source(adapter, root, "project")}
+                    "gate": _gate_source(adapter, root, "project"),
+                    "modes": {node: modes[node] for node in nodes}}
     if enabled_on:
         result["enabled_on_nodes"] = enabled_on
     loopback = _loopback_warning(name, nodes, adapter)
@@ -16665,8 +17142,33 @@ def _placement_report(name: str, root: Path, adapter, mode: str) -> dict:
                      "live": bool(row[4])}
     holder = lease["node"] if lease and lease["live"] else None
     agrees = None if mode == "shared" else (holder in on if on else holder is None)
+
+    def serving(conn, agent_id):
+        # Read as the store stands: the report writes nothing, so a store the
+        # manager's own steps have not reached yet answers every mode as before.
+        recorded = {}
+        if conn.execute("SELECT 1 FROM pg_attribute WHERE attrelid = "
+                        "'capabilities_policy'::regclass AND attname = 'mode' "
+                        "AND NOT attisdropped").fetchone() is not None:
+            recorded = dict(conn.execute(
+                "SELECT node, mode FROM capabilities_policy WHERE agent_id = %s "
+                "AND capability = %s AND node IS NOT NULL AND service",
+                (agent_id, name)).fetchall())
+        if conn.execute("SELECT to_regclass('capabilities_service_leases')"
+                        ).fetchone()[0] is None:
+            return recorded, []
+        return recorded, conn.execute(
+            "SELECT node, mode, acquired_at, renewed_at, expires_at, expires_at > now() "
+            "FROM capabilities_service_leases WHERE project_id = %s AND capability = %s "
+            "ORDER BY node", (agent_id, name)).fetchall()
+    (recorded, held), _setting = _kernel_run(root, serving)
     return {"capability": name, "placement": mode, "placed_on": on, "holder": holder,
-            "lease": lease, "agrees": agrees, "gate": gate_source}
+            "lease": lease, "agrees": agrees, "gate": gate_source,
+            "modes": {node: _placement_mode(name, recorded.get(node)) for node in on},
+            "served_by": [{"node": node, "mode": by, "acquired_at": stamp(acquired),
+                           "renewed_at": stamp(renewed), "expires_at": stamp(expires),
+                           "live": bool(live)}
+                          for node, by, acquired, renewed, expires, live in held]}
 
 
 def _loopback_address(value) -> str | None:
@@ -27033,7 +27535,7 @@ def main() -> None:
             if skip:
                 skip = False
                 continue
-            if a in ("--from", "--source", "--remote", "--ref", "--note", "--node"):
+            if a in ("--from", "--source", "--remote", "--ref", "--note", "--node", "--mode"):
                 skip = True
                 continue
             if a.startswith("--"):
@@ -27303,7 +27805,7 @@ def main() -> None:
         if not pos:
             _die(6, "input", f"{cmd} needs a capability name")
         _place_service(pos[0], cmd == "place", opt("--node"),
-                       every=cmd == "place" and flag("--all"))
+                       every=cmd == "place" and flag("--all"), serving=opt("--mode"))
     elif cmd == "inherit":
         if not pos:
             _die(6, "input", "inherit needs a capability name")

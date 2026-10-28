@@ -2285,6 +2285,245 @@ print(json.dumps({{"ok": True, "agents": [{{"label": label, "action": action}}]}
     assert "deployment machine handover coolify" in _error(failed)["hint"]
 
 
+# --- a placement's mode and the service lease of each node -----------------------------
+
+def _both_commands(lab, placement: str = "shared", machine: bool = True) -> None:
+    """coolify's service declaring a project command and, unless `machine` is
+    false, a machine one beside it, as tasks, memory and automations do."""
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify" / "manifest.json"
+    service = {"name": "svc", "summary": "s", "verbs": [], "placement": placement,
+               "deploy": {"command": ["coolify", "service", "run"], "restart": "on-failure"}}
+    if machine:
+        service["machine"] = {"schema": "capabilities.service.machine.v1",
+                              "command": ["coolify", "service", "run", "--machine"],
+                              "doctor": ["coolify", "service", "doctor", "--machine"],
+                              "projects": "$XDG_CONFIG_HOME/coolify/service/projects.json"}
+    registry.write_text(json.dumps({"name": "coolify", "service": service}))
+
+
+def _modes(lab) -> list[tuple]:
+    return _rows(lab, "SELECT node, service, mode FROM capabilities_policy "
+                      "WHERE capability = 'coolify' AND node IS NOT NULL ORDER BY node")
+
+
+def test_a_placement_records_its_mode_shared_by_default_where_a_machine_service_is_declared(
+        lab):
+    here = _service_lab(lab, placement="shared")
+    _both_commands(lab)
+    placed = _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    assert placed["mode"] == "shared" and placed["changed"] is True
+    assert _modes(lab) == [(NODE, True, "shared")]
+    # Placed again without a mode, it keeps the one it has.
+    again = _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    assert again["mode"] == "shared" and again["changed"] is False
+    own = _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "own", extra=here))
+    assert own["mode"] == "own" and own["changed"] is True
+    assert _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))["mode"] == "own"
+    report = _ok(_manager(lab, "place", "coolify", extra=here))
+    assert report["modes"] == {NODE: "own"} and report["served_by"] == []
+
+    # unplace --mode takes off only a placement in that mode.
+    kept = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, "--mode", "shared",
+                        extra=here))
+    assert kept["changed"] is False and kept["mode"] == "own" and "note" in kept
+    assert _modes(lab) == [(NODE, True, "own")]
+    gone = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, "--mode", "own",
+                        extra=here))
+    assert gone["changed"] is True and gone["placed_on"] == []
+
+    # A new placement takes the default again, and --all records it per node.
+    _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "server",
+                 extra=here))
+    every = _ok(_manager(lab, "place", "coolify", "--all", "--mode", "own", extra=here))
+    assert every["modes"] == {BOX: "own", NODE: "own"}
+    assert _modes(lab) == [(BOX, True, "own"), (NODE, True, "own")]
+
+    # A row that records no mode is served as before: by its own service,
+    # where the capability declares a project command.
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.capabilities_policy SET mode = NULL")
+    assert _ok(_manager(lab, "place", "coolify", extra=here))["modes"] == {
+        BOX: "own", NODE: "own"}
+
+    # A service declaring no machine command can only be its agent's own.
+    _both_commands(lab, machine=False)
+    refused = _manager(lab, "place", "coolify", "--node", NODE, "--mode", "shared",
+                       extra=here)
+    assert refused.returncode == 6 and _error(refused)["code"] == "no_machine_service"
+    assert _modes(lab) == [(BOX, True, None), (NODE, True, None)]
+    _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
+    assert _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))["mode"] == "own"
+    bad = _manager(lab, "place", "coolify", "--node", NODE, "--mode", "both", extra=here)
+    assert bad.returncode == 6 and _error(bad)["code"] == "input"
+
+
+def test_node_run_serves_a_shared_placement_by_the_machine_job_and_an_own_one_by_its_own(
+        lab, tmp_path):
+    """A service that declares a project command and a machine one runs under
+    the node's one machine job for an agent placing it shared, and under the
+    agent's own job for one placing it own."""
+    here = _service_lab(lab, placement="shared")
+    _both_commands(lab)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    jobs = tmp_path / "jobs"
+    machine, own = jobs / "coolify.machine.conf", jobs / f"coolify.{PROJECT_ID}.conf"
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "shared", extra=here))
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor", str(jobs),
+                                 "--every", "30"], cwd=lab["project"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(machine.exists, 15)
+        assert "node supervise coolify --machine\n" in machine.read_text()
+        assert not own.exists()
+        _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "own", extra=here))
+        assert _wait_for(lambda: own.exists() and not machine.exists(), 15)
+        assert f"node supervise coolify --agent {PROJECT_ID}\n" in own.read_text()
+    finally:
+        node_run.terminate()
+        node_run.communicate(timeout=60)
+
+
+def test_one_service_at_a_time_serves_an_agent_on_a_node_under_its_service_lease(
+        lab, tmp_path):
+    """The node's machine service and the agent's own service each take the
+    agent's service lease on the node before serving it: while one holds it
+    live, the other runs nothing for the agent and leaves its row alone. The
+    machine service's own join writes no placement."""
+    here = _service_lab(lab, placement="shared")
+    _both_commands(lab)
+    state = tmp_path / "machine"
+    state.mkdir()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "coolify").write_text(f"""#!{sys.executable}
+import json, os, sys, time
+from pathlib import Path
+state = Path({str(state)!r})
+listed = state / "list.json"
+names = json.loads(listed.read_text()) if listed.exists() else []
+args = sys.argv[1:]
+with open(state / "calls.log", "a") as log:
+    log.write(json.dumps([args, os.environ.get("CAPABILITIES_SERVICE_LIST_ONLY")]) + "\\n")
+if args == ["service", "join"]:
+    listed.write_text(json.dumps(sorted(set(names) | {{"{PROJECT_ID}"}})))
+elif args == ["service", "leave"]:
+    listed.write_text(json.dumps([n for n in names if n != "{PROJECT_ID}"]))
+elif args == ["service", "status", "--machine"]:
+    status = state / "status.json"
+    body = json.loads(status.read_text()) if status.exists() else {{"running": False}}
+    try:
+        os.kill(body.get("pid") or 0, 0) if body.get("pid") else None
+    except ProcessLookupError:
+        body = {{"running": False}}
+    print(json.dumps({{"mode": "machine", **body}}))
+elif args == ["service", "run", "--machine"]:
+    while True:
+        names = json.loads(listed.read_text()) if listed.exists() else []
+        (state / "status.json").write_text(json.dumps({{"running": True, "pid": os.getpid(),
+            "projects": [{{"project_id": n, "state": "served"}} for n in names]}}))
+        time.sleep(0.5)
+elif args[1:2] == ["doctor"]:
+    print(json.dumps({{"ok": True}}))
+""")
+    (bin_dir / "coolify").chmod(0o755)
+    env = {**lab["env"], **here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "shared", extra=here))
+
+    def holder():
+        if _rows(lab, "SELECT to_regclass('capabilities_service_leases')") == [(None,)]:
+            return []
+        return _rows(lab, "SELECT node, mode FROM capabilities_service_leases "
+                          "WHERE project_id = '" + PROJECT_ID + "' AND capability = 'coolify' "
+                          "AND expires_at > now()")
+
+    def row():
+        found = _rows(lab, "SELECT state, pid FROM capabilities_service_instances "
+                           "WHERE capability = 'coolify'")
+        return found[0] if found else None
+
+    marker = tmp_path / "own-started"
+    machine_log = (tmp_path / "machine.log").open("w")
+    own_log = (tmp_path / "own.log").open("w")
+    machine = subprocess.Popen([str(MANAGER), "node", "supervise", "coolify", "--machine",
+                                "--every", "5"], cwd=lab["project"], env=env,
+                               stdout=machine_log, stderr=subprocess.STDOUT,
+                               start_new_session=True)
+    own = None
+    try:
+        assert _wait_for(lambda: holder() == [(NODE, "shared")] and row()
+                         and row()[0] == "ready", 45), (tmp_path / "machine.log").read_text()
+        calls = [json.loads(line) for line in (state / "calls.log").read_text().splitlines()]
+        assert [["service", "join"], "1"] in calls
+        # Its own join wrote no placement: the person's stays as it was.
+        assert _modes(lab) == [(NODE, True, "shared")]
+        served = row()
+
+        own = subprocess.Popen([str(MANAGER), "node", "supervise", "coolify", "--every", "5",
+                                "--", "sh", "-c", f"touch {marker}; exec sleep 600"],
+                               cwd=lab["project"], env=env, stdout=own_log,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+        assert _wait_for(lambda: "by its machine service (shared)" in
+                         (tmp_path / "own.log").read_text(), 45), \
+            (tmp_path / "own.log").read_text()
+        import time
+        time.sleep(6)
+        assert not marker.exists() and holder() == [(NODE, "shared")]
+        assert row() == served
+
+        # The machine service stops: it lets the agent go and gives up the
+        # lease, and the agent's own service takes it and serves the agent.
+        os.killpg(machine.pid, signal.SIGTERM)
+        machine.wait(timeout=60)
+        assert _wait_for(lambda: marker.exists() and holder() == [(NODE, "own")], 45), \
+            (tmp_path / "own.log").read_text()
+        assert json.loads((state / "list.json").read_text()) == []
+        assert _modes(lab) == [(NODE, True, "shared")]
+    finally:
+        if machine.poll() is None:
+            os.killpg(machine.pid, signal.SIGTERM)
+            machine.wait(timeout=60)
+        if own is not None:
+            os.killpg(own.pid, signal.SIGTERM)
+            own.wait(timeout=60)
+        machine_log.close()
+        own_log.close()
+    assert holder() == []
+
+
+def test_node_install_places_shared_each_agent_on_a_machine_list_here(lab, tmp_path):
+    """A project joined before joining wrote a placement - on the machine
+    service's list here, not placed so - is placed on this node in mode
+    shared, once."""
+    here = _service_lab(lab, placement="shared")
+    _both_commands(lab)
+    bin_dir, _calls, _loaded = _stand_in_launchctl(lab, tmp_path)
+    env = {**here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    listing = lab["config"] / "coolify" / "service" / "projects.json"
+    listing.parent.mkdir(parents=True)
+    listing.write_text(json.dumps({"version": 1, "projects": {
+        PROJECT_ID: {"root": str(lab["project"]), "slug": "lab"},
+        "prj_0123456789ab": {"root": "/nowhere", "slug": "gone"}}}))
+    # Its own service placed here before is moved to the machine service.
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "own", extra=here))
+    entry = {"service": "coolify", "agent_id": PROJECT_ID, "folder": str(lab["project"]),
+             "node": NODE, "mode": "shared"}
+
+    preview = _ok(_manager(lab, "node", "install", extra=env))
+    assert preview["would_join"] == [entry]
+    assert _modes(lab) == [(NODE, True, "own")]
+    done = _ok(_manager(lab, "node", "install", "--apply", extra=env))
+    assert done["joined"] == [entry]
+    assert _modes(lab) == [(NODE, True, "shared")]
+    again = _ok(_manager(lab, "node", "install", "--apply", extra=env))
+    assert "joined" not in again and "would_join" not in again
+    assert _modes(lab) == [(NODE, True, "shared")]
+
+
 def test_a_start_or_place_without_a_node_on_a_mac_beside_a_server_says_where_it_lands(lab):
     _import(lab)
     registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"

@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-28 — `service join` and `leave` write the project's shared placement on this node
+
+In a project whose records are in the store, `automations service join` now also places the project's automations service on this node to be served by the node's machine service (`capabilities place automations --node <this node> --mode shared`), and `automations service leave` takes that placement off again (`unplace ... --mode shared`); `leave --machine --project` does so in the project's folder where it is still there and bound to that id. The placement is then the one record of who is served. The list is written exactly as before, and the answers gain `placement` {written, node, mode, changed, placed_on}, or {written: false, error} with a warning on stderr where the manager could not write it. A join or leave the node manager runs for the agents whose leases it holds sets `CAPABILITIES_SERVICE_LIST_ONLY=1` and writes no placement.
+
 ## 2026-10-28 — The scheduler wakes at once on a saved definition where the store names its transaction address apart
 
 The project service and the machine service still poll the `automations_changed` versions about once a second, and where the store names its transaction address apart (`AGENTKIT_DB_TRANSACTION_PORT` or `AGENTKIT_DB_TRANSACTION_HOST`) their sleep between ticks is also cut short by the store's notification, held on a session connection of the library's follower and closed when the service stops, so a saved definition is taken up at the next tick. A store reached through a transaction pooler alone holds no such connection and works as before; a lost notification costs only the second. Declares `capabilities-contract>=0.33,<1`.
