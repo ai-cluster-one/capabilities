@@ -1,5 +1,9 @@
 # coolify — change log
 
+## 2026-10-28 — Server reads carry each server's memory
+
+Every record from `servers`, listed or read by uuid, carries `memory`: the server's total and currently available memory from `MemTotal` and `MemAvailable` in its `/proc/meminfo`, read over the connection's SSH access (`coolify connect --ssh-key`), as `total_bytes` and `available_bytes` and as `total` and `available` in human units. The Coolify host itself, listed at `host.docker.internal`, is reached at the connection's `base_url` host. A server that cannot be read carries `{"error": <reason>}` in its place - no SSH access on the connection, unreachable, key refused, unknown host key - and the read still succeeds. Every other field is unchanged.
+
 ## 2026-10-27 — `projects environment create`
 
 `projects environment create <uuid> <name>` creates the environment `<name>` in an existing project through `POST /projects/<uuid>/environments` and answers what Coolify returns, the new environment's uuid. A write verb, refused with exit 4 on a read-only connection. Nothing else changes.

@@ -129,6 +129,14 @@ COMMANDS
       "dashboard_url", the record's page in the Coolify dashboard, built
       from the connection's base_url (resources read the projects for their
       environment path); it is absent when the page cannot be resolved.
+      Server records also carry "memory", read over the connection's SSH
+      access (coolify connect --ssh-key) from the server's /proc/meminfo:
+      {"total_bytes", "available_bytes"} from MemTotal and MemAvailable, and
+      "total" and "available" in human units (e.g. "7.6 GiB"). A server that
+      cannot be read - no SSH access on the connection, unreachable, key
+      refused, unknown host key - carries {"error": <reason>} instead, and the
+      read still succeeds. The Coolify host itself (ip host.docker.internal)
+      is reached at the connection's base_url host.
   deployments [<uuid>]            List active/queued deployments, or get one
                                   deployment by its uuid.
   logs <uuid> [--lines N]         An application's runtime logs (default 100).
@@ -335,6 +343,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -489,8 +498,10 @@ def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict |
     if not base_url:
         return None, {"exit": 6, "code": "incomplete_connection",
                       "message": f"connection {cid!r} is missing 'base_url'"}
+    ssh = entry.get("ssh")
     return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "base_url": base_url.rstrip("/"), "token": token}, None
+            "base_url": base_url.rstrip("/"), "token": token,
+            "ssh": ssh if isinstance(ssh, dict) else None}, None
 
 
 def _resolve_conn(args) -> dict:
@@ -846,16 +857,77 @@ def _with_dashboard_urls(c, base_url: str | None, value, base_path: str, slim: b
     return out if slim else out[0]
 
 
-def cmd_collection(c, base_path: str, uuid: str | None, base_url: str | None = None):
+def _human_bytes(n: int) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}" if unit != "B" else f"{n} B"
+        n /= 1024
+    return f"{n:.1f} TiB"
+
+
+def _server_memory(server: dict, ssh: dict | None, base_url: str | None) -> dict:
+    """A server's total and available memory, from MemTotal and MemAvailable in
+    its /proc/meminfo read over the connection's SSH access; {"error": reason}
+    in their place when the server cannot be read, so one server never fails
+    the list."""
+    if not ssh or not ssh.get("key_path"):
+        return {"error": "the connection has no SSH access to its servers "
+                         "(coolify connect --ssh-key <path>)"}
+    address = server.get("ip")
+    if address in ("host.docker.internal", "localhost", "127.0.0.1"):
+        # the instance's own host, reached at the instance's address
+        from urllib.parse import urlparse
+        address = urlparse(base_url or "").hostname
+    if not isinstance(address, str) or not re.fullmatch(r"[A-Za-z0-9.:-]+", address):
+        return {"error": "the server has no usable SSH address"}
+    port = str(server.get("port") or 22)
+    if not port.isdigit():
+        return {"error": f"the server's SSH port {port!r} is not a number"}
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "IdentitiesOnly=yes", "-i", str(Path(ssh["key_path"]).expanduser()),
+            "-p", port, f"{ssh.get('user') or 'root'}@{address}", "cat /proc/meminfo"]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+                           stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return {"error": "ssh is not installed on this machine"}
+    except subprocess.TimeoutExpired:
+        return {"error": f"ssh to {address} timed out"}
+    if r.returncode != 0:
+        lines = r.stderr.strip().splitlines()
+        return {"error": f"ssh to {address} failed: "
+                         f"{lines[-1] if lines else f'exit {r.returncode}'}"}
+    kib = {}
+    for line in r.stdout.splitlines():
+        key, _, rest = line.partition(":")
+        if key in ("MemTotal", "MemAvailable") and rest.split() and rest.split()[0].isdigit():
+            kib[key] = int(rest.split()[0])
+    if len(kib) < 2:
+        return {"error": f"/proc/meminfo on {address} gives no MemTotal and MemAvailable"}
+    total, available = kib["MemTotal"] * 1024, kib["MemAvailable"] * 1024
+    return {"total_bytes": total, "available_bytes": available,
+            "total": _human_bytes(total), "available": _human_bytes(available)}
+
+
+def cmd_collection(c, base_path: str, uuid: str | None, base_url: str | None = None,
+                   ssh: dict | None = None):
     """List a resource collection (slimmed), or get one by uuid (full detail).
-    Resource and server reads carry the record's `dashboard_url`."""
+    Resource and server reads carry the record's `dashboard_url`; server reads
+    carry its `memory`."""
     if uuid:
         value = _request(c, "GET", f"/{base_path}/{uuid}")
     else:
         value = _request(c, "GET", f"/{base_path}")
     if base_path not in (*DASHBOARD_KINDS, "servers"):
         return value if uuid else _slim_list(value)
-    return _with_dashboard_urls(c, base_url, value, base_path, slim=not uuid)
+    raw = [value] if uuid else _list_data(value)
+    memory = ([_server_memory(item, ssh, base_url) if isinstance(item, dict) else None
+               for item in raw] if base_path == "servers" else [])
+    out = _with_dashboard_urls(c, base_url, value, base_path, slim=not uuid)
+    for item, mem in zip([out] if uuid else _list_data(out), memory):
+        if mem is not None and isinstance(item, dict):
+            item["memory"] = mem
+    return out
 
 
 def cmd_sources(c):
@@ -2210,7 +2282,8 @@ def main() -> None:
                 out(cmd_collection(c, args.cmd, uuid))
         elif args.cmd in ("applications", "services", "databases",
                           "servers", "deployments"):
-            out(cmd_collection(c, args.cmd, args.uuid, conn["base_url"]))
+            out(cmd_collection(c, args.cmd, args.uuid, conn["base_url"],
+                               conn.get("ssh")))
         elif args.cmd == "logs":
             out(cmd_logs(c, args.uuid, args.lines))
         elif args.cmd == "deploy":
