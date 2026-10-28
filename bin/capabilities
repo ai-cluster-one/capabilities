@@ -890,9 +890,10 @@ PROJECT VERBS (run inside a consuming project)
         README.md, generated/ with generated context alone, and
         icon-*.png (exit 6 contextkit_folder_not_empty, naming the rest;
         icon_ambiguous for more than one icon the row would take and none
-        named by [identity] icon; icon_invalid for an icon that is missing
-        or no PNG). The row's copy is the one that counts: it then fills
-        only the row's empty fields from the binding - [body] root into
+        named by [identity] icon; icon_invalid for an icon that is no PNG,
+        or missing where the row holds none). The row's copy is the one
+        that counts: it then fills only the row's empty fields from the
+        binding - [body] root into
         body_root (null for .), [collaboration] mode into
         collaboration_mode where set, [onboarding] into the onboarding
         columns, [identity] name and description, and the icon
@@ -10242,8 +10243,13 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
     # and none named are ambiguous only where the row has none to keep.
     icon_file = identity.get("icon")
     if icon_file is not None and not icon_file.is_file():
-        _die(6, "icon_invalid", f"identity.icon names {_ck_rel(root, icon_file)}, which is not there",
-             "restore the icon or remove identity.icon, then convert")
+        if not found["has_icon"]:
+            _die(6, "icon_invalid",
+                 f"identity.icon names {_ck_rel(root, icon_file)}, which is not there",
+                 "restore the icon or remove identity.icon, then convert")
+        # The row's icon is the one that counts, as ContextKit counts it: a
+        # named icon gone from the folder leaves nothing to fill or compare.
+        icon_file = None
     if icon_file is None and len(icons) == 1:
         icon_file = icons[0]
     elif icon_file is None and len(icons) > 1 and not found["has_icon"]:

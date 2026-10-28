@@ -1891,6 +1891,28 @@ def test_agent_convert_fills_only_what_the_row_holds_empty_and_names_each_differ
     assert not (root / ".contextkit").exists()
 
 
+def test_agent_convert_keeps_the_row_icon_when_the_named_icon_is_gone(lab, tmp_path):
+    folder = _bound_agent(lab, tmp_path / "gone", BOUND_CONFIG)
+    root = folder.path
+    icon = tmp_path / "icon.png"
+    icon.write_bytes(_png())
+    folder.ok("agent", "set", "--icon", str(icon))
+    for icon in (root / ".contextkit").glob("icon-*.png"):
+        icon.unlink()
+    config = BOUND_CONFIG + '\n[identity]\nicon = "icon-aaaaaaaaaaaa.png"\n'
+    (root / ".contextkit" / "config.toml").write_text(config)
+    sha = lab.sql(f"SELECT icon_sha FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                  (BARE_ID,))[0][0]
+
+    assert "icon_sha" not in folder.ok("agent", "convert", "--dry-run")["fill"]
+    converted = folder.ok("agent", "convert")
+
+    assert "icon_sha" not in converted["carried"]
+    assert lab.sql(f"SELECT icon_sha FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (BARE_ID,)) == [(sha,)]
+    assert not (root / ".contextkit").exists()
+
+
 def test_agent_convert_refuses_before_writing_anything(lab, tmp_path):
     def unchanged(folder: Folder, config: str) -> None:
         assert (folder.path / ".contextkit" / "config.toml").read_text() == config
