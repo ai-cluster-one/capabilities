@@ -1299,3 +1299,71 @@ def test_add_without_events_prints_the_answer_alone(lab, capsys):
     answer = json.loads(capsys.readouterr().out)
     assert answer["ok"] is True and answer["node"] == BOX1
     assert answer["environment"] == "production" and answer["created"] is True
+
+
+class Registry:
+    """Answers the registry's anonymous token and its tag list, a page at a
+    time, as ghcr.io does."""
+
+    def __init__(self, pages):
+        self.pages, self.urls = pages, []
+
+    def __call__(self, request, timeout=None):
+        url = getattr(request, "full_url", request)
+        self.urls.append(url)
+        if "/token?" in url:
+            body, link = {"token": "anon"}, None
+        else:
+            assert request.get_header("Authorization") == "Bearer anon"
+            index = int(url.rsplit("page=", 1)[1]) if "page=" in url else 0
+            body = {"name": "agenium-dev/agent-node", "tags": self.pages[index]}
+            link = (f'</v2/agenium-dev/agent-node/tags/list?page={index + 1}>; rel="next"'
+                    if index + 1 < len(self.pages) else None)
+        answer = io.BytesIO(json.dumps(body).encode())
+        answer.headers = {"Link": link} if link else {}
+        return answer
+
+
+@pytest.fixture
+def registry(lab, monkeypatch):
+    import urllib.request
+    fake = Registry([["probe", "0.0.1", "latest", "0.0.9", "0.0.10-amd64"],
+                     ["0.0.10-arm64", "0.0.10", "0.0.2"]])
+    monkeypatch.setattr(urllib.request, "urlopen", fake)
+    return fake
+
+
+def test_node_image_names_the_newest_release_its_registry_holds(lab, registry, capsys):
+    lab.m.cmd_node_image(SimpleNamespace(json=True))
+    assert json.loads(capsys.readouterr().out) == {
+        "ok": True, "version": "0.0.10", "image": "ghcr.io/agenium-dev/agent-node:0.0.10"}
+    assert registry.urls[0] == ("https://ghcr.io/token?scope=repository:"
+                                "agenium-dev/agent-node:pull")
+    lab.m.cmd_node_image(SimpleNamespace(json=False))
+    assert capsys.readouterr().out.strip() == "ghcr.io/agenium-dev/agent-node:0.0.10"
+
+
+def test_node_image_says_when_the_registry_cannot_name_a_release(lab, monkeypatch):
+    import urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen", Registry([["latest", "probe"]]))
+    with pytest.raises(lab.m.NodeFailure) as unknown:
+        lab.m.cmd_node_image(SimpleNamespace(json=True))
+    assert unknown.value.code == "image_release_unknown" and unknown.value.exit_code == 5
+
+    def unreachable(request, timeout=None):
+        raise OSError("no route")
+    monkeypatch.setattr(urllib.request, "urlopen", unreachable)
+    with pytest.raises(lab.m.NodeFailure) as unknown:
+        lab.m.cmd_node_image(SimpleNamespace(json=True))
+    assert unknown.value.code == "image_release_unknown"
+
+
+def test_create_and_add_without_a_version_take_the_current_release(lab, registry, capsys):
+    lab.m.cmd_node_create(create_args(version=None))
+    assert json.loads(capsys.readouterr().out)["image"] == "ghcr.io/agenium-dev/agent-node:0.0.10"
+    lab.fake.rows.clear()
+    lab.fake.calls.clear()
+    lab.m.cmd_node_add(add_args(version=None, events=False))
+    assert json.loads(capsys.readouterr().out)["image"] == "ghcr.io/agenium-dev/agent-node:0.0.10"
+    [create] = [c for c in lab.fake.of("coolify") if c["argv"][3:5] == ["service", "create"]]
+    assert 'image: "ghcr.io/agenium-dev/agent-node:0.0.10"' in create["stdin"]

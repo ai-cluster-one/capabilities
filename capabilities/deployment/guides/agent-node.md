@@ -25,7 +25,7 @@ You need:
 
 ## Create
 
-`deployment node create <node>`, with the Coolify project, server and environment, the image tag (`--version`) and optionally a memory limit, makes one Coolify service of one container from the standard image. It has a volume of its own for each state path of the image - `~/.config` (store setting, secrets, node key), `~/.local/state` (capability state), `~/.claude` and `~/.codex` (the logins) - and one for `~/work`, the agent's work, and only the two keys above in its environment. Then it mints the node's id, twelve lowercase hex characters, and registers the node row under it with `<node>` as its label; the answer's `node.node` is the id, and every later verb takes the id or the label. The container comes up healthy and its log says it is waiting for a store setting; it runs nothing yet.
+`deployment node create <node>`, with the Coolify project, server and environment, optionally the image tag (`--version`; without it the current release, which `deployment node image --json` answers as `{version, image}` from the image's registry) and a memory limit, makes one Coolify service of one container from the standard image. It has a volume of its own for each state path of the image - `~/.config` (store setting, secrets, node key), `~/.local/state` (capability state), `~/.claude` and `~/.codex` (the logins) - and one for `~/work`, the agent's work, and only the two keys above in its environment. Then it mints the node's id, twelve lowercase hex characters, and registers the node row under it with `<node>` as its label; the answer's `node.node` is the id, and every later verb takes the id or the label. The container comes up healthy and its log says it is waiting for a store setting; it runs nothing yet.
 
 ## Work
 

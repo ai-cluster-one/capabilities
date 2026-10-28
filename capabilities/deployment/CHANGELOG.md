@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-28 — `node image` names the standard image's current release, and `node add` and `node create` default to it
+
+`deployment node image [--json]` reads the registry of `ghcr.io/agenium-dev/agent-node` anonymously and answers its newest `<major>.<minor>.<patch>` tag, the release that publishes the image and moves `:latest` to it: the image reference alone, or with `--json` `{ok, version, image}`. A registry that cannot be read or holds no release exits 5 `image_release_unknown`. `node add` and `node create` take `--version` as optional and, without it, create the node from that release; a `node add` that resumes on a node it already made reads no registry. An explicit `--version`, `--repository` builds and `node update` answer and refuse as before.
+
 ## 2026-10-27 — `node add` takes a node from nothing to raised, step by step
 
 `deployment node add <label> --server <uuid> --version <tag> [--memory <size>] [--services <name,...>] [--project <uuid>] [--environment <name>] [--connection <id>] [--wait <s>] [--events]` runs the whole path of adding a node on a server Coolify already runs: the Coolify project (given, else the one named after the agent, created when missing), the environment in it (created when missing, through `coolify projects environment create`), the node of the standard image as `node create` makes it, a wait until its container runs, then enrolment as `node enrol` does it. With `--events` each step is a `step` JSON line, started then done with its check or failed with its error, and the stream ends in `done` or `error`. A step that finds its work done keeps it, so running the same command again resumes after a failure. `node create` and `node enrol` answer and refuse as before.

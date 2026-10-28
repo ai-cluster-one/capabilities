@@ -290,7 +290,15 @@ USAGE
       fails rolls back the same way.
   deployment logs [--target <name>] [--build] [--follow]
       Read runtime logs or the recorded deployment build log; --follow polls.
-  deployment node add <label> --server <uuid> --version <tag> [--memory 2g]
+  deployment node image [--json]
+      The standard image's current release, read from its registry
+      (ghcr.io, anonymously): the newest <major>.<minor>.<patch> tag of
+      ghcr.io/agenium-dev/agent-node, which its release publishes and moves
+      :latest to. Prints that image reference; --json answers {ok, version,
+      image}. Exit 5 image_release_unknown when the registry cannot be read
+      or holds no release. node add and node create take this version when
+      no --version is given.
+  deployment node add <label> --server <uuid> [--version <tag>] [--memory 2g]
                       [--services <name,...>] [--project <uuid>]
                       [--environment production] [--connection <id>]
                       [--wait 600] [--events]
@@ -300,7 +308,8 @@ USAGE
       slug, created when there is none (exit 6 project_ambiguous when
       several carry that name); environment, --environment in it, created
       when missing (`coolify projects environment create`); create, what
-      `node create` does with --version and --memory; container, until the
+      `node create` does with --version (the current release, as `node
+      image` answers it, when not given) and --memory; container, until the
       node's container runs (exit 5 node_not_running after --wait seconds);
       then what `node enrol` does with --services and --wait, as the steps
       id, key_pair, encryption_key, secrets, place (one per service) and
@@ -320,7 +329,7 @@ USAGE
       installed with Coolify first, as before; node add starts from one
       Coolify runs.
   deployment node create <node> --project <uuid> --server <uuid>
-                         --environment <name> --version <tag>
+                         --environment <name> [--version <tag>]
                          [--memory 2g] [--connection <id>]
   deployment node create <node> --project <uuid> --server <uuid>
                          --environment <name> --repository <url>
@@ -329,7 +338,8 @@ USAGE
                          [--docker-socket] [--host-dir <path>]...
                          [--memory 2g] [--connection <id>]
       For an agent that lives in the store: create a Coolify resource
-      running the standard image ghcr.io/agenium-dev/agent-node:<tag>
+      running the standard image ghcr.io/agenium-dev/agent-node:<tag>, the
+      current release as `node image` answers it when --version is not given,
       through the coolify connection (the only one granted, or --connection),
       in that project's existing environment on that server. It is a Compose
       service of one container with the memory limit, a volume of its own
@@ -8633,6 +8643,12 @@ AGENT_NODE_VOLUMES = (("config", "/home/agent/.config"),
 AGENT_NODE_KEY = ".config/agent-node/node-key.pem"
 AGENT_NODE_STATE = "/tmp/agent-node.state"
 AGENT_NODE_VERSION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
+# The standard image's current release is the newest version its registry
+# holds: a release publishes ghcr.io/agenium-dev/agent-node:<version> and moves
+# :latest to it, and the tags it pushes first for each architecture carry a
+# suffix. The image is public, so the registry is read with an anonymous token.
+AGENT_NODE_REGISTRY = "https://ghcr.io"
+AGENT_NODE_RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 AGENT_NODE_MEMORY_LIMIT = re.compile(r"[1-9][0-9]*[bkmgBKMG]?")
 AGENT_NODE_PUBLIC_KEY = re.compile(r"[A-Za-z0-9+/]{43}=")
 COOLIFY_UUID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
@@ -8999,6 +9015,41 @@ def _agent_node_store_args(root):
     return args + ["--password-stdin"], str(values["password"]) + "\n"
 
 
+def _agent_node_release():
+    """The standard image's current release, {version, image}, read from its
+    registry; image_release_unknown (exit 5) when the registry cannot say."""
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    repository = AGENT_NODE_IMAGE.split("/", 1)[1]
+    tags = []
+    try:
+        with urllib.request.urlopen(f"{AGENT_NODE_REGISTRY}/token?scope=repository:"
+                                    f"{repository}:pull", timeout=PROBE_TIMEOUT_SECONDS) as r:
+            token = json.load(r)["token"]
+        page = f"{AGENT_NODE_REGISTRY}/v2/{repository}/tags/list"
+        while page:
+            request = urllib.request.Request(page, headers={"Authorization": f"Bearer {token}"})
+            with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT_SECONDS) as r:
+                tags += json.load(r).get("tags") or []
+                link = re.match(r'\s*<([^>]+)>;\s*rel="next"', r.headers.get("Link") or "")
+            page = urllib.parse.urljoin(AGENT_NODE_REGISTRY, link.group(1)) if link else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
+        raise NodeFailure("image_release_unknown", f"the registry of {AGENT_NODE_IMAGE} "
+                          f"could not be read for its current release: {e}", 5) from None
+    releases = [tag for tag in tags if isinstance(tag, str) and AGENT_NODE_RELEASE.fullmatch(tag)]
+    if not releases:
+        raise NodeFailure("image_release_unknown", f"the registry of {AGENT_NODE_IMAGE} "
+                          "holds no release", 5)
+    version = max(releases, key=lambda tag: tuple(int(part) for part in tag.split(".")))
+    return {"version": version, "image": f"{AGENT_NODE_IMAGE}:{version}"}
+
+
+def cmd_node_image(args):
+    release = _agent_node_release()
+    _emit({"ok": True, **release} if args.json else release["image"])
+
+
 def _agent_node_build(args):
     """The repository a node's image is built from and the host paths it is
     given, checked; None for a node of the standard image by tag."""
@@ -9115,6 +9166,8 @@ def _agent_node_create(root, args):
     for flag, value in (("--project", args.project), ("--server", args.server)):
         if not COOLIFY_UUID.fullmatch(value or ""):
             raise NodeFailure("input", f"{flag} takes a Coolify uuid", 6)
+    if args.version is None and args.repository is None:
+        args.version = _agent_node_release()["version"]
     build = _agent_node_build(args)
     if build is None and not AGENT_NODE_VERSION.fullmatch(args.version or ""):
         raise NodeFailure("input", "--version takes the standard image's tag", 6)
@@ -9372,7 +9425,7 @@ def cmd_node_add(args):
     for flag, value in (("--project", args.project), ("--server", args.server)):
         if value is not None and not COOLIFY_UUID.fullmatch(value):
             raise NodeFailure("input", f"{flag} takes a Coolify uuid", 6)
-    if not AGENT_NODE_VERSION.fullmatch(args.version or ""):
+    if args.version is not None and not AGENT_NODE_VERSION.fullmatch(args.version):
         raise NodeFailure("input", "--version takes the standard image's tag", 6)
     if not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory or ""):
         raise NodeFailure("input", "--memory takes a size such as 2g or 1536m", 6)
@@ -9393,6 +9446,9 @@ def cmd_node_add(args):
         raise NodeFailure("node_exists", f"this agent already has node {label} on server "
                           f"{row.get('coolify_server')} through connection "
                           f"{row.get('coolify_connection')}", 6)
+    version = args.version
+    if row is None and version is None:
+        version = _agent_node_release()["version"]
     with _NodeStep("project") as check:
         project, project_name, made = _agent_node_coolify_project(root, target, args.project,
                                                                   _slug(slug))
@@ -9409,7 +9465,7 @@ def cmd_node_add(args):
         if row is None:
             created = _agent_node_create(root, argparse.Namespace(
                 node=label, project=project, server=args.server, environment=args.environment,
-                version=args.version, memory=args.memory, connection=target["connection"],
+                version=version, memory=args.memory, connection=target["connection"],
                 repository=None, branch=None, dockerfile=None, context=None, deploy_key=None,
                 github_app=None, docker_socket=False, host_dir=None))
             row = _agent_node_row(root, created["node"]["node"])
@@ -10209,7 +10265,7 @@ def main(argv: list[str] | None = None) -> None:
     p = node.add_parser("add", add_help=False)
     p.add_argument("node")
     p.add_argument("--server", required=True)
-    p.add_argument("--version", required=True)
+    p.add_argument("--version")
     p.add_argument("--memory", default=AGENT_NODE_MEMORY)
     p.add_argument("--project")
     p.add_argument("--environment", default="production")
@@ -10232,6 +10288,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("node")
     p.set_defaults(fn=cmd_node_exec)
     node.add_parser("list", add_help=False).set_defaults(fn=cmd_node_list)
+    p = node.add_parser("image", add_help=False)
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_node_image)
     for verb, fn in (("status", cmd_node_status), ("sync", cmd_node_sync), ("login", cmd_node_login)):
         p = node.add_parser(verb, add_help=False)
         p.add_argument("--target")
