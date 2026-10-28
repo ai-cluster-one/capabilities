@@ -1730,6 +1730,71 @@ def test_node_run_writes_this_nodes_state_on_its_beat_and_after_a_change(lab, tm
     assert row == (True, True, True, True, True)
 
 
+def test_node_run_and_each_supervisor_keep_their_last_lines_in_the_store(lab, tmp_path):
+    """What a service's supervisor and the service print on stderr, and what
+    node run prints, read from the store as the node's log, with what reads as
+    a secret masked; a service's lines stay after its supervisor stops, until
+    the service is no longer placed on the node."""
+    here = _service_lab(lab)
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    env = {**lab["env"], **here}
+
+    def lines(source: str):
+        found = _rows(lab, "SELECT lines FROM capabilities_node_logs WHERE project_id = "
+                           f"'{PROJECT_ID}' AND node = '{NODE}' AND source = '{source}'")
+        return found[0][0] if found else None
+
+    def said(source: str, *words: str):
+        return lambda: (lambda got: got if got and all(any(w in line for line in got)
+                                                       for w in words) else None)(
+            lines(source))
+
+    log = (tmp_path / "supervise.log").open("w")
+    supervise = subprocess.Popen(
+        [str(MANAGER), "node", "supervise", "coolify", "--every", "5", "--", "sh", "-c",
+         "echo 'the service says hello' >&2; echo 'login token=abcdefgh12345 sent' >&2;"
+         " exec sleep 600"],
+        cwd=lab["project"], env=env, stdout=log, stderr=subprocess.STDOUT,
+        start_new_session=True)
+    try:
+        got = _wait_for(said("coolify", "the service says hello", "token=***",
+                             "[capabilities supervise coolify] started"), 30)
+        assert got, (tmp_path / "supervise.log").read_text()
+        assert not any("abcdefgh12345" in line for line in got)
+        assert all(line[:4].isdigit() and line[10] == "T" for line in got)
+    finally:
+        os.killpg(supervise.pid, signal.SIGTERM)
+        supervise.wait(timeout=60)
+        log.close()
+    # The supervisor stopped; its last words stay.
+    assert any("the service says hello" in line for line in lines("coolify"))
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    env = {**env, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor",
+                                 str(tmp_path / "jobs"), "--every", "300"],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(said("manager", f"[capabilities node {NODE}]"), 40)
+        assert lines("coolify") is not None
+        # Unplaced here, the service's lines go with node run's next write.
+        _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
+        assert _wait_for(lambda: lines("coolify") is None, 30)
+        [node] = [n for n in _ok(_manager(lab, "node", "state", extra=here))["nodes"]
+                  if n["node"] == NODE]
+        assert [entry["source"] for entry in node["logs"]] == ["manager"]
+        assert node["logs"][0]["captured_at"] and node["logs"][0]["lines"]
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+
+
 def test_node_run_records_a_placed_service_it_will_not_run_and_keeps_a_listed_machine_one(
         lab, tmp_path):
     """A machine service placed here runs under node run when its --services

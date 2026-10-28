@@ -379,7 +379,7 @@ def test_check_answers_what_is_newer_and_what_it_brings_and_changes_nothing(node
     assert [e["heading"] for e in found["capability"]["entries"]] == ["2026-10-02 — Second"]
     library = found["contract_library"]
     assert (library["installed"], library["available"], library["capabilities"]) == (
-        "0.30.0", "0.31.0", ["probe"])
+        "0.30.0", "0.32.0", ["probe"])
     assert any("capabilities-contract 0.31.0" in e["heading"] for e in library["entries"])
     assert not any("capabilities-contract 0.30.0" in e["heading"] for e in library["entries"])
     assert checked["offer"]["errors"] == []
@@ -413,7 +413,7 @@ def test_an_update_moves_everything_asks_the_doctors_and_restarts_the_placed_ser
     assert run["state"] == "updated", run
     assert os.readlink(node.link) != node.before
     assert "the incoming manager" in node.link.resolve().read_text()
-    assert PROBE_NEW in node.probe_log() and node.library() == "0.31.0"
+    assert PROBE_NEW in node.probe_log() and node.library() == "0.32.0"
     assert run["doctors"] == {"after_update": [
         {"capability": "probe", "agent_id": PROJECT_ID, "state": "ready"}]}
     assert run["versions_before"]["manager"]["links"][str(node.link)] == node.before

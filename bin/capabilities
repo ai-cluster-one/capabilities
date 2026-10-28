@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.31.0,<1",
+#     "capabilities-contract>=0.32.0,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -1012,7 +1012,8 @@ PROJECT VERBS (run inside a consuming project)
         fresh_until, sessions [{capability, connection, live, account,
         checked_at, needed, override, expected}], attention [{kind, tool |
         capability and connection, reason}], health, update {available,
-        checked_at, offer, last_run}}], store}. A row stands
+        checked_at, offer, last_run}, logs [{source, lines, captured_at}]}],
+        store}. A row stands
         for its node for 90
         seconds after it is written (fresh_until, the store's time):
         reachable is whether that has not yet passed, by the store's now,
@@ -1059,7 +1060,17 @@ PROJECT VERBS (run inside a consuming project)
         available, entries}], errors}; last_run is its latest update run
         (capabilities_node_updates) {id, node, state, requested_at,
         requested_by, started_at, finished_at, reason, versions_before,
-        versions_after, doctors}, null where it has none.
+        versions_after, doctors}, null where it has none. logs is what this
+        agent's processes on that node last printed
+        (capabilities_node_logs), one entry per source: manager, the node's
+        manager (`node run`) where this agent's folder runs it, and each
+        service the agent places there, its supervisor's lines with what
+        the service wrote to stderr; lines are oldest first, each with the
+        time it was said, at most 100 of at most 500 characters, with what
+        reads as a secret - a URL's password, a bearer token, a value given
+        to a key named as a secret, a known token shape - masked as ***.
+        captured_at is the store's time of the write. A service's lines
+        stay after it stops, until it is no longer placed on that node.
   node update [--check | --node <node>]
         A node updates only when asked. --check, on this node: what is
         newer than what it runs, as `self-update --check` and `update
@@ -1142,7 +1153,7 @@ PROJECT VERBS (run inside a consuming project)
         ids keeps the name it had as its id - to its own: this machine's id
         (`node id`), or the one given. In one transaction the registry row
         takes the new id, every agent's link to it follows, as do its state
-        row, device sessions and update runs (`node state`), and every
+        row, device sessions, update runs and log lines (`node state`), and every
         column of the store that names a node moves with it: the policy, grant,
         identifier and settings rows for that node, the service leases,
         sessions, runs, definitions, executions and memory entries recorded
@@ -1193,7 +1204,11 @@ PROJECT VERBS (run inside a consuming project)
         right after a reconcile that changed a job, asking the tools'
         sign-ins, the sessions and the harness of the services placed here
         again every 60 seconds; a write that fails
-        is said once on stderr and changes nothing else. It never updates
+        is said once on stderr and changes nothing else. With the state it
+        writes its own last lines as this folder's agent's manager log
+        (capabilities_node_logs, `node state` logs), once a line came since
+        the last write, and drops the lines of each service no longer placed
+        here for an agent it serves. It never updates
         unasked: a requested row of capabilities_node_updates for this node,
         seen within seconds on its channel and on each reconcile, runs
         `node update` as a child of its own session beside the loop, which
@@ -1293,7 +1308,9 @@ PROJECT VERBS (run inside a consuming project)
         degraded, failing, held, waiting or stopping - with the problem and
         its code, the payload, pid, host and start time of the running
         process, the last failure's exit code, stderr tail and time, and the
-        settings skipped on this node. Whether a running service can do its
+        settings skipped on this node, and, beside it, its own last lines and
+        what the service wrote to stderr in capabilities_node_logs (`node
+        state` logs), which stay when it stops. Whether a running service can do its
         work is its declared doctor's answer (service.deploy.doctor), asked
         10 seconds after it starts and then every reconcile, for at most 30
         seconds: exit 0 is ready, or degraded when its body names
@@ -10698,6 +10715,7 @@ NODE_REFERENCES = (
     ("capabilities_identifiers", "node", "whole"),
     ("capabilities_node_login_expectations", "node", "foreign key"),
     ("capabilities_node_logins", "node", "foreign key"),
+    ("capabilities_node_logs", "node", "foreign key"),
     ("capabilities_node_session_expectations", "node", "foreign key"),
     ("capabilities_node_sessions", "node", "foreign key"),
     ("capabilities_node_states", "node", "foreign key"),
@@ -10952,6 +10970,9 @@ def _node_launcher_text(job: dict, manager: str) -> str:
 # answer, which takes a process each, so they are asked on a slower cadence.
 
 NODE_STATE_BEAT_SECONDS = 15
+# How many of its last printed lines a node process holds for the store, which
+# keeps its own bound of them (the contract's NODE_LOG_LINES).
+NODE_LOG_KEEP_LINES = 200
 NODE_STATE_PROBE_SECONDS = 60
 NODE_STATE_TOOL_TIMEOUT = 15
 NODE_STATE_SESSION_TIMEOUT = 60
@@ -11311,6 +11332,38 @@ def _node_state_logins(store, logins: list[dict], node: str) -> dict:
     return out
 
 
+class _NodeLogTail:
+    """The last lines a node process - `node run`, or one service's `node
+    supervise` with what its service writes to stderr - printed, each with
+    the time it was said, for its row of capabilities_node_logs: `take`
+    answers them only where a line came since the last take, and `again` asks
+    for them once more after a write that failed. The store tier bounds and
+    masks what it keeps."""
+
+    def __init__(self):
+        import collections
+        import threading
+        self.lines: collections.deque = collections.deque(maxlen=NODE_LOG_KEEP_LINES)
+        self.lock = threading.Lock()
+        self.fresh = False
+
+    def add(self, line: str) -> None:
+        with self.lock:
+            self.lines.append(f"{_supervise_now_iso()} {line.rstrip()}")
+            self.fresh = True
+
+    def take(self) -> list[str] | None:
+        with self.lock:
+            if not self.fresh:
+                return None
+            self.fresh = False
+            return list(self.lines)
+
+    def again(self) -> None:
+        with self.lock:
+            self.fresh = bool(self.lines)
+
+
 class _NodeManager:
     """`node run` on a node whose supervisor is Supervisor: each job is a
     program file in the include directory its configuration names, applied
@@ -11362,10 +11415,14 @@ class _NodeManager:
         self.update_asked = True
         self.check_due = time.monotonic() + NODE_UPDATE_FIRST_CHECK_SECONDS
         self.restart_self = False
+        # What it prints, kept for this node's log in the store.
+        self.log = _NodeLogTail()
 
     def say(self, message: str) -> None:
-        sys.stderr.write(f"[capabilities node {self.here}] {message}\n")
+        line = f"[capabilities node {self.here}] {message}"
+        sys.stderr.write(line + "\n")
         sys.stderr.flush()
+        self.log.add(line)
 
     def say_once(self, key: str, value: object, message: str) -> None:
         if key not in self.said or self.said[key] != value:
@@ -11701,11 +11758,15 @@ class _NodeManager:
             self.say_once("state", getattr(exc, "slug", type(exc).__name__),
                           f"cannot write this node's state: {getattr(exc, 'message', exc)}")
             return
+        lines = self.log.take()
         try:
             with conn.transaction():
                 _node_state_write(conn, self.here, _node_facts(), self.logins, self.sessions,
                                   sorted(self.folders), self.needed)
+                self.write_logs(conn, lines)
         except Exception as exc:
+            if lines is not None:
+                self.log.again()
             self.say_once("state", type(exc).__name__,
                           "cannot write this node's state: "
                           + " ".join(f"{type(exc).__name__}: {exc}".split())[:300])
@@ -11717,6 +11778,24 @@ class _NodeManager:
         if self.said.get("state") is not None:
             self.say("writes this node's state again")
         self.said["state"] = None
+
+    def write_logs(self, conn, lines: list[str] | None) -> None:
+        """Write this manager's own last lines under its folder's agent, where
+        new ones came, and, once the store has been read, drop the lines of
+        each service no longer placed here for an agent it serves."""
+        own = _folder_agent_id(self.root)
+        if own and lines is not None:
+            self.store.node_log_put(conn, own, self.here, self.store.NODE_LOG_MANAGER, lines,
+                                    secrets=_setting_secrets(self.setting)
+                                    if self.setting is not None else ())
+        if not self.read_once:
+            return
+        for agent_id in sorted(set(self.folders) | ({own} if own else set())):
+            kept = {capability for placed_agent, capability in self.placed
+                    if placed_agent == agent_id}
+            if agent_id == own:
+                kept.add(self.store.NODE_LOG_MANAGER)
+            self.store.node_logs_prune(conn, agent_id, self.here, sorted(kept))
 
     def manager_target(self) -> str | None:
         """The file the manager on PATH runs now, through its link."""
@@ -12478,6 +12557,7 @@ class _SuperviseStore:
     def __init__(self, root: Path):
         self.root = root
         self.conn = None
+        self.setting = None
         self._migrated = False
 
     def _migrate(self, conn, db) -> None:
@@ -12493,7 +12573,7 @@ class _SuperviseStore:
                                     "the shared database library capabilities-contract "
                                     "is not installed") from None
         try:
-            setting = db.resolve_setting(self.root)
+            setting = self.setting = db.resolve_setting(self.root)
         except db.DbError as exc:
             state = ("unavailable" if exc.slug in SUPERVISE_STORE_SETTING_SLUGS
                      else "unreachable")
@@ -12691,6 +12771,17 @@ class _SuperviseInstance(_SuperviseStore):
             self.maybe_written = True
         return found
 
+    def log(self, capability: str, lines: list[str]) -> dict:
+        """Replace this service's last lines on this node in
+        capabilities_node_logs, which outlive the supervisor: the node's
+        manager drops them once the service is no longer placed here."""
+        def work(conn):
+            secrets = _setting_secrets(self.setting) if self.setting is not None else ()
+            return {"logged": _store_module().node_log_put(conn, self.project, self.node,
+                                                           capability, lines,
+                                                           secrets=secrets)}
+        return self._run(work)
+
     def drop(self, capability: str) -> dict:
         if not self.maybe_written:
             return {"dropped": False}
@@ -12761,17 +12852,21 @@ def _supervise_child_preexec() -> None:
             pass
 
 
-def _supervise_relay_stderr(stream, tail: list) -> None:
+def _supervise_relay_stderr(stream, tail: list, log: "_NodeLogTail | None" = None) -> None:
     """Pass the service's stderr through unchanged, keeping its last lines so
-    a refusal can be reported in the service's own words."""
+    a refusal can be reported in the service's own words, and in `log`, this
+    node's log in the store."""
     for raw in iter(stream.readline, b""):
         try:
             sys.stderr.buffer.write(raw)
             sys.stderr.flush()
         except (OSError, ValueError):
             pass
-        tail.append(raw.decode("utf-8", "replace").rstrip("\n"))
+        line = raw.decode("utf-8", "replace").rstrip("\n")
+        tail.append(line)
         del tail[:-20]
+        if log is not None:
+            log.add(line)
     stream.close()
 
 
@@ -12914,10 +13009,14 @@ class _Supervisor:
         self.probe: dict | None = None
         self.probe_at: float | None = None
         self.failure: dict | None = None
+        # What it and its service print, kept for this node's log in the store.
+        self.log = _NodeLogTail()
 
     def say(self, message: str) -> None:
-        sys.stderr.write(f"[capabilities supervise {self.name}] {message}\n")
+        line = f"[capabilities supervise {self.name}] {message}"
+        sys.stderr.write(line + "\n")
         sys.stderr.flush()
+        self.log.add(line)
 
     def say_once(self, key: object, message: str) -> None:
         if key != self.said:
@@ -13032,7 +13131,7 @@ class _Supervisor:
         import threading
         self.stderr_tail = []
         self.relay = threading.Thread(target=_supervise_relay_stderr,
-                                      args=(self.child.stderr, self.stderr_tail),
+                                      args=(self.child.stderr, self.stderr_tail, self.log),
                                       daemon=True)
         self.relay.start()
         self.child_started = time.monotonic()
@@ -13197,6 +13296,9 @@ class _Supervisor:
                      f"{found['error'].get('message')}" if failing
                      else "records what runs here in the store again")
         self.instance_failing = failing
+        lines = self.log.take()
+        if lines is not None and "logged" not in self.instance.log(self.name, lines):
+            self.log.again()
 
     def probe_if_due(self) -> bool:
         """Ask the running service's declared doctor whether it can do its work,
@@ -13498,8 +13600,10 @@ class _MachineSupervisor(_Supervisor):
         self.served: dict[str, dict] = {}
 
     def say(self, message: str) -> None:
-        sys.stderr.write(f"[capabilities supervise {self.name} --machine] {message}\n")
+        line = f"[capabilities supervise {self.name} --machine] {message}"
+        sys.stderr.write(line + "\n")
         sys.stderr.flush()
+        self.log.add(line)
 
     def environment(self) -> dict:
         """A machine process belongs to no project: it is handed none."""
@@ -13720,11 +13824,16 @@ class _MachineSupervisor(_Supervisor):
         return row
 
     def write_instance(self) -> None:
+        # The one process's lines go to every agent that places it here.
+        lines = self.log.take()
         for agent_id in sorted(set(self.agents) | set(self.instances)):
             instance = self.instances.get(agent_id)
             if instance is None:
                 instance = self.instances[agent_id] = _SuperviseInstance(
                     self.root, agent_id, self.node)
+            if lines is not None and agent_id in self.agents \
+                    and "logged" not in instance.log(self.name, lines):
+                self.log.again()
             row = self.agent_row(agent_id)
             found = instance.drop(self.name) if row is None else instance.put(self.name, row)
             failing = (found.get("error") or {}).get("code")
@@ -14335,6 +14444,7 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         sessions = store.node_sessions(conn, agent_id, ids)
         words = store.node_expectations(conn, agent_id, ids)
         runs = {r["node"]: r for r in store.node_updates(conn, ids)}
+        logs = store.node_logs(conn, agent_id, ids)
         placed = conn.execute(
             "SELECT node, capability FROM capabilities_policy WHERE agent_id = %s "
             "AND node = ANY (%s) AND enabled AND service", (agent_id, ids)).fetchall()
@@ -14356,6 +14466,9 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
                                  for s in sessions if s["node"] == node["node"]]
             _node_expected(entry, node["node"], words,
                            {c for n, c in placed if n == node["node"]})
+            entry["logs"] = [{"source": r["source"], "lines": r["lines"],
+                              "captured_at": store._stamp(r["captured_at"])}
+                             for r in logs if r["node"] == node["node"]]
             out.append(entry)
         return agent_id, out
     (agent_id, nodes), setting = _kernel_run(root, read)
