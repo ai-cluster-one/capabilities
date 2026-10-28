@@ -29,14 +29,19 @@ be served at all, and while it may not it asks and starts nothing for it.
 It wakes when the store's change versions say a task became claimable, which
 it reads about once a second, at every poll, at the earliest moment a pickup or
 a lease falls due, and when one of its own turns claims or ends. A store
-without the versions leaves it the poll. It listens for nothing.
+without the versions leaves it the poll. Where the store's two addresses are
+named apart, the connection it holds also listens on the channels the versions
+are followed on, and a notification reads them at once rather than at the end
+of the second; a notification lost costs only that second.
 
 On the connection it holds it keeps, for each project it serves, the lock that
 says a service serves that project, which another project reads before it
-assigns a task there; it goes with the connection.
+assigns a task there; it goes with the connection. A transaction-only store
+keeps no lock, and the host says it by its row alone.
 
 It holds one connection to the store, the session connection the lock is on and
-the versions are read on, and puts the questions of each pass on a transaction
+the versions are read on - a transaction connection on a transaction-only
+store - and puts the questions of each pass on a transaction
 connection opened for that
 pass and closed at its end, each question cut off by the store when it runs
 past `QUESTION_TIMEOUT_SECONDS`. A question or a round trip whose answer is not
@@ -103,6 +108,7 @@ import contextlib
 import datetime
 import json
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -469,6 +475,8 @@ class Store:
         # The host whose connection entry opens this store's connections.
         self.host = host
         self.listener = None
+        # Whether the listener also listens for the store's notifications.
+        self.hears = False
         self.listen_error: str | None = None
         # While there is no listener: when to ask for one again, and how long
         # the wait after that attempt will be if it fails too.
@@ -1765,6 +1773,8 @@ class Dispatcher:
             store.listen_error = why
             self._relisten_later(store)
             return
+        hears = getattr(store.host, "hears", None)
+        store.hears = bool(hears is not None and hears(store.listener))
         store.opened()
         store.listener_pinged = store.presence_renewed = time.monotonic()
         for slot in self.on(store):
@@ -1824,13 +1834,31 @@ class Dispatcher:
             with contextlib.suppress(Exception):
                 store.listener.close()
         store.listener = None
+        store.hears = False
 
     def wait(self, seconds: float) -> None:
-        """Sleep `seconds`, then read every held store's change versions. What
-        moved is handed only to the slot whose project and schema it names; a
-        move for another project or another schema on the same database is no
-        wake."""
-        time.sleep(seconds)
+        """Sleep `seconds`, or less when a listener that listens for the store's
+        notifications hears one, then read every held store's change versions.
+        What moved is handed only to the slot whose project and schema it
+        names; a move for another project or another schema on the same
+        database is no wake."""
+        hearing = [store for store in self.stores()
+                   if store.hears and store.listener is not None]
+        # One that arrived while the listener carried a round trip wakes at once.
+        if not any([store.host.heard(store.listener) for store in hearing]):
+            sockets = []
+            for store in hearing:
+                with contextlib.suppress(Exception):
+                    sockets.append(store.listener.pgconn.socket)
+            started = time.monotonic()
+            try:
+                if not sockets:
+                    raise ValueError("no socket to wait on")
+                select.select(sockets, [], [], seconds)
+            except (OSError, ValueError):
+                time.sleep(max(0.0, seconds - (time.monotonic() - started)))
+            for store in hearing:
+                store.host.heard(store.listener)
         for store in self.stores():
             if store.listener is not None:
                 self._follow(store)

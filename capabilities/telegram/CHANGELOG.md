@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-28 — `migrate` works on a store reached through a transaction pooler alone
+
+`telegram migrate` and `telegram migrate status` apply and read the harness runner's profile table on a transaction connection, so a store whose one address is a transaction pooler (such as Supabase's on port 6543) is migrated and reported as any other; before, that step opened a session connection, which such a store refuses. Declares `capabilities-contract>=0.33,<1`.
+
 ## 2026-10-27 — A call recording fetches ffmpeg before it joins the call, so the first one on a machine without ffmpeg is captured
 
 PyTgCalls writes a recording's capture through `ffmpeg` on PATH from the moment the call is joined, so where the machine had no ffmpeg the first recording failed at the join, before anything had fetched it. Every recording - the service's incoming calls and group calls, and `call_recorder` on a chat, with `--watch-groups` and with `--listen` - now fetches ffmpeg into `$XDG_STATE_HOME/telegram/programs/ffmpeg` before it joins, where none is on PATH, and the capture runs on that copy. The first such recording waits for the fetch; later ones find the copy. Where ffmpeg is on PATH nothing changes.

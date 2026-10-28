@@ -584,6 +584,113 @@ def test_a_running_daemon_is_seen_as_serving_its_project(project, store):
 
 
 @needs_store
+def test_on_a_transaction_only_store_the_daemon_serves_by_its_row_alone(
+        project, store, capsys, monkeypatch):
+    """A store reached through a transaction pooler alone keeps no session: the
+    daemon holds a transaction connection, says it serves the project by a row
+    naming no session and takes no lock, and still wakes by the versions."""
+    from capabilities_contract import db
+    entry, schema, conn = store
+    setting = _cli.transaction_only(_cli.store_setting(schema))
+    assert setting.has_session_address is False
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False, root=None: setting)
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+
+    def serving() -> bool:
+        with mod._connect(entry) as conn, conn.cursor() as cur:
+            return mod._serving(cur, HERE)
+
+    def rows() -> list:
+        return conn.execute(f"select project_id, lock_pid, expires_at > now() as live "
+                            f"from {schema}.tasks_presences").fetchall()
+
+    def locks() -> int:
+        return conn.execute("select count(*) from pg_locks where locktype = 'advisory' "
+                            "and classid = %s::oid", (mod._PRESENCE_CLASS,)).fetchone()[0]
+
+    with Harness(project, entry, setting=setting) as h:
+        h.dispatcher.step()
+        listener = h.daemon.store.listener
+        assert listener is not None and h.daemon.store.listen_error is None
+        # A transaction connection, which refuses a session lock before sending it.
+        with pytest.raises(db.DbError) as caught:
+            listener.execute("select pg_advisory_lock(1)")
+        assert caught.value.slug == "session_state"
+        assert rows() == [(HERE, None, True)] and locks() == 0 and serving() is True
+        assert h.daemon.status()["notification"]["listening"] is True
+        assert h.daemon.status()["wake_by"] == "notification"
+        add(entry, capsys, "alpha")
+        took = h.steps(lambda: h.running("alpha") == 1, seconds=5)
+        assert took < 3 and "notify" in h.daemon.last_wake["reasons"]
+        conn.execute(f"update {schema}.tasks_presences set expires_at = now()")
+        h.dispatcher._ping(time.monotonic() + h.service.PRESENCE_RENEW_SECONDS)
+        assert rows() == [(HERE, None, True)]
+    assert rows() == [] and serving() is False
+
+
+@needs_store
+def test_where_the_two_addresses_are_apart_the_daemon_wakes_on_the_notification(
+        project, store, capsys, monkeypatch):
+    """The held connection also listens, so a change ends the wait at once
+    rather than at its end; the lock and the row are as before."""
+    import dataclasses
+    entry, schema, conn = store
+    base = _cli.store_setting(schema)
+    setting = dataclasses.replace(base, transaction_host=base.host,
+                                  transaction_port=base.port)
+    assert setting.has_transaction_address and setting.has_session_address
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False, root=None: setting)
+    write_settings(project, "version = 1\npoll_seconds = 3600\n")
+    with Harness(project, entry, setting=setting) as h:
+        h.dispatcher.step()
+        listener = h.daemon.store.listener
+        assert h.daemon.store.hears is True
+        assert sorted(row["c"] for row in listener.execute(
+            "select pg_listening_channels() as c").fetchall()) == sorted(
+            [mod.CLAIMABLE_CHANNEL, mod.DECLARATION_CHANNEL, mod.LINES_CHANNEL])
+        pid = listener.execute("select pg_backend_pid() as p").fetchone()["p"]
+        assert conn.execute(f"select lock_pid from {schema}.tasks_presences").fetchall() == [
+            (pid,)]
+        for _ in range(3):
+            h.dispatcher.wait(0.2)
+        started = time.monotonic()
+        h.dispatcher.wait(0.6)
+        assert time.monotonic() - started >= 0.5
+        add(entry, capsys, "alpha")
+        started = time.monotonic()
+        h.dispatcher.wait(5.0)
+        assert time.monotonic() - started < 1.0
+        assert "notify" in h.daemon.wakes
+
+
+@needs_store
+def test_a_transaction_only_store_is_migrated_on_transaction_connections(
+        project, monkeypatch):
+    """`migrate` brings the harness library's profile table up on a transaction
+    connection, as every command brings this capability's tables up."""
+    import psycopg
+    from capabilities_contract import db
+    schema = "tasks_test_" + secrets.token_hex(4)
+    setting = _cli.transaction_only(_cli.store_setting(schema))
+    monkeypatch.setattr(db, "resolve_setting", lambda root, **kwargs: setting)
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False, root=None: setting)
+    monkeypatch.setattr(mod, "SCHEMA", schema)
+    try:
+        mod._migrate_profile_tables()
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            assert conn.execute("select to_regclass(%s) is not null",
+                                (f"{schema}.harness_profiles",)).fetchone()[0]
+        with mod._connect({"allow_write": True}):
+            pass
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            assert conn.execute("select to_regclass(%s) is not null",
+                                (f"{schema}.tasks_presences",)).fetchone()[0]
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f"drop schema if exists {schema} cascade")
+
+
+@needs_store
 def test_a_task_moved_to_todo_or_given_a_new_pickup_is_announced(project, store, capsys):
     entry, schema, conn = store
     tid = add(entry, capsys, "alpha", status="draft")

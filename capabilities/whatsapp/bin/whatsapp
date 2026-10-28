@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.22,<1",
+#     "capabilities-contract>=0.33,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -8504,7 +8504,9 @@ class _ServiceDaemon:
         account: poll the account's `whatsapp_outbox` version on the session's
         own store connection, at most once every FOLLOW_INTERVAL_SECONDS, and
         answer how long until the next poll is due. A poll that fails is taken
-        again at the next; the sender's tick stands behind it."""
+        again at the next; the sender's tick stands behind it. Where the store
+        names its two addresses apart, the loop's wait also listens for the
+        version's notification, and a notified wait polls at once."""
         now = time.monotonic()
         if self.followed_at is not None \
                 and now - self.followed_at < FOLLOW_INTERVAL_SECONDS:
@@ -8639,7 +8641,16 @@ class _ServiceDaemon:
                     with contextlib.suppress(Exception):
                         connected = bool(session._client.is_connected)
                     self.publish(connected=connected, **self.track(session))
-                if self.wake.wait(min(SERVICE_TICK, follow_in)):
+                wait = min(SERVICE_TICK, follow_in)
+                if self.follower is not None and db is not None \
+                        and db.setting.has_transaction_address:
+                    # The store's notification cuts the wait short too, and
+                    # the outbox is polled at once rather than at its interval.
+                    if self.follower.wait(wait, self.wake):
+                        self.followed_at = None
+                        self.wake.set()
+                    wait = 0
+                if self.wake.wait(wait):
                     self.wake.clear()
         except _Refusal as refusal:
             self.last_error = f"{refusal.code}: {refusal.message}"
@@ -8769,6 +8780,9 @@ class _ServiceDaemon:
             code = self.loop()
             return code
         finally:
+            if self.follower is not None:
+                # Its listener, where it holds one.
+                self.follower.close()
             if self.dialogue is not None:
                 if getattr(self.dialogue, "jobs", None) is not None:
                     with contextlib.suppress(Exception):

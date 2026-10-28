@@ -144,3 +144,51 @@ def test_a_scheduler_that_follows_holds_one_connection_to_its_store(runtime):
         scheduler.close()
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+@needs_store
+def test_a_saved_definition_cuts_the_schedulers_sleep_short(runtime):
+    """Where the store names its two addresses apart, the scheduler's sleep
+    between ticks ends as soon as the store notifies a saved definition, and
+    the link polls at its next ask; the listener goes with the link."""
+    import dataclasses
+    import threading
+    import time
+    import psycopg
+    schema = "automations_links_" + uuid.uuid4().hex[:8]
+    setting = _setting(schema)
+    apart = dataclasses.replace(setting, transaction_port=setting.port)
+    scheduler = runtime.StoreLink(apart, follow=True).open()
+    try:
+        assert runtime.wait_for_changes([scheduler], 0.2) is False  # opens the listener
+        scheduler._polled_at = time.monotonic()
+
+        def save() -> None:
+            time.sleep(0.5)
+            with psycopg.connect(DSN, autocommit=True) as writer:
+                writer.execute(f'SET search_path TO "{schema}"')
+                writer.execute("INSERT INTO automations_definitions (project_id, slug, "
+                               "script_path) VALUES ('prj_a', 'kept', 'job.py')")
+
+        writer = threading.Thread(target=save)
+        began = time.monotonic()
+        writer.start()
+        assert runtime.wait_for_changes([scheduler], 20.0) is True
+        assert time.monotonic() - began < 10.0
+        writer.join()
+        assert scheduler._polled_at is None
+        assert scheduler.take_changed("prj_a") is True
+    finally:
+        scheduler.close()
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            deadline = time.monotonic() + 5.0
+            while True:
+                listening = admin.execute(
+                    "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                    "AND application_name = %s AND query ILIKE 'LISTEN%%'",
+                    (runtime.LEDGER_OWNER,)).fetchone()
+                if listening == (0,) or time.monotonic() > deadline:
+                    break
+                time.sleep(0.1)
+            admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+    assert listening == (0,)

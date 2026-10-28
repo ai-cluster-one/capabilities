@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.33,<1",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.10.1",
@@ -1793,7 +1793,9 @@ def _follow_held(cfg: dict, rooms: set | None):
     version of the channel the store raises on each change to them, once every
     WATCH_HELD_SECONDS on the store's own connection, and read the held wakes
     again when it moved, printing a `held` line for each room where they
-    changed. No session is held for it. Answers (held_of, start) - held_of(room_id)
+    changed. Where the store names its two addresses apart the follower also
+    listens on a session connection of its own, so a change is polled at once;
+    otherwise no session is held for it. Answers (held_of, start) - held_of(room_id)
     is what is known now - or None where no store is read here."""
     store, project, _why = _held_store()
     if store is None:
@@ -1838,17 +1840,20 @@ def _follow_held(cfg: dict, rooms: set | None):
         # is already past the follower, so the reread stays owed until one
         # succeeds.
         owed = False
-        while True:
-            time.sleep(WATCH_HELD_SECONDS)
-            try:
-                if store.poll(follower) or owed:
-                    owed = True
-                    reread()
-                    owed = False
-            except _WatchStopped:
-                return
-            except Exception:
-                continue
+        try:
+            while True:
+                follower.wait(WATCH_HELD_SECONDS)
+                try:
+                    if store.poll(follower) or owed:
+                        owed = True
+                        reread()
+                        owed = False
+                except _WatchStopped:
+                    return
+                except Exception:
+                    continue
+        finally:
+            follower.close()
 
     def start() -> None:
         threading.Thread(target=run, name="watch-held", daemon=True).start()

@@ -275,6 +275,49 @@ def test_a_pass_of_an_earlier_release_and_this_one_keep_each_other_out(store):
         new.close()
 
 
+def test_on_a_transaction_only_store_a_pass_holds_its_lease_alone(store, monkeypatch):
+    """A store reached through a transaction pooler alone opens no session
+    connection: a pass takes no advisory lock and keeps a second pass out by
+    its lease row alone, and stays out while an earlier release holds its
+    session lock for the project, read from the store's lock table."""
+    from capabilities_contract import db
+    from _cli import dsn_url
+    monkeypatch.setattr(db.Setting, "has_session_address", property(lambda self: False))
+    opened = []
+    connect = db.connect
+
+    def recording(*args, **kwargs):
+        opened.append(kwargs.get("transaction", False))
+        return connect(*args, **kwargs)
+
+    monkeypatch.setattr(db, "connect", recording)
+    one = E.Store(store.setting, session=True).open()
+    other = E.Store(store.setting, session=True).open()
+    advisory = ("SELECT count(*) AS n FROM pg_locks l JOIN pg_database d ON d.oid = l.database "
+                "WHERE l.locktype = 'advisory' AND d.datname = current_database()")
+    take = ("SELECT pg_try_advisory_lock(hashtext('memory groom ' || %s), hashtext(%s))")
+    try:
+        assert opened == [True, True] and not one.session and not other.session
+        assert one.try_groom_lock(P, 600, node="node-a")
+        [lease] = store.rows("SELECT * FROM memory_groom_leases")
+        assert lease["project_id"] == P and lease["lock_pid"] is None
+        assert store.one(advisory)["n"] == 0
+        assert not other.try_groom_lock(P, 600)
+        one.groom_unlock(P)
+        assert store.rows("SELECT * FROM memory_groom_leases") == []
+        with psycopg.connect(dsn_url(), autocommit=True) as earlier:
+            assert earlier.execute(take, (store.schema, P)).fetchone()[0]
+            assert not other.try_groom_lock(P, 600)
+            assert store.rows("SELECT * FROM memory_groom_leases") == []
+            assert other.try_groom_lock(OTHER, 600)
+            other.groom_unlock(OTHER)
+        assert other.try_groom_lock(P, 600)
+        other.groom_unlock(P)
+    finally:
+        one.close()
+        other.close()
+
+
 def test_adopt_carries_once_per_key(store):
     import datetime as dt
     when = dt.datetime(2026, 9, 14, 0, 1, tzinfo=dt.timezone.utc)

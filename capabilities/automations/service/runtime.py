@@ -1042,8 +1042,11 @@ class StoreLink:
     raises for a project on every definition of it saved or removed: when a
     project asks whether it changed, it polls them, at most once every
     FOLLOW_INTERVAL_SECONDS of the library, in one query on the link's own
-    connection, so following holds no second one, and collects the projects
-    whose version moved in `changed`. Its first poll is
+    connection, and collects the projects whose version moved in `changed`.
+    Where the store names its two addresses apart, the follower also listens
+    on a session connection of its own, so a saved definition cuts the
+    scheduler's sleep short (`wait_for_changes`); a transaction-only store
+    holds no second connection. Its first poll is
     taken when it opens, before any definition is read, and is only where it
     starts from. `generation` moves on every open, so every project on the
     link reads its definitions again after the link was down. A poll that
@@ -1145,6 +1148,9 @@ class StoreLink:
                 self.conn.close()
             self.conn = None
         self.in_transaction = False
+        if self.follower is not None:
+            # Its listener, if it holds one; the versions it read stay.
+            self.follower.close()
 
     def lost(self) -> bool:
         """Whether the connection is gone, so the next statement cannot succeed
@@ -1154,6 +1160,44 @@ class StoreLink:
     def reopen(self) -> None:
         self.close()
         self.open()
+
+
+def wait_for_changes(links: Sequence["StoreLink"], seconds: float) -> bool:
+    """Sleep `seconds` between passes, cut short as soon as a link whose store
+    names its two addresses apart is notified of a changed definition; that
+    link then polls at its next ask rather than at its next interval. A
+    follower that cannot listen waits out the time, so a lost notification
+    costs no more than the sleep."""
+    listening = [link for link in links if link.follower is not None
+                 and link.setting is not None and link.setting.has_transaction_address]
+    if not listening:
+        time.sleep(seconds)
+        return False
+    if len(listening) == 1:
+        noticed = listening[0].follower.wait(seconds)
+    else:
+        import threading
+        woke = threading.Event()
+        found: list = []
+
+        def one(link: "StoreLink") -> None:
+            if link.follower.wait(seconds, woke):
+                found.append(link)
+                woke.set()
+
+        threads = [threading.Thread(target=one, args=(link,), name="automations-wake",
+                                    daemon=True) for link in listening]
+        for thread in threads:
+            thread.start()
+        woke.wait(seconds)
+        woke.set()
+        for thread in threads:
+            thread.join()
+        noticed = bool(found)
+    if noticed:
+        for link in listening:
+            link._polled_at = None
+    return noticed
 
 
 class RunLedger:
@@ -2303,7 +2347,7 @@ class Daemon:
                     self.reload_requested = False
                     self.reload_declaration(fingerprint_path)
                 self.tick()
-                time.sleep(self.config["engine"]["tick_seconds"])
+                wait_for_changes([self.runs.link], self.config["engine"]["tick_seconds"])
         finally:
             self.shutdown()
             pid_path.unlink(missing_ok=True)
@@ -2687,7 +2731,7 @@ class MachineService:
                     self.reload_requested = False
                     self.reload()
                 self.step()
-                time.sleep(self.sleep_seconds())
+                wait_for_changes(list(self.links.values()), self.sleep_seconds())
         finally:
             self.shutdown()
             for link in self.links.values():

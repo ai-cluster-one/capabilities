@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.25,<1",
+#     "capabilities-contract>=0.33,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -8392,8 +8392,9 @@ def cmd_node_sync(args):
 
 # Run inside the node's container, in its project root, through the same library
 # and cascade every capability there resolves its database with: the setting in
-# force with its secrets redacted, whether it connects, and whether the server
-# refuses the same connection without TLS.
+# force with its secrets redacted, whether it connects on a transaction
+# connection, which a store reached through a transaction pooler alone serves,
+# and whether the server refuses the same connection without TLS.
 _NODE_DATABASE_PROBE = """
 import json, os
 import psycopg
@@ -8406,7 +8407,8 @@ except db.DbError as exc:
 else:
     out.update(configured=True, setting=setting.report())
     try:
-        db.connect(application_name="deployment-node-status", setting=setting).close()
+        db.connect(application_name="deployment-node-status", setting=setting,
+                   transaction=True).close()
         out["reachable"] = True
     except db.DbError as exc:
         out["error"] = {"code": exc.slug, "message": exc.message}

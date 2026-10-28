@@ -79,6 +79,27 @@ def store_setting(schema: str, *, host: str | None = None, port: int | None = No
                       **_where(host, port))
 
 
+# A transaction-only store, as a store whose one address is a known transaction
+# pooler reads to the connection library: no session address, so a session
+# connection to it is refused before anything is sent, while a transaction
+# connection reaches the throwaway database behind it.
+POOLER = ("aws-0-<region>.pooler.supabase.com", 6543)
+
+
+def transaction_only(setting):
+    """`setting` as a transaction-only store."""
+    import dataclasses
+
+    from capabilities_contract import db
+
+    class TransactionOnly(db.Setting):
+        def _transaction_pooler_endpoint(self):
+            return POOLER
+
+    return TransactionOnly(**{one.name: getattr(setting, one.name)
+                              for one in dataclasses.fields(setting)})
+
+
 def bind_store(mod, monkeypatch, schema: str, **where):
     """Make `schema` of the throwaway database the store every verb called in
     this process reaches, as `main` makes the machine's store the one it does."""

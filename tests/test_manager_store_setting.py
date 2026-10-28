@@ -420,6 +420,8 @@ def test_show_reports_the_machine_level_without_its_secret(tmp_path):
     assert payload["in_force"] == "machine"
     assert payload["setting"] == {
         "level": "machine", "sources": [str(_family(env))], "schema": "agentkit",
+        "addresses": {"transaction": {"host": "db.example.test", "port": 6543},
+                      "session": {"host": "db.example.test", "port": 6543}},
         "host": "db.example.test", "port": 6543, "database": "app", "user": "agent",
         "sslmode": "require", "sslrootcert": None, "password": "***"}
     assert payload["levels"]["machine"]["setting"] == payload["setting"]
@@ -688,6 +690,88 @@ def test_the_environment_level_names_a_transaction_address(tmp_path):
     assert "AGENTKIT_DB_TRANSACTION_PORT" in payload["setting"]["sources"]
 
 
+# --- the session address ---------------------------------------------------------
+
+# A placeholder in the shape of Supabase's pooler host; nothing here dials it.
+POOLER = "aws-0-test-region.pooler.supabase.com"
+
+
+def test_set_names_a_session_address_in_the_files_existing_form(tmp_path):
+    """--host/--port is the store's address; --session-port names the session
+    address apart, written as the address with the store's as the transaction
+    address - the file the older --transaction-port form wrote."""
+    env = _env(tmp_path)
+    payload = _ok(_set(env, "--port", "6543", "--session-port", "5432"))
+    written = _written(env)
+    assert (written["host"], written["port"], written["transaction_port"]) == (
+        "db.example.test", 5432, 6543)
+    assert "transaction_host" not in written
+    assert payload["setting"]["addresses"] == {
+        "transaction": {"host": "db.example.test", "port": 6543},
+        "session": {"host": "db.example.test", "port": 5432}}
+    older = _env(tmp_path / "older")
+    _ok(_set(older, "--transaction-port", "6543"))
+    assert _written(older) == written
+    _ok(_set(env, "--session-host", "session.example.test"))
+    written = _written(env)
+    assert (written["host"], written["port"], written["transaction_host"]) == (
+        "session.example.test", 5432, "db.example.test")
+    assert "transaction_port" not in written
+    read = _library_reads(env)
+    assert read.transaction_kwargs()["host"] == "db.example.test"
+    assert read.has_session_address is True
+
+
+@pytest.mark.parametrize("args", [
+    ("--session-port", "5432", "--transaction-port", "6543"),
+    ("--session-host", "s.example.test", "--transaction-host", "t.example.test"),
+    ("--session-host", "s.example.test", "--transaction-port", "6543")])
+def test_set_refuses_session_and_transaction_flags_together(tmp_path, args):
+    env = _env(tmp_path)
+    result = _set(env, *args)
+    _no_secret(result)
+    assert result.returncode == 6 and _error(result)["code"] == "input"
+    assert _nothing_written(env)
+
+
+def test_set_accepts_a_transaction_pooler_as_the_one_address(tmp_path):
+    env = _env(tmp_path)
+    payload = _ok(_manager(env, "store", "set", "--host", POOLER, "--port", "6543",
+                           "--database", "postgres", "--user", "postgres.ref",
+                           "--password-stdin", stdin=PASSWORD + "\n"))
+    assert not {"transaction_host", "transaction_port"} & set(_written(env))
+    assert payload["setting"]["addresses"] == {
+        "transaction": {"host": POOLER, "port": 6543}, "session": None}
+    shown = _ok(_manager(env, "store", "show"))
+    assert shown["setting"]["addresses"] == payload["setting"]["addresses"]
+    assert shown["levels"]["machine"]["setting"]["addresses"]["session"] is None
+    read = _library_reads(env)
+    assert read.has_session_address is False and read.has_transaction_address is False
+
+
+def test_doctor_says_a_transaction_only_store_has_no_session_address(tmp_path):
+    """The pooler's name is given with a loopback hostaddr, so nothing leaves
+    this machine; nothing answers there, and the checks that dial fail. What is
+    under test is which addresses the doctor proves and what it says."""
+    env = _env(tmp_path)
+    url = (f"postgresql://agent@{POOLER}:6543/app?hostaddr=127.0.0.1"
+           "&sslmode=require&connect_timeout=2")
+    result = _manager(env, "store", "doctor", extra={"AGENTKIT_DB_URL": url})
+    assert result.returncode == 7, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["addresses"]["session"] is None
+    assert payload["addresses"]["transaction"] == {"host": POOLER, "port": 6543}
+    assert "no session address" in payload["addresses"]["statement"]
+    assert "polling about every second" in payload["addresses"]["statement"]
+    session = payload["checks"]["session"]
+    assert session["ok"] is True and session["skipped"] is True
+    assert "no session address" in session["reason"]
+    assert "nothing needs a session" in session["reason"]
+    transaction = payload["checks"]["transaction"]
+    assert "skipped" not in transaction
+    assert (transaction["host"], transaction["port"]) == (POOLER, 6543)
+
+
 # --- doctor -----------------------------------------------------------------------
 
 def test_doctor_passes_when_tls_works_and_plain_text_is_refused(tmp_path, enforced):
@@ -864,6 +948,37 @@ def test_doctor_fails_when_the_transaction_address_does_not_answer(tmp_path, enf
     assert payload["checks"]["tls"]["ok"] is True
     check = payload["checks"]["transaction"]
     assert check["ok"] is False and check["error"].startswith("store_unreachable")
+
+
+def test_doctor_proves_the_one_address_as_the_session_address_too(tmp_path, enforced):
+    env = _env(tmp_path)
+    _set_cluster(env, enforced, "--schema", "lab")
+    payload = _ok(_manager(env, "store", "doctor"))
+    session = payload["checks"]["session"]
+    assert session["ok"] is True and session["tls"] is True
+    assert (session["host"], session["port"]) == (REMOTE_NAME, enforced.port)
+    assert "schema lab" in session["reason"]
+    assert payload["addresses"]["session"] == payload["addresses"]["transaction"]
+    assert payload["addresses"]["statement"].startswith(
+        f"the store has one address, {REMOTE_NAME}:{enforced.port}")
+
+
+def test_doctor_proves_a_session_address_named_apart(tmp_path, enforced):
+    """--host is the store's address, --session-host its session address: the
+    same server at two names, each proven by its own kind of connection."""
+    env = _env(tmp_path)
+    _set_cluster(env, enforced, "--session-host", REMOTE_NAME, host="localhost")
+    result = _manager(env, "store", "doctor")
+    _no_secret(result)
+    payload = _ok(result)
+    transaction, session = payload["checks"]["transaction"], payload["checks"]["session"]
+    assert transaction["ok"] is True and transaction["host"] == "localhost"
+    assert session["ok"] is True and session["tls"] is True
+    assert (session["host"], session["port"]) == (REMOTE_NAME, enforced.port)
+    statement = payload["addresses"]["statement"]
+    assert statement.startswith(f"transaction connections use localhost:{enforced.port}")
+    assert f"session address {REMOTE_NAME}:{enforced.port}" in statement
+    assert "2027-01-05" in statement
 
 
 def test_doctor_without_a_setting_is_not_found(tmp_path):

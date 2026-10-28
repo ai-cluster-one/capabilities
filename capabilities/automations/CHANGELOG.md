@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-10-28 — The scheduler wakes at once on a saved definition where the store names its transaction address apart
+
+The project service and the machine service still poll the `automations_changed` versions about once a second, and where the store names its transaction address apart (`AGENTKIT_DB_TRANSACTION_PORT` or `AGENTKIT_DB_TRANSACTION_HOST`) their sleep between ticks is also cut short by the store's notification, held on a session connection of the library's follower and closed when the service stops, so a saved definition is taken up at the next tick. A store reached through a transaction pooler alone holds no such connection and works as before; a lost notification costs only the second. Declares `capabilities-contract>=0.33,<1`.
+
 ## 2026-10-26 — A stored body runs from the shared contract's file named by its digest
 
 A `script_body` is written by `capabilities_contract.bodies.materialise`, the one piece the package uses to run a stored script body, to `<state root>/bodies/<sha256 of the body>`, mode 0700, written once and kept for every run of that body rather than written per run and removed after it. The script declares `capabilities-contract>=0.24`.

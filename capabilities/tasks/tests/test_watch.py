@@ -23,6 +23,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -96,6 +97,77 @@ def test_the_watch_follows_the_version_and_listens_for_nothing(monkeypatch):
         assert watch.conn.execute(
             "select count(*) as n from pg_listening_channels()").fetchone()["n"] == 0
         assert watch.follower is not None and watch.due
+    finally:
+        watch.close()
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f"drop schema {schema} cascade")
+
+
+def _insert_task(schema: str, project: str) -> None:
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"""insert into {schema}.tasks_tasks (project_id, type, unique_key,
+                                                            title, status)
+                         values (%s, 'chore', %s, 'a chore', 'todo')""",
+                     (project, uuid.uuid4().hex))
+
+
+@needs_store
+def test_on_a_transaction_only_store_the_watch_follows_on_a_transaction_connection(
+        monkeypatch):
+    import psycopg
+    from capabilities_contract import db
+    schema = "tasks_test_" + secrets.token_hex(4)
+    setting = _cli.transaction_only(_cli.store_setting(schema))
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False, root=None: setting)
+    monkeypatch.setattr(mod, "SCHEMA", schema)
+    project = "prj_" + uuid.uuid4().hex[:12]
+    monkeypatch.setattr(mod, "PROJECT", project)
+    _cli.make_tables(mod, schema)
+    watch = mod._Watch({"allow_write": True}, {})
+    try:
+        watch.open()
+        with pytest.raises(db.DbError) as caught:
+            watch.conn.execute("select pg_advisory_lock(1)")
+        assert caught.value.slug == "session_state" and watch.hears is False
+        assert mod._follow(watch.follower, watch.conn) == {}
+        _insert_task(schema, project)
+        assert (mod.WATCH_CHANNEL, project) in mod._follow(watch.follower, watch.conn)
+    finally:
+        watch.close()
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f"drop schema {schema} cascade")
+
+
+@needs_store
+def test_where_the_two_addresses_are_apart_the_watch_wakes_on_the_notification(
+        monkeypatch):
+    import dataclasses
+
+    import psycopg
+    schema = "tasks_test_" + secrets.token_hex(4)
+    base = _cli.store_setting(schema)
+    setting = dataclasses.replace(base, transaction_host=base.host,
+                                  transaction_port=base.port)
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False, root=None: setting)
+    monkeypatch.setattr(mod, "SCHEMA", schema)
+    project = "prj_" + uuid.uuid4().hex[:12]
+    monkeypatch.setattr(mod, "PROJECT", project)
+    _cli.make_tables(mod, schema)
+    watch = mod._Watch({"allow_write": True}, {})
+    watch.stdin = None
+    try:
+        watch.open()
+        assert watch.hears is True
+        assert [row["c"] for row in watch.conn.execute(
+            "select pg_listening_channels() as c").fetchall()] == [mod.WATCH_CHANNEL]
+        started = time.monotonic()
+        watch.pause(0.6)
+        assert time.monotonic() - started >= 0.5
+        _insert_task(schema, project)
+        started = time.monotonic()
+        watch.pause(5.0)
+        assert time.monotonic() - started < 1.0
     finally:
         watch.close()
         with psycopg.connect(DSN, autocommit=True) as conn:

@@ -414,6 +414,90 @@ def test_first_turns_starting_together_import_once_and_none_fails(lab):
 
 
 @needs_store
+def test_on_a_transaction_only_store_imports_starting_together_import_once(lab, monkeypatch):
+    """A transaction-only store holds no session lock: the import lock is the
+    transaction's, and an import that finds a file gone that the one before it
+    took passes over it, so still none fails and each worker is stored once."""
+    import threading
+    ok(save(lab, "default", "---\nenabled: false\n---\n"))
+    folder = lab["here"] / "capabilities" / "tasks" / "workers"
+    folder.mkdir()
+    (folder / "alpha.md").write_text(ALPHA)
+    (folder / "beta.md").write_text(ALPHA.replace("[alpha]", "[beta]"))
+    project = lab["here"]
+    monkeypatch.setattr(mod, "_project_root", lambda: project)
+    monkeypatch.setattr(mod, "_project_capabilities_dir", lambda root: root / "capabilities")
+    monkeypatch.setattr(mod, "_project_env", dict)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(lab["tmp"] / "config"))
+    for leaked in ("TASKS_EXECUTION", "CAPABILITIES_READ_ONLY"):
+        monkeypatch.delenv(leaked, raising=False)
+    setting = _cli.transaction_only(_cli.store_setting(lab["schema"]))
+    monkeypatch.setattr(mod, "_store_setting", lambda raising=False, root=None: setting)
+    monkeypatch.setattr(mod, "SCHEMA", lab["schema"])
+    monkeypatch.setattr(mod, "PROJECT", lab["ids"]["here"])
+    answers, failures = [], []
+
+    def one() -> None:
+        try:
+            answers.append(mod._import_worker_files(None, lab["ids"]["here"], True,
+                                                    raising=True))
+        except BaseException as exc:  # noqa: BLE001 - a thread's failure is the finding
+            failures.append(exc)
+
+    turns = [threading.Thread(target=one) for _ in range(4)]
+    for turn in turns:
+        turn.start()
+    for turn in turns:
+        turn.join(timeout=120)
+    assert failures == [] and [refused for _plan, refused in answers] == [[]] * 4
+    assert not folder.exists()
+    assert len(rows(lab, "alpha")) == 1 and len(rows(lab, "beta")) == 1
+    # A file listed and gone before it is read was taken by the import before.
+    monkeypatch.setattr(mod, "_unimported_worker_files", lambda: [folder / "gamma.md"])
+    assert mod._import_worker_files(None, lab["ids"]["here"], True, raising=True) == ([], [])
+
+
+@needs_store
+def test_doctor_warns_while_an_earlier_release_serves_by_the_presence_lock_alone(lab):
+    """A session holding the presence lock that no live row names is a service of
+    an earlier release: `doctor` names its machine as far as the store tells,
+    warns, and passes. A row naming the holder is a service of this release."""
+    import psycopg
+    here, schema = lab["ids"]["here"], lab["schema"]
+    rows_ = f"{schema}.tasks_presences"
+    assert "earlier tasks release" not in ok(cli(lab, "doctor")).get("warning", "")
+    with psycopg.connect(DSN, autocommit=True, application_name="tasks-earlier") as held:
+        pid = held.execute("select pg_backend_pid()").fetchone()[0]
+        held.execute("select pg_advisory_lock(%s, hashtext(%s))",
+                      (mod._PRESENCE_CLASS, mod._presence_key(schema, here)))
+        warning = ok(cli(lab, "doctor"))["warning"]
+        assert (f"an earlier tasks release still serves project {here} against this store, "
+                f"on the session {pid} from 127.0.0.1, application 'tasks-earlier', "
+                "connected since ") in warning
+        assert ("relies on a session lock retired on 2027-01-05; update tasks there before "
+                "then") in warning
+        # The row a service of this release writes names the session holding it.
+        held.execute(f"""insert into {rows_} (project_id, holder, node, lock_pid, expires_at)
+                         values (%s, gen_random_uuid(), 'node-a', %s,
+                                 now() + interval '3 minutes')""", (here, pid))
+        assert "earlier tasks release" not in ok(cli(lab, "doctor")).get("warning", "")
+        # A row naming no session - a service on a transaction-only store - does
+        # not stand for the holder, and the node running a tasks service for the
+        # project that no live row names is the machine.
+        held.execute(f"update {rows_} set lock_pid = null")
+        held.execute(f"""create table {schema}.capabilities_service_instances
+                             (project_id text, capability text, node text, host text)""")
+        held.execute(f"""insert into {schema}.capabilities_service_instances
+                         values (%s, 'tasks', 'node-a', null), (%s, 'tasks', 'node-b', 'box-b'),
+                                (%s, 'memory', 'node-c', null)""", (here, here, here))
+        warning = ok(cli(lab, "doctor"))["warning"]
+        assert (f"an earlier tasks release still serves project {here} against this store, "
+                "on node node-b (host box-b): it holds the presence advisory lock") in warning
+        assert "node-a" not in warning and "node-c" not in warning
+    assert "earlier tasks release" not in ok(cli(lab, "doctor")).get("warning", "")
+
+
+@needs_store
 def test_the_service_imports_clean_worker_files_as_it_loads(lab, monkeypatch, capsys):
     ok(save(lab, "default", "---\nenabled: false\n---\n"))
     assert ok(cli(lab, "service", "init"))["written"]

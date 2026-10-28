@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.22,<1",
+#     "capabilities-contract>=0.33,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -3542,12 +3542,13 @@ def _migrate_with_profile_tables(argv: list[str]) -> None:
     """`migrate [status]`, around the contract's own: the runner's profile
     table is applied first, under its ledger, on the same store, and both
     ledgers are reported - the register's at the top, the runner's under
-    `harness`."""
+    `harness`. It runs on a transaction connection, so a store reached through
+    a transaction pooler alone is migrated too."""
     owner, steps, major, minor = _profile_tables()
     from capabilities_contract import db
     conn = None
     try:
-        conn = db.connect(application_name=NAME)
+        conn = db.connect(application_name=NAME, transaction=True)
         if argv:
             found = db.status(conn, owner, steps, major=major, minor=minor)
             harness = {"owner": found.owner, "schema": found.schema, "state": found.state,

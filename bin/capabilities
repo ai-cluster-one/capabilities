@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.32.0,<1",
+#     "capabilities-contract>=0.33,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -350,26 +350,31 @@ STORE VERBS
   Within the project or environment level AGENTKIT_DB_URL, a postgresql://
   URL, wins over that level's separate keys; AGENTKIT_DB_SCHEMA and the
   transaction address apply beside it.
-  A store has one address unless the level in force also names a transaction
-  address (AGENTKIT_DB_TRANSACTION_HOST and AGENTKIT_DB_TRANSACTION_PORT, or
-  transaction_host and transaction_port in the file): the same store at
-  another endpoint, typically a transaction-mode pooler, with the level's own
-  credentials, database and schema; one naming only a port keeps the host.
-  Then only the processes that hold LISTEN - a service's listener, a watch -
-  connect to the address; every other connection - each command, the
-  records reader, a lease renewal, a service's questions - goes to the
-  transaction address and carries no session state. A hosted store with a
-  session-mode and a transaction-mode pooler on one host takes the session
-  pooler as its address and the transaction pooler's port as
-  --transaction-port; a known transaction pooler as the address itself is
-  refused (exit 6 transaction_pooler). An agent's records - its gate,
-  connections, grants, identifiers and settings - are files only until it
-  has moved into the store (see migrate); from then they are rows of the
-  contract's tables in the store, beside the tables each capability migrates
-  for itself. These verbs never create a table.
+  The store's transaction address is its main, required address: every
+  connection - each command, the records reader, a lease renewal, a
+  service's questions - goes there and carries no session state, and it is
+  always enough, a transaction-mode pooler included. A session address is
+  optional: the same store at another endpoint, with the level's own
+  credentials, database and schema, used only by the processes that hold
+  LISTEN - a service's listener, a watch - so a change is noticed at once
+  rather than by polling about every second, and, until 2027-01-05, for the
+  transitional session locks of tasks and memory. A store has one address,
+  serving both, unless the level in force names the two apart
+  (AGENTKIT_DB_TRANSACTION_HOST and AGENTKIT_DB_TRANSACTION_PORT, or
+  transaction_host and transaction_port in the file, beside the session
+  address as the address; one naming only a port keeps the host). A known
+  transaction pooler (a Supabase pooler host on port 6543) as the one
+  address is a transaction-only store: it has no session address, and
+  nothing needs one. A hosted store with a session-mode pooler beside it
+  may name that as --session-port (or --session-host). An agent's records -
+  its gate, connections, grants, identifiers and settings - are files only
+  until it has moved into the store (see migrate); from then they are rows
+  of the contract's tables in the store, beside the tables each capability
+  migrates for itself. These verbs never create a table.
   store set --host H --database D --user U [--port P]
             [--sslmode require|verify-ca|verify-full|disable]
             [--sslrootcert PATH|system] [--schema NAME]
+            [--session-host H] [--session-port P]
             [--transaction-host H] [--transaction-port P]
             (--password-stdin | --password-file PATH | --password-env KEY)
         Write the machine level: the setting file whole (a temporary file
@@ -385,12 +390,18 @@ STORE VERBS
         prefer are refused (exit 6 sslmode_too_weak). --schema names the
         schema the setting binds: a lowercase identifier, never public,
         information_schema or pg_* (exit 6 bad_schema_name); without it the
-        file names none and binds agentkit. --transaction-host and
-        --transaction-port name the store's transaction address (either one
-        alone keeps the other from the address); without them the store has
-        one address. Exit 4 under the read-only
-        switch. Answers as `store show` does for the current project, with
-        changed.
+        file names none and binds agentkit. --host and --port name the
+        store's transaction address, the main one, which every connection
+        but LISTEN and a session lock uses; --session-host and
+        --session-port name its optional session address apart (either one
+        alone keeps the other from the address), written in the file's
+        existing form: the session address as host and port, the store's
+        address as transaction_host and transaction_port. --transaction-host
+        and --transaction-port, the older form, name the transaction address
+        apart with --host and --port as the session address; the two forms
+        are not mixed (exit 6 input). Without either the store has one
+        address. Exit 4 under the read-only switch. Answers as `store show`
+        does for the current project, with changed.
   store show [--project PATH] [--json]
         Every level of the cascade for the current project, or for the
         project at PATH: what each level holds, its secrets redacted (a
@@ -401,8 +412,10 @@ STORE VERBS
         environment {answers, setting, error}, machine {path, exists,
         answers, setting, error}}}: setting is the library's report of the
         level in force {level, sources, schema, transaction {host, port}?,
+        addresses {transaction {host, port}, session {host, port} | null},
         url{...} | host, port, database, user, sslmode, sslrootcert,
-        password}; error {code,
+        password}, addresses naming the address each kind of connection
+        dials, session null for a transaction-only store; error {code,
         message, hint} names a level the library refuses. Output is always
         JSON, so --json changes nothing.
   store doctor [--project PATH] [--json]
@@ -418,14 +431,22 @@ STORE VERBS
         a working connection without TLS passes the tls check. A store
         that names a transaction address is also proven there: a transaction
         connection opened at it, over TLS unless sslmode is disable, runs a
-        transaction bound to the setting's schema; a store with one address
-        skips that check. Never prints a secret. JSON {ok, project,
-        in_force, setting, levels, sslmode, db_schema, checks {tls {ok,
-        server_version?, tls {version, cipher}?, reason?, error?},
-        plain_text_refused {ok, reason, skipped?}, schema {ok, name, exists,
-        reason}, transaction {ok, skipped?, host?, port?, tls?, reason?,
+        transaction bound to the setting's schema, and so is a
+        transaction-only store at its one address; a store with one address
+        that serves sessions too skips that check. The session address is
+        proven by a session connection bound to the setting's schema; a
+        transaction-only store skips that check, saying it has no session
+        address, notices changes by polling about every second and needs
+        none. addresses names the address each kind of connection uses and
+        says so in one sentence. Never prints a secret. JSON {ok, project,
+        in_force, setting, levels, sslmode, db_schema, addresses
+        {transaction {host, port}, session {host, port} | null, statement},
+        checks {tls {ok, server_version?, tls {version, cipher}?, reason?,
+        error?}, plain_text_refused {ok, reason, skipped?}, schema {ok, name,
+        exists, reason}, transaction {ok, skipped?, host?, port?, tls?,
+        reason?, error?}, session {ok, skipped?, host?, port?, tls?, reason?,
         error?}}}, setting and levels as `store show`.
-        Exit 0 when all four hold, 7 when any fails, 3 no_store_setting when
+        Exit 0 when every check holds, 7 when any fails, 3 no_store_setting when
         no level answers, 6 with the library's code when the level in force
         is refused.
   store unset
@@ -1849,8 +1870,9 @@ AUTHORING
         Without a topic, list manager guides with their titles, previews, and
         exact read commands. With a topic, print that guide's Markdown body.
         Start here for capability authoring, repositories, contract work,
-        development, review, sanitizing, and publishing, and for moving
-        agents from files to the database (migrate-to-database).
+        development, review, sanitizing, and publishing, for moving agents
+        from files to the database (migrate-to-database), and for a store on
+        Supabase (supabase).
 
 I/O CONTRACT
   Success: JSON on stdout, except the documented Markdown renderers
@@ -2068,7 +2090,8 @@ _AUTHORING_ASSETS = (
 )
 _MANAGER_GUIDE_TOPICS = (
     "authoring", "conforming", "contract", "dev", "grooming",
-    "migrate-to-database", "publishing", "reporting", "repositories", "sanitizing", "surfaces",
+    "migrate-to-database", "publishing", "reporting", "repositories", "sanitizing", "supabase",
+    "surfaces",
 )
 SKILL_ASSET = "skill/SKILL.md"
 # Each thing that ships keeps its own change log in its own home: a capability
@@ -15411,6 +15434,7 @@ STORE_VALUE_OPTIONS = {
     "--host": "host", "--port": "port", "--database": "database",
     "--user": "user", "--sslmode": "sslmode", "--sslrootcert": "sslrootcert",
     "--transaction-host": "transaction_host", "--transaction-port": "transaction_port",
+    "--session-host": "session_host", "--session-port": "session_port",
 }
 STORE_SCHEMA_OPTION = "--schema"
 STORE_PASSWORD_OPTIONS = ("--password-stdin", "--password-file", "--password-env")
@@ -15465,6 +15489,13 @@ def _store_set_args(args: list[str]) -> tuple[dict, tuple[str, str | None]]:
             _die(6, "input", f"{name} is given twice")
         else:
             values[STORE_VALUE_OPTIONS[name]] = value
+    if {"session_host", "session_port"} & set(values) and \
+            {"transaction_host", "transaction_port"} & set(values):
+        _die(6, "input",
+             "--session-host/--session-port and --transaction-host/--transaction-port "
+             "are two ways to name the same two addresses and are not mixed",
+             "name the store's address with --host/--port and its optional session "
+             "address with --session-host/--session-port")
     if len(sources) != 1:
         _die(6, "password_source",
              "`capabilities store set` needs exactly one password source",
@@ -15472,6 +15503,16 @@ def _store_set_args(args: list[str]) -> tuple[dict, tuple[str, str | None]]:
     for field in ("host", "database", "user"):
         if field not in values:
             _die(6, "input", f"store set needs --{field}")
+    # A session address is written in the file's existing form, which older
+    # copies of the library read: the session address as the address, the
+    # store's address as the transaction address, each field named only where
+    # its --session-* counterpart was given, so the other keeps the address's.
+    if "session_host" in values:
+        values["transaction_host"] = values["host"]
+        values["host"] = values.pop("session_host")
+    if "session_port" in values:
+        values["transaction_port"] = values.get("port", 5432)
+        values["port"] = values.pop("session_port")
     return values, sources[0]
 
 
@@ -15823,17 +15864,66 @@ def _store_transaction_check(setting, plain_allowed: bool) -> dict:
     """Whether the store's transaction address works as the library uses it: a
     transaction connection opened there, over TLS unless the setting allows
     plain text, runs a transaction bound to the setting's schema. A store with
-    one address has nothing more to prove."""
-    if not setting.has_transaction_address:
+    one address that also serves sessions has nothing more to prove; one whose
+    only address is a transaction pooler is proven there."""
+    if not setting.has_transaction_address and setting.has_session_address:
         return {"ok": True, "skipped": True,
                 "reason": "the store has one address: every connection uses it"}
+    return _store_connection_check(setting, plain_allowed, transaction=True)
+
+
+def _store_session_check(setting, plain_allowed: bool) -> dict:
+    """Whether the store's session address works as the library uses it: a
+    session connection opened there, over TLS unless the setting allows plain
+    text, is bound to the setting's schema. A store with no session address
+    has nothing to prove, and says what that means."""
+    if not setting.has_session_address:
+        return {"ok": True, "skipped": True,
+                "reason": "the store has no session address: every connection goes to "
+                          "its transaction address, changes are noticed by polling "
+                          "about every second, and nothing needs a session"}
+    return _store_connection_check(setting, plain_allowed, transaction=False)
+
+
+def _store_address_text(address: dict | None) -> str:
+    address = address or {}
+    return f"{address.get('host') or 'local socket'}:{address.get('port')}"
+
+
+def _store_addresses_statement(setting) -> dict:
+    """Which address each kind of connection uses, as the library reports
+    them, and the same said in one sentence."""
+    addresses = setting.report()["addresses"]
+    transaction = _store_address_text(addresses["transaction"])
+    if not setting.has_session_address:
+        said = (f"every connection uses the transaction address {transaction}; the store "
+                "has no session address, so changes are noticed by polling about every "
+                "second, and nothing needs a session")
+    elif not setting.has_transaction_address:
+        said = (f"the store has one address, {transaction}: transaction and session "
+                "connections both use it")
+    else:
+        said = (f"transaction connections use {transaction}; the session address "
+                f"{_store_address_text(addresses['session'])} serves only LISTEN for fast "
+                "change notifications and, until 2027-01-05, the transitional session "
+                "locks of tasks and memory")
+    return {**addresses, "statement": said}
+
+
+def _store_connection_check(setting, plain_allowed: bool, transaction: bool) -> dict:
+    """Open one connection as the library opens it - a transaction connection
+    to the transaction address, or a session connection to the session
+    address - and prove it reaches the store bound to the setting's schema."""
     db = _db_module()
     import psycopg
-    shown = setting.report().get("transaction") or {}
+    report = setting.report()
+    which = "transaction" if transaction else "session"
+    shown = (report.get("transaction") if transaction else None) \
+        or report["addresses"][which] or {}
     out = {"ok": False, "host": shown.get("host"), "port": shown.get("port")}
     try:
         conn = db.connect(application_name="capabilities", setting=setting,
-                          transaction=True)
+                          transaction=transaction)
     except db.DbError as exc:
         out["error"] = f"{exc.slug}: {_store_scrub(exc.message, setting)}"
         return out
@@ -15848,14 +15938,14 @@ def _store_transaction_check(setting, plain_allowed: bool) -> dict:
         conn.close()
     out["tls"] = tls
     if not tls and not plain_allowed:
-        out["error"] = "the transaction address was reached without TLS"
+        out["error"] = f"the {which} address was reached without TLS"
         return out
     if found != setting.schema:
-        out["error"] = (f"a transaction there was bound to {found!r}, not to the "
+        out["error"] = (f"a {which} connection there was bound to {found!r}, not to the "
                         f"setting's schema {setting.schema!r}")
         return out
     out["ok"] = True
-    out["reason"] = (f"a transaction connection there runs bound to schema "
+    out["reason"] = (f"a {which} connection there runs bound to schema "
                      f"{setting.schema}")
     return out
 
@@ -15924,12 +16014,15 @@ def cmd_store_doctor(project: str | None) -> None:
                   "reason": "not checked: no connection to the database"
                   if plain_allowed else "not checked: no TLS connection to the database"}
     transaction = _store_transaction_check(setting, plain_allowed)
-    out = {"ok": tls["ok"] and plain["ok"] and schema["ok"] and transaction["ok"],
+    session = _store_session_check(setting, plain_allowed)
+    out = {"ok": tls["ok"] and plain["ok"] and schema["ok"] and transaction["ok"]
+           and session["ok"],
            "project": report["project"], "in_force": report["in_force"],
            "setting": report["setting"], "levels": report["levels"],
            "sslmode": sslmode, "db_schema": setting.schema,
+           "addresses": _store_addresses_statement(setting),
            "checks": {"tls": tls, "plain_text_refused": plain, "schema": schema,
-                      "transaction": transaction}}
+                      "transaction": transaction, "session": session}}
     _emit(out)
     if not out["ok"]:
         sys.exit(7)

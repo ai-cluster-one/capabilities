@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.33,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.10.1",
 # ]
@@ -129,9 +129,10 @@ CONSOLIDATION
       check is refused and said; nothing is ever deleted and no single entry
       is rewritten. Bare, the pass is a dry run: it prints the plan and
       changes nothing, and still spends the model turn. --apply applies the
-      checked plan in one transaction under one pass id, holding the store
-      lock that keeps a second pass for the project out on every machine
-      (exit 7 `groom_running`). --undo <pass> drops what the pass made and
+      checked plan in one transaction under one pass id, holding the store's
+      lease that keeps a second pass for the project out on every machine
+      (exit 7 `groom_running`); it needs no session connection, and a store
+      reached through a transaction pooler alone serves it. --undo <pass> drops what the pass made and
       reactivates what it superseded or dropped, unless a later change
       overtook it (exit 6 `pass_overtaken`, naming the pass to undo first).
       A model that is not logged in exits 2 `model_not_authenticated`.
@@ -168,8 +169,11 @@ MOVING IN AND OUT
 SERVICE  (memory service <verb> [--machine])
   The service keeps every served project's block rendered: it follows each
   project's version of the memory_changed channel in the store's change
-  versions about once a second on its working connection, holding no
-  listening session, renders a project again when its memory changes, and
+  versions about once a second on its working connection, and where the
+  store names its transaction address apart it also listens on a session
+  connection of its own so a change wakes it at once (a store reached
+  through a transaction pooler alone needs none); it renders a project
+  again when its memory changes, and
   renders hourly besides so the window moves with the clock. It
   runs a grooming pass for a project - `memory groom --apply` as a child in
   the project's root with the project's own environment - when the window no
@@ -257,7 +261,10 @@ STORE
 CONTRACT VERBS
   memory help                  this text
   memory doctor                store, tables, identity, settings, the block,
-                               consolidation and the service, in this project
+                               consolidation and the service, in this project;
+                               until 2027-01-05 it warns (`earlier_release`,
+                               exit unchanged) of an earlier release grooming
+                               against the store, naming its machine
   memory connections           none: memory reaches no system of its own
   memory stub                  the one-line awareness text
   memory manifest --json       the declaration, with `contribution`
@@ -1080,8 +1087,10 @@ def cmd_groom(args) -> None:
     project = _project(write=bool(args.apply or args.undo))
     root = _root()
     settings = _settings()
-    # A session connection: the pass's lease is held across its transactions,
-    # beside the session lock an earlier release keeps passes out by.
+    # A session connection where the store has a session address: the pass's
+    # lease is held across its transactions, beside the session lock an
+    # earlier release keeps passes out by until 2027-01-05. A transaction-only
+    # store gets a transaction connection and the lease alone.
     with _guarded(), _open_store(root, session=True) as store:
         if args.undo:
             out = store.undo_pass(project, args.undo, actor=_actor(), node=node_name())
@@ -2011,6 +2020,45 @@ def _doctor_store(root: Path | None) -> dict:
     return row
 
 
+# The day the groom advisory lock an earlier release keeps passes out by is
+# retired; until then `doctor` warns of a pass of such a release.
+GROOM_LOCK_RETIRED = "2027-01-05"
+
+
+def _doctor_earlier_release(root: Path | None, project: str) -> dict | None:
+    """A warning, never a failure: an earlier memory release grooming against
+    this store, seen as a holder of the groom advisory lock that no
+    `memory_groom_leases` row names by `lock_pid`, with the machine named as
+    precisely as the store tells it. None when there is none, or the store
+    cannot say."""
+    engine = _engine()
+    try:
+        with engine.Store(engine.resolve_store(root)).open(migrate=False) as store:
+            holders = [h for h in store.groom_lock_holders(project, every_project=True)
+                       if h["lease_project"] is None]
+    except Exception:
+        return None
+    if not holders:
+        return None
+    seen = []
+    for h in holders:
+        machine = h["client_hostname"] or h["client_addr"] or "a local socket"
+        started = h["backend_start"].isoformat() if h["backend_start"] else None
+        seen.append({"pid": h["pid"], "this_project": h["this_project"],
+                     "client_hostname": h["client_hostname"], "client_addr": h["client_addr"],
+                     "application_name": h["application_name"], "user": h["usename"],
+                     "backend_start": started,
+                     "machine": f"{machine}" + (f" ({h['application_name']})"
+                                                if h["application_name"] else "")
+                                + (f", connected since {started}" if started else "")})
+    where = "; ".join(h["machine"] for h in seen)
+    return {"ok": True, "holders": seen, "retires": GROOM_LOCK_RETIRED,
+            "warning": f"an earlier {NAME} release is grooming against this store from {where}: "
+                       f"it keeps a second pass out by a session lock that is retired on "
+                       f"{GROOM_LOCK_RETIRED}, and must be updated on that machine before then",
+            "hint": f"update {NAME} on that machine (`capabilities update {NAME}`)"}
+
+
 def _doctor_consolidation(settings: dict | None) -> dict:
     if settings is None:
         return {"ok": True, "on": None, "reason": "the settings do not load"}
@@ -2145,6 +2193,10 @@ def cmd_doctor() -> None:
         else:
             context["ok"] = True
         note("context", context)
+    if store_row.get("ok") and project:
+        earlier = _doctor_earlier_release(root, project)
+        if earlier:
+            findings["earlier_release"] = earlier
     findings["consolidation"] = _doctor_consolidation(settings)
     findings["service"] = _service_here()
     _emit({"ok": fail == 0, **findings})

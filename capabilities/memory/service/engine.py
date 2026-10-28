@@ -429,13 +429,14 @@ class Store:
 
     It is a transaction connection, at the store's transaction address where
     one is named and carrying no session state, unless `session` asks for a
-    session connection: a grooming pass does, for the lock it holds across its
-    transactions."""
+    session connection and the store has a session address: a grooming pass
+    does, for the lock an earlier release reads, held across its transactions.
+    A transaction-only store opens no session connection."""
 
     def __init__(self, setting, application_name: str = "memory", session: bool = False):
         self.setting = setting
         self.application_name = application_name
-        self.session = session
+        self.session = session and setting.has_session_address
         self.conn = None
         self._groom_holder = None
 
@@ -837,24 +838,32 @@ class Store:
         when none is held or the one held has expired.
 
         A release before the lease kept the pass out by a session advisory lock
-        alone, and may still run somewhere, so the pass takes that lock first
-        and the row only once it holds it: either kind of pass keeps the other
-        out. The lock is held on this connection until `groom_unlock`, so a pass
-        needs a session connection."""
-        locked = self.one("SELECT pg_try_advisory_lock(hashtext('memory groom ' || %s), "
-                          "hashtext(%s)) AS got", (self.schema, project))
-        if not locked["got"]:
+        alone, and may still run somewhere until that lock is retired on
+        2027-01-05. Where the store has a session address the pass takes that
+        lock first and the row only once it holds it, so either kind of pass
+        keeps the other out; the lock is held on this connection until
+        `groom_unlock`, so there the pass needs a session connection. A
+        transaction-only store holds no session, so there the pass takes no
+        lock: it reads the store's lock table and stays out while an earlier
+        release holds the lock, then takes the row alone."""
+        if self.setting.has_session_address:
+            locked = self.one("SELECT pg_try_advisory_lock(hashtext('memory groom ' || %s), "
+                              "hashtext(%s)) AS got", (self.schema, project))
+            if not locked["got"]:
+                return False
+        elif self.groom_lock_holders(project):
             return False
         holder = uuid.uuid4()
         try:
             row = self.one(
                 "INSERT INTO memory_groom_leases AS l (project_id, holder, node, lock_pid, "
-                "expires_at) VALUES (%s, %s, %s, pg_backend_pid(), "
+                "expires_at) VALUES (%s, %s, %s, CASE WHEN %s THEN pg_backend_pid() END, "
                 "now() + make_interval(secs => %s)) "
                 "ON CONFLICT (project_id) DO UPDATE SET holder = excluded.holder, "
                 "node = excluded.node, lock_pid = excluded.lock_pid, taken_at = now(), "
                 "expires_at = excluded.expires_at WHERE l.expires_at <= now() "
-                "RETURNING holder", (project, holder, node, float(seconds)))
+                "RETURNING holder", (project, holder, node, self.setting.has_session_address,
+                                     float(seconds)))
         except BaseException:
             self._groom_unlock_session(project)
             raise
@@ -865,7 +874,8 @@ class Store:
         return True
 
     def groom_unlock(self, project: str) -> None:
-        """Give back the lease and the session lock `try_groom_lock` took."""
+        """Give back the lease and the session lock `try_groom_lock` took, if
+        it took one."""
         holder = self._groom_holder
         self._groom_holder = None
         with contextlib.suppress(Exception):
@@ -875,9 +885,30 @@ class Store:
         self._groom_unlock_session(project)
 
     def _groom_unlock_session(self, project: str) -> None:
+        if not self.setting.has_session_address:
+            return
         with contextlib.suppress(Exception):
             self.one("SELECT pg_advisory_unlock(hashtext('memory groom ' || %s), "
                      "hashtext(%s)) AS done", (self.schema, project))
+
+    def groom_lock_holders(self, project: str, every_project: bool = False) -> list[dict]:
+        """The sessions holding the groom advisory lock in this schema - for
+        `project`, or with `every_project` for any project, `this_project`
+        saying which is `project`'s - read from the store's lock table, which
+        a transaction connection reads too, each with what the store tells of
+        its client and the lease row that names it by `lock_pid`, if any. An
+        earlier release's pass is a holder no row names."""
+        return self.rows(
+            "SELECT l.pid, (l.objid = hashtext(%s)::oid) AS this_project, "
+            "a.client_hostname, host(a.client_addr) AS client_addr, a.application_name, "
+            "a.backend_start, a.usename, g.project_id AS lease_project, g.node AS lease_node "
+            "FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid "
+            "LEFT JOIN memory_groom_leases g ON g.lock_pid = l.pid "
+            "WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 "
+            "AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+            "AND l.classid = hashtext('memory groom ' || %s)::oid "
+            "AND (%s OR l.objid = hashtext(%s)::oid) ORDER BY l.pid",
+            (project, self.schema, every_project, project))
 
     def apply_pass(self, project: str, plan: dict, *, actor: str, node: str,
                    summary: dict) -> dict:
@@ -1517,12 +1548,47 @@ def default_node() -> str:
     return socket.gethostname()
 
 
+def wait_followers(followers: list, seconds: float, stop: threading.Event) -> bool:
+    """Wait `seconds`, or until `stop` is set; True as soon as one of
+    `followers` is notified. Each follower listens only where its store names
+    its two addresses apart, and one that cannot listen waits out the time, so
+    a lost notification costs no more than the wait."""
+    if not followers:
+        stop.wait(seconds)
+        return False
+    if len(followers) == 1:
+        return followers[0].wait(seconds, stop)
+    woke = threading.Event()
+    noticed: list = []
+
+    def one(follower) -> None:
+        if follower.wait(seconds, woke):
+            noticed.append(follower)
+            woke.set()
+
+    threads = [threading.Thread(target=one, args=(f,), name="memory-wake", daemon=True)
+               for f in followers]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + seconds
+    while not stop.is_set() and not woke.wait(min(0.2, max(0.0, deadline - time.monotonic()))):
+        if time.monotonic() >= deadline:
+            break
+    woke.set()
+    for thread in threads:
+        thread.join()
+    return bool(noticed)
+
+
 class StoreLink:
     """The service's connection to one store, shared by every project on it:
     the transaction connection its questions go on, opened when a step first
     asks one and closed when the step ends (`release`), so between steps it
-    holds no session. It learns what changed by following the projects'
-    versions of `memory_changed` on that connection, once a step. The tables
+    holds no session for its questions. It learns what changed by following
+    the projects' versions of `memory_changed` on that connection, once a
+    step; where the store names its two addresses apart, its follower also
+    listens on a session connection of its own, so a change wakes the wait
+    between steps at once. The tables
     are migrated once, when the link first connects."""
 
     def __init__(self, setting):
@@ -1602,8 +1668,8 @@ class StoreLink:
         return {scope for (_, scope) in moved}
 
     def row(self) -> dict:
-        # `listening` stays in the row for a reader of the earlier shape; the
-        # link holds no listening session.
+        # `listening` stays in the row for a reader of the earlier shape, and
+        # names the earlier `memory-listen` session, which no link holds.
         return {"store": store_label(self.setting), "schema": self.setting.schema,
                 "connected": self.connected, "listening": False,
                 "following": self.follower is not None, "error": self.error}
@@ -2007,8 +2073,11 @@ class Engine:
         return max(0.05, seconds)
 
     def wait(self, seconds: float) -> None:
-        """Until `seconds` pass or the process is asked to stop."""
-        self.stopping.wait(seconds)
+        """Until `seconds` pass, the process is asked to stop, or a store whose
+        two addresses are named apart notifies a change the service follows."""
+        wait_followers([link.follower for link in self.links.values()
+                        if link.follower is not None and link.setting.has_transaction_address],
+                       seconds, self.stopping)
 
     def step(self) -> None:
         if self.reload_requested.is_set():
@@ -2119,6 +2188,8 @@ class Engine:
             slot.release("stopped")
         for link in self.links.values():
             link.drop()
+            if link.follower is not None:
+                link.follower.close()
         self.log_machine("stopped")
         with contextlib.suppress(OSError):
             (self.state_dir / STATUS_FILE).unlink()

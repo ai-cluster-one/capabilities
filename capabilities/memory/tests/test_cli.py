@@ -172,6 +172,37 @@ def test_doctor_finds_a_block_behind_the_store(world):
 
 
 @needs_store
+def test_doctor_warns_of_an_earlier_release_grooming_against_the_store(world):
+    """A holder of the groom advisory lock that no lease row names is a pass
+    of an earlier release: a warning naming its machine, never a failure. One
+    a row names by lock_pid is this release's own pass."""
+    import psycopg
+    from _cli import dsn_url
+    root = world.project("p")
+    world.ok(root, "add", "x", "--title", "t")
+    assert "earlier_release" not in world.ok(root, "doctor")
+    project = project_id(root)
+    with psycopg.connect(dsn_url(), autocommit=True,
+                         application_name="memory-earlier") as earlier:
+        earlier.execute("SELECT pg_advisory_lock(hashtext('memory groom ' || %s), hashtext(%s))",
+                        (world.schema, project))
+        done = world.run(root, "doctor")
+        assert done.returncode == 0, done.stdout + done.stderr
+        warned = json.loads(done.stdout)["earlier_release"]
+        assert warned["ok"] is True and warned["retires"] == "2027-01-05"
+        [holder] = warned["holders"]
+        assert holder["pid"] == earlier.info.backend_pid and holder["this_project"] is True
+        assert holder["application_name"] == "memory-earlier"
+        assert holder["client_addr"] and holder["backend_start"]
+        assert "memory-earlier" in warned["warning"] and "2027-01-05" in warned["warning"]
+        earlier.execute(f'INSERT INTO "{world.schema}".memory_groom_leases '
+                        "(project_id, holder, lock_pid, expires_at) "
+                        "VALUES (%s, gen_random_uuid(), pg_backend_pid(), "
+                        "now() + interval '1 hour')", (project,))
+        assert "earlier_release" not in world.ok(root, "doctor")
+
+
+@needs_store
 def test_a_render_that_changes_nothing_leaves_the_block_as_written(world):
     root = world.project("p")
     entry = world.ok(root, "add", "x", "--title", "t")["entry"]

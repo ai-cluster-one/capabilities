@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-10-28 — `node status` proves a store reached through a transaction pooler alone
+
+The database probe `deployment node status` runs inside the node connects on a transaction connection, so a node whose store's one address is a transaction pooler (such as Supabase's on port 6543) reports `reachable` true rather than a refusal; a store with a session address answers as before. Declares `capabilities-contract>=0.33,<1`, which the probe runs on.
+
 ## 2026-10-28 — `node image` names the standard image's current release, and `node add` and `node create` default to it
 
 `deployment node image [--json]` reads the registry of `ghcr.io/agenium-dev/agent-node` anonymously and answers its newest `<major>.<minor>.<patch>` tag, the release that publishes the image and moves `:latest` to it: the image reference alone, or with `--json` `{ok, version, image}`. A registry that cannot be read or holds no release exits 5 `image_release_unknown`. `node add` and `node create` take `--version` as optional and, without it, create the node from that release; a `node add` that resumes on a node it already made reads no registry. An explicit `--version`, `--repository` builds and `node update` answer and refuse as before.

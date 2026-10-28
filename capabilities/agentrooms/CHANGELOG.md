@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-28 — `watch` prints a held change at once where the store names its transaction address apart
+
+`agentrooms watch` still polls the agent's version of `agentrooms_held` about once a second, and where the project's store names its transaction address apart (`AGENTKIT_DB_TRANSACTION_PORT` or `AGENTKIT_DB_TRANSACTION_HOST`) it also listens for the store's notification on a session connection of its own, closed when following ends, so a `held` line follows a change at once. A store reached through a transaction pooler alone holds no such connection and is followed as before; a lost notification costs only the second. Declares `capabilities-contract>=0.33,<1`.
+
 ## 2026-10-27 — `service harness` says which harness sign-ins the agents' turns need
 
 `agentrooms service harness [--json]` prints `{harness, agents, unresolved}`: `harness` is the sorted, distinct harness tools (`claude`, `codex`) of every profile a turn of this project's served agents could run on, and `agents` lists, per served agent, each worker that can answer it - every room's bound worker and the agent's, else the project's `default`, else the shipped one, as a turn picks them - with its profile and harness, or why it answers nothing (no active version, switched off, refused). Each profile is resolved and fitted as a turn resolves it; one that does not is listed under `unresolved` and needs nothing. An agents map an earlier release declared and the service has not moved yet is read as the move would leave it. It reads the store and changes nothing: no turn, no migration, no homeserver call. A project that serves no agent or resolves no store answers an empty list with its `reason`; any other refusal `service run` would meet here is this verb's. The manifest's `service` declares `sign_ins`, `{"harness": ["agentrooms", "service", "harness", "--json"]}`, and its `verbs` gain `harness`. Help (SERVICE) says so.

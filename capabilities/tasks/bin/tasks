@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.27,<1",
+#     "capabilities-contract>=0.33,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.10.1",
 #     "pyyaml>=6",
@@ -1008,21 +1008,26 @@ SERVICE
   which the service brings up to this version once as it starts, raises the
   project's version of `tasks_claimable` in the store's change versions
   (schema_channel, scope the project id) in the writer's own transaction, and
-  the daemon reads those versions about once a second, holding no listening
-  session, so a daemon acts only on its own project. For a service of an
-  earlier release that still listens, the same trigger also sends the
-  `tasks_claimable` notification, whose payload names the schema and the
-  project. A service whose
+  the daemon reads those versions about once a second, so a daemon acts only
+  on its own project. The same trigger also sends the `tasks_claimable`
+  notification, whose payload names the schema and the project; where the
+  setting names the store's two addresses apart (STORE) the daemon's held
+  connection listens for it and reads the versions at once, and a
+  notification lost costs only that second. A service whose
   project resolves no database (STORE) refuses to run, exit 6
   `store_not_configured`, and `service doctor` says the same. A lapsed
   lease and an ended wait are put back by a claim and nothing else, so on the
   poll, with nothing else to start, a daemon that sees one due starts a turn
   whose claim puts it back.
 
-  The daemon holds one connection to the store for as long as it runs, a
-  session connection at the store's address that carries the lock saying a
-  service serves the project, and on which it reads the change versions; it
-  listens for nothing. The questions of
+  The daemon holds one connection to the store for as long as it runs, on
+  which it renews the row saying it serves the project and reads the change
+  versions: a session connection at the store's address, which also carries
+  the lock an earlier release reads as a service serving the project, until
+  that lock retires on 2027-01-05, and on a transaction-only store (STORE) a
+  transaction connection, carrying no lock. `doctor` warns while a service of
+  an earlier release, which relies on that lock alone, still serves a project
+  against the store, naming its machine as far as the store can tell. The questions of
   each pass - whether a lane would take something, whether a claim would put
   something back, the next pickup - go on one transaction connection opened
   for that pass, at the store's transaction address where one is named
@@ -1507,8 +1512,9 @@ PROJECT SCOPE
   answer names `accepted_by`, the project and the worker whose grant takes it,
   and carries `warnings` when no service of that project is running: a stopped
   or paused conveyor is that project's to restart, never a refusal. A running
-  service says so by a lock it holds on the store for each project it serves,
-  which any project reads. `tasks accepts <project id>` answers ahead of time
+  service says so by a row it renews in the store for each project it serves,
+  and a service of an earlier release by a lock it holds, which any project
+  reads. `tasks accepts <project id>` answers ahead of time
   what that project takes from this one, and whether its service runs.
 
   A grant's claim takes the task while it stands assigned there, and passes
@@ -1775,7 +1781,8 @@ WATCH
 
   A read that does not end. It holds one connection to the store, follows the
   version of `tasks_watch` the store raises for the project (every project's
-  under --all-projects) about once a second, holding no listening session,
+  under --all-projects) about once a second - at once on the store's
+  notification where the setting names its two addresses apart (STORE) -
   and prints one JSON object per line on
   stdout, flushing each line as it is written, until it is stopped. It writes
   nothing and needs no allow_write. Its scope is the project scope `list`
@@ -1865,9 +1872,16 @@ STORE
   connections that carry no session state, and only what holds a session
   connection - the service's held connection, `watch`, `workers import --apply` -
   connects to the store's address. Without one, everything uses the one address.
-  None of them listens: what changed is read from the store's change
-  versions (schema_channel), which the tables' triggers raise as each write
-  commits.
+  What changed is read from the store's change versions (schema_channel),
+  which the tables' triggers raise as each write commits; the service and
+  `watch` also listen on the session connection where the two addresses are
+  named apart, which only hastens the read.
+
+  A transaction-only store, whose one address is a transaction pooler
+  (Supabase's, port 6543), serves every command, `watch`, `migrate` and the
+  service on transaction connections alone: none of them needs a session
+  connection there. The service then says it serves a project by its row
+  alone, and `workers import --apply` holds its lock for its transaction.
 
   A turn reaches the store its raise lives in, whatever the project's env
   files say by then. The service hands each turn it starts the store it
@@ -2261,7 +2275,12 @@ def _migrate_profile_tables() -> None:
     db = _db()
     conn = None
     try:
-        conn = db.connect(application_name=NAME)
+        # A session connection where the store has a session address, as before;
+        # a transaction-only store is migrated on a transaction connection, which
+        # serves it since migration takes only transaction-level locks.
+        setting = db.resolve_setting(None)
+        conn = db.connect(application_name=NAME, setting=setting,
+                          transaction=not setting.has_session_address)
         _said_migrated(db.migrate(conn, owner, steps, major=major, minor=minor))
     except db.DbError as exc:
         _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
@@ -5960,6 +5979,79 @@ def _serving(cur, project: str) -> bool:
     return bool(cur.fetchone()["serving"])
 
 
+# The day the presence advisory lock retires: a service of an earlier release
+# says it serves a project only by that session lock, which a store reached
+# through a transaction pooler alone cannot hold, and releases from then on
+# neither take it nor read it.
+_PRESENCE_LOCK_RETIRES = "2027-01-05"
+
+
+def _earlier_services(cur) -> list[str]:
+    """A warning for each tasks service of an earlier release still serving a
+    project of this schema against this store: a holder of the presence
+    advisory lock that no live `tasks_presences` row names by `lock_pid`. The
+    machine is named as precisely as the store can tell: a node with a tasks
+    service instance for that project that no live presence row names, else
+    the holding session's client address, application name and start. Plain
+    catalog reads, which a transaction pooler serves."""
+    def there(table: str) -> bool:
+        cur.execute("select to_regclass(%s) is not null as present", (f"{SCHEMA}.{table}",))
+        return bool(cur.fetchone()["present"])
+
+    presences = there("tasks_presences")
+    known = [f"select project_id from {SCHEMA}.{table}"
+             for table in ("tasks_workers", "tasks_tasks", "tasks_presences") if there(table)]
+    instances = there("capabilities_service_instances")
+    if instances:
+        known.append(f"select project_id from {SCHEMA}.capabilities_service_instances "
+                     "where capability = 'tasks'")
+    named = (f"exists (select 1 from {SCHEMA}.tasks_presences p "
+             "where p.lock_pid = l.pid and p.expires_at > now())" if presences else "false")
+    cur.execute(f"""select p.project_id, l.pid, a.client_hostname, host(a.client_addr) as client_addr,
+                           a.application_name, a.backend_start
+                      from pg_locks l
+                      join (select %s::text as project_id
+                            {''.join(f' union {one}' for one in known)}) p
+                        on l.objid::bigint = (hashtext(%s || ':' || p.project_id)::bigint
+                                              & 4294967295)
+                      left join pg_stat_activity a on a.pid = l.pid
+                     where l.locktype = 'advisory' and l.objsubid = 2 and l.granted
+                       and l.classid = %s::oid
+                       and l.database = (select oid from pg_database
+                                          where datname = current_database())
+                       and p.project_id is not null and not {named}
+                     order by p.project_id, l.pid""",
+                (PROJECT, SCHEMA, _PRESENCE_CLASS))
+    holders = cur.fetchall()
+    said = []
+    for row in holders:
+        nodes = []
+        if instances:
+            live = (f"and node not in (select node from {SCHEMA}.tasks_presences "
+                    "where project_id = %s and expires_at > now())" if presences else "")
+            cur.execute(f"""select node, host from {SCHEMA}.capabilities_service_instances
+                             where project_id = %s and capability = 'tasks' {live}
+                             order by node""",
+                        (row["project_id"],) + ((row["project_id"],) if presences else ()))
+            nodes = [f"node {one['node']}" + (f" (host {one['host']})" if one["host"] else "")
+                     for one in cur.fetchall()]
+        if nodes:
+            where = ", ".join(nodes)
+        else:
+            client = row["client_hostname"] or row["client_addr"]
+            where = (f"the session {row['pid']} from "
+                     + (client or "a local socket")
+                     + (f", application {row['application_name']!r}"
+                        if row["application_name"] else "")
+                     + (f", connected since {_jsonable(row['backend_start'])}"
+                        if row["backend_start"] else ""))
+        said.append(f"an earlier tasks release still serves project {row['project_id']} against "
+                    f"this store, on {where}: it holds the presence advisory lock and no live "
+                    f"tasks_presences row names it. That release relies on a session lock "
+                    f"retired on {_PRESENCE_LOCK_RETIRES}; update tasks there before then")
+    return said
+
+
 def _is_project(cur, name: str) -> bool:
     """Whether `name` is a project of this store: one that keeps a task or a
     worker in it. Any other name is a person or a name."""
@@ -7612,7 +7704,12 @@ def _declarations_unjudged(fresh: bool = False) -> dict:
 # Imports of one project's worker files are taken one at a time: the lock is
 # held while the files are read, saved and removed, so turns starting together
 # store one version of each worker and none of them fails - the later finds the
-# files gone, or the store holding exactly what they say.
+# files gone, or the store holding exactly what they say. A transaction-only
+# store keeps no session lock, so there the lock is the transaction's own,
+# held while the files are read and saved and released as the save commits:
+# the later import then reads the store holding exactly what the files say,
+# and a file the earlier one removed meanwhile is one it took, so it is passed
+# over and its removal is not asked twice.
 _IMPORT_CLASS = 31325
 
 
@@ -7631,10 +7728,14 @@ def _import_worker_files(entry, project: str, apply: bool,
     leaves the files where they are, for `capabilities migrate` to archive and
     remove once it has verified the whole move."""
     # A session connection: the import lock is held past the commit, while the
-    # files it saved are removed.
-    with _connect(entry, raising=raising, session=True) as conn, conn.cursor() as cur:
+    # files it saved are removed. A transaction-only store has none, and its
+    # lock ends with the transaction.
+    setting = _store_setting(raising)
+    held = setting.has_session_address
+    with _connect(entry, raising=raising, setting=setting, session=held) as conn, \
+            conn.cursor() as cur:
         if apply:
-            cur.execute("select pg_advisory_lock(%s, hashtext(%s))",
+            cur.execute(f"select pg_advisory{'' if held else '_xact'}_lock(%s, hashtext(%s))",
                         (_IMPORT_CLASS, _presence_key(SCHEMA, project)))
         plan, refused = [], []
         for path in _unimported_worker_files():
@@ -7644,6 +7745,12 @@ def _import_worker_files(entry, project: str, apply: bool,
                 continue
             try:
                 text = path.read_text()
+            except FileNotFoundError as exc:
+                if not held:
+                    # Removed by the import that saved it before this one.
+                    continue
+                refused.append(f"{path} could not be read: {exc}")
+                continue
             except OSError as exc:
                 refused.append(f"{path} could not be read: {exc}")
                 continue
@@ -7679,10 +7786,14 @@ def _import_worker_files(entry, project: str, apply: bool,
         conn.commit()
         if apply and remove:
             for one in plan:
-                one["path"].unlink()
+                one["path"].unlink(missing_ok=not held)
             folder = _workers_dir()
             if folder.is_dir() and not any(folder.iterdir()):
-                folder.rmdir()
+                try:
+                    folder.rmdir()
+                except FileNotFoundError:
+                    if held:
+                        raise
         if apply:
             _forget_workers()
     return plan, refused
@@ -10642,12 +10753,13 @@ class _Watch:
     on that connection, through the scope `list` reads, so a line never names a
     task the scope could not read.
 
-    It listens for nothing. It follows the version of `tasks_watch` the store
+    It follows the version of `tasks_watch` the store
     raises for the project, or for every project under --all-projects, and when
     it moves reads the tasks in scope touched since its last read, less the
     catch-up's grace, telling which kinds of change each had from what it held
     of the task at its last read: its last move, and how many trail entries,
-    raises and ended raises it had."""
+    raises and ended raises it had. Where the store's two addresses are named
+    apart it also listens on that channel, which only hastens the read."""
 
     def __init__(self, entry, opts: dict):
         self.entry = entry
@@ -10665,6 +10777,8 @@ class _Watch:
         # the server's clock that read began at, and whether a read is owed: set
         # by a move and by a connection opened, cleared by a read that succeeds.
         self.follower = None
+        # Whether the connection listens on the watch channel.
+        self.hears = False
         self.marks: dict = {}
         self.marked_from = None
         self.read_at = None
@@ -10698,13 +10812,28 @@ class _Watch:
     def open(self) -> str | None:
         """Connect, with the store's tables and the triggers that raise the
         version a watch follows in place, and take where the tasks and the
-        version stand. Answers the store's digest."""
+        version stand. Answers the store's digest. The connection is a session
+        connection where the store has a session address and a transaction
+        connection on a transaction-only store; where the store's two addresses
+        are named apart it also listens on the watch channel, so a change is read
+        at once rather than at the next second."""
+        setting = _store_setting(True)
         conn = _connect(self.entry, raising=True, application_name=_WATCH_APPLICATION,
-                        session=True)
+                        setting=setting, session=setting.has_session_address)
         db = _db()
         try:
             conn.autocommit = True
             self.conn = conn
+            self.hears = False
+            if setting.has_transaction_address:
+                import contextlib
+
+                import psycopg
+                from psycopg import sql
+                with contextlib.suppress(db.DbError, psycopg.Error):
+                    self.bounded(lambda: conn.execute(
+                        sql.SQL("listen {}").format(sql.Identifier(WATCH_CHANNEL))))
+                    self.hears = True
 
             def check():
                 with conn.cursor() as cur:
@@ -10719,7 +10848,7 @@ class _Watch:
             if self.follower is None:
                 follow = [(WATCH_CHANNEL, self.project)] if self.project else [WATCH_CHANNEL]
                 self.follower = db.Follower(follow, application_name=_WATCH_APPLICATION,
-                                            setting=_store_setting(True))
+                                            setting=setting)
             self.bounded(lambda: _follow(self.follower, conn))
             self.due = True
         except db.DbError as exc:
@@ -10873,15 +11002,37 @@ class _Watch:
         self.counts()
 
     def pause(self, seconds: float) -> None:
-        """Wait, ending the watch if its stdin closes meanwhile."""
+        """Wait, ending the watch if its stdin closes meanwhile, and no longer
+        than until the store notifies the watch channel where the connection
+        listens on it."""
+        import contextlib
         import select
         import time
-        if self.stdin is None:
+        hearing = self.conn if self.hears and self.conn is not None else None
+        if hearing is not None and self.heard(hearing):
+            return
+        fds = [fd for fd in (self.stdin,) if fd is not None]
+        if hearing is not None:
+            with contextlib.suppress(Exception):
+                fds.append(hearing.pgconn.socket)
+        if not fds:
             time.sleep(seconds)
             return
-        ready, _w, _x = select.select([self.stdin], [], [], seconds)
-        if ready:
+        ready, _w, _x = select.select(fds, [], [], seconds)
+        if self.stdin is not None and self.stdin in ready:
             self.read_stdin()
+        if hearing is not None:
+            self.heard(hearing)
+
+    @staticmethod
+    def heard(conn) -> bool:
+        """Whether the store notified the watch channel on `conn` since this
+        was last asked, taking every notification that came; a lost connection
+        is found by the next round trip on it."""
+        try:
+            return bool(list(conn.notifies(timeout=0)))
+        except Exception:
+            return False
 
     def read_stdin(self) -> None:
         if not os.read(self.stdin, 65536):
@@ -11765,18 +11916,47 @@ class _ServiceHost:
                 "schema": self.setting.schema}
 
     def listen(self):
-        """The connection the daemon holds: a session connection, for the lock
-        that says a service serves the project, on which it follows the store's
-        change versions. It listens for nothing. The daemon keeps asking while
+        """The connection the daemon holds, on which it says it serves the
+        project and follows the store's change versions: a session connection,
+        for the lock that an earlier release reads as a service serving the
+        project, where the store has a session address, and a transaction
+        connection on a transaction-only store, which keeps no lock. Where the
+        setting names the store's two addresses apart it also listens on the
+        channels the versions are followed on, so a change wakes the daemon at
+        once; a LISTEN that fails costs only that. The daemon keeps asking while
         the store is away, so a store it cannot reach is raised to it rather
         than written to the log on every attempt."""
-        conn = _connect(self.entry, raising=True, setting=self.setting, session=True)
+        conn = _connect(self.entry, raising=True, setting=self.setting,
+                        session=self.setting.has_session_address)
         try:
             conn.autocommit = True
         except BaseException:
             conn.close()
             raise
+        if self.setting.has_transaction_address:
+            from psycopg import sql
+            try:
+                for channel in (CLAIMABLE_CHANNEL, DECLARATION_CHANNEL, LINES_CHANNEL):
+                    conn.execute(sql.SQL("listen {}").format(sql.Identifier(channel)))
+            except Exception:
+                return conn
+            self._hearing = conn
         return conn
+
+    def hears(self, conn) -> bool:
+        """Whether `conn`, the connection `listen` gave, listens for the store's
+        notifications."""
+        return getattr(self, "_hearing", None) is conn
+
+    @staticmethod
+    def heard(conn) -> bool:
+        """Whether a notification arrived on `conn` since this was last asked,
+        taking every one that did; never raises, a lost connection being found
+        by the next round trip on it."""
+        try:
+            return bool(list(conn.notifies(timeout=0)))
+        except Exception:
+            return False
 
     def follower(self):
         """What follows the versions of the claimable, declaration and line
@@ -11813,18 +11993,22 @@ class _ServiceHost:
         the row's expiry on, the lock already held."""
         key = (_PRESENCE_CLASS, _presence_key(self.schema, self.project))
         rows = f"{self.schema}.tasks_presences"
+        # A transaction-only store keeps no session lock: the row alone says it,
+        # naming no session.
+        locking = self.setting.has_session_address
         if not on:
             conn.execute(f"delete from {rows} where project_id = %s and holder = %s",
                          (self.project, self.presence))
-            conn.execute("select pg_advisory_unlock(%s, hashtext(%s))", key)
+            if locking:
+                conn.execute("select pg_advisory_unlock(%s, hashtext(%s))", key)
             return
-        if not renew:
+        if not renew and locking:
             conn.execute("select pg_try_advisory_lock(%s, hashtext(%s))", key)
         conn.execute(f"delete from {rows} where project_id = %s and expires_at <= now()",
                      (self.project,))
         conn.execute(f"""insert into {rows} as p
                              (project_id, holder, node, lock_pid, expires_at)
-                         values (%s, %s, %s, pg_backend_pid(),
+                         values (%s, %s, %s, {'pg_backend_pid()' if locking else 'null'},
                                  now() + make_interval(secs => %s))
                          on conflict (project_id, holder) do update
                             set lock_pid = excluded.lock_pid, renewed_at = now(),
@@ -14708,6 +14892,16 @@ def cmd_doctor(wanted: str | None) -> None:
         except db.DbError as exc:
             refusal = _store_refusal(exc)
             _die(refusal.exit_code, refusal.code, refusal.message, refusal.hint)
+        # Until the presence lock retires, a service of an earlier release that
+        # relies on it is said; a store that cannot answer this says nothing.
+        import psycopg
+        try:
+            with conn.cursor() as cur:
+                earlier = _earlier_services(cur)
+            conn.commit()
+        except (psycopg.Error, db.DbError):
+            conn.rollback()
+            earlier = []
     for one, whose, release in ((profile_tables, "harness profile",
                                  "callva-harness-runner, which " + NAME + " pins,"),
                                 (found, NAME, NAME)):
@@ -14758,6 +14952,7 @@ def cmd_doctor(wanted: str | None) -> None:
                             "does now")
     if unescalated:
         warnings.append(unescalated)
+    warnings += earlier
     # Every place a worker may land the task it holds that nobody takes there:
     # the write would be refused, and the turn stopped short of its ending.
     warnings += _coverage(workers)
