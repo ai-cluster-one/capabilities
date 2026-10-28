@@ -143,6 +143,7 @@ def test_the_connection_flag_is_not_looked_for_past_the_end_of_the_flags(
     monkeypatch.setattr(mod, "_gate", lambda: None)
     monkeypatch.setattr(mod, "_contract", lambda argv: None)
     monkeypatch.setattr(mod, "_connections_registry", lambda: (None, None))
+    monkeypatch.setattr(mod, "_connection_grants", lambda: {"c": True})
     def select(reg, wanted):
         seen["wanted"] = wanted
         return "c", {}

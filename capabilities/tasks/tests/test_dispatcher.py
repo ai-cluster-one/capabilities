@@ -448,9 +448,11 @@ def test_a_project_that_fails_the_check_is_asked_nothing_and_served_again_when_i
     connections = root / "capabilities" / "tasks" / "connections.json"
     registry = json.loads(connections.read_text())
 
-    def granted(**fields):
+    def granted(other=None, **fields):
         changed = json.loads(json.dumps(registry))
         changed["connections"]["orchard-store"].update(fields)
+        if other:
+            changed["connections"]["other"] = other
         connections.write_text(json.dumps(changed))
 
     moved = pair.tmp / "orchard-moved"
@@ -458,8 +460,11 @@ def test_a_project_that_fails_the_check_is_asked_nothing_and_served_again_when_i
         ("not enabled", "refused", "project_enable_required",
          lambda: settings.write_text(json.dumps({"capabilities": {}})),
          lambda: settings.write_text(json.dumps({"capabilities": {"tasks": {"enabled": True}}}))),
+        # The default withheld while another is usable: with none usable the
+        # project is served on its store alone.
         ("withheld", "refused", "connection_not_granted",
-         lambda: granted(enabled=False), lambda: connections.write_text(json.dumps(registry))),
+         lambda: granted({"allow_write": True}, enabled=False),
+         lambda: connections.write_text(json.dumps(registry))),
         ("read-only", "refused", "read_only:",
          lambda: granted(allow_write=False), lambda: connections.write_text(json.dumps(registry))),
         ("read-only switch", "refused", "read_only_switch",

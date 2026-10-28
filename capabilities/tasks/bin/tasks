@@ -86,7 +86,7 @@ READING
                                   project, and whether its service runs. See
                                   PROJECT SCOPE
 
-WRITING  (needs allow_write on the connection; exit 4 otherwise)
+WRITING  (needs allow_write on a selected connection; exit 4 otherwise)
   tasks add --type T --title TEXT [fields]      create one
   tasks set <task> [fields] [--clear FIELD]     edit scalar fields; with no
                                                 field, a plain save that only
@@ -1174,10 +1174,10 @@ SERVICE
   says which under `held_by`, `service_pause`, `line_pause` or both.
 
   `init`, `start` and `run` need tasks enabled for this project itself;
-  enabled globally is not asking for a daemon here. `start` and `run` need a
-  connection that allows writes. The pid, the fingerprint, the published
-  status, the pause, the turn records and the log live in the project's
-  capability state,
+  enabled globally is not asking for a daemon here. `start` and `run` need
+  the connection, where one is selected, to allow writes. The pid, the
+  fingerprint, the published status, the pause, the turn records and the log
+  live in the project's capability state,
   `$XDG_STATE_HOME/capabilities/projects/<project-slug>/tasks/`, and `tasks
   inventory` reports from them whether a daemon runs, its lanes and how many
   turns it is running. Every line of the service log reads `<moment> tasks
@@ -1241,8 +1241,9 @@ SERVICE
   project it checks, besides what project mode checks, that the project is
   still on the list. Each project's turns are its own:
   `tasks run <worker> --apply` with the project as its cwd and no
-  `--connection`, so the project's default selects it, reading the project's
-  .env and .env.local itself, its workers the project's and only those.
+  `--connection`, so the project's default selects it where it has one,
+  reading the project's .env and .env.local itself, its workers the
+  project's and only those.
 
   A project the machine process cannot serve is reported in `status --machine`
   with the reason and the others are served: `refused` while it is not on the
@@ -1380,8 +1381,9 @@ FIELDS  (add and set take the same set)
                         held to what that worker takes: ESCALATION states the
                         writes refused for leaving a task where nobody takes it.
   --pickup WHEN         do not raise the task before this moment. A bare date
-                        means midnight in the connection's timezone; give a full
-                        moment (2026-09-10T14:30+03:00) when the hour matters.
+                        means midnight in the project's time zone (TIME
+                        ZONE); give a full moment (2026-09-10T14:30+03:00)
+                        when the hour matters.
                         Empty means no appointed moment, not permission: what
                         grants permission is `status`.
   --key TEXT            stable identity of the material this task came from,
@@ -1639,7 +1641,7 @@ FILTERS  (list, ready, search, counts)
   --pickup-set          only tasks that have an appointed moment
   --pickup-unset        only tasks that have none
 
-  A bare date means midnight in the connection's timezone, so
+  A bare date means midnight in the project's time zone (TIME ZONE), so
   `--created-before 2026-09-03` means everything up to the end of the second, and
   `--pickup-after 2026-09-03` includes that whole day. Filters only narrow: give
   two and both must hold.
@@ -1866,6 +1868,15 @@ STORE
   `store`: the level that answered, the files or variables it came from, and
   where it points, secrets redacted.
 
+  A tasks connection is optional: the store is the project's store setting, not
+  a connection's. With none usable in the project, and no `--connection`
+  given, every command, `doctor` and the service run on the store with no
+  connection selected, and a write is refused only under the read-only switch
+  (CAPABILITIES_READ_ONLY). With one usable, or one named by `--connection`, it
+  is selected as before and its allow_write gates every write. `connections`
+  reports the connections alone, and with none declared still refuses exit 6
+  `connections_required`, as every capability with connections does.
+
   Where the setting also names a transaction address (AGENTKIT_DB_TRANSACTION_HOST
   and AGENTKIT_DB_TRANSACTION_PORT; `capabilities help` gives the store setting),
   every command, every turn and the service's questions connect there, on
@@ -1941,6 +1952,14 @@ STORE
   it is now; `watch` and the service keep asking for as long as it takes, as
   their own sections say.
 
+TIME ZONE
+  A bare date is read as midnight, and `ready` asks the clock, in one zone: the
+  project's `timezone` setting, else the machine's (`tasks settings set
+  timezone Europe/Moscow`, `--scope machine` for the machine's), else the
+  selected connection's `timezone` field while connections still carry one,
+  else this system's own zone. A name that is no IANA zone is refused exit 2
+  `bad_timezone` wherever it was read, and `settings set` writes none.
+
 I/O
   Success is JSON on stdout; errors are JSON on stderr.
 
@@ -1975,14 +1994,17 @@ SCOPE = "project"
 CRED_KEYS = [
     {"key": "timezone", "secret": False, "required": False,
      "note": "IANA zone a bare date is read in, and the zone `ready` asks the "
-             "clock in. Defaults to UTC."},
+             "clock in, read only where no `timezone` setting is set; kept "
+             "readable until connections are retired. A connection is optional: "
+             "the store is the project's store setting."},
 ]
 
 # What a person is asked for (SHEBANG.md, "What a person is asked for"):
 # a connection entry's own fields, which `connection add` writes.
 CONN_FIELDS = [{'key': 'timezone',
   'label': 'Time zone',
-  'help': 'The IANA zone a bare date is read in; UTC when empty.',
+  'help': 'The IANA zone a bare date is read in where no `timezone` setting is set; '
+          'the system zone when empty.',
   'type': 'string',
   'required': False,
   'default': 'UTC'}]
@@ -2034,6 +2056,13 @@ SETTINGS = {'homes': [{'scope': 'project',
            'default': '6h',
            'scope': 'project',
            'apply': 'next_call'},
+          {'key': 'timezone',
+           'label': 'Time zone',
+           'help': 'The IANA zone a bare date is read in and `ready` asks the clock '
+                   'in; the machine\'s, then the system\'s, when empty.',
+           'type': 'string',
+           'scope': 'project',
+           'apply': 'next_call'},
           {'key': 'max_parallel',
            'label': 'Machine parallel turns',
            'help': 'Turns running at once across every joined project; no cap when '
@@ -2050,7 +2079,14 @@ SETTINGS = {'homes': [{'scope': 'project',
            'default': 60,
            'minimum': 0,
            'scope': 'machine',
-           'apply': 'reload'}]}
+           'apply': 'reload'},
+          {'key': 'timezone',
+           'label': 'Machine time zone',
+           'help': 'The IANA zone of every project here that sets none; the '
+                   'system\'s when empty.',
+           'type': 'string',
+           'scope': 'machine',
+           'apply': 'next_call'}]}
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
                "release", "run", "workers", "profiles", "hooks", "lines"}
 WRITE_DEFAULT = False
@@ -2167,6 +2203,45 @@ def _cmd_connections() -> None:
 
 
 # --- Connection --------------------------------------------------------------
+#
+# A connection is optional. The store is the project's store setting, and a
+# connection holds nothing a verb needs, so a project with none usable runs on
+# the store with no connection selected, its writes gated by the read-only
+# switch alone. One usable, or one named with --connection, is selected as
+# every capability selects, and its allow_write gates as it always did.
+
+def _connection_grants() -> dict:
+    """Every tasks connection this project could see, by id, and whether it
+    may use it - read as the registry is read, so a record that cannot be read
+    refuses here as it would there; only an absent registry is none."""
+    try:
+        effective = _records().connections(NAME, write_default=WRITE_DEFAULT,
+                                           include_disabled=True,
+                                           machine_read=_machine_read()) or {}
+    except StoreError as e:
+        _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    return {cid: bool(entry.get("enabled")) for cid, entry in effective.items()}
+
+
+def _selected_connection(wanted: str | None) -> tuple[str | None, dict | None]:
+    """The connection this call works on, or (None, None) when none is named
+    and none is usable. Named, or with one usable, it is selected by the
+    contract, so its refusals are the contract's own."""
+    if not wanted and not any(_connection_grants().values()):
+        return None, None
+    reg, _f = _connections_registry()
+    return _select_connection(reg, wanted)
+
+
+def _connection_write_gate(conn_id: str | None, entry: dict | None, verb: str) -> None:
+    """The write gate over the selected connection, or with none selected the
+    read-only switch alone: the store is the project's own."""
+    if conn_id is None:
+        if verb in WRITE_VERBS:
+            _read_only_gate(f"write verb {verb!r}")
+        return
+    _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
+
 
 def _conf(entry: dict | None, key: str, default: str | None = None) -> str | None:
     """Connection entry first, then the cascade. A per-machine value therefore
@@ -2490,14 +2565,65 @@ def _sever_after(conn, seconds: float):
 SCHEMA = "agentkit"       # replaced per run by the schema the store setting binds
 
 
-def _zone(entry) -> "ZoneInfo":
+_TIMEZONE_KEY = "timezone"
+
+
+def _zone_setting() -> str | None:
+    """The `timezone` setting in force: the project's, else the machine's;
+    None where neither sets one. A document that cannot be read sets none, as
+    it sets no escalation."""
+    for scope in ("project", "machine"):
+        _where, document, _error = _settings_read(_settings_homes(scope)[0])
+        value = (document or {}).get(_TIMEZONE_KEY)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _known_zone(name) -> bool:
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-    name = _conf(entry, "timezone", "UTC")
     try:
-        return ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError):
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _local_zone():
+    """This system's own zone: the one TZ names, else the one /etc/localtime
+    links to or holds, else the offset the clock keeps now."""
+    import datetime
+    from zoneinfo import ZoneInfo
+    named = [(os.environ.get("TZ") or "").lstrip(":")]
+    link = os.path.realpath("/etc/localtime")
+    if "/zoneinfo/" in link:
+        named.append(link.split("/zoneinfo/", 1)[1])
+    for name in named:
+        if name and _known_zone(name):
+            return ZoneInfo(name)
+    try:
+        with open("/etc/localtime", "rb") as held:
+            return ZoneInfo.from_file(held, key="localtime")
+    except (OSError, ValueError):
+        return datetime.datetime.now().astimezone().tzinfo
+
+
+def _zone(entry) -> "ZoneInfo":
+    """The zone a bare date is read in and `ready` asks the clock in: the
+    `timezone` setting (the project's, then the machine's), else the selected
+    connection's `timezone` while connections still carry one, else this
+    system's own. A name no zone answers to is refused wherever it was read."""
+    from zoneinfo import ZoneInfo
+    name = _zone_setting()
+    if name is None and entry is not None:
+        name = _conf(entry, _TIMEZONE_KEY)
+    if name is None:
+        return _local_zone()
+    if not _known_zone(name):
         _die(2, "bad_timezone", f"unknown timezone {name!r}",
-             "use an IANA name such as Europe/Moscow")
+             f"use an IANA name such as Europe/Moscow; `{NAME} settings set "
+             f"{_TIMEZONE_KEY} <zone>` sets it")
+    return ZoneInfo(name)
 
 
 # --- Project scope -----------------------------------------------------------
@@ -2669,7 +2795,7 @@ def _flags(args: list[str], names: tuple, multi: tuple = (), bools: tuple = (), 
 
 
 def _moment(v: str, tz) -> str:
-    """A bare date means midnight in the capability's zone; a full ISO 8601
+    """A bare date means midnight in the project's zone (`_zone`); a full ISO 8601
     moment is taken as given, and a naive one is read in that same zone."""
     import datetime
     text = v.strip()
@@ -2989,7 +3115,7 @@ def _sort_key(wanted: str) -> str:
 
 def _where(opts: dict, tz=None) -> tuple[str, list]:
     """Every filter narrows; none widens. A moment filter reads a bare date as
-    midnight in the connection's zone, so `--created-before 2026-09-03` means
+    midnight in the project's zone (`_zone`), so `--created-before 2026-09-03` means
     everything up to the end of the second.
 
     The project is a filter like the others and is the one that is never absent:
@@ -11138,9 +11264,11 @@ _SERVICE_MINIMUMS = {"poll_seconds": 1, "max_parallel": 1, "shutdown_grace_secon
 # Read only as the cool-down every worker without its own takes, and named by
 # `doctor` as the key it was: the service no longer waits on it.
 _SERVICE_DEPRECATED = ("retry_delay_seconds",)
-# `escalation` is the claim's, read by `_read_conveyor`; the service reads past it.
+# `escalation` is the claim's, read by `_read_conveyor`, and `timezone` every
+# verb's, read by `_zone`; the service reads past both.
+_NOT_SERVICE_KEYS = (_ESCALATION_KEY, _TIMEZONE_KEY)
 _SERVICE_KEYS = ("version", *_SERVICE_DEFAULTS, *_SERVICE_DEPRECATED, "lanes",
-                 _ESCALATION_KEY)
+                 *_NOT_SERVICE_KEYS)
 _LANE_DEFAULTS = {"max_parallel": 1}
 
 # The store notifies this channel when a task becomes claimable. It is one
@@ -11184,7 +11312,12 @@ def _write_receipt(path: str, claim: dict) -> None:
 def _settings_check(scope: str, document: dict) -> list:
     """What the service's own readers find wrong with a settings document the
     contract's `settings` verb is about to write: the project's settings and
-    the machine's, each checked as the service reads them."""
+    the machine's, each checked as the service reads them, and a `timezone`
+    as `_zone` reads it."""
+    zone = document.get(_TIMEZONE_KEY)
+    if zone is not None and not _known_zone(zone):
+        return [f"`{_TIMEZONE_KEY}` {zone!r} is no time zone this machine knows; "
+                "use an IANA name such as Europe/Moscow"]
     try:
         if scope == "project":
             home = _service_settings_home()
@@ -11231,10 +11364,10 @@ def _service_settings_initialized() -> bool:
     """Whether this project has service settings at all: a document in the
     store for an agent whose records moved there, else the file."""
     document = _service_settings_document()[1]
-    if isinstance(document, dict) and set(document) <= {"version", _ESCALATION_KEY} \
-            and _ESCALATION_KEY in document:
-        # Only the escalation, set before the service was: `service init`
-        # writes the template beside it.
+    if isinstance(document, dict) and set(document) <= {"version", *_NOT_SERVICE_KEYS} \
+            and set(document) & set(_NOT_SERVICE_KEYS):
+        # Only the escalation or the time zone, set before the service was:
+        # `service init` writes the template beside them.
         return False
     if _service_settings_in_rows():
         return document is not None
@@ -11894,9 +12027,8 @@ class _ServiceHost:
                                f"{declared or 'no id'}, and this daemon serves "
                                f"{self.project}")
         _require_project_enabled_for_service()
-        reg, _source = _connections_registry()
-        conn_id, entry = _select_connection(reg, self.connection)
-        _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+        conn_id, entry = _selected_connection(self.connection)
+        _connection_write_gate(conn_id, entry, "run")
         return None
 
     def store_key(self) -> tuple:
@@ -12163,11 +12295,11 @@ def _service_store() -> None:
             _die(refused.exit_code, refused.code, refused.message, refused.hint)
 
 
-def _service_connection(wanted: str | None) -> tuple[str, dict | None]:
-    """The connection the service works on, and the schema and project every
-    query it makes is bounded by, resolved the way `main` resolves them."""
-    reg, _f = _connections_registry()
-    conn_id, entry = _select_connection(reg, wanted)
+def _service_connection(wanted: str | None) -> tuple[str | None, dict | None]:
+    """The connection the service works on - none where none is usable - and
+    the schema and project every query it makes is bounded by, resolved the
+    way `main` resolves them."""
+    conn_id, entry = _selected_connection(wanted)
     globals()["SCHEMA"] = _store_setting(root=_project_here()).schema
     globals()["PROJECT_IDENTITY"] = _project_id_state()
     globals()["PROJECT"] = _declared_project()
@@ -12198,7 +12330,8 @@ _PROJECT_ENTRY_KEYS = ("root", "slug", "joined_at", "joined_by")
 # What the machine settings may say. A missing file is these defaults: no
 # machine cap, so only each project's own limits apply.
 _MACHINE_DEFAULTS = {"max_parallel": None, "shutdown_grace_seconds": 60}
-_MACHINE_KEYS = ("version", *_MACHINE_DEFAULTS)
+# `timezone` is every verb's, read by `_zone`; the machine process reads past it.
+_MACHINE_KEYS = ("version", *_MACHINE_DEFAULTS, _TIMEZONE_KEY)
 
 # What a process inherits that points it at one project. The machine process
 # stands in none, so none of it reaches it or the turns it starts.
@@ -12614,9 +12747,9 @@ def cmd_service_join(wanted: str | None, args: list[str]) -> None:
              "service's list names a project by it",
              "run `capabilities init` in the project")
     # The connection the machine service will serve the project on, read as it
-    # will read it, so a project whose records cannot be read does not join.
-    reg, _f = _connections_registry()
-    _select_connection(reg, None)
+    # will read it, so a project whose records cannot be read does not join;
+    # one with none usable is served on its store alone.
+    _selected_connection(None)
     slug = _service_state_key(root)
     path = _machine_projects_path()
     with _MachineListLock():
@@ -13219,8 +13352,7 @@ def _line_pause_read(answer: dict, wanted: str | None) -> None:
         block["daemon"] = seen
     try:
         with contextlib.redirect_stderr(io.StringIO()):
-            reg, _f = _connections_registry()
-            _conn_id, entry = _select_connection(reg, wanted)
+            _conn_id, entry = _selected_connection(wanted)
             setting = _store_setting(True, root=_project_here())
             globals().update(SCHEMA=setting.schema, PROJECT_IDENTITY=_project_id_state(),
                              PROJECT=_declared_project())
@@ -13329,10 +13461,11 @@ def cmd_service_init(args: list[str]) -> None:
              "reinstall the capability from a bundled source")
     target = _service_settings_path()
     written, skipped = [], []
-    # The escalation the settings already carry is the claim's, not the
-    # service's: writing the template keeps it.
+    # The escalation and the time zone the settings already carry are not the
+    # service's: writing the template keeps them.
     held = _service_settings_document()[1]
-    escalation = held.get(_ESCALATION_KEY) if isinstance(held, dict) else None
+    kept = {key: held[key] for key in _NOT_SERVICE_KEYS
+            if isinstance(held, dict) and key in held}
     if _service_settings_in_rows():
         # The settings are rows: the template is written there, once.
         import tomllib
@@ -13340,9 +13473,7 @@ def cmd_service_init(args: list[str]) -> None:
         if _service_settings_initialized() and not opts.get("force"):
             skipped.append(where)
         else:
-            seed = tomllib.loads(template.read_text())
-            if escalation is not None:
-                seed[_ESCALATION_KEY] = escalation
+            seed = {**tomllib.loads(template.read_text()), **kept}
             _settings_rows_write(_service_settings_home(), "project", lambda _current: seed)
             written.append(where)
         target = where
@@ -13351,8 +13482,8 @@ def cmd_service_init(args: list[str]) -> None:
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
         text = template.read_text()
-        if escalation is not None:
-            text = text.rstrip("\n") + "\n\n" + _toml_dumps({_ESCALATION_KEY: escalation})
+        if kept:
+            text = text.rstrip("\n") + "\n\n" + _toml_dumps(kept)
         target.write_text(text)
         written.append(str(target))
     _emit({"initialized": NAME, "project": str(_project_here()), "config": str(target),
@@ -13504,7 +13635,7 @@ def cmd_service_run(wanted: str | None, args: list[str]) -> None:
     module = _service_module()
     # The gate first: loading may import worker files, which is a write.
     conn_id, entry = _service_connection(wanted)
-    _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+    _connection_write_gate(conn_id, entry, "run")
     declaration = _loaded_declaration()
     _service_store()
     # Project mode: a dispatcher over one slot, the project this runs in. Its
@@ -13526,7 +13657,7 @@ def cmd_service_start(wanted: str | None, args: list[str]) -> None:
     _joined_refusal("start")
     module = _service_module()
     conn_id, entry = _service_connection(wanted)
-    _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), "run")
+    _connection_write_gate(conn_id, entry, "run")
     _loaded_declaration()
     state = _service_state_dir()
     state.mkdir(parents=True, exist_ok=True)
@@ -14870,10 +15001,10 @@ def _bundle_dir() -> Path:
 # --- Doctor ------------------------------------------------------------------
 
 def cmd_doctor(wanted: str | None) -> None:
-    report = _connections_report()
-    _doctor_gate(report, wanted)
-    reg, _f = _connections_registry()
-    conn_id, entry = _select_connection(reg, wanted)
+    # With no connection usable there is none to gate: the store answers alone.
+    conn_id, entry = _selected_connection(wanted)
+    if conn_id is not None:
+        _doctor_gate(_connections_report(), wanted)
     setting = _store_setting()
     # The workers judged below are the ones this project keeps in this store.
     globals().update(SCHEMA=setting.schema, PROJECT_IDENTITY=_project_id_state(),
@@ -15095,14 +15226,13 @@ def main() -> None:
         cmd_doctor(wanted); return
     if verb == "service":
         cmd_service(wanted, rest); return
-    reg, _f = _connections_registry()
-    conn_id, entry = _select_connection(reg, wanted)
+    conn_id, entry = _selected_connection(wanted)
     # Read once per run, from the project and not from the command line, so
     # every verb below asks the same question of the same answer.
     globals()["PROJECT_IDENTITY"] = _project_id_state()
     globals()["PROJECT"] = _declared_project()
     if verb in WRITE_VERBS and not _reads_only(verb, rest):
-        _write_gate(conn_id, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
+        _connection_write_gate(conn_id, entry, verb)
     handlers = {
         "list": cmd_list, "ready": cmd_ready, "show": cmd_show, "search": cmd_search,
         "counts": cmd_counts,
