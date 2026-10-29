@@ -175,6 +175,25 @@ class SendCopyTests(unittest.TestCase):
         self.assertTrue(result["sent"])
         self.assertTrue(result["sent_copy"]["saved"])
 
+    def test_bcc_reaches_envelope_only(self):
+        imap = FakeMailbox([_folder("Sent", r"\Sent")])
+        smtp = FakeSMTP()
+        with (
+            mock.patch.object(mailbox, "_imap", return_value=imap),
+            mock.patch.object(mailbox.smtplib, "SMTP", return_value=smtp),
+        ):
+            result = mailbox.cmd_send(
+                _cfg(), ["recipient@example.com"], [], "Subject", "Body", [], None,
+                bcc=["hidden@example.com"],
+            )
+
+        self.assertIn("recipient@example.com", smtp.to_addrs)
+        self.assertIn("hidden@example.com", smtp.to_addrs)
+        self.assertEqual(result["bcc"], ["hidden@example.com"])
+        for wire in (smtp.message, imap.appended[0]["message"]):
+            self.assertIsNone(message_from_bytes(wire)["Bcc"])
+            self.assertNotIn(b"hidden@example.com", wire)
+
     def test_missing_sent_folder_refuses_before_smtp(self):
         imap = FakeMailbox([_folder("INBOX")])
         smtp = FakeSMTP()

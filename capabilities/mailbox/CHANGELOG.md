@@ -1,5 +1,9 @@
 # mailbox — change log
 
+## 2026-10-29 — `mailbox send` takes Bcc recipients
+
+`mailbox send --bcc A`, repeatable like `--to` and `--cc`, delivers the message to A through the SMTP envelope alone. No Bcc header is written, so neither the message the recipients receive nor the copy saved to Sent names a Bcc recipient. The JSON result lists them under `bcc`. Sends without `--bcc` are unchanged.
+
 ## 2026-10-13 — Outside any project, `mailbox connections` and `mailbox doctor` read the machine's own connections
 
 `mailbox` declares `connections` and `doctor` as machine reads. Run outside any project, `mailbox connections` lists the connections declared globally whose grant is not switched off, each under `machine_reads` with the scope `machine`, and `mailbox doctor` checks their health, where both used to refuse with `connection_not_granted`. Each such connection is read-only there: a write through it exits 4 `read_only`, and every other verb outside a project is refused the machine's connections as before. Inside a project nothing changes; its grants alone decide.
