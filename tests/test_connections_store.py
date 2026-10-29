@@ -1847,6 +1847,50 @@ def test_node_run_restarts_onto_the_manager_on_path_once_it_is_another_release(
     assert node_run.returncode == 75, err
     assert "the manager on PATH is another release now" in err
 
+def test_a_supervisor_on_a_disabled_node_stops_its_service_and_lets_its_lease_go(lab, tmp_path):
+    # The defect: `node supervise`, which deployment compiles for a service of
+    # its own, read only the policy row, so a disabled node kept serving and
+    # kept renewing its exclusive lease.
+    here = _service_lab(lab)
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    env = {**lab["env"], **here}
+    marker = tmp_path / "child.pid"
+
+    def running() -> bool:
+        if not marker.exists():
+            return False
+        try:
+            os.kill(int(marker.read_text()), 0)
+        except (ProcessLookupError, ValueError):
+            return False
+        return True
+
+    def live() -> bool:
+        return bool((_ok(_manager(lab, "place", "coolify", extra=here)).get("lease")
+                     or {}).get("live"))
+
+    logp = tmp_path / "supervise.log"
+    log = logp.open("w")
+    supervise = subprocess.Popen(
+        [str(MANAGER), "node", "supervise", "coolify", "--every", "5", "--", "sh", "-c",
+         f"echo $$ > {marker}; exec sleep 600"], cwd=lab["project"], env=env,
+        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        assert _wait_for(lambda: running() and live(), 30), logp.read_text()
+        _ok(_manager(lab, "node", "disable", "lab-node", extra=here))
+        assert _wait_for(lambda: not running() and not live(), 30), logp.read_text()
+        assert "node lab-node is disabled" in logp.read_text() or \
+            f"node {NODE} is disabled" in logp.read_text()
+        # Enabled again, it takes the service up again.
+        marker.unlink()
+        _ok(_manager(lab, "node", "enable", "lab-node", extra=here))
+        assert _wait_for(lambda: running() and live(), 30), logp.read_text()
+    finally:
+        os.killpg(supervise.pid, signal.SIGTERM)
+        supervise.wait(timeout=60)
+        log.close()
+
+
 def test_node_run_and_each_supervisor_keep_their_last_lines_in_the_store(lab, tmp_path):
     """What a service's supervisor and the service print on stderr, and what
     node run prints, read from the store as the node's log, with what reads as

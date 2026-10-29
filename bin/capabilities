@@ -1214,7 +1214,8 @@ PROJECT VERBS (run inside a consuming project)
         state` expects nothing of it and reads it disabled rather than red,
         it is asked no update (`node update --node`), and its `node run`
         keeps no job, writes no state and runs no update or update check,
-        so no service runs or holds a lease there. It is the node's own,
+        and a `node supervise` there stops its service and gives up its
+        lease, so no service runs or holds a lease there. It is the node's own,
         like its label, so it holds for every agent on that machine. enable
         brings every check back. Answers {ok, project, agent_id, node
         (as node list), changed, store}, changed false where it already
@@ -13464,9 +13465,10 @@ def _supervise_readiness(command: list[str], root: Path, timeout: int,
 
 def _supervise_gate_key(gate: dict) -> tuple:
     """What a gate answer says, for telling whether it changed: placed or not,
-    and the row that answered."""
+    the row that answered, and whether the node is disabled."""
     row = gate.get("row") or {}
-    return (bool(gate.get("placed")), row.get("scope"), row.get("node"), row.get("enabled"))
+    return (bool(gate.get("placed")), row.get("scope"), row.get("node"), row.get("enabled"),
+            bool(gate.get("node_disabled")))
 
 
 def _supervise_group_alive(pgid: int) -> bool:
@@ -13583,6 +13585,13 @@ class _Supervisor:
             records = self.records
             answer["records"] = records.mode_of("policy")
             row = records.resolve("capabilities", "policy").get(name)
+            # A disabled node (`node disable`) runs no service, whatever its
+            # rows say; read through the row as a whole, so a store from before
+            # the column answers enabled.
+            disabled = answer["records"] == "store" and any(
+                found for (found,) in records._read(
+                    "SELECT to_jsonb(n) ->> 'disabled_at' IS NOT NULL "
+                    "FROM capabilities_nodes n WHERE n.id = %s", (node,)))
         except store.StoreError as exc:
             answer["error"] = {"code": exc.slug, "message": exc.message}
             answer["reason"] = f"the gate cannot be read: {exc.message}"
@@ -13599,8 +13608,13 @@ class _Supervisor:
             if answer["records"] == "store":
                 answer["row"]["service"] = service
         if answer["records"] == "store":
-            answer["placed"] = enabled and scope == "project" and named == node and service
-            if row is None:
+            answer["node_disabled"] = disabled
+            answer["placed"] = (enabled and scope == "project" and named == node and service
+                                and not disabled)
+            if disabled:
+                answer["reason"] = (f"node {node} is disabled, so no service runs here until "
+                                    f"`capabilities node enable {node}`")
+            elif row is None:
                 answer["reason"] = f"no policy row answers for {name} on {node}"
             elif scope != "project":
                 answer["reason"] = (f"only a global row answers for {name} on {node}, and a "
