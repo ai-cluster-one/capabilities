@@ -948,6 +948,28 @@ def test_an_old_prj_form_id_moves_into_the_agent_the_store_holds_without_it(worl
                      "WHERE id LIKE %s", (f"%{held}",)) == [(held, "Held", True)]
 
 
+def test_a_linked_worktree_of_an_old_prj_form_checkout_stays_a_second_checkout(world):
+    # The main checkout still carries prj_ before the twelve hex characters the
+    # store holds the agent under; its linked worktree only verifies.
+    held = "99999999ac01"
+    world.sql("INSERT INTO capabilities_agents (id, name) VALUES (%s, 'Held')", (held,))
+    main = world.agent("old-form-main", None, {"{env}/settings.json": gate("memory")},
+                       bound_id=f"prj_{held}")
+    copy = world.tmp / "agents" / "old-form-copy"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(copy)], check=True)
+    world.roots["old-form-copy"] = copy
+    plan = world.answer(world.manager(copy, "migrate"))
+    assert plan["agent_id"] == held and plan["second_checkout"]["main"] == str(main.resolve())
+    error = world.error(world.manager(copy, "migrate", "--apply"))
+    assert error["code"] == "second_checkout"
+    assert (copy / "capabilities" / "settings.json").is_file()
+    assert world.sql("SELECT migrated_at IS NULL FROM capabilities_agents WHERE id = %s",
+                     (held,)) == [(True,)]
+    # Neither checkout stays on this machine for the tests after this one.
+    for name in ("old-form-copy", "old-form-main"):
+        shutil.rmtree(world.roots.pop(name))
+    world.agentkit_list()
+
 def test_store_mode_with_no_rows_in_this_store_asks_which_is_the_truth(world):
     # project.json says "records": "store" from an import into another store;
     # the store in force holds none of the agent's rows and its files hold some.

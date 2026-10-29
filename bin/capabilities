@@ -20169,10 +20169,16 @@ def _migrate_main_checkout(ctx: dict) -> dict | None:
     store = _store_module()
     here = Path(ctx["root"]).resolve()
     agent_id = ctx["agent_id"]
+
+    # Another root's id is read as this root's is: the older prj_ form names
+    # the agent the store holds without it.
+    def same(found: str | None) -> bool:
+        return found == agent_id or _store_agent_id(here, found) == agent_id
+
     main = _migrate_git_main(here)
     if main is not None and main != here:
         envelope = _migrate_body_envelope(main)
-        if _migrate_root_id(envelope, main) == agent_id:
+        if same(_migrate_root_id(envelope, main)):
             return {"root": str(main), "envelope": str(envelope),
                     "why": f"{here} is a linked git worktree of {main}"}
     journal = ctx.get("journal") or {}
@@ -20186,7 +20192,7 @@ def _migrate_main_checkout(ctx: dict) -> dict | None:
     mine = _MIGRATE_MODE_RANK.get(ctx["mode"], 0)
     for entry in _migrate_discover(ctx.get("given_roots") or []):
         other = Path(entry["root"]).resolve()
-        if entry.get("id") != agent_id or other == here or _migrate_git_main(other):
+        if other == here or _migrate_git_main(other) or not same(entry.get("id")):
             continue
         envelope = Path(entry["envelope"])
         try:
