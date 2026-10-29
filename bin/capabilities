@@ -22435,14 +22435,21 @@ def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
     warning. The project's own come from the store where it holds one, or
     where no context folder is there: an agent whose store answers and that
     has no context folder lives in the store, so its context is what the
-    store holds, even nothing."""
+    store holds, even nothing. Where the store was tried and did not give the
+    documents, `store["context_unread"]` holds why, as (exit code, code,
+    message)."""
     if store["failed"]:
+        store["context_unread"] = (5, "context_store_unread",
+                                   "the store did not answer earlier in this build"
+                                   + (f": {'; '.join(warnings)}" if warnings else ""))
         return None
     code, rows, err = _ck_in_process(lambda: _ck_stored_rows(root))
     if code != 0:
         detail = _ck_one_line(err)[:300]
         warnings.append("context documents not read from the store, so the context folder "
                         f"is used: exited {code}" + (f": {detail}" if detail else ""))
+        store["context_unread"] = (code, "context_store_unread",
+                                   f"exited {code}" + (f": {detail}" if detail else ""))
         return None
     if rows is None:
         return None
@@ -22468,6 +22475,7 @@ def _ck_stored_context(root: Path, binding: dict, warnings: list[str],
     if errors:
         warnings.append("context documents not read from the store, so the context folder "
                         f"is used: {'; '.join(errors)}")
+        store["context_unread"] = (6, "context_file_invalid", "; ".join(errors))
         return None
     for items in found.values():
         items.sort(key=lambda item: (item["order"], item["rel"].as_posix()))
@@ -22840,6 +22848,15 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings, stored_routines)
                         if onboarding and onboarding["status"] == "pending" else "")
     stored = _ck_stored_context(root, binding, warnings, store)
+    unread = store.get("context_unread")
+    if stored is None and unread and not (root / context_dir).is_dir():
+        # With no folder to fall back on, the store is the context layer, so
+        # what kept the documents from the build is the failure to name.
+        exit_code, code, reason = unread
+        _die(exit_code, code, "context documents not read from the store, and there is no "
+             f"context folder `{context_dir.as_posix()}/` to read instead: {reason}",
+             "make the store answer, or repair the documents with the `context` capability, "
+             "then build again")
     if stored is None or stored["project"] is None:
         project_files = _ck_collect_context(root, root / context_dir, "project")
     else:

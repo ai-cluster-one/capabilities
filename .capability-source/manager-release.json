@@ -18,12 +18,12 @@
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/supabase.md": "62a3ab25a7544af8a336f285c6a5a5e2f598a44a72cde7a169706a94e0313eba",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "622fd20492b6577e0546116a664cf6d554b38aed16a2e7fe30cff74ef4c3cac2",
+    "manager/CHANGELOG.md": "65403dcc8105c3fba9050f4f2b5d3441eb7392b497cbdd84bbbf74d2ebc00745",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "48b3b2abc84bce4c3ed7778695414944c054fe541260382d3f17e4a071de4f5e"
+    "sha256": "18004ce0644b276e62336dbf89a0848f4c7d1cd4868e3b85a0b71028ec2f33ec"
   },
   "schema": "capabilities.manager-release.v1"
 }

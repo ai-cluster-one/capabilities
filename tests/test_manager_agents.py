@@ -1535,6 +1535,28 @@ def test_an_agent_that_lives_in_the_store_builds_with_no_context_folder(lab):
     assert empty.returncode == 0, empty.stderr
     assert "# Other" not in empty.stdout
 
+
+def test_an_agent_in_the_store_without_a_context_folder_names_why_the_store_gave_none(lab):
+    # With no folder to fall back on, the build names what kept the store's
+    # documents from it rather than a context folder the agent never had.
+    project = lab.project
+    (project / ".contextkit").mkdir()
+    (project / ".contextkit" / "config.toml").write_text(
+        f'version = 1\ntype = "agent-project"\n\n[identity]\nid = "{PROJECT_ID}"\n')
+    _seed_context_documents(lab, [
+        (PROJECT_ID, "identity/MISSION", False, [("Stored", "In the store.", "bogus", 1,
+                                                  "\n# Stored\n", True)])])
+    code, error = lab.refused("build", "--print")
+    assert (code, error["code"]) == (6, "context_file_invalid")
+    assert "Invalid frontmatter load in context/identity/MISSION.md: bogus" in error["message"]
+    (project / ".env.local").write_text(
+        "AGENTKIT_DB_URL=postgresql://nobody@127.0.0.1:1/none?sslmode=disable\n"
+        f"AGENTKIT_DB_SCHEMA={SCHEMA}\n")
+    code, error = lab.refused("build", "--print")
+    assert error["code"] == "context_store_unread" and code != 0
+    assert "no context folder `context/`" in error["message"]
+    assert "source directory not found" not in error["message"]
+
 def _seed_routines(lab: Lab, routines: list[tuple]) -> None:
     """The `routine` capability's two tables, holding `routines`:
     (project_id, name, retired, [(description, body, active)])."""

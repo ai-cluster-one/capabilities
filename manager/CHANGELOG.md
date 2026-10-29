@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-29 — A store-held agent with no context folder names why its store gave no documents
+
+`capabilities build` and `capabilities hooks install`, for an agent that has no context folder and whose store did not give its context documents, now refuse with the reason rather than `context_source_missing` (`context source directory not found`) for a folder the agent never had. A store that did not answer refuses with `context_store_unread` and the store's own error, exiting as that read did. A stored document that does not read refuses with `context_file_invalid` naming it, as a file in the context folder does. An agent with a context folder still falls back to that folder with a warning, and an agent with no store still refuses a missing folder.
+
 ## 2026-10-29 — Moving an agent into the store binds the old `prj_` form of its id to the agent it names
 
 `capabilities migrate` and `capabilities agent convert` read an id in the older form, `prj_` and twelve hex characters, as the agent the store holds under the twelve characters alone, where the store holds that agent and none under the older form - an agent moved off the old form while one of its folders still carries it in `.contextkit/config.toml` or `.env.local`. The run moves or converts that agent and binds the folder to its id in `.env.local`, rather than registering a second agent under the old form; `migrate` no longer asks which id is the agent's where the two files differ only by the prefix. An id the store holds as written, and any other id, is read as before. Run `capabilities help` for the details.
