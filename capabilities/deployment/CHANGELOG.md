@@ -1,5 +1,13 @@
 # deployment — change log
 
+## 2026-10-29 — Services start only under the node manager; the runner, the watchdogs and the launchd starters are removed
+
+`deployment runner`, `deployment watchdog`, `deployment machine sync`, `deployment machine next`, `deployment machine status` and `deployment machine watchdog` are removed, and so is the `host-agents` profile's compilation of a launchd agent per service and of the project watchdog's agent: `sync` for that profile now writes only the interval agent per Coolify target that carries the body to its node, its answer no longer carries `agents`, `deployment next` there points the services at the node manager (`capabilities node install --apply`, then `capabilities service start <name>`) and prints launchctl steps only for those body agents, and `deployment doctor` warns about a service agent an older compilation left loaded instead of judging it. On a Mac and on a server a service now starts only under the capabilities manager's node manager (`capabilities node run`, each service under `capabilities node supervise`), as the placements in the store say. A `compiler.host.watchdog` a runtime still declares is ignored and dropped by the next `sync`. The help summary no longer says deployment compiles launchd-supervised processes.
+
+`deployment handover` and `deployment machine handover` stay, to hand an older deployment's agents over to the node manager; `capabilities node install --apply` runs both, and `capabilities update` carries out that move on a Mac before it replaces an older deployment.
+
+Deployment no longer declares tables (`TABLES` is false, so `deployment migrate [status]` goes with them; `migrate files` stays): `deployment_service_leases` is the capabilities manager's alone. `deployment services` reads the lease without making the table, answering free where the store holds none yet, and its lease `last_error` is `{exit, at}`, the exit code and time the service last failed with on the holder; its stderr lines are on the node's row in `capabilities_service_instances`.
+
 ## 2026-10-28 — `node status` proves a store reached through a transaction pooler alone
 
 The database probe `deployment node status` runs inside the node connects on a transaction connection, so a node whose store's one address is a transaction pooler (such as Supabase's on port 6543) reports `reachable` true rather than a refusal; a store with a session address answers as before. Declares `capabilities-contract>=0.33,<1`, which the probe runs on.

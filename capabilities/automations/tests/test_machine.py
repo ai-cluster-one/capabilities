@@ -1,6 +1,6 @@
-"""Machine mode: one scheduler process serving every project that joined it.
+"""Machine mode: one scheduler process serving every project on its list.
 
-The opt-in list, the machine settings, `join`'s refusals and what the machine
+The list the node manager writes, the machine settings and what the machine
 process reads of a project are checked with no store. The machine process
 itself runs through the CLI, as a supervisor runs it, over fixture projects
 written into a temp directory, each with an `.env` of its own; jobs are real
@@ -180,6 +180,40 @@ class Farm:
         assert done.returncode != 0, (args, done.stdout)
         return done.returncode, json.loads(done.stderr.strip().splitlines()[-1])["error"]
 
+    def listing(self) -> Path:
+        return self.tmp / "config" / "automations" / "service" / "projects.toml"
+
+    def write_list(self, listed: dict) -> None:
+        """The machine service's list, written whole as the node manager writes
+        it (`capabilities node supervise automations --machine`)."""
+        lines = ["version = 1", ""]
+        for project, entry in sorted(listed.items()):
+            lines += [f"[projects.{json.dumps(project)}]", f"root = {json.dumps(entry['root'])}",
+                      f"slug = {json.dumps(entry['slug'])}",
+                      f"joined_at = {entry.get('joined_at') or '2026-10-29T00:00:00Z'}",
+                      f"joined_by = {json.dumps(entry.get('joined_by') or 'node manager')}", ""]
+        self.listing().parent.mkdir(parents=True, exist_ok=True)
+        self.listing().write_text("\n".join(lines))
+
+    def read_list(self) -> dict:
+        import tomllib
+        if not self.listing().exists():
+            return {}
+        return dict(tomllib.loads(self.listing().read_text()).get("projects") or {})
+
+    def join(self, name: str) -> None:
+        """Put a project on the list, as the node manager does for an agent
+        placed on this node in mode shared."""
+        listed = self.read_list()
+        listed[self.projects[name]["id"]] = {"root": str(self.projects[name]["root"]),
+                                             "slug": self.projects[name]["slug"]}
+        self.write_list(listed)
+
+    def leave(self, name: str) -> None:
+        listed = self.read_list()
+        listed.pop(self.projects[name]["id"])
+        self.write_list(listed)
+
     def machine(self) -> dict:
         return self.ok(None, "service", "status", "--machine")
 
@@ -244,7 +278,8 @@ def test_the_manifest_declares_the_machine_service(bare):
         "config": "$XDG_CONFIG_HOME/automations/service/config.toml",
         "state": "$XDG_STATE_HOME/capabilities/machine/automations",
     }
-    assert {"run", "status", "doctor", "join", "leave", "pause", "resume"} <= set(service["verbs"])
+    assert {"run", "status", "doctor", "pause", "resume"} <= set(service["verbs"])
+    assert not {"join", "leave"} & set(service["verbs"])
 
 
 def test_the_list_and_the_machine_settings_read_back_and_refuse_saying_why(bare, monkeypatch):
@@ -252,7 +287,7 @@ def test_the_list_and_the_machine_settings_read_back_and_refuse_saying_why(bare,
     monkeypatch.setattr(cli, "_CONFIG_HOME", bare.tmp / "config")
     listed = {"prj_one": {"root": "/srv/one", "slug": "one", "joined_at": "2026-10-08T10:00:00Z",
                           "joined_by": "ops@host"}}
-    cli._write_machine_projects(listed)
+    bare.write_list(listed)
     assert cli._read_machine_projects() == listed
     path = cli._machine_projects_path()
     for text, said in (("version = 2\n", "`version` is 1"),
@@ -274,39 +309,17 @@ def test_the_list_and_the_machine_settings_read_back_and_refuse_saying_why(bare,
         cli._read_machine_settings()
 
 
-def test_join_refuses_what_the_machine_cannot_serve_and_leave_takes_off(bare):
+def test_a_project_on_the_list_is_the_machines_and_refuses_its_own_daemon(bare):
     bare.project("plain")
-    bare.project("global-only", enabled=False)
-    bare.project("own-store", env_text="AGENTKIT_DB_URL=postgresql://elsewhere/db\n")
-    code, error = bare.refused("global-only", "service", "join")
-    assert (code, error["code"]) == (4, "project_enable_required")
-    # A project naming its own store joins: the machine serves it on that store.
-    assert bare.ok("own-store", "service", "join")["joined"] is True
-    code, error = bare.refused("plain", "service", "join", CAPABILITIES_READ_ONLY="1")
-    assert (code, error["code"]) == (4, "read_only_switch")
-    joined = bare.ok("plain", "service", "join")
-    assert joined["joined"] is True
-    assert joined["project"] == {"id": bare.projects["plain"]["id"],
-                                 "slug": bare.projects["plain"]["slug"],
-                                 "root": str(bare.projects["plain"]["root"])}
-    assert bare.ok("plain", "service", "join")["joined"] is False
-    # A second project carrying the same slug would share the state root.
-    twin = bare.project("twin")
-    identity = json.loads((twin / "capabilities" / "project.json").read_text())
-    identity["slug"] = bare.projects["plain"]["slug"]
-    (twin / "capabilities" / "project.json").write_text(json.dumps(identity))
-    code, error = bare.refused("twin", "service", "join")
-    assert (code, error["code"]) == (6, "slug_taken")
+    bare.join("plain")
     assert bare.ok("plain", "service", "status")["mode"] == "machine"
     code, error = bare.refused("plain", "service", "start")
     assert (code, error["code"]) == (4, "joined_to_machine_service")
+    assert "capabilities service stop automations" in error["hint"]
     code, error = bare.refused("plain", "service", "run")
     assert (code, error["code"]) == (4, "joined_to_machine_service")
-    left = bare.ok(None, "service", "leave", "--machine", "--project",
-                   bare.projects["plain"]["slug"])
-    assert left["left"] is True
+    bare.leave("plain")
     assert bare.ok("plain", "service", "status")["mode"] == "project"
-    assert bare.ok("plain", "service", "leave")["left"] is False
 
 
 def test_the_machine_runs_without_a_store_and_refuses_a_project_that_resolves_none(bare):
@@ -314,7 +327,7 @@ def test_the_machine_runs_without_a_store_and_refuses_a_project_that_resolves_no
     a joined project that resolves none is refused with the reason, and asked
     again."""
     bare.project("plain")
-    assert bare.ok("plain", "service", "join")["joined"] is True
+    bare.join("plain")
     try:
         assert bare.ok(None, "service", "start", "--machine")["started"] is True
         row = bare.until_state("plain", "refused")
@@ -366,7 +379,7 @@ def test_one_machine_process_serves_two_projects_and_a_third_keeps_its_own(farm)
     for name in ("alpha", "beta", "gamma"):
         farm.project(name)
     for name in ("alpha", "beta"):
-        assert farm.ok(name, "service", "join")["joined"] is True
+        farm.join(name)
     gamma = farm.ok("gamma", "service", "start")
     assert gamma["mode"] == "project"
 
@@ -440,7 +453,7 @@ def test_a_project_that_does_not_load_is_paused_or_refused_leaves_the_others_ser
         farm.project(name)
     farm.project("delta", config="version = 1\n[engine]\ntick_seconds = \"fast\"\n")
     for name in ("alpha", "beta", "delta"):
-        assert farm.ok(name, "service", "join")["joined"] is True
+        farm.join(name)
     farm.ok(None, "service", "start", "--machine")
     delta = farm.until_state("delta", "error")
     assert "engine.tick_seconds must be a number" in delta["reason"]
@@ -495,7 +508,7 @@ def test_a_project_whose_state_root_cannot_be_used_is_an_error_and_the_others_st
     (shut / "daemon.lock").touch()
     farm.project("omega", env_text=f"AUTOMATIONS_STATE_DIR={shut}\n")
     for name in ("alpha", "delta", "omega"):
-        assert farm.ok(name, "service", "join")["joined"] is True
+        farm.join(name)
     sealed.chmod(0o555)
     shut.chmod(0o555)
     try:
@@ -518,8 +531,7 @@ def test_a_project_whose_state_root_cannot_be_used_is_an_error_and_the_others_st
 def test_one_process_serves_a_project_at_a_time_in_both_directions(farm):
     farm.project("alpha", beat=False)
     own = farm.ok("alpha", "service", "start")
-    joined = farm.ok("alpha", "service", "join")
-    assert f"pid {own['pid']}" in joined["next"]
+    farm.join("alpha")
     machine_pid = farm.ok(None, "service", "start", "--machine")["pid"]
     refused = farm.until_state("alpha", "refused")
     assert f"a project-mode daemon, pid {own['pid']}, serves this project" in refused["reason"]
@@ -550,7 +562,7 @@ def test_one_process_serves_a_project_at_a_time_in_both_directions(farm):
     assert f"[{farm.projects['alpha']['slug']}]" in direct.stderr
 
     # Leaving hands it back: the machine lets go, and its own daemon starts.
-    assert farm.ok("alpha", "service", "leave")["left"] is True
+    farm.leave("alpha")
     until(lambda: not (farm.state("alpha") / "daemon.pid").exists(), 15, "the machine letting go")
     assert farm.machine()["projects"] == []
     again = farm.ok("alpha", "service", "start")
@@ -565,7 +577,7 @@ def test_the_machine_cap_deals_starts_round_the_projects_in_turn(farm):
         "version = 1\nmax_parallel = 1\n")
     for name in ("alpha", "beta"):
         farm.project(name, beat=False)
-        farm.ok(name, "service", "join")
+        farm.join(name)
         for _ in range(3):
             farm.ok(name, "run", "nap")
     status = farm.ok(None, "service", "start", "--machine")
@@ -756,7 +768,7 @@ def test_two_projects_on_two_stores_each_keep_their_runs_in_their_own(farm):
                                   f"AGENTKIT_DB_SCHEMA={own}\n")
     try:
         for name in ("alpha", "beta"):
-            assert farm.ok(name, "service", "join")["joined"] is True
+            farm.join(name)
         farm.ok(None, "service", "start", "--machine")
         for name in ("alpha", "beta"):
             farm.until_state(name, "served")
@@ -796,7 +808,7 @@ def test_one_projects_store_away_is_reported_and_fails_not_the_machine_probe(far
                                   f"AGENTKIT_DB_URL=postgresql://nobody@127.0.0.1:{port}/away\n")
     try:
         for name in ("alpha", "beta"):
-            assert farm.ok(name, "service", "join")["joined"] is True
+            farm.join(name)
         farm.ok(None, "service", "start", "--machine")
         farm.until_state("alpha", "served")
         stores = until(lambda: (found := farm.machine()["stores"]) and len(found) == 2 and found,

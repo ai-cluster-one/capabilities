@@ -2,7 +2,7 @@
   "capabilities": {
     "agentrooms": {
       "path": "capabilities/agentrooms",
-      "payload_sha256": "14f442ff37ae7fe18f6fc32bc8311e675699b702d29f29bfcfec19a8ff13cdf2",
+      "payload_sha256": "a77bdea7f51e8203523d0156adf3cbca7738e5335628976c6d040f63afdead04",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
     "agenttemplates": {
@@ -27,7 +27,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "028395eeb84908a0c0ec6ab3fc7d3d0097d34d7a5f22c55f0c3fc8e2fe425bbf",
+      "payload_sha256": "e35400d199c0067c012e451552b7c6086e5eb2612416285be9f82b10739e1c75",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -67,8 +67,8 @@
     },
     "deployment": {
       "path": "capabilities/deployment",
-      "payload_sha256": "deb50dc38953f0a821568a1e62bbb45f15c13a9e22812e1d2f5ecbb27bbc7a74",
-      "summary": "Project deployment standard - declare the services a project runs, compile them into a container image or into launchd-supervised processes on a Mac, and describe the targets they deploy to."
+      "payload_sha256": "9fe147f5b2fef167ee3f49b633e40b430e52c7b362040e7e9cc10de245cff293",
+      "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to."
     },
     "directo": {
       "path": "capabilities/directo",
@@ -117,7 +117,7 @@
     },
     "memory": {
       "path": "capabilities/memory",
-      "payload_sha256": "09cb1051fc306281eacef3912c226492eb5ea6ec00801e82cb102fa40674a7f7",
+      "payload_sha256": "7c7a97cbb1c070fe2b9c5ca8484ac1324dd90e7df0ac8e9640b5cde2f789fc16",
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
     },
     "notion": {
@@ -172,7 +172,7 @@
     },
     "tasks": {
       "path": "capabilities/tasks",
-      "payload_sha256": "38652f2785fe20951b2c65c10a0eb12cf46be9bb17063db0b8bf3d6b6717f607",
+      "payload_sha256": "a6f104309f7d739ce050a73ac5bb71f8b4bc43a5a8a13d86deaecc2f5eda9a42",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {

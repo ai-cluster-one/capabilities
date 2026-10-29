@@ -222,7 +222,7 @@ def test_each_invalid_machine_shape_is_refused(shape):
     assert problems and all("service.machine" in p for p in problems), problems
 
 
-@pytest.mark.parametrize("verb", ["run", "status", "doctor", "join", "leave"])
+@pytest.mark.parametrize("verb", ["run", "status", "doctor"])
 def test_a_machine_service_must_list_each_required_verb(verb):
     problems = M._validate_service_machine(
         NAME, MACHINE, [v for v in VERBS if v != verb])
@@ -258,10 +258,10 @@ def test_a_valid_declaration_passes_audit_source_check_and_install(tmp_path):
         assert result.returncode == 0, (surface, result.stdout + result.stderr)
 
 
-@pytest.mark.parametrize("shape", sorted(INVALID) + ["missing join"])
+@pytest.mark.parametrize("shape", sorted(INVALID) + ["missing doctor"])
 def test_an_invalid_declaration_is_refused_at_audit_source_check_and_install(tmp_path, shape):
-    service = (_service(MACHINE, [v for v in VERBS if v != "join"])
-               if shape == "missing join" else _service(INVALID[shape]))
+    service = (_service(MACHINE, [v for v in VERBS if v != "doctor"])
+               if shape == "missing doctor" else _service(INVALID[shape]))
     results = _surfaces(tmp_path, service)
     audit = results["audit"]
     assert audit.returncode == 7, audit.stdout + audit.stderr

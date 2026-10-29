@@ -597,22 +597,25 @@ def test_service_activation_needs_an_explicit_project_enable(cli, project, capsy
     global_gate = Path(os.environ["XDG_CONFIG_HOME"]) / "capabilities" / "settings.json"
     global_gate.parent.mkdir(parents=True, exist_ok=True)
     global_gate.write_text(json.dumps({"capabilities": {"agentrooms": {"enabled": True}}}))
-    for argv in (["service", "run"], ["service", "join"], ["service", "init"]):
+    for argv in (["service", "run"], ["service", "init"]):
         code, _out, err = run(cli, capsys, *argv)
         assert code == 4 and err["error"]["code"] == "project_enable_required", argv
 
 
-def test_join_and_leave_write_the_machine_list(cli, project, capsys):
+def test_a_project_on_the_machine_list_refuses_its_own_run(cli, project, capsys):
     connect(project, allow_write=True)
-    code, out, err = run(cli, capsys, "service", "join")
-    assert code == 0 and out["joined"] is True, err
-    listed = json.loads(cli._machine_projects_path().read_text())
-    assert listed["projects"]["prj_test"]["slug"] == "project"
+    for verb in ("join", "leave"):
+        code, _out, err = run(cli, capsys, "service", verb)
+        assert code == 6, (verb, err)
+    # The node manager writes the list for an agent placed on this node in mode shared.
+    path = cli._machine_projects_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "projects": {"prj_test": {
+        "root": str(project), "slug": "project", "joined_at": "2026-10-29T00:00:00Z",
+        "joined_by": "the node manager"}}}))
     code, _out, err = run(cli, capsys, "service", "run")
     assert code == 4 and err["error"]["code"] == "joined_to_machine_service"
-    code, out, _err = run(cli, capsys, "service", "leave")
-    assert out["left"] is True
-    assert json.loads(cli._machine_projects_path().read_text())["projects"] == {}
+    assert "capabilities service stop agentrooms" in err["error"]["hint"]
 
 
 def test_inventory_is_local_and_changes_nothing(cli, project, homeserver, capsys):

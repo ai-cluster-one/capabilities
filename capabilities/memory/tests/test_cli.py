@@ -38,9 +38,9 @@ def test_manifest_declares_the_contribution_and_the_service(tmp_path):
     assert manifest["tables"] is True and manifest["state"] is True
     machine = manifest["service"]["machine"]
     assert machine["command"] == ["memory", "service", "run", "--machine"]
-    for verb in ("init", "doctor", "run", "start", "reload", "stop", "status", "logs",
-                 "join", "leave"):
+    for verb in ("init", "doctor", "run", "start", "reload", "stop", "status", "logs"):
         assert verb in manifest["service"]["verbs"]
+    assert not {"join", "leave"} & set(manifest["service"]["verbs"])
     assert manifest["docs"]["topics"] == sorted(manifest["docs"]["topics"])
 
 

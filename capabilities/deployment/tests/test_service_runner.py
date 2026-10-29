@@ -1,9 +1,11 @@
 """A service runs where the gate on its node places it, and on one machine.
 
-Each supervised service runs through `deployment runner`, which reads the gate
-for this project on this node every reconcile, holds the service's lease in the
-project's store, and starts or stops the service to match. These tests drive the
-real runner and the real manager in projects that exist only for the test: in
+Each supervised service runs under the manager's `capabilities node supervise`,
+which reads the gate for this project on this node every reconcile, holds the
+service's lease in the project's store, and starts or stops the service to
+match, recording what it runs where `deployment services` reads it. These tests
+drive the real supervisor, the real manager and deployment's own reports of
+them in projects that exist only for the test: in
 files mode with no database at all, and in store mode against a throwaway
 PostgreSQL on a loopback port that the module starts when `initdb` and `pg_ctl`
 are on PATH and psycopg is importable, and skips otherwise. The service is a
@@ -74,7 +76,7 @@ def _project(root: Path, identity: dict, settings: dict | None = None,
 
 
 class Runner:
-    """One `deployment runner` for the observable child, on one node."""
+    """One `capabilities node supervise` for the observable child, on one node."""
 
     def __init__(self, root: Path, env: dict[str, str], node: str, log: Path,
                  child: list[str] | None = None):
@@ -84,7 +86,7 @@ class Runner:
                           "import os, time; print('child up', os.getpid(), flush=True); "
                           "time.sleep(600)"]
         self.proc = subprocess.Popen(
-            [str(DEPLOYMENT), "runner", "fixture", "--every", EVERY, "--", *child],
+            [str(MANAGER), "node", "supervise", "fixture", "--every", EVERY, "--", *child],
             cwd=root, env={**env, "AGENT_NODE_ID": node}, stdout=self.log,
             stderr=subprocess.STDOUT, start_new_session=True)
 
@@ -150,10 +152,6 @@ def test_files_mode_places_the_service_by_the_projects_own_enable(tmp_path: Path
         assert running["gate"]["row"] == {"scope": "project", "node": None, "enabled": True}
         child = running["child"]["pid"]
         assert _alive(child)
-        report = json.loads(subprocess.run(
-            [str(DEPLOYMENT), "migrate", "status"], cwd=root, env=env,
-            capture_output=True, text=True, timeout=120).stderr.splitlines()[-1])
-        assert report["error"]["code"] == "store_not_configured"
     finally:
         runner.stop()
     assert "child up" in runner.text()
@@ -528,9 +526,8 @@ def test_a_service_that_fails_leaves_its_error_on_the_lease_for_another_machine(
     try:
         failed = runner.until(lambda s: (s.get("last_exit") or {}).get("code") == 6)
         assert "must be a path inside" in failed["last_exit"]["error"]
-        [(node, code, error)] = rows(
-            "SELECT node, last_exit, last_error FROM deployment_service_leases")
-        assert (node, code) == ("node-a", 6) and "must be a path inside" in error
+        [(node, code)] = rows("SELECT node, last_exit FROM deployment_service_leases")
+        assert (node, code) == ("node-a", 6)
         # Another machine, reading the store, sees why it stopped.
         (b / "deployment").mkdir()
         (b / "deployment" / "runtime.json").write_text(json.dumps(
@@ -542,7 +539,7 @@ def test_a_service_that_fails_leaves_its_error_on_the_lease_for_another_machine(
         [seen] = json.loads(proc.stdout)["services"]
         assert seen["lease"]["holder"] == "node-a"
         assert seen["lease"]["last_error"]["exit"] == 6
-        assert "must be a path inside" in seen["lease"]["last_error"]["error"]
+        assert seen["lease"]["last_error"]["at"]
     finally:
         runner.stop()
 

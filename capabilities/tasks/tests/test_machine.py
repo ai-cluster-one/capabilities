@@ -5,9 +5,9 @@
 #                 "callva-harness-runner==0.10.1",
 #                 "pyyaml>=6"]
 # ///
-"""Machine mode: one process serving every project that joined it.
+"""Machine mode: one process serving every project on its list.
 
-The opt-in list, the machine settings and `join`'s refusals are checked with
+The list the node manager writes and the machine settings are checked with
 no store. The machine process itself runs through the CLI, as a supervisor
 runs it, over three fixture projects written into a temp directory - an
 orchard identified by a UUID, a kiln whose folder is the pottery-shed, and a
@@ -50,7 +50,7 @@ poll_for = base.poll_for
 
 ORCHARD_ID = str(uuid.uuid4())
 
-PROJECTS_TEXT = """# Projects served by the machine tasks service. Written by `tasks service join|leave`; do not edit by hand.
+PROJECTS_TEXT = """# Projects served by the machine tasks service. Written by the node manager; do not edit by hand.
 version = 1
 
 [projects.{orchard}]
@@ -88,27 +88,47 @@ def test_the_manifest_declares_the_machine_service():
         "config": "$XDG_CONFIG_HOME/tasks/service/config.toml",
         "state": "$XDG_STATE_HOME/capabilities/machine/tasks",
     }
-    assert {"run", "status", "doctor", "join", "leave"} <= set(mod.SERVICE["verbs"])
+    assert {"run", "status", "doctor"} <= set(mod.SERVICE["verbs"])
+    assert not {"join", "leave"} & set(mod.SERVICE["verbs"])
     assert set(mod.SERVICE["verbs"]) == set(mod._SERVICE_VERBS)
 
 
-def test_the_list_is_written_in_its_format_and_read_back(homes):
+def write_list(path: Path, listed: dict) -> None:
+    """The machine service's list, written whole as the node manager writes it
+    (`capabilities node supervise tasks --machine`)."""
+    lines = ["version = 1", ""]
+    for project, entry in sorted(listed.items()):
+        lines += [f"[projects.{json.dumps(project)}]", f"root = {json.dumps(entry['root'])}",
+                  f"slug = {json.dumps(entry['slug'])}",
+                  f"joined_at = {entry.get('joined_at') or '2026-10-29T00:00:00Z'}",
+                  f"joined_by = {json.dumps(entry.get('joined_by') or 'node manager')}", ""]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines))
+
+
+def put_on_list(path: Path, project: str, root: Path, slug: str) -> None:
+    listed = mod._read_machine_projects(path)
+    listed[project] = {"root": str(Path(root).resolve()), "slug": slug}
+    write_list(path, listed)
+
+
+def take_off_list(path: Path, project: str) -> None:
+    listed = mod._read_machine_projects(path)
+    listed.pop(project)
+    write_list(path, listed)
+
+
+def test_the_list_is_read_in_its_format(homes):
     listed = {ORCHARD_ID: {"root": "/srv/fields/orchard", "slug": "orchard",
                            "joined_at": "2026-10-02T18:00:00Z", "joined_by": "ops-person"},
               "prj_k1ln00000001": {"root": "/srv/fields/pottery-shed", "slug": "kiln",
                                    "joined_at": "2026-10-02T18:05:00Z",
                                    "joined_by": "ops-person"}}
-    mod._write_machine_projects(listed)
     path = homes / "config" / "tasks" / "service" / "projects.toml"
     assert path == mod._machine_projects_path()
-    text = path.read_text()
-    expected = PROJECTS_TEXT.format(orchard=ORCHARD_ID)
-    # Sorted by id: the UUID and the prj_ id fall where they fall.
-    blocks = sorted(expected.split("\n\n")[1:])
-    assert sorted(text.split("\n\n")[1:]) == blocks
-    assert text.startswith(expected.split("\n\n")[0] + "\n\n")
+    path.parent.mkdir(parents=True)
+    path.write_text(PROJECTS_TEXT.format(orchard=ORCHARD_ID))
     assert mod._read_machine_projects() == listed
-    assert not list(path.parent.glob(".projects.toml.*"))
 
 
 @pytest.mark.parametrize("text, said", [
@@ -169,7 +189,7 @@ def test_init_machine_writes_the_template_and_keeps_an_edited_file(homes, capsys
     assert target.read_text() == template
 
 
-# --- join and leave ----------------------------------------------------------
+# --- projects on the list ----------------------------------------------------
 
 def write_project(root: Path, *, project_id: str | None, slug: str, worker: str, kind: str,
                   entry: dict, connection: str = "farm") -> Path:
@@ -212,233 +232,6 @@ def joining(homes, monkeypatch):
         monkeypatch.delenv(leaked, raising=False)
     monkeypatch.setenv("TASKS_ACTOR", "ops-person")
     return homes
-
-
-def join(root: Path, capsys) -> tuple[int, dict]:
-    """`tasks service join` in the project at `root`: its exit code and answer
-    or error."""
-    code = 0
-    with mod.ProjectScope(root, dict(os.environ)):
-        try:
-            mod.cmd_service_join(None, [])
-        except SystemExit as stopped:
-            code = stopped.code
-    said = capsys.readouterr()
-    return code, (json.loads(said.out) if code == 0 else json.loads(said.err)["error"])
-
-
-def test_join_refuses_in_order_and_answers_with_the_project(joining, capsys):
-    root = joining / "pottery-shed"
-    write_project(root, project_id=None, slug="kiln", worker="potter", kind="clay",
-                  entry=entry_for(db_host="db.example", db_port="5432"))
-    identity = root / "capabilities" / "project.json"
-    found = json.loads(identity.read_text())
-
-    # Every refusal holds at once; each is reported in its turn as the one
-    # before it is put right.
-    code, error = join(root, capsys)
-    assert (code, error["code"]) == (6, "no_project_identity")
-    assert "capabilities init" in error["hint"]
-    identity.write_text(json.dumps({**found, "id": "prj_k1ln00000001", "store": "db"}))
-    code, error = join(root, capsys)
-    # Records are kept only in files, so a project declaring them elsewhere is
-    # refused by the records layer before anything is read.
-    assert (code, error["code"]) == (6, "bad_store_mode")
-    # The store keys its connection still carries are not read, and refuse
-    # nothing.
-    identity.write_text(json.dumps({**found, "id": "prj_k1ln00000001"}))
-    # Another project already joined under the same slug.
-    other = joining / "kiln-copy"
-    write_project(other, project_id="prj_k1ln00000002", slug="kiln", worker="potter",
-                  kind="clay", entry=entry_for())
-    code, answer = join(other, capsys)
-    assert code == 0 and answer["joined"] is True
-    code, error = join(root, capsys)
-    assert (code, error["code"]) == (6, "slug_taken")
-    assert "prj_k1ln00000002" in error["message"]
-    listed = mod._read_machine_projects()
-    del listed["prj_k1ln00000002"]
-    mod._write_machine_projects(listed)
-
-    code, answer = join(root, capsys)
-    assert code == 0
-    assert answer == {"joined": True,
-                      "project": {"id": "prj_k1ln00000001", "slug": "kiln",
-                                  "root": str(root.resolve())},
-                      "list": str(mod._machine_projects_path())}
-    [(project, entry)] = mod._read_machine_projects().items()
-    assert project == "prj_k1ln00000001"
-    assert (entry["root"], entry["slug"], entry["joined_by"]) == (
-        str(root.resolve()), "kiln", "ops-person")
-    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", entry["joined_at"])
-    text = mod._machine_projects_path().read_text()
-    assert f'[projects.prj_k1ln00000001]\nroot = "{root.resolve()}"\nslug = "kiln"\n' \
-           f'joined_at = {entry["joined_at"]}\njoined_by = "ops-person"\n' in text
-    # Joined already: an answer, not a refusal, and the list is unchanged.
-    code, again = join(root, capsys)
-    assert code == 0 and again["joined"] is False and again["reason"]
-    assert again["project"]["id"] == "prj_k1ln00000001"
-    assert mod._machine_projects_path().read_text() == text
-
-
-def leave(root: Path | None, capsys, *args: str) -> tuple[int, dict]:
-    code = 0
-    scope = (mod.ProjectScope(root, dict(os.environ)) if root is not None
-             else __import__("contextlib").nullcontext())
-    with scope:
-        try:
-            mod.cmd_service_leave(list(args))
-        except SystemExit as stopped:
-            code = stopped.code
-    said = capsys.readouterr()
-    return code, (json.loads(said.out) if code == 0 else json.loads(said.err)["error"])
-
-
-def test_leave_in_the_project_and_from_anywhere(joining, capsys):
-    roots = {}
-    for name, project, slug in (("orchard", ORCHARD_ID, "orchard"),
-                                ("pottery-shed", "prj_k1ln00000001", "kiln"),
-                                ("mill", "prj_m1ll00000001", "mill")):
-        roots[slug] = write_project(joining / name, project_id=project, slug=slug,
-                                    worker="w", kind=slug, entry=entry_for())
-        assert join(roots[slug], capsys)[1]["joined"] is True
-    # In the project.
-    code, answer = leave(roots["orchard"], capsys)
-    assert code == 0 and answer["left"] is True
-    assert answer["project"] == {"id": ORCHARD_ID, "slug": "orchard",
-                                 "root": str(roots["orchard"].resolve())}
-    assert set(mod._read_machine_projects()) == {"prj_k1ln00000001", "prj_m1ll00000001"}
-    assert leave(roots["orchard"], capsys)[1]["left"] is False
-    # From anywhere, by slug, the folder gone.
-    roots["kiln"].rename(joining / "gone")
-    code, answer = leave(None, capsys, "--machine", "--project", "kiln")
-    assert code == 0 and answer["left"] is True and answer["project"]["id"] == "prj_k1ln00000001"
-    # By id.
-    code, answer = leave(None, capsys, "--machine", "--project", "prj_m1ll00000001")
-    assert code == 0 and answer["left"] is True
-    assert mod._read_machine_projects() == {}
-    code, answer = leave(None, capsys, "--machine", "--project", "kiln")
-    assert code == 0 and answer["left"] is False
-    code, error = leave(None, capsys, "--machine")
-    assert (code, error["code"]) == (6, "input")
-
-
-def test_join_and_leave_write_the_shared_placement_of_a_store_mode_project(
-        joining, capsys, monkeypatch, tmp_path):
-    """In a project whose records are in the store, join places its service on
-    this node to be served by the machine service and leave takes that off,
-    each through the manager; the node manager's own join writes none, and a
-    placement the manager refuses is answered, never fatal."""
-    calls = tmp_path / "manager.log"
-    bin_dir = tmp_path / "manager-bin"
-    bin_dir.mkdir()
-    (bin_dir / "capabilities").write_text(f"""#!{sys.executable}
-import json, os, sys
-with open({str(calls)!r}, "a") as log:
-    log.write(json.dumps([sys.argv[1:], os.getcwd()]) + "\\n")
-if sys.argv[1:] == ["help"]:
-    print("  place <name> --node <node> [--mode shared|own]")
-    sys.exit(0)
-if os.environ.get("REFUSE_PLACE"):
-    sys.stderr.write(json.dumps({{"error": {{"code": "node_read_only",
-                                             "message": "not on this node"}}}}) + "\\n")
-    sys.exit(6)
-before = os.environ.get("PLACED_BEFORE") or None
-print(json.dumps({{"changed": True, "placed_on": ["lab-node"], "placed_before": before}}))
-""")
-    (bin_dir / "capabilities").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("AGENT_NODE_ID", "lab-node")
-    monkeypatch.delenv("CAPABILITIES_SERVICE_LIST_ONLY", raising=False)
-    root = write_project(joining / "orchard", project_id=ORCHARD_ID, slug="orchard",
-                         worker="w", kind="orchard", entry=entry_for())
-    # A project whose records are files writes no placement.
-    code, answer = join(root, capsys)
-    assert code == 0 and answer["joined"] is True and "placement" not in answer
-    assert leave(root, capsys)[1]["left"] is True and not calls.exists()
-
-    monkeypatch.setattr(mod, "_records_in_store", lambda: True)
-    written = {"written": True, "node": "lab-node", "mode": "shared", "changed": True,
-               "placed_on": ["lab-node"]}
-    code, answer = join(root, capsys)
-    assert code == 0 and answer["joined"] is True and answer["placement"] == written
-    monkeypatch.setenv("CAPABILITIES_SERVICE_LIST_ONLY", "1")
-    code, again = join(root, capsys)
-    assert code == 0 and again["joined"] is False and "placement" not in again
-    monkeypatch.delenv("CAPABILITIES_SERVICE_LIST_ONLY")
-    code, left = leave(root, capsys)
-    assert code == 0 and left["left"] is True and left["placement"] == written
-    join(root, capsys)
-    code, left = leave(None, capsys, "--machine", "--project", "orchard")
-    assert code == 0 and left["left"] is True and left["placement"] == written
-
-    monkeypatch.setenv("REFUSE_PLACE", "1")
-    code, answer = join(root, capsys)
-    assert code == 0 and answer["joined"] is True
-    assert answer["placement"]["written"] is False
-    assert answer["placement"]["error"]["code"] == "placement_refused"
-    assert ORCHARD_ID in mod._read_machine_projects()
-    logged = [json.loads(line) for line in calls.read_text().splitlines()
-              if json.loads(line)[0] != ["help"]]
-    place = ["place", "tasks", "--node", "lab-node", "--mode", "shared"]
-    unplace = ["unplace", "tasks", "--node", "lab-node", "--mode", "shared"]
-    assert [argv for argv, _cwd in logged] == [place, unplace, place, unplace, place]
-    assert {os.path.realpath(cwd) for _argv, cwd in logged} == {os.path.realpath(root)}
-
-    # A manager from before placement modes is not asked to place at all.
-    (bin_dir / "capabilities").write_text(f"#!{sys.executable}\nprint('  place <name>')\n")
-    monkeypatch.delenv("REFUSE_PLACE")
-    code, again = join(root, capsys)
-    assert code == 0 and again["joined"] is False
-    assert again["placement"]["error"]["code"] == "manager_predates_modes"
-
-
-def test_leave_takes_off_only_the_shared_placement_its_join_wrote(
-        joining, capsys, monkeypatch, tmp_path):
-    """A placement the node already held - shared, or from before modes, as a
-    node manager from before CAPABILITIES_SERVICE_LIST_ONLY finds it when it
-    joins an agent it serves - is not the join's, so a leave, that manager's
-    own when it stops for an update included, leaves it placed."""
-    calls = tmp_path / "manager.log"
-    bin_dir = tmp_path / "manager-bin"
-    bin_dir.mkdir()
-    (bin_dir / "capabilities").write_text(f"""#!{sys.executable}
-import json, os, sys
-with open({str(calls)!r}, "a") as log:
-    log.write(json.dumps(sys.argv[1:]) + "\\n")
-if sys.argv[1:] == ["help"]:
-    print("  place <name> --node <node> [--mode shared|own]")
-    sys.exit(0)
-print(json.dumps({{"changed": False, "placed_on": ["lab-node"],
-                  "placed_before": os.environ.get("PLACED_BEFORE") or None}}))
-""")
-    (bin_dir / "capabilities").chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("AGENT_NODE_ID", "lab-node")
-    monkeypatch.delenv("CAPABILITIES_SERVICE_LIST_ONLY", raising=False)
-    monkeypatch.setattr(mod, "_records_in_store", lambda: True)
-    root = write_project(joining / "orchard", project_id=ORCHARD_ID, slug="orchard",
-                         worker="w", kind="orchard", entry=entry_for())
-    unplace = ["unplace", "tasks", "--node", "lab-node", "--mode", "shared"]
-
-    def unplaced() -> int:
-        return sum(json.loads(line) == unplace for line in calls.read_text().splitlines())
-
-    for before in ("unrecorded", "shared"):
-        monkeypatch.setenv("PLACED_BEFORE", before)
-        assert join(root, capsys)[1]["placement"]["written"] is True
-        code, left = leave(root, capsys)
-        assert code == 0 and left["left"] is True and unplaced() == 0
-        assert left["placement"]["written"] is False
-        assert "capabilities unplace tasks --node lab-node" in left["placement"]["note"]
-    # One the join placed is its own, and its leave takes it off, once.
-    monkeypatch.setenv("PLACED_BEFORE", "own")
-    join(root, capsys)
-    monkeypatch.setenv("PLACED_BEFORE", "shared")
-    join(root, capsys)
-    assert leave(root, capsys)[1]["placement"]["written"] is True and unplaced() == 1
-    join(root, capsys)
-    assert leave(root, capsys)[1]["placement"]["written"] is False and unplaced() == 1
 
 
 # --- The machine process, in this process ------------------------------------
@@ -489,8 +282,13 @@ def plot(joining, monkeypatch):
 
 def test_the_machine_process_holds_one_store_and_keeps_no_project_env(
         plot, capsys, monkeypatch):
-    for root in plot["roots"].values():
-        assert join(root, capsys)[1]["joined"] is True
+    for (name, root), project in zip(plot["roots"].items(), (ORCHARD_ID, "prj_k1ln00000001")):
+        put_on_list(mod._machine_projects_path(), project, root, name)
+        # Each project resolved here first, as an act in the project does,
+        # so the processes recorded below are the dispatcher's alone.
+        with mod.ProjectScope(root, dict(os.environ)):
+            mod._project_capabilities_dir(root)
+            assert mod._declared_project() == project
     spawned = []
     service = mod._service_module()
 
@@ -607,9 +405,17 @@ class Farm:
         assert done.returncode != 0, done.stdout
         return done.returncode, json.loads(done.stderr.strip().splitlines()[-1])["error"]
 
+    def listing(self) -> Path:
+        return self.tmp / "config" / "tasks" / "service" / "projects.toml"
+
     def join(self, *names: str) -> None:
+        """Put each project on the list, as the node manager does for an agent
+        placed on this node in mode shared."""
         for name in names:
-            assert self.ok(name, "service", "join")["joined"] is True
+            put_on_list(self.listing(), self.ids[name], self.roots[name], name)
+
+    def leave(self, name: str) -> None:
+        take_off_list(self.listing(), self.ids[name])
 
     def machine(self) -> dict:
         return self.ok(None, "service", "status", "--machine")
@@ -675,34 +481,6 @@ def started_in(farm: Farm) -> list[str]:
 
 # The service's own judgement, under which a zombie has already ended.
 alive = mod._service_module().pid_alive
-
-
-@needs_store
-def test_the_gate_asks_join_for_an_explicit_enable_and_the_read_only_switch_refuses(farm):
-    """`join` is a project act: enabled globally is not opting a project in, and
-    under the read-only switch neither `join` nor `leave` writes the list."""
-    envelope = farm.roots["mill"] / "capabilities"
-    (envelope / "settings.json").write_text(json.dumps({"capabilities": {}}))
-    global_gate = farm.tmp / "config" / "capabilities" / "settings.json"
-    global_gate.parent.mkdir(parents=True, exist_ok=True)
-    global_gate.write_text(json.dumps({"capabilities": {"tasks": {"enabled": True}}}))
-    code, error = farm.refused("mill", "service", "join")
-    assert (code, error["code"]) == (4, "project_enable_required")
-    (envelope / "settings.json").write_text(
-        json.dumps({"capabilities": {"tasks": {"enabled": True}}}))
-    code, error = farm.refused("mill", "service", "join", CAPABILITIES_READ_ONLY="1")
-    assert (code, error["code"]) == (4, "read_only_switch")
-    assert not (farm.tmp / "config" / "tasks" / "service" / "projects.toml").exists()
-    farm.join("mill")
-    for args in (("mill", "service", "leave"),
-                 (None, "service", "leave", "--machine", "--project", "mill")):
-        code, error = farm.refused(*args, CAPABILITIES_READ_ONLY="1")
-        assert (code, error["code"]) == (4, "read_only_switch")
-    # Outside every project, with tasks enabled nowhere, the machine verbs pass.
-    global_gate.write_text(json.dumps({"capabilities": {}}))
-    assert farm.machine()["projects_file"]["joined"] == 1
-    left = farm.ok(None, "service", "leave", "--machine", "--project", "mill")
-    assert left["left"] is True
 
 
 @needs_store
@@ -882,8 +660,8 @@ def test_joining_and_leaving_are_followed_without_a_reload(farm):
     farm.complete("mill", "t-mill")
     assert farm.machine()["pid"] == pid
 
-    # Leaving lets the project go at once: its lock, pid and status.
-    assert farm.ok("kiln", "service", "leave")["left"] is True
+    # Taken off, the project is let go at once: its lock, pid and status.
+    farm.leave("kiln")
     poll_for(lambda: "kiln" not in [row["project"] for row in farm.machine()["projects"]]
              and not (farm.state("kiln") / "daemon.pid").exists(), 15)
     with (farm.state("kiln") / "daemon.lock").open("a+") as lock:
@@ -910,10 +688,9 @@ def test_joining_and_leaving_are_followed_without_a_reload(farm):
     assert "is gone" in gone["reason"] and gone["present"] is False
     moved.rename(farm.roots["orchard"])
     farm.until("orchard", "served")
-    # Leaving from anywhere, by slug, with the folder gone.
+    # Taken off with the folder gone.
     farm.roots["orchard"].rename(moved)
-    left = farm.ok(None, "service", "leave", "--machine", "--project", "orchard")
-    assert left["left"] is True and left["project"]["id"] == farm.ids["orchard"]
+    farm.leave("orchard")
     poll_for(lambda: [row["project"] for row in farm.machine()["projects"]] == ["mill"], 15)
     moved.rename(farm.roots["orchard"])
 
@@ -945,7 +722,7 @@ def test_a_project_mode_daemon_keeps_its_project_until_it_exits(farm):
     for verb in ("start", "run"):
         code, error = farm.refused("orchard", "service", verb)
         assert (code, error["code"]) == (4, "joined_to_machine_service")
-        assert "tasks service leave" in error["hint"]
+        assert "capabilities service stop tasks" in error["hint"]
     # The project-mode daemon is stopped where it runs; its turn is left.
     assert farm.ok("orchard", "service", "stop")["stopped"] is True
     assert alive(row["pid"])
@@ -1015,7 +792,7 @@ def test_turns_outlive_the_machine_process_and_move_between_modes(farm):
     farm.until("kiln", "served")
     farm.add("orchard", "t-moved")
     moved = working(farm, "orchard", "t-moved")
-    assert farm.ok("orchard", "service", "leave")["left"] is True
+    farm.leave("orchard")
     poll_for(lambda: not (farm.state("orchard") / "daemon.pid").exists(), 15)
     assert alive(moved["pid"])
     farm.ok("orchard", "service", "start")

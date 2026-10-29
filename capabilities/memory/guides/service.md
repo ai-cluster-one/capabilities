@@ -8,7 +8,7 @@ The block a session reads is a file in the project's envelope, rendered from the
 
 ## Choosing a mode
 
-On a workstation that holds several projects, run the service once for the machine and join each project to it from inside the project; one process then serves them all, and each project's trouble stays its own. On a server that runs one project, run the service in that project. A project is served by one process at a time, so a project that joined the machine service does not also run its own. Keeping either running under a supervisor is the deployment capability's domain: start at `deployment help`.
+On a workstation that holds several projects, run the service once for the machine and place each project on it in mode shared (`capabilities service start memory` from inside the project); the node manager runs that one process, puts the projects so placed on its list, and each project's trouble stays its own. On a server that runs one project, run the service in that project. A project is served by one process at a time, so a project that joined the machine service does not also run its own. Keeping either running under a supervisor is the deployment capability's domain: start at `deployment help`.
 
 ## Consolidation
 

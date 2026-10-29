@@ -50,21 +50,23 @@ def test_dry_run_reports_every_decision_and_writes_nothing(world, tmp_path):
 
 
 @pytest.mark.skipif(manager_bin() is None, reason="no manager beside the source")
-def test_apply_enables_joins_carries_and_is_idempotent(world, tmp_path):
+def test_apply_enables_carries_and_is_idempotent(world, tmp_path):
     root = world.project("p", enabled=None)
     folder(root)
     out = world.ok(tmp_path, "adopt", str(root), "--apply", "--pin-titles", "^Owner", TZ="UTC")
     project = out["projects"][0]
     assert project["enabled"]["ok"], project
-    assert project["counts"]["carried"] == 2 and project["joined"]["joined"] is True
+    assert project["counts"]["carried"] == 2
+    # A project in files mode cannot be placed on the machine service, and says so.
+    assert project["joined"]["joined"] is False and "store" in project["joined"]["why"]
     assert project["context"]["rendered"]
     gate = json.loads((root / "capabilities" / "settings.json").read_text())
     assert gate["capabilities"]["memory"] == {"enabled": True}
     entries = {e["title"]: e for e in world.ok(root, "list", "--json")["entries"]}
     assert entries["Owner decision on stores"]["pinned"] is True
     assert entries["What memory is for"]["created_at"] == "2026-09-14T00:01:00Z"
-    listed = json.loads((world.config / "memory" / "service" / "projects.json").read_text())
-    assert project_id(root) in listed["projects"]
+    # The list is the node manager's, so adopt writes none.
+    assert not (world.config / "memory" / "service" / "projects.json").exists()
 
     again = world.ok(tmp_path, "adopt", str(root), "--apply")["projects"][0]
     assert again["counts"]["carried"] == 0 and again["counts"]["already"] == 2

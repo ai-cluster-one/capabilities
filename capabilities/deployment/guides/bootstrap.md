@@ -17,7 +17,7 @@ explicitly enabled in project settings. Descriptor-default services are embedded
 in the agent container and supervised there; an explicit `enabled` override keeps
 a capability as a separate Compose service. Global inheritance, installed
 payloads, and existing service directories do not authorize runtime services.
-Each embedded service runs under its runner.
+Each embedded service runs under its supervisor, `capabilities node supervise`.
 
 That is files mode. In a project whose records are in the store (an agent made by `capabilities init`, or moved there by `capabilities migrate`), setup compiles every installed capability service, and whether one runs on a node is the gate's answer there: `capabilities enable <name> --project --node <node>` turns it on without a redeploy (`deployment guide profiles`). There the Telegram and automations flags below exit 6 with `retired_option` for any value but `auto`.
 

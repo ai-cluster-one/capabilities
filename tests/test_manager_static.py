@@ -33,33 +33,5 @@ class ManagerStaticTests(unittest.TestCase):
         self.assertEqual(undefined, [], "\n".join(undefined))
 
 
-def _literal(path: Path, name: str):
-    """The literal value `path` assigns to `name`, a tuple target included."""
-    import ast
-    for node in ast.parse(path.read_text()).body:
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if getattr(target, "id", None) == name:
-                return ast.literal_eval(node.value)
-            if isinstance(target, ast.Tuple):
-                names = [getattr(item, "id", None) for item in target.elts]
-                if name in names:
-                    return ast.literal_eval(node.value)[names.index(name)]
-    raise AssertionError(f"{path} assigns no {name}")
-
-
-class LeaseStepsTests(unittest.TestCase):
-    def test_the_supervisor_makes_the_lease_table_with_deployments_own_steps(self):
-        # The manager's supervisor makes deployment_service_leases under
-        # deployment's ledger entry, which refuses a step whose SQL changed.
-        deployment = REPO / "capabilities" / "deployment" / "bin" / "deployment"
-        self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_STEPS"),
-                         _literal(deployment, "LEASE_STEPS"))
-        self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_VERSION"),
-                         (_literal(deployment, "LEASE_MAJOR"),
-                          _literal(deployment, "LEASE_MINOR")))
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -951,11 +951,9 @@ SERVICE
                                   lane's profile, resolved as a turn resolves
                                   it, for the sign-ins a node needs; starts no
                                   turn and changes nothing
-  tasks service join              put this project on the machine service's list
-  tasks service leave             take this project off it
 
-  MACHINE MODE - the same service once per machine, for every project that
-  joined it; see below:
+  MACHINE MODE - the same service once per machine, for every project placed
+  on it; see below:
   tasks service init --machine [--force]
                                   write the machine settings from the template
   tasks service run --machine     the machine process in the foreground, for a
@@ -977,8 +975,6 @@ SERVICE
                                   running unless --end-turns
   tasks service logs --machine [--project <slug>] [--tail 100]
                                   the machine log, or one project's lines in it
-  tasks service leave --machine --project <id-or-slug>
-                                  take any project off the list, from anywhere
 
   One daemon per project runs the conveyor on its own. Every enabled worker that
   takes something - a `takes` list, or the shipped `default` taking every type
@@ -1187,41 +1183,22 @@ SERVICE
   status` lists carries `project`, the same slug.
 
   MACHINE MODE. The service also runs once per machine, serving every project
-  that joined it, so the projects on one machine share one process, its store
-  connections and an optional cap on the turns they run at once. A project
-  opts in by an act of its own: `tasks service join`, run in a project that
-  enables tasks for itself (`capabilities enable tasks --project`), puts it on
-  the opt-in list `$XDG_CONFIG_HOME/tasks/service/projects.toml`, keyed by its
-  durable id, with its root, its slug and when and by whom it joined; `tasks
-  service leave` takes it off. Only these verbs write the list, atomically and
-  under a lock in the machine state root; do not edit it by hand. `join`
-  refuses, in this order and each with exit 6: a project without a durable id
-  (CAPABILITIES_PROJECT_ID; `capabilities init` gives it one), `no_project_identity`;
-  and a project whose slug another joined project has, `slug_taken`,
-  since the two would share a state root. It answers
-  `{"joined", "project": {"id", "slug", "root"}, "list"}`, `joined` false
-  with a reason when the project is already on the list, and starts nothing.
-  `leave` answers `{"left", "project", "list"}`; `leave --machine --project
-  <id-or-slug>` takes any project off from anywhere, one whose folder is gone
-  included. `capabilities disable tasks --project` leaves the list alone, and
-  the machine service reports the project refused until it is enabled again.
-
-  In a project whose records are in the store, `join` also places the
-  project's tasks service on this node to be served by the node's machine
-  service (`capabilities place tasks --node <this node> --mode shared`), and
-  `leave` takes that placement off (`unplace ... --mode shared`), `leave
-  --machine --project` in the project's folder where it is still there and
-  bound to that id: the placement is the one record of who is served, and
-  the node manager runs one machine service for the agents placed so. Each
-  answer then carries `placement` {written, node, mode, changed, placed_on},
-  or {written: false, error {code, message}}, said on stderr too, where the
-  manager could not write it; the list is written either way. A join or
-  leave the node manager runs for the agents whose leases it holds sets
-  CAPABILITIES_SERVICE_LIST_ONLY=1 and writes no placement.
-  A leave takes off only a placement its join wrote, one this node's row did
-  not already hold in mode shared or from before modes; any other it leaves
-  placed, answering placement {written: false, note} that names `capabilities
-  unplace`.
+  on its list, so the projects on one machine share one process, its store
+  connections and an optional cap on the turns they run at once. The list is
+  `$XDG_CONFIG_HOME/tasks/service/projects.toml`, keyed by each project's
+  durable id, with its root, its slug and when and by whom it was put there.
+  The node manager writes it (`capabilities node supervise tasks --machine`):
+  it puts there each agent placed on this node in mode shared whose leases it
+  holds, and takes off those it put there once they are not; tasks itself
+  never writes it, and nobody edits it by hand. A project in the store is
+  served by the machine service by being placed so: `capabilities service
+  start tasks` (on this node, shared where tasks declares a machine command)
+  or `capabilities place tasks --node <node> --mode shared`; `capabilities
+  service stop tasks` or `capabilities unplace tasks --node <node> --mode
+  shared` takes it off. A project already on the list stays on it until the
+  node manager takes it off. `capabilities disable tasks --project` leaves the
+  list alone, and the machine service reports the project refused until it is
+  enabled again.
 
   The machine process is `tasks service run --machine`, what a supervisor
   runs, or `start --machine`. Exactly one runs per machine, by the lock in its
@@ -1250,8 +1227,8 @@ SERVICE
   stops whichever process runs, and launchd restarts none that exits cleanly,
   so a stopped service stays stopped until it is started again.
 
-  It follows the list without a reload: a project that joins is served from
-  the first pass at which it can be, and one that leaves is let go at once,
+  It follows the list without a reload: a project put on it is served from
+  the first pass at which it can be, and one taken off is let go at once,
   its running turns left running. For each project it holds the project's own
   `daemon.lock` and writes the project's `daemon.pid`, `daemon.fingerprint`
   and `daemon.json` behind it, with `"mode": "machine"`, so `service status`,
@@ -1278,7 +1255,7 @@ SERVICE
   `served` are as in project mode, and each project pauses alone.
 
   In a joined project `service start` and `run` exit 4
-  `joined_to_machine_service`, naming `tasks service leave`, and `service
+  `joined_to_machine_service`, naming `capabilities service stop tasks`, and `service
   stop` exits 4 naming `tasks service pause` for this project and `tasks
   service stop --machine` for all; a project-mode daemon still serving it may
   be stopped as ever, and the machine process takes the project and adopts
@@ -1328,10 +1305,8 @@ SERVICE
 
   The machine verbs are the one operational use of tasks that resolves no
   project and reads no policy row: the process checks each joined project's
-  own explicit enable before every action for it. `join` needs tasks enabled
-  for the project itself, like `init`, `start` and `run`, and the read-only
-  switch refuses `join` and `leave` as it refuses `init`, `start`, `run` and
-  `reload`.
+  own explicit enable before every action for it. The read-only switch
+  refuses `init`, `start`, `run` and `reload`.
 
 ARGUMENTS
   A lone `--` ends the flags: everything after it is positional text as written,
@@ -2123,7 +2098,7 @@ SERVICE = {
     "summary": ("Project-local daemon that runs one turn of the conveyor for each "
                 "worker lane with work, woken by the store."),
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs",
-              "pause", "resume", "join", "leave", "harness"],
+              "pause", "resume", "harness"],
     # The sign-ins a node needs for it: gh for the git work its turns do, and the
     # harness of every lane's profile, which `service harness` answers.
     "sign_ins": {"tools": ["gh"], "harness": ["tasks", "service", "harness", "--json"]},
@@ -11273,7 +11248,7 @@ def cmd_watch(entry, args: list[str]) -> None:
 # uses, so a turn the service starts is the turn a person starts.
 
 _SERVICE_VERBS = ("init", "doctor", "run", "start", "reload", "stop", "status", "logs",
-                  "pause", "resume", "join", "leave", "harness")
+                  "pause", "resume", "harness")
 
 # What the settings file may say, and what it leaves to this capability. Any
 # other key is refused: a key nothing reads is a declaration doing nothing.
@@ -12336,14 +12311,13 @@ def _service_host(root: Path, wanted: str | None, environment: Mapping[str, str]
 
 # --- Machine mode ------------------------------------------------------------
 
-# One process per machine serves every project that opted in, from the list
-# its own `join` and `leave` write. The machine's files live under the machine:
+# One process per machine serves every project on its list, which the node
+# manager writes (`capabilities node supervise tasks --machine`) from the agents
+# placed on this node in mode shared. The machine's files live under the machine:
 # the list and the machine settings in this capability's config home, the lock,
 # the pid, the status and the log in its machine state root. Nothing here reads
 # a project's environment; each project is resolved inside its own scope.
 
-_PROJECTS_HEADER = ("# Projects served by the machine tasks service. Written by "
-                    "`tasks service join|leave`; do not edit by hand.")
 _PROJECT_ENTRY_KEYS = ("root", "slug", "joined_at", "joined_by")
 
 # What the machine settings may say. A missing file is these defaults: no
@@ -12384,16 +12358,6 @@ def _project_state_dir(slug: str) -> Path:
     return _STATE_HOME / "capabilities" / "projects" / slug / NAME
 
 
-def _toml_string(value: str) -> str:
-    """A TOML basic string; JSON's escapes are TOML's for every character."""
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def _toml_key(key: str) -> str:
-    import re as _re
-    return key if _re.fullmatch(r"[A-Za-z0-9_-]+", key) else _toml_string(key)
-
-
 def _utc_moment(value) -> str:
     """A moment as the list writes it: UTC to the second, `Z`."""
     import datetime as _dt
@@ -12414,8 +12378,9 @@ def _read_machine_projects(path: Path | None = None) -> dict:
 
     def refuse(sentence: str) -> NoReturn:
         raise Refusal(6, "projects_invalid", f"{path}: {sentence}",
-                      f"`{NAME} service join` and `{NAME} service leave` write it; "
-                      "repair it, or remove it and join the projects again")
+                      "the node manager writes it (`capabilities node supervise "
+                      f"{NAME} --machine`) from the agents placed on this node in mode "
+                      "shared; remove it and the node manager writes it again")
 
     if not path.exists():
         return {}
@@ -12448,48 +12413,6 @@ def _read_machine_projects(path: Path | None = None) -> dict:
                                 "joined_at": _utc_moment(entry.get("joined_at")),
                                 "joined_by": str(entry.get("joined_by") or "")}
     return listed
-
-
-def _write_machine_projects(listed: dict, path: Path | None = None) -> None:
-    """Write the opt-in list whole, under a spare name first, so a reader finds
-    the list before the write or after it and never half of it."""
-    path = path or _machine_projects_path()
-    lines = [_PROJECTS_HEADER, "version = 1", ""]
-    for project, entry in sorted(listed.items(), key=lambda item: item[0]):
-        lines += [f"[projects.{_toml_key(project)}]",
-                  f"root = {_toml_string(entry['root'])}",
-                  f"slug = {_toml_string(entry['slug'])}",
-                  f"joined_at = {entry['joined_at']}",
-                  f"joined_by = {_toml_string(entry['joined_by'])}", ""]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    spare = path.with_name(f".{path.name}.{os.getpid()}")
-    spare.write_text("\n".join(lines))
-    os.replace(spare, path)
-
-
-class _MachineListLock:
-    """The lock `join` and `leave` write the list under, in the machine state
-    root, so two of them never write over each other."""
-
-    def __enter__(self):
-        import fcntl
-
-        state = _machine_state_dir()
-        state.mkdir(parents=True, exist_ok=True)
-        self._handle = (state / "projects.lock").open("a+")
-        fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
-        return self
-
-    def __exit__(self, *_exc) -> bool:
-        self._handle.close()
-        return False
-
-
-def _listed_projects() -> dict:
-    try:
-        return _read_machine_projects()
-    except Refusal as refused:
-        _die(refused.exit_code, refused.code, refused.message, refused.hint)
 
 
 def _joined_here() -> dict | None:
@@ -12633,8 +12556,8 @@ class _MachineHost:
             return None, found
         if host.slug != entry["slug"]:
             return None, ("refused", f"slug_changed: the project now declares slug {host.slug} "
-                                     f"and joined as {entry['slug']}; `{NAME} service leave` "
-                                     f"and `{NAME} service join` there take the new one")
+                                     f"and joined as {entry['slug']}; the node manager "
+                                     "writes the new one on its next reconcile")
         return host, None
 
 
@@ -12738,259 +12661,6 @@ def _machine_status(module) -> dict:
 
 def _without_project_pointers() -> dict:
     return {key: value for key, value in os.environ.items() if key not in _PROJECT_POINTERS}
-
-
-def _project_answer(project: str, entry: dict) -> dict:
-    return {"id": project, "slug": entry["slug"], "root": entry["root"]}
-
-
-# --- the placement join and leave write ------------------------------------
-# In a project whose records are in the store, `service join` also places this
-# agent's tasks service on this node to be served by the node's machine service
-# (`capabilities place tasks --node <this node> --mode shared`), and `service
-# leave` takes that placement off again (`unplace ... --mode shared`): the
-# placement is the one record of who is served, and the manager alone writes
-# it. A join or leave the node manager runs for the leases it holds sets
-# CAPABILITIES_SERVICE_LIST_ONLY=1 and writes none.
-# A leave takes off only a placement its own join wrote - one the node's row
-# did not already hold in mode shared or from before modes - which the join
-# records beside the list, never on it, so a machine process from before
-# placements reads the list it always has. A node manager from before
-# CAPABILITIES_SERVICE_LIST_ONLY joins and leaves without it; its leave, when it
-# stops for an update, thereby takes off nothing it did not write.
-
-_PLACEMENT_LIST_ONLY_ENV = "CAPABILITIES_SERVICE_LIST_ONLY"
-
-
-def _shared_placement(verb: str, root, scoped: str | None = None,
-                      project: str | None = None) -> dict | None:
-    """What the manager answered placing (join) or unplacing (leave) this
-    agent's shared service on this node, {written, node, mode, changed?,
-    placed_on?, error?, note?}, or None where nothing is written: a project whose
-    records are not in the store, a folder that is gone, or the node manager's
-    own join or leave. `project` is the agent's id; `scoped`, a project's id in
-    its place, asks it of that project's folder from another, and of none where the folder is bound to another id
-    now. It never fails the verb, whose list is already written: a
-    placement that cannot be written is answered with why, and said on stderr."""
-    import contextlib
-    import io
-    import shutil
-    import subprocess
-
-    if os.environ.get(_PLACEMENT_LIST_ONLY_ENV) == "1" or root is None \
-            or not Path(root).is_dir():
-        return None
-    said = io.StringIO()
-    try:
-        with contextlib.redirect_stderr(said):
-            if scoped:
-                with ProjectScope(Path(root), dict(os.environ)):
-                    in_store = (_declared_project() == scoped and _records_in_store())
-                    env = dict(os.environ)
-            else:
-                in_store, env = _records_in_store(), dict(os.environ)
-    except SystemExit:
-        return _placement_unwritten(verb, None, "store_unreadable",
-                                    f"whether its records are in the store cannot be read: "
-                                    f"{_refusal_said(said.getvalue())}")
-    if not in_store:
-        return None
-    manager = shutil.which("capabilities")
-    if manager is None:
-        return _placement_unwritten(verb, None, "manager_missing",
-                                    "the capabilities manager is not on PATH")
-    try:
-        from capabilities_contract.capability import store as contract_store
-        node = contract_store.node_id()
-    except Exception as exc:
-        return _placement_unwritten(verb, None, getattr(exc, "slug", "node_unidentified"),
-                                    getattr(exc, "message", str(exc)))
-    project = scoped or project
-    if verb == "leave" and project not in _join_placements():
-        return {"written": False, "node": node, "mode": "shared",
-                "note": f"no join here placed {NAME}'s service on {node}, so leave leaves "
-                        f"its placement as it is; `capabilities unplace {NAME} --node "
-                        f"{node}` takes it off"}
-    argv = [manager, "place" if verb == "join" else "unplace", NAME, "--node", node,
-            "--mode", "shared"]
-    try:
-        # A manager from before placement modes would read the placement
-        # without its mode, so it is asked only once its help names --mode.
-        said = subprocess.run([manager, "help"], env=env, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=60)
-        if "[--mode shared|own]" not in said.stdout:
-            return _placement_unwritten(verb, node, "manager_predates_modes",
-                                        "the capabilities manager on PATH places no mode; "
-                                        "`capabilities self-update` brings one that does")
-        done = subprocess.run(argv, cwd=str(root), env=env, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return _placement_unwritten(verb, node, "manager_failed", str(exc))
-    if done.returncode != 0:
-        return _placement_unwritten(verb, node, "placement_refused",
-                                    _refusal_said(done.stderr))
-    try:
-        answer = json.loads(done.stdout)
-    except ValueError:
-        answer = {}
-    if verb == "leave":
-        _join_placement_mark(project, False)
-    elif answer.get("placed_before", "unrecorded") not in ("shared", "unrecorded"):
-        # Placed by this join, not found placed so: its leave takes it off.
-        _join_placement_mark(project, True)
-    return {"written": True, "node": node, "mode": "shared",
-            "changed": answer.get("changed"), "placed_on": answer.get("placed_on")}
-
-
-_JOIN_PLACEMENTS = "placed-by-join.json"
-
-
-def _join_placements() -> set:
-    """The projects whose shared placement on this node a join here wrote."""
-    try:
-        body = json.loads((_machine_state_dir() / _JOIN_PLACEMENTS).read_text())
-    except (OSError, ValueError):
-        return set()
-    listed = body.get("projects") if isinstance(body, dict) else None
-    return {p for p in listed if isinstance(p, str)} if isinstance(listed, list) else set()
-
-
-def _join_placement_mark(project, placed: bool) -> None:
-    """Record that a join here wrote `project`'s shared placement, or that
-    its leave took it off, whole under a lock of its own."""
-    import fcntl
-
-    if not project:
-        return
-    state = _machine_state_dir()
-    state.mkdir(parents=True, exist_ok=True)
-    with (state / "placed-by-join.lock").open("a+") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        projects = _join_placements()
-        if (project in projects) == placed:
-            return
-        projects = projects | {project} if placed else projects - {project}
-        path = state / _JOIN_PLACEMENTS
-        spare = path.with_name(f".{path.name}.{os.getpid()}")
-        spare.write_text(json.dumps({"version": 1, "projects": sorted(projects)}) + "\n")
-        os.replace(spare, path)
-
-
-def _placement_unwritten(verb: str, node, code: str, message: str) -> dict:
-    what = "placed" if verb == "join" else "unplaced"
-    sys.stderr.write(json.dumps({"warning": f"{verb} wrote the list, and the shared "
-                                            f"placement on this node was not {what}: "
-                                            f"{message}"}, ensure_ascii=False) + "\n")
-    return {"written": False, "node": node, "mode": "shared",
-            "error": {"code": code, "message": message}}
-
-
-def cmd_service_join(wanted: str | None, args: list[str]) -> None:
-    """Put this project on the machine service's opt-in list. It refuses, in
-    this order: no durable id; a connection entry that
-    still carries a store of its own; and a slug another joined project
-    already has, since the two would share a state root. It operates no
-    daemon."""
-    _flags(args, ())
-    if wanted:
-        _die(6, "input", "join takes no --connection: the machine service serves a project "
-             "on the connection the project selects by default",
-             "set `default` in this project's connections.json to the one it should use")
-    root = _project_here()
-    # The envelope is resolved first: resolving it moves an id an older
-    # project.json still holds, which the id is then read after.
-    _project_capabilities_dir(root)
-    project = _declared_project()
-    if not project:
-        _die(6, "no_project_identity",
-             "this project has no durable id (CAPABILITIES_PROJECT_ID), and the machine "
-             "service's list names a project by it",
-             "run `capabilities init` in the project")
-    # The connection the machine service will serve the project on, read as it
-    # will read it, so a project whose records cannot be read does not join;
-    # one with none usable is served on its store alone.
-    _selected_connection(None)
-    slug = _service_state_key(root)
-    path = _machine_projects_path()
-    already = None
-    with _MachineListLock():
-        listed = _listed_projects()
-        if project in listed:
-            already = {"joined": False, "reason": "already on the machine service's list",
-                       "project": _project_answer(project, listed[project]),
-                       "list": str(path)}
-        else:
-            taken = sorted(other for other, found in listed.items() if found["slug"] == slug)
-            if taken:
-                _die(6, "slug_taken",
-                     f"project {taken[0]} at {listed[taken[0]]['root']} is joined with slug "
-                     f"{slug!r}, and two projects of one slug would share a state root",
-                     "give one of them another slug with `capabilities relabel`, or leave the "
-                     f"other with `{NAME} service leave --machine --project {taken[0]}`")
-            import datetime as _dt
-            listed[project] = {"root": str(root), "slug": slug,
-                               "joined_at": _utc_moment(_dt.datetime.now(_dt.timezone.utc)),
-                               "joined_by": _actor()}
-            _write_machine_projects(listed, path)
-    if already is not None:
-        placement = _shared_placement("join", root, project=project)
-        _emit({**already, **({"placement": placement} if placement else {})})
-        return
-    module = _service_module()
-    state = _project_state_dir(slug)
-    if state.is_dir():
-        module.log_line(state, slug, f"joined the machine service, by {listed[project]['joined_by']}")
-    placement = _shared_placement("join", root, project=project)
-    _emit({"joined": True, "project": _project_answer(project, listed[project]),
-           "list": str(path), **({"placement": placement} if placement else {})})
-
-
-def cmd_service_leave(args: list[str]) -> None:
-    """Take a project off the opt-in list: this project, or with `--machine
-    --project <id-or-slug>` any project from anywhere, a folder that is gone
-    included. The machine process lets go of it on its next pass and leaves its
-    running turns running."""
-    opts = _flags(args, ("project",), bools=("machine",))
-    path = _machine_projects_path()
-    if opts.get("machine"):
-        named = (opts.get("project") or "").strip()
-        if not named:
-            _die(6, "input", "leave --machine names the project it takes off the list",
-                 f"`{NAME} service leave --machine --project <id-or-slug>`; "
-                 f"`{NAME} service status --machine` lists them")
-        here = None
-    else:
-        if opts.get("project"):
-            _die(6, "input", "--project names a project to leave from anywhere, with --machine",
-                 f"`{NAME} service leave` leaves this project")
-        _project_here()
-        here = _declared_project()
-        if not here:
-            _die(6, "no_project_identity", "this project has no durable id, so it is on no list",
-                 "run `capabilities init` in the project")
-        named = here
-    with _MachineListLock():
-        listed = _listed_projects()
-        found = [project for project, entry in listed.items()
-                 if project == named or (here is None and entry["slug"] == named)]
-        if found:
-            [project] = found[:1]
-            entry = listed.pop(project)
-            _write_machine_projects(listed, path)
-    if not found:
-        placement = _shared_placement("leave", _project_here(), project=here) if here else None
-        _emit({"left": False, "reason": "not on the machine service's list",
-               "project": {"id": here} if here else {"named": named}, "list": str(path),
-               **({"placement": placement} if placement else {})})
-        return
-    module = _service_module()
-    state = _project_state_dir(entry["slug"])
-    if state.is_dir():
-        module.log_line(state, entry["slug"], f"left the machine service, by {_actor()}")
-    placement = (_shared_placement("leave", _project_here(), project=here) if here else
-                 _shared_placement("leave", entry["root"], scoped=project))
-    _emit({"left": True, "project": _project_answer(project, entry), "list": str(path),
-           **({"placement": placement} if placement else {})})
 
 
 # --- launchd supervision -------------------------------------------------------
@@ -13130,7 +12800,8 @@ def cmd_service_init_machine(args: list[str]) -> None:
         written.append(str(target))
     _emit({"initialized": NAME, "mode": "machine", "config": str(target),
            "written": written, "skipped": skipped,
-           "next": [f"`{NAME} service join` in each project the machine service is to serve",
+           "next": [f"`capabilities service start {NAME}` in each project the machine service "
+                    "is to serve, which places it on this node in mode shared",
                     f"`{NAME} service start --machine`, or `{NAME} service run --machine` "
                     "under a supervisor"]})
 
@@ -13437,7 +13108,7 @@ def _joined_refusal(verb: str) -> None:
         _die(4, "joined_to_machine_service",
              f"this project is joined to the machine tasks service, which serves it, so "
              f"`{NAME} service {verb}` here is refused",
-             f"`{NAME} service leave` takes it back to project mode first")
+             f"`capabilities service stop {NAME}` takes it back to project mode first")
 
 
 def _machine_entry_of(module, project: str) -> dict | None:
@@ -14198,14 +13869,6 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
         _die(6, "input", f"unknown service verb {args[0]!r}" if args else "service needs a verb",
              f"{NAME} service {'|'.join(_SERVICE_VERBS)}")
     verb, rest = args[0], args[1:]
-    if verb == "join":
-        cmd_service_join(wanted, rest)
-        return
-    if verb == "leave":
-        if wanted and "--machine" in rest:
-            _die(6, "input", "the machine service takes no --connection")
-        cmd_service_leave(rest)
-        return
     if "--machine" in rest and verb in _MACHINE_VERBS:
         # The machine service: one process serving every joined project, each
         # on the connection its own default selects.

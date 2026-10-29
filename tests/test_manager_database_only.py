@@ -894,8 +894,17 @@ def test_a_dev_session_drops_the_schema_it_made_and_no_other(world, tmp_path):
 
 def test_the_machine_scheduler_serves_a_moved_agent(world):
     w = world
-    joined = w.answer(run(w, "moved", "automations", "service", "join"))
-    assert joined["joined"] is True
+    # On its list as the node manager puts an agent placed on the node in
+    # mode shared there (`node supervise automations --machine`).
+    root = w.roots["moved"]
+    [(slug,)] = w.sql("SELECT slug FROM capabilities_agents WHERE id = %s", (IDS["moved"],))
+    slug = slug or json.loads((root / "capabilities" / "project.json").read_text()).get(
+        "slug") or IDS["moved"]
+    listing = w.config / "automations" / "service" / "projects.toml"
+    listing.parent.mkdir(parents=True, exist_ok=True)
+    listing.write_text(f'version = 1\n\n[projects.{IDS["moved"]}]\nroot = {json.dumps(str(root))}\n'
+                       f'slug = {json.dumps(slug)}\njoined_at = 2026-10-29T10:00:00Z\n'
+                       'joined_by = "capabilities node supervise automations --machine"\n')
     started = w.answer(run(w, "moved", "automations", "service", "start", "--machine"))
     try:
         deadline, served = time.monotonic() + 60, None
@@ -909,7 +918,7 @@ def test_the_machine_scheduler_serves_a_moved_agent(world):
         assert served and served["state"] == "served", served
     finally:
         run(w, "moved", "automations", "service", "stop", "--machine")
-        run(w, "moved", "automations", "service", "leave")
+        listing.unlink(missing_ok=True)
 
 
 @pytest.mark.parametrize("capability", ["tasks", "memory"])

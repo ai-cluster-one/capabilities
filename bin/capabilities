@@ -195,6 +195,21 @@ MACHINE VERBS
         $CAPABILITIES_HOME/.update-failed/<name>.json {name, at, error}, which
         that capability's doctor raises as its one supervisor line; the next
         install or update of it that lands removes the record.
+        deployment is updated first. Where its installed payload has `deployment
+        runner` and the one it would be replaced by does not, the machine is
+        moved off the runner before anything is replaced: on a Mac whose node
+        manager agent (capabilities.node) is not loaded while launchd holds
+        deployment's old agents loaded - a machine agent
+        (capabilities.machine.<name>), or an agent whose program runs
+        `deployment runner`, `deployment watchdog` or `deployment machine
+        watchdog` - it runs `capabilities node install --apply` in this folder,
+        which places what they ran and hands them over, and answers it as
+        moved {ok, folder, node_install}. Where that fails, or old agents or a
+        process running `deployment runner` (a server's Supervisor program, which
+        only a redeploy onto the agent-node image changes) are still there,
+        deployment keeps the payload it has, answered as {name, changed: false,
+        kept {reason, next, agents, processes, move?}}, and the rest of the
+        update goes on; the next update tries again.
   update --check [<name>] [--json]
         Report, for every installed capability or the one named, whether
         `update` would change it: its recorded source carries a different
@@ -658,8 +673,7 @@ POLICY VERBS
         included - changes nothing and says so (note). A place answers
         placed_before, what the node's row held before it: null where the
         service was not placed there, else the mode it recorded, unrecorded
-        for a row from before modes; this is how `<name> service join` knows
-        the shared placement it wrote, which its leave alone takes off.
+        for a row from before modes.
         A service's descriptor declares how many nodes run it at once
         (service.placement): exclusive, the default, runs on one node at a
         time, so place takes it off every other node in the same write - this
@@ -1071,9 +1085,9 @@ PROJECT VERBS (run inside a consuming project)
   node seen
         Report this node up: set its last_seen_at to the store's now. The
         node is the one this process runs on (`node id`); a node reports
-        itself and no other. Every `deployment runner` runs it on each
-        reconcile, `node run` does the same, and `deployment help` says
-        when a node counts as live.
+        itself and no other. `node run` and every `node supervise` run it on
+        each reconcile, and `deployment help` says when a node counts as
+        live.
         Answers {ok, project, agent_id, node, last_seen_at, store}. Exit 6
         node_unknown for a node not registered.
   node state
@@ -1371,10 +1385,9 @@ PROJECT VERBS (run inside a consuming project)
         agents over too (`deployment machine handover <name> ...`, once,
         answered as machine_handover {services, agents, error?}). Before
         that, every agent it serves that is on a machine service's list here
-        (`<name> service join`'s, service.machine.projects) and not placed on
-        this node in mode shared is placed so (`<name> service join` again in
-        its folder, which writes that placement as the join's own, so its
-        leave takes it off), answered as joined
+        (service.machine.projects) and not placed on this node in mode shared
+        is placed so (`capabilities place <name> --node <this node> --mode
+        shared` in its folder), answered as joined
         [{service, agent_id, folder, node, mode, error?}] (would_join without
         --apply); a service one fails for keeps its old machine agent, and the
         command exits 6 handover_incomplete. An old agent's service placed
@@ -1450,17 +1463,18 @@ PROJECT VERBS (run inside a consuming project)
         keeps none. It records its state as deployment always kept a runner's
         (capabilities/deployment/state/runners/<name>.json, read by `deployment
         services`), and a second supervisor of the same service in the same
-        project on this machine - a host agent loaded again, a runner of an
-        older release - starts nothing and waits for the first to stop. The
+        project on this machine - an old host agent loaded again, the runner
+        of an older deployment - starts nothing and waits for the first to
+        stop. The
         service gets each environment default the compiled service carries -
         its descriptor's optional defaults, then the project runtime's
         environment_defaults for it - where the supervisor's environment sets
         none. Exit 6 agent_mismatch where the folder is bound to another agent
         than --agent, 3 no_service; 4 under the read-only switch.
   node supervise --probe
-        Answer {supervises: true} and start nothing: how `deployment runner`
-        learns that this manager supervises the service it is handed, where an
-        older one refuses the option and the runner supervises it itself.
+        Answer {supervises: true} and start nothing: how the runner of an
+        older deployment, on a machine not yet moved to the node manager,
+        learns that this manager supervises the service it is handed.
   node supervise <name> --machine [--every N] [--restart POLICY]
         What a node-run job runs for a service that declares one per machine
         (service.machine.command): one process on this node for every agent
@@ -1469,17 +1483,20 @@ PROJECT VERBS (run inside a consuming project)
         (mode shared; an agent whose own service holds it live is left to
         that service, its row and lines untouched) and its lease where the
         service is exclusive, puts each agent whose leases it holds on the
-        service's own list (`<name> service join` in its folder, with
-        CAPABILITIES_SERVICE_LIST_ONLY=1, so it writes no placement) and takes
-        off those it put there that it no longer holds (`service leave`,
-        likewise), giving up the agent's service lease once it is off, and
-        runs the machine command while any agent is on it, under the restart
-        policy and exit-4 hold above, probing it with service.machine.doctor.
+        service's own list (service.machine.projects, a TOML file under the
+        capability's config home, which this process alone writes: the
+        agent's id, its folder as root, its slug as the store keeps it) and
+        takes off those it put there that it no longer holds, giving up the
+        agent's service lease once it is off; an entry it did not put there
+        is left as it is, and one naming an agent it holds becomes its own.
+        It runs the machine command while any agent is on it, under the
+        restart policy and exit-4 hold above, probing it with
+        service.machine.doctor.
         It writes one row per placed agent: from what `<name> service status
         --machine` says of that agent (served ready, paused held, refused or
         error unusable), waiting for an agent whose lease another node holds.
-        Where a machine process it did not start runs <name> here - an agent
-        of `deployment machine sync`, or one started by hand - it starts none
+        Where a machine process it did not start runs <name> here - an old
+        machine agent an older deployment compiled, or one started by hand - it starts none
         beside it, changes no list and writes each row waiting
         (machine_process_elsewhere), its problem naming the command that ends
         it: `deployment machine handover <name>` where launchd runs
@@ -3640,7 +3657,7 @@ def _validate_service_deploy(deploy: object) -> list[str]:
 
 SERVICE_MACHINE_SCHEMA = "capabilities.service.machine.v1"
 SERVICE_MACHINE_KEYS = ("schema", "command", "doctor", "projects", "config", "state")
-SERVICE_MACHINE_VERBS = ("run", "status", "doctor", "join", "leave")
+SERVICE_MACHINE_VERBS = ("run", "status", "doctor")
 
 
 def _validate_service_machine(name: str, machine: object, verbs: object) -> list[str]:
@@ -4892,12 +4909,14 @@ def cmd_update(name: str | None) -> None:
     if name and not _registry_dir(name).is_dir():
         _die(3, "not_found", f"{name} is not installed")
     results = []
-    for n in targets:
+    # deployment goes first: where its new payload no longer has the runner,
+    # the machine is moved off the runner's agents before anything is replaced.
+    for n in sorted(targets, key=lambda name: name != "deployment"):
         _assert_payload_mutable(n)
         with _update_recorded(n):
             results.append(_update_one(n))
     _sync_skill()
-    _emit({"updated": results})
+    _emit({"updated": sorted(results, key=lambda entry: entry["name"])})
 
 
 def _update_one(n: str) -> dict:
@@ -4920,13 +4939,154 @@ def _update_one(n: str) -> dict:
         "sha256": _sha256(stage / n), "payload_sha256": after,
         **provenance,
     })
+    moved = None
+    if n == RUNNER_CAPABILITY and before != after:
+        kept, moved = _runner_move(stage / n)
+        if kept is not None:
+            shutil.rmtree(stage, ignore_errors=True)
+            return {"name": n, "changed": False, "kept": kept}
     script = _activate_payload(n, stage)
     _refresh_contract_library(script)
     entry = {"name": n, "changed": before != after}
+    if moved is not None:
+        entry["moved"] = moved
     migrated = _migrate_tables(n, script, manifest)
     if migrated is not None:
         entry["migrate"] = migrated
     return entry
+
+
+# deployment's runner, and the launchd agents of its compiling that run the
+# runner or its watchdogs, started services before the node manager did. A
+# deployment release without them cannot replace one that has them while this
+# machine still runs them, or a service they run would stop at its next start:
+# `update` first moves a Mac to the node manager, as `node install --apply`
+# does, and otherwise keeps the older deployment and says what moves it.
+RUNNER_CAPABILITY = "deployment"
+RUNNER_STOP_WAIT_SECONDS = 45
+RUNNER_HELP_LINE = re.compile(r"(?m)^\s*deployment runner\b")
+RUNNER_PROCESS = re.compile(r"(^|[/\s])deployment\s+runner(\s|$)")
+RUNNER_AGENT_COMMAND = re.compile(
+    r"(^|[/\s'\"])deployment['\"]?\s+['\"]?(runner|watchdog|machine['\"]?\s+['\"]?watchdog)\b")
+
+
+def _has_runner(script: Path) -> bool:
+    """Whether a deployment payload carries `deployment runner`, as its help
+    (the script's own usage text) names it."""
+    try:
+        return RUNNER_HELP_LINE.search(script.read_text()) is not None
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _runner_agents() -> list[dict]:
+    """The launchd agents of deployment's compiling that launchd holds loaded
+    here: every machine agent (capabilities.machine.<name>), and every agent
+    in ~/Library/LaunchAgents whose program - or the launcher it names - runs
+    `deployment runner`, `deployment watchdog` or `deployment machine
+    watchdog`. [] off a Mac."""
+    import plistlib
+    if not shutil.which("launchctl"):
+        return []
+    state = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+    found: dict[str, dict] = {}
+    for directory in (_launch_agents_dir(), state / "deployment" / "machine" / "launchd"):
+        for path in sorted(directory.glob("*.plist")) if directory.is_dir() else []:
+            try:
+                body = plistlib.loads(path.read_bytes())
+            except Exception:  # noqa: BLE001 - a file launchd could not read either
+                continue
+            label = body.get("Label") if isinstance(body, dict) else None
+            if not isinstance(label, str) or label in found or label == NODE_AGENT_LABEL:
+                continue
+            argv = body.get("ProgramArguments")
+            words = [str(v) for v in argv] if isinstance(argv, list) else []
+            program = body.get("Program") or (words[0] if words else None)
+            runs = " ".join(words)
+            try:
+                if program and Path(program).is_file() and Path(program).stat().st_size < 65536:
+                    runs += "\n" + Path(program).read_text()
+            except (OSError, UnicodeDecodeError):
+                pass
+            if label.startswith("capabilities.machine."):
+                kind = "machine"
+            elif RUNNER_AGENT_COMMAND.search(runs):
+                kind = "host"
+            else:
+                continue
+            if _launchd_loaded(label):
+                found[label] = {"label": label, "kind": kind, "plist": str(path)}
+    return list(found.values())
+
+
+def _runner_processes() -> list[dict]:
+    """The processes on this machine running `deployment runner`, as `ps`
+    reports their command lines."""
+    try:
+        done = subprocess.run(["ps", "-eo", "pid=,args="], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    found = []
+    for line in done.stdout.splitlines():
+        pid, _sep, args = line.strip().partition(" ")
+        if pid.isdigit() and int(pid) != os.getpid() and RUNNER_PROCESS.search(args):
+            found.append({"pid": int(pid), "args": args.strip()[:300]})
+    return found
+
+
+def _runner_move(staged: Path) -> tuple[dict | None, dict | None]:
+    """Before deployment's payload is replaced by `staged`: (kept, moved).
+    kept is None where it may be replaced - the installed one has no runner,
+    `staged` still has it, or nothing here runs it any more, moved naming the
+    node install that moved a Mac first - else why the installed one stays
+    and what moves the machine."""
+    installed = _script_path(RUNNER_CAPABILITY)
+    if not installed.is_file() or not _has_runner(installed) or _has_runner(staged):
+        return None, None
+    agents, processes = _runner_agents(), _runner_processes()
+    if not agents and not processes:
+        return None, None
+    moved = None
+    mac = bool(shutil.which("launchctl"))
+    if mac and agents and not _launchd_loaded(NODE_AGENT_LABEL):
+        root = _project_root()
+        if root is None:
+            moved = {"ok": False, "error": {
+                "code": "no_project", "message": "this update runs outside an agent's "
+                "folder, so the node manager it would install has no agent to serve"}}
+        else:
+            answer, said = _node_install_manager(root, "node", "install", "--apply")
+            moved = ({"ok": True, "folder": str(root), "node_install": answer}
+                     if answer is not None else
+                     {"ok": False, "folder": str(root), "error": {
+                         "code": "node_install_failed", "message": said}})
+        agents, processes = _runner_agents(), _runner_processes()
+        # A runner its agent's bootout stopped takes its service down first.
+        waited = time.monotonic() + RUNNER_STOP_WAIT_SECONDS
+        while moved["ok"] and not agents and processes and time.monotonic() < waited:
+            time.sleep(1)
+            processes = _runner_processes()
+        if moved["ok"] and not agents and not processes:
+            return None, moved
+    if mac:
+        reason = ("deployment's old launchd agents still run here"
+                  if agents else "processes still run `deployment runner` here")
+        step = ("`capabilities node install --apply` in the folder of an agent on this "
+                "node hands its old agents to the node manager, `deployment machine "
+                "handover <name>` the machine agents of a service no agent here places "
+                "in mode shared; then `capabilities update deployment`")
+    else:
+        reason = "this machine's supervisor still runs `deployment runner` programs"
+        step = ("only a redeploy onto the agent-node image, whose supervisor runs "
+                "`capabilities node run`, moves it (`deployment node update <node> "
+                "--version <release>`); then `capabilities update deployment`")
+    kept = {"reason": f"{reason}, and the deployment update would remove the runner they "
+                      "need, so deployment keeps the payload it has",
+            "next": step, "agents": agents, "processes": processes}
+    if moved is not None:
+        kept["move"] = moved
+    return kept, None
 
 
 def _captured(fn, *args):
@@ -10803,8 +10963,8 @@ def _agent_rekey(root: Path, given: str | None, dry_run: bool) -> dict:
                  "stop each before the rekey and start it after: on a server node stop "
                  "the node (`coolify stop <resource>`), a project service with "
                  "`<capability> service stop` in its folder, a machine service's project "
-                 "with `<capability> service leave` here (`service join` after); a lease "
-                 "a stopped service held runs out at its time")
+                 "with `capabilities service stop <capability>` there (`service start` "
+                 "after); a lease a stopped service held runs out at its time")
         if refusals and not dry_run:
             _die(6, *refusals[0])
         triggers = _rekey_triggers(conn, schema, [hit["table"] for hit in plan])
@@ -12635,38 +12795,118 @@ def _node_install_manager(path: Path, *argv: str) -> tuple[dict | None, str]:
             (proc.stderr or proc.stdout).strip()[-1000:] or f"exit {proc.returncode}")
 
 
-def _machine_list_ids(name: str) -> list[str] | None:
-    """The ids of the projects on `name`'s machine service list on this
-    machine (`service.machine.projects`, which its `service join` and `leave`
-    write), or None where it keeps none or it cannot be read."""
+# A machine service's list (`service.machine.projects`, a TOML file under the
+# capability's own config home) names the projects its one machine process
+# serves. The node manager alone writes it: `node supervise <name> --machine`
+# puts there each agent placed on this node in mode shared whose leases it
+# holds, and takes off each it put there that it no longer serves, so the list
+# follows the placements in the store. An entry it did not write - one a
+# `service join` of an older release put there - stays until that agent is
+# served here and given up again.
+
+MACHINE_LIST_VERSION = 1
+MACHINE_LIST_ENTRY_KEYS = ("root", "slug", "joined_at", "joined_by")
+
+
+def _machine_list_path(name: str) -> Path | None:
+    """Where `name`'s installed service keeps its machine list, or None where
+    it declares none under $XDG_CONFIG_HOME, which is where it reads it."""
     machine = (_installed_service(name) or {}).get("machine")
     listing = machine.get("projects") if isinstance(machine, dict) else None
     if not isinstance(listing, str) or not listing.startswith("$XDG_CONFIG_HOME/"):
         return None
     path = _CONFIG_HOME / listing[len("$XDG_CONFIG_HOME/"):]
+    return path if path.suffix in (".toml", ".json") else None
+
+
+def _machine_list_read(path: Path) -> dict[str, dict]:
+    """The entries of a machine list (TOML, or JSON by its suffix) by project
+    id, {} where there is no file; ValueError where it does not read as one."""
+    import tomllib
     try:
-        if path.suffix == ".toml":
-            import tomllib
-            body = tomllib.loads(path.read_text())
-        elif path.suffix == ".json":
-            body = json.loads(path.read_text())
-        else:
-            return None
-    except (OSError, ValueError):
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(str(exc)) from None
+    try:
+        body = json.loads(text) if path.suffix == ".json" else tomllib.loads(text)
+    except (tomllib.TOMLDecodeError, ValueError) as exc:
+        raise ValueError(str(exc)) from None
+    projects = body.get("projects", {}) if isinstance(body, dict) else None
+    if not isinstance(projects, dict) or body.get("version") != MACHINE_LIST_VERSION \
+            or not all(isinstance(entry, dict) for entry in projects.values()):
+        raise ValueError("it does not read as a machine list (version 1, [projects.<id>])")
+    return {str(k): dict(v) for k, v in projects.items()}
+
+
+def _machine_list_write(path: Path, name: str, listed: dict[str, dict]) -> None:
+    """Write a machine list whole, under a spare name first, so its machine
+    process reads it before the write or after it and never half of it."""
+    from datetime import datetime, timezone
+
+    def text(value) -> str:
+        return json.dumps(str(value), ensure_ascii=False)
+
+    def moment(value) -> str:
+        if isinstance(value, datetime):
+            if value.tzinfo is not None:
+                value = value.astimezone(timezone.utc)
+            return value.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return text(value)
+
+    if path.suffix == ".json":
+        body = {"version": MACHINE_LIST_VERSION, "projects": {
+            project: {field: (entry[field].astimezone(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ") if isinstance(entry[field], datetime)
+                else str(entry[field]))
+                for field in MACHINE_LIST_ENTRY_KEYS if field in entry}
+            for project, entry in sorted(listed.items())}}
+        lines = [json.dumps(body, indent=2, ensure_ascii=False)]
+    else:
+        lines = _machine_list_toml(name, listed, text, moment)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    spare = path.with_name(f".{path.name}.{os.getpid()}")
+    spare.write_text("\n".join(lines) + ("\n" if path.suffix == ".json" else ""))
+    os.replace(spare, path)
+
+
+def _machine_list_toml(name: str, listed: dict[str, dict], text, moment) -> list[str]:
+    lines = [f"# Projects served by the machine {name} service. Written by the node "
+             f"manager (`capabilities node supervise {name} --machine`) from the agents "
+             "placed on this node in mode shared; do not edit by hand.",
+             f"version = {MACHINE_LIST_VERSION}", ""]
+    for project, entry in sorted(listed.items()):
+        key = project if re.fullmatch(r"[A-Za-z0-9_-]+", project) else text(project)
+        lines.append(f"[projects.{key}]")
+        for field in MACHINE_LIST_ENTRY_KEYS:
+            if field in entry:
+                value = entry[field]
+                lines.append(f"{field} = "
+                             f"{moment(value) if field == 'joined_at' else text(value)}")
+        lines.append("")
+    return lines
+
+
+def _machine_list_ids(name: str) -> list[str] | None:
+    """The ids of the projects on `name`'s machine list on this machine, or
+    None where it keeps none or it cannot be read."""
+    path = _machine_list_path(name)
+    try:
+        return sorted(_machine_list_read(path)) if path is not None else None
+    except ValueError:
         return None
-    projects = body.get("projects") if isinstance(body, dict) else None
-    return sorted(str(k) for k in projects) if isinstance(projects, dict) else None
 
 
 def _node_install_joined(folders: list[tuple[str, Path]], placed: list[tuple], here: str,
                          apply: bool) -> tuple[list[dict], set[str]]:
     """Every agent the node manager will serve that is on a machine service's
-    list here - joined with `<name> service join` before joining wrote a
+    list here - put there by a `service join` before joining wrote a
     placement - placed on this node to be served by that machine service
-    (mode shared) where it is not already, each where `apply`. Answers
-    ([{service, agent_id, folder, node, mode, error?}], the services one
-    failed for); an agent placed so already is left out, so running it again
-    changes nothing."""
+    (`capabilities place <name> --node <here> --mode shared` in its folder)
+    where it is not already, each where `apply`. Answers ([{service, agent_id,
+    folder, node, mode, error?}], the services one failed for); an agent
+    placed so already is left out, so running it again changes nothing."""
     served = dict(folders)
     modes = {(agent_id, capability): _placement_mode(capability, recorded)
              for agent_id, capability, recorded in placed}
@@ -12682,37 +12922,13 @@ def _node_install_joined(folders: list[tuple[str, Path]], placed: list[tuple], h
             entry = {"service": name, "agent_id": agent_id, "folder": str(path),
                      "node": here, "mode": "shared"}
             if apply:
-                said = _node_install_join(path, name)
-                if said is not None:
+                answer, said = _node_install_manager(path, "place", name, "--node", here,
+                                                     "--mode", "shared")
+                if answer is None:
                     entry["error"] = said
                     failed.add(name)
             out.append(entry)
     return out, failed
-
-
-def _node_install_join(path: Path, name: str) -> str | None:
-    """Join the agent in `path` to `name`'s machine service again, which writes
-    its shared placement on this node as the join's own; None where it was
-    written, else what was said."""
-    executable = shutil.which(name)
-    if not executable:
-        return f"{name} is not on PATH"
-    env = _snapshot_env()
-    env.pop(PLACEMENT_LIST_ONLY_ENV, None)
-    rc, out, err = _run_script(Path(executable), ["service", "join"], cwd=path, env=env,
-                               timeout=180)
-    try:
-        answer = json.loads(out) if rc == 0 else None
-    except ValueError:
-        answer = None
-    placement = answer.get("placement") if isinstance(answer, dict) else None
-    if isinstance(placement, dict) and placement.get("written") is True:
-        return None
-    if isinstance(placement, dict) and isinstance(placement.get("error"), dict):
-        return str(placement["error"].get("message") or placement["error"].get("code"))
-    if answer is not None:
-        return f"`{name} service join` wrote no placement"
-    return (err or out).strip()[-1000:] or f"exit {rc}"
 
 
 def _node_install(args: list[str]) -> None:
@@ -12803,7 +13019,7 @@ def _node_install(args: list[str]) -> None:
               if (row[0], row[1]) not in {(e["agent_id"], e["service"]) for e in joined}]
     placed += [(e["agent_id"], e["service"], "shared") for e in joined if "error" not in e]
     # The machine services the node manager will run here, as `node run`
-    # chooses them, hand their old machine agents (`deployment machine sync`'s)
+    # chooses them, hand their old machine agents (an older deployment's)
     # over the same way, once for the machine; not one an agent on its list
     # could not be placed for, which its old agent goes on serving.
     served = {linked for linked, _path in folders}
@@ -12894,12 +13110,13 @@ def _node_install(args: list[str]) -> None:
 # the service, holds the service's lease in the project's store, and starts or
 # stops the service's command to match, once per reconcile. Turning a service
 # on or off for a node is therefore a gate write, never a recompile or a
-# redeploy, and the lease keeps one service on one machine. `deployment
-# runner`, which every compilation before the node manager runs, hands its
+# redeploy, and the lease keeps one service on one machine. An older
+# deployment's runner, still run where a machine has not moved yet, hands its
 # service to this process unchanged.
 #
 # The lease rows are the table deployment's runner kept (`deployment_service_
-# leases`), under deployment's name and ledger entry; the record of each
+# leases`), under deployment's name and ledger entry, whose steps live here
+# alone; the record of each
 # supervisor and the lock that
 # keeps it the only one in its project on this machine stay where `deployment
 # services` reads them, under deployment's state, so a runner still running an
@@ -12921,8 +13138,11 @@ SUPERVISE_SCHEMA = "capabilities.deployment.runner.v1"
 SUPERVISE_UNLOCKED = object()
 # The lease table keeps the name and the migration ledger entry deployment gave
 # it when its runner held the leases, so a store either side made reads alike:
-# these steps are deployment's LEASE_STEPS, byte for byte, which the ledger's
-# checksum holds to, until deployment's copy goes with its runner.
+# the first two steps are the ones deployment applied, byte for byte, which the
+# ledger's checksum holds to. This is the table's one home now that deployment's
+# copy has gone with its runner. The instance rows carry what a failing service
+# said, so nothing here reads or writes the lease's last_error any more; the
+# column stays, since a released manager still on another node names it.
 SUPERVISE_LEASE_OWNER = "deployment"
 SUPERVISE_LEASE_VERSION = (1, 1)
 SUPERVISE_LEASE_STEPS = [
@@ -13163,14 +13383,14 @@ class _SuperviseLease(_SuperviseStore):
     def _holding(row, node: str) -> dict:
         if row is None:
             return {"state": "free", "holder": None}
-        holder, acquired, renewed, expires, live, code, error, failed = row
+        holder, acquired, renewed, expires, live, code, failed = row
         return {"state": ("held" if holder == node else
                           "held_elsewhere" if live else "free"),
                 "holder": holder, "acquired_at": _supervise_iso(acquired),
                 "renewed_at": _supervise_iso(renewed), "expires_at": _supervise_iso(expires),
                 "live": bool(live),
-                "last_error": ({"exit": code, "error": error, "at": _supervise_iso(failed)}
-                               if failed is not None else None)}
+                "last_failure": ({"exit": code, "at": _supervise_iso(failed)}
+                                 if failed is not None else None)}
 
     def acquire(self, capability: str) -> dict:
         """Take or renew this node's hold, unless another node's is live."""
@@ -13184,17 +13404,16 @@ class _SuperviseLease(_SuperviseStore):
                 "renewed_at = now(), acquired_at = CASE WHEN l.node = EXCLUDED.node "
                 "THEN l.acquired_at ELSE now() END, "
                 "last_exit = CASE WHEN l.node = EXCLUDED.node THEN l.last_exit END, "
-                "last_error = CASE WHEN l.node = EXCLUDED.node THEN l.last_error END, "
                 "last_error_at = CASE WHEN l.node = EXCLUDED.node "
                 "THEN l.last_error_at END "
                 "WHERE l.node = EXCLUDED.node OR l.expires_at <= now() "
                 "RETURNING node, acquired_at, renewed_at, expires_at, true, "
-                "last_exit, last_error, last_error_at",
+                "last_exit, last_error_at",
                 (self.project, capability, self.node, self.ttl)).fetchone()
             if row is None:
                 row = conn.execute(
                     "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
-                    "last_exit, last_error, last_error_at "
+                    "last_exit, last_error_at "
                     "FROM deployment_service_leases WHERE project = %s AND capability = %s",
                     (self.project, capability)).fetchone()
             return self._holding(row, self.node)
@@ -13218,7 +13437,7 @@ class _SuperviseLease(_SuperviseStore):
                 (self.project, capability, self.node)).rowcount
             row = conn.execute(
                 "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
-                "last_exit, last_error, last_error_at "
+                "last_exit, last_error_at "
                 "FROM deployment_service_leases WHERE project = %s AND capability = %s",
                 (self.project, capability)).fetchone()
             found = self._holding(row, self.node)
@@ -13237,16 +13456,14 @@ class _SuperviseLease(_SuperviseStore):
             return known
         return self.release(capability)
 
-    def record_error(self, capability: str, code, error: str) -> dict:
-        """Write why the service last failed onto this node's hold, so it can
-        be read from any machine that reads the store."""
+    def record_error(self, capability: str, code) -> dict:
+        """Write the exit code the service last failed with, and when, onto
+        this node's hold; what it said is the instance row's."""
         def work(conn):
             done = conn.execute(
-                "UPDATE deployment_service_leases SET last_exit = %s, last_error = %s, "
-                "last_error_at = now() "
+                "UPDATE deployment_service_leases SET last_exit = %s, last_error_at = now() "
                 "WHERE project = %s AND capability = %s AND node = %s",
-                (code, error[-SUPERVISE_ERROR_CHARS:], self.project, capability,
-                 self.node)).rowcount
+                (code, self.project, capability, self.node)).rowcount
             return {"recorded": bool(done)}
         return self._run(work)
 
@@ -13831,8 +14048,7 @@ class _Supervisor:
         another machine can read it."""
         if self.lease.mine_until is None:
             return
-        found = self.lease.record_error(self.name, self.last_exit.get("code"),
-                                        self.last_exit.get("error") or "")
+        found = self.lease.record_error(self.name, self.last_exit.get("code"))
         failing = (found.get("error") or {}).get("code")
         if failing and failing != self.error_unrecorded:
             self.say("cannot record the failure on the lease: "
@@ -14175,10 +14391,10 @@ def _supervise(root: Path, name: str, command: list[str], restart: str, every: i
 # <name> --machine`, started by the node manager when any agent on this node
 # places the service so. It takes each such agent's service lease on this node
 # and, where the service is exclusive, its lease, puts each agent it holds on the
-# service's own list through the service's `service join` verb and takes it off
-# with `service leave`, runs the service's machine command while any agent is
-# on it, and writes one instance row per agent from what the service says of
-# that agent. A machine process it did not start - one an older machine-scope
+# service's own list (`service.machine.projects`, which it alone writes) and
+# takes it off once it no longer holds it, runs the service's machine command
+# while any agent is on it, and writes one instance row per agent from what the
+# service says of that agent. A machine process it did not start - one an older machine-scope
 # agent runs, or one started by hand - keeps the service: this one then starts
 # nothing and changes no list.
 
@@ -14218,13 +14434,16 @@ class _SupervisePlacement(_SuperviseStore):
     def placed(self, capability: str) -> dict:
         def work(conn):
             rows = conn.execute(
-                "SELECT l.agent_id, l.folder, p.mode FROM capabilities_policy p "
+                "SELECT l.agent_id, l.folder, p.mode, a.slug FROM capabilities_policy p "
                 "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
-                "AND l.node = p.node WHERE p.node = %s AND p.capability = %s "
+                "AND l.node = p.node LEFT JOIN capabilities_agents a ON a.id = p.agent_id "
+                "WHERE p.node = %s AND p.capability = %s "
                 "AND p.enabled AND p.service ORDER BY l.agent_id",
                 (self.node, capability)).fetchall()
-            return {"agents": [(agent_id, folder) for agent_id, folder, mode in rows
-                               if _placement_mode(capability, mode) == "shared"]}
+            return {"agents": [(agent_id, folder) for agent_id, folder, mode, _slug in rows
+                               if _placement_mode(capability, mode) == "shared"],
+                    "slugs": {agent_id: slug for agent_id, _folder, _mode, slug in rows
+                              if slug}}
         return self._run(work)
 
 
@@ -14244,8 +14463,9 @@ class _MachineSupervisor(_Supervisor):
         self.lease_states: dict[str, dict] = {}
         self.instances: dict[str, _SuperviseInstance] = {}
         self.admitted: set[str] = set()
+        self.slugs: dict[str, str] = {}
         # The agents this supervisor put on the service's list, with the folder
-        # each was joined from, so it can take each off again after a restart.
+        # each was put there from, so it can take each off again after a restart.
         joined = self.read_record().get("joined")
         self.joined: dict[str, str] = ({k: v for k, v in joined.items()
                                         if isinstance(k, str) and isinstance(v, str)}
@@ -14322,31 +14542,75 @@ class _MachineSupervisor(_Supervisor):
         except (ProcessLookupError, PermissionError):
             return False
 
-    def list_verb(self, verb: str, agent_id: str) -> bool:
-        """`<name> service join|leave` in the agent's folder; whether it took."""
-        folder = self.agents.get(agent_id) or (Path(self.joined[agent_id])
-                                               if agent_id in self.joined else None)
-        executable = shutil.which(self.name)
-        if folder is None or not executable:
-            return False
-        # The list follows the leases this process holds; the placement is a
-        # person's, so this join or leave writes none.
-        rc, out, err = _run_script(Path(executable), ["service", verb], cwd=folder,
-                                   env={**_snapshot_env(), PLACEMENT_LIST_ONLY_ENV: "1"},
-                                   timeout=120)
-        said = _supervise_refusal_of(err.splitlines())
-        failing = None if rc == 0 else (said.get("message") or (err or out).strip()[-300:]
-                                        or f"exit {rc}")
-        key = f"{verb}:{agent_id}"
+    def list_failed(self, key: str, failing: str | None) -> None:
+        """Say once that the list could not be written for `key`, and once
+        that it is written again."""
         if failing != self.list_failing.get(key):
-            self.say(f"`{self.name} service {verb}` for {agent_id} in {folder}: {failing}"
-                     if failing else f"{verb}s {agent_id} to the machine process here"
-                     if verb == "join" else f"takes {agent_id} off the machine process here")
+            self.say(failing if failing else f"writes the list of {self.name} here again")
         if failing:
             self.list_failing[key] = failing
         else:
             self.list_failing.pop(key, None)
-        return rc == 0
+
+    def list_sync(self, admitted: set[str]) -> None:
+        """Make the service's list name each agent this process holds, as the
+        project the service serves (its folder, and its slug as the store
+        keeps it), and take off each it put there that it holds no longer. An
+        entry it did not put there is left as it is; one naming an agent it
+        holds is taken as its own. Where the list cannot be written nothing
+        changes, and it is said once."""
+        path = _machine_list_path(self.name)
+        if path is None:
+            if admitted:
+                self.list_failed("path", f"{self.name}'s service declares no machine list "
+                                         "under $XDG_CONFIG_HOME (service.machine.projects), "
+                                         "so no agent can be handed to its machine process")
+            return
+        try:
+            listed = _machine_list_read(path)
+            self.list_failed("read", None)
+        except ValueError as exc:
+            self.list_failed("read", f"the list {path} does not read ({exc}); it is written "
+                                     "anew with the agents served here")
+            listed = {}
+        from datetime import datetime, timezone
+        before = json.dumps(listed, sort_keys=True, default=str)
+        joined = {k: v for k, v in self.joined.items() if k in admitted}
+        for agent_id in sorted(set(self.joined) - admitted):
+            listed.pop(agent_id, None)
+        for agent_id in sorted(admitted):
+            folder = self.agents.get(agent_id)
+            if folder is None:
+                continue
+            slug = self.slugs.get(agent_id) or _legacy_project_slug(folder) or agent_id
+            taken = sorted(other for other, entry in listed.items()
+                           if other != agent_id and entry.get("slug") == slug)
+            self.list_failed(f"slug:{agent_id}", (
+                f"{agent_id} is not put on the list of {self.name}: project {taken[0]} there "
+                f"has its slug {slug!r}, and two projects of one slug would share a state "
+                "root") if taken else None)
+            if taken:
+                continue
+            entry = listed.get(agent_id)
+            if entry is None or entry.get("root") != str(folder) or entry.get("slug") != slug:
+                listed[agent_id] = {
+                    "root": str(folder), "slug": slug,
+                    "joined_at": (entry or {}).get("joined_at") or datetime.now(timezone.utc),
+                    "joined_by": (entry or {}).get("joined_by")
+                    or f"capabilities node supervise {self.name} --machine on {self.node}"}
+            joined[agent_id] = str(folder)
+        if json.dumps(listed, sort_keys=True, default=str) != before:
+            try:
+                _machine_list_write(path, self.name, listed)
+            except OSError as exc:
+                self.list_failed("write", f"cannot write the list {path}: {exc}")
+                return
+            self.list_failed("write", None)
+        for agent_id in sorted(set(joined) - set(self.joined)):
+            self.say(f"puts {agent_id} on the machine process here")
+        for agent_id in sorted(set(self.joined) - set(joined)):
+            self.say(f"takes {agent_id} off the machine process here")
+        self.joined = joined
 
     def tick(self) -> None:
         self.tick_at = _supervise_now_iso()
@@ -14362,6 +14626,7 @@ class _MachineSupervisor(_Supervisor):
                 if path is not None and _folder_agent_id(path) == agent_id:
                     agents[agent_id] = path
             self.agents = agents
+            self.slugs = found.get("slugs") or {}
             self.placed = bool(agents)
             self.gate = {"placed": self.placed, "agents": sorted(agents)}
         else:
@@ -14422,12 +14687,7 @@ class _MachineSupervisor(_Supervisor):
             self.say("the agents it serves changed; the refusal hold is lifted")
             self.refusal = None
         self.gate_seen = tuple(sorted(admitted))
-        for agent_id in sorted(set(self.joined) - admitted):
-            if self.list_verb("leave", agent_id):
-                self.joined.pop(agent_id, None)
-        for agent_id in sorted(admitted - set(self.joined)):
-            if self.list_verb("join", agent_id):
-                self.joined[agent_id] = str(self.agents[agent_id])
+        self.list_sync(admitted)
         # An agent it serves no longer gives up its lease here once it is off
         # the list, so its own service may take it.
         for agent_id in sorted(set(self.node_leases) - admitted - set(yielded)
@@ -14470,8 +14730,7 @@ class _MachineSupervisor(_Supervisor):
         """Put the failure on the lease of every agent this node holds."""
         for agent_id, lease in self.leases.items():
             if lease.mine_until is not None:
-                lease.record_error(self.name, self.last_exit.get("code"),
-                                   self.last_exit.get("error") or "")
+                lease.record_error(self.name, self.last_exit.get("code"))
 
     def hold_refused(self) -> None:
         said = _supervise_refusal_of(self.stderr_tail)
@@ -14576,9 +14835,7 @@ class _MachineSupervisor(_Supervisor):
         self.want = False
         self.reason = "the supervisor is stopping"
         self.stop("the supervisor is stopping")
-        for agent_id in sorted(self.joined):
-            if self.list_verb("leave", agent_id):
-                self.joined.pop(agent_id, None)
+        self.list_sync(set())
         for agent_id, lease in self.leases.items():
             if lease.mine_until is not None:
                 self.lease_states[agent_id] = lease.release(self.name)
@@ -17010,10 +17267,6 @@ def _service_placement(service: dict) -> str:
 # mode: `shared`, the node's one machine service of the capability, serving
 # every agent there that places it so, or `own`, the agent's own service.
 PLACEMENT_MODES = ("shared", "own")
-# A join or leave the node manager's machine supervisor runs, with this set to
-# 1, puts the agent on the service's list or takes it off and changes no
-# placement: only a person's join or leave writes one.
-PLACEMENT_LIST_ONLY_ENV = "CAPABILITIES_SERVICE_LIST_ONLY"
 # The manager's own steps in the contract's ledger, after the library's: they
 # extend its tables under its owner, so they are named apart from its numbered
 # steps, and the manager applies them where it reads or writes what they make.

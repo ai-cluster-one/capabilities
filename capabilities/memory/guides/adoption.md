@@ -16,7 +16,7 @@ A pinned entry stays out of every grooming pass, so pin the decisions the projec
 
 ## Apply
 
-Applying enables memory for each project that does not already decide for itself, joins it to the machine service, carries every entry with its original date, and renders its block. A project that disables memory is left alone. Running it again, here or on another machine that holds the same project, carries nothing twice and reports each entry it finds already carried.
+Applying enables memory for each project that does not already decide for itself, opts it in to the machine service - a project in the store is placed on this node in mode shared, as `capabilities place memory --node <this node> --mode shared` places it, and the node manager puts it on the machine list; a project in files mode is answered as not joined, with why - carries every entry with its original date, and renders its block. A project that disables memory is left alone. Running it again, here or on another machine that holds the same project, carries nothing twice and reports each entry it finds already carried.
 
 ## Afterwards
 

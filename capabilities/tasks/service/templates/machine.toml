@@ -1,5 +1,6 @@
 # The machine tasks service: one process on this machine serving every project
-# that joined it with `tasks service join`. Each project's own settings and
+# the node manager puts on its list, those placed on this node in mode shared
+# (`capabilities service start tasks`). Each project's own settings and
 # lanes still apply; these are the machine's. `tasks help` states every key;
 # any other is refused.
 version = 1

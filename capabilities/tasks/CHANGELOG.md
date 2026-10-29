@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-29 — `service join` and `service leave` are removed; the node manager writes the machine service's list
+
+`tasks service join` and `tasks service leave` (with `leave --machine --project`) are removed. The machine service's list, `$XDG_CONFIG_HOME/tasks/service/projects.toml`, is now written by the node manager alone (`capabilities node supervise tasks --machine`), from the agents placed on this node in mode shared whose leases it holds: it puts each there and takes off those it put there once they are no longer placed so. A project is served by the machine service by placing it so - `capabilities service start tasks`, or `capabilities place tasks --node <node> --mode shared` - and leaves it with `capabilities service stop tasks` or `capabilities unplace tasks --node <node> --mode shared`. A project already on the list stays on it. Hints that named `service join` or `leave` now name those commands; the list's format, `service status --machine` and every other machine verb answer as before.
+
 ## 2026-10-29 — `service run` and `start` write the settings themselves on a fresh agent
 
 A project with no service settings yet no longer refuses `tasks service run` and `tasks service start` with `service_not_initialized` (exit 3): either writes the shipped template first, where `service init` writes it - the settings file, or the store's settings document for an agent whose records moved - keeping an escalation or time zone already set, and then starts as before. So a service a node or a Mac starts for a fresh agent runs with no `service init` by hand. Settings already there are never written over, and `service init` behaves as before. Help (SERVICE) says so.

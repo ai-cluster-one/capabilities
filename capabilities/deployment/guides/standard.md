@@ -31,10 +31,10 @@ compiler for capability services: it discovers installed
 `manifest.service.deploy` descriptors, filters them through explicit project
 enablement and `runtime.json` service policy, and reconciles the runtime graph,
 Compose, env example, Dockerfile, dockerignore, and entrypoint. Each compiled
-service is supervised through its runner, the manager's `capabilities node
-supervise` - a host agent through `deployment runner`, which hands it over.
+service is supervised by the manager's `capabilities node supervise`; on a Mac
+the node manager (`capabilities node install --apply`) runs it.
 
-That filtering is files mode, the gate kept in `capabilities/settings.json`. An agent whose records are in the store (every agent `capabilities init` made, and every one moved there by `capabilities migrate`) compiles every installed descriptor instead, less `capabilities.exclude`, and the gate row naming each node decides whether a service runs there; its `service_policy` keeps only `shape` and per-capability shapes (`embedded` or `container`), and the switches and placements below are retired for it, reported and rewritten by `sync`. `deployment guide profiles` describes both, the runner and the lease.
+That filtering is files mode, the gate kept in `capabilities/settings.json`. An agent whose records are in the store (every agent `capabilities init` made, and every one moved there by `capabilities migrate`) compiles every installed descriptor instead, less `capabilities.exclude`, and the gate row naming each node decides whether a service runs there; its `service_policy` keeps only `shape` and per-capability shapes (`embedded` or `container`), and the switches and placements below are retired for it, reported and rewritten by `sync`. `deployment guide profiles` describes both, the supervisor and the lease.
 
 `service_policy.auto_include` controls descriptor-default auto inclusion, and
 `service_policy.default_mode` selects `embedded` or `enabled` for those auto
@@ -47,7 +47,7 @@ service and, for managed agent-box artifacts, renders its command into a
 generated Supervisor configuration; `disabled`
 omits the service runtime while leaving the CLI available. An override cannot
 bypass the explicit project gate, and a capability enabled only at global scope
-contributes no service. `service_policy.reconcile_seconds` (5 to 3600, default 60) sets how often each runner asks the gate, in either mode. Run
+contributes no service. `service_policy.reconcile_seconds` (5 to 3600, default 60) sets how often each service's supervisor asks the gate, in either mode. Run
 `deployment sync --check` in CI; it performs no writes and reports structured
 missing/content/ownership drift with exit 7.
 
@@ -154,7 +154,7 @@ not used as a replacement.
 For an embedded descriptor, the same required/optional environment, defaults,
 and state mounts are reconciled into `services.agent`; its name is recorded in
 `services.agent.embedded_services`. Managed agent-box artifacts install
-Supervisor, render each descriptor's runner as one program, and start it from the
+Supervisor, render each descriptor's supervisor as one program, and start it from the
 entrypoint.
 
 A profile may additionally own a supervised program that no capability

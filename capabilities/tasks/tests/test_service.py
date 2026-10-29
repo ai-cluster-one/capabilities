@@ -104,8 +104,7 @@ def refused(capsys=None) -> str:
 def test_the_manifest_declares_the_service_the_contract_expects():
     service = mod.SERVICE
     assert service["verbs"] == ["init", "doctor", "run", "start", "reload", "stop",
-                                "status", "logs", "pause", "resume", "join", "leave",
-                                "harness"]
+                                "status", "logs", "pause", "resume", "harness"]
     assert service["config"] == "capabilities/tasks/service/config.toml"
     deploy = service["deploy"]
     assert deploy["schema"] == "capabilities.service.deploy.v1"

@@ -41,6 +41,27 @@ def start(world, cwd, machine=False, **extra):
     return out
 
 
+def put_on_list(world, *roots):
+    """Put each project on the machine service's list, as the node manager
+    (`capabilities node supervise memory --machine`) writes it for an agent
+    placed on this node in mode shared."""
+    path = world.config / "memory" / "service" / "projects.json"
+    listed = json.loads(path.read_text()) if path.exists() else {"version": 1, "projects": {}}
+    for root in roots:
+        listed["projects"][project_id(root)] = {
+            "root": str(root), "slug": root.name, "joined_at": "2026-10-29T00:00:00Z",
+            "joined_by": "the node manager"}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(listed, indent=2) + "\n")
+
+
+def take_off_list(world, root):
+    path = world.config / "memory" / "service" / "projects.json"
+    listed = json.loads(path.read_text())
+    del listed["projects"][project_id(root)]
+    path.write_text(json.dumps(listed, indent=2) + "\n")
+
+
 def sidecar(root):
     return json.loads((root / "capabilities" / "memory" / "state" / "context.json").read_text())
 
@@ -94,15 +115,12 @@ def test_service_activation_needs_an_explicit_project_enable(world):
     root = world.project("p", enabled=None)
     done = world.run(root, "service", "start")
     assert done.returncode == 4 and error(done)["code"] == "project_enable_required"
-    done = world.run(root, "service", "join")
-    assert done.returncode == 4
 
 
 def test_machine_mode_serves_joined_projects_and_refuses_the_rest(world):
     a, b = world.project("a"), world.project("b")
     world.ok(a, "add", "in a", "--title", "a1")
-    assert world.ok(a, "service", "join")["joined"] is True
-    assert world.ok(b, "service", "join")["joined"] is True
+    put_on_list(world, a, b)
     done = world.run(a, "service", "start")
     assert done.returncode == 4 and error(done)["code"] == "joined_to_machine_service"
     start(world, a, machine=True)
@@ -130,8 +148,7 @@ def test_machine_mode_serves_joined_projects_and_refuses_the_rest(world):
     world.ok(a, "add", "later", "--title", "a2", MEMORY_ACTOR="tester")
     until(lambda: sidecar(a)["last_event"] == world.ok(a, "status")["last_event"]
           and sidecar(a)["rendered_by"] == "the memory service")
-    left = world.ok(a, "service", "leave", "--machine", "--project", project_id(b))
-    assert left["left"] is True
+    take_off_list(world, b)
     machine_log = world.ok(a, "service", "logs", "--machine", "--tail", "500")["lines"]
     assert any("[a]: served" in line for line in machine_log)
     assert any("[b]: no longer served" in line for line in machine_log)

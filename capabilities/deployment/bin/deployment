@@ -68,13 +68,14 @@ USAGE
       empty project root to the agent with `capabilities init --id
       $CAPABILITIES_PROJECT_ID`, wires the agent CLIs with `capabilities hooks
       install`, composes its context from the store with `capabilities build`,
-      and starts the compiled services under their runners, where the gate
-      for this node places them. `host-agents` supervises the same declared
-      services as processes on the machine itself, on macOS: `sync` writes one
-      launchd agent per service under `compiler.host.agents_dir`, at
-      ProcessType Standard so the work a service starts gets the whole machine
-      (its watchdog runs at Background), and `deployment next` hands over the
-      launchctl steps. `generic` stays
+      and starts the compiled services under the node's service manager, where
+      the gate for this node places them. `host-agents` declares the same
+      services for a Mac, where they run as processes on the machine itself
+      under its node manager (`capabilities node install --apply`, which
+      places each service the gate puts on that node); `sync` compiles no
+      agent for a service, only one per Coolify target that carries the body
+      to its node, under `compiler.host.agents_dir`, and `deployment next`
+      hands over the launchctl steps for those. `generic` stays
       declaration-only. A Linux host uses a container profile, or `generic`
       with a supervisor the project owns. Run `deployment guide profiles` for
       the trade-offs.
@@ -84,8 +85,7 @@ USAGE
       service graph and, for a container profile, one bundle per declared
       target (Compose, Dockerfile, ignore file, env example, entrypoint,
       supervisor configuration) in its folder. Every compiled service runs
-      under the node's service supervisor, `capabilities node supervise` - a
-      host agent through `deployment runner`, which hands it over. Which
+      under the node's service supervisor, `capabilities node supervise`. Which
       services are compiled
       depends on where the project's gate is kept:
       Files mode (no node in the gate): as before, only capabilities
@@ -130,71 +130,29 @@ USAGE
       at sync) is set with CAPABILITIES_PROJECT_ID_ROOT, the box's project
       root, in every container and, for an image that runs `capabilities
       init` in its build, in the image before that step.
-      For host-agents, a loaded agent of a compiled service whose process
-      is not `deployment runner <service>` or the `capabilities node supervise
-      <service>` it hands over to (or, with no process, whose program
-      is not the compiled launcher) runs its service outside the gate and the
-      lease, as an agent loaded from an older compilation does: once the
-      artifacts are written, sync boots it out, links the compiled agent in
-      place of its installed file and bootstraps it, and lists each in
-      `agents` (`replaced`, or `unloaded` or `failed` with the step, which is
-      also an error). An agent never loaded stays a person's act (`next`).
-      --check is read-only and exits 7 with structured drift details, and
-      reports such an agent as an error instead of replacing it.
+      --check is read-only and exits 7 with structured drift details.
       --adopt explicitly replaces unmarked files at the runtime-declared
       managed artifact paths; external artifacts and overlays are never written.
-
-  deployment runner <name> [--every SECONDS] [--restart POLICY] -- <command...>
-      Run one capability service as the gate on this node says, until
-      stopped; this is what a host launchd agent runs, and what every
-      compiled supervisor entry ran before the node's service manager. It
-      checks its arguments, this capability's gate and the read-only switch,
-      then hands the service, in the same process, to the manager's
-      supervisor: `capabilities node supervise <name> --every SECONDS
-      --restart POLICY -- <command...>`, with SECONDS
-      service_policy.reconcile_seconds when omitted (default 60, 5-3600) and
-      POLICY unless-stopped. What the supervisor does - the gate and the lease
-      on each reconcile, the restart policy, the hold on exit 4, the failure
-      written onto the lease, the node reported seen, this node's row in
-      capabilities_service_instances, the record it keeps under
-      capabilities/deployment/state/runners/ - is the manager's (`capabilities
-      help`, node supervise). It hands over where the manager answers `node
-      supervise --probe`; with an older manager, or none found here, it
-      supervises the service itself in the same way.
 
   deployment services
       This node - its id (node) and the label it gives itself (label) - and
       its view of each compiled service: what the gate answers for
       it here (placed, the row that answered: scope, node, enabled, service,
       and why),
-      whether its runner is running it, a refusal it is held idle for, and
-      who holds its lease (state, holder, expiry, and last_error: the exit
-      code, stderr tail and time the service last failed with on the holder,
-      else null). Writes nothing.
-
-  deployment watchdog [--dry-run]
-      One pass over the launchd agents this project supervises: ask each
-      service's declared doctor whether it still works, and restart the ones
-      that answer no. A supervisor restarts what died; this is for what is
-      alive and doing nothing, which it cannot see. Two consecutive bad
-      answers are required before a restart, and a cooldown keeps a service
-      that a restart does not fix from being restarted every interval. A
-      service whose doctor fails because the store does not answer
-      (store_unreachable) is never restarted for it, since a restart cannot
-      bring the store back and every restart opens its connections again: the
-      watchdog waits, asking that doctor again after a pause that starts at the
-      interval and doubles each time the store is still away, up to 30
-      minutes, and the service reconnects by itself once the store returns.
-      `deployment sync` installs this as its own launchd agent on the
-      host-agents profile; run it by hand with --dry-run to see what it would
-      do. Settings live under `compiler.host.watchdog` in runtime.json.
+      whether its supervisor (`capabilities node supervise`, which records
+      it under capabilities/deployment/state/runners/) is running it, a
+      refusal it is held idle for, and who holds its lease (state, holder,
+      expiry, and last_error: the exit code and time the service last
+      failed with on the holder, else null). Writes nothing; a store that
+      holds no lease table yet answers free.
 
   deployment handover [--dry-run]
       Hand this project's host agents over to the node's service manager on
       a Mac (`capabilities node install`, which runs this in every folder
-      whose services it will run): boot out each loaded launchd agent the
-      host-agents compilation left in compiler.host.agents_dir - every
-      service agent and the project watchdog, not the node-sync agents - and
+      whose services it will run): boot out each loaded launchd agent an
+      older deployment's host-agents compilation left in
+      compiler.host.agents_dir - every service agent and the project
+      watchdog, not the node-sync agents - and
       every other agent in ~/Library/LaunchAgents or that folder whose
       program or working directory lies inside the project, whatever
       compiled it, where its label ends in `watchdog` or in the name of an
@@ -212,52 +170,23 @@ USAGE
       agents and no agent of it is found; exit 6 when an agent could not be
       handed over.
 
-  deployment machine sync|next [--text|--json]|status|watchdog [--dry-run]
   deployment machine handover [<name> ...] [--dry-run]
-      The machine scope, on macOS: supervision for the services that run once
-      per machine rather than once per project. `sync` asks the capabilities
-      manager for the installed set and reads each capability's manifest
-      snapshot; every one that declares `service.machine`, is allowed on this
-      machine, and is not disabled in the machine declaration gets a launcher
-      `capabilities-machine-<name>` and an agent
-      `capabilities.machine.<name>.plist` running its `service.machine.command`
-      in its expanded `service.machine.state` (home when it declares none), with
-      the compiling shell's PATH, RunAtLoad, KeepAlive on unsuccessful exit,
-      AbandonProcessGroup, so launchd never reaps the work the service started,
-      and ProcessType Standard, so that work runs at standard priority on every
-      core. It also writes `capabilities.machine.watchdog.plist`, at ProcessType
-      Background, which runs
-      `deployment machine watchdog`: one pass asking each machine service's
-      `service.machine.doctor`, with the project watchdog's failure count,
-      timeout, cooldown and wait for a store that does not answer, and `launchctl kickstart -k` after repeated
-      failures. A loaded machine agent with no pid is never kickstarted: it is
-      reported as `outside_launchd` with the pid when its doctor says the
-      service runs as a copy started outside launchd, as `stopped` when it
-      exited cleanly (last exit code 0), since its KeepAlive restarts only a
-      failure, and otherwise as `restarting`. Every other installed capability
-      is listed as skipped with the reason. A machine service with no joined project is still compiled; it
-      idles. The declaration is `$XDG_CONFIG_HOME/deployment/machine.json`,
-      {"watchdog": {...}, "services": {"<name>": {"disabled": true}}}, and a
-      missing file means defaults; agents and logs land in
-      `$XDG_STATE_HOME/deployment/machine/launchd/`, the same from any working
-      directory. `next` prints the `ln -sf` and `launchctl bootstrap` steps,
-      since handing an agent to launchd stays a person's act, and a loaded agent
-      takes a recompiled file only through those steps; `status` reports each
-      compiled agent, whether it is linked and loaded, its compiled
-      `process_type`, the `spawn_type` launchd runs it with, and
-      `spawn_type_current`, false while launchd still runs an earlier
-      compilation, and writes nothing. `handover` hands the named machine
-      services' agents (every compiled one when none is named) over to the
-      node's service manager on a Mac (`capabilities node install`, which runs
-      it for the machine services the node manager will run there): it boots
-      out each loaded `capabilities.machine.<name>` and takes its entry out of
+      Hand this Mac's machine-service agents - the
+      `capabilities.machine.<name>` launchd agents an older deployment
+      compiled for the services that run once per machine, and the
+      `capabilities.machine.watchdog` over them, in
+      `$XDG_STATE_HOME/deployment/machine/launchd/` - over to the node's
+      service manager (`capabilities node install`, which runs it for the
+      machine services the node manager will run there): it boots out each
+      loaded `capabilities.machine.<name>` of the named services (every one
+      found when none is named) and takes its entry out of
       ~/Library/LaunchAgents, as `deployment handover` does a project's, and
-      the machine watchdog with them once no other machine service agent stays
-      loaded. The compiled files stay. Run again it changes nothing; --dry-run
-      changes nothing and answers the same. Answers {dry_run, ok, agents_dir,
-      agents [{label, kind (service|watchdog), service?, loaded, installed,
-      action, kept_at?}]}; exit 6 when an agent could not be handed over. Run
-      `deployment guide profiles` for the model.
+      the machine watchdog with them once no other machine service agent
+      stays loaded. The compiled files stay. Run again it changes nothing;
+      --dry-run changes nothing and answers the same. Answers {dry_run, ok,
+      agents_dir, agents [{label, kind (service|watchdog), service?, loaded,
+      installed, action, kept_at?}]}; exit 6 when an agent could not be
+      handed over.
 
   deployment deploy [--target <name>]
       Check compiler drift, sync the body through node-<target> over SSH,
@@ -531,8 +460,8 @@ USAGE
       is within three reconciles (3 x service_policy.reconcile_seconds of
       deployment/runtime.json, default 60) of now: this is the definition of
       a node being live, and it holds for a Mac and for a node of the
-      standard image alike, since the runner on either reports it each
-      reconcile. A node never seen is not live. Whether a given service runs
+      standard image alike, since the node manager's supervisors on either
+      report it each reconcile. A node never seen is not live. Whether a given service runs
       is not this: an exclusive service's live lease is the proof it runs,
       and on which node (`deployment services`). Answers {ok, project,
       agent_id, reconcile_seconds, live_within_seconds, nodes [{...,
@@ -562,16 +491,13 @@ USAGE
       Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
       references. Reports provider readiness as local facts only: whether the
       provider capability is installed/enabled here. It does not call Coolify,
-      SSH, Docker, or any remote provider. For host-agents it reports each
-      compiled agent as launchd holds it, and a loaded one running its
-      service outside `deployment runner` as an error naming its label. On a
-      Mac whose node manager runs the project's services (records in the
-      store, and capabilities.node, from `capabilities node install`, in
-      place) the compiled service agents are left unloaded, as `deployment
-      handover` leaves them, and only one loaded beside the node manager is
-      reported, as a warning; `deployment next` there lists only the agents
-      that carry the body to a node, and starts, stops and restarts the
-      services through `capabilities service`.
+      SSH, Docker, or any remote provider. For host-agents it reports the
+      launchd agent an older deployment compiled for each service as launchd
+      holds it, and one still loaded as a warning: the services run under
+      this Mac's node manager (`capabilities node install --apply`, which
+      hands such an agent over); `deployment next` there lists only the
+      agents that carry the body to a node, and starts, stops and restarts
+      the services through `capabilities service`.
 
   deployment runtime
       Print deployment/runtime.json.
@@ -593,7 +519,6 @@ Contract commands:
   deployment stub
   deployment manifest --json
   deployment guide [agent-node|bootstrap|profiles|standard|targets]
-  deployment migrate [status]
   deployment connections
   deployment ids list|get <label>|set <label> <value>|rm <label> [--note <text>]
   deployment refs
@@ -695,16 +620,16 @@ from typing import NoReturn
 
 NAME = "deployment"
 SUMMARY = ("Project deployment standard - declare the services a project runs, "
-           "compile them into a container image or into launchd-supervised "
-           "processes on a Mac, and describe the targets they deploy to.")
+           "compile them into a container image, and describe the targets they "
+           "deploy to.")
 SCOPE = "project"
 CRED_KEYS: list = []
 WRITE_VERBS = {"init", "setup", "scaffold", "sync", "deploy", "rollback"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/deployment/guides/")
-STATE = True        # each service runner's record under capabilities/deployment/state/
-TABLES = True       # deployment_service_leases in the project's store, built by _tables()
+STATE = True        # each service supervisor's record under capabilities/deployment/state/
+TABLES = False      # deployment_service_leases is the capabilities manager's to make
 INVENTORY = {"network": "none"}   # the declarations are files in this project
 POST_INSTALL: list = []
 
@@ -719,50 +644,30 @@ GENERATED_SCHEMA = "capabilities.deployment.generated.v1"
 GENERATED_MARKER = f"Generated by deployment sync ({GENERATED_SCHEMA})"
 SERVICE_MOUNT_TOKENS = ("{agent_home}", "{project_root}")
 # What remains of service_policy: the shape a service is composed in. Whether it
-# runs, and on which node, is the gate's answer, read by the service's runner.
+# runs, and on which node, is the gate's answer, read by the node manager.
 SERVICE_SHAPES = ("embedded", "container")
 RESTART_POLICIES = ("no", "on-failure", "always", "unless-stopped")
-# How often a runner asks the gate, renews its lease and converges its service,
+# How often a service's supervisor (the manager's `node supervise`) asks the
+# gate, renews its lease and converges its service,
 # unless service_policy.reconcile_seconds says otherwise. A lease lasts three
 # reconciles, so one missed renewal never hands the service to another machine.
 RECONCILE_DEFAULT_SECONDS = 60
 RECONCILE_BOUNDS = (5, 3600)
-LEASE_TTL_RECONCILES = 3
-# Each reconcile a runner reports its node seen; a node is live while it was
+# Each reconcile a service's supervisor reports its node seen; a node is live while it was
 # seen within this many reconciles, so one missed report never reads as down.
 LIVE_RECONCILES = 3
-SEEN_TIMEOUT_SECONDS = 20
 RUNNER_STOP_GRACE_SECONDS = 20
-# The contract's policy refusal. A service that exits with it is refusing to run
-# here, so restarting it would only be refused again.
-POLICY_REFUSAL_EXIT = 4
 RUNNER_STATE_DIR = "runners"
 # Where a store-mode box's node service manager keeps a Supervisor program per
 # service placed on its node, and that manager's own program.
 NODE_JOBS_DIR = "/tmp/agent-box-services"
 NODE_MANAGER_PROGRAM = "node"
-# A running service is asked whether it can do its work by its declared doctor
-# once it has run this long, and again every reconcile, each time for at most
-# PROBE_TIMEOUT_SECONDS. A doctor's exit code stands for its category where
-# it names no error code of its own.
-PROBE_GRACE_SECONDS = 10
 PROBE_TIMEOUT_SECONDS = 30
-PROBE_EXIT_CODES = {2: "auth", 3: "not_found", 4: "policy", 5: "unreachable", 6: "input"}
 PROFILES = ("generic", "agent-box", "agent-box-checkout", "agent-box-shell", "host-agents")
 # A profile picks the substrate: a container image the target runs, or
 # supervised processes on the machine itself.
 CONTAINER_PROFILES = ("agent-box", "agent-box-checkout", "agent-box-shell")
 HOST_PROFILES = ("host-agents",)
-# launchd's ProcessType for the agents a host compiles. A supervised service
-# runs real work and its children inherit the class, so it gets Standard, the
-# full machine; Background would confine it to the efficiency cores at the
-# lowest priority with throttled I/O. A watchdog is a short scheduled probe and
-# stays out of the way.
-SERVICE_PROCESS_TYPE = "Standard"
-WATCHDOG_PROCESS_TYPE = "Background"
-# What `launchctl print` names as the spawn type of each ProcessType.
-LAUNCHD_SPAWN_TYPES = {"Standard": "daemon", "Background": "background",
-                       "Interactive": "interactive", "Adaptive": "adaptive"}
 # A checkout profile builds the same container and fills it differently. The
 # image carries tools and the boot path and no project at all; the checkout
 # arrives at run time on a volume, which the entrypoint clones into while it is
@@ -833,24 +738,6 @@ SYNC_DEFAULTS = {
     SYNC_QUIET_ENV: "600",
 }
 HOST_SUPERVISORS = ("launchd",)
-# A supervisor restarts a process that died. It cannot see one that is alive
-# and doing nothing — the shape a deadlock leaves behind, where the process
-# sits in the list at 0% CPU and answers nobody. Each service already declares
-# the command that proves it works, so the watchdog asks that, and asks twice
-# before acting: one bad answer is a service that is still starting or a probe
-# that timed out, and restarting on it would be worse than the silence.
-WATCHDOG_DEFAULTS = {
-    "enabled": True,
-    "interval_seconds": 60,
-    "failures_before_restart": 2,
-    "probe_timeout_seconds": 30,
-    "restart_cooldown_seconds": 300,
-}
-# A doctor that fails because the store does not answer is not a reason to
-# restart: the watchdog asks it again after a pause that starts at the interval
-# and doubles while the store stays away, up to this long.
-WATCHDOG_STORE_WAIT_LONGEST_SECONDS = 1800
-WATCHDOG_STORE_SLUG = "store_unreachable"
 PROVIDERS = ("coolify", "dockerhost", "manual")
 PROVIDER_CAPABILITIES = {"coolify": "coolify", "dockerhost": "dockerhost"}
 # A container runtime compiles one bundle per target: everything a build of that
@@ -1236,7 +1123,7 @@ def _discover_service_descriptors(root: Path, runtime: dict | None = None
                                   ) -> tuple[dict[str, dict], list[dict]]:
     """The deployable services this project compiles: in store mode every one
     the installed catalogue declares, less the runtime's exclusions, each
-    under a runner that asks the gate on its node; in files mode the ones the
+    under a supervisor that asks the gate on its node; in files mode the ones the
     project enabled itself."""
     if not _store_placed(root):
         return _files_service_descriptors(root)
@@ -1247,7 +1134,7 @@ def _store_service_descriptors(runtime: dict | None = None
                                ) -> tuple[dict[str, dict], list[dict]]:
     """Every deployable service the installed catalogue declares, less the
     runtime's exclusions. Nothing here decides whether a service runs: each one
-    is compiled under a runner that asks the gate on the node it runs on, so
+    is compiled under a supervisor that asks the gate on the node it runs on, so
     turning a service on or off needs no recompile."""
     excluded = _runtime_capability_excludes(runtime or {})
     descriptors: dict[str, dict] = {}
@@ -1357,7 +1244,7 @@ def _service_policy(runtime: dict, store: bool = True) -> tuple[dict, bool]:
     In store mode, the runtime's service shape: `shape`, the default for every service
     (`embedded` in the agent container's Supervisor, or `container`, a Compose
     service of its own), `capabilities`, a shape per capability, and
-    `reconcile_seconds`, how often each runner asks the gate. A runtime
+    `reconcile_seconds`, how often each supervisor asks the gate. A runtime
     still carrying the retired on/off vocabulary is read for the shape it
     implied. The second value says the runtime declared no service_policy."""
     if not store:
@@ -1414,7 +1301,7 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[
     their own and embedded in the agent container. In files mode the runtime
     declaration decides as it always has; in store mode every deployable
     service is compiled, split by shape, and the gate on each node starts and
-    stops it through its runner."""
+    stops it through its supervisor."""
     if not _store_placed(root):
         return _files_active_descriptors(root, runtime)
     discovered, findings = _store_service_descriptors(runtime)
@@ -1454,23 +1341,6 @@ def _active_descriptors(root: Path, runtime: dict) -> tuple[
     return active, embedded, findings, migrated
 
 
-def _watchdog_config(raw) -> dict:
-    """The watchdog's settings, with anything unusable falling back to default."""
-    config = dict(WATCHDOG_DEFAULTS)
-    if not isinstance(raw, dict):
-        return config
-    if isinstance(raw.get("enabled"), bool):
-        config["enabled"] = raw["enabled"]
-    for key, low, high in (("interval_seconds", 20, 3600),
-                           ("failures_before_restart", 1, 10),
-                           ("probe_timeout_seconds", 5, 300),
-                           ("restart_cooldown_seconds", 0, 86400)):
-        value = raw.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and low <= value <= high:
-            config[key] = value
-    return config
-
-
 def _safe_package_name(value: object) -> bool:
     """One Debian package name: what apt accepts and nothing a shell would read."""
     return isinstance(value, str) and re.fullmatch(r"[a-z0-9][a-z0-9+.-]+", value) is not None
@@ -1487,8 +1357,7 @@ def _compiler_config(runtime: dict) -> dict:
         },
         "compose_overlays": [],
         "container": {"agent_home": "/home/agent", "project_root": "/app"},
-        "host": {"supervisor": "launchd", "agents_dir": "deployment/launchd",
-                 "watchdog": dict(WATCHDOG_DEFAULTS)},
+        "host": {"supervisor": "launchd", "agents_dir": "deployment/launchd"},
         "build_args": {},
     }
     raw = runtime.get("compiler")
@@ -1535,7 +1404,6 @@ def _compiler_config(runtime: dict) -> dict:
             host["agents_dir"] = raw_host["agents_dir"]
         if isinstance(raw_host.get("label_prefix"), str) and raw_host["label_prefix"].strip():
             host["label_prefix"] = raw_host["label_prefix"].strip()
-        host["watchdog"] = _watchdog_config(raw_host.get("watchdog"))
     overlays = raw.get("compose_overlays")
     raw_build_args = raw.get("build_args")
     build_args = ({key: value for key, value in raw_build_args.items()
@@ -2719,13 +2587,6 @@ def _supervise_argv(name: str, command: list[str], restart: str, every: int) -> 
             "--", *command]
 
 
-def _runner_argv(name: str, command: list[str], restart: str, every: int) -> list[str]:
-    """How a host agent starts a capability service: through `deployment
-    runner`, which hands it to the same supervisor (`_supervise_argv`), so an
-    agent compiled before the node manager and one compiled now run alike."""
-    return [NAME, "runner", *_supervise_argv(name, command, restart, every)[3:]]
-
-
 def _node_manager_argv(embedded: dict[str, dict], every: int) -> list[str]:
     """The one program a store-mode box runs for its embedded services: the
     node's service manager, which keeps a program per service the gate places
@@ -2783,7 +2644,7 @@ priority=5""")
         # In store mode the node's service manager is the one program for the
         # services: it adds a program per service placed on this node to the
         # included directory and removes it when the service leaves, and each
-        # runs that service's runner. The directory is in /tmp, so a restarted
+        # runs that service's supervisor. The directory is in /tmp, so a restarted
         # box starts no service before the manager has read the store.
         sections.append(f"""[include]
 files={NODE_JOBS_DIR}/*.conf
@@ -2805,8 +2666,8 @@ stderr_logfile=/dev/fd/2
 stderr_logfile_maxbytes=0
 priority=10""")
         return "\n\n".join(sections) + "\n"
-    # Each program is the service's runner, kept running whatever the gate
-    # says: the runner is what starts the service when the gate places it on
+    # Each program is the service's supervisor, kept running whatever the gate
+    # says: the supervisor is what starts the service when the gate places it on
     # this node and stops it when it does not, and it applies the descriptor's
     # restart policy to the service itself.
     for priority, (name, service) in enumerate(sorted(embedded.items()), 10):
@@ -2849,7 +2710,7 @@ def _compose_template(project_name: str, runtime: dict,
         "x-agent-env: &agent-env",
         "  GIT_DEPLOY_KEY_B64: ${GIT_DEPLOY_KEY_B64:-}",
         "  AGENT_GIT_KNOWN_HOSTS_B64: ${AGENT_GIT_KNOWN_HOSTS_B64:-}",
-        # The node's id in the gate: a runner starts a service only where
+        # The node's id in the gate: a supervisor starts a service only where
         # the project's policy row names this node. A target that declares
         # an id sets nothing: the node resolves it from the file enrolment
         # writes. One that declares the name a node registered before ids is
@@ -3600,45 +3461,6 @@ def _plist_fragment(value, indent: int) -> list[str]:
     return [f"{pad}<string>{_plist_escape(value)}</string>"]
 
 
-def _launchd_keep_alive(restart: str):
-    """A host profile answers to a person at the machine.
-
-    `SuccessfulExit: false` restarts a job that fell over and honours one that
-    was stopped on purpose, so `<capability> service stop` stays a real stop.
-    A container has nobody to type that, which is why the same descriptor maps
-    to an unconditional restart there."""
-    if restart == "no":
-        return None
-    return {"SuccessfulExit": False}
-
-
-def _launchd_environment(runtime: dict, name: str, search_path: str) -> dict:
-    """Non-secret values only.
-
-    The compiled service already carries the descriptor's optional defaults
-    with any project override applied on top, so `environment_defaults` is the
-    one place a value is decided. Required keys stay out: every capability
-    resolves its own secrets through the credential cascade at run time, and a
-    plist that baked them in would be a second, staler, world-readable home."""
-    environment = {"PATH": search_path}
-    service = (runtime.get("services") or {}).get(name)
-    defaults = service.get("environment_defaults") if isinstance(service, dict) else None
-    if isinstance(defaults, dict):
-        for key, value in defaults.items():
-            if _safe_env_key(key) and isinstance(value, str):
-                environment[key] = value
-    return environment
-
-
-def _launchd_program(command: list[str]) -> list[str]:
-    """launchd resolves the program itself, against its own minimal PATH, and
-    never against the job's environment - so a bare command name fails to spawn
-    with EX_CONFIG. The executable is resolved here instead; PATH still travels
-    with the job, for the workers the service spawns in turn."""
-    resolved = shutil.which(command[0]) if command else None
-    return [resolved or command[0], *command[1:]]
-
-
 def _host_launcher_text(command: list[str]) -> str:
     """A launcher whose *filename* carries the project.
 
@@ -3651,41 +3473,12 @@ def _host_launcher_text(command: list[str]) -> str:
     return f'#!/bin/sh\nexec {quoted} "$@"\n'
 
 
-def _launchd_plist(root: Path, runtime: dict, name: str, service: dict,
-                   search_path: str, launcher: Path) -> str:
-    del service
-    prefix = _host_label_prefix(runtime, root)
-    agents_dir = _host_agents_dir(root, runtime)
-    body: dict = {
-        "Label": f"{prefix}.{name}",
-        "ProgramArguments": [str(launcher)],
-        "WorkingDirectory": str(root),
-        "EnvironmentVariables": _launchd_environment(runtime, name, search_path),
-        "RunAtLoad": True,
-    }
-    # The agent runs the service's runner, which is meant to run for as long as
-    # the agent is loaded: it starts and stops the service itself as the gate
-    # answers, so even a descriptor that restarts nothing keeps its runner.
-    body["KeepAlive"] = _launchd_keep_alive("unless-stopped")
-    body.update({
-        "ThrottleInterval": 10,
-        "ProcessType": SERVICE_PROCESS_TYPE,
-        # launchd opens these itself and creates no directory to hold them, so
-        # they sit beside the agents, in the one directory sync guarantees.
-        "StandardOutPath": str(agents_dir / f"{name}.out.log"),
-        "StandardErrorPath": str(agents_dir / f"{name}.err.log"),
-    })
-    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
-             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-             '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
-             '<plist version="1.0">']
-    lines += _plist_fragment(body, 0)
-    lines.append("</plist>")
-    return "\n".join(lines) + "\n"
-
-
 def _host_artifact_texts(root: Path, runtime: dict,
                          services: dict[str, dict]) -> tuple[dict[Path, str], list[dict]]:
+    """What a host profile compiles: one interval agent per Coolify target that
+    carries the body to its node (`deployment node sync`). The services
+    themselves run under this Mac's node manager (`capabilities node install`),
+    so no agent is compiled for them."""
     findings: list[dict] = []
     host = _compiler_config(runtime)["host"]
     if host["supervisor"] != "launchd":
@@ -3700,37 +3493,13 @@ def _host_artifact_texts(root: Path, runtime: dict,
             "message": "launchd agents are compiled here but only load on macOS",
         })
     agents_dir = _host_agents_dir(root, runtime)
-    # The watchdog runs each service's doctor, so those have to resolve from
-    # the agent's PATH too — launchd hands a job nothing, and a watchdog that
-    # cannot run a probe silently never restarts anything.
-    probe_commands = [service["deploy"].get("doctor") or []
-                      for service in services.values()]
+    # The PATH the agents carry is the one the compiled services resolve from,
+    # as it always was, so a recompile leaves an agent already loaded as it is.
     search_path = _launchd_search_path(
         [service["deploy"]["command"] for service in services.values()]
-        + probe_commands + [[NAME]])
+        + [service["deploy"].get("doctor") or [] for service in services.values()]
+        + [[NAME]])
     texts: dict[Path, str] = {}
-    for name, service in sorted(services.items()):
-        command = service["deploy"]["command"]
-        if command and not shutil.which(command[0]):
-            findings.append({
-                "severity": "error", "path": "deployment/runtime.json",
-                "message": f"service {name!r} runs {command[0]!r}, which is not "
-                           "on PATH here; launchd needs it resolved at compile "
-                           "time"})
-        prefix = _host_label_prefix(runtime, root)
-        launcher = agents_dir / f"{prefix}-{name}"
-        # A person at the machine stops a service with `<name> service stop`,
-        # so a clean exit stays a stop here, as launchd's SuccessfulExit has
-        # always made it; a descriptor that restarts nothing still does not.
-        restart = str(service["deploy"].get("restart") or "unless-stopped")
-        runner = _runner_argv(name, list(command),
-                              "no" if restart == "no" else "on-failure",
-                              _reconcile_seconds(runtime))
-        texts[launcher] = _mark_generated(
-            launcher, _host_launcher_text(_launchd_program(runner)))
-        path = agents_dir / f"{prefix}.{name}.plist"
-        texts[path] = _mark_generated(
-            path, _launchd_plist(root, runtime, name, service, search_path, launcher))
     for path in _target_files(root):
         target, error = _read_json(path)
         if error or not isinstance(target, dict) or target.get("provider") != "coolify":
@@ -3751,56 +3520,7 @@ def _host_artifact_texts(root: Path, runtime: dict,
             "StartInterval": int(target.get("sync_interval", 60)), "RunAtLoad": True,
             "StandardOutPath": str(agents_dir / f"{name}.log"),
             "StandardErrorPath": str(agents_dir / f"{name}.log")}))
-    watchdog = host["watchdog"]
-    stale_watchdog = agents_dir / f"{_host_label_prefix(runtime, root)}.watchdog.plist"
-    if not watchdog["enabled"] and stale_watchdog.is_file():
-        # sync writes artifacts and never deletes them, so a watchdog turned
-        # off in the declaration keeps running from the agent already loaded.
-        findings.append({
-            "severity": "warning", "path": _rel(root, stale_watchdog),
-            "message": "the watchdog is disabled but its agent is still here; "
-                       f"run `launchctl bootout gui/$UID/"
-                       f"{_host_label_prefix(runtime, root)}.watchdog` and "
-                       "delete this file"})
-    if services and watchdog["enabled"]:
-        prefix = _host_label_prefix(runtime, root)
-        launcher = agents_dir / f"{prefix}-watchdog"
-        texts[launcher] = _mark_generated(
-            launcher, _host_launcher_text(_launchd_program([NAME, "watchdog"])))
-        path = agents_dir / f"{prefix}.watchdog.plist"
-        texts[path] = _mark_generated(
-            path, _watchdog_plist(root, runtime, search_path, launcher))
     return texts, findings
-
-
-def _watchdog_plist(root: Path, runtime: dict, search_path: str,
-                    launcher: Path) -> str:
-    """The one agent that is scheduled rather than supervised.
-
-    `StartInterval` and no `KeepAlive`: this job is meant to run, look, and
-    exit, so launchd restarting it on exit would be a busy loop. `RunAtLoad` is
-    off because a load happens right after `deployment sync`, when the services
-    it watches are still coming up and a probe would judge them unfairly."""
-    prefix = _host_label_prefix(runtime, root)
-    agents_dir = _host_agents_dir(root, runtime)
-    body = {
-        "Label": f"{prefix}.watchdog",
-        "ProgramArguments": [str(launcher)],
-        "WorkingDirectory": str(root),
-        "EnvironmentVariables": {"PATH": search_path},
-        "RunAtLoad": False,
-        "StartInterval": _compiler_config(runtime)["host"]["watchdog"]["interval_seconds"],
-        "ProcessType": WATCHDOG_PROCESS_TYPE,
-        "StandardOutPath": str(agents_dir / "watchdog.out.log"),
-        "StandardErrorPath": str(agents_dir / "watchdog.err.log"),
-    }
-    lines = ['<?xml version="1.0" encoding="UTF-8"?>',
-             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
-             '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
-             '<plist version="1.0">']
-    lines += _plist_fragment(body, 0)
-    lines.append("</plist>")
-    return "\n".join(lines) + "\n"
 
 
 def _launchd_status(label: str) -> dict:
@@ -3842,63 +3562,12 @@ def _handed_over() -> dict | None:
     """This Mac's node manager agent where it runs this project's services: a
     project whose records are in the store, which is where the node manager
     reads what is placed on this node, on a Mac where `capabilities node
-    install` put its agent in place. None otherwise, and the project's own
-    host agents are what run its services."""
+    install` put its agent in place. None otherwise: no node manager runs
+    them here yet, and `deployment next` names the install."""
     if not _records_in_store():
         return None
     status = _launchd_status(NODE_MANAGER_AGENT)
     return status if status["installed"] or status["loaded"] else None
-
-
-def _process_args(pid) -> str | None:
-    """The command line of a running process, as `ps` reports it."""
-    try:
-        result = subprocess.run(["ps", "-o", "args=", "-p", str(pid)],
-                                capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    text = result.stdout.strip()
-    return text if result.returncode == 0 and text else None
-
-
-def _runs_runner(args: str, name: str) -> bool:
-    """Whether a command line is `deployment runner <name>`, or the manager's
-    `capabilities node supervise <name>` it hands the service to in the same
-    process, however the executable was reached."""
-    return re.search(rf"(^|[/\s])({re.escape(NAME)}\s+runner|capabilities\s+node\s+supervise)"
-                     rf"\s+{re.escape(name)}(\s|$)", args) is not None
-
-
-def _agent_outside_runner(status: dict, name: str, launcher: Path) -> str | None:
-    """What a loaded agent of service `name` runs when that is not its runner;
-    None when it runs the runner, or will when it next starts.
-
-    The live process is the evidence. A job keeps the process it started after
-    sync rewrites its launcher, so a launcher that now runs the runner says
-    nothing about what is running: an agent loaded from an older compilation
-    goes on running its service outside the gate and the lease until it is
-    replaced. With no process, the program launchd would start is."""
-    if not status.get("loaded"):
-        return None
-    args = _process_args(status["pid"]) if status.get("pid") else None
-    if args is not None:
-        return None if _runs_runner(args, name) else args
-    program = status.get("program")
-    return program if program and program != str(launcher) else None
-
-
-def _agents_outside_runner(root: Path, runtime: dict, services) -> list[dict]:
-    prefix = _host_label_prefix(runtime, root)
-    agents_dir = _host_agents_dir(root, runtime)
-    found = []
-    for name in sorted(services):
-        label = f"{prefix}.{name}"
-        runs = _agent_outside_runner(_launchd_status(label), name,
-                                     agents_dir / f"{prefix}-{name}")
-        if runs is not None:
-            found.append({"label": label, "service": name, "runs": runs,
-                          "compiled": agents_dir / f"{label}.plist"})
-    return found
 
 
 def _launchctl(*argv: str) -> tuple[int, str]:
@@ -3908,299 +3577,6 @@ def _launchctl(*argv: str) -> tuple[int, str]:
     except (OSError, subprocess.SubprocessError) as exc:
         return 1, str(exc)
     return result.returncode, (result.stderr or result.stdout).strip()
-
-
-def _replace_agent(label: str, compiled: Path) -> dict:
-    """Put the compiled agent in place of the one launchd holds: take the job
-    down, which stops the process it runs, put the compiled file where the old
-    one was installed, and load it. The installed file goes as well as the job,
-    because macOS keeps the program it recorded for an agent until its file
-    leaves ~/Library/LaunchAgents. A job that is down but did not load again is
-    reported as `unloaded`: its service no longer runs outside the runner, and
-    `deployment next` names the steps that load it."""
-    domain = f"gui/{os.getuid()}"
-    installed = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
-    code, detail = _launchctl("bootout", f"{domain}/{label}")
-    if code != 0 and _launchd_status(label)["loaded"]:
-        return {"label": label, "action": "failed", "step": "bootout",
-                "detail": detail[:400]}
-    try:
-        if installed.is_symlink() or installed.exists():
-            installed.unlink()
-        installed.parent.mkdir(parents=True, exist_ok=True)
-        installed.symlink_to(compiled)
-    except OSError as exc:
-        return {"label": label, "action": "unloaded", "step": "link",
-                "detail": str(exc)[:400]}
-    for attempt in range(5):
-        if attempt:
-            # bootout answers before launchd has let go of the label.
-            time.sleep(1)
-        code, detail = _launchctl("bootstrap", domain, str(installed))
-        if code == 0:
-            return {"label": label, "action": "replaced"}
-    return {"label": label, "action": "unloaded", "step": "bootstrap",
-            "detail": detail[:400]}
-
-
-def _watchdog_state_path(root: Path, runtime: dict) -> Path:
-    return _host_agents_dir(root, runtime) / ".watchdog-state.json"
-
-
-def _read_watchdog_state(path: Path) -> dict:
-    try:
-        state = json.loads(path.read_text())
-    except (OSError, ValueError):
-        return {}
-    return state if isinstance(state, dict) else {}
-
-
-def _probe_service(command: list[str], root: Path, timeout: int) -> dict:
-    """Ask a service's own declared doctor whether it is working.
-
-    Exit status is the contract, and a body that says `ok: false` is honoured
-    too, because a capability may report a sick service without failing the
-    command. A probe that does not answer within the timeout counts as sick:
-    the wedge this exists for takes the whole interpreter down with it, and a
-    doctor that talks to the service will hang exactly as hard.
-    """
-    if not command:
-        return {"ok": None, "detail": "no doctor declared"}
-    try:
-        result = subprocess.run(command, cwd=str(root), capture_output=True,
-                                text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "detail": f"doctor did not answer in {timeout}s"}
-    except OSError as exc:
-        return {"ok": None, "detail": f"cannot run doctor: {exc}"[:200]}
-    store_away = _names_store_away(result.stdout, result.stderr)
-    if result.returncode != 0:
-        return {"ok": False, "detail": f"doctor exited {result.returncode}",
-                "store_unreachable": store_away}
-    try:
-        body = json.loads(result.stdout)
-    except ValueError:
-        return {"ok": True, "detail": "doctor exited 0"}
-    if isinstance(body, dict) and body.get("ok") is False:
-        return {"ok": False, "detail": "doctor reported ok=false",
-                "store_unreachable": store_away}
-    return {"ok": True, "detail": "doctor reported ok"}
-
-
-def _names_store_away(*outputs: str) -> bool:
-    """Whether a failing doctor said the store does not answer: an error code
-    or check code `store_unreachable` anywhere in what it printed."""
-    def found(value) -> bool:
-        if isinstance(value, dict):
-            return any((key in ("code", "slug") and item == WATCHDOG_STORE_SLUG)
-                       or found(item) for key, item in value.items())
-        if isinstance(value, list):
-            return any(found(item) for item in value)
-        return False
-    for text in outputs:
-        for chunk in [text or "", *(text or "").splitlines()]:
-            try:
-                if found(json.loads(chunk)):
-                    return True
-            except ValueError:
-                continue
-    return False
-
-
-def _kickstart(label: str) -> dict:
-    try:
-        result = subprocess.run(
-            ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"],
-            capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError) as exc:
-        return {"restarted": False, "detail": f"{type(exc).__name__}: {exc}"[:200]}
-    if result.returncode != 0:
-        return {"restarted": False,
-                "detail": (result.stderr or result.stdout).strip()[:200]}
-    return {"restarted": True, "detail": "launchctl kickstart -k"}
-
-
-def cmd_watchdog(dry_run: bool, now: float | None = None) -> dict:
-    """One pass over the supervised services, restarting any that stopped working.
-
-    Deliberately one pass and not a loop: launchd owns the schedule through
-    `StartInterval`, so the watchdog is a job like any other and a machine that
-    reboots does not need it started by hand.
-    """
-    root = _root()
-    runtime = _load_runtime(root)
-    host = _compiler_config(runtime)["host"]
-    config = host["watchdog"]
-    report = {"profile": runtime.get("profile"), "supervisor": host["supervisor"],
-              "enabled": config["enabled"], "dry_run": dry_run, "services": []}
-    if str(runtime.get("profile") or "") not in HOST_PROFILES:
-        report["skipped"] = "watchdog supervises host agents only"
-        return report
-    if not config["enabled"]:
-        report["skipped"] = "watchdog disabled in deployment/runtime.json"
-        return report
-
-    services = (runtime.get("services") or {})
-    state_path = _watchdog_state_path(root, runtime)
-    state = _read_watchdog_state(state_path)
-    prefix = _host_label_prefix(runtime, root)
-    stamp = time.time() if now is None else now
-
-    for name in sorted(services):
-        service = services[name]
-        if not isinstance(service, dict):
-            continue
-        # A runner the gate keeps idle runs no service to ask about, and a
-        # restart would change nothing it decides.
-        runner = _read_runner_state(name)
-        if runner and runner.get("want") is False:
-            state.pop(name, None)
-            report["services"].append({
-                "service": name, "label": f"{prefix}.{name}", "action": "none",
-                "detail": f"not running here by the gate: {runner.get('reason')}"})
-            continue
-        report["services"].append(_watchdog_check(
-            name, f"{prefix}.{name}", list(service.get("doctor") or []), root,
-            config, state, stamp, dry_run))
-
-    _save_watchdog_state(report, state_path, state, dry_run)
-    return report
-
-
-def _doctor_body(command: list[str], cwd: Path, timeout: int) -> dict | None:
-    """The JSON body a service's declared doctor answers with, whatever its
-    exit status, or None when it does not run, answer in time or answer JSON."""
-    if not command:
-        return None
-    try:
-        result = subprocess.run(command, cwd=str(cwd), capture_output=True,
-                                text=True, timeout=timeout)
-        body = json.loads(result.stdout)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return None
-    return body if isinstance(body, dict) else None
-
-
-def _machine_agent_without_pid(name: str, label: str, doctor: list[str], cwd: Path,
-                               launchd: dict, timeout: int) -> dict:
-    """What a loaded machine agent with no pid is. A machine agent's KeepAlive
-    restarts its process only after a failure, so one that exited cleanly is
-    stopped rather than restarting, and its service may still run as a copy a
-    person started outside launchd, which its declared doctor names."""
-    body = _doctor_body(doctor, cwd, timeout) or {}
-    machine = body.get("machine") if isinstance(body.get("machine"), dict) else {}
-    pid = machine.get("pid") if machine.get("running") is True else None
-    if isinstance(pid, int) and pid > 0 and not _launchd_status(label)["pid"]:
-        return {"state": "outside_launchd", "outside_pid": pid,
-                "detail": (f"no pid under launchd, while the service runs as pid {pid} "
-                           f"outside it, so nothing supervises it; `{name} service stop "
-                           f"--machine`, then `launchctl kickstart gui/$UID/{label}`, "
-                           f"hands it back to launchd")}
-    if str(launchd.get("last_exit_status") or "").strip() == "0":
-        return {"state": "stopped",
-                "detail": (f"stopped: it exited cleanly (last exit code 0), and launchd "
-                           f"restarts it only after a failure; `launchctl kickstart "
-                           f"gui/$UID/{label}` starts it")}
-    # Between restarts. launchd owns that, and stepping in would race it.
-    return {"state": "restarting", "detail": "no pid; launchd is already restarting it"}
-
-
-def _watchdog_check(name: str, label: str, doctor: list[str], cwd: Path,
-                    config: dict, state: dict, stamp: float, dry_run: bool,
-                    machine: bool = False) -> dict:
-    """One service's turn in a watchdog pass, recording its count in `state`.
-
-    The project and the machine scope watch their agents by this one decision,
-    so a failure count, a timeout and a cooldown mean the same thing in both.
-    They differ only in what a loaded agent with no pid is: in the machine
-    scope it is read for a clean stop and for a copy running outside launchd,
-    and neither is restarted."""
-    entry = {"service": name, "label": label, "action": "none"}
-    launchd = _launchd_status(label)
-    entry["loaded"] = launchd["loaded"]
-    if not launchd["loaded"]:
-        entry["detail"] = "not loaded; a person has not started this agent"
-        return entry
-    if not launchd["pid"]:
-        if machine:
-            entry["last_exit_status"] = launchd.get("last_exit_status")
-            entry.update(_machine_agent_without_pid(
-                name, label, doctor, cwd, launchd, config["probe_timeout_seconds"]))
-        else:
-            # Between restarts. launchd owns that, and stepping in would race it.
-            entry["detail"] = "no pid; launchd is already restarting it"
-        state.pop(name, None)
-        return entry
-
-    record = state.get(name) if isinstance(state.get(name), dict) else {}
-    waiting = float(record.get("store_wait_until") or 0)
-    if stamp < waiting:
-        # The store was away when last asked; the doctor is asked again only
-        # once the pause is over, so a watchdog pass opens no connection for it.
-        entry.update({"action": "waiting for the store", "ok": False,
-                      "detail": (f"the store did not answer its doctor; asking again in "
-                                 f"{int(waiting - stamp)}s"),
-                      "store_waits": int(record.get("store_waits") or 0)})
-        return entry
-
-    probe = _probe_service(doctor, cwd, config["probe_timeout_seconds"])
-    entry.update({"ok": probe["ok"], "detail": probe["detail"]})
-    if probe["ok"] is not False:
-        state.pop(name, None)
-        return entry
-
-    if probe.get("store_unreachable"):
-        # A restart cannot bring the store back, and every restart opens the
-        # service's connections again; the service reconnects by itself.
-        waits = int(record.get("store_waits") or 0) + 1
-        pause = min(config["interval_seconds"] * 2 ** (waits - 1),
-                    WATCHDOG_STORE_WAIT_LONGEST_SECONDS)
-        entry.update({"action": "waiting for the store", "store_waits": waits,
-                      "detail": (f"{probe['detail']}: the store does not answer "
-                                 f"({WATCHDOG_STORE_SLUG}); not restarting, asking again "
-                                 f"in {int(pause)}s")})
-        state[name] = {"failures": int(record.get("failures") or 0),
-                       "last_restart": float(record.get("last_restart") or 0),
-                       "store_waits": waits, "store_wait_until": stamp + pause}
-        return entry
-
-    failures = int(record.get("failures") or 0) + 1
-    entry["failures"] = failures
-    last_restart = float(record.get("last_restart") or 0)
-    if failures < config["failures_before_restart"]:
-        entry["action"] = "watching"
-        state[name] = {"failures": failures, "last_restart": last_restart}
-    elif stamp - last_restart < config["restart_cooldown_seconds"]:
-        # Restarting again this soon would mean the restart is not the fix,
-        # and a loop of them buries the evidence of whatever is.
-        entry["action"] = "cooling down"
-        entry["detail"] += (f"; last restart "
-                            f"{int(stamp - last_restart)}s ago")
-        state[name] = {"failures": failures, "last_restart": last_restart}
-    elif dry_run:
-        entry["action"] = "would restart"
-        state[name] = {"failures": failures, "last_restart": last_restart}
-    else:
-        outcome = _kickstart(label)
-        entry["action"] = "restarted" if outcome["restarted"] else "restart failed"
-        entry["detail"] += f"; {outcome['detail']}"
-        state[name] = ({"failures": 0, "last_restart": stamp}
-                       if outcome["restarted"] else
-                       {"failures": failures, "last_restart": last_restart})
-    return entry
-
-
-def _save_watchdog_state(report: dict, state_path: Path, state: dict,
-                         dry_run: bool) -> None:
-    if not dry_run:
-        try:
-            state_path.parent.mkdir(parents=True, exist_ok=True)
-            state_path.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
-        except OSError as exc:
-            # Losing the count costs one extra probe before a restart, which is
-            # not worth failing a watchdog pass over.
-            report["state_error"] = f"{type(exc).__name__}: {exc}"[:200]
-    report["state_file"] = str(state_path)
 
 
 def _desired_state(root: Path, runtime: dict, targets: list[str] | None = None
@@ -4310,28 +3686,6 @@ def _sync(root: Path, runtime: dict, *, check: bool,
             written.append({"path": _rel(root, path),
                             "action": "created" if actual is None else "updated"})
         drift = []
-        wrote = True
-    else:
-        wrote = False
-    agents: list[dict] = []
-    if str(compiled.get("profile") or "") in HOST_PROFILES:
-        for found in _agents_outside_runner(root, compiled, {**active, **embedded}):
-            if wrote:
-                outcome = {**_replace_agent(found["label"], found["compiled"]),
-                           "ran": found["runs"]}
-                agents.append(outcome)
-                if outcome["action"] == "replaced":
-                    continue
-                message = (f"agent {found['label']!r} ran {found['runs']!r} outside the "
-                           f"deployment runner and could not be replaced at "
-                           f"{outcome['step']}: {outcome['detail']}")
-            else:
-                message = (f"agent {found['label']!r} runs {found['runs']!r} outside the "
-                           "deployment runner, so its service never asks the gate or "
-                           "holds the lease; `deployment sync` replaces it")
-            findings.append({"severity": "error", "path": found["label"],
-                             "message": message,
-                             "hint": "`deployment next` names the launchctl steps"})
     errors = [f for f in findings if f.get("severity") == "error"]
     ok = not errors and not drift
     return {
@@ -4347,7 +3701,6 @@ def _sync(root: Path, runtime: dict, *, check: bool,
         "drift": drift,
         "findings": findings,
         "written": written,
-        "agents": agents,
     }
 
 
@@ -5223,82 +4576,32 @@ def _host_next_payload(root: Path, runtime: dict, target_name: str | None) -> di
                                 if isinstance(x, str))
             optional_env.update(x for x in (service.get("optional_env") or [])
                                 if isinstance(x, str))
-    node_manager = _handed_over()
-    # Handed over to this Mac's node manager, the services and their watchdog
-    # are its jobs, and only the agents that carry the body to a node are left.
-    labels = [] if node_manager is not None else [f"{prefix}.{name}" for name in services]
-    # The watchdog is an agent like the rest: it has to be linked and loaded,
-    # or the thing that restarts a wedged service is itself never running.
-    if (node_manager is None and services
-            and _compiler_config(runtime)["host"]["watchdog"]["enabled"]):
-        labels.append(f"{prefix}.watchdog")
-    labels.extend(f"{prefix}.node-sync-{item['name']}"
-                  for item in _all_target_payloads(root) if item.get("provider") == "coolify")
-    if node_manager is not None:
-        return _handed_over_next_payload(root, runtime, target, target_path, services,
-                                         labels, agents_dir, library, required_env,
-                                         optional_env)
-    apply_steps = [
-        "Stop any copy of these services you started by hand, so launchd does "
-        f"not end up beside one: {', '.join(f'`{name} service stop`' for name in services) or 'none declared'}."
-        " That verb reaches a daemon it started itself; once launchd owns one,"
-        " the switch below is launchctl.",
-        "Take down any earlier copy of these agents and remove the installed"
-        f" file, not only the job. macOS records the program an agent runs when"
-        " the file appears in `" + str(library) + "` and keeps that record"
-        " across a reload, so an agent whose program changed keeps running -"
-        " and listing itself - under the old one until the file goes away:",
-        *[f"`launchctl bootout gui/$UID {library / f'{label}.plist'} 2>/dev/null;"
-          f" rm -f {library / f'{label}.plist'}`" for label in labels],
-        f"Link the compiled agents into `{library}`:",
-        *[f"`ln -sf {agents_dir / f'{label}.plist'} {library / f'{label}.plist'}`"
-          for label in labels],
-        *[f"Load it: `launchctl bootstrap gui/$UID {library / f'{label}.plist'}`"
-          for label in labels],
-    ]
-    return {
-        "project": str(root),
-        "runtime": _rel(root, _runtime_path(root)),
-        "target": {"name": target.get("name") or _target_name(target_path),
-                   "path": _rel(root, target_path),
-                   "provider": target.get("provider")},
-        "required_env": sorted(required_env),
-        "optional_env": sorted(optional_env),
-        "artifacts": [_rel(root, agents_dir / f"{label}.plist") for label in labels],
-        "compose_overlays": [],
-        "host_agents": labels,
-        "validation": [f"plutil -lint {_rel(root, agents_dir / f'{label}.plist')}"
-                       for label in labels],
-        "apply_title": "Hand Them To launchd",
-        "provider_steps": apply_steps,
-        "first_run": [f"{name} doctor" for name in services]
-                     + (["deployment watchdog --dry-run"]
-                        if f"{prefix}.watchdog" in labels else []),
-        "check_commands": [f"launchctl print gui/$UID/{label}" for label in labels]
-                          + ["deployment doctor"],
-        "manual_control": {
-            "restart": [f"launchctl kickstart -k gui/$UID/{label}" for label in labels],
-            "stop": [f"launchctl kill TERM gui/$UID/{label}" for label in labels],
-            "start": [f"launchctl kickstart gui/$UID/{label}" for label in labels],
-            "remove": [f"launchctl bootout gui/$UID/{label}" for label in labels],
-        },
-        "with_telegram": "telegram" in services,
-    }
+    # The services run under this Mac's node manager; only the agents that
+    # carry the body to a node are compiled here.
+    labels = [f"{prefix}.node-sync-{item['name']}"
+              for item in _all_target_payloads(root) if item.get("provider") == "coolify"]
+    return _handed_over_next_payload(root, runtime, target, target_path, services,
+                                     labels, agents_dir, library, required_env,
+                                     optional_env, _handed_over() is not None)
 
 
 def _handed_over_next_payload(root: Path, runtime: dict, target: dict, target_path: Path,
                               services: list[str], labels: list[str], agents_dir: Path,
-                              library: Path, required_env: set, optional_env: set) -> dict:
-    """`next` for host agents on a Mac whose node manager runs the project's
-    services: those are started, stopped and restarted through the manager,
-    and only the agents that carry the body to a node are linked and loaded."""
-    apply_steps = [
-        f"This Mac's node manager ({NODE_MANAGER_AGENT}, which `capabilities node "
-        "install` loaded) runs this project's services, each as a job of its own, "
-        "wherever the gate places them on this node: "
+                              library: Path, required_env: set, optional_env: set,
+                              installed: bool = True) -> dict:
+    """`next` for a host profile: the project's services run under this Mac's
+    node manager and are started, stopped and restarted through it, and only
+    the agents that carry the body to a node are linked and loaded."""
+    apply_steps = [] if installed else [
+        f"Install this Mac's node manager ({NODE_MANAGER_AGENT}): `capabilities node "
+        "install --apply`, which first hands over any launchd agent an older "
+        "deployment compiled for this project (`deployment handover`) and places "
+        "on this node a service such an agent ran."]
+    apply_steps += [
+        f"This Mac's node manager runs this project's services, each as a job of its "
+        "own, wherever the gate places them on this node: "
         + (", ".join(f"`capabilities service start {name}`" for name in services)
-           or "none declared") + ". Their compiled agents stay unloaded; `deployment "
-        "handover` takes down any that is loaded again.",
+           or "none declared") + ".",
     ]
     if labels:
         apply_steps += [
@@ -5625,53 +4928,21 @@ def cmd_doctor(args) -> None:
                     findings.append({"severity": "warning", "path": ".env.local",
                                      "message": f"runtime service {name!r} requires unresolved env {key}"})
         if str(compiled.get("profile") or "") in HOST_PROFILES:
+            # The services run under this Mac's node manager; an agent an older
+            # deployment compiled for one, still loaded, runs it beside that.
             prefix = _host_label_prefix(compiled, root)
-            node_manager = _handed_over()
             for name in sorted({**active, **embedded}):
                 status = _launchd_status(f"{prefix}.{name}")
                 host_status.append(status)
-                if node_manager is not None:
-                    # The node manager runs this service from its own job; a
-                    # compiled agent left unloaded is as handover leaves it.
-                    if status["loaded"]:
-                        findings.append({
-                            "severity": "warning", "path": status["label"],
-                            "message": f"agent {status['label']!r} is loaded beside this "
-                                       f"Mac's node manager ({NODE_MANAGER_AGENT}), which "
-                                       "runs this service itself",
-                            "hint": "run `deployment handover`, which takes it down"})
-                    continue
-                if not status["installed"]:
-                    findings.append({
-                        "severity": "warning",
-                        "path": _rel(root, _host_agents_dir(root, compiled)),
-                        "message": f"agent {status['label']!r} is compiled but not "
-                                   "installed; run `deployment next` for the "
-                                   "launchctl steps"})
-                elif not status["loaded"]:
+                if status["loaded"]:
                     findings.append({
                         "severity": "warning", "path": status["label"],
-                        "message": "agent is installed but not loaded into launchd"})
-                else:
-                    expected = str(_host_agents_dir(root, compiled) / f"{prefix}-{name}")
-                    runs = _agent_outside_runner(status, name, Path(expected))
-                    if runs is not None:
-                        findings.append({
-                            "severity": "error", "path": status["label"],
-                            "message": f"agent {status['label']!r} runs {runs!r} outside "
-                                       "the deployment runner, so its service never asks "
-                                       "the gate or holds the lease, and keeps running "
-                                       "here wherever it is placed",
-                            "hint": "run `deployment sync`, which replaces it with the "
-                                    "compiled agent"})
-                    elif status["program"] and status["program"] != expected:
-                        findings.append({
-                            "severity": "warning", "path": status["label"],
-                            "message": f"agent runs {status['program']!r} but the "
-                                       f"compiled agent names {expected!r}; "
-                                       "re-register it, because reloading alone "
-                                       "leaves the old program in place",
-                            "hint": "run `deployment next` for the re-registration steps"})
+                        "message": f"agent {status['label']!r}, which an older deployment "
+                                   "compiled, is still loaded and runs this service "
+                                   "outside this Mac's node manager",
+                        "hint": "run `capabilities node install --apply`, which hands it "
+                                "over (`deployment handover`) and runs the service under "
+                                "the node manager"})
         else:
             names = ([_target_name(path) for path in target_paths if path.exists()]
                      if _bundle_layout(compiled) else [None])
@@ -5730,8 +5001,8 @@ def _bundles_service(name: str) -> bool:
 
 def _handover_labels(root: Path, runtime: dict | None) -> list[dict]:
     """Each launchd agent of this folder that runs a service or watches one:
-    every service agent and the project watchdog this project's compiling left
-    in its agents folder, not the agents that carry the body to a node; and
+    every service agent and the project watchdog an older deployment compiled
+    into its agents folder, not the agents that carry the body to a node; and
     every other agent in ~/Library/LaunchAgents or that folder whose program
     or working directory lies inside the project, whatever compiled it, such
     as one an older compilation left under another label. Such an agent is a
@@ -5853,57 +5124,14 @@ def _hand_over_agent(agent: dict, aside_dir: Path, dry_run: bool) -> dict:
     return entry
 
 
-def cmd_watchdog_command(args) -> None:
-    report = cmd_watchdog(bool(getattr(args, "dry_run", False)))
-    _emit(report)
+# --- Services as this node runs them ----------------------------------------
+# Every capability service a node runs is supervised by the capabilities
+# manager's `node supervise`, which asks the gate on this node, holds the
+# service's lease in the project's store (deployment_service_leases, whose one
+# home is the manager), and keeps a record of what it runs under this
+# capability's state, where `deployment services` reads it.
 
-
-# --- Service runners -----------------------------------------------------------
-# Every capability service a supervisor runs is started through its runner, and
-# the runner is the capabilities manager's: `deployment runner` hands its
-# service to `capabilities node supervise` in its own process, which asks the
-# gate on this node, holds the service's lease in the project's store, and
-# starts or stops the command to match, once per reconcile. The supervision
-# below is what a runner does itself where the manager is too old to take the
-# service, and goes once every machine runs a manager that does.
-
-LEASE_STEPS = [
-    ("0001-service-leases",
-     "CREATE TABLE deployment_service_leases ("
-     " project text NOT NULL,"
-     " capability text NOT NULL,"
-     " node text NOT NULL CHECK (node <> ''),"
-     " acquired_at timestamptz NOT NULL DEFAULT now(),"
-     " renewed_at timestamptz NOT NULL DEFAULT now(),"
-     " expires_at timestamptz NOT NULL,"
-     " PRIMARY KEY (project, capability))"),
-    ("0002-service-lease-errors",
-     "ALTER TABLE deployment_service_leases"
-     " ADD COLUMN last_exit integer,"
-     " ADD COLUMN last_error text,"
-     " ADD COLUMN last_error_at timestamptz;"
-     " COMMENT ON COLUMN deployment_service_leases.last_exit IS"
-     " 'the exit code the service last failed with on the holding node; null when it"
-     " could not be started at all';"
-     " COMMENT ON COLUMN deployment_service_leases.last_error IS"
-     " 'the last lines the service printed to stderr when it last failed, or why it"
-     " could not be started; cleared when another node takes the lease';"
-     " COMMENT ON COLUMN deployment_service_leases.last_error_at IS"
-     " 'when the service last failed on the holding node'"),
-]
-LEASE_MAJOR, LEASE_MINOR = 1, 1
-LEASE_ERROR_CHARS = 2000
 RUNNER_SCHEMA = "capabilities.deployment.runner.v1"
-RUNNER_UNLOCKED = object()
-
-
-def _tables():
-    """The steps and version of deployment's tables, for the contract's `migrate`."""
-    return LEASE_STEPS, LEASE_MAJOR, LEASE_MINOR
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _iso(moment) -> str | None:
@@ -5982,251 +5210,54 @@ def _runner_project_key(root: Path) -> str:
     return project or f"path:{root}"
 
 
-class _StoreTurns:
-    """The project's store, one transaction at a time: each on a transaction
-    connection opened for it and closed after it, so a runner holds no
-    connection between reconciles, with the tables it writes migrated on the
-    first. With no database resolvable for the project nothing is written and
-    the answer is `unavailable`."""
-
-    def __init__(self, root: Path):
-        self.root = root
-        self.conn = None
-        self._migrated = False
-
-    def _migrate(self, conn, db) -> None:
-        raise NotImplementedError
-
-    def _connect(self):
-        if self.conn is not None:
-            return self.conn
-        try:
-            from capabilities_contract import db
-        except ImportError:
-            raise _LeaseProblem("unavailable", "driver_missing",
-                                "the shared database library capabilities-contract "
-                                "is not installed") from None
-        try:
-            setting = db.resolve_setting(self.root)
-        except db.DbError as exc:
-            state = "unavailable" if exc.slug in _STORE_SETTING_SLUGS else "unreachable"
-            raise _LeaseProblem(state, exc.slug, exc.message) from None
-        try:
-            conn = db.connect(application_name=NAME, setting=setting, transaction=True)
-        except db.DbError as exc:
-            raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
-        if not self._migrated:
-            try:
-                self._migrate(conn, db)
-            except db.DbError as exc:
-                conn.close()
-                raise _LeaseProblem("unreachable", exc.slug, exc.message) from None
-            self._migrated = True
-        self.conn = conn
-        return conn
-
-    def _run(self, work):
-        """`work(conn)` in one transaction on a connection opened for it and
-        closed after it."""
-        try:
-            conn = self._connect()
-        except _LeaseProblem as problem:
-            return problem.report()
-        try:
-            with conn.transaction():
-                return work(conn)
-        except Exception as exc:  # psycopg.Error, or a connection that went away
-            return {"state": "unreachable", "error": {
-                "code": "store_unreachable",
-                "message": " ".join(f"{type(exc).__name__}: {exc}".split())[:300]}}
-        finally:
-            self.close()
-
-    def close(self) -> None:
-        if self.conn is not None:
-            try:
-                self.conn.close()
-            except Exception:
-                pass
-            self.conn = None
-
-
-class _Lease(_StoreTurns):
-    """One project's service leases in its store: a row per (project,
-    capability) naming the node that holds it and when that hold expires. The
-    holder renews it every reconcile; another node takes it only once it has
-    expired or been released. With no database resolvable for the project,
-    no lease can be taken and the lease is `unavailable`.
-
-    Each take, renewal, release or read is one store turn. `maybe_held` is
-    whether this node may hold the lease as far as this runner knows: unknown
-    at first, so the first release asks the store; a release is skipped while
-    it is known not to be held, so a runner whose service is not placed here
-    does not reach the store for its lease at all."""
-
-    def __init__(self, root: Path, project: str, node: str, ttl: int = 0):
-        super().__init__(root)
-        self.project, self.node, self.ttl = project, node, ttl
-        self.mine_until: float | None = None
-        self.maybe_held = True
-
-    def _migrate(self, conn, db) -> None:
-        steps, major, minor = _tables()
-        db.migrate(conn, NAME, steps, major=major, minor=minor)
-
-    @staticmethod
-    def _holding(row, node: str) -> dict:
-        if row is None:
-            return {"state": "free", "holder": None}
-        holder, acquired, renewed, expires, live, code, error, failed = row
-        return {"state": ("held" if holder == node else
-                          "held_elsewhere" if live else "free"),
-                "holder": holder, "acquired_at": _iso(acquired),
-                "renewed_at": _iso(renewed), "expires_at": _iso(expires),
-                "live": bool(live),
-                "last_error": ({"exit": code, "error": error, "at": _iso(failed)}
-                               if failed is not None else None)}
-
-    def acquire(self, capability: str) -> dict:
-        """Take or renew this node's hold, unless another node's is live."""
-        def work(conn):
-            row = conn.execute(
-                "INSERT INTO deployment_service_leases AS l "
-                "(project, capability, node, expires_at) "
-                "VALUES (%s, %s, %s, now() + %s * interval '1 second') "
-                "ON CONFLICT (project, capability) DO UPDATE "
-                "SET node = EXCLUDED.node, expires_at = EXCLUDED.expires_at, "
-                "renewed_at = now(), acquired_at = CASE WHEN l.node = EXCLUDED.node "
-                "THEN l.acquired_at ELSE now() END, "
-                "last_exit = CASE WHEN l.node = EXCLUDED.node THEN l.last_exit END, "
-                "last_error = CASE WHEN l.node = EXCLUDED.node THEN l.last_error END, "
-                "last_error_at = CASE WHEN l.node = EXCLUDED.node "
-                "THEN l.last_error_at END "
-                "WHERE l.node = EXCLUDED.node OR l.expires_at <= now() "
-                "RETURNING node, acquired_at, renewed_at, expires_at, true, "
-                "last_exit, last_error, last_error_at",
-                (self.project, capability, self.node, self.ttl)).fetchone()
-            if row is None:
-                row = conn.execute(
-                    "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
-                    "last_exit, last_error, last_error_at "
-                    "FROM deployment_service_leases WHERE project = %s AND capability = %s",
-                    (self.project, capability)).fetchone()
-            return self._holding(row, self.node)
-        found = self._run(work)
-        if found.get("state") == "held":
-            self.mine_until = time.monotonic() + self.ttl
-            self.maybe_held = True
-        elif found.get("state") == "unreachable":
-            self.maybe_held = True
-        else:
-            self.mine_until = None
-            self.maybe_held = found.get("state") not in ("held_elsewhere", "free")
-        return found
-
-    def release(self, capability: str) -> dict:
-        """Give up this node's hold, so another node may take it at once."""
-        def work(conn):
-            gone = conn.execute(
-                "DELETE FROM deployment_service_leases "
-                "WHERE project = %s AND capability = %s AND node = %s",
-                (self.project, capability, self.node)).rowcount
+def _lease_read(root: Path, project: str, node: str, capability: str) -> dict:
+    """Who holds one service's lease in the project's store, read only: the
+    manager makes and writes the table, so where it is not there yet the lease
+    is free, and with no database resolvable for the project it is
+    `unavailable`. `last_error` is the exit code and time the service last
+    failed with on the holder, else null."""
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        return {"state": "unavailable", "error": {
+            "code": "driver_missing",
+            "message": "the shared database library capabilities-contract is not installed"}}
+    try:
+        setting = db.resolve_setting(root)
+    except db.DbError as exc:
+        state = "unavailable" if exc.slug in _STORE_SETTING_SLUGS else "unreachable"
+        return {"state": state, "error": {"code": exc.slug, "message": exc.message}}
+    try:
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+    except db.DbError as exc:
+        return {"state": "unreachable", "error": {"code": exc.slug, "message": exc.message}}
+    try:
+        with conn.transaction():
+            if conn.execute("SELECT to_regclass('deployment_service_leases')"
+                            ).fetchone()[0] is None:
+                return {"state": "free", "holder": None}
             row = conn.execute(
                 "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
-                "last_exit, last_error, last_error_at "
+                "last_exit, last_error_at "
                 "FROM deployment_service_leases WHERE project = %s AND capability = %s",
-                (self.project, capability)).fetchone()
-            found = self._holding(row, self.node)
-            found["released"] = bool(gone)
-            return found
-        found = self._run(work)
-        if found.get("state") != "unreachable":
-            self.mine_until = None
-            self.maybe_held = False
-        return found
-
-    def release_if_held(self, capability: str, known: dict) -> dict:
-        """`release`, unless this node is known not to hold the lease: then
-        `known`, the lease as last seen, and the store is not asked."""
-        if not self.maybe_held:
-            return known
-        return self.release(capability)
-
-    def record_error(self, capability: str, code, error: str) -> dict:
-        """Write why the service last failed onto this node's hold, so it can
-        be read from any machine that reads the store."""
-        def work(conn):
-            done = conn.execute(
-                "UPDATE deployment_service_leases SET last_exit = %s, last_error = %s, "
-                "last_error_at = now() "
-                "WHERE project = %s AND capability = %s AND node = %s",
-                (code, error[-LEASE_ERROR_CHARS:], self.project, capability,
-                 self.node)).rowcount
-            return {"recorded": bool(done)}
-        return self._run(work)
-
-    def read(self, capability: str) -> dict:
-        def work(conn):
-            row = conn.execute(
-                "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
-                "last_exit, last_error, last_error_at "
-                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
-                (self.project, capability)).fetchone()
-            return self._holding(row, self.node)
-        return self._run(work)
-
-    def still_mine(self) -> bool:
-        """Whether the hold this node last renewed has not yet run out."""
-        return self.mine_until is not None and time.monotonic() < self.mine_until
-
-
-class _Instance(_StoreTurns):
-    """This node's row of what it runs of one service, in the store's
-    `capabilities_service_instances`, which the contract's ledger owns:
-    written on every start, reconcile and exit, and deleted once the runner
-    no longer supervises the service here. `maybe_written` is whether a row
-    may stand: unknown at first, since a runner killed before it could delete
-    its row left one, so the first delete asks the store, and later ones only
-    after a write."""
-
-    def __init__(self, root: Path, project: str, node: str):
-        super().__init__(root)
-        self.project, self.node = project, node
-        self.maybe_written = True
-
-    def _migrate(self, conn, db) -> None:
-        major, minor = STORE_TABLES_VERSION
-        db.migrate(conn, STORE_OWNER, record_table_steps(), major=major, minor=minor)
-
-    def put(self, capability: str, row: dict) -> dict:
-        def work(conn):
-            service_instance_put(conn, self.project, capability, self.node, **row)
-            return {"written": True}
-        found = self._run(work)
-        if found.get("written"):
-            self.maybe_written = True
-        return found
-
-    def drop(self, capability: str) -> dict:
-        if not self.maybe_written:
-            return {"dropped": False}
-
-        def work(conn):
-            return {"dropped": service_instance_drop(conn, self.project, capability,
-                                                     self.node)}
-        found = self._run(work)
-        if "dropped" in found:
-            self.maybe_written = False
-        return found
-
-
-class _LeaseProblem(Exception):
-    def __init__(self, state: str, code: str, message: str):
-        super().__init__(message)
-        self.state, self.code, self.message = state, code, message
-
-    def report(self) -> dict:
-        return {"state": self.state, "error": {"code": self.code, "message": self.message}}
+                (project, capability)).fetchone()
+    except Exception as exc:  # psycopg.Error, or a connection that went away
+        return {"state": "unreachable", "error": {
+            "code": "store_unreachable",
+            "message": " ".join(f"{type(exc).__name__}: {exc}".split())[:300]}}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if row is None:
+        return {"state": "free", "holder": None}
+    holder, acquired, renewed, expires, live, code, failed = row
+    return {"state": ("held" if holder == node else "held_elsewhere" if live else "free"),
+            "holder": holder, "acquired_at": _iso(acquired),
+            "renewed_at": _iso(renewed), "expires_at": _iso(expires), "live": bool(live),
+            "last_error": ({"exit": code, "at": _iso(failed)}
+                           if failed is not None else None)}
 
 
 def _runner_state_path(name: str) -> Path:
@@ -6236,735 +5267,6 @@ def _runner_state_path(name: str) -> Path:
 def _read_runner_state(name: str) -> dict:
     data, _err = _read_json(_runner_state_path(name))
     return data if isinstance(data, dict) and data.get("schema") == RUNNER_SCHEMA else {}
-
-
-def _runner_environment(root: Path, name: str) -> dict:
-    """The service's environment: the runner's own, with each default the
-    compiled service carries set where the runner's sets none - the
-    descriptor's optional environment defaults, then the runtime's
-    environment_defaults for it - as a host agent's file and a box's Compose
-    file set them. A runner started from neither, as the node's service
-    manager starts it on a Mac, gives the service the same values."""
-    defaults: dict[str, str] = {}
-    manifest, _err = _installed_manifest(name)
-    service = (manifest or {}).get("service")
-    deploy = service.get("deploy") if isinstance(service, dict) else None
-    environment = deploy.get("environment") if isinstance(deploy, dict) else None
-    optional = environment.get("optional") if isinstance(environment, dict) else None
-    for item in optional if isinstance(optional, list) else []:
-        if (isinstance(item, dict) and isinstance(item.get("key"), str)
-                and isinstance(item.get("default"), str)):
-            defaults[item["key"]] = item["default"]
-    runtime, err = _read_json(_runtime_path(root))
-    services = runtime.get("services") if not err and isinstance(runtime, dict) else None
-    entry = services.get(name) if isinstance(services, dict) else None
-    declared = entry.get("environment_defaults") if isinstance(entry, dict) else None
-    if isinstance(declared, dict):
-        defaults.update({key: value for key, value in declared.items()
-                         if isinstance(value, str)})
-    env = dict(os.environ)
-    for key, value in defaults.items():
-        if _safe_env_key(key):
-            env.setdefault(key, value)
-    return env
-
-
-def _runner_lock(name: str, stopping: dict):
-    """The one runner of `name` in this project on this machine. A lease is
-    held by a node, so it cannot tell two runners on one node apart - a host
-    agent loaded again beside the node manager's job - and a second runner
-    waits here, starting nothing, until the first stops. None once stopped
-    while waiting."""
-    import fcntl
-    path = _runner_state_path(name).with_suffix(".lock")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        handle = path.open("a")
-    except OSError as exc:
-        # As with its state, a runner that cannot write here still runs its
-        # service; only the guard against a second copy is lost.
-        sys.stderr.write(f"[deployment runner {name}] cannot take its lock {path}: {exc}; "
-                         "it runs without the guard against a second runner here\n")
-        sys.stderr.flush()
-        return RUNNER_UNLOCKED
-    said = False
-    while not stopping["now"]:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return handle
-        except BlockingIOError:
-            if not said:
-                holder = _read_runner_state(name).get("runner_pid")
-                sys.stderr.write(
-                    f"[deployment runner {name}] another runner of {name}"
-                    + (f", pid {holder}," if isinstance(holder, int) else "")
-                    + " runs in this project on this machine; this one starts nothing "
-                    "and waits for it to stop, so the service never runs twice here\n")
-                sys.stderr.flush()
-                said = True
-            time.sleep(2)
-    handle.close()
-    return None
-
-
-def _child_preexec() -> None:
-    """The service leads a process group of its own, so stopping it reaches
-    every worker it started; on Linux it is also told when its runner dies."""
-    os.setpgid(0, 0)
-    if sys.platform.startswith("linux"):
-        try:
-            import ctypes
-            import signal
-            ctypes.CDLL(None).prctl(1, signal.SIGTERM)  # PR_SET_PDEATHSIG
-        except (OSError, AttributeError):
-            pass
-
-
-def _relay_stderr(stream, tail: list) -> None:
-    """Pass the service's stderr through unchanged, keeping its last lines so
-    a refusal can be reported in the service's own words."""
-    for raw in iter(stream.readline, b""):
-        try:
-            sys.stderr.buffer.write(raw)
-            sys.stderr.flush()
-        except (OSError, ValueError):
-            pass
-        tail.append(raw.decode("utf-8", "replace").rstrip("\n"))
-        del tail[:-20]
-    stream.close()
-
-
-def _refusal_of(lines: list) -> dict:
-    """The contract's error envelope among a service's last stderr lines, if
-    it printed one: its code and message."""
-    for line in reversed(lines):
-        try:
-            error = json.loads(line).get("error")
-        except (ValueError, AttributeError):
-            continue
-        if isinstance(error, dict) and error.get("code"):
-            return {"slug": str(error["code"]),
-                    "message": str(error.get("message") or "")[:500]}
-    return {}
-
-
-def _service_doctor(name: str) -> list[str]:
-    """The argv the installed service declares as its doctor, or none."""
-    manifest, _err = _installed_manifest(name)
-    service = (manifest or {}).get("service")
-    deploy = service.get("deploy") if isinstance(service, dict) else None
-    doctor = deploy.get("doctor") if isinstance(deploy, dict) else None
-    if isinstance(doctor, list) and doctor and all(isinstance(v, str) and v for v in doctor):
-        return list(doctor)
-    return []
-
-
-def _payload_sha256(name: str) -> str | None:
-    """The installed payload of `name`, as the manager recorded it."""
-    meta, _err = _read_json(_cap_home() / name / "meta.json")
-    value = meta.get("payload_sha256") if isinstance(meta, dict) else None
-    return value if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) else None
-
-
-def _readiness(command: list[str], root: Path, timeout: int) -> dict:
-    """Whether a running service can do its work here, in its declared
-    doctor's words: `ready`, `degraded` (ready, with settings it skipped on
-    this node) or `unusable`, with the problem and its code. The words are the
-    contract's: the exit code, the error envelope on stderr, and the body's
-    `ok`, `problem` and `skipped_settings`."""
-    if not command:
-        return {"state": "unusable", "code": "doctor_undeclared",
-                "problem": "the service declares no doctor, so whether it can do its "
-                           "work here is not known"}
-    shown = shlex.join(command)
-    try:
-        done = subprocess.run(command, cwd=str(root), stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return {"state": "unusable", "code": "doctor_timeout",
-                "problem": f"{shown} did not answer in {timeout}s"}
-    except OSError as exc:
-        return {"state": "unusable", "code": "doctor_unavailable",
-                "problem": f"{shown} cannot be run: {exc}"[:300]}
-    try:
-        body = json.loads(done.stdout)
-    except ValueError:
-        body = None
-    body = body if isinstance(body, dict) else {}
-    skipped = body.get("skipped_settings")
-    skipped = skipped if isinstance(skipped, list) else []
-    if done.returncode == 0 and body.get("ok") is not False:
-        return {"state": "degraded" if skipped else "ready", "skipped_settings": skipped}
-    said = _refusal_of(done.stderr.splitlines())
-    problem = (said.get("message")
-               or (body.get("problem") if isinstance(body.get("problem"), str) else None)
-               or (f"{shown} exited {done.returncode}" if done.returncode
-                   else f"{shown} answered ok: false"))
-    return {"state": "unusable", "problem": problem,
-            "code": said.get("slug") or PROBE_EXIT_CODES.get(done.returncode)
-            or "doctor_failed", "skipped_settings": skipped}
-
-
-def _gate_key(gate: dict) -> tuple:
-    """What a gate answer says, for telling whether it changed: placed or not,
-    and the row that answered."""
-    row = gate.get("row") or {}
-    return (bool(gate.get("placed")), row.get("scope"), row.get("node"), row.get("enabled"))
-
-
-def _group_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def _stop_group(pgid: int, grace: float = RUNNER_STOP_GRACE_SECONDS,
-                reap=None) -> None:
-    """TERM the group, and KILL what is left of it after `grace`. `reap` lets
-    the runner collect its own child as it exits, since a child that exited
-    but was not yet collected still counts as a member of its group."""
-    import signal
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = time.monotonic() + grace
-    while time.monotonic() < deadline:
-        if reap is not None:
-            reap()
-        if not _group_alive(pgid):
-            return
-        time.sleep(0.1)
-    if _group_alive(pgid):
-        try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-
-
-class _Runner:
-    def __init__(self, root: Path, name: str, command: list[str], restart: str,
-                 every: int):
-        self.root, self.name, self.command = root, name, command
-        self.restart, self.every = restart, every
-        self.node = node_name()
-        self.lease = _Lease(root, _runner_project_key(root), self.node,
-                            every * LEASE_TTL_RECONCILES)
-        self.child: subprocess.Popen | None = None
-        self.child_started: float | None = None
-        self.child_started_at: str | None = None
-        self.want = False
-        self.placed = False
-        self.held_down = False
-        self.restart_at: float | None = None
-        self.quick_failures = 0
-        self.gate: dict = {}
-        self.lease_state: dict = {}
-        self.reason = "starting"
-        self.last_exit: dict | None = None
-        self.said: object = None
-        self.tick_at: str | None = None
-        self.stderr_tail: list = []
-        self.relay = None
-        self.error_unrecorded: str | None = None
-        # A service that refused with the policy exit is held idle until the
-        # gate answer it was refused under changes, or the runner restarts.
-        self.refusal: dict | None = None
-        self.gate_seen: tuple | None = None
-        self.seen_failing: str | None = None
-        # What runs here, as the store's instance row tells every machine: the
-        # running child's payload and readiness, and the last failure.
-        project_id = _project_id(refuse=False)
-        self.instance = _Instance(root, project_id, self.node) if project_id else None
-        self.instance_failing: str | None = None
-        self.payload_sha256: str | None = None
-        self.probe: dict | None = None
-        self.probe_at: float | None = None
-        self.failure: dict | None = None
-
-    def say(self, message: str) -> None:
-        sys.stderr.write(f"[deployment runner {self.name}] {message}\n")
-        sys.stderr.flush()
-
-    def say_once(self, key: object, message: str) -> None:
-        if key != self.said:
-            self.said = key
-            self.say(message)
-
-    def running(self) -> bool:
-        return self.child is not None and self.child.poll() is None
-
-    def adopt_orphan(self) -> None:
-        """A service a previous runner left behind - killed before it could
-        stop it - is stopped, so this runner never starts a second copy."""
-        record = _read_runner_state(self.name)
-        child = record.get("child") if isinstance(record.get("child"), dict) else {}
-        pgid = child.get("pgid")
-        previous = record.get("runner_pid")
-        if not isinstance(pgid, int) or pgid <= 1 or previous == os.getpid():
-            return
-        if isinstance(previous, int) and previous > 1:
-            try:
-                os.kill(previous, 0)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                return
-            else:
-                self.say(f"another runner, pid {previous}, still records this service "
-                         "here; its service is left to it")
-                return
-        if _group_alive(pgid):
-            self.say(f"stopping process group {pgid} a previous runner left running")
-            _stop_group(pgid)
-
-    def start(self) -> None:
-        try:
-            self.child = subprocess.Popen(self.command, cwd=str(self.root),
-                                          env=_runner_environment(self.root, self.name),
-                                          preexec_fn=_child_preexec,
-                                          stderr=subprocess.PIPE)
-        except OSError as exc:
-            self.child = None
-            self.last_exit = {"code": None, "at": _now_iso(),
-                              "error": f"{type(exc).__name__}: {exc}"[:300]}
-            self.failure = dict(self.last_exit)
-            self.say(f"cannot start {shlex.join(self.command)}: {exc}")
-            self.restart_at = time.monotonic() + self.every
-            self.record_error()
-            self.write_instance()
-            return
-        import threading
-        self.stderr_tail = []
-        self.relay = threading.Thread(target=_relay_stderr,
-                                      args=(self.child.stderr, self.stderr_tail),
-                                      daemon=True)
-        self.relay.start()
-        self.child_started = time.monotonic()
-        self.child_started_at = _now_iso()
-        self.restart_at = None
-        self.payload_sha256 = _payload_sha256(self.name)
-        self.probe = None
-        self.probe_at = self.child_started + PROBE_GRACE_SECONDS
-        self.say(f"started {shlex.join(self.command)} as pid {self.child.pid} on {self.node}")
-        self.write_instance()
-        self.save()
-
-    def stop(self, why: str) -> None:
-        if self.child is None:
-            return
-        pid = self.child.pid
-        self.write_instance()
-        _stop_group(pid, reap=self.child.poll)
-        try:
-            self.child.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        self.last_exit = {"code": self.child.returncode, "at": _now_iso(), "stopped": why}
-        self.child = None
-        self.say(f"stopped pid {pid}: {why}")
-        self.save()
-
-    def reap(self) -> None:
-        """A service that exited on its own: restart it as its policy says."""
-        if self.child is None or self.child.poll() is None:
-            return
-        code = self.child.returncode
-        ran = time.monotonic() - (self.child_started or time.monotonic())
-        self.last_exit = {"code": code, "at": _now_iso(), "ran_seconds": round(ran, 1)}
-        self.child = None
-        if code == POLICY_REFUSAL_EXIT and self.want:
-            time.sleep(0.2)  # let the relay take the service's last words
-            self.failure = {"code": code, "at": self.last_exit["at"],
-                            "error": "\n".join(self.stderr_tail)[-LEASE_ERROR_CHARS:]
-                            or f"exited with {code}"}
-            self.hold_refused()
-            return
-        if code != 0:
-            if self.relay is not None:
-                self.relay.join(timeout=0.5)  # the service's last words
-            self.last_exit["error"] = "\n".join(self.stderr_tail)[-LEASE_ERROR_CHARS:]
-            self.failure = {"code": code, "at": self.last_exit["at"],
-                            "error": self.last_exit["error"] or f"exited with {code}"}
-            self.record_error()
-        again = (self.restart in ("always", "unless-stopped")
-                 or (self.restart == "on-failure" and code != 0))
-        if not self.want:
-            self.write_instance()
-            self.save()
-            return
-        if not again:
-            self.held_down = True
-            self.say(f"exited with {code}; restart policy {self.restart!r} keeps it "
-                     "stopped until the gate turns it off and on again or the runner "
-                     "restarts")
-        else:
-            self.quick_failures = self.quick_failures + 1 if ran < 10 else 0
-            delay = min(2 ** self.quick_failures, self.every)
-            self.restart_at = time.monotonic() + delay
-            self.say(f"exited with {code}; restarting in {delay}s")
-        self.write_instance()
-        self.save()
-
-    def record_error(self) -> None:
-        """Put the failure in `last_exit` on the lease this node holds, where
-        another machine can read it."""
-        if self.lease.mine_until is None:
-            return
-        found = self.lease.record_error(self.name, self.last_exit.get("code"),
-                                        self.last_exit.get("error") or "")
-        failing = (found.get("error") or {}).get("code")
-        if failing and failing != self.error_unrecorded:
-            self.say("cannot record the failure on the lease: "
-                     f"{found['error'].get('message')}")
-        self.error_unrecorded = failing
-
-    def hold_refused(self) -> None:
-        """The service refused to run here with the policy exit: hold it
-        idle, give up the lease, and say what it said."""
-        said = _refusal_of(self.stderr_tail)
-        self.refusal = {"exit": POLICY_REFUSAL_EXIT, "at": _now_iso(), **said,
-                        "gate": self.gate_seen}
-        detail = (f"{said['slug']}: {said['message']}" if said
-                  else "it printed no error envelope")
-        self.want = False
-        self.reason = (f"held idle: {self.name} refused to run here with exit "
-                       f"{POLICY_REFUSAL_EXIT} ({detail}); it is tried again when the "
-                       f"gate answer for {self.node} changes or the runner restarts")
-        self.say(self.reason)
-        self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
-        if self.lease_state.get("released"):
-            self.say(f"released the lease for {self.name}")
-        self.write_instance()
-        self.save()
-
-    def instance_row(self) -> dict | None:
-        """The row of what this node runs of the service as the runner sees it
-        now, or None while it does not supervise the service here: neither
-        placed here nor still running."""
-        running = self.running()
-        if not self.placed and not running:
-            return None
-        failure = self.failure or {}
-        row = {"payload_sha256": self.payload_sha256 if running else None,
-               "pid": self.child.pid if running else None,
-               "host": socket.gethostname() if running else None,
-               "started_at": self.child_started_at if running else None,
-               "last_exit_code": failure.get("code"), "last_error": failure.get("error"),
-               "last_error_at": failure.get("at")}
-        holder = self.lease_state.get("holder")
-        # Whether the service's last exit was a failure: a start that failed or
-        # an exit other than 0, and not a stop the runner made.
-        last = self.last_exit or {}
-        failed = bool(last) and "stopped" not in last and last.get("code") != 0
-        if running and not self.want:
-            return {**row, "state": "stopping", "problem": self.reason}
-        if running:
-            if self.probe is None:
-                # Restarted after a quick failure and not yet asked: it is
-                # crashing, not starting.
-                state = "failing" if self.quick_failures and failed else "starting"
-                return {**row, "state": state}
-            return {**row, "state": self.probe["state"], "problem": self.probe.get("problem"),
-                    "problem_code": self.probe.get("code"),
-                    "skipped_settings": self.probe.get("skipped_settings") or []}
-        if self.refusal is not None:
-            return {**row, "state": "held", "problem": self.reason,
-                    "problem_code": self.refusal.get("slug") or "policy"}
-        if self.held_down:
-            return {**row, "state": "held", "problem_code": "restart_policy",
-                    "problem": (f"exited with {failure.get('code', 0)}; restart policy "
-                                f"{self.restart!r} keeps it stopped until the gate turns "
-                                "it off and on again or the runner restarts")}
-        if self.want:
-            return {**row, "state": "failing" if failed else "starting"}
-        return {**row, "state": "waiting", "problem": self.reason,
-                "problem_code": ("lease_held_elsewhere" if holder and holder != self.node
-                                 else "lease_unconfirmed")}
-
-    def write_instance(self) -> None:
-        """Put the row of what runs here in the store, or take it away once the
-        runner no longer supervises the service here. A failure to reach the
-        store is said once, and once more when the writes work again."""
-        if self.instance is None:
-            if self.instance_failing != "project_undeclared":
-                self.say("the project declares no id, so what runs here is not recorded "
-                         "in the store")
-            self.instance_failing = "project_undeclared"
-            return
-        row = self.instance_row()
-        found = (self.instance.drop(self.name) if row is None
-                 else self.instance.put(self.name, row))
-        failing = (found.get("error") or {}).get("code")
-        if failing != self.instance_failing:
-            self.say(f"cannot record what runs here in the store: "
-                     f"{found['error'].get('message')}" if failing
-                     else "records what runs here in the store again")
-        self.instance_failing = failing
-
-    def probe_if_due(self) -> bool:
-        """Ask the running service's declared doctor whether it can do its work,
-        once it has run PROBE_GRACE_SECONDS and then every reconcile; whether
-        it was asked."""
-        if not self.running() or self.probe_at is None or time.monotonic() < self.probe_at:
-            return False
-        self.probe = _readiness(_service_doctor(self.name), self.root,
-                                min(PROBE_TIMEOUT_SECONDS, 2 * self.every))
-        self.probe_at = time.monotonic() + self.every
-        return True
-
-    def converge(self) -> None:
-        if self.want and not self.running() and not self.held_down:
-            if self.restart_at is None or time.monotonic() >= self.restart_at:
-                self.start()
-        elif not self.want and self.child is not None:
-            self.stop(self.reason)
-
-    def report_seen(self) -> None:
-        """Report this node up in the store through the manager, which alone
-        writes the agent's nodes. A failure is said once, and once more when
-        the reports work again."""
-        failing = detail = None
-        try:
-            done = subprocess.run(["capabilities", "node", "seen"], cwd=str(self.root),
-                                  stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                  timeout=min(self.every, SEEN_TIMEOUT_SECONDS))
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            failing = type(exc).__name__
-            detail = f"the manager could not be run ({failing})"
-        else:
-            if done.returncode:
-                said = _refusal_of(done.stderr.splitlines())
-                failing = said.get("slug") or f"exit {done.returncode}"
-                detail = (f"{said['slug']}: {said['message']}" if said else
-                          f"capabilities node seen exited {done.returncode}")
-        if failing != self.seen_failing:
-            self.say(f"cannot report {self.node} seen: {detail}" if failing
-                     else f"reports {self.node} seen again")
-        self.seen_failing = failing
-
-    def tick(self) -> None:
-        self.tick_at = _now_iso()
-        self.report_seen()
-        gate = _gate_answer(self.name)
-        self.gate = gate
-        if "error" in gate:
-            # A gate that cannot be read changes nothing this reconcile; the
-            # lease below still decides how long a running service may stay.
-            self.say_once(("gate_error", gate["error"]["code"]), gate["reason"])
-            placed = self.placed
-        else:
-            placed = bool(gate["placed"])
-            seen = _gate_key(gate)
-            if self.refusal is not None and seen != self.gate_seen:
-                self.say(f"the gate answer for {self.node} changed; the refusal "
-                         "hold is lifted")
-                self.refusal = None
-            self.gate_seen = seen
-        if placed and self.refusal is not None:
-            want, key = False, ("refused",)
-            reason = self.reason if self.reason.startswith("held idle") else "held idle"
-            lease = self.lease.release_if_held(self.name, self.lease_state)
-            self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
-            self.converge()
-            self.write_instance()
-            self.save()
-            return
-        shared = placed and _service_placement(self.name) == "shared"
-        if shared:
-            # A shared service runs on every node it is placed on, so it takes
-            # no lease, and gives up one it held while it was exclusive.
-            lease = self.lease.release_if_held(self.name, self.lease_state)
-            want = True
-            reason = (f"{gate.get('reason') or 'placed'}; a shared service, so it runs on "
-                      "every node it is placed on")
-            key = ("shared",)
-        elif placed:
-            lease = self.lease.acquire(self.name)
-            state = lease.get("state")
-            if state == "held":
-                want = True
-                reason = f"{gate.get('reason') or 'placed'}; this node holds the lease"
-                key: object = ("held",)
-            elif state == "unavailable":
-                want = True
-                reason = (f"{gate.get('reason') or 'placed'}; the lease is unavailable "
-                          f"({(lease.get('error') or {}).get('code')}), so it runs as the "
-                          "gate says")
-                key = ("unavailable",)
-            elif state == "held_elsewhere":
-                want = False
-                reason = (f"refused: the lease for {self.name} is held by "
-                          f"{lease.get('holder')} until {lease.get('expires_at')}; "
-                          "checking again every reconcile")
-                key = ("held_elsewhere", lease.get("holder"))
-            else:
-                want = self.running() and self.lease.still_mine()
-                reason = ("the lease cannot be confirmed: "
-                          f"{(lease.get('error') or {}).get('message')}; "
-                          + ("keeping the service until this node's hold runs out" if want
-                             else "not starting the service until it can be"))
-                key = ("lease_unreachable", want)
-        else:
-            want = False
-            reason = f"not placed on {self.node}: {gate.get('reason')}"
-            key = ("idle", reason)
-            lease = self.lease_state
-        if not want:
-            self.held_down = False
-        if want and not self.want:
-            self.quick_failures = 0
-            self.restart_at = None
-        self.placed, self.want, self.reason, self.lease_state = placed, want, reason, lease
-        if "error" not in gate or placed:
-            self.say_once(key, reason)
-        self.converge()
-        if not placed:
-            # A node the gate turned off gives the service up once it has
-            # stopped it, so the node it was moved to need not wait for the
-            # hold to run out, and never starts it beside this one. Once it
-            # knows it holds none, it asks the store nothing more.
-            self.lease_state = self.lease.release_if_held(self.name, self.lease_state)
-            if self.lease_state.get("released"):
-                self.say(f"released the lease for {self.name}")
-        self.probe_if_due()
-        self.write_instance()
-        self.save()
-
-    def save(self) -> None:
-        child = None
-        if self.child is not None and self.child.poll() is None:
-            child = {"pid": self.child.pid, "pgid": self.child.pid,
-                     "started_at": self.child_started_at}
-        record = {"schema": RUNNER_SCHEMA, "service": self.name, "node": self.node,
-                  "runner_pid": os.getpid(), "every": self.every,
-                  "restart": self.restart, "command": self.command,
-                  "tick_at": self.tick_at, "want": self.want, "reason": self.reason,
-                  "running": child is not None, "child": child,
-                  "last_exit": self.last_exit, "gate": self.gate,
-                  "lease": self.lease_state, "refusal": self.refusal}
-        path = _runner_state_path(self.name)
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(path.name + f".{os.getpid()}.tmp")
-            tmp.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
-            os.replace(tmp, path)
-        except OSError as exc:
-            self.say_once(("state_unwritable", str(path)),
-                          f"cannot record its state in {path}: {exc}")
-
-    def shutdown(self) -> None:
-        self.want = False
-        self.reason = "the runner is stopping"
-        self.stop("the runner is stopping")
-        if self.lease.mine_until is not None:
-            self.lease_state = self.lease.release(self.name)
-        self.lease.close()
-        if self.instance is not None:
-            self.instance.drop(self.name)
-            self.instance.close()
-        self.save()
-
-
-def _disconnect_store() -> None:
-    """Close this process's idle store connection, which the shared database
-    library keeps for its next operation."""
-    try:
-        from capabilities_contract import db
-    except ImportError:
-        return
-    db.disconnect()
-
-
-def _manager_executable() -> str | None:
-    """The manager this executable belongs with, as a path to exec: an explicit
-    override, the one beside a source checkout, else the one on PATH."""
-    manager = _machine_manager()
-    return manager if os.path.sep in manager else shutil.which(manager)
-
-
-def _manager_supervises(manager: str) -> bool:
-    """Whether this manager's `node supervise` runs a service it is handed, as
-    its `--probe` answers; an older manager refuses the option."""
-    try:
-        proc = subprocess.run([manager, "node", "supervise", "--probe"],
-                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                              timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    try:
-        answer = json.loads(proc.stdout) if proc.returncode == 0 else None
-    except ValueError:
-        return False
-    return isinstance(answer, dict) and answer.get("supervises") is True
-
-
-def cmd_runner(args) -> None:
-    """Run one capability service as the gate on this node says, until stopped:
-    handed to the manager's `node supervise` in this process where the manager
-    supervises it, else supervised here, as before the manager could."""
-    import signal
-    root = _root()
-    name = args.name
-    if not re.fullmatch(r"[a-z][a-z0-9_-]*", name or ""):
-        _die(6, "input", f"runner needs a capability name, not {name!r}")
-    command = list(args.service_command or [])
-    if not command:
-        _die(6, "input", "runner needs the service command after `--`",
-             f"deployment runner {name} [--every N] [--restart POLICY] -- <command...>")
-    if args.every is None:
-        # A node manager's program names no cadence: the project's own applies.
-        args.every = _reconcile_seconds(_load_runtime(root) if _runtime_path(root).exists()
-                                        else {})
-    low, high = RECONCILE_BOUNDS
-    if not low <= args.every <= high:
-        _die(6, "input", f"--every must be from {low} to {high} seconds")
-    manager = _manager_executable()
-    if manager and _manager_supervises(manager):
-        sys.stdout.flush()
-        sys.stderr.flush()
-        os.chdir(root)
-        os.execv(manager, [manager, "node", "supervise", name, "--every", str(args.every),
-                           "--restart", args.restart, "--", *command])
-    # A manager whose `node supervise` cannot take a service, or none found
-    # here: this runner supervises the service itself.
-    stopping = {"now": False}
-
-    def stop(_signum, _frame):
-        stopping["now"] = True
-
-    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(signum, stop)
-    lock = _runner_lock(name, stopping)
-    if lock is None:
-        return
-    runner = _Runner(root, name, command, args.restart, args.every)
-    runner.adopt_orphan()
-    runner.say(f"runs {shlex.join(command)} on {runner.node} as the gate says, "
-               f"reconciling every {args.every}s")
-    next_tick = 0.0
-    try:
-        while not stopping["now"]:
-            now = time.monotonic()
-            if now >= next_tick:
-                runner.tick()
-                next_tick = now + args.every
-                if not runner.running():
-                    # Its service not running here, the runner holds no
-                    # connection between reconciles.
-                    _disconnect_store()
-            else:
-                runner.reap()
-                runner.converge()
-                if runner.probe_if_due():
-                    runner.write_instance()
-            time.sleep(max(0.05, min(1.0, next_tick - time.monotonic())))
-    finally:
-        runner.shutdown()
 
 
 def _compiled_service_names(runtime: dict) -> list[str]:
@@ -6980,41 +5282,38 @@ def _compiled_service_names(runtime: dict) -> list[str]:
 def _services_report(root: Path) -> dict:
     runtime = _load_runtime(root)
     node = node_name()
-    lease = _Lease(root, _runner_project_key(root), node)
+    project = _runner_project_key(root)
     every_default = _reconcile_seconds(runtime)
     out: dict = {"project": str(root), "node": node, "label": node_label(), "records": None,
                  "services": []}
-    try:
-        for name in _compiled_service_names(runtime):
-            gate = _gate_answer(name)
-            out["records"] = out["records"] or gate.get("records")
-            record = _read_runner_state(name)
-            every = record.get("every") if isinstance(record.get("every"), int) else every_default
-            tick = record.get("tick_at")
-            fresh = False
-            if isinstance(tick, str):
-                try:
-                    age = (datetime.now(timezone.utc)
-                           - datetime.fromisoformat(tick)).total_seconds()
-                    fresh = age <= 2 * every + 5
-                except ValueError:
-                    fresh = False
-            runner = ({"recorded": True, "node": record.get("node"),
-                       "tick_at": tick, "current": fresh, "want": record.get("want"),
-                       "reason": record.get("reason"), "last_exit": record.get("last_exit"),
-                       "refusal": record.get("refusal")}
-                      if record else {"recorded": False})
-            out["services"].append({
-                "name": name,
-                "gate": {key: gate.get(key) for key in ("placed", "row", "reason", "error")
-                         if key in gate},
-                "running": (bool(record.get("running")) and fresh) if record else None,
-                "refusal": record.get("refusal") if record else None,
-                "runner": runner,
-                "lease": lease.read(name),
-            })
-    finally:
-        lease.close()
+    for name in _compiled_service_names(runtime):
+        gate = _gate_answer(name)
+        out["records"] = out["records"] or gate.get("records")
+        record = _read_runner_state(name)
+        every = record.get("every") if isinstance(record.get("every"), int) else every_default
+        tick = record.get("tick_at")
+        fresh = False
+        if isinstance(tick, str):
+            try:
+                age = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(tick)).total_seconds()
+                fresh = age <= 2 * every + 5
+            except ValueError:
+                fresh = False
+        runner = ({"recorded": True, "node": record.get("node"),
+                   "tick_at": tick, "current": fresh, "want": record.get("want"),
+                   "reason": record.get("reason"), "last_exit": record.get("last_exit"),
+                   "refusal": record.get("refusal")}
+                  if record else {"recorded": False})
+        out["services"].append({
+            "name": name,
+            "gate": {key: gate.get(key) for key in ("placed", "row", "reason", "error")
+                     if key in gate},
+            "running": (bool(record.get("running")) and fresh) if record else None,
+            "refusal": record.get("refusal") if record else None,
+            "runner": runner,
+            "lease": _lease_read(root, project, node, name),
+        })
     return out
 
 
@@ -7024,22 +5323,13 @@ def cmd_services(args) -> None:
 
 # --- Machine scope ------------------------------------------------------------
 # A service that runs once per machine (its manifest declares `service.machine`)
-# belongs to no project, so its supervision cannot live in one. The machine
-# scope compiles one launchd agent per such service, and one watchdog over them,
-# from the installed manifests and this machine's own settings, into this
-# machine's state home - wherever it is run from, the same files. Like the
-# project scope it stops at the artifact: handing an agent to launchd stays a
-# person's act, and `deployment machine next` prints the steps.
+# runs under the node manager (`capabilities node supervise <name> --machine`).
+# An older deployment compiled a launchd agent per such service, and one
+# watchdog over them, into this machine's state home; `machine handover` takes
+# those down so the node manager's job is the only one.
 
-SERVICE_MACHINE_SCHEMA = "capabilities.service.machine.v1"
 MACHINE_LABEL_PREFIX = "capabilities.machine"
-MACHINE_LAUNCHER_PREFIX = "capabilities-machine"
 MACHINE_WATCHDOG = "watchdog"
-# The machine's homes a machine service's declaration is expanded against. They
-# travel with the agent when they are set, so launchd starts the service, and
-# the watchdog, against the same settings and state that sync read.
-MACHINE_HOME_KEYS = ("XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME",
-                     "XDG_CACHE_HOME", "CAPABILITIES_HOME")
 
 
 def _machine_homes() -> dict[str, str]:
@@ -7053,165 +5343,12 @@ def _machine_homes() -> dict[str, str]:
     }
 
 
-def _machine_settings_path() -> Path:
-    return Path(_machine_homes()["XDG_CONFIG_HOME"]) / NAME / "machine.json"
-
-
 def _machine_agents_dir() -> Path:
     return Path(_machine_homes()["XDG_STATE_HOME"]) / NAME / "machine" / "launchd"
 
 
 def _machine_label(name: str) -> str:
     return f"{MACHINE_LABEL_PREFIX}.{name}"
-
-
-def _machine_settings() -> dict:
-    """This machine's declaration: watchdog settings and the services it keeps
-    out. A missing file is every default; one that cannot be read is refused,
-    because guessing would quietly supervise what a person switched off."""
-    path = _machine_settings_path()
-    data, err = _read_json(path)
-    if err == "missing":
-        data = {}
-    elif err:
-        _die(6, "bad_machine_settings", f"cannot read {path}: {err}",
-             'expected {"watchdog": {...}, "services": {"<name>": {"disabled": true}}}')
-    if not isinstance(data, dict):
-        _die(6, "bad_machine_settings", f"{path} is not a JSON object",
-             'expected {"watchdog": {...}, "services": {"<name>": {"disabled": true}}}')
-    services = data.get("services")
-    disabled = sorted(name for name, entry in (services.items() if isinstance(services, dict) else [])
-                      if isinstance(entry, dict) and entry.get("disabled") is True)
-    return {"path": str(path), "present": err != "missing",
-            "watchdog": _watchdog_config(data.get("watchdog")), "disabled": disabled}
-
-
-def _machine_manager() -> str:
-    """The manager this executable belongs with: an explicit override, the one
-    beside a source checkout, else the one on PATH."""
-    manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
-    if manager:
-        return manager
-    source_manager = Path(__file__).resolve().parents[3] / "bin" / "capabilities"
-    return str(source_manager) if source_manager.is_file() else "capabilities"
-
-
-def _machine_installed() -> list[dict]:
-    """The installed set and each capability's machine state, as the manager
-    answers for the machine: asked from the home directory with every project
-    hand-down removed, so the answer is the same from wherever this runs."""
-    env = dict(os.environ)
-    for key in ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ENVELOPE",
-                "CAPABILITIES_PROJECT_ENVELOPE_ROOT", "CAPABILITIES_PROJECT_ID",
-                "CAPABILITIES_PROJECT_ID_ROOT"):
-        env.pop(key, None)
-    home = Path.home()
-    try:
-        proc = subprocess.run([_machine_manager(), "list", "--json"],
-                              cwd=str(home if home.is_dir() else Path("/")),
-                              env=env, capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError) as exc:
-        _die(6, "capabilities_manager_unavailable",
-             f"could not ask the capabilities manager for the installed set: {exc}",
-             "install or repair the `capabilities` command")
-    if proc.returncode != 0:
-        _die(6, "capabilities_list_failed",
-             "the capabilities manager could not list the installed set",
-             (proc.stderr or proc.stdout).strip()[:400] or "run `capabilities list --json`")
-    try:
-        rows = json.loads(proc.stdout).get("installed")
-    except (ValueError, AttributeError):
-        rows = None
-    if not isinstance(rows, list):
-        _die(6, "capabilities_list_malformed",
-             "the capabilities manager returned no installed list")
-    return [row for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)]
-
-
-def _expand_machine_path(value: str) -> Path | None:
-    """`$XDG_STATE_HOME/...` and the like, against this machine's homes."""
-    homes = _machine_homes()
-    text = value
-    if text == "~" or text.startswith("~/"):
-        text = homes["HOME"] + text[1:]
-    for key in sorted(homes, key=len, reverse=True):
-        text = text.replace("${" + key + "}", homes[key]).replace("$" + key, homes[key])
-    if "$" in text or not os.path.isabs(text):
-        return None
-    return Path(os.path.normpath(text))
-
-
-def _argv(value: object) -> bool:
-    return (isinstance(value, list) and bool(value)
-            and all(isinstance(part, str) and part for part in value))
-
-
-def _machine_services() -> tuple[dict[str, dict], list[dict], dict, dict]:
-    """Every machine service this machine supervises, and every installed
-    capability it does not, each with the reason; also the settings read and
-    the manager's row for this capability."""
-    settings = _machine_settings()
-    rows = _machine_installed()
-    services: dict[str, dict] = {}
-    skipped: list[dict] = []
-    for row in sorted(rows, key=lambda item: item["name"]):
-        name = row["name"]
-        manifest, err = _installed_manifest(name)
-        if err or manifest is None:
-            skipped.append({"capability": name,
-                            "reason": f"its manifest snapshot cannot be read ({err})"})
-            continue
-        service = manifest.get("service")
-        machine = service.get("machine") if isinstance(service, dict) else None
-        if machine is None:
-            skipped.append({"capability": name, "reason": "declares no machine service"})
-            continue
-        if row.get("machine") != "allowed":
-            skipped.append({"capability": name, "reason": (
-                f"quarantined on this machine; lifting it is the user's decision "
-                f"(`capabilities allow {name}`)")})
-            continue
-        if name in settings["disabled"]:
-            skipped.append({"capability": name,
-                            "reason": f"disabled in {settings['path']}"})
-            continue
-        if name == MACHINE_WATCHDOG:
-            skipped.append({"capability": name, "reason": (
-                f"its label would be the machine watchdog's "
-                f"({_machine_label(MACHINE_WATCHDOG)})")})
-            continue
-        if (not isinstance(machine, dict)
-                or machine.get("schema") != SERVICE_MACHINE_SCHEMA
-                or not _argv(machine.get("command")) or not _argv(machine.get("doctor"))):
-            skipped.append({"capability": name, "reason": (
-                f"its service.machine is not a valid {SERVICE_MACHINE_SCHEMA} "
-                "declaration")})
-            continue
-        state = machine.get("state")
-        if state is None:
-            # Never a project: a machine service resolves none from where it stands.
-            working = Path(_machine_homes()["HOME"])
-        else:
-            working = _expand_machine_path(state) if isinstance(state, str) else None
-        if working is None:
-            skipped.append({"capability": name, "reason": (
-                f"its service.machine.state {state!r} does not expand to an "
-                "absolute path")})
-            continue
-        services[name] = {"command": list(machine["command"]),
-                          "doctor": list(machine["doctor"]),
-                          "working_directory": working}
-    return services, skipped, settings, next(
-        (row for row in rows if row["name"] == NAME), {})
-
-
-def _machine_environment(search_path: str) -> dict:
-    environment = {"PATH": search_path}
-    for key in MACHINE_HOME_KEYS:
-        value = os.environ.get(key)
-        if value:
-            environment[key] = value
-    return environment
 
 
 def _plist_document(body: dict) -> str:
@@ -7222,281 +5359,6 @@ def _plist_document(body: dict) -> str:
     lines += _plist_fragment(body, 0)
     lines.append("</plist>")
     return "\n".join(lines) + "\n"
-
-
-def _machine_desired() -> dict:
-    """What `machine sync` writes, and what it found on the way."""
-    services, skipped, settings, own_row = _machine_services()
-    agents_dir = _machine_agents_dir()
-    watchdog = settings["watchdog"]
-    findings: list[dict] = []
-    if sys.platform != "darwin":
-        findings.append({"severity": "warning", "path": str(agents_dir),
-                         "message": "launchd agents are compiled here but only load on macOS"})
-    search_path = _launchd_search_path(
-        [service["command"] for service in services.values()]
-        + [service["doctor"] for service in services.values()] + [[NAME]])
-    environment = _machine_environment(search_path)
-    texts: dict[Path, str] = {}
-    for name, service in sorted(services.items()):
-        command = service["command"]
-        if not shutil.which(command[0]):
-            findings.append({
-                "severity": "error", "path": f"registry:{name}/manifest.json",
-                "message": f"machine service {name!r} runs {command[0]!r}, which is "
-                           "not on PATH here; launchd needs it resolved at compile time"})
-        working = service["working_directory"]
-        if not working.is_dir():
-            findings.append({
-                "severity": "warning", "path": str(working),
-                "message": f"the working directory of {name!r} does not exist yet, and "
-                           "launchd will not start an agent without it; "
-                           "`deployment machine next` names the step that creates it"})
-        label = _machine_label(name)
-        launcher = agents_dir / f"{MACHINE_LAUNCHER_PREFIX}-{name}"
-        texts[launcher] = _mark_generated(
-            launcher, _host_launcher_text(_launchd_program(command)))
-        plist = agents_dir / f"{label}.plist"
-        texts[plist] = _mark_generated(plist, _plist_document({
-            "Label": label,
-            "ProgramArguments": [str(launcher)],
-            "WorkingDirectory": str(working),
-            "EnvironmentVariables": environment,
-            "RunAtLoad": True,
-            "KeepAlive": {"SuccessfulExit": False},
-            # A machine service starts work that outlives it; launchd must not
-            # reap that work when it stops or restarts the service.
-            "AbandonProcessGroup": True,
-            "ThrottleInterval": 10,
-            "ProcessType": SERVICE_PROCESS_TYPE,
-            "StandardOutPath": str(agents_dir / f"{name}.out.log"),
-            "StandardErrorPath": str(agents_dir / f"{name}.err.log"),
-        }))
-    watchdog_label = _machine_label(MACHINE_WATCHDOG)
-    watchdog_plist = agents_dir / f"{watchdog_label}.plist"
-    if services and watchdog["enabled"]:
-        launcher = agents_dir / f"{MACHINE_LAUNCHER_PREFIX}-{MACHINE_WATCHDOG}"
-        texts[launcher] = _mark_generated(launcher, _host_launcher_text(
-            _launchd_program([NAME, "machine", "watchdog"])))
-        # Scheduled, not supervised: see _watchdog_plist.
-        texts[watchdog_plist] = _mark_generated(watchdog_plist, _plist_document({
-            "Label": watchdog_label,
-            "ProgramArguments": [str(launcher)],
-            "WorkingDirectory": str(agents_dir),
-            "EnvironmentVariables": environment,
-            "RunAtLoad": False,
-            "StartInterval": watchdog["interval_seconds"],
-            "ProcessType": WATCHDOG_PROCESS_TYPE,
-            "StandardOutPath": str(agents_dir / "watchdog.out.log"),
-            "StandardErrorPath": str(agents_dir / "watchdog.err.log"),
-        }))
-        if own_row.get("effective") != "enabled":
-            findings.append({
-                "severity": "warning", "path": str(watchdog_plist),
-                "message": f"the watchdog agent runs outside any project, where "
-                           f"{NAME} is not enabled, so its pass would be refused; "
-                           f"it needs `capabilities enable {NAME} --global`, which "
-                           "is the user's decision"})
-    elif watchdog_plist.is_file():
-        findings.append({
-            "severity": "warning", "path": str(watchdog_plist),
-            "message": "no machine watchdog is wanted but its agent is still here; "
-                       f"run `launchctl bootout gui/$UID/{watchdog_label}` and "
-                       "delete this file"})
-    for entry in skipped:
-        stale = agents_dir / f"{_machine_label(entry['capability'])}.plist"
-        if entry["capability"] != MACHINE_WATCHDOG and stale.is_file():
-            findings.append({
-                "severity": "warning", "path": str(stale),
-                "message": f"{entry['capability']} is no longer supervised here "
-                           f"({entry['reason']}) but its agent is still here; run "
-                           f"`launchctl bootout gui/$UID/{_machine_label(entry['capability'])}` "
-                           "and delete this file"})
-    return {"services": services, "skipped": skipped, "settings": settings,
-            "agents_dir": agents_dir, "texts": texts, "findings": findings}
-
-
-def cmd_machine_sync(args) -> None:
-    desired = _machine_desired()
-    findings = desired["findings"]
-    errors = [f for f in findings if f.get("severity") == "error"]
-    written: list[dict] = []
-    if not errors:
-        for path, expected in sorted(desired["texts"].items()):
-            actual = _read_text(path)
-            if actual == expected:
-                written.append({"path": str(path), "action": "unchanged"})
-                continue
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(expected)
-            if expected.startswith("#!"):
-                path.chmod(path.stat().st_mode | 0o755)
-            written.append({"path": str(path),
-                            "action": "created" if actual is None else "updated"})
-    settings = desired["settings"]
-    _emit({
-        "ok": not errors,
-        "agents_dir": str(desired["agents_dir"]),
-        "settings": {"path": settings["path"], "present": settings["present"]},
-        "services": sorted(desired["services"]),
-        "agents": sorted(path.stem for path in desired["texts"] if path.suffix == ".plist"),
-        "skipped": desired["skipped"],
-        "findings": findings,
-        "written": written,
-    })
-    if errors:
-        sys.exit(6)
-
-
-def _machine_next_payload() -> dict:
-    desired = _machine_desired()
-    agents_dir = desired["agents_dir"]
-    library = Path.home() / "Library" / "LaunchAgents"
-    plists = sorted((path for path in desired["texts"] if path.suffix == ".plist"),
-                    key=lambda path: path.name)
-    labels = [path.stem for path in plists]
-    services = sorted(desired["services"])
-    missing = [str(path) for path in plists if not path.is_file()]
-    stale = [str(path) for path in plists
-             if path.is_file() and _read_text(path) != desired["texts"][path]]
-    steps: list[str] = []
-    if missing or stale:
-        steps.append("Compile first: `deployment machine sync`. Not yet written or "
-                     f"out of date: {', '.join(missing + stale)}.")
-    steps.append(
-        "Stop any copy of these services you started by hand, so launchd does not "
-        "end up beside one: "
-        f"{', '.join(f'`{name} service stop --machine`' for name in services) or 'none declared'}.")
-    workdirs = sorted({str(desired["services"][name]["working_directory"])
-                       for name in services
-                       if not desired["services"][name]["working_directory"].is_dir()})
-    if workdirs:
-        steps.append("Create the working directories launchd starts them in: "
-                     + " ".join(f"`mkdir -p {path}`" for path in workdirs))
-    steps += [
-        "Take down any earlier copy of these agents and remove the installed file, "
-        "not only the job; macOS keeps the program it recorded for an agent until "
-        f"its file leaves `{library}`:",
-        *[f"`launchctl bootout gui/$UID {library / f'{label}.plist'} 2>/dev/null;"
-          f" rm -f {library / f'{label}.plist'}`" for label in labels],
-        f"Link the compiled agents into `{library}`:",
-        *[f"`ln -sf {agents_dir / f'{label}.plist'} {library / f'{label}.plist'}`"
-          for label in labels],
-        *[f"Load it: `launchctl bootstrap gui/$UID {library / f'{label}.plist'}`"
-          for label in labels],
-    ]
-    watchdog_label = _machine_label(MACHINE_WATCHDOG)
-    return {
-        "agents_dir": str(agents_dir),
-        "settings": desired["settings"]["path"],
-        "services": services,
-        "skipped": desired["skipped"],
-        "host_agents": labels,
-        "artifacts": [str(path) for path in plists],
-        "validation": [f"plutil -lint {path}" for path in plists],
-        "steps": steps,
-        "first_run": [f"{name} service doctor --machine" for name in services]
-                     + (["deployment machine watchdog --dry-run"]
-                        if watchdog_label in labels else []),
-        "check_commands": [f"launchctl print gui/$UID/{label}" for label in labels]
-                          + ["deployment machine status"],
-        "manual_control": {
-            "restart": [f"launchctl kickstart -k gui/$UID/{label}" for label in labels],
-            "stop": [f"launchctl kill TERM gui/$UID/{label}" for label in labels],
-            "start": [f"launchctl kickstart gui/$UID/{label}" for label in labels],
-            "remove": [f"launchctl bootout gui/$UID/{label}" for label in labels],
-        },
-    }
-
-
-def _machine_next_markdown(payload: dict) -> str:
-    lines = ["# Machine Agents Next Steps", "",
-             f"Compiled into `{payload['agents_dir']}` from the installed machine "
-             f"services and `{payload['settings']}`.", "", "## 1. Review Files", ""]
-    lines += [f"- `{path}`" for path in payload["artifacts"]] or ["- No machine service is supervised here."]
-    if payload["skipped"]:
-        lines += ["", "Not supervised:", ""]
-        lines += [f"- `{entry['capability']}`: {entry['reason']}" for entry in payload["skipped"]]
-    lines += ["", "## 2. Validate Locally", ""]
-    lines += [f"```sh\n{cmd}\n```" for cmd in payload["validation"]]
-    lines += ["", "## 3. Hand Them To launchd", ""]
-    lines += [f"{idx}. {step}" for idx, step in enumerate(payload["steps"], 1)]
-    lines += ["", "## 4. First Run", ""]
-    lines += [f"```sh\n{cmd}\n```" for cmd in payload["first_run"]]
-    lines += ["", "## 5. Check", "", "```sh", *payload["check_commands"], "```"]
-    control = payload["manual_control"]
-    lines += ["", "## 6. Manual Control", "",
-              "Restart:", "", "```sh", *control["restart"], "```",
-              "", "Stop, and stay stopped:", "", "```sh", *control["stop"], "```",
-              "", "Start again:", "", "```sh", *control["start"], "```",
-              "", "Remove from launchd:", "", "```sh", *control["remove"], "```", ""]
-    return "\n".join(lines)
-
-
-def cmd_machine_next(args) -> None:
-    payload = _machine_next_payload()
-    _emit(payload if args.json else _machine_next_markdown(payload))
-
-
-def cmd_machine_status(args) -> None:
-    """Each compiled machine agent, and what launchd says about it. Reads only."""
-    agents_dir = _machine_agents_dir()
-    library = Path.home() / "Library" / "LaunchAgents"
-    agents = []
-    plists = sorted(agents_dir.glob(f"{MACHINE_LABEL_PREFIX}.*.plist")) if agents_dir.is_dir() else []
-    for path in plists:
-        label = path.stem
-        installed = library / f"{label}.plist"
-        try:
-            linked = installed.resolve() == path.resolve() and installed.exists()
-        except OSError:
-            linked = False
-        launchd = _launchd_status(label)
-        try:
-            process_type = plistlib.loads(path.read_bytes()).get("ProcessType")
-        except (OSError, plistlib.InvalidFileException):
-            process_type = None
-        spawn_type = launchd.get("spawn_type")
-        agents.append({"label": label, "artifact": str(path), "compiled": True,
-                       "installed": str(installed), "linked": linked,
-                       "loaded": launchd["loaded"], "pid": launchd["pid"],
-                       "last_exit_status": launchd["last_exit_status"],
-                       "program": launchd["program"],
-                       "process_type": process_type, "spawn_type": spawn_type,
-                       "spawn_type_current": (
-                           None if not (launchd["loaded"] and spawn_type and process_type)
-                           else LAUNCHD_SPAWN_TYPES.get(process_type) == spawn_type)})
-    out = {"agents_dir": str(agents_dir), "agents": agents}
-    if not agents:
-        out["hint"] = "nothing is compiled here; run `deployment machine sync`"
-    _emit(out)
-
-
-def cmd_machine_watchdog(dry_run: bool, now: float | None = None) -> dict:
-    """One pass over the machine agents, as `cmd_watchdog` makes over a project's."""
-    settings = _machine_settings()
-    config = settings["watchdog"]
-    report = {"scope": "machine", "supervisor": "launchd", "enabled": config["enabled"],
-              "dry_run": dry_run, "services": []}
-    if not config["enabled"]:
-        report["skipped"] = f"watchdog disabled in {settings['path']}"
-        return report
-    services = _machine_services()[0]
-    state_path = _machine_agents_dir() / ".watchdog-state.json"
-    state = _read_watchdog_state(state_path)
-    stamp = time.time() if now is None else now
-    for name in sorted(services):
-        working = services[name]["working_directory"]
-        report["services"].append(_watchdog_check(
-            name, _machine_label(name), services[name]["doctor"],
-            working if working.is_dir() else Path.home(),
-            config, state, stamp, dry_run, machine=True))
-    _save_watchdog_state(report, state_path, state, dry_run)
-    return report
-
-
-def cmd_machine_watchdog_command(args) -> None:
-    _emit(cmd_machine_watchdog(bool(args.dry_run)))
 
 
 def cmd_machine_handover(args) -> None:
@@ -8053,7 +5915,7 @@ def _node_environment(root, runtime, target, host, repo_url, key, branch):
     # In store mode every installed service is compiled, and which of them runs
     # on the node is the gate's answer there, so a key only a capability
     # service requires is not refused here: left unset, the server's value stands, and a
-    # service placed without it says so when its runner starts it.
+    # service placed without it says so when its supervisor starts it.
     service_keys: set[str] = set()
     if _store_placed(root):
         descriptors, _findings = _store_service_descriptors(runtime)
@@ -8570,7 +6432,7 @@ def cmd_node_status(args):
         except ValueError:
             report["errors"].append({"code": "node_leftovers_unreadable",
                                      "message": "the leftovers probe on the node returned malformed JSON"})
-    # What the gate on the node answers for each service, whether its runner
+    # What the gate on the node answers for each service, whether its supervisor
     # runs it, and who holds its lease, as the node itself reads them.
     remote: dict = {}
     if container is not None:
@@ -10132,12 +7994,8 @@ def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     _gate()
     _contract(argv)
-    # The runner's service command follows `--` and is passed on untouched.
-    service_command: list[str] = []
-    if argv and argv[0] == "runner" and "--" in argv:
-        split = argv.index("--")
-        argv, service_command = argv[:split], argv[split + 1:]
-    # So is the command `node exec` runs on the node.
+    # The command `node exec` runs on the node follows `--` and is passed on
+    # untouched.
     node_command: list[str] = []
     if argv[:2] == ["node", "exec"] and "--" in argv:
         split = argv.index("--")
@@ -10184,19 +8042,9 @@ def main(argv: list[str] | None = None) -> None:
     p_doctor.add_argument("--target")
     p_doctor.set_defaults(fn=cmd_doctor)
 
-    p_watchdog = sub.add_parser("watchdog", add_help=False)
-    p_watchdog.add_argument("--dry-run", action="store_true")
-    p_watchdog.set_defaults(fn=cmd_watchdog_command)
-
     p_handover = sub.add_parser("handover", add_help=False)
     p_handover.add_argument("--dry-run", action="store_true")
     p_handover.set_defaults(fn=cmd_handover)
-
-    p_runner = sub.add_parser("runner", add_help=False)
-    p_runner.add_argument("name")
-    p_runner.add_argument("--every", type=int, default=None)
-    p_runner.add_argument("--restart", choices=RESTART_POLICIES, default="unless-stopped")
-    p_runner.set_defaults(fn=cmd_runner)
 
     sub.add_parser("services", add_help=False).set_defaults(fn=cmd_services)
 
@@ -10218,15 +8066,6 @@ def main(argv: list[str] | None = None) -> None:
 
     p_machine = sub.add_parser("machine", add_help=False)
     machine = p_machine.add_subparsers(dest="machine_cmd", required=True)
-    machine.add_parser("sync", add_help=False).set_defaults(fn=cmd_machine_sync)
-    p_machine_next = machine.add_parser("next", add_help=False)
-    p_machine_next.add_argument("--text", action="store_true")
-    p_machine_next.add_argument("--json", action="store_true")
-    p_machine_next.set_defaults(fn=cmd_machine_next)
-    machine.add_parser("status", add_help=False).set_defaults(fn=cmd_machine_status)
-    p_machine_watchdog = machine.add_parser("watchdog", add_help=False)
-    p_machine_watchdog.add_argument("--dry-run", action="store_true")
-    p_machine_watchdog.set_defaults(fn=cmd_machine_watchdog_command)
     p_machine_handover = machine.add_parser("handover", add_help=False)
     p_machine_handover.add_argument("names", nargs="*")
     p_machine_handover.add_argument("--dry-run", action="store_true")
@@ -10310,17 +8149,13 @@ def main(argv: list[str] | None = None) -> None:
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
-    args.service_command = service_command
     args.argv = node_command
-    # A write verb, a watchdog pass that may restart a service, and a runner
-    # that starts and stops one change the project or its machine; a preview
-    # (--check, --dry-run) only reads.
+    # A write verb and a handover, which takes launchd agents down, change the
+    # project or its machine; a preview (--check, --dry-run) only reads.
     previews = getattr(args, "check", False) or getattr(args, "dry_run", False)
-    if ((args.cmd in WRITE_VERBS or args.cmd in ("watchdog", "runner", "handover"))
-            and not previews):
+    if (args.cmd in WRITE_VERBS or args.cmd == "handover") and not previews:
         _read_only_gate(f"`{NAME} {args.cmd}`")
-    if (args.cmd == "machine" and args.machine_cmd in ("sync", "watchdog", "handover")
-            and not previews):
+    if args.cmd == "machine" and args.machine_cmd == "handover" and not previews:
         _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
     # A sign-in asked for events speaks them from here on, refusals included.
     if args.cmd == "node" and args.node_cmd in ("login", "add") and args.events:

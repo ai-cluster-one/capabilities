@@ -1,5 +1,6 @@
 # The machine automations service: one process on this machine serving every
-# project that joined it with `automations service join`. Each project's own
+# project the node manager puts on its list, those placed on this node in mode
+# shared (`capabilities service start automations`). Each project's own
 # declaration and limits still apply; these are the machine's. `automations help`
 # states every key; any other is refused.
 version = 1

@@ -86,13 +86,13 @@ To move an exclusive service from the machine it runs on now to the node, place 
 capabilities place <name> --node <node>
 ```
 
-That one write places it on the node and takes it off every other node; the answer names them under `unplaced_from`. The capability stays usable on the machine it left - reading its messages there on demand keeps working - and only its service stops there. At its next reconcile the machine's runner stops the service and releases the lease, and the node's runner takes it over at its own next reconcile, by default within a minute.
+That one write places it on the node and takes it off every other node; the answer names them under `unplaced_from`. The capability stays usable on the machine it left - reading its messages there on demand keeps working - and only its service stops there. At its next reconcile the machine's supervisor stops the service and releases the lease, and the node's supervisor takes it over at its own next reconcile, by default within a minute.
 
 A shared service is placed on the node beside the machines it already runs on; to take it off one of them, `capabilities unplace <name> --node <machine>`.
 
 Do not move a service with `capabilities disable <name> --project --node <machine>`: that turns the capability off on that machine, CLI and all. `capabilities inherit <name> --project --node <machine>` removes the machine's row, and with it the service, and leaves the CLI to whatever the project's row for every node says. Both warn when they take a service off a node.
 
-No recompile and no redeploy is needed on either side. `deployment services` on each side shows what the gate answers there, whether the runner runs the service and who holds the lease.
+No recompile and no redeploy is needed on either side. `deployment services` on each side shows what the gate answers there, whether its supervisor runs the service and who holds the lease.
 
 ## Status and logs
 
@@ -100,7 +100,7 @@ No recompile and no redeploy is needed on either side. `deployment services` on 
 
 - `capabilities node list` here: the node's row, its resource and its public key;
 - `coolify services <resource>`: what Coolify reports for the node's service;
-- in the container, `docker exec <container> deployment services`: each service's gate answer, runner state, refusal and lease; `docker exec <container> cat /tmp/agent-node.state`: what the node is doing (`idle: ...`, `running agent ...`);
+- in the container, `docker exec <container> deployment services`: each service's gate answer, supervisor state, refusal and lease; `docker exec <container> cat /tmp/agent-node.state`: what the node is doing (`idle: ...`, `running agent ...`);
 - on the server, `docker logs <container>`: the boot log, which says what an idle node is waiting for and what the agent's raise did.
 
 ## Update to a new image version

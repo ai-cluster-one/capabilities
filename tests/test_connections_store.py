@@ -2089,8 +2089,8 @@ def test_node_run_records_a_placed_service_it_will_not_run_and_keeps_a_listed_ma
 def test_a_machine_service_runs_once_per_node_for_the_agents_placing_it(lab, tmp_path):
     """A service with no project command of its own that declares a machine one
     is run once on the node, for each placing agent whose lease it holds, which
-    it puts on the service's own list; and never beside a machine process it did
-    not start."""
+    the supervisor itself puts on the service's own list; and never beside a
+    machine process it did not start."""
     import time
     _import(lab)
     registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
@@ -2098,25 +2098,23 @@ def test_a_machine_service_runs_once_per_node_for_the_agents_placing_it(lab, tmp
     (registry / "coolify").write_text("#!/bin/sh\n")
     state = tmp_path / "machine"
     state.mkdir()
-    # The service as the capability's own verbs show it: join and leave keep a
-    # list, `status --machine` reads what its machine process published.
+    # The service as the capability's own verbs show it: its machine process
+    # serves the projects on the list the supervisor writes, and `status
+    # --machine` reads what that process published.
+    listing = lab["config"] / "coolify" / "service" / "projects.json"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "coolify").write_text(f"""#!{sys.executable}
 import json, os, sys, time
 from pathlib import Path
 state = Path({str(state)!r})
-listed = state / "list.json"
-names = json.loads(listed.read_text()) if listed.exists() else []
+listed = Path({str(listing)!r})
+def names():
+    return sorted(json.loads(listed.read_text())["projects"]) if listed.exists() else []
 args = sys.argv[1:]
 with open(state / "calls.log", "a") as log:
     log.write(json.dumps([args, os.getcwd()]) + "\\n")
-if args == ["service", "join"]:
-    names = sorted(set(names) | {{"{PROJECT_ID}"}})
-    listed.write_text(json.dumps(names))
-elif args == ["service", "leave"]:
-    listed.write_text(json.dumps([n for n in names if n != "{PROJECT_ID}"]))
-elif args == ["service", "status", "--machine"]:
+if args == ["service", "status", "--machine"]:
     status = state / "status.json"
     body = json.loads(status.read_text()) if status.exists() else {{"running": False}}
     try:
@@ -2126,9 +2124,8 @@ elif args == ["service", "status", "--machine"]:
     print(json.dumps({{"mode": "machine", **body}}))
 elif args == ["service", "run", "--machine"]:
     while True:
-        names = json.loads(listed.read_text()) if listed.exists() else []
         (state / "status.json").write_text(json.dumps({{"running": True, "pid": os.getpid(),
-            "projects": [{{"project_id": n, "state": "served"}} for n in names]}}))
+            "projects": [{{"project_id": n, "state": "served"}} for n in names()]}}))
         time.sleep(0.5)
 elif args == ["service", "doctor", "--machine"]:
     print(json.dumps({{"ok": True}}))
@@ -2138,7 +2135,12 @@ elif args == ["service", "doctor", "--machine"]:
         "name": "svc", "summary": "s", "verbs": [], "placement": "exclusive",
         "machine": {"schema": "capabilities.service.machine.v1",
                     "command": ["coolify", "service", "run", "--machine"],
-                    "doctor": ["coolify", "service", "doctor", "--machine"]}}}))
+                    "doctor": ["coolify", "service", "doctor", "--machine"],
+                    "projects": "$XDG_CONFIG_HOME/coolify/service/projects.json"}}}))
+
+    def listed():
+        return (sorted(json.loads(listing.read_text())["projects"]) if listing.exists()
+                else [])
     here = {"AGENT_NODE_ID": NODE}
     _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "server",
                  extra=here))
@@ -2193,28 +2195,29 @@ elif args == ["service", "doctor", "--machine"]:
     try:
         assert _wait_for(lambda: row() == ("waiting", "machine_process_elsewhere"), 30), \
             (tmp_path / "supervise.log").read_text()
-        assert ["service", "join"] not in calls() and lease() == []
+        assert listed() == [] and lease() == []
         assert ["service", "run", "--machine"] not in calls()
         # Its problem names the command that retires that agent.
         assert "`deployment machine handover coolify`" in _rows(
             lab, "SELECT problem FROM capabilities_service_instances "
             "WHERE capability = 'coolify'")[0][0]
 
-        # Gone, it takes the agent's lease, joins it, runs the machine process,
-        # and the row says what the service says of the agent.
+        # Gone, it takes the agent's lease, puts it on the list, runs the
+        # machine process, and the row says what the service says of the agent.
         foreign.kill()
         foreign.wait()
         assert _wait_for(lambda: row() == ("ready", None), 45), \
             (tmp_path / "supervise.log").read_text()
         assert lease() == [(NODE,)]
-        assert calls().count(["service", "join"]) == 1
+        assert listed() == [PROJECT_ID]
+        entry = json.loads(listing.read_text())["projects"][PROJECT_ID]
+        assert entry["root"] == str(lab["project"]) and entry["slug"]
 
         # Unplaced, it takes the agent off the list, stops it and lets go.
         _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
         assert _wait_for(lambda: row() is None and lease() == [], 30), \
             (tmp_path / "supervise.log").read_text()
-        assert ["service", "leave"] in calls()
-        assert json.loads((state / "list.json").read_text()) == []
+        assert listed() == []
     finally:
         if foreign.poll() is None:
             foreign.kill()
@@ -2585,8 +2588,8 @@ def test_one_service_at_a_time_serves_an_agent_on_a_node_under_its_service_lease
         lab, tmp_path):
     """The node's machine service and the agent's own service each take the
     agent's service lease on the node before serving it: while one holds it
-    live, the other runs nothing for the agent and leaves its row alone. The
-    machine service's own join writes no placement."""
+    live, the other runs nothing for the agent and leaves its row alone. Putting
+    the agent on the machine service's list writes no placement."""
     here = _service_lab(lab, placement="shared")
     _both_commands(lab)
     state = tmp_path / "machine"
@@ -2597,16 +2600,13 @@ def test_one_service_at_a_time_serves_an_agent_on_a_node_under_its_service_lease
 import json, os, sys, time
 from pathlib import Path
 state = Path({str(state)!r})
-listed = state / "list.json"
-names = json.loads(listed.read_text()) if listed.exists() else []
+listed = Path({str(lab["config"] / "coolify" / "service" / "projects.json")!r})
+def names():
+    return sorted(json.loads(listed.read_text())["projects"]) if listed.exists() else []
 args = sys.argv[1:]
 with open(state / "calls.log", "a") as log:
-    log.write(json.dumps([args, os.environ.get("CAPABILITIES_SERVICE_LIST_ONLY")]) + "\\n")
-if args == ["service", "join"]:
-    listed.write_text(json.dumps(sorted(set(names) | {{"{PROJECT_ID}"}})))
-elif args == ["service", "leave"]:
-    listed.write_text(json.dumps([n for n in names if n != "{PROJECT_ID}"]))
-elif args == ["service", "status", "--machine"]:
+    log.write(json.dumps([args]) + "\\n")
+if args == ["service", "status", "--machine"]:
     status = state / "status.json"
     body = json.loads(status.read_text()) if status.exists() else {{"running": False}}
     try:
@@ -2616,9 +2616,8 @@ elif args == ["service", "status", "--machine"]:
     print(json.dumps({{"mode": "machine", **body}}))
 elif args == ["service", "run", "--machine"]:
     while True:
-        names = json.loads(listed.read_text()) if listed.exists() else []
         (state / "status.json").write_text(json.dumps({{"running": True, "pid": os.getpid(),
-            "projects": [{{"project_id": n, "state": "served"}} for n in names]}}))
+            "projects": [{{"project_id": n, "state": "served"}} for n in names()]}}))
         time.sleep(0.5)
 elif args[1:2] == ["doctor"]:
     print(json.dumps({{"ok": True}}))
@@ -2650,9 +2649,9 @@ elif args[1:2] == ["doctor"]:
     try:
         assert _wait_for(lambda: holder() == [(NODE, "shared")] and row()
                          and row()[0] == "ready", 45), (tmp_path / "machine.log").read_text()
-        calls = [json.loads(line) for line in (state / "calls.log").read_text().splitlines()]
-        assert [["service", "join"], "1"] in calls
-        # Its own join wrote no placement: the person's stays as it was.
+        listing = lab["config"] / "coolify" / "service" / "projects.json"
+        assert list(json.loads(listing.read_text())["projects"]) == [PROJECT_ID]
+        # Putting it on the list wrote no placement: the person's stays as it was.
         assert _modes(lab) == [(NODE, True, "shared")]
         served = row()
 
@@ -2674,7 +2673,7 @@ elif args[1:2] == ["doctor"]:
         machine.wait(timeout=60)
         assert _wait_for(lambda: marker.exists() and holder() == [(NODE, "own")], 45), \
             (tmp_path / "own.log").read_text()
-        assert json.loads((state / "list.json").read_text()) == []
+        assert json.loads(listing.read_text())["projects"] == {}
         assert _modes(lab) == [(NODE, True, "shared")]
     finally:
         if machine.poll() is None:
@@ -2701,18 +2700,6 @@ import json
 print(json.dumps({{"ok": True, "agents": []}}))
 """)
     (bin_dir / "deployment").chmod(0o755)
-    # Its join, run again in the agent's folder, writes the shared placement.
-    joins = tmp_path / "joins.log"
-    (bin_dir / "coolify").write_text(f"""#!{sys.executable}
-import json, os, subprocess, sys
-with open({str(joins)!r}, "a") as log:
-    log.write(json.dumps([sys.argv[1:], os.getcwd(),
-                          os.environ.get("CAPABILITIES_SERVICE_LIST_ONLY")]) + "\\n")
-done = subprocess.run([{str(MANAGER)!r}, "place", "coolify", "--node", {NODE!r},
-                       "--mode", "shared"], capture_output=True, text=True)
-print(json.dumps({{"joined": False, "placement": {{"written": done.returncode == 0}}}}))
-""")
-    (bin_dir / "coolify").chmod(0o755)
     env = {**here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
     listing = lab["config"] / "coolify" / "service" / "projects.json"
     listing.parent.mkdir(parents=True)
@@ -2727,16 +2714,12 @@ print(json.dumps({{"joined": False, "placement": {{"written": done.returncode ==
     preview = _ok(_manager(lab, "node", "install", extra=env))
     assert preview["would_join"] == [entry]
     assert _modes(lab) == [(NODE, True, "own")]
-    assert not joins.exists()
     done = _ok(_manager(lab, "node", "install", "--apply", extra=env))
     assert done["joined"] == [entry]
     assert _modes(lab) == [(NODE, True, "shared")]
     again = _ok(_manager(lab, "node", "install", "--apply", extra=env))
     assert "joined" not in again and "would_join" not in again
     assert _modes(lab) == [(NODE, True, "shared")]
-    assert [(argv, os.path.realpath(cwd), only) for argv, cwd, only in
-            map(json.loads, joins.read_text().splitlines())] == [
-        (["service", "join"], os.path.realpath(lab["project"]), None)]
 
 
 def test_a_start_or_place_without_a_node_on_a_mac_beside_a_server_says_where_it_lands(lab):
