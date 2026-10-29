@@ -152,6 +152,37 @@ def test_an_older_launchers_runner_hands_its_service_to_node_supervise(
     assert not _alive(child)
 
 
+def test_a_runner_under_a_manager_too_old_to_supervise_runs_its_service_itself(
+        tmp_path: Path) -> None:
+    # A manager released before `node supervise --probe` updates deployment
+    # under an older launcher without moving the machine first: the runner
+    # says why and supervises the service itself, so the service still runs.
+    home = tmp_path / "home"
+    env = _env(home)
+    # The manager as one that old answers: it refuses `--probe`, and does
+    # everything else this one does.
+    old = tmp_path / "old-manager"
+    old.write_text("#!/bin/sh\n"
+                   "[ \"$1 $2 $3\" = 'node supervise --probe' ] && "
+                   "echo '{\"error\": {\"code\": \"input\"}}' >&2 && exit 6\n"
+                   f"exec {MANAGER} \"$@\"\n")
+    old.chmod(0o755)
+    env["CAPABILITIES_MANAGER_BIN"] = str(old)
+    root = _project(tmp_path / "project", {"id": PROJECT_ID, "slug": "files"},
+                    settings={"deployment": {"enabled": True}, "fixture": {"enabled": True}})
+    runner = Runner(root, env, "6e6f64652d66", tmp_path / "runner.log",
+                    via=[str(DEPLOYMENT), "runner"])
+    try:
+        running = runner.until(lambda s: s.get("running"))
+        child = running["child"]["pid"]
+        assert _alive(child)
+    finally:
+        runner.stop()
+    assert "supervises fixture itself" in runner.text()
+    assert "capabilities self-update" in runner.text()
+    assert not _alive(child)
+
+
 def test_files_mode_places_the_service_by_the_projects_own_enable(tmp_path: Path) -> None:
     home = tmp_path / "home"
     env = _env(home)

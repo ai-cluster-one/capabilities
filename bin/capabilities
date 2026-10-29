@@ -13139,10 +13139,11 @@ SUPERVISE_UNLOCKED = object()
 # The lease table keeps the name and the migration ledger entry deployment gave
 # it when its runner held the leases, so a store either side made reads alike:
 # the first two steps are the ones deployment applied, byte for byte, which the
-# ledger's checksum holds to. This is the table's one home now that deployment's
-# copy has gone with its runner. The instance rows carry what a failing service
-# said, so nothing here reads or writes the lease's last_error any more; the
-# column stays, since a released manager still on another node names it.
+# ledger's checksum holds to, and which deployment's runner still applies where
+# it supervises a service itself under a manager too old to. The instance rows
+# carry what a failing service said, so nothing here reads or writes the
+# lease's last_error any more; the column stays, since a released manager still
+# on another node, and that runner, name it.
 SUPERVISE_LEASE_OWNER = "deployment"
 SUPERVISE_LEASE_VERSION = (1, 1)
 SUPERVISE_LEASE_STEPS = [
