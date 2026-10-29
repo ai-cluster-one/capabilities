@@ -112,7 +112,7 @@
     },
     "mailbox": {
       "path": "capabilities/mailbox",
-      "payload_sha256": "f8576698e091b5a136fb277218338c9aa577377d64ef05c3efdd7c20ea438e4b",
+      "payload_sha256": "0c6e96ffb0c220ab1dd5c98eccee33b22a3cc7b4fc5a232954499a94dbe491c4",
       "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, and send."
     },
     "memory": {
