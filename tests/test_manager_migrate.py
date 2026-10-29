@@ -525,6 +525,10 @@ def build_agents(w: World) -> None:
     for name in ("tasks", "automations", "whatsapp", "telegram", "memory", "agentrooms"):
         result = w.cap(w.roots["admin"], name, "migrate")
         assert result.returncode == 0, (name, result.stderr)
+    # A core capability's arrival enable, as install writes it: in the store
+    # only, so the config home's gate does not name it.
+    w.sql("INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+          "VALUES (NULL, 'deployment', NULL, true)")
     # A launchd agent of relay's, loaded.
     plist = w.home / "Library" / "LaunchAgents" / "test.relay.telegram.plist"
     plist.parent.mkdir(parents=True, exist_ok=True)
@@ -579,6 +583,7 @@ def test_global_dry_run_lists_rows_and_gate_flips_and_writes_nothing(world):
     assert policy["agentrooms"] == "add"
     grants = {row["connection"]: row for row in dry["plan"]["grants"]}
     assert grants["ops"]["allow_write"] is True and grants["ops"]["is_default"] is True
+    assert not [r for r in dry["plan"]["remove"] if r["kind"] == "policy"], dry["plan"]["remove"]
     flips = {entry["agent_id"]: entry["flips"] for entry in dry["gate_flips"]}
     assert flips[IDS["kept"]] == [{"capability": "agentrooms", "was": False, "now": True}]
     assert [s["document"] for s in dry["plan"]["settings"]] == ["memory"]
@@ -650,6 +655,9 @@ def test_global_apply_writes_the_rows_once(world):
     assert applied["state"] == "migrated" and applied["global_migrated_at"]
     assert world.sql("SELECT enabled FROM capabilities_policy WHERE agent_id IS NULL "
                      "AND capability = 'agentrooms'") == [(True,)]
+    # The arrival enable the config home does not name stays.
+    assert world.sql("SELECT enabled FROM capabilities_policy WHERE agent_id IS NULL "
+                     "AND capability = 'deployment' AND node IS NULL") == [(True,)]
     # A config-home allow_write is a global grant's allow_write only, never enabled.
     assert world.sql("SELECT enabled, allow_write, is_default FROM "
                      "capabilities_connection_grants WHERE agent_id IS NULL") == [

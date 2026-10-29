@@ -1874,7 +1874,10 @@ PROJECT VERBS (run inside a consuming project)
         Write the config home's gate, identifiers, connections, grants (a
         grant's allow_write only, never enabled), default pointer and global
         settings as the global rows every agent inherits, converging the
-        store's global rows on them, and set global_migrated_at; the dry run
+        store's global rows on them, except that a global enable the store
+        holds and the config home does not name stays (install writes a core
+        capability's arrival enable to the store only), and set
+        global_migrated_at; the dry run
         lists each row it would add, change or remove and every agent whose
         effective gate would flip (gate_flips), counting only agents that
         read the same database. --apply first brings the contract's tables
@@ -21003,8 +21006,10 @@ def _migrate_global_plan(conn, manifests: dict, answers: dict) -> dict:
                                "store": held,
                                "outcome": "held" if held == value["enabled"] else
                                "add" if held is None else "change"})
+    # A global enable the files do not name stays: install writes a core
+    # capability's arrival enable to the store only.
     for (name, node), enabled in sorted(held_policy.items(), key=lambda k: (k[0][0], k[0][1] or "")):
-        if node is None:
+        if node is None and enabled is not True:
             plan["remove"].append({"kind": "policy", "capability": name, "name": name,
                                    "store": enabled})
     held_ids = _migrate_identifier_rows(conn, None)
@@ -21100,7 +21105,8 @@ def _migrate_gate_flips(conn, plan: dict, given: list[str], setting=None) -> lis
     db = _db_module()
     here = _migrate_database(setting) if setting is not None else None
     before = _migrate_policy_rows(conn, None)
-    after = {key: value for key, value in before.items() if key[1] is not None}
+    removed = {(row["capability"], None) for row in plan["remove"] if row["kind"] == "policy"}
+    after = {key: value for key, value in before.items() if key not in removed}
     for row in plan["policy"]:
         after[(row["capability"], None)] = row["enabled"]
     agents: dict[str, dict] = {}

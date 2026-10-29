@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-29 — `migrate --global` keeps the global enables install wrote
+
+`capabilities migrate --global` no longer removes a global enable the store holds because the config home's gate does not name it. Install writes a core capability's arrival enable to the store only, so on a new machine the global migration used to switch the core capabilities off; such a row now stays, is not listed under `plan.remove`, and counts as kept in `gate_flips`. A global row the config home does not name that is not an enable is removed as before. Run `capabilities help` for the details.
+
 ## 2026-10-29 — A connection keeps its id and is renamed by its label
 
 `capabilities set <name> connection|grant <key>` and `set <name> setting connection.default <value>` name a connection by its id or by the label `<name> connection rename` gave it, and the row holds its id, so a grant or a default written by the new name lands on the connection it always was. `capabilities connections list` adds each connection's `label`, its id where it has none. The manager now requires `capabilities-contract>=0.36`, which adds the label and the rename.
