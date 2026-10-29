@@ -188,6 +188,18 @@ USAGE
       installed, action, kept_at?}]}; exit 6 when an agent could not be
       handed over.
 
+  deployment runner <name> [--every SECONDS] [--restart POLICY] -- <command...>
+      What a launchd agent or supervisor entry an older deployment compiled
+      runs, kept so that agent goes on working until the node manager takes
+      it over. It starts nothing itself: it checks its arguments, this
+      capability's gate and the read-only switch, then hands the service, in
+      the same process, to the manager's supervisor, `capabilities node
+      supervise <name> --every SECONDS --restart POLICY -- <command...>`, with
+      SECONDS service_policy.reconcile_seconds when omitted (default 60,
+      5-3600) and POLICY unless-stopped. A manager that does not answer `node
+      supervise --probe`, or none found here, exits 5 manager_cannot_supervise
+      naming `capabilities self-update`. Nothing deployment compiles runs it.
+
   deployment deploy [--target <name>]
       Check compiler drift, sync the body through node-<target> over SSH,
       provision a Coolify application in the project's existing environment
@@ -7990,12 +8002,81 @@ def _memory_attributes(root):
     return path, current
 
 
+# --- The runner older launchers still run -----------------------------------
+# A launchd agent or supervisor entry an older deployment compiled runs
+# `deployment runner <name> ... -- <command...>`, and a manager older than the
+# one that moves a machine before replacing deployment can update deployment
+# under it. The runner stays so that entry keeps its service: it only hands
+# the service to the manager's `node supervise`, which starts it.
+
+def _manager_executable() -> str | None:
+    """The manager this executable belongs with, as a path to exec: an explicit
+    override, the one beside a source checkout, else the one on PATH."""
+    manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip()
+    if not manager:
+        source_manager = Path(__file__).resolve().parents[3] / "bin" / "capabilities"
+        manager = str(source_manager) if source_manager.is_file() else "capabilities"
+    return manager if os.path.sep in manager else shutil.which(manager)
+
+
+def _manager_supervises(manager: str) -> bool:
+    """Whether this manager's `node supervise` runs a service it is handed, as
+    its `--probe` answers; an older manager refuses the option."""
+    try:
+        proc = subprocess.run([manager, "node", "supervise", "--probe"],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    try:
+        answer = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except ValueError:
+        return False
+    return isinstance(answer, dict) and answer.get("supervises") is True
+
+
+def cmd_runner(args) -> None:
+    """Hand one capability service to the manager's `node supervise` in this
+    process, as an older deployment's launcher asks."""
+    root = _root()
+    name = args.name
+    if not re.fullmatch(r"[a-z][a-z0-9_-]*", name or ""):
+        _die(6, "input", f"runner needs a capability name, not {name!r}")
+    command = list(args.service_command or [])
+    if not command:
+        _die(6, "input", "runner needs the service command after `--`",
+             f"deployment runner {name} [--every N] [--restart POLICY] -- <command...>")
+    if args.every is None:
+        # A launcher that names no cadence takes the project's own.
+        args.every = _reconcile_seconds(_load_runtime(root) if _runtime_path(root).exists()
+                                        else {})
+    low, high = RECONCILE_BOUNDS
+    if not low <= args.every <= high:
+        _die(6, "input", f"--every must be from {low} to {high} seconds")
+    manager = _manager_executable()
+    if not manager or not _manager_supervises(manager):
+        _die(5, "manager_cannot_supervise",
+             f"no capabilities manager here supervises {name}: `node supervise --probe` "
+             "is not answered",
+             "`capabilities self-update`, then `capabilities node install --apply` in this "
+             "folder hands the service to the node manager")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.chdir(root)
+    os.execv(manager, [manager, "node", "supervise", name, "--every", str(args.every),
+                       "--restart", args.restart, "--", *command])
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     _gate()
     _contract(argv)
-    # The command `node exec` runs on the node follows `--` and is passed on
-    # untouched.
+    # The runner's service command follows `--` and is passed on untouched.
+    service_command: list[str] = []
+    if argv and argv[0] == "runner" and "--" in argv:
+        split = argv.index("--")
+        argv, service_command = argv[:split], argv[split + 1:]
+    # So is the command `node exec` runs on the node.
     node_command: list[str] = []
     if argv[:2] == ["node", "exec"] and "--" in argv:
         split = argv.index("--")
@@ -8045,6 +8126,12 @@ def main(argv: list[str] | None = None) -> None:
     p_handover = sub.add_parser("handover", add_help=False)
     p_handover.add_argument("--dry-run", action="store_true")
     p_handover.set_defaults(fn=cmd_handover)
+
+    p_runner = sub.add_parser("runner", add_help=False)
+    p_runner.add_argument("name")
+    p_runner.add_argument("--every", type=int, default=None)
+    p_runner.add_argument("--restart", choices=RESTART_POLICIES, default="unless-stopped")
+    p_runner.set_defaults(fn=cmd_runner)
 
     sub.add_parser("services", add_help=False).set_defaults(fn=cmd_services)
 
@@ -8149,11 +8236,13 @@ def main(argv: list[str] | None = None) -> None:
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
+    args.service_command = service_command
     args.argv = node_command
-    # A write verb and a handover, which takes launchd agents down, change the
-    # project or its machine; a preview (--check, --dry-run) only reads.
+    # A write verb, a handover, which takes launchd agents down, and a runner,
+    # whose supervisor starts and stops a service, change the project or its
+    # machine; a preview (--check, --dry-run) only reads.
     previews = getattr(args, "check", False) or getattr(args, "dry_run", False)
-    if (args.cmd in WRITE_VERBS or args.cmd == "handover") and not previews:
+    if (args.cmd in WRITE_VERBS or args.cmd in ("handover", "runner")) and not previews:
         _read_only_gate(f"`{NAME} {args.cmd}`")
     if args.cmd == "machine" and args.machine_cmd == "handover" and not previews:
         _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")

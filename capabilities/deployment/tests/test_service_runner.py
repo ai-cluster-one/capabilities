@@ -79,14 +79,15 @@ class Runner:
     """One `capabilities node supervise` for the observable child, on one node."""
 
     def __init__(self, root: Path, env: dict[str, str], node: str, log: Path,
-                 child: list[str] | None = None):
+                 child: list[str] | None = None, via: list[str] | None = None):
         self.root, self.node, self.log_path = root, node, log
         self.log = log.open("w")
         child = child or [sys.executable, "-c",
                           "import os, time; print('child up', os.getpid(), flush=True); "
                           "time.sleep(600)"]
         self.proc = subprocess.Popen(
-            [str(MANAGER), "node", "supervise", "fixture", "--every", EVERY, "--", *child],
+            [*(via or [str(MANAGER), "node", "supervise"]), "fixture", "--every", EVERY,
+             "--", *child],
             cwd=root, env={**env, "AGENT_NODE_ID": node}, stdout=self.log,
             stderr=subprocess.STDOUT, start_new_session=True)
 
@@ -128,6 +129,27 @@ def _alive(pid: int | None) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def test_an_older_launchers_runner_hands_its_service_to_node_supervise(
+        tmp_path: Path) -> None:
+    # A launchd agent an older deployment compiled runs `deployment runner`,
+    # and an older manager may update deployment under it: the service still
+    # runs, under the manager's supervisor, whose record the state is.
+    home = tmp_path / "home"
+    env = _env(home)
+    root = _project(tmp_path / "project", {"id": PROJECT_ID, "slug": "files"},
+                    settings={"deployment": {"enabled": True}, "fixture": {"enabled": True}})
+    runner = Runner(root, env, "6e6f64652d66", tmp_path / "runner.log",
+                    via=[str(DEPLOYMENT), "runner"])
+    try:
+        running = runner.until(lambda s: s.get("running"))
+        child = running["child"]["pid"]
+        assert _alive(child)
+    finally:
+        runner.stop()
+    assert "child up" in runner.text()
+    assert not _alive(child)
 
 
 def test_files_mode_places_the_service_by_the_projects_own_enable(tmp_path: Path) -> None:
