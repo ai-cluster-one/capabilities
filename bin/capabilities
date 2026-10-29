@@ -4238,13 +4238,20 @@ def _machine_reads_problems(script: Path, help_text: str | None = None,
 
 # ---------------------------------------------------------------- snapshots
 
+# The snapshot is a capability's first run on this machine, which is when uv
+# downloads and builds its environment: a few hundred MB on an empty cache,
+# minutes over a slow link.
+SNAPSHOT_TIMEOUT_SECONDS = 600
+
+
 def _snapshot(name: str, script: Path, registry: Path | None = None) -> dict:
     """Run stub + manifest outside any project; persist snapshots keyed by hash."""
     reg = registry or _registry_dir(name)
-    rc, stub_out, err = _run_script(script, ["stub"])
+    rc, stub_out, err = _run_script(script, ["stub"], timeout=SNAPSHOT_TIMEOUT_SECONDS)
     if rc != 0:
         _die(6, "snapshot_failed", f"`{name} stub` exited {rc}", err.strip() or None)
-    rc, man_out, err = _run_script(script, ["manifest", "--json"])
+    rc, man_out, err = _run_script(script, ["manifest", "--json"],
+                                   timeout=SNAPSHOT_TIMEOUT_SECONDS)
     if rc != 0:
         _die(6, "snapshot_failed", f"`{name} manifest --json` exited {rc}",
              err.strip() or None)
