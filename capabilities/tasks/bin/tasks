@@ -924,7 +924,9 @@ SERVICE
                                   when the store is unreachable and no daemon
                                   runs; with one running that is a warning
   tasks service run               the daemon in the foreground, for a supervisor
-  tasks service start             the daemon detached, logging to its state
+  tasks service start             the daemon detached, logging to its state;
+                                  either writes the shipped template first
+                                  when the project has no settings yet
   tasks service reload [--timeout 30]
                                   hand the running daemon the declaration on disk
   tasks service stop [--end-turns] [--timeout S] [--force]
@@ -13626,6 +13628,26 @@ def _pause_taken_up(pause: dict, published: dict | None) -> bool:
 
 def cmd_service_init(args: list[str]) -> None:
     opts = _flags(args, (), bools=("force",))
+    target, written, skipped = _write_service_template(bool(opts.get("force")))
+    _emit({"initialized": NAME, "project": str(_project_here()), "config": str(target),
+           "written": written, "skipped": skipped,
+           "next": ["add a [lanes.<worker>] table for a worker whose cap is not 1",
+                    f"`{NAME} service doctor`",
+                    f"`{NAME} service start`, or `{NAME} service run` under a supervisor"]})
+
+
+def _seed_service_settings() -> None:
+    """Write the shipped template for a project with no service settings yet,
+    so `service run` and `start` need no `service init` first. Settings already
+    there are left as they are."""
+    if not _service_settings_initialized():
+        _write_service_template(False)
+
+
+def _write_service_template(force: bool) -> tuple[Path | str, list[str], list[str]]:
+    """Write the shipped settings template where this project's service
+    settings are kept, unless they are there already and `force` is not given.
+    Answers where, what was written and what was skipped."""
     template = _service_template()
     if not template.is_file():
         _die(3, "service_bundle_missing", f"the shipped settings template is missing at {template}",
@@ -13641,14 +13663,14 @@ def cmd_service_init(args: list[str]) -> None:
         # The settings are rows: the template is written there, once.
         import tomllib
         where = _service_settings_where()
-        if _service_settings_initialized() and not opts.get("force"):
+        if _service_settings_initialized() and not force:
             skipped.append(where)
         else:
             seed = {**tomllib.loads(template.read_text()), **kept}
             _settings_rows_write(_service_settings_home(), "project", lambda _current: seed)
             written.append(where)
         target = where
-    elif _service_settings_initialized() and not opts.get("force"):
+    elif _service_settings_initialized() and not force:
         skipped.append(str(target))
     else:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -13657,11 +13679,7 @@ def cmd_service_init(args: list[str]) -> None:
             text = text.rstrip("\n") + "\n\n" + _toml_dumps(kept)
         target.write_text(text)
         written.append(str(target))
-    _emit({"initialized": NAME, "project": str(_project_here()), "config": str(target),
-           "written": written, "skipped": skipped,
-           "next": ["add a [lanes.<worker>] table for a worker whose cap is not 1",
-                    f"`{NAME} service doctor`",
-                    f"`{NAME} service start`, or `{NAME} service run` under a supervisor"]})
+    return target, written, skipped
 
 
 def _wake_overdue(module, status: dict) -> float | None:
@@ -13807,6 +13825,7 @@ def cmd_service_run(wanted: str | None, args: list[str]) -> None:
     # The gate first: loading may import worker files, which is a write.
     conn_id, entry = _service_connection(wanted)
     _connection_write_gate(conn_id, entry, "run")
+    _seed_service_settings()
     declaration = _loaded_declaration()
     _service_store()
     # Project mode: a dispatcher over one slot, the project this runs in. Its
@@ -13829,6 +13848,7 @@ def cmd_service_start(wanted: str | None, args: list[str]) -> None:
     module = _service_module()
     conn_id, entry = _service_connection(wanted)
     _connection_write_gate(conn_id, entry, "run")
+    _seed_service_settings()
     _loaded_declaration()
     state = _service_state_dir()
     state.mkdir(parents=True, exist_ok=True)

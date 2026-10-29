@@ -1659,6 +1659,28 @@ def test_the_daemon_end_to_end_through_the_cli(lab):
 
 
 @needs_store
+def test_start_with_no_settings_writes_them_and_runs_a_turn_with_no_init(lab):
+    """A fresh agent's service starts with no `service init` by hand: `start`
+    writes the shipped template, the daemon it runs takes work, and settings
+    already there are left as they are."""
+    settings = lab["project"] / "capabilities" / "tasks" / "service" / "config.toml"
+    assert not settings.exists()
+    started = answer_of(tasks_cli(lab, "service", "start"))
+    assert started["started"] and started["initialized"] is True
+    assert settings.read_text() == TEMPLATE.read_text()
+    answer_of(tasks_cli(lab, "add", "--type", "alpha", "--title", "probe",
+                        "--key", "t-probe", "--status", "todo"))
+    poll_for(lambda: answer_of(tasks_cli(lab, "show", "t-probe"))["task"]["status"]
+             == "complete", 60)
+    assert answer_of(tasks_cli(lab, "service", "stop"))["stopped"] is True
+
+    settings.write_text(settings.read_text() + "\n[lanes.alpha]\nmax_parallel = 2\n")
+    edited = settings.read_text()
+    assert answer_of(tasks_cli(lab, "service", "start"))["started"]
+    assert settings.read_text() == edited
+
+
+@needs_store
 def test_service_harness_answers_the_harness_of_every_lanes_profile(lab):
     assert mod.SERVICE["sign_ins"] == {"tools": ["gh"],
                                        "harness": ["tasks", "service", "harness", "--json"]}
