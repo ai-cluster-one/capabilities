@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-10-29 — A node can be disabled; capabilities-contract 0.35.0
+
+`capabilities-contract` 0.35.0 adds ledger step `0035-node-disabled` (store tables 1.20). `capabilities_nodes` gains `disabled_at`, when the node was taken out of service (`capabilities node disable`), null for a node in service. The store tier refuses to place a service on a disabled node: `StoreRecords.place` with `placed` and an agent's policy row for a node that enables the capability, which places its service there, raise `node_disabled`; unplacing and disabling there stay allowed. No capability script changes: the ranges the capabilities declare, `>=0.12,<1` and `>=0.33,<1`, admit 0.35.0.
+
 ## 2026-10-29 — Why a node's device session is down; capabilities-contract 0.34.0
 
 `capabilities-contract` 0.34.0 adds ledger step `0034-node-session-reasons` (store tables 1.19). `capabilities_node_sessions` gains `reason`, why a session that is not live is down on its node - `key_missing`, `session_missing` or `not_signed_in` - and `reason_keys`, the required keys that do not resolve there, set exactly when the reason is `key_missing`. The store refuses a reason beside a live session, a reason outside the three, `key_missing` without keys and keys without `key_missing`. A row with no reason is one whose capability states none, or one a manager from before this step wrote. `node_sessions_put` takes each session as `(connection, live, account)`, as before, or `(connection, live, account, reason, reason_keys)`, and refuses with `bad_state` what the row cannot say; `node_sessions` answers both new fields (`NODE_SESSION_COLUMNS`), and `NODE_SESSION_REASONS` names the three.

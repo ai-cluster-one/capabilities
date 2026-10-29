@@ -483,7 +483,7 @@ def test_nodes_are_added_changed_listed_and_removed(lab):
                              "is_master": True, "may_write": False, "target": None,
                              "last_seen_at": None, "coolify_connection": None,
                              "coolify_server": None, "coolify_resource": None,
-                             "public_key": None, "folder": None}
+                             "public_key": None, "folder": None, "disabled_at": None}
     lab.ok("node", "add", nid("srv-one"), "--label", "srv-one", "--kind", "server", "--address", "203.0.113.10",
            "--target", "prod", "--may-write")
 
@@ -868,6 +868,61 @@ def test_a_node_is_expected_to_have_what_its_placed_services_need_and_the_owner_
     assert {(r["table"], r["rows"]) for r in planned["rows"]} >= {
         ("capabilities_node_login_expectations", 1),
         ("capabilities_node_session_expectations", 1)}
+
+
+def test_a_disabled_node_stays_on_record_expects_nothing_and_takes_nothing(lab):
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server",
+           "--address", "box-one.example.test")
+    lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server")
+    here = {**node_env("box-one"), **_state_tools(lab)}
+    _placed_dialer(lab)
+    for name in ("dialer", "phonelink"):
+        lab.sql(f"INSERT INTO {SCHEMA}.capabilities_policy (agent_id, capability, node, "
+                "enabled, service) VALUES (%s, %s, %s, true, true) RETURNING capability",
+                (PROJECT_ID, name, nid("box-one")))
+    lab.ok("node", "state", "report", **here)
+    lab.ok("node", "expect", "box-two", "session", "phonelink", "main", "on")
+    nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
+    assert (nodes[nid("box-one")]["health"], nodes[nid("box-two")]["health"]) == (
+        "yellow", "red")
+
+    said = lab.ok("node", "disable", "box-one")
+    assert (said["node"]["node"], said["changed"]) == (nid("box-one"), True)
+    assert said["node"]["disabled_at"] is not None
+    assert lab.ok("node", "disable", nid("box-one"))["changed"] is False
+    lab.ok("node", "disable", "box-two")
+    # Kept on record: its row, its address, its placements, its state.
+    listed = {n["node"]: n for n in lab.ok("node", "list")["nodes"]}
+    assert listed[nid("box-one")]["address"] == "box-one.example.test"
+    assert listed[nid("box-one")]["disabled_at"] == said["node"]["disabled_at"]
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.capabilities_policy WHERE node = %s "
+                   "AND service", (nid("box-one"),)) == [(2,)]
+    nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
+    for node in nodes.values():
+        assert (node["health"], node["attention"]) == ("disabled", [])
+        assert node["disabled_at"] is not None
+        assert [node[f"{t}_expected"] for t in ("claude", "codex", "gh")] == [False] * 3
+        assert all(s["expected"] is False for s in node["sessions"])
+    one = nodes[nid("box-one")]
+    assert one["reachable"] is True and one["claude_login"] == "signed_in"
+    assert (one["gh_needed"], one["sessions"][0]["needed"]) == (True, True)
+    # It is asked no update.
+    code, error = lab.refused("node", "update", "--node", "box-one")
+    assert (code, error["code"]) == (6, "node_disabled")
+
+    said = lab.ok("node", "enable", "box-one")
+    assert (said["changed"], said["node"]["disabled_at"]) == (True, None)
+    assert lab.ok("node", "enable", "box-one")["changed"] is False
+    nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
+    assert nodes[nid("box-one")]["health"] == "yellow"
+    assert nodes[nid("box-one")]["gh_expected"] is True
+    assert nodes[nid("box-two")]["health"] == "disabled"
+
+    for verb in ("disable", "enable"):
+        assert lab.refused("node", verb, "box-three")[1]["code"] == "node_unknown"
+        code, error = lab.refused("node", verb, "box-one", CAPABILITIES_READ_ONLY="1")
+        assert (code, error["code"]) == (4, "read_only_switch")
+        assert lab.refused("node", verb)[1]["code"] == "input"
 
 
 def test_writes_are_refused_under_the_read_only_switch(lab):

@@ -526,6 +526,38 @@ def test_node_run_updates_only_when_a_row_asks_and_then_runs_the_new_release(nod
     assert os.readlink(node.link) != node.before
 
 
+def test_node_run_on_a_disabled_node_runs_nothing_writes_no_state_and_comes_back(node):
+    (node.bin / "supervisorctl").write_text(f"#!{sys.executable}\n")
+    (node.bin / "supervisorctl").chmod(0o755)
+    env = node.env(SUPERVISOR_SERVER_URL="unix:///tmp/test.sock")
+    job = node.tmp / "jobs" / f"probe.{PROJECT_ID}.conf"
+    node_run = subprocess.Popen([str(node.link), "node", "run", "--supervisor",
+                                 str(job.parent), "--every", "300"], cwd=node.project,
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+
+    def reported():
+        return node.sql("SELECT reported_at FROM capabilities_node_states")
+    try:
+        assert _wait(job.exists, 60) and _wait(reported, 30)
+        node.ok("node", "disable", "lab-node")
+        # The placement announce reaches it at once, not on its 300-second reconcile.
+        assert _wait(lambda: not job.exists(), 20)
+        last = reported()
+        time.sleep(20)
+        assert reported() == last
+        assert node.refused("node", "update", "--node", NODE)[1]["code"] == "node_disabled"
+        assert node.sql("SELECT count(*) FROM capabilities_policy WHERE node = %s"
+                        " AND service", (NODE,)) == [(1,)]
+        node.ok("node", "enable", "lab-node")
+        assert _wait(job.exists, 20) and _wait(lambda: reported() != last, 30)
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert f"stops job probe.{PROJECT_ID}: this node is disabled" in err
+    assert "this node is enabled again" in err
+
+
 def _wait(check, seconds: float):
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:

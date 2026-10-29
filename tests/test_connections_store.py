@@ -1083,6 +1083,47 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
     assert _manager(lab, "place", "coolify", "--node", NODE, extra=read_only).returncode == 4
 
 
+def test_nothing_is_placed_on_a_disabled_node_and_what_is_there_stays_until_unplaced(lab):
+    _import(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "coolify").write_text("#!/bin/sh\n")
+    (registry / "manifest.json").write_text(json.dumps({"name": "coolify", "service": {
+        "name": "svc", "summary": "s", "verbs": [], "placement": "shared"}}))
+
+    def placed() -> list[tuple]:
+        return _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+                          "AND service ORDER BY node")
+
+    here = {"AGENT_NODE_ID": NODE}
+    _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "mac", "--master",
+                 extra=here))
+    _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "server",
+                 extra=here))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.capabilities_agents SET migrated_at = now()")
+    _ok(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
+    _ok(_manager(lab, "node", "disable", "box-node", extra=here))
+    # What was placed there stays on record.
+    assert placed() == [(BOX,)]
+    for args in (("place", "coolify", "--node", BOX),
+                 ("enable", "coolify", "--project", "--node", BOX)):
+        refused = _manager(lab, *args, extra=here)
+        assert refused.returncode == 6 and _error(refused)["code"] == "node_disabled"
+    # --all places on the nodes in service and names the one it left out.
+    every = _ok(_manager(lab, "place", "coolify", "--all", extra=here))
+    assert (every["nodes"], every["disabled"], every["placed_on"]) == ([NODE], [BOX],
+                                                                        [BOX, NODE])
+    _ok(_manager(lab, "unplace", "coolify", "--node", BOX, extra=here))
+    assert placed() == [(NODE,)]
+    _ok(_manager(lab, "node", "disable", "lab-node", extra=here))
+    none = _manager(lab, "place", "coolify", "--all", extra=here)
+    assert none.returncode == 6 and _error(none)["code"] == "no_nodes"
+    _ok(_manager(lab, "node", "enable", "box-node", extra=here))
+    _ok(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
+    assert placed() == [(BOX,), (NODE,)]
+
+
 def test_placing_a_service_on_another_node_warns_of_a_connection_at_loopback(lab):
     # The defect: a service placed on another node kept a connection whose
     # address is loopback, which on that node reaches the node itself.

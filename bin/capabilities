@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.34,<1",
+#     "capabilities-contract>=0.35,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -68,7 +68,8 @@ ENVIRONMENT
                        refuses agent convert (but --dry-run), agent set,
                        allow, connections import, disable, enable, inherit,
                        init, key generate, key set, key change, node add, node
-                       remove, node seen, node set, place (but its report),
+                       disable, node enable, node remove, node seen, node set,
+                       place (but its report),
                        quarantine, relabel, secrets set, secrets rm, secrets
                        raw --set, secrets move, set, store set, store unset
                        and unplace.
@@ -620,7 +621,8 @@ POLICY VERBS
         enable --node writes both true, so it places the service there, and
         disable --node both false, so it also takes the service off that node
         and says so (unplaced, warning); `place` and `unplace` below change the
-        service alone. A row for every node, or a global row, makes the CLI
+        service alone. enable --node on a disabled node (`node disable`) is
+        refused (exit 6 node_disabled), since it would place the service there. A row for every node, or a global row, makes the CLI
         usable without placing the service (`deployment guide profiles`).
         Files carry no node, so --node in files mode is refused with
         node_requires_store; `capabilities connections import` moves the
@@ -666,7 +668,9 @@ POLICY VERBS
         has no row naming the node writes one that also enables <name> there
         (enabled_on_node), since a service runs only where its project
         enables it; placing where that row disables it is refused (exit 6
-        disabled_on_node). Unplacing a node it is not on changes nothing.
+        disabled_on_node), and so is placing on a disabled node (exit 6
+        node_disabled, `node disable`). Unplacing a node it is not on changes
+        nothing.
         Placing it on a node that is not this machine - here, with --all,
         through enable --node or service start|move --node - carries a
         warning, said on stderr too, naming each connection the service uses
@@ -679,17 +683,19 @@ POLICY VERBS
         no_service when it bundles none.
   place <name> --all [--mode shared|own]
         Put a shared service on every node of this project's agent (`node
-        list`), each node's placement recording its mode as place --node
-        does; an exclusive one is refused (exit 6 placement_exclusive).
+        list`) that is not disabled, each node's placement recording its mode
+        as place --node does; an exclusive one is refused (exit 6
+        placement_exclusive).
         Every node is checked before anything is written: where any would
         refuse - disabled there, or a row this node may not write - nothing
         is written and the error's detail.refused names each node, code and
         message. Then it is placed node by node, each its own write; a write
         that fails part-way exits non-zero with detail {placed [nodes],
         failed}, and running the command again finishes it. Exit 6 no_nodes
-        when the agent has no registered node. JSON {placed, nodes [nodes],
-        placement, changed, placed_on [nodes], enabled_on_nodes?, gate,
-        modes {node: mode}}.
+        when the agent has no registered node that is not disabled. JSON
+        {placed, nodes [nodes], placement, changed, placed_on [nodes],
+        enabled_on_nodes?, disabled? [nodes it left out, being disabled],
+        gate, modes {node: mode}}.
   place <name>
         Store mode only, and allowed under the read-only switch: where the
         service is placed beside the node running it, writing nothing. JSON
@@ -990,12 +996,13 @@ PROJECT VERBS (run inside a consuming project)
         The nodes of this project's agent: {ok, project, agent_id, nodes
         [{node, label, kind, address, is_master, may_write, target,
         last_seen_at, coolify_connection, coolify_server, coolify_resource,
-        public_key, folder}], store}. A node is a row of the node registry
-        (capabilities_nodes): node is its id, the key every store row naming
-        the node holds, and label the name it is shown by. is_master,
-        may_write and folder belong to the agent's link to it
+        public_key, folder, disabled_at}], store}. A node is a row of the node
+        registry (capabilities_nodes): node is its id, the key every store
+        row naming the node holds, and label the name it is shown by.
+        is_master, may_write and folder belong to the agent's link to it
         (capabilities_agent_nodes): folder is the folder the agent lives in
-        on that node, null where it is not recorded.
+        on that node, null where it is not recorded. disabled_at is when the
+        node was disabled (`node disable`), null for a node in service.
   node id [--set <id>]
         This machine's node id, resolved with nothing configured: on a Mac
         derived from its hardware UUID through a hash (the UUID never leaves
@@ -1070,7 +1077,7 @@ PROJECT VERBS (run inside a consuming project)
         capabilities_node_states holds it, one row per machine shared by
         every agent on it, with this agent's own sign-ins there from
         capabilities_node_logins: {ok, project, agent_id, nodes [{node,
-        label, reachable, load_1, load_5, load_15, cpu_count,
+        label, disabled_at, reachable, load_1, load_5, load_15, cpu_count,
         memory_used_bytes, memory_limit_bytes, disk_used_bytes,
         disk_total_bytes, booted_at, uptime_seconds, boot_line,
         image_version, claude_login, claude_account, claude_needed,
@@ -1129,7 +1136,9 @@ PROJECT VERBS (run inside a consuming project)
         not_live or not_reported. A login that is unknown is not raised.
         health is red where the node is not reachable, else yellow where
         attention is not empty, else green. Nothing that is not expected
-        raises anything. update is what the node last checked of its
+        raises anything. A disabled node (`node disable`) expects nothing:
+        every expected is false, attention is empty and health is disabled,
+        whatever its row last said. update is what the node last checked of its
         updates (`node update --check`), null until it has: available, when
         (checked_at) and offer {components [{kind, name, installed,
         available, entries}], errors}; last_run is its latest update run
@@ -1192,7 +1201,24 @@ PROJECT VERBS (run inside a consuming project)
         reason, ...}, interrupted, availability, store}; rolled_back and
         failed exit 6 update_rolled_back and update_failed with that answer
         as the error's detail. Exit 6 node_unknown for a node the agent does
-        not have; 4 under the read-only switch.
+        not have, node_disabled for --node naming a disabled node; 4 under
+        the read-only switch.
+  node disable <node>
+  node enable <node>
+        Take one of this agent's nodes, by id or label, out of service while
+        keeping it on record - a machine that is off, or a server superseded
+        and kept for a while - or bring it back. A disabled node keeps its
+        registry row, links, folder, address, history and placements; while
+        it is disabled nothing is placed on it (place, place --all and
+        enable --node leave it out or refuse it, node_disabled), `node
+        state` expects nothing of it and reads it disabled rather than red,
+        it is asked no update (`node update --node`), and its `node run`
+        keeps no job, writes no state and runs no update or update check,
+        so no service runs or holds a lease there. It is the node's own,
+        like its label, so it holds for every agent on that machine. enable
+        brings every check back. Answers {ok, project, agent_id, node
+        (as node list), changed, store}, changed false where it already
+        was. Exit 6 node_unknown for a node not registered.
   node expect <node> sign-in <claude|codex|gh> on|off|default
   node expect <node> session <capability> <connection> on|off|default
         Set the owner's word on whether a tool's sign-in, or a device-bound
@@ -1248,8 +1274,8 @@ PROJECT VERBS (run inside a consuming project)
         The agent and node verbs but `node id` need the project's id (exit 6
         no_project_identity: run init) and a database that resolves for the
         project (exit 6 store_not_configured, 5 when it cannot be reached);
-        set, add, remove, seen, state report, expect, update and rekey exit 4
-        under the read-only switch, but for rekey --dry-run.
+        set, add, remove, seen, state report, expect, update, disable, enable
+        and rekey exit 4 under the read-only switch, but for rekey --dry-run.
   node run --supervisor <dir> [--every N] [--services <name,...>]
         The node's service manager: one per node and OS user, run as a
         program of the Supervisor whose configuration includes <dir>/*.conf
@@ -1295,7 +1321,10 @@ PROJECT VERBS (run inside a consuming project)
         --check`) once the last check is an hour old, first looking two
         minutes after it starts. After a run that moved the manager on PATH
         to another release it stops, exit 75, so its supervisor starts it
-        again on that release, every job running on. While the store cannot be read it changes no job,
+        again on that release, every job running on. While its node is
+        disabled (`node disable`) it keeps no job, writes no state and runs
+        no update or update check, and it takes them all up again once the
+        node is enabled. While the store cannot be read it changes no job,
         and at its first start it writes none until it has read the store. A
         placed service it will not run - not installed, no deploy or machine
         command (a shared placement of a service declaring no machine command
@@ -8727,10 +8756,10 @@ NODE_LINK_FIELDS = ("is_master", "may_write")
 # What a node reads as: its id as `node`, its own fields, the link's.
 NODE_COLUMNS = ("node", "label", "kind", "address", "is_master", "may_write", "target",
                 "last_seen_at", "coolify_connection", "coolify_server",
-                "coolify_resource", "public_key", "folder")
+                "coolify_resource", "public_key", "folder", "disabled_at")
 NODE_SELECT = ("SELECT l.node, n.label, n.kind, n.address, l.is_master, l.may_write, "
                "n.target, n.last_seen_at, n.coolify_connection, n.coolify_server, "
-               "n.coolify_resource, n.public_key, l.folder "
+               "n.coolify_resource, n.public_key, l.folder, n.disabled_at "
                "FROM capabilities_agent_nodes l JOIN capabilities_nodes n ON n.id = l.node ")
 # What a migration reads of a node, on a store at any version: it reads them
 # before the store is brought to this code's version, and a store from before
@@ -10797,6 +10826,7 @@ def _node_rows(conn, agent_id: str, node: str | None = None) -> list[dict]:
     for row in rows:
         entry = dict(zip(NODE_COLUMNS, row))
         entry["last_seen_at"] = stamp(entry["last_seen_at"])
+        entry["disabled_at"] = stamp(entry["disabled_at"])
         out.append(entry)
     return out
 
@@ -11652,6 +11682,9 @@ class _NodeManager:
         self.update_asked = True
         self.check_due = time.monotonic() + NODE_UPDATE_FIRST_CHECK_SECONDS
         self.restart_self = False
+        # A disabled node (`node disable`) runs no job, writes no state and
+        # takes no update until it is enabled again.
+        self.disabled = False
         # The release this process runs, to stop when the manager on PATH
         # moves to another one by any route.
         self.started_on = self.manager_target()
@@ -11687,8 +11720,9 @@ class _NodeManager:
 
     def read_store(self) -> tuple[list[tuple], list[tuple]] | None:
         """(agents [(agent_id, folder, slug)], placed [(agent_id, capability,
-        mode)]) as the store holds them for this node, reporting the node seen;
-        None where the store cannot be read, said once."""
+        mode)]) as the store holds them for this node, reporting the node seen,
+        placed empty while the node is disabled; None where the store cannot be
+        read, said once."""
         try:
             conn = self._connect()
         except Exception as exc:
@@ -11707,8 +11741,10 @@ class _NodeManager:
                     "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
                     "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
                     "ORDER BY p.agent_id, p.capability", (self.here,)).fetchall()
-                conn.execute("UPDATE capabilities_nodes SET last_seen_at = now() "
-                             "WHERE id = %s", (self.here,))
+                disabled = conn.execute(
+                    "UPDATE capabilities_nodes SET last_seen_at = now() "
+                    "WHERE id = %s RETURNING disabled_at IS NOT NULL",
+                    (self.here,)).fetchone()
         except Exception as exc:
             self.say_once("store", type(exc).__name__,
                           "cannot read the store, so every job stays as it is: "
@@ -11719,7 +11755,13 @@ class _NodeManager:
         if self.said.get("store") is not None:
             self.say("reads the store again")
         self.said["store"] = None
-        return agents, placed
+        self.disabled = bool(disabled and disabled[0])
+        self.say_once("disabled", self.disabled,
+                      "this node is disabled: it runs no service, writes no state and "
+                      "takes no update until `capabilities node enable` brings it back"
+                      if self.disabled else
+                      "this node is enabled again" if "disabled" in self.said else "")
+        return agents, (placed if not self.disabled else [])
 
     def desired(self, agents: list[tuple], placed: list[tuple]) -> dict[str, dict]:
         """The jobs this node should run, by job name; what is placed here and
@@ -11897,7 +11939,9 @@ class _NodeManager:
             if self.remove_job(name, path):
                 self.pending_apply = True
                 self.moved = True
-                self.say(f"stops job {name}: its service is no longer placed here")
+                self.say(f"stops job {name}: " + ("this node is disabled" if self.disabled
+                                                  else "its service is no longer placed "
+                                                  "here"))
         self.jobs = desired
         self.read_once = True
         if self.pending_apply:
@@ -12175,8 +12219,9 @@ class _NodeManager:
 
     def tend_update(self) -> None:
         """Start the update a row asks for, else the check once it is due;
-        one child at a time, and never an update no row asked for."""
-        if self.update_child is not None or not self.read_once:
+        one child at a time, never an update no row asked for, and neither on
+        a disabled node."""
+        if self.update_child is not None or not self.read_once or self.disabled:
             return
         if self.update_asked:
             self.update_asked = False
@@ -12240,7 +12285,9 @@ class _NodeManager:
             else:
                 self.tend_update()
             self.follow_release(stopping)
-            if self.moved or self.probed() or time.monotonic() >= self.state_due:
+            if self.disabled:
+                self.moved = False
+            elif self.moved or self.probed() or time.monotonic() >= self.state_due:
                 self.report_state()
             deadline = time.monotonic() + NODE_RUN_FOLLOW_SECONDS
             while not stopping["now"] and time.monotonic() < deadline:
@@ -14907,7 +14954,8 @@ def cmd_service(args: list[str]) -> None:
     verbs[sub](args[1:])
 
 
-def _node_expected(entry: dict, node: str, words: dict, placed: set[str]) -> None:
+def _node_expected(entry: dict, node: str, words: dict, placed: set[str],
+                   disabled: bool = False) -> None:
     """Fill a `node state` entry with what the node is expected to have and
     whether it has it. A sign-in is expected where the owner's word says so,
     else where a service the agent places on the node needs it; a device
@@ -14915,13 +14963,14 @@ def _node_expected(entry: dict, node: str, words: dict, placed: set[str]) -> Non
     capability's service there. An expected sign-in that is not signed in, or
     an expected session that is not live or not reported, needs attention and
     makes the node yellow; a node that is not reachable is red. Nothing that
-    is not expected is raised."""
+    is not expected is raised. A disabled node expects nothing and reads
+    disabled."""
     attention: list[dict] = []
     said = {w["tool"]: w["expected"] for w in words["sign_ins"] if w["node"] == node}
     for tool in NODE_STATE_SIGN_IN_TOOLS:
         needed = bool(entry.pop(f"{tool}_needed", None))
         override = said.get(tool)
-        expected = needed if override is None else override
+        expected = not disabled and (needed if override is None else override)
         entry.update({f"{tool}_needed": needed, f"{tool}_override": override,
                       f"{tool}_expected": expected})
         login = entry.get(f"{tool}_login")
@@ -14939,13 +14988,13 @@ def _node_expected(entry: dict, node: str, words: dict, placed: set[str]) -> Non
         key = (session["capability"], session["connection"])
         needed = key in reported and session["capability"] in placed
         override = said.get(key)
-        expected = needed if override is None else override
+        expected = not disabled and (needed if override is None else override)
         session.update({"needed": needed, "override": override, "expected": expected})
         if expected and session["live"] is not True:
             attention.append({"kind": "session", "capability": key[0], "connection": key[1],
                               "reason": "not_reported" if key not in reported else "not_live"})
     entry["attention"] = attention
-    entry["health"] = ("red" if not entry["reachable"] else
+    entry["health"] = ("disabled" if disabled else "red" if not entry["reachable"] else
                        "yellow" if attention else "green")
 
 
@@ -15026,6 +15075,7 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
                  "uptime_seconds"))
             state = {**state, **_node_state_logins(store, logins, node["node"])}
             entry = {"node": node["node"], "label": node["label"],
+                     "disabled_at": node["disabled_at"],
                      "reachable": bool(state.pop("reachable", False))}
             entry["update"] = {"available": state.pop("update_available", None),
                                "checked_at": store._stamp(state.pop("update_checked_at",
@@ -15036,7 +15086,8 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
             entry["sessions"] = [_node_state_answer({k: v for k, v in s.items() if k != "node"})
                                  for s in sessions if s["node"] == node["node"]]
             _node_expected(entry, node["node"], words,
-                           {c for n, c in placed if n == node["node"]})
+                           {c for n, c in placed if n == node["node"]},
+                           node["disabled_at"] is not None)
             entry["logs"] = [{"source": r["source"], "lines": r["lines"],
                               "captured_at": store._stamp(r["captured_at"])}
                              for r in logs if r["node"] == node["node"]]
@@ -15514,6 +15565,10 @@ def _node_update_verb(root: Path, args: list[str]) -> None:
 
         def ask(conn, agent_id):
             node = _node_ref(conn, agent_id, ref)
+            if _node_rows(conn, agent_id, node)[0]["disabled_at"] is not None:
+                raise _KernelRefusal("node_disabled", f"node {node} is disabled, so it "
+                                     "takes no update", "enable it first: "
+                                     f"`capabilities node enable {node}`")
             try:
                 return agent_id, store.node_update_request(conn, node, by=_vault_actor())
             except store.StoreError as exc:
@@ -15617,9 +15672,12 @@ def cmd_node(args: list[str]) -> None:
     if sub == "update":
         _node_update_verb(root, args[1:])
         return
+    if sub in ("disable", "enable"):
+        _node_disable_verb(root, sub, args[1:])
+        return
     if sub not in ("add", "set", "remove", "seen"):
         _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, state, "
-             "expect, update, id, rekey, run or supervise",
+             "expect, update, disable, enable, id, rekey, run or supervise",
              "run `capabilities help`")
     _read_only_gate(f"node {sub}")
     if sub == "seen":
@@ -15743,6 +15801,33 @@ def cmd_node(args: list[str]) -> None:
     else:
         answer.update(node=row, changed=changed)
     _emit(answer)
+
+
+def _node_disable_verb(root: Path, sub: str, args: list[str]) -> None:
+    """`node disable|enable <node>`: take a node out of service, kept on record,
+    or bring it back."""
+    pos, _opts = _kernel_options(args, set(), {"--json"}, f"node {sub}")
+    ref = _node_name_arg(pos, sub)
+    _read_only_gate(f"node {sub}")
+
+    def work(conn, agent_id):
+        node = _node_ref(conn, agent_id, ref)
+        changed = conn.execute(
+            "UPDATE capabilities_nodes SET disabled_at = "
+            + ("now()" if sub == "disable" else "NULL")
+            + ", updated_at = now() WHERE id = %s AND disabled_at IS "
+            + ("NULL" if sub == "disable" else "NOT NULL"), (node,)).rowcount > 0
+        return agent_id, _node_rows(conn, agent_id, node)[0], changed
+    try:
+        (agent_id, row, changed), setting = _kernel_run(root, work)
+    except _KernelRefusal as exc:
+        _die(6, exc.code, exc.message, exc.hint)
+    if changed:
+        # The node's manager stops or starts its jobs at once, not on its next
+        # reconcile.
+        _announce_placement(root)
+    _emit({"ok": True, "project": str(root), "agent_id": agent_id, "node": row,
+           "changed": changed, "store": _kernel_store_report(setting)})
 
 
 def _node_ref(conn, agent_id: str, ref: str) -> str:
@@ -17110,9 +17195,9 @@ def _service_place(name: str, placed: bool, node: str, serving: str | None = Non
 
 
 def _place_everywhere(name: str, root: Path, adapter, serving: str | None = None) -> dict:
-    """Place a shared service on every node of the agent. Every node is checked
-    before anything is written, and one that would refuse refuses the whole
-    command; the writes are then one per node, so a write that fails part-way
+    """Place a shared service on every node of the agent that is not disabled.
+    Every node is checked before anything is written, and one that would
+    refuse refuses the whole command; the writes are then one per node, so a write that fails part-way
     names the nodes it placed, and running it again finishes the job. Each
     node's placement records `serving`, or without it keeps the mode a service
     already placed there is served in, a new one taking the default."""
@@ -17121,7 +17206,9 @@ def _place_everywhere(name: str, root: Path, adapter, serving: str | None = None
     _stamp_policy(adapter, root, "project")
 
     def survey(conn, agent_id):
-        nodes = [row["node"] for row in _node_rows(conn, agent_id)]
+        rows = _node_rows(conn, agent_id)
+        nodes = [row["node"] for row in rows if row["disabled_at"] is None]
+        parked = [row["node"] for row in rows if row["disabled_at"] is not None]
         modes = {node: _placement_mode(name, recorded) for node, recorded in conn.execute(
             "SELECT node, mode FROM capabilities_policy WHERE agent_id = %s "
             "AND capability = %s AND node IS NOT NULL AND service",
@@ -17142,12 +17229,15 @@ def _place_everywhere(name: str, root: Path, adapter, serving: str | None = None
             except store.StoreError as exc:
                 refused.append({"node": node, "code": exc.slug, "message": exc.message,
                                 "exit": _store_error_exit(exc)})
-        return agent_id, nodes, refused, modes
+        return agent_id, nodes, refused, modes, parked
 
-    (agent_id, nodes, refused, modes), _setting = _kernel_run(root, survey, placement=True)
+    (agent_id, nodes, refused, modes, parked), _setting = _kernel_run(root, survey,
+                                                                      placement=True)
     if not nodes:
-        _die(6, "no_nodes", f"agent {agent_id} has no registered node to place {name} on",
-             "register its nodes with `capabilities node add <node> --kind mac|server`")
+        _die(6, "no_nodes", f"agent {agent_id} has no registered node to place {name} on"
+             + (f" that is not disabled ({', '.join(parked)})" if parked else ""),
+             "register its nodes with `capabilities node add <node> --kind mac|server`"
+             + (", or enable one with `capabilities node enable <node>`" if parked else ""))
     if refused:
         sys.stderr.write(json.dumps({"error": {
             "code": refused[0]["code"],
@@ -17183,6 +17273,8 @@ def _place_everywhere(name: str, root: Path, adapter, serving: str | None = None
                     "modes": {node: modes[node] for node in nodes}}
     if enabled_on:
         result["enabled_on_nodes"] = enabled_on
+    if parked:
+        result["disabled"] = parked
     loopback = _loopback_warning(name, nodes, adapter)
     if loopback:
         result["warning"] = loopback
