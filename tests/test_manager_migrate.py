@@ -934,6 +934,20 @@ def test_an_id_project_json_and_contextkit_disagree_on_is_a_question(world):
     assert _bound(root) == IDS["split-bound"]
 
 
+def test_an_old_prj_form_id_moves_into_the_agent_the_store_holds_without_it(world):
+    # The store holds the agent under the twelve hex characters alone, and the
+    # folder's binding still carries prj_ before them.
+    held = "99999999abc1"
+    world.sql("INSERT INTO capabilities_agents (id, name) VALUES (%s, 'Held')", (held,))
+    root = world.agent("old-form", None, {"{env}/settings.json": gate("memory")},
+                       bound_id=f"prj_{held}")
+    applied = world.answer(world.manager(root, "migrate", "--apply"))
+    assert applied["agent_id"] == held and applied["state"] == "migrated"
+    assert _bound(root) == held
+    assert world.sql("SELECT id, name, migrated_at IS NOT NULL FROM capabilities_agents "
+                     "WHERE id LIKE %s", (f"%{held}",)) == [(held, "Held", True)]
+
+
 def test_store_mode_with_no_rows_in_this_store_asks_which_is_the_truth(world):
     # project.json says "records": "store" from an import into another store;
     # the store in force holds none of the agent's rows and its files hold some.

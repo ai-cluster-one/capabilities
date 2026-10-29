@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-29 — Moving an agent into the store binds the old `prj_` form of its id to the agent it names
+
+`capabilities migrate` and `capabilities agent convert` read an id in the older form, `prj_` and twelve hex characters, as the agent the store holds under the twelve characters alone, where the store holds that agent and none under the older form - an agent moved off the old form while one of its folders still carries it in `.contextkit/config.toml` or `.env.local`. The run moves or converts that agent and binds the folder to its id in `.env.local`, rather than registering a second agent under the old form; `migrate` no longer asks which id is the agent's where the two files differ only by the prefix. An id the store holds as written, and any other id, is read as before. Run `capabilities help` for the details.
+
 ## 2026-10-29 — `migrate --global` keeps the global enables install wrote
 
 `capabilities migrate --global` no longer removes a global enable the store holds because the config home's gate does not name it. Install writes a core capability's arrival enable to the store only, so on a new machine the global migration used to switch the core capabilities off; such a row now stays, is not listed under `plan.remove`, and counts as kept in `gate_flips`. A global row the config home does not name that is not an enable is removed as before. Run `capabilities help` for the details.

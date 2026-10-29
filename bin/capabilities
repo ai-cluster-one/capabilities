@@ -915,7 +915,11 @@ PROJECT VERBS (run inside a consuming project)
   agent convert [--dry-run]
         Turn a ContextKit-bound agent into one bound by its id alone, as one
         change. It first checks, writing nothing when it refuses: the id
-        resolves (an [identity] id is moved into .env.local), a store
+        resolves (an [identity] id is moved into .env.local; an id in the
+        older form, prj_ and twelve hex characters, is the agent the store
+        holds under the twelve alone where it holds that one and none under
+        the older form, and the folder is bound to that id before the row is
+        written), a store
         answers and holds the agent's row (store_not_configured,
         store_unreachable, agent_unknown), the config is valid
         (contextkit_config_invalid) and sets no [sources] entry (exit 6
@@ -1825,7 +1829,10 @@ PROJECT VERBS (run inside a consuming project)
         it, the stored one left to the others), a node to register, an id the
         project's files (.env.local/.env, else project.json v1) and
         .contextkit/config.toml disagree on (the one chosen is written to
-        .env.local), a slack user or channel only one of policy.json and the
+        .env.local; an id in the older form, prj_ and twelve hex characters,
+        is the agent the store holds under the twelve alone where it holds
+        that one and none under the older form, so it is no disagreement and
+        the agent moves under that id), a slack user or channel only one of policy.json and the
         service settings holds (keep or drop), a slack mode the two disagree
         on. Each question names the path in the --answers JSON its
         answer goes to. --apply refuses (exit 6, nothing written) without a
@@ -9478,6 +9485,39 @@ def _agent_registered(root: Path, agent_id: str) -> bool:
         conn.close()
 
 
+# An id in the older form: `prj_` before the twelve hex characters an agent is
+# given now.
+OLD_FORM_ID_RE = re.compile(r"^prj_([0-9a-f]{12})$")
+
+
+def _store_agent_id(root: Path, agent_id: str | None) -> str | None:
+    """The id the store holds this folder's agent under. An id in the older
+    `prj_` form names the agent the store holds under its twelve hex
+    characters alone, where the store holds that one and none under the old
+    form - an agent moved off it whose folder still carries it. Any other id,
+    and one whose store does not answer, is answered as it is."""
+    old = OLD_FORM_ID_RE.match(agent_id or "")
+    if not old:
+        return agent_id
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                          transaction=True)
+    except db.DbError:
+        return agent_id
+    import psycopg
+    try:
+        held = {row[0] for row in conn.execute(
+            "SELECT id FROM capabilities_agents WHERE id IN (%s, %s)",
+            (agent_id, old.group(1))).fetchall()}
+    except psycopg.Error:
+        return agent_id
+    finally:
+        conn.close()
+    return old.group(1) if held == {old.group(1)} else agent_id
+
+
 def _preflight_new_agent(root: Path) -> None:
     """A new agent starts in the store, so init refuses one before writing
     anything where it could not work there: no node id, no store, or a store
@@ -10293,7 +10333,8 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
              "convert` again; the agent stays bound and working until then")
     binding = _ck_binding(root)
     had_env_id = _env_file_project_id(root)[0] is not None
-    agent_id = _project_id_state(root, move=not dry_run)["id"]
+    found_id = _project_id_state(root, move=not dry_run)["id"]
+    agent_id = _store_agent_id(root, found_id)
     if not agent_id:
         _die(6, "no_project_identity",
              f"{root} has no id: neither the environment, its .env.local or .env nor "
@@ -10388,8 +10429,19 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
         return {"ok": True, "project": str(root), "agent_id": agent_id, "dry_run": True,
                 "changed": False, "fill": fill, "differs": differs}
 
-    # Everything is checked: the change is made. What it changes is kept, so a
-    # refusal while it builds leaves the agent bound and as it was.
+    # Everything is checked: the change is made. A folder still carrying the
+    # older form of its agent's id is bound to the id the store holds first, so
+    # the row written is that agent's and no second one is registered.
+    rebound = None
+    if agent_id != found_id:
+        if _handed_off_project_id(root) == found_id:
+            os.environ[PROJECT_ID_ENV] = agent_id
+        else:
+            rebound = next((root / name for name in PROJECT_ID_FILES
+                            if _rebind_env_file(root / name, found_id, agent_id, True)),
+                           None) or _write_env_local_id(root, agent_id)
+    # What it changes is kept, so a refusal while it builds leaves the agent
+    # bound and as it was.
     states = _path_states(root, _convert_touched())
     previous = {key: (None if key == "icon" else row.get(key)) for key in values}
     answer = _agent_fill(root, values)
@@ -10456,7 +10508,9 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
             wrote.append(claude["settings"])
     if gitignore["changed"]:
         wrote.append(gitignore["path"])
-    if not had_env_id and _env_file_project_id(root)[0]:
+    if rebound is not None:
+        wrote.append(str(rebound))
+    elif not had_env_id and _env_file_project_id(root)[0]:
         wrote.append(str(root / ".env.local"))
     return {"ok": True, "project": str(root), "agent_id": agent_id, "changed": True,
             "carried": carried, "differs": differs, "removed": removed, "untracked": untracked,
@@ -19353,6 +19407,10 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
     declared = _file_project_id(envelope, root)
     declaring = declaring or identity_file
     bound = _contextkit_config_id(root)
+    # An id in the older prj_ form is the agent the store holds without it,
+    # where it holds that one alone: the agent moves under it, and the folder
+    # is bound to it.
+    declared, bound = _store_agent_id(root, declared), _store_agent_id(root, bound)
     ctx: dict = {"root": root, "envelope": envelope, "identity_file": identity_file,
                  "given_roots": opts.get("roots") or [], "answers": answers,
                  "identity": identity, "blockers": [], "questions": [], "warnings": [],

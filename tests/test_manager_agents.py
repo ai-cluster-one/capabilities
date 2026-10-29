@@ -2063,6 +2063,31 @@ def test_agent_convert_refuses_before_writing_anything(lab, tmp_path):
     assert (unknown.path / ".contextkit" / "config.toml").read_text() == BOUND_CONFIG
 
 
+def test_agent_convert_binds_the_old_prj_form_of_an_id_to_the_agent_the_store_holds(
+        lab, tmp_path):
+    # The store holds the agent under the twelve hex characters alone; its
+    # folders still carry prj_ before them, in the binding or in .env.local.
+    held = "00000000cc0a"
+    Folder(lab, tmp_path / "held", agent_id=held).ok("agent", "set", "--name", "Held")
+    config = BOUND_CONFIG + f'\n[identity]\nname = "Held"\nid = "prj_{held}"\n'
+    for name, carried in (("binding", None), ("env-local", f"prj_{held}")):
+        folder = Folder(lab, tmp_path / name, agent_id=carried)
+        for rel, body in {"agent/context/MISSION.md": "---\ntitle: Mission\ndescription: Why.\n"
+                                                      "load: inline\norder: 1\n---\n# Mission\n",
+                          ".contextkit/config.toml": config}.items():
+            (folder.path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (folder.path / rel).write_text(body)
+
+        assert folder.ok("agent", "convert", "--dry-run")["agent_id"] == held
+        converted = folder.ok("agent", "convert")
+
+        assert converted["agent_id"] == held and converted["agent"]["name"] == "Held"
+        assert _bound(folder.path) == held
+        assert str(folder.path / ".env.local") in converted["wrote"]
+        assert lab.sql(f"SELECT id, name, body_root FROM {SCHEMA}.capabilities_agents "
+                       "WHERE id LIKE %s", (f"%{held}",)) == [(held, "Held", "agent")]
+
+
 def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(lab, tmp_path):
     old, new = PROJECT_ID, "0123456789ab"
     here = {**node_env("lab-node")}
