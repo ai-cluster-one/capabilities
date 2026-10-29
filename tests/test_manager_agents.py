@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -618,6 +619,40 @@ def _state_tools(lab: Lab, account: str = "lab@example.test") -> dict:
     (registry / "phonelink").chmod(0o755)
     return {"PATH": str(tools), "AGENT_NODE_VERSION_FILE": str(image / "VERSION"),
             "AGENT_NODE_STATE_FILE": str(image / "agent-node.state")}
+
+
+def test_a_session_that_is_down_on_a_node_says_why(lab):
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server")
+    here = {**node_env("box-one"), **_state_tools(lab)}
+    keys = [{"key": "API_ID", "required": True, "set": True},
+            {"key": "API_HASH", "required": True, "set": False},
+            {"key": "VOICE_KEY", "required": False, "set": False}]
+    answer = json.dumps({"connections": {
+        "personal": {"keys": keys, "session": {"live": False, "account": None,
+                                               "reason": "session_missing"}},
+        "unsigned": {"keys": keys[:1], "session": {"live": False, "account": None,
+                                                   "reason": "not_signed_in"}},
+        "gone": {"keys": keys[:1], "session": {"live": False, "account": None,
+                                               "reason": "session_missing"}},
+        "quiet": {"session": {"live": False, "account": None}},
+        "odd": {"session": {"live": False, "account": None, "reason": "logged_out"}},
+        "main": {"keys": keys, "session": {"live": True, "account": "+10000000000"}}}})
+    script = lab.tmp / "registry" / "phonelink" / "phonelink"
+    script.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(answer)}\n")
+
+    expected = [("gone", False, "session_missing", None),
+                ("main", True, None, None),
+                ("odd", False, None, None),
+                ("personal", False, "key_missing", ["API_HASH"]),
+                ("quiet", False, None, None),
+                ("unsigned", False, "not_signed_in", None)]
+    reported = lab.ok("node", "state", "report", **here)
+    assert [(s["connection"], s["live"], s["reason"], s["reason_keys"])
+            for s in reported["sessions"]] == expected
+    [node] = lab.ok("node", "state")["nodes"]
+    assert [(s["connection"], s["live"], s["reason"], s["reason_keys"])
+            for s in node["sessions"]] == expected
+    assert [s["account"] for s in node["sessions"]][1] == "+10000000000"
 
 
 def test_a_node_reports_its_state_and_the_agent_reads_every_nodes(lab):

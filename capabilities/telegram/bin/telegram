@@ -1290,12 +1290,17 @@ def _session_state(session: str, entry: dict | None) -> dict:
     is: `live` is true when its session file holds a signed-in login and no
     service here recorded it unauthorized; `account` is the account the
     connection records - the one a login or doctor verified, else the bound
-    expected_account_id. Local reads only, no network."""
+    expected_account_id. A session that is not live says why in `reason`:
+    session_missing where no session file is here, else not_signed_in.
+    Local reads only, no network."""
     path = _session_file(session)
     stem = path.with_name(path.name[:-len(".session")])
     live = _session_signed_in(path) and not _service_says_unauthorized(stem, entry)
     identity = _connection_identity(entry) if entry is not None else None
-    return {"live": live, "account": identity["id"] if identity else None}
+    state = {"live": live, "account": identity["id"] if identity else None}
+    if not live:
+        state["reason"] = "not_signed_in" if path.is_file() else "session_missing"
+    return state
 
 
 def _session_file(session: str) -> Path:

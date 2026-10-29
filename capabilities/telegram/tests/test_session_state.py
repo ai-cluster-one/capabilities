@@ -81,9 +81,9 @@ class SessionStateTests(unittest.TestCase):
             "auth_session_path": str((self.state / "revoked" / "session").resolve())}))
         self.assertEqual(self.sessions(), {
             "here": {"live": True, "account": "1001"},
-            "absent": {"live": False, "account": "1002"},
-            "revoked": {"live": False, "account": "1003"},
-            "unsigned": {"live": False, "account": "1004"},
+            "absent": {"live": False, "account": "1002", "reason": "session_missing"},
+            "revoked": {"live": False, "account": "1003", "reason": "not_signed_in"},
+            "unsigned": {"live": False, "account": "1004", "reason": "not_signed_in"},
             "unbound": {"live": True, "account": None}})
 
     def test_a_service_that_found_the_session_authorized_leaves_it_live(self):

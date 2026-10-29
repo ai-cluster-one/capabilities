@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.33,<1",
+#     "capabilities-contract>=0.34,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -1078,7 +1078,8 @@ PROJECT VERBS (run inside a consuming project)
         codex_needed, codex_override, codex_expected, gh_login, gh_account,
         gh_needed, gh_override, gh_expected, logins_checked_at, reported_at,
         fresh_until, sessions [{capability, connection, live, account,
-        checked_at, needed, override, expected}], attention [{kind, tool |
+        reason, reason_keys, checked_at, needed, override, expected}],
+        attention [{kind, tool |
         capability and connection, reason}], health, update {available,
         checked_at, offer, last_run}, logs [{source, lines, captured_at}]}],
         store}. A row stands
@@ -1105,7 +1106,13 @@ PROJECT VERBS (run inside a consuming project)
         sessions are this agent's on that node: for each installed
         capability whose manifest declares connections.device_bound, every
         connection whose `connections --json` answer in the agent's folder
-        there carries a session {live, account}.
+        there carries a session {live, account}. A session that is not live
+        says why where that is known: reason key_missing, with reason_keys
+        naming each required key the answer's key rows report unresolved
+        there (what its doctor refuses as credentials_missing), else the
+        reason the capability states, session_missing (no device session of
+        the connection there) or not_signed_in (one there, not signed in);
+        null where the session is live or no reason is known.
         What a node is expected to have is derived from what the agent
         places there. A tool's <tool>_needed is whether a service the agent
         places on that node needs it signed in there, as that node's manager
@@ -11407,8 +11414,9 @@ def _device_bound_capabilities() -> list[str]:
 def _node_device_sessions(folders: dict[str, Path]) -> dict[tuple[str, str], list | None]:
     """For each agent's folder here and each device-bound capability, the
     capability's own answer of whether each connection holds a live session
-    on this node: {(agent, capability): [(connection, live, account)]}, None
-    where the capability could not answer, so what it said last stands."""
+    on this node: {(agent, capability): [(connection, live, account, reason,
+    reason_keys)]}, None where the capability could not answer, so what it
+    said last stands."""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
     out: dict[tuple[str, str], list | None] = {}
     for capability in _device_bound_capabilities():
@@ -11430,9 +11438,34 @@ def _node_device_sessions(folders: dict[str, Path]) -> dict[tuple[str, str], lis
                 if isinstance(session, dict) and isinstance(session.get("live"), bool):
                     account = session.get("account")
                     rows.append((cid, session["live"],
-                                 account if isinstance(account, str) and account else None))
+                                 account if isinstance(account, str) and account else None,
+                                 *_node_session_reason(entry, session)))
             out[(agent_id, capability)] = rows
     return out
+
+
+# What a device-bound capability may say of why a session is down, in its
+# connections answer's `session.reason`; a required key that does not resolve
+# is read from the answer's key rows instead, and comes first.
+NODE_SESSION_STATED_REASONS = ("session_missing", "not_signed_in")
+
+
+def _node_session_reason(entry: dict, session: dict) -> tuple[str | None, list[str] | None]:
+    """Why a connection's session that is not live is down on this node, as
+    (reason, reason_keys): key_missing with each required key its key rows
+    report unresolved - the rows and the rule its doctor's credentials gate
+    reads, so the two never disagree - else the reason the capability states,
+    else none. A live session has none."""
+    if session["live"]:
+        return None, None
+    keys = entry.get("keys")
+    missing = [k["key"] for k in keys if isinstance(k, dict) and k.get("required")
+               and not k.get("set") and isinstance(k.get("key"), str) and k["key"]] \
+        if isinstance(keys, list) else []
+    if missing:
+        return "key_missing", missing
+    said = session.get("reason")
+    return (said, None) if said in NODE_SESSION_STATED_REASONS else (None, None)
 
 
 def _service_sign_ins(capability: str) -> dict | None:
@@ -14899,7 +14932,8 @@ def _node_expected(entry: dict, node: str, words: dict, placed: set[str]) -> Non
             for w in words["sessions"] if w["node"] == node}
     reported = {(s["capability"], s["connection"]) for s in entry["sessions"]}
     entry["sessions"] += [{"capability": capability, "connection": connection, "live": None,
-                           "account": None, "checked_at": None}
+                           "account": None, "reason": None, "reason_keys": None,
+                           "checked_at": None}
                           for capability, connection in sorted(set(said) - reported)]
     for session in entry["sessions"]:
         key = (session["capability"], session["connection"])

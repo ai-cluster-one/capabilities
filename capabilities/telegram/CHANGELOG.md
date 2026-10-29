@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-29 — A connection's session that is not live says why
+
+The `session` each connection `telegram connections` reports carries `reason` where `live` is false: `session_missing` where no session file of the connection is on this machine, else `not_signed_in` - a session file that holds no signed-in login, or one a service here recorded Telegram no longer accepts. A live session carries no reason. Still read from local files alone.
+
 ## 2026-10-28 — A connection's session path set on one machine no longer sends another machine's login there, and a local file error is no longer reported as the network
 
 A connection record is read by every machine that reaches its store, so a `session` path it carries is the path of the machine that set it. Each verb now resolves a named connection's session on the machine it runs on: the recorded path where a session already lives there or where it lies under this machine's home, and anywhere else `<state-dir>/<id>/session`, so signing a connection in on a node writes the session under that node's own state home rather than failing on another machine's folder. The machine that set the path keeps using it, and `telegram connections` reports the path each machine actually uses. A verb that cannot open or make a local file - such as the session's folder - exits 6 `local_file_error` naming the path, where it used to exit 5 `network_error` "network error reaching Telegram"; a failure reaching Telegram is still `network_error`.
