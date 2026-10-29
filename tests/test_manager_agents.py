@@ -1407,6 +1407,17 @@ def test_the_empty_agent_is_laid_named_and_bootstrapped(lab, tmp_path):
     assert (folder / ".capabilities-generated" / "context.md").is_file()
 
 
+def test_init_with_template_leaves_an_existing_agents_doctrine_alone(lab, tmp_path):
+    made = Creation(lab, tmp_path)
+    for _ in range(2):
+        result = made.run("init", "--with-template", "--json")
+        assert result.returncode == 0, result.stderr
+    # Only the init that created the agent wrote the starter files to its store.
+    assert made.imports() == [
+        ("context", ["import", str(made.templates / "context")], str(made.folder))]
+    assert "imported" not in json.loads(result.stdout)
+
+
 # --- the context documents a build composes ---------------------------------------
 
 

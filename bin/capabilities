@@ -24530,7 +24530,9 @@ def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bo
     if raised is not None:
         result["raised"] = {"id": given_id, **raised}
     if with_body:
-        result.update(_ck_lay_body(root, starter, body))
+        # The starter files are a new agent's first doctrine: an agent that
+        # already exists keeps its own.
+        result.update(_ck_lay_body(root, starter and new_agent, body))
     if migrated:
         result["migrated_from"] = str(root / LEGACY_PROJECT_CAPABILITIES_REL)
         result["migrated_entries"] = migrated
@@ -24671,8 +24673,9 @@ def _ck_import_layer(root: Path, layer: str, folder: Path) -> dict:
 def _ck_lay_body(root: Path, starter: bool, report: dict) -> dict:
     """The rest of `init --with-layers` (and, with `starter`,
     `--with-template`) once the agent is bound: its env files kept out of its
-    repository and, with `starter`, the starter context files written to its
-    store. No body folder is laid, since the store holds the body."""
+    repository and, with `starter` (a new agent only), the starter context
+    files written to its store. No body folder is laid, since the store holds
+    the body."""
     _ck_ignore_env_files(root, report)
     if starter:
         report["imported"] = [_ck_import_layer(root, "context", _ck_template_root() / "context")]
