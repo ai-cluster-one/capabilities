@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.35,<1",
+#     "capabilities-contract>=0.36,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -1719,13 +1719,18 @@ PROJECT VERBS (run inside a consuming project)
         is a row every project may be granted, a grant is this project's row
         and may carry node (a node id, or null for every node, the default)
         and is_default (the default pointer, one per capability and node), and
-        setting connection.default moves is_default; such a write stamps the
+        setting connection.default moves is_default; a connection, a grant
+        and the default pointer name the connection by its id or by the label
+        `<name> connection rename` gave it, and the row holds its id. Such a
+        write stamps the
         project id, so it refuses (exit 6) where the id is not verified, and
         `records.mode` answers `store` with the table as `source`. A store
         that cannot be reached is exit 5 store_unreachable.
   connections list [<name> ...]
         Every connection the store holds, per capability - of the capabilities
-        named, or of all - with its owner and every grant on it, read from the
+        named, or of all - with its id (`connection`), what it is called
+        (`label`, its id until `<name> connection rename` changes it), its
+        owner and every grant on it, read from the
         database `store show` names here, inside a project or outside one. A
         connection is shared by the capability (owner null, shared true),
         which any agent may be granted, or one agent's own (owner its id),
@@ -17991,6 +17996,10 @@ def cmd_set(name: str, collection: str, key: str,
     root = _require_project()
     adapter = _records_for(root)
     try:
+        if collection in ("connection", "grant"):
+            key = _connection_key(adapter, name, key)
+        elif key == "connection.default" and isinstance(value, str) and value:
+            value = _connection_key(adapter, name, value)
         in_store = adapter.mode_of(collection, key) == "store"
         if in_store:
             # A store row carries the project id as its agent, so the write
@@ -18009,6 +18018,17 @@ def cmd_set(name: str, collection: str, key: str,
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     finally:
         adapter.close()
+
+
+def _connection_key(adapter, name: str, wanted: str) -> str:
+    """The id of `name`'s connection `wanted` names, by its id or by its
+    label; the store keeps every label apart from every id, so a word that
+    is no label is taken as the id it already is."""
+    labels = getattr(adapter, "connection_labels", None)
+    held = labels(name) if labels is not None else {}
+    if wanted in held:
+        return wanted
+    return next((cid for cid, label in held.items() if label == wanted), wanted)
 
 
 # ---------------------------------------------------------------- connections import
@@ -18464,7 +18484,8 @@ def cmd_connections_list(names: list[str]) -> None:
     params = (names,) if names else ()
     try:
         connections = conn.execute(
-            "SELECT c.capability, c.name, c.owner, a.name FROM capabilities_connections c "
+            "SELECT c.capability, c.name, c.owner, a.name, to_jsonb(c) ->> 'label' "
+            "FROM capabilities_connections c "
             "LEFT JOIN capabilities_agents a ON a.id = c.owner" + only
             + " ORDER BY c.capability, c.name", params).fetchall()
         grants = conn.execute(
@@ -18492,9 +18513,10 @@ def cmd_connections_list(names: list[str]) -> None:
             "agent": agent, "agent_name": agent_name, "node": node, "enabled": enabled,
             "allow_write": allow_write, "is_default": bool(is_default)})
     out: dict = {}
-    for capability, connection, owner, owner_name in connections:
+    for capability, connection, owner, owner_name, label in connections:
         out.setdefault(capability, []).append({
-            "connection": connection, "owner": owner, "owner_name": owner_name,
+            "connection": connection, "label": label or connection,
+            "owner": owner, "owner_name": owner_name,
             "shared": owner is None, "grants": held.get((capability, connection), [])})
     _emit({"store": {"schema": setting.schema}, "capabilities": out})
 

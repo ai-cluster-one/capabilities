@@ -259,7 +259,7 @@ def test_the_ledger_applies_the_new_steps_on_a_fresh_store_and_on_one_at_p2(lab,
 
     steps = [r[0] for r in lab.sql(
         "SELECT step FROM schema_ledger WHERE owner = 'capabilities' ORDER BY step")]
-    assert steps[-22:] == ["0014-connection-grants-global", "0015-identifiers-node",
+    assert steps[-23:] == ["0014-connection-grants-global", "0015-identifiers-node",
                            "0016-settings", "0017-settings-documents",
                            "0018-settings-changes", "0019-references", "0020-connection-owner",
                            "0021-agent-slug", "0022-agent-node-coolify", "0023-agent-binding",
@@ -267,9 +267,10 @@ def test_the_ledger_applies_the_new_steps_on_a_fresh_store_and_on_one_at_p2(lab,
                            "0027-agent-node-fields-kept", "0028-service-instances",
                            "0029-vault", "0030-node-states", "0031-node-expectations",
                            "0032-node-updates", "0033-node-logs",
-                           "0034-node-session-reasons", "0035-node-disabled"]
+                           "0034-node-session-reasons", "0035-node-disabled",
+                           "0036-connection-label"]
     assert lab.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
-        == [(1, 20)]
+        == [(1, 21)]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "COALESCE(agent_id, ''::text)" in indexes["capabilities_connection_grants_scope_key"]
@@ -415,7 +416,7 @@ def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
     assert set(listed["capabilities"]) == {"agentrooms", "clickup"}
     ada, clinic = listed["capabilities"]["agentrooms"]
     assert clinic == {
-        "connection": "clinic", "owner": OTHER, "owner_name": "Clinic Desk",
+        "connection": "clinic", "label": "clinic", "owner": OTHER, "owner_name": "Clinic Desk",
         "shared": False, "grants": [{"agent": OTHER, "agent_name": "Clinic Desk",
                                      "node": None, "enabled": True, "allow_write": None,
                                      "is_default": False}]}

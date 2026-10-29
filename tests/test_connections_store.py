@@ -707,6 +707,82 @@ def test_a_store_connection_added_in_the_project_is_its_own_and_granted(lab):
     assert removed["action"] == "remove" and "fresh" not in _stored_connections(lab)
 
 
+def _peer(lab) -> dict:
+    """A second agent on the same store: a project of its own with the lab's
+    store setting and secret, and no connection of its own."""
+    peer_id = "prj_" + "9f8e7d6c5b4a"
+    project = lab["project"].parent / "peer"
+    (project / ".git").mkdir(parents=True)
+    envelope = project / "capabilities"
+    envelope.mkdir()
+    identity = json.loads((lab["envelope"] / "project.json").read_text())
+    (envelope / "project.json").write_text(json.dumps({**identity, "id": peer_id,
+                                                       "slug": "peer"}))
+    (envelope / "settings.json").write_text(
+        json.dumps({"capabilities": {"coolify": {"enabled": True}}}))
+    (project / ".env").write_text((lab["project"] / ".env").read_text())
+    return {**lab, "project": project, "envelope": envelope, "id": peer_id,
+            "env": {**lab["env"], "CLAUDE_PROJECT_DIR": str(project)}}
+
+
+def test_a_granted_connection_renamed_keeps_its_id_and_every_agent_resolves_it(lab):
+    refused = _coolify(lab, "connection", "rename", "box", "office")
+    assert refused.returncode == 6 and _error(refused)["code"] == "connection_not_in_store"
+    _import(lab)
+    peer = _peer(lab)
+    _ok(_manager(lab, "set", "coolify", "connection", "team", json.dumps(
+        {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN"})))
+    _ok(_manager(peer, "enable", "coolify", "--project"))
+    for agent in (lab, peer):
+        _ok(_manager(agent, "set", "coolify", "grant", "team", '{"enabled": true}'))
+    _ok(_manager(lab, "set", "coolify", "setting", "connection.default", "team"))
+    grants = ("SELECT agent_id, capability, connection, node, enabled, allow_write, "
+              "is_default FROM capabilities_connection_grants ORDER BY agent_id, connection")
+    before = _rows(lab, grants)
+
+    renamed = _ok(_coolify(lab, "connection", "rename", "team", "office"))
+    assert (renamed["connection"], renamed["label"], renamed["previous_label"],
+            renamed["changed"]) == ("team", "office", "team", True)
+    assert _rows(lab, grants) == before
+    assert _rows(lab, "SELECT name, label FROM capabilities_connections "
+                      "WHERE name = 'team'") == [("team", "office")]
+
+    # Every agent granted it resolves it by its id and by its new label, and
+    # the lab's default still points at it.
+    for agent in (lab, peer):
+        for named in ("team", "office"):
+            lab["seen"].clear()
+            _ok(_coolify(agent, "--connection", named, "resources"))
+            assert ("GET", "/api/v1/resources") in lab["seen"]
+            _ok(_coolify(agent, "--connection", named, "doctor"))
+        report = _ok(_coolify(agent, "connections"))
+        assert report["connections"]["team"]["label"] == "office"
+    assert _ok(_coolify(lab, "connections"))["connections"]["box"]["label"] == "box"
+    _ok(_coolify(lab, "doctor"))
+    assert _rows(lab, "SELECT connection FROM capabilities_connection_grants "
+                      "WHERE agent_id = %s AND is_default" % repr(PROJECT_ID)) == [("team",)]
+
+    # The manager names it by its label too, and the row holds its id.
+    _ok(_manager(peer, "set", "coolify", "grant", "office", '{"allow_write": false}'))
+    assert _rows(lab, "SELECT allow_write FROM capabilities_connection_grants WHERE "
+                      "agent_id = %s AND connection = 'team'" % repr(peer["id"])) == [(False,)]
+    listed = {c["connection"]: c for c in
+              _ok(_manager(lab, "connections", "list"))["capabilities"]["coolify"]}
+    assert listed["team"]["label"] == "office" and listed["spare"]["label"] == "spare"
+
+    # No label is another connection's id or label, and renaming to the id
+    # clears the label.
+    for wanted, label in (("spare", "office"), ("spare", "team"), ("office", "box")):
+        refused = _coolify(lab, "connection", "rename", wanted, label)
+        assert refused.returncode == 6 and _error(refused)["code"] == "connection_exists"
+    back = _ok(_coolify(peer, "connection", "rename", "office", "team"))
+    assert (back["label"], back["previous_label"]) == ("team", "office")
+    assert _rows(lab, "SELECT label FROM capabilities_connections WHERE name = 'team'") \
+        == [(None,)]
+    gone = _coolify(lab, "--connection", "office", "resources")
+    assert gone.returncode == 6 and _error(gone)["code"] == "unknown_connection"
+
+
 def test_a_read_only_grant_refuses_a_write_verb(lab):
     _import(lab)
     _ok(_coolify(lab, "deploy", "some-app"))
