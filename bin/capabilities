@@ -241,7 +241,10 @@ MACHINE VERBS
         The incoming release manifest owns the asset list and hashes; the whole
         release is verified and staged before one atomic symlink switch. No-op
         when already current. The manager is not a capability, so it has no
-        registry entry or snapshots.
+        registry entry or snapshots. Without --from it then installs each
+        capability that arrives with the manager (agenttemplates) where this
+        machine does not have it, answered as carried_capabilities [{name,
+        installed, error?}]; one that fails never fails the update.
   self-update --check [--from <checkout>] [--json]
         Report whether the canonical source (or --from) carries a manager
         release other than the one the PATH symlink selects. Reads only the
@@ -794,50 +797,57 @@ PROJECT VERBS (run inside a consuming project)
         context only on the other hosts it names.
         A legacy project `.capabilities/` envelope is preflighted and migrated
         into visible `capabilities/`; content conflicts refuse before writes.
-        --with-layers first lays, in the folder init runs in, the body
-        ContextKit's `init --with-layers` lays - .contextkit/config.toml,
-        .contextkit/README.md, .gitignore lines, .env.local and the body
-        layer folders, each written only where missing - and
-        --with-template adds ContextKit's starter context files; the answer
-        adds {body_root, created, changed, skipped}.
+        --with-layers binds the folder init runs in as a new agent's: no
+        .contextkit/ binding and no body folders, since the agent lives in
+        the store, and the root .gitignore given the agent's env files
+        (.env, .env.local, .env.*.local) where missing; --with-template also
+        writes the starter context files of the agenttemplates bundle to the
+        agent's store with `context import`. The answer adds {body_root,
+        created, changed, skipped, imported?}. A new agent whose init fails
+        partway is undone: the entries it added to the folder are removed,
+        the files it changed there put back, and its agent row deleted.
   init --template <id> [--name <name>]
         Create a new agent in an empty folder (a .git or .DS_Store aside)
-        from one of ContextKit's agent templates, as `contextkit init
-        --template` does: git init, the body --with-layers lays (through the
-        new-agent path above, so it starts in the store and is refused
-        there), the template's files, its icon (.contextkit/icon-<sha>.png)
-        and name - --name, or one the template offers - description and
-        onboarding in the agent row, its capabilities enabled for the
-        project and confirmed through `list`, both hosts wired by `hooks
-        install`, and the first build. Answers {project, created, template,
-        ok, git, identity, onboarding, capabilities [{name, result,
-        effective, detail}], hooks, build}; exits 1 with the agent created
-        when a capability could not be enabled. Exit 6 folder_not_empty,
-        unknown_template, template_invalid.
+        from one of the agent templates: git init, the agent --with-layers
+        binds (through the new-agent path above, so it starts in the store
+        and is refused there), the template's context, routines and assets
+        written to the agent's store by `context import`, `routine import`
+        and `assets import`, its icon, name - --name, or one the template
+        offers - description and onboarding in the agent row, its
+        capabilities enabled for the project and confirmed through `list`,
+        both hosts wired by `hooks install`, and the first build. The folder
+        gets no .contextkit/ and no body folders. Answers {project, created,
+        imported, template, ok, git, identity {id, name, description,
+        icon_sha}, onboarding, capabilities [{name, result, effective,
+        detail}], hooks, build}; exits 1 with the agent created when a
+        capability could not be enabled. A step that fails leaves the folder
+        as it was and no agent registered, and exits with that step's error
+        (capability_missing, exit 5, where context, routine or assets is not
+        installed; layer_import_failed with the import's own exit). Exit 6
+        folder_not_empty, unknown_template, template_invalid.
   templates [--json]
         What `contextkit templates --json` answers: {source, starter [{path,
         title, description}], agents [{id, name, description, icon,
         capabilities, routines, onboarding, agent_names, path}]}. Templates
         are read from the agenttemplates capability's installed bundle
-        (~/.capabilities/agenttemplates/templates) when it is installed, and
-        otherwise where ContextKit reads them: the folder
-        CONTEXTKIT_TEMPLATES_DIR names, beside the `contextkit` on PATH (its
-        install or checkout), then ~/.contextkit/templates; exit 6
-        templates_not_found when none is there. `init --with-template` and
-        `init --template` read the same folder.
+        (~/.capabilities/agenttemplates/templates), a core capability the
+        manager's install and self-update install with it; exit 6
+        templates_not_found when it is not installed. `init --with-template`
+        and `init --template` read the same folder.
   identity set [--name <n>] [--description <d>] [--icon <png>] [--project <dir>]
-        In a ContextKit-bound project, write the agent's name, description or
-        icon to its row as `agent set` does, checked as ContextKit checks
-        them (one line; name 120, description 500 characters; a square PNG of
-        64-1024 pixels, kept as .contextkit/icon-<sha>.png, other such icons
-        removed).
+        Write the agent's name, description or icon to its row as `agent
+        set` does, checked as ContextKit checks them (one line; name 120,
+        description 500 characters; a square PNG of 64-1024 pixels). The
+        icon is kept in the row alone; a ContextKit-bound project also keeps
+        it as .contextkit/icon-<sha>.png, other such icons removed. Exit 6
+        no_project_identity where the folder is bound to no agent.
   bootstrap [--target claude|codex]... [--yes]
-        Bind the project as `contextkit bootstrap` does: a Git repository
-        (where the folder holds files and none, a checkpoint commit of them
-        first, which needs --yes), `init --with-layers`, `hooks install` for
-        each target (both by default) and the build. Answers {project,
-        targets, git, init, hooks, build}; ContextKit's doctor and audit are
-        not run.
+        Bind the project: a Git repository (where the folder holds files and
+        none, a checkpoint commit of them first, which needs --yes, with the
+        env files and generated host files left out through
+        .git/info/exclude), `init --with-layers`, `hooks install` for each
+        target (both by default) and the build. Answers {project, targets,
+        git, init, hooks, build}.
   relabel <slug>
         Give this project a new slug, keeping its id: the slug is its agent's
         row in the store (capabilities_agents.slug, unique there: exit 6
@@ -2186,7 +2196,7 @@ SERVICE_SUPERVISION_POINTER = (
     "  Keeping it running - on this machine or on a server - is the "
     f"`{SERVICE_SUPERVISION_CAPABILITY}` capability's domain: "
 )
-CORE_CAPABILITIES = ("askproject", "assets", "automations", "context", "deployment", "memory", "routine", "tasks")
+CORE_CAPABILITIES = ("agenttemplates", "askproject", "assets", "automations", "context", "deployment", "memory", "routine", "tasks")
 # The catalogue's core tier, and its only declaration. Which capabilities are
 # foundational is a fact about the catalogue, which no single capability is
 # part of deciding, so the manager declares it rather than any manifest. Every
@@ -5780,7 +5790,35 @@ def cmd_self_update(from_ref: str | None = None) -> None:
         result = _activate_manager_release(content, assets, source, manifest)
         if checkout_result is not None:
             result["official_checkout"] = checkout_result
-        _emit(result)
+    carried = _install_carried_capabilities(Path(result["manager"]))
+    if carried:
+        result["carried_capabilities"] = carried
+    _emit(result)
+
+
+# The capabilities that arrive with the manager: the manager's install and its
+# update install each one this machine does not have, from the official
+# catalogue, so it arrives as core. The agent templates are read from
+# agenttemplates before any agent is created.
+MANAGER_CARRIED_CAPABILITIES = ("agenttemplates",)
+
+
+def _install_carried_capabilities(manager: Path) -> list[dict]:
+    """Install, with the manager release just activated, each carried
+    capability not yet installed here; one that fails is reported, never
+    failing the update."""
+    out = []
+    for name in MANAGER_CARRIED_CAPABILITIES:
+        if _script_path(name).is_file():
+            continue
+        code, stdout, stderr = _run_script(manager, ["install", name], env=_snapshot_env(),
+                                           timeout=600)
+        entry: dict = {"name": name, "installed": code == 0}
+        if code != 0:
+            entry["error"] = _ck_manager_message(
+                subprocess.CompletedProcess([], code, stdout, stderr))
+        out.append(entry)
+    return out
 
 
 def cmd_self_update_check(from_ref: str | None = None) -> None:
@@ -24279,19 +24317,136 @@ def _remove_env_local_id(root: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+# What a create writes in the agent's folder, beside the entries it adds: the
+# files and folders of these names that were already there are put back as
+# they were when the create fails.
+CREATION_KEPT = (".env.local", ".gitignore", ".claude", ".codex",
+                 AGENT_OUTPUT_REL.parent.as_posix(), PROJECT_CAPABILITIES_REL.as_posix())
+
+
+class _Creation:
+    """A create that fails partway leaves nothing behind: what the folder held
+    before it, so `undo` removes every entry it added and puts back what it
+    changed, and the agent row it registered, which `undo` deletes with the
+    policy rows written for it. Only a create of a new agent is undone, from
+    what the folder held when `arm` was first called; an existing project's
+    init is never armed."""
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.new_agent = False
+        self.agent_id: str | None = None
+        self.entries: set[str] = set()
+        self.kept: dict[Path, tuple[str, bytes | str]] = {}
+
+    def arm(self) -> None:
+        if self.new_agent:
+            return
+        self.new_agent = True
+        root = self.root
+        self.entries = {entry.name for entry in root.iterdir()}
+        for name in CREATION_KEPT:
+            top = root / name
+            for path in [top, *(sorted(top.rglob("*")) if top.is_dir() and not top.is_symlink()
+                                else [])]:
+                if path.is_symlink():
+                    self.kept[path] = ("link", os.readlink(path))
+                elif path.is_dir():
+                    self.kept[path] = ("dir", b"")
+                elif path.is_file():
+                    self.kept[path] = ("file", path.read_bytes())
+
+    def _forget_agent(self) -> None:
+        db = _db_module()
+        try:
+            setting = db.resolve_setting(self.root)
+            conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+                              transaction=True)
+        except db.DbError:
+            return
+        import psycopg
+        try:
+            with conn.transaction():
+                conn.execute("DELETE FROM capabilities_policy WHERE agent_id = %s",
+                             (self.agent_id,))
+                conn.execute("DELETE FROM capabilities_agents WHERE id = %s", (self.agent_id,))
+        except psycopg.Error:
+            pass
+        finally:
+            conn.close()
+
+    def undo(self) -> None:
+        if not self.new_agent:
+            return
+        # The row first: the store is found through the .env files put back below.
+        if self.agent_id:
+            self._forget_agent()
+        try:
+            present = list(self.root.iterdir())
+        except OSError:
+            return
+        for entry in present:
+            if entry.name not in self.entries:
+                if entry.is_dir() and not entry.is_symlink():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
+        for name in CREATION_KEPT:
+            top = self.root / name
+            if top.is_dir() and not top.is_symlink():
+                for path in sorted(top.rglob("*"), reverse=True):
+                    if path not in self.kept:
+                        if path.is_dir() and not path.is_symlink():
+                            shutil.rmtree(path, ignore_errors=True)
+                        else:
+                            path.unlink(missing_ok=True)
+        for path, (kind, value) in sorted(self.kept.items()):
+            try:
+                if kind == "dir":
+                    path.mkdir(parents=True, exist_ok=True)
+                    continue
+                if path.is_symlink() or (path.exists() and not path.is_dir()):
+                    if kind == "link" and path.is_symlink() and os.readlink(path) == value:
+                        continue
+                    if kind == "file" and not path.is_symlink() and path.read_bytes() == value:
+                        continue
+                    path.unlink()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if kind == "link":
+                    path.symlink_to(value)
+                else:
+                    path.write_bytes(value)
+            except OSError:
+                pass
+
+
 def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False,
-          given_id: str | None = None, name: str | None = None) -> dict:
+          given_id: str | None = None, name: str | None = None,
+          creation: _Creation | None = None) -> dict:
     """What `init` does, answered rather than printed. With `layers` or
-    `starter` it first lays the body ContextKit's `init --with-layers` /
-    `--with-template` lays, in the folder it runs in. With `given_id` it binds
-    the folder to the agent the store holds under that id rather than creating
-    one."""
+    `starter` it first lays the rest of a new agent's body in the folder it
+    runs in. With `given_id` it binds the folder to the agent the store holds
+    under that id rather than creating one. A new agent whose init fails
+    partway is undone (`_Creation`), by the caller that passes `creation`."""
     # init ESTABLISHES the project root: an existing root wins, else cwd. A body
-    # is laid where it is asked for, as ContextKit lays it: in the folder itself.
-    global _CONTEXT_WITHOUT_STORE
-    _CONTEXT_WITHOUT_STORE = True
+    # is laid where it is asked for: in the folder itself.
     with_body = layers or starter
     root = Path.cwd().resolve() if with_body else (_project_root() or Path.cwd().resolve())
+    own = creation is None
+    if own:
+        creation = _Creation(root)
+    try:
+        return _init_in(root, claude, codex, with_body, starter, given_id, name, creation)
+    except BaseException:
+        if own:
+            creation.undo()
+        raise
+
+
+def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bool,
+             given_id: str | None, name: str | None, creation: _Creation) -> dict:
+    global _CONTEXT_WITHOUT_STORE
+    _CONTEXT_WITHOUT_STORE = True
     raised = None
     if given_id is not None:
         if not PROJECT_ID_RE.match(given_id):
@@ -24320,21 +24475,15 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
              f"checkout, or set {PROJECT_ID_ENV}")
     if new_agent:
         _preflight_new_agent(root)
+        creation.arm()
     had_file_id = _env_file_project_id(root)[0] is not None
     had_ignore = envelope_ignore.exists()
-    body: dict = {}
-    if with_body:
-        body = {"created": [], "changed": [], "skipped": []}
-        _ck_write_if_missing(root / CONTEXTKIT_CONFIG_REL, CK_CONFIG_BODY, body)
-        # The binding now names where the envelope lives.
-        _ENVELOPE_HOME.pop(root, None)
-        identity_file = _envelope_home(root) / PROJECT_IDENTITY_REL
-        had_identity = identity_file.exists()
+    body: dict = {"created": [], "changed": [], "skipped": []} if with_body else {}
     migrated = _ensure_envelope(root, new_agent=new_agent, given_id=given_id,
                                 records_in_store=bool(raised and raised.get("migrated")))
-    if with_body and not had_identity and identity_file.exists():
-        body["created"].append(str(identity_file))
     registration = _register_agent_on_init(root, new_agent=new_agent, name=name)
+    if new_agent and registration.get("created"):
+        creation.agent_id = registration["id"]
     if new_agent and not registration.get("migrated"):
         # Its identity was written by this init alone: removing it leaves the
         # project new, so the next init creates the agent again.
@@ -24440,22 +24589,26 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
     return result
 
 
-# ---------------------------------------------------------------- agent creation: ContextKit's body and agent templates
+# ---------------------------------------------------------------- agent creation: the body and agent templates
 
-# `init --with-layers` and `--with-template` lay the body ContextKit's `init`
-# lays, `init --template` creates a new agent from one of ContextKit's agent
-# templates, and `identity set` and `bootstrap` carry the rest of the way
-# AgentKit creates an empty agent. The templates are read from the
-# agenttemplates capability's bundle when it is installed, and otherwise where
-# ContextKit reads them; the files, their text and the template format below
-# are ContextKit's, carried so an agent made here reads as one it made.
+# `init --with-layers` and `--with-template` lay the rest of a new agent's
+# body, `init --template` creates a new agent from an agent template, and
+# `identity set` and `bootstrap` carry the rest of the way AgentKit creates an
+# empty agent. A new agent is bound by its id alone and lives in the store: its
+# identity and icon are its registry row, its context, routines and assets are
+# written to the store by the context, routine and assets capabilities, and its
+# folder holds only what must live on the machine - .env.local, the host
+# wiring and the generated context. The templates are read from the
+# agenttemplates capability's bundle, a core capability installed with the
+# manager; the template format is ContextKit's.
 # The agent itself goes through `init`'s new-agent path, so it starts in the
 # store and is refused where that path refuses it.
-CK_TEMPLATES_ENV = "CONTEXTKIT_TEMPLATES_DIR"
 CK_TEMPLATES_CAPABILITY = "agenttemplates"
-CK_README_REL = Path(".contextkit") / "README.md"
 CK_AGENT_TEMPLATE_MANIFEST = "template.toml"
 CK_AGENT_TEMPLATE_LAYERS = ("context", "assets", "routines")
+# The capability, and its verb, that writes a template's body layer to the store.
+CK_LAYER_IMPORTS = {"context": "context", "routines": "routine", "assets": "assets"}
+CK_LAYER_IMPORT_TIMEOUT = 300
 CK_AGENT_TEMPLATE_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
 CK_CAPABILITY_NAME = re.compile(r"[a-z][a-z0-9-]*")
 # Entries that leave a folder empty for a new agent: a Finder marker and a repository.
@@ -24463,134 +24616,67 @@ CK_EMPTY_FOLDER_IGNORED = (".DS_Store", ".git")
 CK_IDENTITY_LIMITS = {"name": 120, "description": 500}
 CK_ICON_MAX_BYTES = 1024 * 1024
 CK_ICON_MIN_PX, CK_ICON_MAX_PX = 64, 1024
-CK_GITIGNORE_LINES = (".env", ".env.local", ".env.*.local", ".contextkit/generated/",
-                      ".contextkit.md", ".claude/rules/CONTEXT.md", "__pycache__/", "*.pyc",
-                      ".DS_Store")
-CK_CONFIG_BODY = """\
-version = 1
-type = "agent-project"
-
-[body]
-# Visible folder that holds the agent body. Use `.` to keep the layers at
-# the project root, or a folder name to collapse them into one home.
-# root = "agent"
-
-[sources]
-# Optional shared doctrine outside this project:
-# global_context = "~/contextkit-global"
-
-[output]
-# Generated context file every host reads through its own link.
-context = ".contextkit/generated/context.md"
-"""
-CK_ENV_LOCAL_BODY = """# Local machine-only environment for this agent project.
-# Keep secrets and machine-local overrides here. This file is ignored by git.
-#
-# Examples:
-# CAPABILITIES_HOME=/Users/you/.capabilities
-# CONTEXTKIT_ENV=local
-"""
+# The files of an agent's folder that stay on this machine and out of its
+# repository: its env files, which hold its id and its secrets.
+AGENT_ENV_IGNORES = (".env", ".env.local", ".env.*.local")
+AGENT_ENV_IGNORE_HEADER = "# capabilities: machine-local env files"
 
 
-def _ck_binding_readme(layers: dict) -> str:
-    return f"""# ContextKit Binding
-
-This repository is managed by ContextKit, a local manager for agent project structure and runtime context.
-
-The agent body stays in this repository: live context, supporting assets,
-repeatable routines, and capability envelopes. ContextKit owns the shape,
-compiler, templates, host bindings, guides, and audit tooling that turn that
-body into Codex and Claude runtime context.
-
-Common commands:
-
-- `contextkit bootstrap`
-- `contextkit init --with-layers`
-- `contextkit init --with-template`
-- `contextkit build --target codex`
-- `contextkit build --target claude`
-- `contextkit build --target all`
-- `contextkit doctor`
-- `contextkit audit`
-- `contextkit guide authoring`
-- `contextkit guide global-context`
-
-Add durable project context under `{layers['context']}/`. Configure optional cross-project doctrine with `sources.global_context`. Put historical or supporting material under `{layers['assets']}/`. Put repeatable procedures under `{layers['routines']}/`. Put installed tool envelopes under `{layers['capabilities']}/`.
-
-Run `contextkit doctor` for the resolved body layout.
-"""
-
-
-def _ck_write_if_missing(path: Path, text: str, report: dict) -> None:
-    if path.exists():
+def _ck_ignore_env_files(root: Path, report: dict) -> None:
+    """The root .gitignore names the agent's env files, each line added only
+    where it is missing; every other line is kept as it is."""
+    path = root / ".gitignore"
+    existed = path.exists()
+    text = path.read_text() if existed else ""
+    present = {line.strip() for line in text.splitlines()
+               if line.strip() and not line.strip().startswith("#")}
+    missing = [line for line in AGENT_ENV_IGNORES if line not in present]
+    if not missing:
         report["skipped"].append(str(path))
         return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-    report["created"].append(str(path))
+    lead = "" if not text else ("\n" if text.endswith("\n") else "\n\n")
+    path.write_text(text + lead + AGENT_ENV_IGNORE_HEADER + "\n" + "\n".join(missing) + "\n")
+    report["changed" if existed else "created"].append(str(path))
 
 
-def _ck_layer_paths(root: Path) -> dict:
-    """Each body layer as the project-relative path ContextKit's config names."""
-    return {name: _ck_rel(root, path) for name, path in _project_body(root)["layers"].items()}
+def _ck_import_layer(root: Path, layer: str, folder: Path) -> dict:
+    """Write the files of one body layer under `folder` to this agent's store
+    through the capability that owns the layer (`context import`, `routine
+    import`, `assets import`), run as the project. A capability that is not
+    installed or refuses ends the create with its own exit code."""
+    name = CK_LAYER_IMPORTS[layer]
+    command = f"{name} import"
+    script = _script_path(name)
+    if not script.is_file():
+        _die(5, "capability_missing",
+             f"the {layer} of a new agent is written to its store by `{command}`, and "
+             f"{name} is not installed on this machine",
+             f"install it with `capabilities install {name}`, then create the agent again")
+    env = {**_snapshot_env(), "CLAUDE_PROJECT_DIR": str(root)}
+    code, out, err = _run_script(script, ["import", str(folder)], cwd=root, env=env,
+                                 timeout=CK_LAYER_IMPORT_TIMEOUT)
+    if code != 0:
+        detail = _ck_manager_message(subprocess.CompletedProcess([], code, out, err))
+        _die(code if code in (3, 4, 5, 6) else 5, "layer_import_failed",
+             f"`{command}` did not write the {layer} of the new agent to its store "
+             f"(exit {code}): {detail}",
+             f"repair what `{command}` names, then create the agent again")
+    try:
+        answer = json.loads(out)
+    except ValueError:
+        answer = None
+    return {"layer": layer, "by": command, "from": str(folder), "result": answer}
 
 
 def _ck_lay_body(root: Path, starter: bool, report: dict) -> dict:
-    """The rest of ContextKit's `init --with-layers` (and, with `starter`,
-    `--with-template`) once the binding config is in place."""
-    layers = _ck_layer_paths(root)
-    _ck_write_if_missing(root / CK_README_REL, _ck_binding_readme(layers), report)
-    gitignore = root / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_text("# ContextKit local and generated files\n"
-                             + "\n".join(CK_GITIGNORE_LINES) + "\n")
-        report["created"].append(str(gitignore))
-    else:
-        text = gitignore.read_text()
-        present = {line.strip() for line in text.splitlines()
-                   if line.strip() and not line.strip().startswith("#")}
-        missing = [line for line in CK_GITIGNORE_LINES if line not in present]
-        if missing:
-            gitignore.write_text(text.rstrip("\n") + "\n\n# ContextKit local and generated files\n"
-                                 + "\n".join(missing) + "\n")
-            report["changed"].append(str(gitignore))
-    _ck_write_if_missing(root / ".env.local", CK_ENV_LOCAL_BODY, report)
-    assets = Path(layers["assets"])
-    for rel in ((Path(".contextkit") / "audits").as_posix(), layers["context"],
-                (assets / "sessions").as_posix(), (assets / "plans").as_posix(),
-                (assets / "research").as_posix(), layers["routines"], layers["capabilities"]):
-        path = root / rel
-        if path.exists():
-            report["skipped"].append(str(path))
-        else:
-            path.mkdir(parents=True, exist_ok=True)
-            report["created"].append(str(path))
+    """The rest of `init --with-layers` (and, with `starter`,
+    `--with-template`) once the agent is bound: its env files kept out of its
+    repository and, with `starter`, the starter context files written to its
+    store. No body folder is laid, since the store holds the body."""
+    _ck_ignore_env_files(root, report)
     if starter:
-        base = _ck_template_root() / "context"
-        for source in _ck_starter_files():
-            _ck_write_if_missing(root / layers["context"] / source.relative_to(base),
-                                 source.read_text(), report)
+        report["imported"] = [_ck_import_layer(root, "context", _ck_template_root() / "context")]
     return {"body_root": _project_body(root)["body_root"].as_posix(), **report}
-
-
-def _ck_template_candidates() -> list[Path]:
-    """Where ContextKit looks for its templates, in its order: the folder
-    CONTEXTKIT_TEMPLATES_DIR names, beside the installed `contextkit` (its
-    install or its checkout), then ~/.contextkit/templates."""
-    candidates: list[Path] = []
-    named = os.environ.get(CK_TEMPLATES_ENV)
-    if named:
-        candidates.append(Path(named).expanduser())
-    program = shutil.which("contextkit")
-    if program:
-        script = Path(program).resolve()
-        candidates += [script.parent.parent / "templates", script.parent / "templates"]
-    candidates.append(Path.home() / ".contextkit" / "templates")
-    out: list[Path] = []
-    for candidate in candidates:
-        if candidate not in out:
-            out.append(candidate)
-    return out
 
 
 def _ck_capability_templates() -> Path | None:
@@ -24607,13 +24693,10 @@ def _ck_template_root() -> Path:
     bundled = _ck_capability_templates()
     if bundled is not None:
         return bundled
-    for candidate in _ck_template_candidates():
-        if candidate.is_dir():
-            return candidate
     _die(6, "templates_not_found",
-         "ContextKit's templates were not found; searched: "
-         + ", ".join(str(path) for path in _ck_template_candidates()),
-         f"set {CK_TEMPLATES_ENV}, or install ContextKit")
+         f"the agent templates were not found: the {CK_TEMPLATES_CAPABILITY} capability "
+         f"that carries them is not installed ({_registry_dir(CK_TEMPLATES_CAPABILITY)})",
+         f"install it with `capabilities install {CK_TEMPLATES_CAPABILITY}`")
 
 
 def _ck_starter_files() -> list[Path]:
@@ -24742,8 +24825,8 @@ def cmd_templates() -> None:
                "agent_names", "path")} for item in agents]})
 
 
-def _ck_stage_icon(root: Path, source: str) -> tuple[Path, bytes]:
-    """Copy a square PNG into the binding folder under its content's name."""
+def _ck_icon_bytes(source: str) -> bytes:
+    """A square PNG's bytes, checked as ContextKit checks an icon, for the agent row."""
     origin = Path(source).expanduser()
     if not origin.is_file():
         _die(6, "input", f"icon file not found: {source}")
@@ -24758,6 +24841,12 @@ def _ck_stage_icon(root: Path, source: str) -> tuple[Path, bytes]:
     if width != height or not CK_ICON_MIN_PX <= width <= CK_ICON_MAX_PX:
         _die(6, "input", f"unsupported icon size {width}x{height}: {source}",
              f"the icon is square, {CK_ICON_MIN_PX} to {CK_ICON_MAX_PX} pixels per side")
+    return data
+
+
+def _ck_stage_icon(root: Path, source: str) -> tuple[Path, bytes]:
+    """Copy a square PNG into a ContextKit binding's folder under its content's name."""
+    data = _ck_icon_bytes(source)
     destination = root / CONTEXTKIT_CONFIG_REL.parent / \
         f"icon-{hashlib.sha256(data).hexdigest()[:12]}.png"
     if not destination.is_file():
@@ -24774,8 +24863,14 @@ def _ck_git(root: Path, *args: str) -> subprocess.CompletedProcess:
         _die(6, "git_failed", f"git {args[0]} failed in {root}: {exc}")
 
 
+# What bootstrap's checkpoint leaves out of the files it commits: the agent's
+# env files, the host files the manager generates, and caches.
+BOOTSTRAP_EXCLUDES = (*AGENT_ENV_IGNORES, *AGENT_HOST_FILES, CLAUDE_CAPABILITIES_REL.as_posix(),
+                      CODEX_CAPABILITIES_REL.as_posix(), "__pycache__/", "*.pyc", ".DS_Store")
+
+
 def _ck_prepare_git(root: Path, yes: bool) -> dict:
-    """ContextKit's git step: a repository, and where the folder already holds
+    """Bootstrap's git step: a repository, and where the folder already holds
     files and none, a checkpoint commit of them first (with `yes`)."""
     if (root / ".git").exists():
         return {"present": True, "initialized": False, "path": str(root / ".git"),
@@ -24800,12 +24895,12 @@ def _ck_prepare_git(root: Path, yes: bool) -> dict:
     text = exclude.read_text() if exclude.is_file() else ""
     present = {line.strip() for line in text.splitlines()
                if line.strip() and not line.strip().startswith("#")}
-    missing = [line for line in CK_GITIGNORE_LINES if line not in present]
+    missing = [line for line in BOOTSTRAP_EXCLUDES if line not in present]
     if missing:
         exclude.parent.mkdir(parents=True, exist_ok=True)
-        exclude.write_text(text.rstrip("\n") + "\n# ContextKit local and generated files\n"
+        exclude.write_text(text.rstrip("\n") + "\n# capabilities: local and generated files\n"
                            + "\n".join(missing) + "\n")
-    message = "ContextKit pre-bootstrap checkpoint"
+    message = "capabilities pre-bootstrap checkpoint"
     if _ck_git(root, "add", "-A").returncode != 0:
         _die(6, "git_failed", f"pre-bootstrap git add failed in {root}")
     staged = _ck_git(root, "diff", "--cached", "--quiet")
@@ -24815,7 +24910,8 @@ def _ck_prepare_git(root: Path, yes: bool) -> dict:
         return git
     named = all(_ck_git(root, "config", "--get", key).stdout.strip()
                 for key in ("user.name", "user.email"))
-    identity = [] if named else ["-c", "user.name=ContextKit", "-c", "user.email=contextkit@local"]
+    identity = [] if named else ["-c", "user.name=capabilities", "-c",
+                                 "user.email=capabilities@local"]
     commit = _ck_git(root, *identity, "commit", "-m", message)
     if commit.returncode != 0:
         _die(6, "git_failed", f"pre-bootstrap checkpoint commit failed in {root}: "
@@ -24896,8 +24992,9 @@ def _ck_enable_capabilities(root: Path, names: list[str]) -> list[dict]:
 
 
 def cmd_init_template(template_id: str, name: str | None) -> None:
-    """Create a new agent in the empty folder this runs in from one of
-    ContextKit's agent templates, named `name` or one the template offers."""
+    """Create a new agent in the empty folder this runs in from one of the
+    agent templates, named `name` or one the template offers. A step that
+    fails leaves the folder empty again and no agent registered."""
     root = Path.cwd().resolve()
     templates = _ck_agent_template_dirs()
     if template_id not in templates:
@@ -24916,35 +25013,35 @@ def cmd_init_template(template_id: str, name: str | None) -> None:
              "with `capabilities bootstrap`")
     # The agent starts in the store: refuse it before the repository is made.
     _preflight_new_agent(root)
-    git = _ck_prepare_git(root, yes=True)
-    if name is None:
-        name = secrets.choice(template["agent_names"])
-    result = _init(claude=True, codex=False, layers=True, name=name)
-    layers = _ck_layer_paths(root)
-    base = Path(template["path"])
-    for rel in template["files"]:
-        layer, *rest = Path(rel).parts
-        destination = root / layers[layer] / Path(*rest)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes((base / rel).read_bytes())
-        result["created"].append(str(destination))
-    icon, data = _ck_stage_icon(root, template["icon"])
-    result["created"].append(str(icon))
-    values = {"name": name, "description": template["description"], "icon": data,
-              "icon_sha": hashlib.sha256(data).hexdigest()}
-    if template["onboarding"]:
-        values.update(onboarding_status="pending",
-                      onboarding_routine=template["onboarding"]["routine"])
-    row = _agent_set(root, values)["agent"] or {}
-    capabilities = _ck_enable_capabilities(root, template["capabilities"])
-    # A Claude or Codex session in the new agent's folder loads its context only through these bindings.
-    hooks = _hooks_install(root, ["codex", "claude"])
-    build = hooks.pop("build")
+    creation = _Creation(root)
+    creation.arm()
+    try:
+        git = _ck_prepare_git(root, yes=True)
+        if name is None:
+            name = secrets.choice(template["agent_names"])
+        result = _init(claude=True, codex=False, layers=True, name=name, creation=creation)
+        base = Path(template["path"])
+        result["imported"] = [_ck_import_layer(root, layer, base / layer)
+                              for layer in CK_AGENT_TEMPLATE_LAYERS if (base / layer).is_dir()]
+        data = _ck_icon_bytes(template["icon"])
+        values = {"name": name, "description": template["description"], "icon": data,
+                  "icon_sha": hashlib.sha256(data).hexdigest()}
+        if template["onboarding"]:
+            values.update(onboarding_status="pending",
+                          onboarding_routine=template["onboarding"]["routine"])
+        row = _agent_set(root, values)["agent"] or {}
+        capabilities = _ck_enable_capabilities(root, template["capabilities"])
+        # A Claude or Codex session in the new agent's folder loads its context only through these bindings.
+        hooks = _hooks_install(root, ["codex", "claude"])
+        build = hooks.pop("build")
+    except BaseException:
+        creation.undo()
+        raise
     failed = [item for item in capabilities if item["result"] != "enabled"]
     result.update({
         "template": template_id, "ok": not failed, "git": git,
         "identity": {"id": row.get("id"), "name": row.get("name"),
-                     "description": row.get("description"), "icon": str(icon)},
+                     "description": row.get("description"), "icon_sha": row.get("icon_sha")},
         "onboarding": {"status": row.get("onboarding_status") or "none",
                        "routine": row.get("onboarding_routine")},
         "capabilities": capabilities, "hooks": hooks, "build": build})
@@ -24959,8 +25056,9 @@ def cmd_init_template(template_id: str, name: str | None) -> None:
 
 
 def cmd_identity_set(args: list[str]) -> None:
-    """Set the agent's name, description or icon in its registry row, the
-    icon kept beside the binding config under its content's name."""
+    """Set the agent's name, description or icon in its registry row; in a
+    ContextKit-bound project the icon is also kept beside the binding config
+    under its content's name."""
     _read_only_gate("identity set")
     pos, opts = _kernel_options(args, {"--name", "--description", "--icon", "--project"},
                                 {"--json"}, "identity set")
@@ -24972,17 +25070,22 @@ def cmd_identity_set(args: list[str]) -> None:
             _die(6, "input", f"project directory not found: {opts['--project']}")
     else:
         root = _require_project().resolve()
-    if not _contextkit_managed(root):
-        _die(6, "not_contextkit_bound",
-             f"{root} has no ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()})",
-             "run `capabilities init --with-template` first, or use `capabilities agent set`")
+    bound = _contextkit_managed(root)
+    if not bound and not _project_id_state(root)["id"]:
+        _die(6, "no_project_identity",
+             f"{root} is bound to no agent: neither the environment nor its .env.local or "
+             f".env sets {PROJECT_ID_ENV}",
+             "run `capabilities init --with-layers` first, or use `capabilities agent set`")
     values: dict = {}
     for key in ("name", "description"):
         if f"--{key}" in opts:
             values[key] = _ck_written_identity_text(key, opts[f"--{key}"], f"--{key}")
     icon = None
     if "--icon" in opts:
-        icon, data = _ck_stage_icon(root, opts["--icon"])
+        if bound:
+            icon, data = _ck_stage_icon(root, opts["--icon"])
+        else:
+            data = _ck_icon_bytes(opts["--icon"])
         values.update(icon=data, icon_sha=hashlib.sha256(data).hexdigest())
     if not values:
         _die(6, "input", "nothing to set: pass --name, --description, or --icon")
@@ -24994,17 +25097,18 @@ def cmd_identity_set(args: list[str]) -> None:
                 path.unlink()
                 removed.append(_ck_rel(root, path))
     row = answer["agent"] or {}
-    _emit({"project": str(root), "config": str(root / CONTEXTKIT_CONFIG_REL),
+    _emit({"project": str(root), "config": str(root / CONTEXTKIT_CONFIG_REL) if bound else None,
            "id": answer["agent_id"], "name": row.get("name"),
            "description": row.get("description"),
            "icon": str(icon) if icon is not None else None,
+           "icon_sha": row.get("icon_sha"),
            "changed": answer["changed"], "removed": removed, "store": answer["store"]})
 
 
 def cmd_bootstrap(args: list[str]) -> None:
-    """ContextKit's bootstrap of a folder: its repository (a checkpoint commit
-    of files already there, with --yes), the body `init --with-layers` lays,
-    the host hooks `hooks install` wires for each --target, and the build."""
+    """Bootstrap of a folder: its repository (a checkpoint commit of files
+    already there, with --yes), the agent `init --with-layers` binds, the host
+    hooks `hooks install` wires for each --target, and the build."""
     targets: list[str] = []
     i, yes = 0, False
     while i < len(args):

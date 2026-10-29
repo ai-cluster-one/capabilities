@@ -1203,31 +1203,80 @@ def _templates(tmp_path: Path) -> Path:
     return root
 
 
+# The capabilities that write a new agent's body layers to its store, played by
+# scripts that record each call: the arguments and the project it ran as.
+LAYER_CAPABILITIES = ("context", "routine", "assets")
+FAKE_IMPORT = """import json, os, sys
+if sys.argv[1:2] != ["import"]:
+    sys.exit(1)
+with open(os.environ["IMPORT_LOG"], "a") as log:
+    log.write(json.dumps({"capability": %r, "args": sys.argv[1:],
+                          "project": os.environ.get("CLAUDE_PROJECT_DIR")}) + "\\n")
+fail = os.environ.get("IMPORT_FAIL") == %r
+if fail:
+    sys.stderr.write(json.dumps({"error": {"code": "store_unreachable", "message": "forced"}}) + "\\n")
+    sys.exit(5)
+print(json.dumps({"imported": []}))
+"""
+
+
+def _install_agenttemplates(registry: Path, templates: Path) -> Path:
+    """An installed agenttemplates payload carrying `templates` in its bundle."""
+    payload = registry / "agenttemplates"
+    payload.mkdir(parents=True)
+    (payload / "agenttemplates").write_text("#!/bin/sh\n")
+    return shutil.copytree(templates, payload / "templates")
+
+
 class Creation:
-    """A new, empty agent folder in the lab's store, with the global records moved."""
+    """A new, empty agent folder in the lab's store, with the global records
+    moved, the templates installed with agenttemplates and the layer
+    capabilities recording their imports."""
 
     def __init__(self, lab: Lab, tmp_path: Path):
         self.lab = lab
         self.folder = tmp_path / "agent"
         self.folder.mkdir()
+        self.templates = _install_agenttemplates(tmp_path / "registry", _templates(tmp_path))
+        for name in LAYER_CAPABILITIES:
+            _fake_tool(tmp_path / "registry" / name, name, FAKE_IMPORT % (name, name))
+        self.log = tmp_path / "imports.jsonl"
         self.extra = {**node_env("lab-node"), "CLAUDE_PROJECT_DIR": str(self.folder),
-                      "CONTEXTKIT_TEMPLATES_DIR": str(_templates(tmp_path)),
+                      "IMPORT_LOG": str(self.log),
                       "AGENTKIT_DB_URL": lab.cluster.url(lab.database),
                       "AGENTKIT_DB_SCHEMA": SCHEMA}
         migrated = lab.run("migrate", "--global", "--apply", **self.extra)
         assert migrated.returncode == 0, migrated.stderr
 
-    def run(self, *args: str) -> subprocess.CompletedProcess:
+    def run(self, *args: str, **extra: str) -> subprocess.CompletedProcess:
         return subprocess.run([sys.executable, str(MANAGER), *args], cwd=self.folder,
-                              env=self.lab.env(**self.extra), text=True, capture_output=True,
-                              timeout=120)
+                              env=self.lab.env(**self.extra, **extra), text=True,
+                              capture_output=True, timeout=120)
+
+    def imports(self) -> list[tuple]:
+        if not self.log.exists():
+            return []
+        return [(c["capability"], c["args"], c["project"])
+                for c in map(json.loads, self.log.read_text().splitlines())]
 
 
-def test_init_template_creates_an_agent_from_a_contextkit_template(lab, tmp_path):
+def _no_contextkit(folder: Path) -> None:
+    """A new agent's folder holds no ContextKit binding, no body folder and no
+    ContextKit lines in its .gitignore."""
+    assert not (folder / ".contextkit").exists()
+    for layer in ("context", "routines", "assets"):
+        assert not (folder / layer).exists()
+    ignore = (folder / ".gitignore").read_text()
+    assert "ContextKit" not in ignore and ".contextkit/" not in ignore
+    assert {".env", ".env.local", ".env.*.local"} <= set(ignore.splitlines())
+
+
+def test_init_template_creates_an_agent_in_the_store_from_a_template(lab, tmp_path):
     made = Creation(lab, tmp_path)
     listed = made.run("templates", "--json")
     assert listed.returncode == 0, listed.stderr
     templates = json.loads(listed.stdout)
+    assert templates["source"] == str(made.templates)
     assert [s["path"] for s in templates["starter"]] == ["context/identity/MISSION.md"]
     assert [(a["id"], a["capabilities"], a["onboarding"]) for a in templates["agents"]] == [
         ("demo", ["absent-cap"], {"routine": "onboarding"})]
@@ -1239,17 +1288,18 @@ def test_init_template_creates_an_agent_from_a_contextkit_template(lab, tmp_path
     assert [(c["name"], c["result"]) for c in answer["capabilities"]] == [("absent-cap", "failed")]
     folder = made.folder
     assert (folder / ".git").is_dir()
-    assert (folder / ".contextkit" / "config.toml").read_text().startswith(
-        'version = 1\ntype = "agent-project"\n')
-    assert (folder / "context" / "identity" / "AGENT.md").read_text() == AGENT_MD
-    assert (folder / "routines" / "onboarding.md").is_file()
-    assert not (folder / "context" / "identity" / "MISSION.md").exists()
-    for layer in ("assets/sessions", "assets/plans", "assets/research", ".contextkit/audits"):
-        assert (folder / layer).is_dir()
+    _no_contextkit(folder)
+    # The template's body layers are written to the store by the capabilities that own them.
+    template = made.templates / "agents" / "demo"
+    assert made.imports() == [
+        ("context", ["import", str(template / "context")], str(folder)),
+        ("routine", ["import", str(template / "routines")], str(folder))]
+    assert [item["by"] for item in answer["imported"]] == ["context import", "routine import"]
     icon = _square_png()
     import hashlib
     sha = hashlib.sha256(icon).hexdigest()
-    assert (folder / ".contextkit" / f"icon-{sha[:12]}.png").read_bytes() == icon
+    assert answer["identity"]["icon_sha"] == sha
+    assert not list(folder.rglob("icon-*.png"))
 
     assert not (folder / "capabilities" / "project.json").exists()
     agent_id = _bound(folder)
@@ -1259,17 +1309,40 @@ def test_init_template_creates_an_agent_from_a_contextkit_template(lab, tmp_path
     assert lab.sql(f"SELECT name, description, icon_sha, onboarding_status, onboarding_routine, "
                    f"migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents WHERE id = %s",
                    (agent_id,)) == [("Probe", "A demo agent.", sha, "pending", "onboarding", True)]
+    assert lab.sql(f"SELECT icon FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (agent_id,)) == [(icon,)]
     assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
                    "WHERE agent_id = %s", (agent_id,)) == [(nid("lab-node"), True)]
 
-    # Both hosts are wired to the manager, and the first build is made.
+    # Both hosts are wired to the manager, and the first build is made in the manager's place.
     claude = json.loads((folder / ".claude" / "settings.json").read_text())
     assert claude["hooks"]["SessionStart"][0]["hooks"][0]["command"] == \
         "/bin/bash -lc 'capabilities session-start --host claude'"
     assert "exec capabilities session-start --host codex" in \
         (folder / ".codex" / "hooks" / "build-context.sh").read_text()
-    assert (folder / ".contextkit" / "generated" / "context.md").is_file()
+    assert (folder / ".capabilities-generated" / "context.md").is_file()
     assert answer["build"]["links"] == {"codex": "linked", "claude": "linked"}
+
+
+def test_init_template_that_fails_partway_leaves_nothing_behind(lab, tmp_path):
+    made = Creation(lab, tmp_path)
+    agents = f"SELECT count(*) FROM {SCHEMA}.capabilities_agents"
+    before = lab.sql(agents)
+    # The routines are written after the agent is registered, bound and its context written.
+    result = made.run("init", "--template=demo", "--name=Probe", "--json", IMPORT_FAIL="routine")
+    assert result.returncode == 5, result.stderr
+    assert json.loads(result.stderr.splitlines()[-1])["error"]["code"] == "layer_import_failed"
+    assert [c[0] for c in made.imports()] == ["context", "routine"]
+    assert list(made.folder.iterdir()) == []
+    assert lab.sql(agents) == before
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.capabilities_agents WHERE slug = 'probe'") \
+        == [(0,)]
+
+    # Add agent works again.
+    again = made.run("init", "--template=demo", "--name=Probe", "--json")
+    assert again.returncode == 1, again.stderr
+    assert lab.sql(f"SELECT name FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (_bound(made.folder),)) == [("Probe",)]
 
 
 def test_init_template_refuses_a_folder_that_is_not_empty(lab, tmp_path):
@@ -1280,67 +1353,58 @@ def test_init_template_refuses_a_folder_that_is_not_empty(lab, tmp_path):
     assert sorted(p.name for p in made.folder.iterdir()) == ["notes.txt"]
 
 
-def _install_agenttemplates(registry: Path, templates: Path) -> Path:
-    """An installed agenttemplates payload carrying `templates` in its bundle."""
-    payload = registry / "agenttemplates"
-    payload.mkdir(parents=True)
-    (payload / "agenttemplates").write_text("#!/bin/sh\n")
-    return shutil.copytree(templates, payload / "templates")
-
-
-def test_templates_are_read_from_agenttemplates_when_it_is_installed(tmp_path):
-    bundled = _templates(tmp_path / "bundled")
-    contextkit = shutil.copytree(bundled, tmp_path / "contextkit" / "templates")
+def test_templates_are_read_from_agenttemplates_alone(tmp_path):
+    contextkit = _templates(tmp_path / "contextkit")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("CAPABILITIES_", "CLAUDE"))}
     env.update({"HOME": str(tmp_path / "home"), "XDG_CONFIG_HOME": str(tmp_path / "config"),
                 "XDG_CACHE_HOME": str(tmp_path / "cache"), "XDG_STATE_HOME": str(tmp_path / "state"),
                 "CAPABILITIES_HOME": str(tmp_path / "registry"),
                 "CONTEXTKIT_TEMPLATES_DIR": str(contextkit)})
+    (tmp_path / "home" / ".contextkit").mkdir(parents=True)
+    shutil.copytree(contextkit, tmp_path / "home" / ".contextkit" / "templates")
 
-    def templates() -> str:
-        result = subprocess.run([sys.executable, str(MANAGER), "templates", "--json"],
-                                cwd=tmp_path, env=env, text=True, capture_output=True,
-                                timeout=120)
-        assert result.returncode == 0, result.stderr
-        return result.stdout
+    def templates() -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(MANAGER), "templates", "--json"],
+                              cwd=tmp_path, env=env, text=True, capture_output=True, timeout=120)
 
-    fallback = templates()
-    assert json.loads(fallback)["source"] == str(contextkit)
-    bundled = _install_agenttemplates(tmp_path / "registry", bundled)
+    # A ContextKit install is no source of templates.
+    missing = templates()
+    assert missing.returncode == 6
+    assert json.loads(missing.stderr)["error"]["code"] == "templates_not_found"
+    bundled = _install_agenttemplates(tmp_path / "registry", contextkit)
     answer = templates()
-    assert json.loads(answer)["source"] == str(bundled)
-    # The same set answers the same bytes; only the folder it names differs.
-    assert answer == fallback.replace(str(contextkit), str(bundled))
-
-
-def test_init_template_reads_the_template_from_agenttemplates(lab, tmp_path):
-    made = Creation(lab, tmp_path)
-    _install_agenttemplates(tmp_path / "registry", Path(made.extra["CONTEXTKIT_TEMPLATES_DIR"]))
-    made.extra["CONTEXTKIT_TEMPLATES_DIR"] = str(tmp_path / "nothing-here")
-    result = made.run("init", "--template=demo", "--name=Probe", "--json")
-    assert result.returncode == 1, result.stderr
-    assert json.loads(result.stdout)["template"] == "demo"
-    assert (made.folder / "context" / "identity" / "AGENT.md").read_text() == AGENT_MD
+    assert answer.returncode == 0, answer.stderr
+    assert json.loads(answer.stdout)["source"] == str(bundled)
 
 
 def test_the_empty_agent_is_laid_named_and_bootstrapped(lab, tmp_path):
     made = Creation(lab, tmp_path)
+    icon = tmp_path / "icon.png"
+    icon.write_bytes(_square_png())
     for args in (("init", "--with-template", "--json"),
-                 ("identity", "set", "--name=Probe", "--json"),
+                 ("identity", "set", "--name=Probe", f"--icon={icon}", "--json"),
                  ("bootstrap", "--target", "claude", "--target", "codex", "--yes", "--json")):
         result = made.run(*args)
         assert result.returncode == 0, (args, result.stderr)
     folder = made.folder
-    assert (folder / "context" / "identity" / "MISSION.md").is_file()
-    assert (folder / ".env.local").is_file() and (folder / ".contextkit" / "README.md").is_file()
-    assert lab.sql(f"SELECT name, migrated_at IS NOT NULL FROM {SCHEMA}.capabilities_agents "
-                   "WHERE id = %s", (_bound(folder),)) == [("Probe", True)]
+    _no_contextkit(folder)
+    assert made.imports() == [
+        ("context", ["import", str(made.templates / "context")], str(folder))]
+    assert (folder / ".env.local").is_file()
+    import hashlib
+    assert lab.sql(f"SELECT name, icon_sha, migrated_at IS NOT NULL "
+                   f"FROM {SCHEMA}.capabilities_agents WHERE id = %s", (_bound(folder),)) \
+        == [("Probe", hashlib.sha256(_square_png()).hexdigest(), True)]
+    assert not list(folder.rglob("icon-*.png"))
     log = subprocess.run(["git", "log", "--format=%s"], cwd=folder, text=True,
                          capture_output=True)
-    assert log.stdout.strip() == "ContextKit pre-bootstrap checkpoint"
+    assert log.stdout.strip() == "capabilities pre-bootstrap checkpoint"
+    committed = subprocess.run(["git", "ls-files"], cwd=folder, text=True,
+                               capture_output=True).stdout.split()
+    assert ".env.local" not in committed
     assert "capabilities session-start --host claude" in \
         (folder / ".claude" / "settings.json").read_text()
-    assert (folder / ".contextkit.md").is_symlink()
+    assert (folder / ".capabilities-generated" / "context.md").is_file()
 
 
 # --- the context documents a build composes ---------------------------------------

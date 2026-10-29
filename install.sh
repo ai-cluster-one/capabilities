@@ -171,6 +171,12 @@ fi
 # bootstrap owns it: nothing else runs on a machine that has only the manager.
 "$BIN_DIR/capabilities" skill >/dev/null || printf 'NOTE: could not generate the agent skill — run `capabilities skill`.\n' >&2
 
+# The agent templates arrive with the manager, so they are there before any
+# agent is created; a machine that already has them keeps its install.
+if [ ! -e "${CAPABILITIES_HOME:-$HOME/.capabilities}/agenttemplates/agenttemplates" ]; then
+    "$BIN_DIR/capabilities" install agenttemplates >/dev/null || printf 'NOTE: could not install the agent templates — run `capabilities install agenttemplates`.\n' >&2
+fi
+
 case ":$CALLER_PATH:" in
     *":$BIN_DIR:"*) ;;
     *) printf 'NOTE: %s is not on PATH — add it so `capabilities` resolves by name.\n' "$BIN_DIR" >&2;;
