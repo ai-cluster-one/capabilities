@@ -487,6 +487,22 @@ def test_a_global_write_refuses_text_that_looks_like_a_secret(lab):
     assert lab.ok("save", "identity/MISSION", "--from", "-", stdin=leaky)["changed"] is True
 
 
+def test_a_system_agent_s_documents_are_not_written(lab):
+    lab.ok("import")
+    shown = subprocess.run([sys.executable, str(MANAGER), "agent", "show"], cwd=lab.project,
+                           env=lab.env(), text=True, capture_output=True, timeout=180)
+    assert shown.returncode == 0, shown.stderr
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id, kind) VALUES (%s, 'system') "
+            "ON CONFLICT (id) DO UPDATE SET kind = 'system'", (PROJECT_ID,))
+    for args in (("save", "identity/MISSION", "--from", "-"), ("retire", "identity/MISSION"),
+                 ("import",), ("transfer", "identity/MISSION", "--to", "prj_x"),
+                 ("enable", "identity/MISSION"), ("disable", "identity/MISSION")):
+        code, error = lab.refused(*args, stdin=FILES["identity/MISSION.md"])
+        assert (code, error["code"]) == (4, "system_agent"), args
+    assert lab.run("list").returncode == 0
+    assert lab.run("show", "identity/MISSION").returncode == 0
+
+
 def test_the_read_only_switch_refuses_every_write(lab):
     lab.ok("import")
     for args in (("save", "identity/MISSION", "--from", "-"), ("retire", "identity/MISSION"),

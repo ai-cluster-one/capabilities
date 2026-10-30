@@ -2310,3 +2310,113 @@ def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(la
     (stranger / ".env.local").write_text(env_before)
     assert code(rekey(new, cwd=stranger, **node_env("no-such-node"))) \
         == (6, "agent_unknown")
+
+
+
+# --- a system agent --------------------------------------------------------------
+
+def _in(lab: Lab, path: Path, *args: str, **extra: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(MANAGER), *args], cwd=path,
+                          env=lab.env(CLAUDE_PROJECT_DIR=str(path), **extra), text=True,
+                          capture_output=True, timeout=120)
+
+
+def _error_of(result: subprocess.CompletedProcess) -> tuple[int, str]:
+    line = next(line for line in reversed(result.stderr.splitlines())
+                if line.lstrip().startswith("{"))
+    return result.returncode, json.loads(line)["error"]["code"]
+
+
+def _store_folder(lab: Lab, path: Path) -> Path:
+    path.mkdir()
+    (path / ".env.local").write_text(f"AGENTKIT_DB_URL={lab.cluster.url(lab.database)}\n"
+                                     f"AGENTKIT_DB_SCHEMA={SCHEMA}\n")
+    return path
+
+
+def test_a_system_agent_is_made_or_adopted_on_its_one_node_and_no_edit_changes_it(lab, tmp_path):
+    mac_a, mac_b = node_env("mac-a"), node_env("mac-b")
+    assert lab.run("migrate", "--global", "--apply", **mac_a).returncode == 0
+    keeper = _store_folder(lab, tmp_path / "keeper")
+
+    def run(*args, **extra):
+        return _in(lab, keeper, *args, **{**mac_a, **extra})
+
+    def ok(*args, **extra):
+        result = run(*args, **extra)
+        assert result.returncode == 0, result.stderr
+        return json.loads(result.stdout) if result.stdout.lstrip().startswith("{") else result.stdout
+
+    agent = ok("init")["agent"]
+    agent_id = agent["id"]
+    assert (agent["kind"], agent["slug"]) == ("agent", "keeper")
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_policy (agent_id, capability, node, enabled)"
+            " VALUES (NULL, 'askproject', NULL, true), (%s, 'tasks', NULL, true),"
+            " (%s, 'memory', NULL, true) RETURNING capability", (agent_id, agent_id))
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_connections (capability, name, spec)"
+            " VALUES ('clickup', 'work', '{}') RETURNING name")
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_connection_grants (agent_id, capability,"
+            " connection, enabled, is_default) VALUES (%s, 'clickup', 'work', true, true)"
+            " RETURNING agent_id", (agent_id,))
+    (keeper / "AGENTS.md").write_text("# The app's own doctrine\n")
+    with (keeper / ".env.local").open("a") as env_local:
+        env_local.write("CAPABILITIES_CONTEXT_PROMPT=An override of the prompt.\n")
+    before = ok("build", "--print")
+    assert "# Foreign Instruction Files" in before and "An override of the prompt." in before
+    assert {"## askproject", "## memory", "## tasks"} <= set(before.splitlines())
+
+    # The existing agent is adopted in place: its id, grants and slug kept.
+    adopted = ok("init", "--system", "--name", "Keeper")["agent"]
+    assert (adopted["id"], adopted["kind"], adopted["slug"]) == (agent_id, "system", "keeper")
+    assert lab.sql(f"SELECT id, name, kind FROM {SCHEMA}.capabilities_agents WHERE kind = "
+                   "'system'") == [(agent_id, "Keeper", "system")]
+    assert lab.sql(f"SELECT agent_id, connection FROM {SCHEMA}.capabilities_connection_grants"
+                   ) == [(agent_id, "work")]
+    assert ok("init", "--system")["agent"]["kind"] == "system"
+    assert ok("agent", "show")["agent"]["kind"] == "system"
+    assert _error_of(run("init", "--system", "--name", "Other")) == (4, "system_agent")
+    assert ok("init")["agent"]["kind"] == "system"
+
+    # Its composed context offers only what is enabled for it.
+    text = ok("build", "--print")
+    assert "## tasks" in text.splitlines()
+    assert "## askproject" not in text and "## memory" not in text
+    assert "# Foreign Instruction Files" not in text and "An override" not in text
+
+    # No edit changes it; grants, settings, enable and keys stay open.
+    elsewhere = _store_folder(lab, tmp_path / "elsewhere")
+    for args in (("agent", "set", "--name", "Renamed"), ("identity", "set", "--name", "R"),
+                 ("relabel", "keeper-two"), ("agent", "convert"),
+                 ("node", "add", nid("mac-b"), "--label", "mac-b", "--kind", "mac"),
+                 ("agent", "materialize", agent_id, str(elsewhere))):
+        assert _error_of(run(*args)) == (4, "system_agent"), args
+    assert lab.sql(f"SELECT name, slug FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   (agent_id,)) == [("Keeper", "keeper")]
+    assert ok("key", "generate")["ok"] is True
+    for args in (("enable", "routine", "--project"), ("disable", "tasks", "--project"),
+                 ("set", "clickup", "workspace", "w1")):
+        result = run(*args)
+        assert result.returncode != 4 and "system_agent" not in result.stderr, args
+
+    # One per node; another Mac's may share its slug, an ordinary agent may not.
+    second = _store_folder(lab, tmp_path / "second")
+    assert _error_of(_in(lab, second, "init", "--system", "--name", "Keeper", **mac_a)) == (
+        6, "system_agent_exists")
+    made = _in(lab, second, "init", "--system", "--name", "Keeper", **mac_b)
+    assert made.returncode == 0, made.stderr
+    other = json.loads(made.stdout)["agent"]
+    assert (other["kind"], other["created"], other["slug"]) == ("system", True, "keeper")
+    assert lab.sql(f"SELECT node, is_master FROM {SCHEMA}.capabilities_agent_nodes "
+                   "WHERE agent_id = %s", (other["id"],)) == [(nid("mac-b"), True)]
+    assert ok("agent", "state", "keeper")["agent"]["id"] == agent_id
+    third = _store_folder(lab, tmp_path / "third")
+    ordinary = _in(lab, third, "init", **mac_b)
+    assert ordinary.returncode == 0, ordinary.stderr
+    assert json.loads(ordinary.stdout)["agent"]["slug"] == "third"
+    assert _error_of(_in(lab, third, "relabel", "keeper", **mac_b)) == (6, "slug_taken")
+    added = _in(lab, third, "node", "add", nid("mac-c"), "--label", "mac-c", "--kind", "mac",
+                **mac_b)
+    assert added.returncode == 0, added.stderr
+    assert _error_of(_in(lab, third, "init", "--system", **mac_b)) == (6, "system_agent_nodes")
+    assert lab.sql(f"SELECT kind FROM {SCHEMA}.capabilities_agents WHERE slug = 'third'") == [
+        ("agent",)]

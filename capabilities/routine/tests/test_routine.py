@@ -440,6 +440,21 @@ def test_show_reads_the_store_once_it_holds_the_routines(lab):
     assert lab.refused("show", "only-a-file")[0] == 3
 
 
+def test_a_system_agent_s_routines_are_not_written(lab):
+    lab.ok("import")
+    shown = subprocess.run([sys.executable, str(MANAGER), "agent", "show"], cwd=lab.project,
+                           env=lab.env(), text=True, capture_output=True, timeout=180)
+    assert shown.returncode == 0, shown.stderr
+    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id, kind) VALUES (%s, 'system') "
+            "ON CONFLICT (id) DO UPDATE SET kind = 'system'", (PROJECT_ID,))
+    for args in (("save", "pitstop", "--from", "-"), ("retire", "pitstop"), ("import",),
+                 ("title", "pitstop", "Pit stop"), ("disable", "pitstop")):
+        code, error = lab.refused(*args, stdin=FILES["pitstop.md"])
+        assert (code, error["code"]) == (4, "system_agent"), args
+    assert lab.run("list", "--store").returncode == 0
+    assert lab.run("show", "pitstop").returncode == 0
+
+
 def test_the_read_only_switch_refuses_every_write(lab):
     lab.ok("import")
     for args in (("save", "pitstop", "--from", "-"), ("retire", "pitstop"), ("import",)):

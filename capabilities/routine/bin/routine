@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.37,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -106,7 +106,8 @@ Routines in the store:
   ID, A and B are a version's whole id or a prefix of six or more characters
   that names one version of the routine.
 
-  Writing (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY):
+  Writing (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY, and exit 4
+  `system_agent` in a system agent, whose doctrine no edit changes):
   routine save <name> --from FILE|- [--base ID] [--note TEXT]
       Save the file form read from FILE, or stdin with `-`, as the routine's
       new active version; a name not in use starts a new routine. --base names
@@ -1737,6 +1738,7 @@ def main(argv: list[str] | None = None) -> None:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
     if args.cmd in WRITE_VERBS:
         _read_only_gate(f"`{NAME} {args.cmd}`")
+        _system_agent_gate(f"`{NAME} {args.cmd}`")
     if args.cmd == "list" and args.store:
         cmd_store_list(args)
         return

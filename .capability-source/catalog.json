@@ -57,7 +57,7 @@
     },
     "context": {
       "path": "capabilities/context",
-      "payload_sha256": "378d795ecd315eba837975b7432801c4436829ae85ccdf01e323f7cc3ba08e24",
+      "payload_sha256": "5ed992db036b7deb6890dbe1194b1a4d57e28fd35f956e006d050a2c6abe23c0",
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte."
     },
     "coolify": {
@@ -142,7 +142,7 @@
     },
     "routine": {
       "path": "capabilities/routine",
-      "payload_sha256": "1a7aff9a7083be47f0897b7858bbd7f43e5b6b59b1e317f29dd7f552eccdc903",
+      "payload_sha256": "8e135538681719214c0ece714aaaaf292616af3c7221d8c7e2e17107d328e66e",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte."
     },
     "signoz": {

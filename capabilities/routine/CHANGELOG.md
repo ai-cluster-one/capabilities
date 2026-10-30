@@ -1,5 +1,9 @@
 # routine — change log
 
+## 2026-10-29 — A system agent's routines are not written
+
+In a system agent - one an app keeps on its machine for itself, `capabilities_agents.kind` `system`, made with `capabilities init --system` - every write verb (`save`, `retire`, `import`, `title`, `enable`, `disable`, `transfer`) is refused with exit 4 `system_agent` and changes nothing; reading is unchanged, and so is every other agent. The capability now needs `capabilities-contract` 0.37.0, whose core tier carries the refusal (`_system_agent_gate`).
+
 ## 2026-10-24 — Any routine is switched off for one agent, its own included
 
 `routine disable <name>` switches a routine off for the agent it runs in, and `routine enable <name>` switches it back on. The name names the agent's own routine where it has one, else the global routine of that name, as `show`, `history` and `diff` resolve it, and `--global` names the global one. A global routine is switched as before, by its enablement. A routine of the agent's own switched off stays in the store and in every verb, still shadows a global routine of its name, and leaves the routine index the manager builds; who switched it off and when are recorded. Both answers carry `origin` (`own` or `global`) and `enabled`. `routine list --json` gives every routine it lists `origin` and `enabled`: in the store, the agent's own routines that are off are listed with `enabled` false, and `list --store --global --json` run in a project marks each global routine `enabled` or not for it; a routine file is `own` and on. The text form of `list --store` marks a routine that is off `(off)`. The ledger goes to 1.2: `routine_documents` gains `disabled_at` and `disabled_by`. A routine CLI of ledger 1.1 reads a 1.2 store as before, and lists a routine that is off as on.
