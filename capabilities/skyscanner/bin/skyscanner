@@ -16,25 +16,34 @@ USAGE
   skyscanner help                    Print this contract.
 
 MODEL
-  skyscanner calls the endpoints Skyscanner's own website calls on
-  https://www.skyscanner.net (autosuggest, the unified flight search and the
-  price calendar), as a browser would: a Chrome user agent and the
-  x-skyscanner-market, -locale, -currency and -channelid headers. There is no
-  Skyscanner account, key or login; the answers are Skyscanner's public prices.
+  skyscanner calls the endpoints Skyscanner's own website calls (autosuggest,
+  the unified flight search and the price calendar), as a browser would: a
+  Chrome user agent and the x-skyscanner-market, -locale, -currency and
+  -channelid headers. There is no Skyscanner account, key or login; the
+  answers are Skyscanner's public prices.
 
-  Skyscanner's bot protection blocks an IP address that searches too often:
-  from one address, expect a block after roughly 15 to 25 searches in half an
-  hour, lifting on its own some minutes later. A blocked request answers 403,
-  which skyscanner reports as exit 7 `blocked`. The remedy is a fresh IP
-  address, not a browser session: a connection that names an Oxylabs
-  residential proxy sends every request through it, and each request then
-  leaves from another residential address in the chosen country unless the
-  connection asks for sticky sessions. Skyscanner flags single residential
-  addresses too, so through a proxy a 403 is tried again from a new exit
-  address, up to 3 times, each named on stderr, before skyscanner reports
-  `blocked`; direct, the first 403 is reported. `skyscanner guide oxylabs`
-  teaches the proxy fields, how they compose, and how to test the exit
-  address.
+  Skyscanner's country sites (www.skyscanner.de, .fr, .it, .nl, .fi, .ie, .pl,
+  .se and .net) serve the same endpoints and the same data; the market,
+  currency and locale come from the headers, not the site. Each call runs on
+  one site: the ones without a recent refusal first, the one used longest ago
+  among them, www.skyscanner.net only after the others. The connection's
+  domains field replaces this pool. Booking links point at the site that
+  served the search.
+
+  Skyscanner's bot protection refuses an address, or a site, that is asked too
+  often: a 403, an answer that points at its captcha, or a search that never
+  completes. A refused call is started again as a whole - every request of it,
+  from the first autosuggest - on the next site and, through an Oxylabs
+  connection, from a new exit address, up to 6 attempts, each refusal named
+  on stderr; after the sixth skyscanner reports exit 7 `blocked` with what
+  was tried. A site that refused is passed over for 30 minutes; the state
+  home keeps when, per connection. Through an Oxylabs residential proxy every
+  attempt holds one sticky exit address in the chosen country for all its
+  requests; direct, every attempt leaves from this machine's address, which
+  is refused after roughly 15 to 25 searches in half an hour. The remedy is a
+  fresh address and a fresh site, not a browser session.
+  `skyscanner guide oxylabs` teaches the proxy fields, how they compose, and
+  how to test the exit address.
 
   Market, currency and locale shape every answer. The market is the country
   site: it chooses which booking agents are offered, so prices differ slightly
@@ -50,9 +59,11 @@ CONNECTIONS
   With no oxylabs_username the connection goes direct from this machine's
   address, and `doctor` warns about the block. With one, every request goes
   through the Oxylabs residential proxy, and skyscanner composes the proxy
-  username itself from oxylabs_username, oxylabs_country and, when set,
-  oxylabs_session_minutes (a fresh session id for every invocation, so the
-  requests of one search share one exit address). oxylabs_username is the
+  username itself from oxylabs_username, oxylabs_country and
+  oxylabs_session_minutes (default 10), with a fresh session id for every
+  attempt, so the requests of one attempt share one exit address.
+  domains, when set, is the comma-separated list of Skyscanner site hosts to
+  rotate across, in order of preference. oxylabs_username is the
   proxy user's own name, without the customer- prefix or any parameter;
   `skyscanner guide oxylabs` shows the composition, country targeting,
   sticky sessions and how to test the exit address.
@@ -81,10 +92,11 @@ COMMANDS
         resolve its fields, then, with an Oxylabs user, one request to
         https://ip.oxylabs.io/location through the proxy proving the exit
         address and its country, then one autosuggest request to Skyscanner
-        proving it answers rather than blocks. Emits {ok, connections: {<id>:
-        {ok, proxy, exit?, skyscanner: {reachable, blocked_addresses,
-        suggestions}, warning?}}}; blocked_addresses counts the exit
-        addresses Skyscanner refused before one answered. Exit 0 all healthy / 2 a
+        proving it answers rather than blocks, on the site a call would use
+        next and on the following ones while a site refuses (up to 6). Emits
+        {ok, connections: {<id>: {ok, proxy, exit?, skyscanner: {reachable,
+        domain, refused, suggestions}, warning?}}}; domain is the site that
+        answered, refused the sites that refused before it. Exit 0 all healthy / 2 a
         password missing or refused by the proxy / 5 unreachable / 7 blocked by
         Skyscanner / 8 the proxy exits in another country than oxylabs_country.
     connections
@@ -174,8 +186,9 @@ QUIRKS WORTH KNOWING
   them, so a field can change without notice; a request Skyscanner refuses as
   malformed exits 6 with its own words.
   A blocked address stays blocked for some minutes whatever is sent; a retry
-  from the same address fails the same way. Through an Oxylabs connection
-  every invocation starts from a new address.
+  from the same address fails the same way, so an attempt is never retried on
+  its own address. Through an Oxylabs connection a transport failure of the
+  exit address also starts a new attempt.
 
 EXIT CODES
   0 success · 2 auth (the Oxylabs password missing, or refused by the proxy) ·
@@ -184,9 +197,8 @@ EXIT CODES
   5xx, 429 after retries, the proxy unreachable) · 6 input (bad arguments, an
   unknown or ambiguous connection, a malformed connection field, a request
   Skyscanner refused as invalid) · 7 blocked (Skyscanner's bot protection
-  refused with 403: the direct address, or 4 proxy exit addresses in a row) ·
-  8 wrong exit country (doctor: the proxy
-  exits in another country than oxylabs_country).
+  refused all 6 attempts) · 8 wrong exit country (doctor: the proxy exits in
+  another country than oxylabs_country).
 
 EXAMPLES
   skyscanner doctor
@@ -252,10 +264,13 @@ CONN_FIELDS = [
      "type": "integer", "required": False, "default": 7777,
      "minimum": 1, "maximum": 65535},
     {"key": "oxylabs_session_minutes", "label": "Sticky session minutes",
-     "help": "When set, each invocation keeps one exit address for up to this many "
-             "minutes, which searching needs (10 suits it); empty rotates the "
-             "address on every request.",
-     "type": "integer", "required": False, "minimum": 1, "maximum": 30},
+     "help": "How long one attempt may keep its exit address; every attempt starts a "
+             "new session on a new address.",
+     "type": "integer", "required": False, "default": 10, "minimum": 1, "maximum": 30},
+    {"key": "domains", "label": "Skyscanner domains",
+     "help": "Comma-separated Skyscanner site hosts to rotate searches across, in "
+             "order of preference; empty uses the built-in pool.",
+     "type": "string", "required": False},
     {"key": "market", "label": "Market",
      "help": "Two-letter country code of the Skyscanner site whose booking agents "
              "are offered.",
@@ -275,7 +290,7 @@ WRITE_DEFAULT = False
 MACHINE_READS = ("connections", "doctor", "places", "search", "calendar")
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/skyscanner/guides/")
-STATE = False       # skyscanner mints nothing; no session is kept between calls
+STATE = True        # per-connection domain cooldowns: which site refused, and when
 INVENTORY = None    # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL: list = []
 
@@ -283,7 +298,15 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
-BASE = "https://www.skyscanner.net"
+# Skyscanner's country sites serve the same endpoints and data; the market,
+# currency and locale come from the x-skyscanner-* headers, not the host. The
+# bot protection judges each site apart, so searches rotate across them.
+DOMAINS = ("www.skyscanner.de", "www.skyscanner.fr", "www.skyscanner.it",
+           "www.skyscanner.nl", "www.skyscanner.fi", "www.skyscanner.ie",
+           "www.skyscanner.pl", "www.skyscanner.se", "www.skyscanner.net")
+LAST_RESORT = {"www.skyscanner.net"}   # the busiest site: used after the others
+COOLDOWN = 30 * 60    # seconds a site that refused is passed over
+ATTEMPTS = 6          # whole attempts, each on a new site and a new exit address
 # A non-browser user agent is refused with 403.
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
@@ -292,7 +315,6 @@ TIMEOUT = httpx.Timeout(30.0)
 MAX_RETRIES = 3
 POLL_INTERVAL = 1.5
 MAX_POLLS = 30
-BLOCKED_RETRIES = 3   # new exit addresses tried after a 403 through a proxy
 FIELD_DEFAULTS = {f["key"]: f["default"] for f in CONN_FIELDS if "default" in f}
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -316,6 +338,11 @@ def _effective(entry: dict, field: str):
     return FIELD_DEFAULTS.get(field) if value in (None, "") else value
 
 
+def _domain_list(value) -> list:
+    """The hosts a connection's domains field names, in its order."""
+    return [h.strip().lower() for h in str(value or "").split(",") if h.strip()]
+
+
 def _proxy_summary(entry: dict) -> dict | None:
     """What the connection's proxy is, without its password."""
     if not entry.get("oxylabs_username"):
@@ -324,7 +351,7 @@ def _proxy_summary(entry: dict) -> dict | None:
             "host": _effective(entry, "oxylabs_host"),
             "port": _effective(entry, "oxylabs_port"),
             "country": str(_effective(entry, "oxylabs_country")).upper(),
-            "session_minutes": entry.get("oxylabs_session_minutes")}
+            "session_minutes": _effective(entry, "oxylabs_session_minutes")}
 
 
 def _connections_report() -> dict:
@@ -361,6 +388,7 @@ def _connections_report() -> dict:
             "uses": {"market": str(_effective(entry, "market")).upper(),
                      "currency": str(_effective(entry, "currency")).upper(),
                      "locale": _effective(entry, "locale"),
+                     "domains": _domain_list(entry.get("domains")) or list(DOMAINS),
                      "proxy": _proxy_summary(entry)},
             "keys": rows}
     return report
@@ -385,7 +413,16 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
                  "market": str(_effective(entry, "market")).upper(),
                  "currency": str(_effective(entry, "currency")).upper(),
                  "locale": str(_effective(entry, "locale")),
+                 "domains": _domain_list(entry.get("domains")) or list(DOMAINS),
                  "proxy": None}
+    bad = [h for h in cfg["domains"]
+           if not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", h)]
+    if bad:
+        return None, _problem(6, "bad_domains",
+                              f"connection {cid!r}: domains names {bad[0]!r}, which "
+                              "is not a host name",
+                              "comma-separated hosts such as www.skyscanner.de, or "
+                              "empty for the built-in pool")
     user = entry.get("oxylabs_username")
     if not user:
         return cfg, None
@@ -413,18 +450,14 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
                               f"connection {cid!r}: oxylabs_host/oxylabs_port do not "
                               "name a proxy endpoint",
                               "the residential entry is pr.oxylabs.io:7777")
-    minutes = entry.get("oxylabs_session_minutes")
-    if minutes not in (None, ""):
-        try:
-            minutes = int(minutes)
-        except (TypeError, ValueError):
-            minutes = 0
-        if not 1 <= minutes <= 30:
-            return None, _problem(6, "bad_oxylabs_session_minutes",
-                                  f"connection {cid!r}: oxylabs_session_minutes is "
-                                  "a whole number of minutes from 1 to 30")
-    else:
-        minutes = None
+    try:
+        minutes = int(_effective(entry, "oxylabs_session_minutes"))
+    except (TypeError, ValueError):
+        minutes = 0
+    if not 1 <= minutes <= 30:
+        return None, _problem(6, "bad_oxylabs_session_minutes",
+                              f"connection {cid!r}: oxylabs_session_minutes is "
+                              "a whole number of minutes from 1 to 30")
     env_key = entry.get("oxylabs_password_env")
     if not env_key:
         return None, _problem(
@@ -446,12 +479,11 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
 
 def _proxy_url(proxy: dict | None, session_id: str) -> str | None:
     """The Oxylabs residential proxy URL, composed the way Oxylabs specifies:
-    customer-<user>-cc-<COUNTRY>[-sessid-<id>-sesstime-<minutes>]."""
+    customer-<user>-cc-<COUNTRY>-sessid-<id>-sesstime-<minutes>."""
     if not proxy:
         return None
-    user = f"customer-{proxy['user']}-cc-{proxy['country']}"
-    if proxy["minutes"]:
-        user += f"-sessid-{session_id}-sesstime-{proxy['minutes']}"
+    user = (f"customer-{proxy['user']}-cc-{proxy['country']}"
+            f"-sessid-{session_id}-sesstime-{proxy['minutes']}")
     return (f"http://{quote(user, safe='')}:{quote(proxy['password'], safe='')}"
             f"@{proxy['host']}:{proxy['port']}")
 
@@ -462,28 +494,30 @@ def _new_session_id() -> str:
 
 # ── HTTP ────────────────────────────────────────────────────────────────────
 
-def _client(cfg: dict, proxy_url: str | None, skyscanner: bool = True) -> httpx.Client:
+def _client(cfg: dict, proxy_url: str | None, base: str | None) -> httpx.Client:
+    """An HTTP client; with a Skyscanner site's base URL, dressed as that site."""
     headers = {"user-agent": UA, "accept": "application/json"}
-    if skyscanner:
+    if base:
         headers.update({
             "content-type": "application/json",
             "accept-language": cfg["locale"],
-            "origin": BASE,
-            "referer": BASE + "/",
+            "origin": base,
+            "referer": base + "/",
             "x-skyscanner-market": cfg["market"],
             "x-skyscanner-locale": cfg["locale"],
             "x-skyscanner-currency": cfg["currency"],
             "x-skyscanner-channelid": "website",
             "x-skyscanner-viewid": str(uuid.uuid4()),
         })
-    return httpx.Client(http2=skyscanner, timeout=TIMEOUT, proxy=proxy_url,
+    return httpx.Client(http2=bool(base), timeout=TIMEOUT, proxy=proxy_url,
                         headers=headers)
 
 
-BLOCK_HINT = ("Skyscanner's bot protection refused the address; a block lifts on its "
-              "own within minutes. Direct, wait or route through an Oxylabs "
-              "connection; through one, every exit address tried was refused, so "
-              f"wait before the next call (`{NAME} guide oxylabs`)")
+BLOCK_HINT = ("Skyscanner's bot protection refused every attempt; a refused site is "
+              "passed over for a while and a block lifts on its own within minutes, "
+              "so wait before the next call. Direct, route through an Oxylabs "
+              f"connection (`{NAME} guide oxylabs`)")
+CAPTCHA = "/sttc/px/captcha"   # where the bot protection sends a refused client
 
 
 class _Failure(Exception):
@@ -550,6 +584,10 @@ def _request(c: httpx.Client, method: str, url: str, **kw):
         if resp.status_code == 403:
             raise _Failure(7, "blocked", f"{what} was refused with 403", BLOCK_HINT,
                            status=403)
+        if 300 <= resp.status_code < 400 and \
+                "captcha" in resp.headers.get("location", ""):
+            raise _Failure(7, "blocked", f"{what} was sent to the captcha", BLOCK_HINT,
+                           status=resp.status_code)
         if resp.status_code == 404:
             raise _Failure(3, "not_found", f"{what} returned 404",
                            resp.text[:300] or None, status=404)
@@ -558,46 +596,31 @@ def _request(c: httpx.Client, method: str, url: str, **kw):
                            f"{what} was refused with {resp.status_code}: "
                            f"{resp.text[:300]}", status=resp.status_code)
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError:
+            if CAPTCHA in resp.text:
+                raise _Failure(7, "blocked", f"{what} answered the captcha page",
+                               BLOCK_HINT, status=resp.status_code)
             raise _Failure(5, "bad_response", f"{what} answered something other than "
                            f"JSON: {resp.text[:200]}", status=resp.status_code)
+        if isinstance(data, dict) and CAPTCHA in str(data.get("redirect_to") or ""):
+            raise _Failure(7, "blocked", f"{what} was sent to the captcha", BLOCK_HINT,
+                           status=resp.status_code)
+        return data
     raise _transport_failure(last, what)  # the loop returns or raises before this
 
 
 class _Http:
-    """The HTTP session of one invocation. Through an Oxylabs proxy a 403 is
-    tried again from a new exit address - a new request on a rotating proxy,
-    a new session id on a sticky one - because Skyscanner's bot protection
-    flags single residential addresses; direct, a 403 is final."""
+    """One attempt's HTTP session: one Skyscanner site and, through an Oxylabs
+    proxy, one sticky exit address that every request of the attempt shares."""
 
-    def __init__(self, cfg: dict, skyscanner: bool = True):
-        self.cfg, self.skyscanner, self.blocked = cfg, skyscanner, 0
-        self.c = self._open()
-
-    def _open(self) -> httpx.Client:
-        return _client(self.cfg, _proxy_url(self.cfg["proxy"], _new_session_id()),
-                       self.skyscanner)
-
-    def request(self, method: str, url: str, **kw):
-        while True:
-            try:
-                return _request(self.c, method, url, **kw)
-            except _Failure as f:
-                if f.code != "blocked" or not self.cfg["proxy"] \
-                        or self.blocked >= BLOCKED_RETRIES:
-                    raise
-                self.blocked += 1
-                sys.stderr.write(f"{NAME}: {f.message}; trying again from a new exit "
-                                 f"address ({self.blocked}/{BLOCKED_RETRIES})\n")
-                self.c.close()
-                self.c = self._open()
+    def __init__(self, cfg: dict, domain: str | None):
+        self.cfg = cfg
+        self.base = f"https://{domain}" if domain else None
+        self.c = _client(cfg, _proxy_url(cfg["proxy"], _new_session_id()), self.base)
 
     def call(self, method: str, url: str, **kw):
-        try:
-            return self.request(method, url, **kw)
-        except _Failure as f:
-            f.die()
+        return _request(self.c, method, url, **kw)
 
     def __enter__(self):
         return self
@@ -606,10 +629,88 @@ class _Http:
         self.c.close()
 
 
+# ── site rotation ───────────────────────────────────────────────────────────
+
+def _domains_file(cid: str) -> Path:
+    return _state_dir() / cid / "domains.json"
+
+
+def _domain_state(cid: str) -> dict:
+    """{host: {used, blocked}} - when each site was last tried and last refused."""
+    try:
+        data = json.loads(_domains_file(cid).read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_domain_state(cid: str, state: dict) -> None:
+    path = _domains_file(cid)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=1))
+        tmp.replace(path)
+    except OSError:
+        pass   # the cooldown is advice; a call never fails for want of it
+
+
+def _domain_order(domains: list, state: dict, now: float) -> list:
+    """Sites without a recent refusal first, the last-resort site after the
+    others, then the one used longest ago; sites still cooling down come
+    last, the one refused longest ago first."""
+    def key(item):
+        i, host = item
+        s = state.get(host) if isinstance(state.get(host), dict) else {}
+        blocked = float(s.get("blocked") or 0)
+        cooling = now - blocked < COOLDOWN
+        return (cooling, blocked if cooling else 0, host in LAST_RESORT,
+                float(s.get("used") or 0), i)
+    return [host for _, host in sorted(enumerate(domains), key=key)]
+
+
+def _restartable(f: _Failure, cfg: dict) -> bool:
+    """A refusal is answered by a new attempt; through a proxy, so is an exit
+    address that failed in transport."""
+    return f.code == "blocked" or (
+        cfg["proxy"] is not None and f.code in ("network_error", "timeout", "proxy_error"))
+
+
+def _attempts(cfg: dict, run):
+    """run(c) on one site and one exit address; on a refusal, the whole of it
+    again on the next site and a new address, up to ATTEMPTS times."""
+    state = _domain_state(cfg["id"])
+    tried: list = []
+    for n in range(1, ATTEMPTS + 1):
+        now = time.time()
+        order = _domain_order(cfg["domains"], state, now)
+        used = {t["domain"] for t in tried}
+        domain = next((h for h in order if h not in used), order[0])
+        entry = state.setdefault(domain, {})
+        entry["used"] = now
+        _save_domain_state(cfg["id"], state)
+        try:
+            with _Http(cfg, domain) as c:
+                return run(c)
+        except _Failure as f:
+            if not _restartable(f, cfg):
+                f.die()
+            if f.code == "blocked":
+                entry["blocked"] = time.time()
+                _save_domain_state(cfg["id"], state)
+            tried.append({"domain": domain, "why": f.message})
+            sys.stderr.write(f"{NAME}: attempt {n}/{ATTEMPTS} on {domain}: {f.message}"
+                             + ("; starting again on another site"
+                                + (" and exit address" if cfg["proxy"] else "")
+                                if n < ATTEMPTS else "") + "\n")
+    _die(7, "blocked", f"every attempt was refused ({ATTEMPTS}): "
+         + "; ".join(f"{t['domain']}: {t['why']}" for t in tried), BLOCK_HINT)
+
+
 # ── domain ──────────────────────────────────────────────────────────────────
 
 def _suggest(c, cfg, query: str, is_dest: bool = False) -> list:
-    url = (f"{BASE}/g/autosuggest-search/api/v1/search-flight/"
+    url = (f"{c.base}/g/autosuggest-search/api/v1/search-flight/"
            f"{cfg['market']}/{cfg['locale']}/{quote(query, safe='')}")
     data = c.call("GET", url, params={"isDestination": str(is_dest).lower(),
                                        "enable_general_search_v2": "true"})
@@ -667,7 +768,7 @@ def _connections_of(segs: list) -> list:
     return out
 
 
-def _normalise(data: dict, adults: int) -> list:
+def _normalise(data: dict, adults: int, base: str) -> list:
     it = data.get("itineraries") or {}
     agents = {x["id"]: x["name"] for x in it.get("agents") or []}
     out = []
@@ -707,7 +808,7 @@ def _normalise(data: dict, adults: int) -> list:
             "skyscanner_rank": rank,
             "agent": agents.get(agent_ids[0], agent_ids[0]),
             "agent_price": (po.get("price") or {}).get("amount"),
-            "deeplink": BASE + url if url else None,
+            "deeplink": base + url if url else None,
             "legs": legs,
         })
     return out
@@ -737,7 +838,7 @@ def cmd_search(c, cfg, a) -> dict:
     d = _resolve(c, cfg, a.destination, True)
     legs = [_leg(o, d, a.date)] + ([_leg(d, o, a.ret)] if a.ret else [])
     body = {"cabinClass": a.cabin, "childAges": [], "adults": a.adults, "legs": legs}
-    url = BASE + "/g/radar/api/v2/web-unified-search/"
+    url = c.base + "/g/radar/api/v2/web-unified-search/"
     data = c.call("POST", url, json=body)
     polls = 0
     while (data.get("context") or {}).get("status") != "complete" and polls < MAX_POLLS:
@@ -745,7 +846,10 @@ def cmd_search(c, cfg, a) -> dict:
         data = c.call("GET", url + data["context"]["sessionId"])
         polls += 1
     status = (data.get("context") or {}).get("status")
-    every = _normalise(data, a.adults)
+    every = _normalise(data, a.adults, c.base)
+    if status != "complete" and not every:
+        raise _Failure(7, "blocked", f"the search did not complete in {MAX_POLLS} polls "
+                       "and priced nothing", BLOCK_HINT)
     matched = sorted((z for z in every if _keep(z, a)), key=SORTS[a.sort])
     results = matched[:a.top]
     return {"origin": _place(o), "destination": _place(d),
@@ -764,7 +868,7 @@ def cmd_calendar(c, cfg, a) -> dict:
     o = _resolve(c, cfg, a.origin, False)
     d = _resolve(c, cfg, a.destination, True)
     oc, dc = o.get("IataCode") or o["PlaceId"], d.get("IataCode") or d["PlaceId"]
-    data = c.call("POST", BASE + "/g/search-intent/v1/pricecalendar", json={
+    data = c.call("POST", c.base + "/g/search-intent/v1/pricecalendar", json={
         "headers": {"xSkyscannerClient": "acorn", "xSkyscannerCurrency": cfg["currency"],
                     "xSkyscannerLocale": cfg["locale"],
                     "xSkyscannerMarket": cfg["market"]},
@@ -791,8 +895,8 @@ def cmd_calendar(c, cfg, a) -> dict:
 
 def _exit_location(cfg: dict) -> dict:
     """The exit address and the country each geolocation provider places it in."""
-    with _Http(cfg, skyscanner=False) as c:
-        data = c.request("GET", EXIT_CHECK_URL)
+    with _Http(cfg, None) as c:
+        data = c.call("GET", EXIT_CHECK_URL)
     providers = data.get("providers") if isinstance(data, dict) else None
     countries = {name: str(p.get("country") or "").upper()
                  for name, p in (providers or {}).items()
@@ -826,19 +930,32 @@ def _check_connection(cfg: dict) -> dict:
                              f"not {proxy['country']!r}",
                     "hint": "check oxylabs_country; Oxylabs places the exit by the "
                             "-cc- parameter skyscanner composes from it"}
-    c = _Http(cfg)
-    try:
-        with c:
-            items = c.request(
-                "GET", f"{BASE}/g/autosuggest-search/api/v1/search-flight/"
-                f"{cfg['market']}/{cfg['locale']}/London",
-                params={"isDestination": "false", "enable_general_search_v2": "true"})
-    except _Failure as f:
-        return {**result, "ok": False, "category": f.exit_code, "code": f.code,
-                "error": f.message, **({"hint": f.hint} if f.hint else {})}
-    result["skyscanner"] = {"reachable": True, "blocked_addresses": c.blocked,
-                            "suggestions": len(items) if isinstance(items, list) else 0}
-    return result
+    state = _domain_state(cfg["id"])
+    order = _domain_order(cfg["domains"], state, time.time())
+    refused: list = []
+    for domain in order[:ATTEMPTS]:
+        try:
+            with _Http(cfg, domain) as c:
+                items = c.call(
+                    "GET", f"{c.base}/g/autosuggest-search/api/v1/search-flight/"
+                    f"{cfg['market']}/{cfg['locale']}/London",
+                    params={"isDestination": "false", "enable_general_search_v2": "true"})
+        except _Failure as f:
+            if not _restartable(f, cfg):
+                return {**result, "ok": False, "category": f.exit_code, "code": f.code,
+                        "error": f.message, **({"hint": f.hint} if f.hint else {})}
+            if f.code == "blocked":
+                state.setdefault(domain, {})["blocked"] = time.time()
+                _save_domain_state(cfg["id"], state)
+            refused.append(f"{domain}: {f.message}")
+            continue
+        result["skyscanner"] = {
+            "reachable": True, "domain": domain, "refused": refused,
+            "suggestions": len(items) if isinstance(items, list) else 0}
+        return result
+    return {**result, "ok": False, "category": 7, "code": "blocked",
+            "error": "every site tried was refused: " + "; ".join(refused),
+            "hint": BLOCK_HINT}
 
 
 def _proxy_summary_cfg(proxy: dict | None) -> dict | None:
@@ -1025,9 +1142,8 @@ def main() -> None:
         if getattr(args, key, None):
             cfg[key] = getattr(args, key)
 
-    with _Http(cfg) as c:
-        _emit({"places": cmd_places, "search": cmd_search,
-               "calendar": cmd_calendar}[args.cmd](c, cfg, args))
+    verb = {"places": cmd_places, "search": cmd_search, "calendar": cmd_calendar}[args.cmd]
+    _emit(_attempts(cfg, lambda c: verb(c, cfg, args)))
 
 
 if __name__ == "__main__":
