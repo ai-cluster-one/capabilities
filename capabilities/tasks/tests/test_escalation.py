@@ -381,6 +381,12 @@ def test_a_hold_under_the_ceiling_holds_and_writes_nothing(project, store, turns
     assert task["status"] == "todo" and task["assignee"] is None
     assert task["pickup_at"] is None
     assert trail(entry, capsys, "t-young") == []
+    # The hold row joins its worker by id, as a raise does.
+    [(hold, version)] = conn.execute(
+        f"""select e.worker_id, w.id from {schema}.tasks_executions e
+              join {schema}.tasks_workers w on w.name = e.worker and w.active
+             where e.metrics ? 'hold'""").fetchall()
+    assert hold is not None and hold == version
 
 
 @needs_store

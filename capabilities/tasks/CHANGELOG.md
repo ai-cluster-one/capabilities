@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-30 — A hold row records the worker version it was held under
+
+The row a claim writes at the first hold of a task by its worker's `before` hook (`attempt` 0, `handback`, `metrics.hold`) now carries `worker_id`, the stored worker version, as a raise does, so every new execution row of a stored worker joins its worker by id. A worker this capability ships still records none. Rows already written are left as they are.
+
 ## 2026-10-30 — A store declared a transaction pooler stays one in the processes tasks starts
 
 Where the store setting declares its one address a transaction pooler (`AGENTKIT_DB_TRANSACTION_POOLER`, `capabilities-contract` 0.38.0), the setting tasks hands the processes it starts - a worker's turn and what it runs - carries the declaration too, so they also take only per-transaction locks and open no session through the pooler. A setting without it is handed on as before.

@@ -5316,7 +5316,7 @@ def _escalation_of(worker: dict) -> dict | None:
     settings = _conveyor()
     if settings is None:
         return None
-    return {**settings, "worker": worker["name"],
+    return {**settings, "worker": worker["name"], "worker_id": worker.get("version"),
             "attempts": worker["limits"]["attempts"],
             "park_hint": worker.get("park_hint") or "",
             "workers": sorted(_declarations())}
@@ -5672,10 +5672,10 @@ def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, 
             # every claim from now on, by hand or by any service, counts from it.
             if write:
                 cur.execute(f"""insert into {SCHEMA}.tasks_executions
-                                  (task_id, attempt, worker, status, metrics,
+                                  (task_id, attempt, worker, worker_id, status, metrics,
                                    started_at, ended_at)
-                                values (%s, 0, %s, 'handback', %s::jsonb, now(), now())""",
-                            (str(row["id"]), escalation["worker"],
+                                values (%s, 0, %s, %s, 'handback', %s::jsonb, now(), now())""",
+                            (str(row["id"]), escalation["worker"], escalation.get("worker_id"),
                              json.dumps({_HOLD_MARK: {"said": said, "how": how}})))
             conn.commit()
             return None
