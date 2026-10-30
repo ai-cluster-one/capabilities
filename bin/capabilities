@@ -291,14 +291,24 @@ MACHINE VERBS
         is disabled - once the store's global rows exist, the shared
         connections the store holds for it, with a config-home file counted
         only for one the store holds no row of; a quarantined row is
-        effective "disabled" with source "machine".
+        effective "disabled" with source "machine". Every row carries `icon`,
+        true when the installed capability carries one (see icon).
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources.
         Listing never executes catalogue capability code. JSON {matches [{name,
-        source, summary, installed}], unavailable_sources [{source, hint}]}.
-        Every row carries installed: true when a capability of that name is in
-        the machine registry, false when it is a catalogue capability not yet
-        installed here.
+        source, summary, installed, icon}], unavailable_sources [{source,
+        hint}]}. Every row carries installed: true when a capability of that
+        name is in the machine registry, false when it is a catalogue
+        capability not yet installed here; and icon, what the source's
+        catalogue says of the capability's icon (false where it says nothing).
+  icon <name> [--json]
+        The installed capability's icon: one file, icon.png at the root of its
+        bundle, a square PNG of at least 96 pixels a side (`capabilities guide
+        authoring`), which the manager reads and no capability's own code
+        touches. JSON {name, icon {path, format "png", width, height, bytes,
+        sha256}}; path is the file in this machine's registry, its bytes the
+        icon. Exit 3 not_found when the capability is not installed, 3 no_icon
+        when it carries none, 6 icon_invalid when the file is not a PNG.
   changelog (<name> | --manager | --contract) [--all]
             [--from <path> | --source ID]
         Print the change log of a capability, of the manager, or of the
@@ -1750,8 +1760,8 @@ PROJECT VERBS (run inside a consuming project)
         a project id.
   inventory [NAME ...] [--detail] [--network]
         What this project's capabilities are and what they hold. One row per
-        effective-enabled capability: its tier (as in `list`), gate and the
-        scope that set it,
+        effective-enabled capability: its tier (as in `list`), whether it
+        carries an icon (`icon`, see icon), gate and the scope that set it,
         the connections it may act on and the ones a grant withholds,
         the declared service and its state, and whether the
         capability reports an inventory of its own and how much of it needs
@@ -3588,6 +3598,59 @@ def _installed() -> dict[str, dict]:
         if (d / d.name).is_file():
             out[d.name] = _read_json(d / "meta.json") or {}
     return out
+
+
+# A capability's icon is one file at one place in its bundle, which the manager
+# reads and no capability's own code touches. Its presence is the declaration:
+# every listing derives it from the file, as docs.topics derives from guides/.
+ICON_FILE = "icon.png"
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _png_size(data: bytes) -> tuple[int, int] | None:
+    """A PNG's width and height from its header, or None for bytes that are not one."""
+    if len(data) < 24 or data[:8] != PNG_SIGNATURE or data[12:16] != b"IHDR":
+        return None
+    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+
+
+def _has_icon(bundle: Path) -> bool:
+    return (bundle / ICON_FILE).is_file()
+
+
+def _bundle_icon_problems(capdir: Path) -> list[str]:
+    """Why a bundle's icon is not the one the standard names: icon.png at the
+    bundle's root, a PNG. Size and squareness are reported by `capabilities
+    icon`, not refused here."""
+    problems = [f"icon: {path.name} is not the icon's place; the icon is {ICON_FILE}, a PNG"
+                for path in sorted(capdir.glob("icon.*"))
+                if path.name != ICON_FILE]
+    icon = capdir / ICON_FILE
+    if icon.is_file():
+        try:
+            data = icon.read_bytes()
+        except OSError as exc:
+            return [*problems, f"icon: {ICON_FILE} cannot be read: {exc}"]
+        if _png_size(data) is None:
+            problems.append(f"icon: {ICON_FILE} is not a PNG")
+    return problems
+
+
+def cmd_icon(name: str) -> None:
+    if name not in _installed():
+        _die(3, "not_found", f"{name} is not installed", f"`capabilities install {name}`")
+    path = _registry_dir(name) / ICON_FILE
+    if not path.is_file():
+        _die(3, "no_icon", f"{name} carries no icon",
+             f"its bundle holds none at capabilities/{name}/{ICON_FILE}")
+    data = path.read_bytes()
+    size = _png_size(data)
+    if size is None:
+        _die(6, "icon_invalid", f"{name}: {path} is not a PNG")
+    _emit({"name": name, "icon": {"path": str(path), "format": "png",
+                                  "width": size[0], "height": size[1],
+                                  "bytes": len(data),
+                                  "sha256": hashlib.sha256(data).hexdigest()}})
 
 
 def _snapshot_env() -> dict:
@@ -5979,7 +6042,8 @@ def cmd_list() -> None:
         stub, manifest = _load_snapshots(name)
         entry: dict = {"name": name,
                        "summary": (manifest or {}).get("summary", ""),
-                       "tier": _capability_tier(name)}
+                       "tier": _capability_tier(name),
+                       "icon": _has_icon(_registry_dir(name))}
         local = _gate_state(project_caps.get(name)) if root else "absent"
         global_state = _gate_state(global_caps.get(name))
         effective, source = _effective_gate_state(
@@ -6037,6 +6101,7 @@ def _inventory_rows(root: Path) -> list[dict]:
                 "name": name,
                 "summary": manifest.get("summary", ""),
                 "tier": _capability_tier(name),
+                "icon": _has_icon(_registry_dir(name)),
                 "gate": {"effective": effective, "source": source},
                 "connections": {"count": len(usable), "default": default,
                                 "ids": usable, "withheld": withheld},
@@ -27311,6 +27376,7 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
             problems += [f"connections/machine-reads: {p}"
                          for p in _machine_reads_problems(script)]
         problems += _bundle_library_problems(capdir)
+        problems += _bundle_icon_problems(capdir)
         if problems:
             failures[name] = sorted(set(problems))
             continue
@@ -27318,6 +27384,7 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
             "path": f"capabilities/{name}",
             "summary": manifest.get("summary", ""),
             "payload_sha256": _payload_sha256(capdir),
+            "icon": _has_icon(capdir),
         }
     return {"capabilities": entries}, failures
 
@@ -27363,6 +27430,7 @@ def _catalog_payload_scoped(
                 problems += [f"connections/machine-reads: {p}"
                              for p in _machine_reads_problems(script)]
             problems += _bundle_library_problems(capdir)
+            problems += _bundle_icon_problems(capdir)
             if problems:
                 failures[name] = sorted(set(problems))
                 continue
@@ -27377,6 +27445,7 @@ def _catalog_payload_scoped(
             "path": f"capabilities/{name}",
             "summary": summary,
             "payload_sha256": _payload_sha256(capdir),
+            "icon": _has_icon(capdir),
         }
     return {"capabilities": entries}, failures
 
@@ -28330,7 +28399,8 @@ def cmd_search(query: str | None, source_id: str | None) -> None:
             if needle and needle not in name.lower() and needle not in summary.lower():
                 continue
             matches.append({"name": name, "source": sid, "summary": summary,
-                            "installed": _registry_dir(name).is_dir()})
+                            "installed": _registry_dir(name).is_dir(),
+                            "icon": bool((entry or {}).get("icon"))})
     _emit({"matches": matches, "unavailable_sources": unavailable})
 
 
@@ -28981,6 +29051,10 @@ def main() -> None:
         cmd_path(flag("--json"), flag("--identity"))
     elif cmd == "search":
         cmd_search(pos[0] if pos else None, opt("--source"))
+    elif cmd == "icon":
+        if len(pos) != 1:
+            _die(6, "input", "icon needs exactly one capability name")
+        cmd_icon(pos[0])
     elif cmd == "changelog":
         selectors = [s for s in ("--manager", "--contract") if flag(s)]
         if len(pos) + len(selectors) != 1:

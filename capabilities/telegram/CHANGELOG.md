@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-30 — `telegram` carries its own icon
+
+The bundle holds its icon as `icon.png`; `capabilities icon telegram` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
 ## 2026-10-30 — The service and the profile reads run on a library that reads today's store setting
 
 `service/daemon.py`, `service/profiles.py` and `service/call_recorder.py` declare `capabilities-contract>=0.38,<1`, where they declared `>=0.25` and `>=0.12`. The environment uv had made for them earlier kept the library it held then, since install and update bring only the `telegram` executable's library forward, so on a machine whose store setting declares a transaction pooler `telegram profiles list` saw no store profiles and `telegram service run` stopped at start with `profile_refused`. The new range makes uv build each of them anew on the next run.

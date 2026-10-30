@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-10-30 — `whatsapp` carries its own icon
+
+The bundle holds its icon as `icon.png`; `capabilities icon whatsapp` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
 ## 2026-10-28 — A queued message is sent at once where the store names its transaction address apart
 
 The listener still polls the account's `whatsapp_outbox` version about once a second, and where the project's store names its transaction address apart (`AGENTKIT_DB_TRANSACTION_PORT` or `AGENTKIT_DB_TRANSACTION_HOST`) its wait between ticks also listens for the store's notification on a session connection of its own, closed when the listener stops, so a message another process queued is polled for and sent at once. A store reached through a transaction pooler alone holds no such connection and is followed as before; a lost notification costs only the second. Declares `capabilities-contract>=0.33,<1`.

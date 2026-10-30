@@ -261,6 +261,7 @@ def test_remote_source_catalog_search_and_install(tmp_path):
         "source": "shared",
         "summary": "Test capability with a completed managed manifest.",
         "installed": False,
+        "icon": False,
     }]
     installed = json.loads(_run(
         consumer_env, "install", "demo", "--source", "shared").stdout)
@@ -276,6 +277,76 @@ def test_remote_source_catalog_search_and_install(tmp_path):
         tmp_path / "clone" / "registry" / "sources" / "personal")
     assert json.loads(_run(
         clone_env, "source", "check", "personal").stdout)["ok"] is True
+
+
+def test_a_bundle_icon_is_checked_catalogued_and_read_through_the_manager(tmp_path):
+    import struct
+    import zlib
+
+    def png(width: int, height: int) -> bytes:
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return (struct.pack(">I", len(data)) + kind + data
+                    + struct.pack(">I", zlib.crc32(kind + data)))
+        raw = b"".join(b"\0" + b"\0\0\0\0" * width for _ in range(height))
+        return (b"\x89PNG\r\n\x1a\n"
+                + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+    author_env = _env(tmp_path / "author")
+    _run(author_env, "source", "init", "personal")
+    for name in ("demo", "plain"):
+        created = json.loads(_run(
+            author_env, "new", name, "--source", "personal").stdout)
+        script = Path(created["executable"])
+        script.write_text(script.read_text().replace(
+            "TODO: describe the capability's smallest useful surface.",
+            "Test capability with a completed managed manifest.",
+        ).replace("Replace this scaffold check with", "Test readiness uses"))
+    workspace = tmp_path / "author" / "registry" / "sources" / "personal"
+    icon = workspace / "capabilities" / "demo" / "icon.png"
+
+    icon.write_bytes(b"not a png")
+    refused = _run(author_env, "source", "index", "personal", check=False)
+    assert refused.returncode == 7
+    assert "icon: icon.png is not a PNG" in json.loads(refused.stdout)["failures"]["demo"]
+    icon.unlink()
+    (icon.parent / "icon.svg").write_text("<svg/>")
+    refused = _run(author_env, "source", "index", "personal", check=False)
+    assert refused.returncode == 7
+    assert any("icon.svg is not the icon's place" in problem
+               for problem in json.loads(refused.stdout)["failures"]["demo"])
+    (icon.parent / "icon.svg").unlink()
+
+    icon.write_bytes(png(128, 128))
+    _run(author_env, "source", "index", "personal")
+    catalog = json.loads((workspace / ".capability-source" / "catalog.json").read_text())
+    assert catalog["capabilities"]["demo"]["icon"] is True
+    assert catalog["capabilities"]["plain"]["icon"] is False
+    subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com",
+         "commit", "-m", "Add demo"], cwd=workspace, check=True,
+        capture_output=True, text=True,
+    )
+
+    consumer_env = _env(tmp_path / "consumer")
+    _run(consumer_env, "source", "add", "shared", str(workspace))
+    search = json.loads(_run(consumer_env, "search", "--source", "shared").stdout)
+    assert {row["name"]: row["icon"] for row in search["matches"]} == {
+        "demo": True, "plain": False}
+    for name in ("demo", "plain"):
+        _run(consumer_env, "install", name, "--source", "shared")
+    listed = json.loads(_run(consumer_env, "list").stdout)["installed"]
+    assert {row["name"]: row["icon"] for row in listed} == {"demo": True, "plain": False}
+
+    answer = json.loads(_run(consumer_env, "icon", "demo", "--json").stdout)
+    assert answer["name"] == "demo"
+    assert {k: answer["icon"][k] for k in ("format", "width", "height")} == {
+        "format": "png", "width": 128, "height": 128}
+    assert Path(answer["icon"]["path"]).read_bytes() == icon.read_bytes()
+    missing = _run(consumer_env, "icon", "plain", check=False)
+    assert missing.returncode == 3
+    assert json.loads(missing.stderr.splitlines()[-1])["error"]["code"] == "no_icon"
 
 
 def test_legacy_workspace_is_migrated_into_capabilities_home(tmp_path):

@@ -1,5 +1,9 @@
 # geminitalk — change log
 
+## 2026-10-30 — `geminitalk` carries its own icon
+
+The bundle holds its icon as `icon.png`; `capabilities icon geminitalk` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
 ## 2026-10-22 — A project without project.json is a project
 
 The envelope check accepts a project bound to its id. Declares `capabilities-contract>=0.12,<1`.

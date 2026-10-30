@@ -1,5 +1,9 @@
 # rclonec — change log
 
+## 2026-10-30 — `rclonec` carries its own icon
+
+The bundle holds its icon as `icon.png`; `capabilities icon rclonec` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
 ## 2026-10-28 — `rclonec connections` names each secret by the env key it resolves from
 
 A secret row in `rclonec connections` now names the env key under `secret_env` as its `key`, as every capability's report does, where it used to read `<option> (<ENV_KEY>)`. A reader that looks a key up by name - `capabilities secrets move` among them - therefore finds rclonec reading it, so rclonec's keys move into the agent's vault like any other, and a key the vault could not be read for carries the vault's note on why. The option a key fills is still the connection's `secret_env`. Nothing else changes.

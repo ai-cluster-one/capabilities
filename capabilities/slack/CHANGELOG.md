@@ -1,5 +1,9 @@
 # slack — change log
 
+## 2026-10-30 — `slack` carries its own icon
+
+The bundle holds its icon as `icon.png`; `capabilities icon slack` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
 ## 2026-10-23 — The service declares how many nodes run it at once
 
 The service descriptor declares `service.placement` `exclusive`: one node runs the service at a time, the deployment runner's lease holds it there, and `capabilities place slack --node <node>` moves it, leaving `slack` usable on the node it left.

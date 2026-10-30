@@ -118,13 +118,14 @@ capabilities/
     service/         optional
     CHANGELOG.md    change log
     deviations.md   optional
+    icon.png        optional
 .capability-source/
   catalog.json       generated
   manager-release.json  generated for the official manager source
 ```
 
 The executable manifest remains the source of truth. `catalog.json` is only a
-generated discovery index and is rejected when its summaries or payload hashes
-are stale. In the official source, `manager-release.json` is also generated: it
+generated discovery index and is rejected when its summaries, payload hashes
+or icon flags are stale. In the official source, `manager-release.json` is also generated: it
 binds the incoming manager and its complete runtime/authoring asset set to
 SHA-256 hashes so `self-update` can stage the whole release before activation.

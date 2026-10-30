@@ -37,6 +37,16 @@ Implement declarations, doctor, and domain verbs in the capability's own code
 around the contract binds. Use placeholders in examples and resolve consumer-specific
 values through the standard configuration surfaces.
 
+## Give it an icon
+
+A capability's icon is one file, `capabilities/<name>/icon.png` at the root of
+its bundle: a square PNG of at least 96 pixels a side, the system's own mark
+where it has one. Nothing declares it and no code of the capability touches it:
+the manager reads the file, says on every `list`, `inventory` and `search` row
+whether one is there, and answers `capabilities icon <name>` with its path and
+size. Source checks refuse an `icon.png` that is not a PNG, and an icon kept
+under any other `icon.*` name. A capability without one carries no file.
+
 ## Verify and release
 
 Stage the intended files and run `capabilities source index <id> --staged`.
