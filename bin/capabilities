@@ -994,8 +994,10 @@ PROJECT VERBS (run inside a consuming project)
         through `context` - its author project imports it with --global
         and this agent enables each document it uses), and .contextkit/
         holds only config.toml,
-        README.md, generated/ with generated context alone, and
-        icon-*.png (exit 6 contextkit_folder_not_empty, naming the rest;
+        README.md, generated/ with generated context alone, icon-*.png,
+        and audits/ with ContextKit audit records (*.md) and .gitkeep alone
+        (exit 6 contextkit_folder_not_empty, naming the rest, or a record
+        whose place in the assets folder holds another file;
         icon_ambiguous for more than one icon the row would take and none
         named by [identity] icon; icon_invalid for an icon that is no PNG,
         or missing where the row holds none). The row's copy is the one
@@ -1007,7 +1009,13 @@ PROJECT VERBS (run inside a consuming project)
         ([identity] icon, else the one icon-*.png) - in the statement that
         writes them, so a value the store holds is never overwritten, and
         names every field where the binding holds another value than the
-        row, which keeps its own; builds the context at
+        row, which keeps its own; keeps each audit record in the agent's
+        assets as the report reports/<name>: in its assets folder where it
+        keeps its assets there (the folder is there and the store holds
+        none), moved once the context is built and staged in a Git
+        repository, else in its store through `assets save` before anything
+        else changes (exit 5 capability_missing without assets, its refusal
+        as evidence_save_failed); builds the context at
         .capabilities-generated/context.md,
         points every wired host's link at it and brings the wired hosts'
         hooks to `capabilities session-start` as `hooks install` does;
@@ -1019,15 +1027,18 @@ PROJECT VERBS (run inside a consuming project)
         builds (a context file the build refuses, a file it did not
         generate at the new output) puts the binding, the host files, the
         .gitignore and the row's values back as it found them. Answers {ok, project,
-        agent_id, changed, carried, differs, removed, untracked, staged,
-        wrote, hosts, build, agent}: carried the fields it filled, differs
-        [{field, file, store}] the fields the row kept against the
-        binding (onboarding as {status, routine}, the icon as icon_sha).
+        agent_id, changed, carried, differs, removed, untracked, evidence,
+        staged, wrote, hosts, build, agent}: carried the fields it filled,
+        differs [{field, file, store}] the fields the row kept against the
+        binding (onboarding as {status, routine}, the icon as icon_sha),
+        evidence [{from, where, to}] each audit record, where (folder or
+        store) and the file or asset name it is kept as.
         --dry-run runs the same checks and refuses the same way, writes
         nothing - the id left where it is, the row, the binding and the
         host files as they are - and answers {ok, project, agent_id,
-        dry_run, changed: false, fill, differs}: fill the fields a real run
-        would fill, with the values it would write (the icon as icon_sha).
+        dry_run, changed: false, fill, differs, evidence}: fill the fields a
+        real run would fill, with the values it would write (the icon as
+        icon_sha), evidence where a real run would keep each audit record.
         Run where no ContextKit binding is left, it changes nothing and
         answers changed false with a message. Exit 4 under the read-only
         switch, except --dry-run.
@@ -10679,6 +10690,73 @@ def _agent_fill(root: Path, values: dict) -> dict:
     return {"agent": agent, "store": _kernel_store_report(setting)}
 
 
+# A ContextKit audit record in .contextkit/audits/, and what else that folder
+# holds that is no one's: its placeholder and a Finder marker.
+CK_AUDIT_RECORD = re.compile(r"[^./\\][^/\\]*\.md")
+CK_AUDIT_IGNORED = (".gitkeep", ".DS_Store")
+# Where an audit record goes among the agent's assets, and why it is there.
+CK_AUDIT_ASSETS_FOLDER = "reports"
+CK_AUDIT_NOTE = "ContextKit audit record, kept as evidence by `capabilities agent convert`"
+
+
+def _convert_evidence(root: Path, records: list[Path]) -> list[dict]:
+    """Where each ContextKit audit record goes: the agent's assets folder
+    where the agent keeps its assets there (the folder is there and the store
+    holds none), else its store, as the report `reports/<name>`. A folder that
+    already holds another file under that name refuses, naming it."""
+    folder = _project_body(root)["layers"]["assets"]
+    in_folder = folder.is_dir() and not _ck_stored_assets(root)
+    if not in_folder:
+        if not _script_path(CK_LAYER_IMPORTS["assets"]).is_file():
+            _die(5, "capability_missing",
+                 f"{_ck_rel(root, records[0].parent)} holds audit records the agent's "
+                 "store keeps as assets, through `assets save`, and assets is not "
+                 "installed on this machine",
+                 "install it with `capabilities install assets`, then convert")
+        return [{"source": item, "where": "store",
+                 "name": f"{CK_AUDIT_ASSETS_FOLDER}/{item.name[:-len('.md')]}"}
+                for item in records]
+    evidence, taken = [], []
+    for item in records:
+        target = folder / CK_AUDIT_ASSETS_FOLDER / item.name
+        if target.is_symlink() or (target.exists() and (
+                not target.is_file() or target.read_bytes() != item.read_bytes())):
+            taken.append(_ck_rel(root, target))
+        evidence.append({"source": item, "where": "folder", "target": target})
+    if taken:
+        _die(6, "contextkit_folder_not_empty",
+             f"{_ck_rel(root, records[0].parent)} holds audit records whose place in the "
+             f"agent's assets holds another file: {', '.join(taken)}",
+             "move or rename those, then run `capabilities agent convert` again; the "
+             "agent stays bound and working until then")
+    return evidence
+
+
+def _convert_evidence_report(root: Path, item: dict) -> dict:
+    """{from, where, to}: the record, and the asset name (store) or the file
+    (folder) it is kept as."""
+    return {"from": _ck_rel(root, item["source"]), "where": item["where"],
+            "to": item["name"] if item["where"] == "store" else _ck_rel(root, item["target"])}
+
+
+def _convert_save_record(root: Path, agent_id: str, item: dict) -> None:
+    """Save one audit record to the agent's store through `assets save`, run as
+    the project; a refusal ends the convert with its own exit code."""
+    env = {**_snapshot_env(), "CLAUDE_PROJECT_DIR": str(root),
+           PROJECT_ID_ENV: agent_id, PROJECT_ID_ROOT_ENV: str(root)}
+    code, out, err = _run_script(_script_path(CK_LAYER_IMPORTS["assets"]),
+                                 ["save", item["name"], "--from", str(item["source"]),
+                                  "--note", CK_AUDIT_NOTE],
+                                 cwd=root, env=env, timeout=CK_LAYER_IMPORT_TIMEOUT)
+    if code != 0:
+        detail = _ck_manager_message(subprocess.CompletedProcess([], code, out, err))
+        _die(code if code in (3, 4, 5, 6) else 5, "evidence_save_failed",
+             f"`assets save {item['name']}` did not keep {_ck_rel(root, item['source'])} "
+             f"in the agent's store (exit {code}): {detail}",
+             "repair what `assets save` names, then convert; the agent stays bound and "
+             "working until then")
+
+
 def _agent_convert(root: Path, dry_run: bool = False) -> dict:
     """`agent convert`: turn a ContextKit-bound agent into one bound by its id
     alone, as one change, refusing before anything is written. Its row takes
@@ -10690,7 +10768,7 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
             return {"ok": True, "project": str(root), "changed": False,
                     "message": "this agent has no ContextKit binding to convert; nothing changed",
                     "carried": {}, "fill": {}, "differs": [], "removed": [], "untracked": [],
-                    "wrote": [], **({"dry_run": True} if dry_run else {})}
+                    "wrote": [], "evidence": [], **({"dry_run": True} if dry_run else {})}
         _die(6, "not_contextkit_bound",
              f"{root} has neither a ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
              f"nor a project id ({PROJECT_ID_ENV}), so there is no agent to convert",
@@ -10726,13 +10804,24 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
              "run `capabilities init --id <id>` with the agent's id, then convert")
     # .contextkit/ holds the binding and what ContextKit and this manager made
     # for it, and nothing else that removing the folder would lose.
-    foreign, icons = [], []
+    foreign, icons, records = [], [], []
     for entry in sorted(ck_dir.iterdir()):
         rel = _ck_rel(root, entry)
         if entry.is_symlink():
             foreign.append(rel)
         elif entry.name in ("config.toml", "README.md") and entry.is_file():
             continue
+        elif entry.name == "audits" and entry.is_dir():
+            # ContextKit's audit records are evidence, kept in the agent's
+            # assets; its .gitkeep and a Finder marker go with the folder.
+            for item in sorted(entry.iterdir()):
+                if item.name in CK_AUDIT_IGNORED and item.is_file() and not item.is_symlink():
+                    continue
+                if CK_AUDIT_RECORD.fullmatch(item.name) and item.is_file() \
+                        and not item.is_symlink():
+                    records.append(item)
+                else:
+                    foreign.append(_ck_rel(root, item))
         elif entry.name == "generated" and entry.is_dir():
             for item in sorted(entry.rglob("*")):
                 if item.is_dir() and not item.is_symlink():
@@ -10764,6 +10853,7 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
     identity = _convert_identity(root, raw, ck_dir)
     found = _convert_preflight_store(root, agent_id)
     row = found["row"]
+    evidence = _convert_evidence(root, records) if records else []
     # Everything the binding holds that the agent's row has a column for.
     held: dict = {"body_root": (None if binding["body_root"] == Path(".")
                                 else binding["body_root"].as_posix())}
@@ -10811,7 +10901,8 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
     git = (root / ".git").exists() and _ck_git(root, "rev-parse", "--git-dir").returncode == 0
     if dry_run:
         return {"ok": True, "project": str(root), "agent_id": agent_id, "dry_run": True,
-                "changed": False, "fill": fill, "differs": differs}
+                "changed": False, "fill": fill, "differs": differs,
+                "evidence": [_convert_evidence_report(root, item) for item in evidence]}
 
     # Everything is checked: the change is made. A folder still carrying the
     # older form of its agent's id is bound to the id the store holds first, so
@@ -10824,6 +10915,12 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
             rebound = next((root / name for name in PROJECT_ID_FILES
                             if _rebind_env_file(root / name, found_id, agent_id, True)),
                            None) or _write_env_local_id(root, agent_id)
+    # An audit record the store keeps is saved before anything else changes,
+    # so a store that refuses it leaves the agent as it was; saving it again
+    # on a later run saves nothing.
+    for item in evidence:
+        if item["where"] == "store":
+            _convert_save_record(root, agent_id, item)
     # What it changes is kept, so a refusal while it builds leaves the agent
     # bound and as it was.
     states = _path_states(root, _convert_touched())
@@ -10876,6 +10973,14 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
                      "the agent is converted; untrack its host files with `git rm --cached`")
         if gitignore["changed"]:
             _ck_git(root, "add", "--", ".gitignore")
+    # An audit record the assets folder keeps moves there once the agent is
+    # built, staged where the agent is a Git repository.
+    for item in evidence:
+        if item["where"] == "folder" and not item["target"].exists():
+            item["target"].parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(aside / item["source"].relative_to(ck_dir), item["target"])
+            if git:
+                _ck_git(root, "add", "--", str(item["target"].relative_to(root)))
     shutil.rmtree(aside)
     wrote = [build["output"]]
     wrote += relinked + [str(root / CK_HOST_LINKS[host]) for host, status in build["links"].items()
@@ -10898,6 +11003,7 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
         wrote.append(str(root / ".env.local"))
     return {"ok": True, "project": str(root), "agent_id": agent_id, "changed": True,
             "carried": carried, "differs": differs, "removed": removed, "untracked": untracked,
+            "evidence": [_convert_evidence_report(root, item) for item in evidence],
             "staged": git and bool(untracked or gitignore["changed"]), "wrote": wrote,
             "hosts": hosts, "build": build, "agent": answer["agent"]}
 

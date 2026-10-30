@@ -2215,6 +2215,95 @@ def test_agent_convert_refuses_before_writing_anything(lab, tmp_path):
     assert (unknown.path / ".contextkit" / "config.toml").read_text() == BOUND_CONFIG
 
 
+# The assets capability, played by a script that records each save beside itself:
+# its arguments, the id it ran as and the body it was given.
+FAKE_ASSETS_SAVE = """import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+if args[:1] != ["save"]:
+    sys.exit(1)
+body = Path(args[args.index("--from") + 1]).read_text()
+with open(Path(__file__).with_name("saves.jsonl"), "a") as log:
+    log.write(json.dumps({"args": args, "id": os.environ.get("CAPABILITIES_PROJECT_ID"),
+                          "body": body}) + "\\n")
+print(json.dumps({"ok": True, "created": True}))
+"""
+
+AUDIT = "2026-01-15_contextkit-audit.md"
+
+
+def test_agent_convert_keeps_contextkit_audits_as_evidence_in_the_agents_assets(lab, tmp_path):
+    # An empty audits/, or one holding only .gitkeep, goes with .contextkit/.
+    for name, keep in (("empty", False), ("gitkeep", True)):
+        folder = _bound_agent(lab, tmp_path / name, BOUND_CONFIG)
+        audits = folder.path / ".contextkit" / "audits"
+        audits.mkdir()
+        if keep:
+            (audits / ".gitkeep").write_text("")
+        planned = folder.ok("agent", "convert", "--dry-run")
+        assert (planned["dry_run"], planned["evidence"]) == (True, [])
+        assert audits.is_dir()
+        converted = folder.ok("agent", "convert")
+        assert (converted["changed"], converted["evidence"]) == (True, [])
+        assert not (folder.path / ".contextkit").exists()
+        lab.sql(f"UPDATE {SCHEMA}.capabilities_agents SET body_root = NULL, "
+                "collaboration_mode = NULL, onboarding_status = NULL, onboarding_routine = NULL, "
+                "icon = NULL, icon_sha = NULL WHERE id = %s RETURNING id", (BARE_ID,))
+
+    # A record moves into an assets folder the agent keeps, staged.
+    folder = _bound_agent(lab, tmp_path / "folder", BOUND_CONFIG)
+    root = folder.path
+    (root / ".contextkit" / "audits").mkdir()
+    (root / ".contextkit" / "audits" / AUDIT).write_text("# Audit\n")
+    (root / ".contextkit" / "audits" / ".gitkeep").write_text("")
+    (root / "agent" / "assets" / "plans").mkdir(parents=True)
+    (root / "agent" / "assets" / "plans" / "p.md").write_text("# Plan\n")
+    folder.git("add", "-A")
+    folder.git("commit", "-qm", "audits")
+    kept = {"from": f".contextkit/audits/{AUDIT}", "where": "folder",
+            "to": f"agent/assets/reports/{AUDIT}"}
+    assert folder.ok("agent", "convert", "--dry-run")["evidence"] == [kept]
+    assert not (root / "agent" / "assets" / "reports").exists()
+    converted = folder.ok("agent", "convert")
+    assert converted["evidence"] == [kept]
+    assert (root / "agent" / "assets" / "reports" / AUDIT).read_text() == "# Audit\n"
+    assert not (root / ".contextkit").exists()
+    assert f"R  .contextkit/audits/{AUDIT} -> agent/assets/reports/{AUDIT}" in folder.git(
+        "status", "--porcelain").splitlines()
+    lab.sql(f"UPDATE {SCHEMA}.capabilities_agents SET body_root = NULL, "
+            "collaboration_mode = NULL, onboarding_status = NULL, onboarding_routine = NULL, "
+            "icon = NULL, icon_sha = NULL WHERE id = %s RETURNING id", (BARE_ID,))
+
+    # Without an assets folder the store keeps it, through `assets save`.
+    folder = _bound_agent(lab, tmp_path / "store", BOUND_CONFIG)
+    root = folder.path
+    (root / ".contextkit" / "audits").mkdir()
+    (root / ".contextkit" / "audits" / AUDIT).write_text("# Audit\n")
+    code, error = folder.refused("agent", "convert", "--dry-run")
+    assert (code, error["code"]) == (5, "capability_missing")
+    assets = lab.tmp / "registry" / "assets"
+    _fake_tool(assets, "assets", FAKE_ASSETS_SAVE)
+    kept = {"from": f".contextkit/audits/{AUDIT}", "where": "store",
+            "to": "reports/2026-01-15_contextkit-audit"}
+    assert folder.ok("agent", "convert", "--dry-run")["evidence"] == [kept]
+    assert not (assets / "saves.jsonl").exists()
+    converted = folder.ok("agent", "convert")
+    assert converted["evidence"] == [kept]
+    [save] = [json.loads(line) for line in (assets / "saves.jsonl").read_text().splitlines()]
+    assert save["args"][:2] == ["save", "reports/2026-01-15_contextkit-audit"]
+    assert (save["id"], save["body"]) == (BARE_ID, "# Audit\n")
+    assert not (root / ".contextkit").exists() and not (root / "agent" / "assets").exists()
+
+    # Anything else in audits/ is refused, as before.
+    folder = _bound_agent(lab, tmp_path / "other", BOUND_CONFIG)
+    (folder.path / ".contextkit" / "audits" / "raw").mkdir(parents=True)
+    (folder.path / ".contextkit" / "audits" / "notes.txt").write_text("x\n")
+    code, error = folder.refused("agent", "convert", "--dry-run")
+    assert (code, error["code"]) == (6, "contextkit_folder_not_empty")
+    assert ".contextkit/audits/notes.txt" in error["message"]
+    assert ".contextkit/audits/raw" in error["message"]
+
+
 def test_agent_convert_binds_the_old_prj_form_of_an_id_to_the_agent_the_store_holds(
         lab, tmp_path):
     # The store holds the agent under the twelve hex characters alone; its
