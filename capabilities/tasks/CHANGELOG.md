@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-10-30 — A store declared a transaction pooler stays one in the processes tasks starts
+
+Where the store setting declares its one address a transaction pooler (`AGENTKIT_DB_TRANSACTION_POOLER`, `capabilities-contract` 0.38.0), the setting tasks hands the processes it starts - a worker's turn and what it runs - carries the declaration too, so they also take only per-transaction locks and open no session through the pooler. A setting without it is handed on as before.
+
 ## 2026-10-29 — `service join` and `service leave` are removed; the node manager writes the machine service's list
 
 `tasks service join` and `tasks service leave` (with `leave --machine --project`) are removed. The machine service's list, `$XDG_CONFIG_HOME/tasks/service/projects.toml`, is now written by the node manager alone (`capabilities node supervise tasks --machine`), from the agents placed on this node in mode shared whose leases it holds: it puts each there and takes off those it put there once they are no longer placed so. A project is served by the machine service by placing it so - `capabilities service start tasks`, or `capabilities place tasks --node <node> --mode shared` - and leaves it with `capabilities service stop tasks` or `capabilities unplace tasks --node <node> --mode shared`. A project already on the list stays on it. Hints that named `service join` or `leave` now name those commands; the list's format, `service status --machine` and every other machine verb answer as before.

@@ -2,7 +2,7 @@
   "assets": {
     "DOCTRINE.md": "905189759463ecf2b8164ef0c1b37d1550a33353af567d900270fe586e9fee3b",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "412cd319b283c35b0a6efde0102d8c3792572a7ef52d0d9ca6b160e3f80e0815",
+    "SHEBANG.md": "be906ac72cb2eaa74332e0df6b4b30c14d4650dd82cc87bfb82001832fd259c8",
     "SOURCES.md": "f130558217bd581ccff5ed8020d35c7e2e155b59894e6e2fc01dc63e5f1a4aaa",
     "TEMPLATE.md": "29f72a0c4dfeb08a8434fc89440e799bba6a42a933b5819bd6e897af6d15c73b",
     "contract/CHANGELOG.md": "259e5c8321be88832cf2176666a1cdf3c8bb71dff1f538b89351d9938c76d5ec",
@@ -11,19 +11,19 @@
     "guides/contract.md": "8dfbe840b2c17fe73e718971a65913d271f72b5767b1f18b1fca13e2f65cee08",
     "guides/dev.md": "b4440aefeea80efb3d8e9502193d3a73168abcb9bcd9b75a2447af4a06ca9d27",
     "guides/grooming.md": "a3ed64a86c4c0efbd2232cb42521f556452ffb1d1211f9599203360916b317bc",
-    "guides/migrate-to-database.md": "458edf63be655237cea550fde9b42457e960562df104bdb42e66721c74ffb80f",
+    "guides/migrate-to-database.md": "c75d8ffc73c9a622a27003740d3bfe9ee9a6edff2b40e7d1f31b0a6cd829939d",
     "guides/publishing.md": "afe771c3d708ce65092a2e63ccf8360966ce0149c268275bac70e3ee8c46ebf8",
     "guides/reporting.md": "5492d5058213e19738a70ab2be013c62a154238c1bf8c24bfb947bf34d1d0836",
     "guides/repositories.md": "61c593b97dc699a8932892ceacbb86f8231222faa06a6915d0d97f25756d76b2",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
-    "guides/supabase.md": "62a3ab25a7544af8a336f285c6a5a5e2f598a44a72cde7a169706a94e0313eba",
+    "guides/supabase.md": "8ab19359d8f46296b0040a6d65bd182cdf0e837c2b95ddfc62db1df44820afef",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "ac18730167b696e51342fc18fc0165f3fba0e748e4c4e567b57efb362b282cf2",
+    "manager/CHANGELOG.md": "9bab881e36ab4426d87be7b96f9a2c3ba4b58cd2e5989c27d523fa6293526d90",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "58c894b9911e2d2992584e7d93af3d70e7c3266f0a458ab0232cd52f8b7efe67"
+    "sha256": "4873b6db3cd8d5a36bb5bb585b0d531293196c885efd29b7ea163201a0794c35"
   },
   "schema": "capabilities.manager-release.v1"
 }

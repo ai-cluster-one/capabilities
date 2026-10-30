@@ -772,6 +772,64 @@ def test_doctor_says_a_transaction_only_store_has_no_session_address(tmp_path):
     assert (transaction["host"], transaction["port"]) == (POOLER, 6543)
 
 
+
+# --- a declared transaction pooler -----------------------------------------------
+
+BOUNCER = "bouncer.example.test"
+
+
+def test_set_declares_the_one_address_a_transaction_pooler(tmp_path):
+    env = _env(tmp_path)
+    payload = _ok(_manager(env, "store", "set", "--host", BOUNCER, "--port", "6432",
+                           "--database", "app", "--user", "agent", "--transaction-pooler",
+                           "--password-stdin", stdin=PASSWORD + "\n"))
+    written = _written(env)
+    assert written["transaction_pooler"] is True
+    assert not {"transaction_host", "transaction_port"} & set(written)
+    assert payload["setting"]["transaction_pooler"] is True
+    assert payload["setting"]["addresses"] == {
+        "transaction": {"host": BOUNCER, "port": 6432}, "session": None}
+    shown = _ok(_manager(env, "store", "show"))
+    assert shown["setting"]["addresses"]["session"] is None
+    read = _library_reads(env)
+    assert read.transaction_pooler and not read.has_session_address
+    _ok(_manager(env, "store", "set", "--host", BOUNCER, "--port", "6432",
+                 "--database", "app", "--user", "agent",
+                 "--password-stdin", stdin=PASSWORD + "\n"))
+    assert "transaction_pooler" not in _written(env)
+    assert _library_reads(env).has_session_address
+
+
+@pytest.mark.parametrize("args", [("--transaction-pooler", "--session-port", "5432"),
+                                  ("--transaction-pooler", "--transaction-port", "6543"),
+                                  ("--transaction-pooler=yes",),
+                                  ("--transaction-pooler", "--transaction-pooler")])
+def test_set_refuses_the_declaration_beside_a_second_address(tmp_path, args):
+    env = _env(tmp_path)
+    result = _set(env, *args)
+    _no_secret(result)
+    assert result.returncode == 6 and _error(result)["code"] == "input"
+    assert _nothing_written(env)
+
+
+def test_doctor_says_a_declared_store_has_no_session_address(tmp_path):
+    """Nothing answers at the loopback hostaddr; what is under test is which
+    addresses the doctor proves and what it says."""
+    env = _env(tmp_path)
+    url = (f"postgresql://agent@{BOUNCER}:6432/app?hostaddr=127.0.0.1"
+           "&sslmode=require&connect_timeout=2")
+    result = _manager(env, "store", "doctor", extra={
+        "AGENTKIT_DB_URL": url, "AGENTKIT_DB_TRANSACTION_POOLER": "true"})
+    assert result.returncode == 7, result.stdout + result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["addresses"]["session"] is None
+    assert "no session address" in payload["addresses"]["statement"]
+    session = payload["checks"]["session"]
+    assert session["ok"] is True and session["skipped"] is True
+    assert "declared a transaction pooler" in session["reason"]
+    assert (payload["checks"]["transaction"]["host"],
+            payload["checks"]["transaction"]["port"]) == (BOUNCER, 6432)
+
 # --- doctor -----------------------------------------------------------------------
 
 def test_doctor_passes_when_tls_works_and_plain_text_is_refused(tmp_path, enforced):

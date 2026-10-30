@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.37,<1",
+#     "capabilities-contract>=0.38,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -83,7 +83,7 @@ ENVIRONMENT
   AGENTKIT_DB_URL, AGENTKIT_DB_HOST, AGENTKIT_DB_PORT, AGENTKIT_DB_NAME,
   AGENTKIT_DB_USER, AGENTKIT_DB_PASSWORD, AGENTKIT_DB_SCHEMA,
   AGENTKIT_DB_SSLMODE, AGENTKIT_DB_SSLROOTCERT, AGENTKIT_DB_TRANSACTION_HOST,
-  AGENTKIT_DB_TRANSACTION_PORT
+  AGENTKIT_DB_TRANSACTION_PORT, AGENTKIT_DB_TRANSACTION_POOLER
                        the environment level of the database cascade, below a
                        project's .env.local/.env and above the machine's store
                        setting (see STORE VERBS).
@@ -364,12 +364,14 @@ STORE VERBS
                  (~/.config/agentkit/store.json when XDG_CONFIG_HOME is unset),
                  an agentkit.store.v1 document holding host, port, database,
                  user, password, sslmode, an optional sslrootcert, an
-                 optional db_schema (default agentkit) and an optional
-                 transaction_host and transaction_port, at mode 0600. Its
-                 format is SHEBANG.md's "The store setting".
+                 optional db_schema (default agentkit), an optional
+                 transaction_host and transaction_port, and an optional
+                 transaction_pooler, at mode 0600. Its format is
+                 SHEBANG.md's "The store setting".
   Within the project or environment level AGENTKIT_DB_URL, a postgresql://
-  URL, wins over that level's separate keys; AGENTKIT_DB_SCHEMA and the
-  transaction address apply beside it.
+  URL, wins over that level's separate keys; AGENTKIT_DB_SCHEMA, the
+  transaction address and the transaction pooler declaration apply beside
+  it.
   The store's transaction address is its main, required address: every
   connection - each command, the records reader, a lease renewal, a
   service's questions - goes there and carries no session state, and it is
@@ -385,7 +387,13 @@ STORE VERBS
   address as the address; one naming only a port keeps the host). A known
   transaction pooler (a Supabase pooler host on port 6543) as the one
   address is a transaction-only store: it has no session address, and
-  nothing needs one. A hosted store with a session-mode pooler beside it
+  nothing needs one. Any other transaction-mode pooler as the one address
+  is a transaction-only store once the level declares it
+  (AGENTKIT_DB_TRANSACTION_POOLER=true, or transaction_pooler true in the
+  file, never beside a transaction address); declare it only once every
+  tool on the machine reads it, since an older library refuses a file or
+  project level carrying it and ignores the key in the environment
+  (capabilities guide migrate-to-database). A hosted store with a session-mode pooler beside it
   may name that as --session-port (or --session-host). An agent's records -
   its gate, connections, grants, identifiers and settings - are files only
   until it has moved into the store (see migrate); from then they are rows
@@ -396,6 +404,7 @@ STORE VERBS
             [--sslrootcert PATH|system] [--schema NAME]
             [--session-host H] [--session-port P]
             [--transaction-host H] [--transaction-port P]
+            [--transaction-pooler]
             (--password-stdin | --password-file PATH | --password-env KEY)
         Write the machine level: the setting file whole (a temporary file
         renamed over it, mode 0600) under the manager's lock, in the format
@@ -420,7 +429,11 @@ STORE VERBS
         and --transaction-port, the older form, name the transaction address
         apart with --host and --port as the session address; the two forms
         are not mixed (exit 6 input). Without either the store has one
-        address. Exit 4 under the read-only switch. Answers as `store show`
+        address. --transaction-pooler, taking no value, declares that one
+        address a transaction pooler (transaction_pooler true in the file):
+        the store is then transaction-only, as one on Supabase's transaction
+        pooler is; it is not given beside --session-* or --transaction-*
+        (exit 6 input). Exit 4 under the read-only switch. Answers as `store show`
         does for the current project, with changed.
   store show [--project PATH] [--json]
         Every level of the cascade for the current project, or for the
@@ -432,7 +445,7 @@ STORE VERBS
         environment {answers, setting, error}, machine {path, exists,
         answers, setting, error}}}: setting is the library's report of the
         level in force {level, sources, schema, transaction {host, port}?,
-        addresses {transaction {host, port}, session {host, port} | null},
+        transaction_pooler: true?, addresses {transaction {host, port}, session {host, port} | null},
         url{...} | host, port, database, user, sslmode, sslrootcert,
         password}, addresses naming the address each kind of connection
         dials, session null for a transaction-only store; error {code,
@@ -6575,7 +6588,8 @@ def cmd_dev_start(name: str, source_ref: str | None, project_ref: str | None,
 DEV_DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_DB_NAME",
                "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
                "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT",
-               "AGENTKIT_DB_TRANSACTION_HOST", "AGENTKIT_DB_TRANSACTION_PORT")
+               "AGENTKIT_DB_TRANSACTION_HOST", "AGENTKIT_DB_TRANSACTION_PORT",
+               "AGENTKIT_DB_TRANSACTION_POOLER")
 # The tables a `dev run` projects an attached project's rows of one capability
 # through, each with the column naming the capability.
 DEV_PROJECTED_TABLES = (("capabilities_policy", "capability"),
@@ -6610,6 +6624,8 @@ def _dev_database(session: dict):
         keys["AGENTKIT_DB_TRANSACTION_HOST"] = setting.transaction_host
     if setting.transaction_port is not None:
         keys["AGENTKIT_DB_TRANSACTION_PORT"] = str(setting.transaction_port)
+    if setting.transaction_pooler:
+        keys["AGENTKIT_DB_TRANSACTION_POOLER"] = "true"
     if setting.url is not None:
         keys["AGENTKIT_DB_URL"] = setting.url
     else:
@@ -16615,6 +16631,7 @@ STORE_VALUE_OPTIONS = {
     "--session-host": "session_host", "--session-port": "session_port",
 }
 STORE_SCHEMA_OPTION = "--schema"
+STORE_POOLER_OPTION = "--transaction-pooler"
 STORE_PASSWORD_OPTIONS = ("--password-stdin", "--password-file", "--password-env")
 # What a plain-text attempt reads when pg_hba.conf turns it away for lacking
 # TLS: "no encryption" from Postgres 14 on, "SSL off" before it.
@@ -16643,6 +16660,14 @@ def _store_set_args(args: list[str]) -> tuple[dict, tuple[str, str | None]]:
             if eq:
                 _die(6, "input", "--password-stdin takes no value")
             sources.append(("stdin", None))
+            i += 1
+            continue
+        if name == STORE_POOLER_OPTION:
+            if eq:
+                _die(6, "input", f"{name} takes no value")
+            if "transaction_pooler" in values:
+                _die(6, "input", f"{name} is given twice")
+            values["transaction_pooler"] = True
             i += 1
             continue
         if name not in STORE_VALUE_OPTIONS and name not in STORE_PASSWORD_OPTIONS \
@@ -16674,6 +16699,14 @@ def _store_set_args(args: list[str]) -> tuple[dict, tuple[str, str | None]]:
              "are two ways to name the same two addresses and are not mixed",
              "name the store's address with --host/--port and its optional session "
              "address with --session-host/--session-port")
+    if "transaction_pooler" in values and {"session_host", "session_port", "transaction_host",
+                                           "transaction_port"} & set(values):
+        _die(6, "input",
+             "--transaction-pooler declares the store's one address a transaction pooler "
+             "and is not given beside --session-host/--session-port or "
+             "--transaction-host/--transaction-port",
+             "name the pooler with --host/--port and --transaction-pooler alone, or give "
+             "the store a session address apart without --transaction-pooler")
     if len(sources) != 1:
         _die(6, "password_source",
              "`capabilities store set` needs exactly one password source",
@@ -17056,10 +17089,12 @@ def _store_session_check(setting, plain_allowed: bool) -> dict:
     text, is bound to the setting's schema. A store with no session address
     has nothing to prove, and says what that means."""
     if not setting.has_session_address:
+        declared = (", its one address being declared a transaction pooler"
+                    if setting.transaction_pooler else "")
         return {"ok": True, "skipped": True,
-                "reason": "the store has no session address: every connection goes to "
-                          "its transaction address, changes are noticed by polling "
-                          "about every second, and nothing needs a session"}
+                "reason": f"the store has no session address{declared}: every connection "
+                          "goes to its transaction address, changes are noticed by "
+                          "polling about every second, and nothing needs a session"}
     return _store_connection_check(setting, plain_allowed, transaction=False)
 
 

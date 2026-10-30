@@ -12243,6 +12243,8 @@ def _setting_env(setting) -> dict:
                        ("AGENTKIT_DB_TRANSACTION_PORT", getattr(setting, "transaction_port", None))):
         if value not in (None, ""):
             env[key] = str(value)
+    if getattr(setting, "transaction_pooler", False):
+        env["AGENTKIT_DB_TRANSACTION_POOLER"] = "true"
     if setting.url is not None:
         env["AGENTKIT_DB_URL"] = setting.url
         return env

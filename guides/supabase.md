@@ -29,6 +29,8 @@ Each command replaces the whole setting. `capabilities store show` names the two
 
 The earlier two-address setup - the session pooler as `--host`/`--port` and the transaction pooler as `--transaction-port 6543` - writes the same file as the second command and keeps working; it is no longer needed.
 
+Supabase's transaction pooler is recognised by its host and port 6543, so it needs no declaration. A transaction pooler of any other kind as the store's one address - a self-hosted connection pooler in transaction mode, or another provider's transaction-mode pool - is declared with `--transaction-pooler` beside `--host` and `--port`, and the store is then transaction-only as it is here; see `capabilities guide migrate-to-database` for when it may be set.
+
 ## The session locks end on 2027-01-05
 
 Until 2027-01-05, tasks and memory still take transitional session locks where the store has a session address, because earlier releases of them read those locks. On that date the locks are retired. Until then, `tasks doctor` names a machine where an earlier tasks service still serves against the store, and `memory doctor` one where an earlier memory is grooming; update those machines before 2027-01-05.

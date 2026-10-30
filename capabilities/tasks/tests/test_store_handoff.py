@@ -97,6 +97,26 @@ def test_separate_fields_are_handed_as_separate_fields():
         "AGENTKIT_DB_SSLMODE": "verify-full", "AGENTKIT_DB_PASSWORD": "pw"}
 
 
+
+def test_a_declared_transaction_pooler_is_handed_on():
+    from capabilities_contract import db
+
+    setting = db.Setting(schema="s1", level="machine", host="pool.internal", port=6432,
+                         database="d1", user="u1", sslmode="require",
+                         transaction_pooler=True)
+    handed = mod._setting_env(setting)
+    assert handed["AGENTKIT_DB_TRANSACTION_POOLER"] == "true"
+    saved = dict(os.environ)
+    try:
+        for key in db.KEYS:
+            os.environ.pop(key, None)
+        os.environ.update(handed)
+        again = db.resolve_setting(None)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    assert again.transaction_pooler and not again.has_session_address
+
 def test_a_turn_reads_its_projects_env_files_but_not_their_store(project, monkeypatch):
     monkeypatch.setenv(mod._RECEIPT_ENV, str(project / "claim.json"))
     monkeypatch.delenv("PROJECT_ONLY", raising=False)
