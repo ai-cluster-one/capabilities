@@ -1052,18 +1052,80 @@ def test_doctor_passes_a_local_store_reached_without_tls(tmp_path, enforced):
     assert payload["checks"]["schema"]["ok"] is True
 
 
-def test_doctor_fails_when_the_server_accepts_plain_text(tmp_path, enforced):
+def test_doctor_warns_when_the_server_accepts_plain_text(tmp_path, enforced):
+    """A client at sslmode require never sends plain text, so a server that
+    would accept it is named as a warning rather than failing the store."""
     env = _env(tmp_path)
     _set_cluster(env, enforced)
     enforced.hba(PLAIN_HBA)
     result = _manager(env, "store", "doctor")
     _no_secret(result)
-    assert result.returncode == 7, result.stdout + result.stderr
-    payload = json.loads(result.stdout)
-    assert payload["ok"] is False
+    payload = _ok(result)
+    assert payload["ok"] is True
     assert payload["checks"]["tls"]["ok"] is True
     plain = payload["checks"]["plain_text_refused"]
-    assert plain["ok"] is False and "plain-text connection" in plain["reason"]
+    assert plain["ok"] is True and plain["warning"] is True
+    assert "plain-text connection" in plain["reason"]
+    assert payload["warnings"] == ["plain_text_refused"]
+
+
+PGBOUNCER_ENV = "CAPABILITIES_TEST_PGBOUNCER"
+
+
+@pytest.fixture()
+def tls_bouncer(enforced, tmp_path):
+    """PgBouncer in front of the cluster with client_tls_sslmode require, which
+    turns a plain-text client away with `SSL required`. Skipped unless
+    CAPABILITIES_TEST_PGBOUNCER names a pgbouncer executable."""
+    binary = os.environ.get(PGBOUNCER_ENV)
+    if not binary or not Path(binary).is_file():
+        pytest.skip(f"{PGBOUNCER_ENV} does not name a pgbouncer executable")
+    folder = tmp_path / "bouncer"
+    folder.mkdir()
+    port = _free_port()
+    secret = PASSWORD.replace('"', '""')
+    (folder / "users.txt").write_text(f'"agent" "{secret}"\n')
+    (folder / "pgbouncer.ini").write_text(
+        "[databases]\n"
+        f"app = host=127.0.0.1 port={enforced.port} dbname=app\n"
+        "[pgbouncer]\n"
+        f"listen_addr = 127.0.0.1\nlisten_port = {port}\nunix_socket_dir =\n"
+        f"auth_type = scram-sha-256\nauth_file = {folder / 'users.txt'}\n"
+        "client_tls_sslmode = require\n"
+        f"client_tls_cert_file = {enforced.cert}\n"
+        f"client_tls_key_file = {enforced.root / 'server.key'}\n"
+        "server_tls_sslmode = require\n"
+        f"logfile = {folder / 'pgbouncer.log'}\n")
+    proc = subprocess.Popen([binary, str(folder / "pgbouncer.ini")],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 15
+    try:
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                break
+            except OSError:
+                assert time.monotonic() < deadline and proc.poll() is None
+                time.sleep(0.1)
+        yield port
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_doctor_passes_a_pooler_that_refuses_plain_text_as_ssl_required(tmp_path,
+                                                                         tls_bouncer):
+    env = _env(tmp_path)
+    _ok(_manager(env, "store", "set", "--host", REMOTE_NAME, "--port", str(tls_bouncer),
+                 "--database", "app", "--user", "agent",
+                 "--password-stdin", stdin=PASSWORD + "\n"))
+    result = _manager(env, "store", "doctor", "--json")
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["ok"] is True and payload["checks"]["tls"]["ok"] is True
+    plain = payload["checks"]["plain_text_refused"]
+    assert plain["ok"] is True and "SSL required" in plain["reason"]
+    assert "warning" not in plain and payload["warnings"] == []
 
 
 def test_doctor_with_one_address_skips_the_transaction_check(tmp_path, enforced):

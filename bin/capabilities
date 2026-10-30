@@ -464,8 +464,11 @@ STORE VERBS
         Prove the database in force for the current project, or for the
         project at PATH, whichever level answered: a TLS connection works,
         reporting the server version and the negotiated TLS; a plain-text
-        connection to the same server is refused, so a pg_hba.conf that lets
-        plain text back in is noticed; and the role may use the setting's
+        connection to the same server is refused, so a server that lets
+        plain text back in is noticed - for a client whose sslmode is require
+        or stronger, which never sends plain text, that is a warning rather
+        than a failure: plain_text_refused stays ok with warning true and its
+        reason, and warnings names the check; and the role may use the setting's
         schema - USAGE and CREATE on it when it exists, CREATE on the
         database when it does not yet, since the first migration creates it.
         A database on a local host is not reached across a network: its
@@ -484,10 +487,10 @@ STORE VERBS
         in_force, setting, levels, sslmode, db_schema, addresses
         {transaction {host, port}, session {host, port} | null, statement},
         checks {tls {ok, server_version?, tls {version, cipher}?, reason?,
-        error?}, plain_text_refused {ok, reason, skipped?}, schema {ok, name,
+        error?}, plain_text_refused {ok, reason, skipped?, warning?}, schema {ok, name,
         exists, reason}, transaction {ok, skipped?, host?, port?, tls?,
         reason?, error?}, session {ok, skipped?, host?, port?, tls?, reason?,
-        error?}}}, setting and levels as `store show`.
+        error?}}, warnings [check name]}, setting and levels as `store show`.
         Exit 0 when every check holds, 7 when any fails, 3 no_store_setting when
         no level answers, 6 with the library's code when the level in force
         is refused.
@@ -16757,9 +16760,12 @@ STORE_VALUE_OPTIONS = {
 STORE_SCHEMA_OPTION = "--schema"
 STORE_POOLER_OPTION = "--transaction-pooler"
 STORE_PASSWORD_OPTIONS = ("--password-stdin", "--password-file", "--password-env")
-# What a plain-text attempt reads when pg_hba.conf turns it away for lacking
-# TLS: "no encryption" from Postgres 14 on, "SSL off" before it.
-STORE_PLAIN_REFUSAL_MARKERS = ("no encryption", "SSL off")
+# What a plain-text attempt reads when the server turns it away for lacking
+# TLS: "no encryption" from pg_hba.conf on Postgres 14 on, "SSL off" before
+# it, and "SSL required" from PgBouncer with client_tls_sslmode require.
+STORE_PLAIN_REFUSAL_MARKERS = ("no encryption", "SSL off", "SSL required")
+# The sslmodes under which the client opens no connection without TLS.
+STORE_TLS_ONLY_SSLMODES = ("require", "verify-ca", "verify-full")
 
 
 def _store_set_args(args: list[str]) -> tuple[dict, tuple[str, str | None]]:
@@ -17461,17 +17467,23 @@ def cmd_store_doctor(project: str | None) -> None:
                  "reason": "not checked: the database is on this machine "
                            f"({host or 'local socket'}), not reached across a network"}
     else:
+        # A client whose sslmode requires TLS never reaches the store in plain
+        # text, so what the server does with a plain attempt is a warning about
+        # the server, not a failure of this store.
+        tls_only = sslmode in STORE_TLS_ONLY_SSLMODES
         plain_found, plain_error = _store_probe(setting, sslmode="disable")
         if plain_found is not None:
-            plain = {"ok": False,
-                     "reason": "the server accepted a plain-text connection: its "
-                               "pg_hba.conf lets a client in without TLS"}
+            plain = {"ok": tls_only, "warning": tls_only,
+                     "reason": "the server accepted a plain-text connection: it "
+                               "lets a client in without TLS"}
         elif any(marker in plain_error for marker in STORE_PLAIN_REFUSAL_MARKERS):
             plain = {"ok": True, "reason": plain_error}
         else:
-            plain = {"ok": False,
+            plain = {"ok": tls_only, "warning": tls_only,
                      "reason": "the plain-text attempt failed, but not as a refusal "
                                f"for lacking TLS: {plain_error}"}
+        if not plain.get("warning"):
+            plain.pop("warning", None)
     if tls["ok"]:
         schema = _store_schema_check(setting)
     else:
@@ -17488,6 +17500,8 @@ def cmd_store_doctor(project: str | None) -> None:
            "addresses": _store_addresses_statement(setting),
            "checks": {"tls": tls, "plain_text_refused": plain, "schema": schema,
                       "transaction": transaction, "session": session}}
+    out["warnings"] = [name for name, check in out["checks"].items()
+                       if check.get("warning")]
     _emit(out)
     if not out["ok"]:
         sys.exit(7)
