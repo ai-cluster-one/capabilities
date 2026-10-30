@@ -279,6 +279,53 @@ def test_remote_source_catalog_search_and_install(tmp_path):
         clone_env, "source", "check", "personal").stdout)["ok"] is True
 
 
+def test_search_fetches_the_official_source_a_fresh_machine_has_not_cached(tmp_path):
+    author_env = _env(tmp_path / "author")
+    _run(author_env, "source", "init", "personal")
+    created = json.loads(_run(
+        author_env, "new", "demo", "--source", "personal").stdout)
+    script = Path(created["executable"])
+    script.write_text(script.read_text().replace(
+        "TODO: describe the capability's smallest useful surface.",
+        "Test capability with a completed managed manifest.",
+    ).replace("Replace this scaffold check with", "Test readiness uses"))
+    _run(author_env, "source", "index", "personal")
+    workspace = tmp_path / "author" / "registry" / "sources" / "personal"
+    _git(workspace, "add", ".")
+    _commit(workspace, "Add demo")
+
+    # An installed manager sits outside any checkout, so the official source is
+    # its cache clone; git is pointed from the official URL to the local source.
+    machine = tmp_path / "machine"
+    manager = machine / "registry" / ".manager" / "capabilities"
+    manager.parent.mkdir(parents=True)
+    shutil.copy2(MANAGER, manager)
+    env = _env(machine)
+    official = "https://github.com/ai-cluster-one/capabilities.git"
+
+    def search(remote: Path):
+        return subprocess.run(
+            [str(manager), "search", "--json"], cwd=machine,
+            env={**env, "GIT_CONFIG_COUNT": "1",
+                 "GIT_CONFIG_KEY_0": f"url.{remote}.insteadOf",
+                 "GIT_CONFIG_VALUE_0": official},
+            text=True, capture_output=True, timeout=120)
+
+    unreachable = search(tmp_path / "nowhere")
+    assert unreachable.returncode == 0, unreachable.stderr
+    assert json.loads(unreachable.stdout) == {"matches": [], "unavailable_sources": [
+        {"source": "official", "hint": "capabilities source refresh official"}]}
+
+    fetched = search(workspace)
+    assert fetched.returncode == 0, fetched.stderr
+    answer = json.loads(fetched.stdout)
+    assert answer["unavailable_sources"] == []
+    assert [(row["name"], row["source"]) for row in answer["matches"]] == [
+        ("demo", "official")]
+    assert (machine / "cache" / "capabilities" / "sources" / "official"
+            / ".capability-source" / "catalog.json").is_file()
+
+
 def test_a_bundle_icon_is_checked_catalogued_and_read_through_the_manager(tmp_path):
     import struct
     import zlib

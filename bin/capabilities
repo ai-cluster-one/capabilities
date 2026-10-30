@@ -294,7 +294,8 @@ MACHINE VERBS
         effective "disabled" with source "machine". Every row carries `icon`,
         true when the installed capability carries one (see icon).
   search [QUERY] [--source ID]
-        Search cached catalogues from the official and registered sources.
+        Search cached catalogues from the official and registered sources;
+        the official source is fetched first when it has no local copy yet.
         Listing never executes catalogue capability code. JSON {matches [{name,
         source, summary, installed, icon}], unavailable_sources [{source,
         hint}]}. Every row carries installed: true when a capability of that
@@ -28396,6 +28397,11 @@ def cmd_search(query: str | None, source_id: str | None) -> None:
     unavailable = []
     for sid in ids:
         root = _source_author_root(sid)
+        # The built-in source is registered on every machine but fetched by no
+        # step of its own, so the first read of it fetches it; a fetch that
+        # fails leaves it unavailable, as a missing tree always was.
+        if sid == OFFICIAL_SOURCE_ID and not root.is_dir():
+            _captured(_refresh_source, sid)
         catalog = _read_json(root / ".capability-source" / "catalog.json") if root.is_dir() else None
         if not isinstance(catalog, dict) or not isinstance(catalog.get("capabilities"), dict):
             unavailable.append({"source": sid,
