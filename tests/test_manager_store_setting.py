@@ -22,6 +22,7 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -829,6 +830,99 @@ def test_doctor_says_a_declared_store_has_no_session_address(tmp_path):
     assert "declared a transaction pooler" in session["reason"]
     assert (payload["checks"]["transaction"]["host"],
             payload["checks"]["transaction"]["port"]) == (BOUNCER, 6432)
+
+
+# A running process keeps the capabilities-contract it started with, and one
+# before 0.38.0 refuses a file carrying the declaration whole: a process
+# reading this machine's file is stood in for by a Python run from an
+# environment holding the library at a chosen version.
+
+def _library_environment(where: Path, version: str) -> Path:
+    """An environment's interpreter, with capabilities-contract `version`."""
+    (where / "bin").mkdir(parents=True, exist_ok=True)
+    python = where / "bin" / "python3"
+    if not python.exists():
+        python.symlink_to(shutil.which("python3") or sys.executable)
+    (where / "lib" / "python3.12" / "site-packages"
+     / f"capabilities_contract-{version}.dist-info").mkdir(parents=True)
+    return python
+
+
+def _reader(python: Path, env: dict) -> subprocess.Popen:
+    """A process that runs until it is ended, seen by `ps` once it answers."""
+    process = subprocess.Popen([str(python), "-c", "import time; time.sleep(300)"],
+                               env=env)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        seen = subprocess.run(["ps", "-o", "args=", "-p", str(process.pid)],
+                              capture_output=True, text=True).stdout
+        if str(python) in seen:
+            return process
+        time.sleep(0.1)
+    process.kill()
+    raise AssertionError("the reader never showed in ps")
+
+
+def _set_pooler(env: dict) -> subprocess.CompletedProcess:
+    return _manager(env, "store", "set", "--host", BOUNCER, "--port", "6432",
+                    "--database", "app", "--user", "agent", "--transaction-pooler",
+                    "--password-stdin", stdin=PASSWORD + "\n")
+
+
+def test_set_refuses_the_declaration_while_a_reader_holds_an_older_library(tmp_path):
+    env = _env(tmp_path)
+    reader = _reader(_library_environment(tmp_path / "older", "0.37.0"), env)
+    try:
+        result = _set_pooler(env)
+        _no_secret(result)
+        assert result.returncode == 6, result.stdout + result.stderr
+        error = _error(result)
+        assert error["code"] == "store_readers_behind"
+        assert f"pid {reader.pid} " in error["message"]
+        assert "capabilities-contract 0.37.0" in error["message"]
+        assert _nothing_written(env)
+        _ok(_set(env))
+        assert "transaction_pooler" not in _written(env)
+    finally:
+        reader.kill()
+        reader.wait()
+
+
+def test_set_refuses_the_declaration_while_a_reader_started_before_its_library(tmp_path):
+    env = _env(tmp_path)
+    where = tmp_path / "replaced"
+    (where / "bin").mkdir(parents=True)
+    (where / "bin" / "python3").symlink_to(shutil.which("python3") or sys.executable)
+    reader = _reader(where / "bin" / "python3", env)
+    try:
+        time.sleep(2)
+        _library_environment(where, "0.38.0")
+        result = _set_pooler(env)
+        assert result.returncode == 6, result.stdout + result.stderr
+        error = _error(result)
+        assert error["code"] == "store_readers_behind"
+        assert f"pid {reader.pid} " in error["message"]
+        assert "before 0.38.0 replaced it" in error["message"]
+        assert _nothing_written(env)
+    finally:
+        reader.kill()
+        reader.wait()
+
+
+def test_set_declares_it_beside_current_readers_and_those_of_another_file(tmp_path):
+    env = _env(tmp_path)
+    current = _library_environment(tmp_path / "current", "0.38.0")
+    elsewhere = _library_environment(tmp_path / "elsewhere", "0.37.0")
+    time.sleep(2)
+    readers = [_reader(current, env),
+               _reader(elsewhere, {**env, "XDG_CONFIG_HOME": str(tmp_path / "other")})]
+    try:
+        _ok(_set_pooler(env))
+        assert _written(env)["transaction_pooler"] is True
+    finally:
+        for reader in readers:
+            reader.kill()
+            reader.wait()
 
 # --- doctor -----------------------------------------------------------------------
 

@@ -433,8 +433,17 @@ STORE VERBS
         address a transaction pooler (transaction_pooler true in the file):
         the store is then transaction-only, as one on Supabase's transaction
         pooler is; it is not given beside --session-* or --transaction-*
-        (exit 6 input). Exit 4 under the read-only switch. Answers as `store show`
-        does for the current project, with changed.
+        (exit 6 input). Since a capabilities-contract before 0.38.0 refuses
+        such a file whole, and a running process keeps the copy it started
+        with after `update` replaces it, --transaction-pooler is refused,
+        writing nothing, while a process of this OS user that reads the
+        same file runs Python from an environment whose capabilities-contract
+        is older or was replaced after the process started - a node
+        manager, a service's supervisor, a service: exit 6
+        store_readers_behind, naming each by pid, command, start and
+        library; restart them on the release installed now and set again.
+        Exit 4 under the read-only switch. Answers as `store show` does for
+        the current project, with changed.
   store show [--project PATH] [--json]
         Every level of the cascade for the current project, or for the
         project at PATH: what each level holds, its secrets redacted (a
@@ -17029,6 +17038,132 @@ def _store_setting_document(values: dict, schema: str | None) -> dict:
     return document
 
 
+# A file declaring its one address a transaction pooler is refused whole by a
+# capabilities-contract before this one, and a running process keeps the copy
+# it started with even after `update` replaces it in its environment: a node
+# manager, a service's supervisor or a service started before then stops
+# reading the store the moment the file carries the declaration. `store set`
+# therefore writes it only while no process reading the same file holds one.
+STORE_POOLER_LIBRARY = "0.38.0"
+STORE_POOLER_NAMED = 12
+
+
+def _process_seconds(etime: str) -> int | None:
+    """Seconds a process has run, from `ps`'s etime ([[dd-]hh:]mm:ss)."""
+    days, _sep, clock = etime.rpartition("-")
+    parts = clock.split(":")
+    if not (2 <= len(parts) <= 3 and all(p.isdigit() for p in parts)
+            and (not days or days.isdigit())):
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds + int(days or 0) * 86400
+
+
+def _process_setting_path(pid: int) -> Path:
+    """The machine store setting file the process `pid` reads, from its
+    HOME and XDG_CONFIG_HOME; its owner's home where they cannot be read."""
+    found: dict[str, str] = {}
+    try:
+        for item in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"):
+            key, _sep, value = item.decode(errors="replace").partition("=")
+            if key in ("HOME", "XDG_CONFIG_HOME"):
+                found[key] = value
+    except OSError:
+        try:
+            done = subprocess.run(["ps", "-E", "-ww", "-o", "command=", "-p", str(pid)],
+                                  stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, timeout=30)
+            for key, value in re.findall(r"(?:^|\s)(HOME|XDG_CONFIG_HOME)=(\S+)",
+                                         done.stdout):
+                found.setdefault(key, value)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    config = found.get("XDG_CONFIG_HOME")
+    if not config:
+        config = os.path.join(found.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir,
+                              ".config")
+    return Path(os.path.abspath(config)) / "agentkit" / "store.json"
+
+
+def _store_pooler_unread() -> list[dict]:
+    """The processes of this OS user that read the machine store setting file
+    with a capabilities-contract that does not read a transaction pooler
+    declaration: each runs Python from an environment holding the library,
+    and that copy is older than STORE_POOLER_LIBRARY or was written into the
+    environment after the process started, so it holds whatever was there
+    before. Each {pid, command, started_at, library, replaced}."""
+    from packaging.version import InvalidVersion, Version
+    try:
+        done = subprocess.run(["ps", "-A", "-o", "pid=,uid=,etime=,args="],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                              timeout=30, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    target = _db_module().setting_path()
+    now = time.time()
+    found = []
+    for line in done.stdout.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) != 4 or not fields[0].isdigit() or fields[1] != str(os.getuid()):
+            continue
+        pid, seconds, words = int(fields[0]), _process_seconds(fields[2]), fields[3].split()
+        interpreter = Path(words[0]) if words else None
+        if (pid == os.getpid() or seconds is None or interpreter is None
+                or not interpreter.name.startswith("python")
+                or interpreter.parent.name != "bin"):
+            continue
+        dists = sorted(interpreter.parent.parent.glob(
+            "lib/python*/site-packages/capabilities_contract-*.dist-info"))
+        if not dists:
+            continue
+        dist = dists[-1]
+        version = dist.name[len("capabilities_contract-"):-len(".dist-info")]
+        try:
+            # Its change time, which a copy cloned from uv's cache does not
+            # carry over the way it carries the modification time.
+            written = dist.stat().st_ctime
+            older = Version(version) < Version(STORE_POOLER_LIBRARY)
+        except (OSError, InvalidVersion):
+            continue
+        started = now - seconds
+        replaced = written > started
+        if not (older or replaced) or _process_setting_path(pid) != target:
+            continue
+        found.append({"pid": pid, "command": " ".join(words[1:] or words)[:200],
+                      "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                  time.gmtime(started)),
+                      "library": version, "replaced": replaced})
+    return found
+
+
+def _refuse_pooler_unread() -> None:
+    """Refuse a transaction pooler declaration while a process here reading
+    the same file would refuse it, naming each one, and write nothing."""
+    unread = _store_pooler_unread()
+    if not unread:
+        return
+    named = "; ".join(
+        f"pid {p['pid']} `{p['command']}`, started {p['started_at']}, "
+        + (f"holding the capabilities-contract it had before {p['library']} replaced it"
+           if p["replaced"] else f"on capabilities-contract {p['library']}")
+        for p in unread[:STORE_POOLER_NAMED])
+    if len(unread) > STORE_POOLER_NAMED:
+        named += f"; and {len(unread) - STORE_POOLER_NAMED} more"
+    _die(6, "store_readers_behind",
+         f"--transaction-pooler writes a setting that a capabilities-contract before "
+         f"{STORE_POOLER_LIBRARY} refuses whole, and {len(unread)} running "
+         f"process{'es' if len(unread) != 1 else ''} reading this machine's setting "
+         f"hold{'s' if len(unread) == 1 else ''} one, so the setting is left as it is: "
+         + named,
+         "bring each onto the release installed now, then run store set again: "
+         "`capabilities update` brings an environment to capabilities-contract "
+         f"{STORE_POOLER_LIBRARY}, `capabilities service restart <name>` restarts a "
+         "service with its supervisor, and the node manager (`node run`) restarts with "
+         "its own job (`launchctl kickstart -k gui/$(id -u)/capabilities.node` on a Mac)")
+
+
 def _write_store_setting_locked(document: dict) -> bool:
     """Write the machine file whole."""
     path = _db_module().setting_path()
@@ -17079,6 +17214,8 @@ def cmd_store_set(args: list[str]) -> None:
         values["sslrootcert"] = str(path)
     schema = values.pop("db_schema", None)
     document = _store_setting_document(values, schema)
+    if document.get("transaction_pooler"):
+        _refuse_pooler_unread()
     document["password"] = _store_password(source)
     changed = _with_store_lock(lambda: _write_store_setting_locked(document))
     _emit({**_store_report(_project_root())[0], "changed": changed})
