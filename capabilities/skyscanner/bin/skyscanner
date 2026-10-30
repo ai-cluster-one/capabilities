@@ -1,0 +1,1034 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx[http2]>=0.27",
+#     "capabilities-contract>=0.8,<1",
+# ]
+# ///
+"""skyscanner — Skyscanner flight search over plain HTTP: resolve places, search
+live itineraries with their prices, comfort facts and booking links, and read
+the cached cheapest price per day. Read-only; agent-invoked; every answer is
+JSON on stdout.
+
+USAGE
+  skyscanner <command> [options]     Run one verb against the selected connection.
+  skyscanner help                    Print this contract.
+
+MODEL
+  skyscanner calls the endpoints Skyscanner's own website calls on
+  https://www.skyscanner.net (autosuggest, the unified flight search and the
+  price calendar), as a browser would: a Chrome user agent and the
+  x-skyscanner-market, -locale, -currency and -channelid headers. There is no
+  Skyscanner account, key or login; the answers are Skyscanner's public prices.
+
+  Skyscanner's bot protection blocks an IP address that searches too often:
+  from one address, expect a block after roughly 15 to 25 searches in half an
+  hour, lifting on its own some minutes later. A blocked request answers 403,
+  which skyscanner reports as exit 7 `blocked`. The remedy is a fresh IP
+  address, not a browser session: a connection that names an Oxylabs
+  residential proxy sends every request through it, and each request then
+  leaves from another residential address in the chosen country unless the
+  connection asks for sticky sessions. Skyscanner flags single residential
+  addresses too, so through a proxy a 403 is tried again from a new exit
+  address, up to 3 times, each named on stderr, before skyscanner reports
+  `blocked`; direct, the first 403 is reported. `skyscanner guide oxylabs`
+  teaches the proxy fields, how they compose, and how to test the exit
+  address.
+
+  Market, currency and locale shape every answer. The market is the country
+  site: it chooses which booking agents are offered, so prices differ slightly
+  between markets for the same currency. The currency is the one every price
+  comes back in. The locale is the language of place names and labels.
+
+CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. A connection is how skyscanner reaches Skyscanner: optionally
+  through one Oxylabs residential proxy user, and with the market, currency
+  and locale its answers use. The fields are listed at the end of this help.
+
+  With no oxylabs_username the connection goes direct from this machine's
+  address, and `doctor` warns about the block. With one, every request goes
+  through the Oxylabs residential proxy, and skyscanner composes the proxy
+  username itself from oxylabs_username, oxylabs_country and, when set,
+  oxylabs_session_minutes (a fresh session id for every invocation, so the
+  requests of one search share one exit address). oxylabs_username is the
+  proxy user's own name, without the customer- prefix or any parameter;
+  `skyscanner guide oxylabs` shows the composition, country targeting,
+  sticky sessions and how to test the exit address.
+  The password is a secret: the entry names its env key in
+  oxylabs_password_env, and its value resolves through the cascade below.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+  Outside any project, every verb below is a machine read: it uses the
+  machine's own connections, unless a grant switched one off.
+
+  Secret resolution (first non-empty wins), for the key oxylabs_password_env
+  names:
+    1. project env   .env.local then .env at the project root
+    2. user config   $XDG_CONFIG_HOME/skyscanner/credentials.env
+                     (default ~/.config/skyscanner/)
+    3. process env   the key itself
+  There is no password flag: a secret never touches argv.
+
+COMMANDS
+  Readiness
+    doctor [--connection <id>]
+        Per connection (every configured one bare; one with --connection):
+        resolve its fields, then, with an Oxylabs user, one request to
+        https://ip.oxylabs.io/location through the proxy proving the exit
+        address and its country, then one autosuggest request to Skyscanner
+        proving it answers rather than blocks. Emits {ok, connections: {<id>:
+        {ok, proxy, exit?, skyscanner: {reachable, blocked_addresses,
+        suggestions}, warning?}}}; blocked_addresses counts the exit
+        addresses Skyscanner refused before one answered. Exit 0 all healthy / 2 a
+        password missing or refused by the proxy / 5 unreachable / 7 blocked by
+        Skyscanner / 8 the proxy exits in another country than oxylabs_country.
+    connections
+        The resolution report: every connection, every value, its winning tier
+        and source, the password masked, and the market, currency, locale and
+        proxy the connection uses. Local only: no network.
+
+  Flights
+    places <query> [--market CC] [--currency CUR] [--locale LL-CC]
+        Skyscanner's place suggestions for a city, airport or country name or
+        an IATA code: {query, market, locale, places: [{name, code, place_id,
+        entity_id, country, nearby_airport}]}. nearby_airport is set when the
+        suggestion is an airport offered near the place asked for. No match
+        answers an empty list at exit 0. One request.
+
+    search <from> <to> <date> [--return DATE] [--adults N]
+           [--cabin economy|premium_economy|business|first]
+           [--sort price|duration|best] [--max-stops N] [--max-layover H]
+           [--max-duration H] [--top N]
+           [--market CC] [--currency CUR] [--locale LL-CC]
+        Live itineraries from <from> to <to>, departing <date>, returning
+        --return DATE when given (one-way without it). Dates are YYYY-MM-DD.
+        <from> and <to> are a place as `places` takes it; each resolves to its
+        exact code when one matches, else to the first suggestion, and the
+        answer names the place it resolved to. A place with no suggestion exits
+        3 not_found.
+        --adults is 1 to 9 (default 1); --cabin defaults to economy.
+        Filters apply before --top (default 10):
+          --max-stops N     no leg has more than N stops
+          --max-layover H   no single connection waits longer than H hours
+          --max-duration H  no leg takes longer than H hours
+        Sorting:
+          price (default)   cheapest first, then shortest
+          duration          shortest total travel time first, then cheapest
+          best              Skyscanner's own "Best" score, highest first
+        The answer: {origin, destination, outbound, return, adults, cabin,
+        market, currency, locale, status, complete, sort, filters, itineraries,
+        matched, returned, truncated, results}. itineraries counts what
+        Skyscanner returned with a price, matched what passed the filters,
+        returned what is in results; truncated is true when --top cut matched
+        results. complete is false when Skyscanner was still collecting prices
+        after 30 polls; the results are then what it had.
+        Each result: price_total (all adults), price_per_passenger,
+        price_formatted, carriers, total_duration_min (the legs added),
+        max_stops, longest_layover_min, self_transfer, protected_self_transfer,
+        separate_tickets (the cheapest option is booked as several tickets),
+        airport_change (a connection leaves from another airport than it
+        landed at), score, tags, skyscanner_rank, agent and agent_price (the
+        cheapest booking option), deeplink, and legs: [{from, to, departure,
+        arrival, duration_min, stops, carriers, connections: [{airport,
+        layover_min, airport_change, to_airport}]}]. A layover is measured
+        from one flight's arrival to the next flight's departure.
+        Cost: two autosuggest requests, one search request and one poll every
+        1.5 seconds until Skyscanner completes (usually 3 to 10), so a search
+        takes 5 to 20 seconds and counts as one search toward the block.
+
+    calendar <from> <to> [--months-only]
+             [--market CC] [--currency CUR] [--locale LL-CC]
+        Skyscanner's cached cheapest one-way price per adult for each day it
+        has one, from <from> to <to>, and the cheapest day of each month:
+        {origin, destination, currency, requested_currency, market, days:
+        [{day, price, group}], months: [{month, price, day}]}. These are
+        estimates from earlier searches, not live prices: run `search` on a
+        chosen day for live prices and booking links. currency is the one
+        Skyscanner answered in. --months-only leaves days out. No cached price
+        answers empty lists at exit 0. Three requests.
+
+  --market, --currency and --locale override the connection's values for one
+  call: market a two-letter country code (EE, GB, US), currency a three-letter
+  code (EUR, USD), locale a language tag (en-GB, de-DE).
+
+Contract commands (the same on every capability):
+  skyscanner stub                                  One-line awareness text.
+  skyscanner manifest --json                       Machine-readable declaration.
+  skyscanner guide [<topic>]                       Guide topics / one guide body.
+  skyscanner ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope.
+             [--note <text>]
+  skyscanner refs                                  Menu of the project's reference files.
+  skyscanner inventory [--network]                 What this capability holds here.
+
+THE WRITE GATE
+  skyscanner has no write verb: nothing it does changes anything at
+  Skyscanner, and a connection's allow_write has nothing to open.
+
+QUIRKS WORTH KNOWING
+  Skyscanner serves these endpoints to its own website and documents none of
+  them, so a field can change without notice; a request Skyscanner refuses as
+  malformed exits 6 with its own words.
+  A blocked address stays blocked for some minutes whatever is sent; a retry
+  from the same address fails the same way. Through an Oxylabs connection
+  every invocation starts from a new address.
+
+EXIT CODES
+  0 success · 2 auth (the Oxylabs password missing, or refused by the proxy) ·
+  3 not found (a place with no suggestion) · 4 policy refusal (the project
+  gate; ask the user, never lift a gate yourself) · 5 server/network (timeout,
+  5xx, 429 after retries, the proxy unreachable) · 6 input (bad arguments, an
+  unknown or ambiguous connection, a malformed connection field, a request
+  Skyscanner refused as invalid) · 7 blocked (Skyscanner's bot protection
+  refused with 403: the direct address, or 4 proxy exit addresses in a row) ·
+  8 wrong exit country (doctor: the proxy
+  exits in another country than oxylabs_country).
+
+EXAMPLES
+  skyscanner doctor
+  skyscanner places <city name>
+  skyscanner search <FROM> <TO> <YYYY-MM-DD> --return <YYYY-MM-DD> --adults 2
+  skyscanner search <city name> <city name> <YYYY-MM-DD> --currency USD --top 5
+  skyscanner search <FROM> <TO> <YYYY-MM-DD> --max-stops 1 --max-layover 4 --sort best
+  skyscanner calendar <FROM> <TO> --months-only
+  skyscanner --connection <id> places <query>
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import uuid
+from collections import Counter
+from datetime import date, datetime
+from pathlib import Path
+from typing import NoReturn
+from urllib.parse import quote
+
+import httpx
+
+# --- Capability declaration — one home for every contract fact ---------------
+
+NAME = "skyscanner"
+SUMMARY = ("Skyscanner flight search over plain HTTP — resolve places, search live "
+           "itineraries with prices, comfort facts (stops, layovers, self-transfer, "
+           "airport changes) and booking links, and read the cached cheapest price "
+           "per day; read-only, optionally through an Oxylabs residential proxy "
+           "that keeps Skyscanner's bot protection from blocking the address.")
+SCOPE = "project"   # credential scope: "project" | "user"
+CRED_KEYS = [
+    {"key": "SKYSCANNER_OXYLABS_PASSWORD", "secret": True, "required": False,
+     "note": "password of the Oxylabs residential proxy user; the conventional "
+             "key a single connection's oxylabs_password_env names"},
+]
+
+# What a person is asked for (SHEBANG.md, "What a person is asked for"):
+# a connection entry's own fields, which `connection add` writes.
+CONN_FIELDS = [
+    {"key": "oxylabs_username", "label": "Oxylabs proxy username",
+     "help": "The Oxylabs residential proxy user's own name, without the customer- "
+             "prefix or any parameter; empty sends requests direct.",
+     "type": "string", "required": False},
+    {"key": "oxylabs_password_env", "label": "Oxylabs proxy password",
+     "help": "The password of that Oxylabs residential proxy user.",
+     "type": "string", "secret": True, "required": False,
+     "env": "SKYSCANNER_{ID}_OXYLABS_PASSWORD"},
+    {"key": "oxylabs_country", "label": "Oxylabs exit country",
+     "help": "Two-letter country code the proxy's exit address is in.",
+     "type": "string", "required": False, "default": "EE"},
+    {"key": "oxylabs_host", "label": "Oxylabs proxy host",
+     "help": "The Oxylabs residential proxy entry host.",
+     "type": "string", "required": False, "default": "pr.oxylabs.io"},
+    {"key": "oxylabs_port", "label": "Oxylabs proxy port",
+     "help": "The Oxylabs residential proxy entry port.",
+     "type": "integer", "required": False, "default": 7777,
+     "minimum": 1, "maximum": 65535},
+    {"key": "oxylabs_session_minutes", "label": "Sticky session minutes",
+     "help": "When set, each invocation keeps one exit address for up to this many "
+             "minutes, which searching needs (10 suits it); empty rotates the "
+             "address on every request.",
+     "type": "integer", "required": False, "minimum": 1, "maximum": 30},
+    {"key": "market", "label": "Market",
+     "help": "Two-letter country code of the Skyscanner site whose booking agents "
+             "are offered.",
+     "type": "string", "required": False, "default": "EE"},
+    {"key": "currency", "label": "Currency",
+     "help": "Three-letter code of the currency every price comes back in.",
+     "type": "string", "required": False, "default": "EUR"},
+    {"key": "locale", "label": "Locale",
+     "help": "Language tag of place names and labels.",
+     "type": "string", "required": False, "default": "en-GB"},
+]
+
+WRITE_VERBS: set = set()   # nothing skyscanner does changes anything at Skyscanner
+WRITE_DEFAULT = False
+# Every verb is a read of public prices, so outside any project each uses the
+# machine's own connections, read-only.
+MACHINE_READS = ("connections", "doctor", "places", "search", "calendar")
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/skyscanner/guides/")
+STATE = False       # skyscanner mints nothing; no session is kept between calls
+INVENTORY = None    # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
+POST_INSTALL: list = []
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+BASE = "https://www.skyscanner.net"
+# A non-browser user agent is refused with 403.
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
+EXIT_CHECK_URL = "https://ip.oxylabs.io/location"
+TIMEOUT = httpx.Timeout(30.0)
+MAX_RETRIES = 3
+POLL_INTERVAL = 1.5
+MAX_POLLS = 30
+BLOCKED_RETRIES = 3   # new exit addresses tried after a 403 through a proxy
+FIELD_DEFAULTS = {f["key"]: f["default"] for f in CONN_FIELDS if "default" in f}
+
+# The shared capability code is the capabilities-contract library's, bound here
+# into this script's namespace (SHEBANG.md, "The contract verbs").
+from capabilities_contract.capability import bind as _contract_bind
+
+_contract_bind(globals(), "core")
+_contract_bind(globals(), "store")
+
+_contract_bind(globals(), "connections")
+
+# --- Connections (capability-specific) --------------------------------------
+
+
+def _entry_of(raw) -> dict:
+    return raw if isinstance(raw, dict) else {}
+
+
+def _effective(entry: dict, field: str):
+    value = entry.get(field)
+    return FIELD_DEFAULTS.get(field) if value in (None, "") else value
+
+
+def _proxy_summary(entry: dict) -> dict | None:
+    """What the connection's proxy is, without its password."""
+    if not entry.get("oxylabs_username"):
+        return None
+    return {"provider": "oxylabs",
+            "host": _effective(entry, "oxylabs_host"),
+            "port": _effective(entry, "oxylabs_port"),
+            "country": str(_effective(entry, "oxylabs_country")).upper(),
+            "session_minutes": entry.get("oxylabs_session_minutes")}
+
+
+def _connections_report() -> dict:
+    """The resolution report — every connection, every value, its winning tier
+    and source, the password masked. Local only: no network."""
+    reg, _ = _connections_registry()
+    report: dict = {"default": None, "connections": {}}
+    if reg is None:
+        return report
+    conns = reg["connections"]
+    report["default"] = reg.get("default") or \
+        (next(iter(conns)) if len(conns) == 1 else None)
+    for cid, raw in conns.items():
+        entry = _entry_of(raw)
+        origin = reg["sources"][cid]
+        proxied = bool(entry.get("oxylabs_username"))
+        rows = []
+        for field in CONN_FIELDS:
+            key = field["key"]
+            if field.get("secret"):
+                env_key = entry.get(key)
+                if env_key:
+                    value, tier, source = _resolve_env_key(env_key)
+                    rows.append(_key_report(env_key, True, proxied, value, tier, source))
+                else:
+                    rows.append(_key_report(key, False, proxied, None, None, None))
+                continue
+            value = entry.get(key)
+            rows.append(_key_report(key, False, False,
+                                    str(value) if value not in (None, "") else None,
+                                    "connection", origin))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "uses": {"market": str(_effective(entry, "market")).upper(),
+                     "currency": str(_effective(entry, "currency")).upper(),
+                     "locale": _effective(entry, "locale"),
+                     "proxy": _proxy_summary(entry)},
+            "keys": rows}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+def _problem(exit_code: int, code: str, message: str, hint: str | None = None) -> dict:
+    out = {"exit": exit_code, "code": code, "message": message}
+    if hint:
+        out["hint"] = hint
+    return out
+
+
+def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
+    """Materialize one connection. Returns (cfg, problem) — problem is an error
+    dict instead of a die, so doctor reports every connection."""
+    entry = _entry_of(entry)
+    cfg: dict = {"id": cid,
+                 "market": str(_effective(entry, "market")).upper(),
+                 "currency": str(_effective(entry, "currency")).upper(),
+                 "locale": str(_effective(entry, "locale")),
+                 "proxy": None}
+    user = entry.get("oxylabs_username")
+    if not user:
+        return cfg, None
+    user = str(user).strip()
+    if (user.lower().startswith("customer-") or "-cc-" in user
+            or "-sessid-" in user or not re.fullmatch(r"[A-Za-z0-9_.]+", user)):
+        return None, _problem(
+            6, "bad_oxylabs_username",
+            f"connection {cid!r}: oxylabs_username is not a bare proxy user name",
+            "give the Oxylabs proxy user's own name only; skyscanner adds the "
+            "customer- prefix, the country and the session itself "
+            f"(`{NAME} guide oxylabs`)")
+    country = str(_effective(entry, "oxylabs_country")).upper()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        return None, _problem(6, "bad_oxylabs_country",
+                              f"connection {cid!r}: oxylabs_country {country!r} is "
+                              "not a two-letter country code", "e.g. EE, DE, US")
+    host = str(_effective(entry, "oxylabs_host")).strip()
+    try:
+        port = int(_effective(entry, "oxylabs_port"))
+    except (TypeError, ValueError):
+        port = 0
+    if not host or not 1 <= port <= 65535:
+        return None, _problem(6, "bad_oxylabs_endpoint",
+                              f"connection {cid!r}: oxylabs_host/oxylabs_port do not "
+                              "name a proxy endpoint",
+                              "the residential entry is pr.oxylabs.io:7777")
+    minutes = entry.get("oxylabs_session_minutes")
+    if minutes not in (None, ""):
+        try:
+            minutes = int(minutes)
+        except (TypeError, ValueError):
+            minutes = 0
+        if not 1 <= minutes <= 30:
+            return None, _problem(6, "bad_oxylabs_session_minutes",
+                                  f"connection {cid!r}: oxylabs_session_minutes is "
+                                  "a whole number of minutes from 1 to 30")
+    else:
+        minutes = None
+    env_key = entry.get("oxylabs_password_env")
+    if not env_key:
+        return None, _problem(
+            2, "missing_secret",
+            f"connection {cid!r} names an Oxylabs user but no oxylabs_password_env",
+            f"write the password with `{NAME} connection add {cid} --replace --stdin` "
+            "and {\"oxylabs_password_env\": \"<password>\"} on stdin")
+    password = _resolve_env_key(env_key)[0]
+    if not password:
+        return None, _problem(
+            2, "missing_secret",
+            f"env var {env_key} (for connection {cid!r}) is unset",
+            f"set {env_key} in the project's .env.local / .env, {CREDENTIALS_ENV}, "
+            "or the environment")
+    cfg["proxy"] = {"user": user, "password": password, "country": country,
+                    "host": host, "port": port, "minutes": minutes}
+    return cfg, None
+
+
+def _proxy_url(proxy: dict | None, session_id: str) -> str | None:
+    """The Oxylabs residential proxy URL, composed the way Oxylabs specifies:
+    customer-<user>-cc-<COUNTRY>[-sessid-<id>-sesstime-<minutes>]."""
+    if not proxy:
+        return None
+    user = f"customer-{proxy['user']}-cc-{proxy['country']}"
+    if proxy["minutes"]:
+        user += f"-sessid-{session_id}-sesstime-{proxy['minutes']}"
+    return (f"http://{quote(user, safe='')}:{quote(proxy['password'], safe='')}"
+            f"@{proxy['host']}:{proxy['port']}")
+
+
+def _new_session_id() -> str:
+    return uuid.uuid4().hex[:16]
+
+
+# ── HTTP ────────────────────────────────────────────────────────────────────
+
+def _client(cfg: dict, proxy_url: str | None, skyscanner: bool = True) -> httpx.Client:
+    headers = {"user-agent": UA, "accept": "application/json"}
+    if skyscanner:
+        headers.update({
+            "content-type": "application/json",
+            "accept-language": cfg["locale"],
+            "origin": BASE,
+            "referer": BASE + "/",
+            "x-skyscanner-market": cfg["market"],
+            "x-skyscanner-locale": cfg["locale"],
+            "x-skyscanner-currency": cfg["currency"],
+            "x-skyscanner-channelid": "website",
+            "x-skyscanner-viewid": str(uuid.uuid4()),
+        })
+    return httpx.Client(http2=skyscanner, timeout=TIMEOUT, proxy=proxy_url,
+                        headers=headers)
+
+
+BLOCK_HINT = ("Skyscanner's bot protection refused the address; a block lifts on its "
+              "own within minutes. Direct, wait or route through an Oxylabs "
+              "connection; through one, every exit address tried was refused, so "
+              f"wait before the next call (`{NAME} guide oxylabs`)")
+
+
+class _Failure(Exception):
+    """A request that failed, carried to the caller so doctor can report it."""
+
+    def __init__(self, exit_code: int, code: str, message: str,
+                 hint: str | None = None, status: int | None = None):
+        super().__init__(message)
+        self.exit_code, self.code, self.message = exit_code, code, message
+        self.hint, self.status = hint, status
+
+    def die(self) -> NoReturn:
+        _die(self.exit_code, self.code, self.message, self.hint, self.status)
+
+
+def _transport_failure(e: Exception, what: str) -> _Failure:
+    text = str(e)
+    if isinstance(e, httpx.ProxyError):
+        if "407" in text:
+            return _Failure(2, "proxy_auth",
+                            f"the Oxylabs proxy refused the credentials ({text})",
+                            "check oxylabs_username and the password its "
+                            "oxylabs_password_env names; `skyscanner connections` "
+                            "shows where each resolves")
+        return _Failure(5, "proxy_error", f"the proxy failed {what}: {text}",
+                        "check oxylabs_host and oxylabs_port, and the Oxylabs "
+                        "account's traffic")
+    if isinstance(e, httpx.TimeoutException):
+        return _Failure(5, "timeout", f"{what} timed out", "the service was unresponsive")
+    return _Failure(5, "network_error", f"network error on {what}: {text}",
+                    "check connectivity")
+
+
+def _request(c: httpx.Client, method: str, url: str, **kw):
+    """One request under the retry loop; a refusal raises _Failure."""
+    what = f"{method} {httpx.URL(url).path}"
+    last = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = c.request(method, url, **kw)
+        except (httpx.TimeoutException, httpx.RemoteProtocolError) as e:
+            last = e
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            raise _transport_failure(e, what)
+        except httpx.RequestError as e:
+            raise _transport_failure(e, what)
+        if resp.status_code == 429:
+            if attempt < MAX_RETRIES:
+                try:
+                    wait = float(resp.headers.get("Retry-After", attempt * 1.5))
+                except ValueError:
+                    wait = attempt * 1.5
+                time.sleep(min(wait, 30.0))
+                continue
+            raise _Failure(5, "rate_limited", f"{what} was rate-limited", status=429)
+        if resp.status_code >= 500:
+            if attempt < MAX_RETRIES:
+                time.sleep(attempt * 1.5)
+                continue
+            raise _Failure(5, "server_error", f"{what} returned {resp.status_code}",
+                           resp.text[:300] or None, status=resp.status_code)
+        if resp.status_code == 403:
+            raise _Failure(7, "blocked", f"{what} was refused with 403", BLOCK_HINT,
+                           status=403)
+        if resp.status_code == 404:
+            raise _Failure(3, "not_found", f"{what} returned 404",
+                           resp.text[:300] or None, status=404)
+        if resp.status_code >= 400:
+            raise _Failure(6, "invalid_request",
+                           f"{what} was refused with {resp.status_code}: "
+                           f"{resp.text[:300]}", status=resp.status_code)
+        try:
+            return resp.json()
+        except ValueError:
+            raise _Failure(5, "bad_response", f"{what} answered something other than "
+                           f"JSON: {resp.text[:200]}", status=resp.status_code)
+    raise _transport_failure(last, what)  # the loop returns or raises before this
+
+
+class _Http:
+    """The HTTP session of one invocation. Through an Oxylabs proxy a 403 is
+    tried again from a new exit address - a new request on a rotating proxy,
+    a new session id on a sticky one - because Skyscanner's bot protection
+    flags single residential addresses; direct, a 403 is final."""
+
+    def __init__(self, cfg: dict, skyscanner: bool = True):
+        self.cfg, self.skyscanner, self.blocked = cfg, skyscanner, 0
+        self.c = self._open()
+
+    def _open(self) -> httpx.Client:
+        return _client(self.cfg, _proxy_url(self.cfg["proxy"], _new_session_id()),
+                       self.skyscanner)
+
+    def request(self, method: str, url: str, **kw):
+        while True:
+            try:
+                return _request(self.c, method, url, **kw)
+            except _Failure as f:
+                if f.code != "blocked" or not self.cfg["proxy"] \
+                        or self.blocked >= BLOCKED_RETRIES:
+                    raise
+                self.blocked += 1
+                sys.stderr.write(f"{NAME}: {f.message}; trying again from a new exit "
+                                 f"address ({self.blocked}/{BLOCKED_RETRIES})\n")
+                self.c.close()
+                self.c = self._open()
+
+    def call(self, method: str, url: str, **kw):
+        try:
+            return self.request(method, url, **kw)
+        except _Failure as f:
+            f.die()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.c.close()
+
+
+# ── domain ──────────────────────────────────────────────────────────────────
+
+def _suggest(c, cfg, query: str, is_dest: bool = False) -> list:
+    url = (f"{BASE}/g/autosuggest-search/api/v1/search-flight/"
+           f"{cfg['market']}/{cfg['locale']}/{quote(query, safe='')}")
+    data = c.call("GET", url, params={"isDestination": str(is_dest).lower(),
+                                       "enable_general_search_v2": "true"})
+    return data if isinstance(data, list) else []
+
+
+def _place(it: dict) -> dict:
+    near = it.get("AirportInformation")
+    return {"name": it.get("PlaceName"),
+            "code": it.get("IataCode") or it.get("PlaceId"),
+            "place_id": it.get("PlaceId"),
+            "entity_id": it.get("GeoId"),
+            "country": it.get("CountryName"),
+            "nearby_airport": ({"name": near.get("PlaceName"),
+                                "place_id": near.get("PlaceId"),
+                                "entity_id": near.get("GeoId")}
+                               if isinstance(near, dict) else None)}
+
+
+def _resolve(c, cfg, query: str, is_dest: bool) -> dict:
+    items = _suggest(c, cfg, query, is_dest)
+    if not items:
+        _die(3, "not_found", f"no place found for {query!r}",
+             f"`{NAME} places <query>` lists what a name or code resolves to")
+    for it in items:  # an exact code match that is not a nearby-airport suggestion
+        if query.upper() in (it.get("PlaceId"), it.get("IataCode")) \
+                and not it.get("AirportInformation"):
+            return it
+    return items[0]
+
+
+def _date_body(day: str) -> dict:
+    y, m, d = day.split("-")
+    return {"@type": "date", "year": y, "month": m, "day": d}
+
+
+def _leg(o: dict, d: dict, day: str) -> dict:
+    return {"legOrigin": {"@type": "entity", "entityId": o["GeoId"]},
+            "legDestination": {"@type": "entity", "entityId": d["GeoId"]},
+            "dates": _date_body(day)}
+
+
+def _connections_of(segs: list) -> list:
+    """Each change of flight inside a leg: airport, layover minutes, airport change."""
+    out = []
+    for prev, nxt in zip(segs, segs[1:]):
+        wait = datetime.fromisoformat(nxt["departure"]) - \
+            datetime.fromisoformat(prev["arrival"])
+        out.append({
+            "airport": prev["destination"]["displayCode"],
+            "layover_min": int(wait.total_seconds() // 60),
+            "airport_change": prev["destination"]["entityId"] != nxt["origin"]["entityId"],
+            "to_airport": nxt["origin"]["displayCode"],
+        })
+    return out
+
+
+def _normalise(data: dict, adults: int) -> list:
+    it = data.get("itineraries") or {}
+    agents = {x["id"]: x["name"] for x in it.get("agents") or []}
+    out = []
+    for rank, x in enumerate(it.get("results") or []):
+        if (x.get("price") or {}).get("raw") is None:
+            continue
+        options = x.get("pricingOptions") or []
+        if not options:
+            continue
+        po = min(options, key=lambda p: (p.get("price") or {}).get("amount") or 1e12)
+        url = next((i["url"] for i in po.get("items") or [] if i.get("url")), None)
+        legs = [{
+            "from": leg["origin"]["displayCode"], "to": leg["destination"]["displayCode"],
+            "departure": leg["departure"], "arrival": leg["arrival"],
+            "duration_min": leg["durationInMinutes"], "stops": leg["stopCount"],
+            "carriers": [cc["name"] for cc in leg["carriers"]["marketing"]],
+            "connections": _connections_of(leg.get("segments") or []),
+        } for leg in x["legs"]]
+        lays = [cn["layover_min"] for leg in legs for cn in leg["connections"]]
+        agent_ids = po.get("agentIds") or [None]
+        out.append({
+            "price_total": x["price"]["raw"],
+            "price_per_passenger": round(x["price"]["raw"] / adults, 2),
+            "price_formatted": x["price"].get("formatted"),
+            "carriers": sorted({cc["name"] for leg in x["legs"]
+                                for cc in leg["carriers"]["marketing"]}),
+            "total_duration_min": sum(leg["duration_min"] for leg in legs),
+            "max_stops": max((leg["stops"] for leg in legs), default=0),
+            "longest_layover_min": max(lays, default=0),
+            "self_transfer": bool(x.get("isSelfTransfer")),
+            "protected_self_transfer": bool(x.get("isProtectedSelfTransfer")),
+            "separate_tickets": len(po.get("items") or []) > 1,
+            "airport_change": any(cn["airport_change"] for leg in legs
+                                  for cn in leg["connections"]),
+            "score": x.get("score"),
+            "tags": x.get("tags") or [],
+            "skyscanner_rank": rank,
+            "agent": agents.get(agent_ids[0], agent_ids[0]),
+            "agent_price": (po.get("price") or {}).get("amount"),
+            "deeplink": BASE + url if url else None,
+            "legs": legs,
+        })
+    return out
+
+
+SORTS = {
+    "price": lambda z: (z["price_total"], z["total_duration_min"]),
+    "duration": lambda z: (z["total_duration_min"], z["price_total"]),
+    "best": lambda z: (-(z["score"] or 0), z["skyscanner_rank"]),
+}
+
+
+def _keep(z: dict, a) -> bool:
+    return ((a.max_stops is None or z["max_stops"] <= a.max_stops)
+            and (a.max_layover is None or z["longest_layover_min"] <= a.max_layover * 60)
+            and (a.max_duration is None
+                 or all(leg["duration_min"] <= a.max_duration * 60 for leg in z["legs"])))
+
+
+def cmd_places(c, cfg, a) -> dict:
+    return {"query": a.query, "market": cfg["market"], "locale": cfg["locale"],
+            "places": [_place(it) for it in _suggest(c, cfg, a.query)]}
+
+
+def cmd_search(c, cfg, a) -> dict:
+    o = _resolve(c, cfg, a.origin, False)
+    d = _resolve(c, cfg, a.destination, True)
+    legs = [_leg(o, d, a.date)] + ([_leg(d, o, a.ret)] if a.ret else [])
+    body = {"cabinClass": a.cabin, "childAges": [], "adults": a.adults, "legs": legs}
+    url = BASE + "/g/radar/api/v2/web-unified-search/"
+    data = c.call("POST", url, json=body)
+    polls = 0
+    while (data.get("context") or {}).get("status") != "complete" and polls < MAX_POLLS:
+        time.sleep(POLL_INTERVAL)
+        data = c.call("GET", url + data["context"]["sessionId"])
+        polls += 1
+    status = (data.get("context") or {}).get("status")
+    every = _normalise(data, a.adults)
+    matched = sorted((z for z in every if _keep(z, a)), key=SORTS[a.sort])
+    results = matched[:a.top]
+    return {"origin": _place(o), "destination": _place(d),
+            "outbound": a.date, "return": a.ret, "adults": a.adults,
+            "cabin": a.cabin.lower(), "market": cfg["market"],
+            "currency": cfg["currency"], "locale": cfg["locale"],
+            "status": status, "complete": status == "complete", "sort": a.sort,
+            "filters": {"max_stops": a.max_stops, "max_layover_h": a.max_layover,
+                        "max_duration_h": a.max_duration},
+            "itineraries": len(every), "matched": len(matched),
+            "returned": len(results), "truncated": len(matched) > len(results),
+            "results": results}
+
+
+def cmd_calendar(c, cfg, a) -> dict:
+    o = _resolve(c, cfg, a.origin, False)
+    d = _resolve(c, cfg, a.destination, True)
+    oc, dc = o.get("IataCode") or o["PlaceId"], d.get("IataCode") or d["PlaceId"]
+    data = c.call("POST", BASE + "/g/search-intent/v1/pricecalendar", json={
+        "headers": {"xSkyscannerClient": "acorn", "xSkyscannerCurrency": cfg["currency"],
+                    "xSkyscannerLocale": cfg["locale"],
+                    "xSkyscannerMarket": cfg["market"]},
+        "originRelevantFlightSkyId": oc, "destinationRelevantFlightSkyId": dc})
+    flights = (data or {}).get("flights") or {}
+    days = [{"day": x["day"], "price": x["price"], "group": x.get("group")}
+            for x in flights.get("days") or [] if x.get("price")]
+    by_month: dict = {}
+    for x in days:
+        best = by_month.get(x["day"][:7])
+        if best is None or x["price"] < best["price"]:
+            by_month[x["day"][:7]] = x
+    months = [{"month": m, "price": x["price"], "day": x["day"]}
+              for m, x in sorted(by_month.items())]
+    out = {"origin": _place(o), "destination": _place(d),
+           "currency": flights.get("currency"), "requested_currency": cfg["currency"],
+           "market": cfg["market"], "months": months}
+    if not a.months_only:
+        out["days"] = days
+    return out
+
+
+# ── doctor ──────────────────────────────────────────────────────────────────
+
+def _exit_location(cfg: dict) -> dict:
+    """The exit address and the country each geolocation provider places it in."""
+    with _Http(cfg, skyscanner=False) as c:
+        data = c.request("GET", EXIT_CHECK_URL)
+    providers = data.get("providers") if isinstance(data, dict) else None
+    countries = {name: str(p.get("country") or "").upper()
+                 for name, p in (providers or {}).items()
+                 if isinstance(p, dict) and p.get("country")}
+    country = Counter(countries.values()).most_common(1)[0][0] if countries else None
+    return {"ip": data.get("ip") if isinstance(data, dict) else None,
+            "country": country, "providers": countries}
+
+
+def _check_connection(cfg: dict) -> dict:
+    proxy = cfg["proxy"]
+    result: dict = {"ok": True, "proxy": _proxy_summary_cfg(proxy),
+                    "market": cfg["market"], "currency": cfg["currency"],
+                    "locale": cfg["locale"]}
+    if proxy is None:
+        result["warning"] = ("no Oxylabs proxy: requests leave from this machine's own "
+                             "address, which Skyscanner blocks after roughly 15 to 25 "
+                             f"searches in half an hour; `{NAME} guide oxylabs`")
+    else:
+        try:
+            where = _exit_location(cfg)
+        except _Failure as f:
+            return {**result, "ok": False, "category": f.exit_code,
+                    "error": f.message, "code": f.code,
+                    **({"hint": f.hint} if f.hint else {})}
+        result["exit"] = where
+        if where["country"] != proxy["country"]:
+            return {**result, "ok": False, "category": 8,
+                    "code": "exit_country_mismatch",
+                    "error": f"the proxy exits in {where['country']!r}, "
+                             f"not {proxy['country']!r}",
+                    "hint": "check oxylabs_country; Oxylabs places the exit by the "
+                            "-cc- parameter skyscanner composes from it"}
+    c = _Http(cfg)
+    try:
+        with c:
+            items = c.request(
+                "GET", f"{BASE}/g/autosuggest-search/api/v1/search-flight/"
+                f"{cfg['market']}/{cfg['locale']}/London",
+                params={"isDestination": "false", "enable_general_search_v2": "true"})
+    except _Failure as f:
+        return {**result, "ok": False, "category": f.exit_code, "code": f.code,
+                "error": f.message, **({"hint": f.hint} if f.hint else {})}
+    result["skyscanner"] = {"reachable": True, "blocked_addresses": c.blocked,
+                            "suggestions": len(items) if isinstance(items, list) else 0}
+    return result
+
+
+def _proxy_summary_cfg(proxy: dict | None) -> dict | None:
+    if not proxy:
+        return None
+    return {"provider": "oxylabs", "host": proxy["host"], "port": proxy["port"],
+            "country": proxy["country"], "session_minutes": proxy["minutes"]}
+
+
+def cmd_doctor(reg: dict, wanted: str | None) -> None:
+    """Every connection bare; one with --connection. Exit 0 only when every
+    examined connection is healthy, else the first failure's category."""
+    _doctor_gate(_connections_report(), wanted)
+    targets = [_select_connection(reg, wanted)] if wanted is not None \
+        else list(reg["connections"].items())
+    connections: dict = {}
+    fail_exit = 0
+    for cid, entry in targets:
+        cfg, problem = _build_cfg(cid, entry)
+        if problem:
+            res = {"ok": False, "category": problem["exit"], "code": problem["code"],
+                   "error": problem["message"]}
+            if problem.get("hint"):
+                res["hint"] = problem["hint"]
+        else:
+            res = _check_connection(cfg)
+        if not res.get("ok") and not fail_exit:
+            fail_exit = res.get("category") or 5
+        res.pop("category", None)
+        connections[cid] = res
+    _emit({"ok": fail_exit == 0, "connections": connections})
+    if fail_exit:
+        sys.exit(fail_exit)
+
+
+# ── the verb surface ────────────────────────────────────────────────────────
+
+class _Parser(argparse.ArgumentParser):
+    """Usage errors leave through the envelope at exit 6, not argparse's 2,
+    which this taxonomy reserves for auth."""
+
+    def error(self, message: str) -> NoReturn:
+        _die(6, "invalid_arguments", f"{self.prog}: {message}",
+             f"run `{NAME} help` for the verb's arguments")
+
+
+def _day(value: str) -> str:
+    try:
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return date.fromisoformat(value).isoformat()
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError(f"{value!r} is not a date in YYYY-MM-DD form")
+
+
+def _bounded_int(lo: int, hi: int | None = None):
+    def parse(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value!r} is not a whole number")
+        if n < lo or (hi is not None and n > hi):
+            raise argparse.ArgumentTypeError(
+                f"{value!r} is outside {lo}..{hi}" if hi is not None
+                else f"{value!r} is below {lo}")
+        return n
+    return parse
+
+
+def _hours(value: str) -> float:
+    try:
+        h = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a number of hours")
+    if h <= 0:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a positive number of hours")
+    return h
+
+
+def _code(length: int, what: str):
+    def parse(value: str) -> str:
+        if not re.fullmatch(rf"[A-Za-z]{{{length}}}", value):
+            raise argparse.ArgumentTypeError(f"{value!r} is not a {what}")
+        return value.upper()
+    return parse
+
+
+def _locale(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,4})?", value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a language tag like en-GB")
+    return value
+
+
+CABINS = ("economy", "premium_economy", "business", "first")
+
+
+def _cabin(value: str) -> str:
+    if value.lower() not in CABINS:
+        raise argparse.ArgumentTypeError(f"{value!r} is one of {', '.join(CABINS)}")
+    return value.upper()
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = _Parser(prog=NAME, allow_abbrev=False, add_help=False)
+    sub = p.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
+
+    def verb(name: str) -> argparse.ArgumentParser:
+        sp = sub.add_parser(name, allow_abbrev=False, add_help=False)
+        sp.add_argument("--market", type=_code(2, "two-letter market code"))
+        sp.add_argument("--currency", type=_code(3, "three-letter currency code"))
+        sp.add_argument("--locale", type=_locale)
+        return sp
+
+    verb("places").add_argument("query")
+
+    sp = verb("search")
+    sp.add_argument("origin")
+    sp.add_argument("destination")
+    sp.add_argument("date", type=_day)
+    sp.add_argument("--return", dest="ret", type=_day)
+    sp.add_argument("--adults", type=_bounded_int(1, 9), default=1)
+    sp.add_argument("--cabin", type=_cabin, default="ECONOMY")
+    sp.add_argument("--sort", choices=list(SORTS), default="price")
+    sp.add_argument("--max-stops", dest="max_stops", type=_bounded_int(0))
+    sp.add_argument("--max-layover", dest="max_layover", type=_hours)
+    sp.add_argument("--max-duration", dest="max_duration", type=_hours)
+    sp.add_argument("--top", type=_bounded_int(1), default=10)
+
+    sp = verb("calendar")
+    sp.add_argument("origin")
+    sp.add_argument("destination")
+    sp.add_argument("--months-only", dest="months_only", action="store_true")
+    return p
+
+
+# ── dispatch ────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    _gate()                      # every verb passes the effective policy gate first
+
+    # `--connection <id>` is a global selector accepted anywhere on the line,
+    # extracted before argparse so it works after the subcommand too.
+    argv = sys.argv[1:]
+    wanted: str | None = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--connection" and i + 1 < len(argv):
+            wanted = argv[i + 1]
+            i += 2
+            continue
+        if a.startswith("--connection="):
+            wanted = a.split("=", 1)[1]
+            i += 1
+            continue
+        cleaned.append(a)
+        i += 1
+
+    _contract(cleaned)           # contract verbs; domain verbs fall through
+    if not cleaned or cleaned[0] in ("help", "-h", "--help"):
+        _cmd_help()
+        return
+
+    reg, _ = _connections_registry()
+    if cleaned[0] == "doctor":
+        if len(cleaned) > 1:
+            _die(6, "invalid_arguments",
+                 f"doctor takes only --connection <id>, not {cleaned[1]!r}")
+        cmd_doctor(reg, wanted)
+        return
+
+    args = _build_parser().parse_args(cleaned)
+    if args.cmd == "search" and args.ret and args.ret < args.date:
+        _die(6, "invalid_arguments",
+             f"--return {args.ret} is before the outbound date {args.date}")
+
+    cid, entry = _select_connection(reg, wanted)
+    _write_gate(cid, bool(_entry_of(entry).get("allow_write", WRITE_DEFAULT)), args.cmd)
+    cfg, problem = _build_cfg(cid, entry)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"], problem.get("hint"))
+    for key in ("market", "currency", "locale"):
+        if getattr(args, key, None):
+            cfg[key] = getattr(args, key)
+
+    with _Http(cfg) as c:
+        _emit({"places": cmd_places, "search": cmd_search,
+               "calendar": cmd_calendar}[args.cmd](c, cfg, args))
+
+
+if __name__ == "__main__":
+    main()
