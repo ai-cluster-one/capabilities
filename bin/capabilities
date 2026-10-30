@@ -529,6 +529,8 @@ VAULT VERBS
         project's .env.local. Everything sealed under the previous key becomes
         unreadable; the answer names how many (unreadable) and the previous
         fingerprint. Set those secrets again.
+  secrets help
+        Print these vault verbs.
   secrets list [--json]
         The vault's names with readable, updated_at and updated_by, never a
         value, and the key in force here {set, source, fingerprint, recorded,
@@ -2289,7 +2291,13 @@ CAPABILITIES_CONTEXT_INTRO = (
     "disabled capability or a read-only "
     "connection; ask the user, never lift a gate yourself. Global enable "
     "covers ordinary CLI use; a bundled service's init/start/run still requires "
-    "explicit project enable."
+    "explicit project enable.\n\n"
+    "An agent's secrets and API keys live in its vault, never in `.env.local` or "
+    "another environment file, which keep only the vault's own key: "
+    "`capabilities secrets list` names them, `capabilities secrets show <NAME>` "
+    "prints one, `capabilities secrets set <NAME>` stores the value it reads on "
+    "standard input, and `capabilities secrets rm <NAME>` removes one; "
+    "`capabilities secrets help` gives the rest."
 )
 
 _MANAGER_DIR = Path(__file__).resolve().parent
@@ -9532,13 +9540,25 @@ def _vault_move(root: Path) -> dict:
             "not_reading": refusing, "unread": unread}
 
 
+def _help_section(heading: str) -> str:
+    """One section of the manager's help, from its heading to the next."""
+    lines = (__doc__ or "").splitlines()
+    start = lines.index(heading)
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i] and not lines[i][0].isspace()), len(lines))
+    return "\n".join(lines[start:end]).rstrip() + "\n"
+
+
 def cmd_secrets(rest: list[str]) -> None:
-    vault = _vault_module()
     sub = rest[0] if rest else None
     args = rest[1:]
+    if sub in ("help", "--help", "-h"):
+        sys.stdout.write(_help_section("VAULT VERBS"))
+        return
+    vault = _vault_module()
     if sub not in ("list", "show", "set", "rm", "raw", "move"):
         _die(6, "input", "secrets needs a subcommand: list, show, set, rm, raw or move",
-             "run `capabilities help`")
+             "run `capabilities secrets help`")
     root = _require_project()
 
     if sub == "move":

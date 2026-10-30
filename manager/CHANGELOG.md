@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-30 — Every agent's capabilities block says its secrets live in its vault, and `capabilities secrets help` answers
+
+The capabilities block `capabilities build` and `capabilities context` compose carries a second always-on paragraph: an agent's secrets and API keys live in its vault, never in `.env.local` or another environment file, which keep only the vault's own key; `capabilities secrets list`, `show <NAME>`, `set <NAME>` with the value on standard input and `rm <NAME>` are shown inline, and `capabilities secrets help` gives the rest. `capabilities secrets help` (also `--help`, `-h`) now prints the VAULT VERBS section of `capabilities help` and exits 0, where it exited 6 `secrets needs a subcommand`; a missing or unknown subcommand still exits 6 and its hint names `capabilities secrets help`.
+
 ## 2026-10-30 — A release refuses a bundle script that could read the store setting with an older library
 
 `capabilities source verify`, `source index` and `dev check` refuse a capability whose bundle ships a script other than its executable - a service daemon, a helper run with `uv run --script` - declaring a `capabilities-contract` range under its own header that admits a release older than 0.38.0, the first to read the store setting `store set` writes. Install and update bring only the executable's library forward, so such a script kept the environment uv first made for it: telegram's `service/profiles.py` ran on 0.23.1 and refused a setting carrying `transaction_pooler`. The refusal is `contract-range` and names the file and the range to declare. Tests are not asked.
