@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -1125,6 +1126,118 @@ def test_doctor_passes_a_pooler_that_refuses_plain_text_as_ssl_required(tmp_path
     assert payload["ok"] is True and payload["checks"]["tls"]["ok"] is True
     plain = payload["checks"]["plain_text_refused"]
     assert plain["ok"] is True and "SSL required" in plain["reason"]
+    assert "warning" not in plain and payload["warnings"] == []
+
+
+def test_doctor_passes_a_login_role_whose_role_default_hides_its_pg_stat_ssl_row(
+        tmp_path, enforced):
+    """A login role whose role default sets a role that is not a member of it,
+    as a hosted database is set up for an agent, runs as a role Postgres does not show this
+    backend's pg_stat_ssl row to; the client's own socket still proves TLS."""
+    admin = enforced.connect(ADMIN, "app")
+    admin.autocommit = True
+    with admin.cursor() as cur:
+        from psycopg import sql
+        cur.execute("CREATE ROLE bound NOLOGIN")
+        cur.execute(sql.SQL("CREATE ROLE boundlogin LOGIN PASSWORD {} IN ROLE bound")
+                    .format(sql.Literal(PASSWORD)))
+        cur.execute("ALTER ROLE boundlogin SET role = 'bound'")
+        cur.execute("GRANT CREATE ON DATABASE app TO bound")
+    admin.close()
+    env = _env(tmp_path)
+    _ok(_manager(env, "store", "set", "--host", REMOTE_NAME, "--port", str(enforced.port),
+                 "--database", "app", "--user", "boundlogin",
+                 "--password-stdin", stdin=PASSWORD + "\n"))
+    result = _manager(env, "store", "doctor", "--json")
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["ok"] is True and payload["warnings"] == []
+    assert payload["checks"]["tls"]["ok"] is True and "error" not in payload["checks"]["tls"]
+    assert payload["checks"]["schema"]["ok"] is True
+
+
+# A hosted pooler's answer to a plain-text startup when its database enforces TLS.
+HOSTED_POOLER_REFUSAL = "(ESSLREQUIRED) SSL connection is required"
+
+
+@pytest.fixture()
+def hosted_pooler(enforced):
+    """A loopback pooler that refuses a plain-text startup as a hosted pooler does and
+    passes a connection that asks for TLS through to the cluster untouched."""
+    import struct
+    listener = socket.create_server(("127.0.0.1", 0))
+    listener.settimeout(0.2)
+    stop = threading.Event()
+
+    def pipe(src, dst):
+        try:
+            while data := src.recv(65536):
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for sock in (src, dst):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def serve(client):
+        with client:
+            while True:
+                head = client.recv(8, socket.MSG_WAITALL)
+                if len(head) < 8:
+                    return
+                length, code = struct.unpack("!II", head)
+                if code == 80877104:  # GSSENCRequest: declined
+                    client.sendall(b"N")
+                    continue
+                if code == 80877103:  # SSLRequest: the cluster negotiates it
+                    upstream = socket.create_connection(("127.0.0.1", enforced.port))
+                    upstream.sendall(head)
+                    back = threading.Thread(target=pipe, args=(upstream, client))
+                    back.start()
+                    pipe(client, upstream)
+                    back.join()
+                    upstream.close()
+                    return
+                client.recv(length - 8, socket.MSG_WAITALL)
+                fields = b"".join(kind + text.encode() + b"\0" for kind, text in (
+                    (b"S", "FATAL"), (b"V", "FATAL"), (b"C", "XX000"),
+                    (b"M", HOSTED_POOLER_REFUSAL))) + b"\0"
+                client.sendall(b"E" + struct.pack("!I", len(fields) + 4) + fields)
+                return
+
+    def accept():
+        while not stop.is_set():
+            try:
+                client, _ = listener.accept()
+            except (TimeoutError, socket.timeout):
+                continue
+            threading.Thread(target=serve, args=(client,), daemon=True).start()
+
+    acceptor = threading.Thread(target=accept, daemon=True)
+    acceptor.start()
+    try:
+        yield listener.getsockname()[1]
+    finally:
+        stop.set()
+        acceptor.join(timeout=5)
+        listener.close()
+
+
+def test_doctor_passes_a_pooler_that_refuses_plain_text_as_ssl_connection_is_required(
+        tmp_path, hosted_pooler):
+    env = _env(tmp_path)
+    _ok(_manager(env, "store", "set", "--host", REMOTE_NAME, "--port", str(hosted_pooler),
+                 "--database", "app", "--user", "agent",
+                 "--password-stdin", stdin=PASSWORD + "\n"))
+    result = _manager(env, "store", "doctor", "--json")
+    _no_secret(result)
+    payload = _ok(result)
+    assert payload["ok"] is True and payload["checks"]["tls"]["ok"] is True
+    plain = payload["checks"]["plain_text_refused"]
+    assert plain["ok"] is True and "SSL connection is required" in plain["reason"]
     assert "warning" not in plain and payload["warnings"] == []
 
 

@@ -473,7 +473,9 @@ STORE VERBS
   store doctor [--project PATH] [--json]
         Prove the database in force for the current project, or for the
         project at PATH, whichever level answered: a TLS connection works,
-        reporting the server version and the negotiated TLS; a plain-text
+        as the client's own connection reports it, with the server version
+        and the negotiated TLS version and cipher, null where the server
+        does not show this connection in pg_stat_ssl; a plain-text
         connection to the same server is refused, so a server that lets
         plain text back in is noticed - for a client whose sslmode is require
         or stronger, which never sends plain text, that is a warning rather
@@ -16847,8 +16849,10 @@ STORE_POOLER_OPTION = "--transaction-pooler"
 STORE_PASSWORD_OPTIONS = ("--password-stdin", "--password-file", "--password-env")
 # What a plain-text attempt reads when the server turns it away for lacking
 # TLS: "no encryption" from pg_hba.conf on Postgres 14 on, "SSL off" before
-# it, and "SSL required" from PgBouncer with client_tls_sslmode require.
-STORE_PLAIN_REFUSAL_MARKERS = ("no encryption", "SSL off", "SSL required")
+# it, "SSL required" from PgBouncer with client_tls_sslmode require, and "SSL
+# connection is required" from a hosted pooler that enforces TLS.
+STORE_PLAIN_REFUSAL_MARKERS = ("no encryption", "SSL off", "SSL required",
+                               "SSL connection is required")
 # The sslmodes under which the client opens no connection without TLS.
 STORE_TLS_ONLY_SSLMODES = ("require", "verify-ca", "verify-full")
 
@@ -17353,25 +17357,28 @@ def _store_connect(setting, sslmode: str | None = None):
 
 def _store_probe(setting, sslmode: str | None = None) -> tuple[dict | None, str | None]:
     """Open one connection with the setting, `sslmode` replacing its own, and
-    say what the server negotiated; or the reason it was not opened."""
+    say what was negotiated; or the reason it was not opened. Whether TLS is in
+    use is the client's own socket: behind a pooler the server sees only the
+    pooler's hop, and a role it does not let read this backend's row gets none
+    from pg_stat_ssl, which is read for the version and cipher it can name."""
     import psycopg
     try:
         conn = _store_connect(setting, sslmode)
     except psycopg.Error as exc:
         return None, _store_scrub(exc, setting)
     try:
+        ssl = bool(conn.pgconn.ssl_in_use)
         with conn.cursor() as cur:
-            cur.execute("SELECT current_setting('server_version'), s.ssl, s.version, "
-                        "s.cipher FROM pg_stat_ssl s WHERE s.pid = pg_backend_pid()")
+            cur.execute("SELECT current_setting('server_version'), s.version, s.cipher "
+                        "FROM (SELECT 1) one LEFT JOIN pg_stat_ssl s "
+                        "ON s.pid = pg_backend_pid()")
             row = cur.fetchone()
     except psycopg.Error as exc:
         return {}, _store_scrub(exc, setting)
     finally:
         conn.close()
-    if row is None:
-        return {}, "the server did not report this connection in pg_stat_ssl"
-    return {"server_version": row[0], "ssl": bool(row[1]),
-            "tls": {"version": row[2], "cipher": row[3]}}, None
+    return {"server_version": row[0], "ssl": ssl,
+            "tls": {"version": row[1], "cipher": row[2]}}, None
 
 
 def _store_schema_check(setting) -> dict:
