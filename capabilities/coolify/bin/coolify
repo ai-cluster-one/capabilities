@@ -52,6 +52,15 @@ CONNECTIONS
   Unflagged, the registry's "default" pointer applies, else the sole entry;
   several entries without a pointer is refused as ambiguous.
 
+  A lent connection: a caller holding a Coolify connection of its own may lend
+  it to one process, through that process's environment alone -
+  COOLIFY_LENT_BASE_URL (the instance root) and COOLIFY_LENT_TOKEN - as
+  `deployment node --coolify-stdin` does for each coolify it runs. While both
+  are set they are the run's only connection, writable unless the read-only
+  switch is on: no registry is read and no grant is asked for, --connection
+  beside them is refused (exit 6 lent_connection), and one set without the
+  other is refused (exit 6 lent_connection_incomplete). Nothing is written.
+
   Inside a project, a connection declared in ~/.config/coolify/ is usable once
   the project grants it. Outside any project, connections, doctor and servers
   are machine reads: they use the machine's own connections read-only, unless
@@ -504,7 +513,33 @@ def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict |
             "ssh": ssh if isinstance(ssh, dict) else None}, None
 
 
+# A connection a caller lends this one process through its environment, in
+# place of every connection the registry declares (deviations.md).
+LENT_BASE_URL = "COOLIFY_LENT_BASE_URL"
+LENT_TOKEN = "COOLIFY_LENT_TOKEN"
+
+
+def _lent_conn(args) -> dict | None:
+    """The connection lent to this process, or None when none is."""
+    base_url, token = os.environ.get(LENT_BASE_URL), os.environ.get(LENT_TOKEN)
+    if not base_url and not token:
+        return None
+    if not (base_url and token):
+        _die(6, "lent_connection_incomplete",
+             f"a lent connection needs both {LENT_BASE_URL} and {LENT_TOKEN}")
+    if getattr(args, "connection", None) or getattr(args, "base_url", None) \
+            or getattr(args, "token", None):
+        _die(6, "lent_connection",
+             "a lent connection is this run's only connection: "
+             "--connection, --base-url and --token are refused beside it")
+    return {"id": "lent", "allow_write": WRITE_DEFAULT,
+            "base_url": base_url.rstrip("/"), "token": token, "ssh": None}
+
+
 def _resolve_conn(args) -> dict:
+    lent = _lent_conn(args)
+    if lent is not None:
+        return lent
     reg, _ = _connections_registry()
     cid, entry = _select_connection(reg, getattr(args, "connection", None))
     conn, problem = _build_conn(cid, entry, args)

@@ -245,7 +245,7 @@ USAGE
   deployment node add <label> --server <uuid> [--version <tag>] [--memory 2g]
                       [--services <name,...>] [--project <uuid>]
                       [--environment production] [--connection <id>]
-                      [--wait 600] [--events]
+                      [--wait 600] [--events] [--coolify-stdin]
       The whole path from nothing to a raised node of the standard image on
       a server Coolify already runs, one step after another: project, the
       Coolify project - --project, else the one named after the agent's
@@ -272,15 +272,29 @@ USAGE
       vault and a connection that does not allow writes. A fresh server is
       installed with Coolify first, as before; node add starts from one
       Coolify runs.
+      --coolify-stdin (node add, create, enrol, update and remove): reach
+      Coolify through a connection the caller lends this one run instead of
+      one granted to the agent - a JSON object {"url", "token"} on standard
+      input, the instance root without /api/v1 and its API token - which
+      each coolify the verb runs is given in its environment alone
+      (COOLIFY_LENT_BASE_URL, COOLIFY_LENT_TOKEN; coolify help) and which is
+      never on a command line, printed or written. --connection beside it is
+      refused (exit 6 lent_connection). A node created so records that
+      Coolify's address as its connection, and every later verb on it
+      takes the same connection lent again: without one it is refused (exit 6
+      coolify_connection_required), and one lent for another address, or
+      for a node created through a granted connection, is refused (exit 6
+      lent_connection_mismatch). enrol carries the agent's own coolify
+      connections to such a node, since none of them created it.
   deployment node create <node> --project <uuid> --server <uuid>
                          --environment <name> [--version <tag>]
-                         [--memory 2g] [--connection <id>]
+                         [--memory 2g] [--connection <id> | --coolify-stdin]
   deployment node create <node> --project <uuid> --server <uuid>
                          --environment <name> --repository <url>
                          --branch <branch> --dockerfile <path> [--context <dir>]
                          [--deploy-key <uuid> | --github-app <uuid>]
                          [--docker-socket] [--host-dir <path>]...
-                         [--memory 2g] [--connection <id>]
+                         [--memory 2g] [--connection <id> | --coolify-stdin]
       For an agent that lives in the store: create a Coolify resource
       running the standard image ghcr.io/agenium-dev/agent-node:<tag>, the
       current release as `node image` answers it when --version is not given,
@@ -317,6 +331,7 @@ USAGE
       wait <uuid> --deployment <uuid>` waits for the build before enrol.
       A step that fails once the application exists takes it away again.
   deployment node enrol <node> [--services <name,...>] [--wait 300]
+                         [--coolify-stdin]
       <node> is the node's id, or the label exactly one of the agent's
       nodes carries (node_ambiguous otherwise); so for exec and remove.
       Over SSH to the node's server and docker exec into its container:
@@ -366,6 +381,7 @@ USAGE
       https. Each is kept on the node's volumes and outlives a new image
       tag.
   deployment node update <node> --version <tag> [--memory <size>] [--wait 600]
+                          [--coolify-stdin]
       Move a node of the standard image to ghcr.io/agenium-dev/agent-node:<tag>
       through the coolify connection its row names: write its Coolify
       service the whole Compose document `node create` writes for it, with
@@ -406,7 +422,7 @@ USAGE
       6 node_resource_not_own) and a coolify without `service set-compose`
       (exit 6 provider_not_ready); nothing is changed then. A node that is
       not back in time exits 5 node_not_raised after printing the answer.
-  deployment node remove <node> --yes
+  deployment node remove <node> --yes [--coolify-stdin]
       Delete the node's Coolify resource with its volumes and configuration,
       then its node row. Only the resource the row names is touched; one
       already gone leaves only the row to remove. A resource whose agent
@@ -6466,7 +6482,11 @@ def _node_coolify(root, target, *args, stdin=None):
     # options before the verb. Neither path may fall back to another connection.
     command = (["coolify", *args, *selection] if args and args[0] == "ids"
                else ["coolify", *selection, *args])
-    p = _node_run(command, root, stdin=stdin, timeout=900)
+    # A connection lent to this run reaches coolify through its environment
+    # alone, never its argv; nothing else this run starts is given it.
+    env = ({**os.environ, "COOLIFY_LENT_BASE_URL": _NODE_LENT["url"],
+            "COOLIFY_LENT_TOKEN": _NODE_LENT["token"]} if _NODE_LENT else None)
+    p = _node_run(command, root, stdin=stdin, timeout=900, env=env)
     if args[:2] == ("ids", "get"):
         try:
             return json.loads(p.stdout)
@@ -6521,7 +6541,65 @@ def _node_target(root, name):
     return target
 
 
+# The Coolify connection a caller lends this run on stdin (--coolify-stdin),
+# {url, token}: the run's only one, asked of no grant, written nowhere.
+_NODE_LENT: dict = {}
+
+
+def _node_lend():
+    """Take the connection lent on stdin: a JSON object {url, token}, the
+    Coolify instance root and its API token. Never echoed."""
+    try:
+        given = json.loads(sys.stdin.read() or "null")
+    except ValueError:
+        given = None
+    if not isinstance(given, dict) or set(given) != {"url", "token"}:
+        raise NodeFailure("input", "--coolify-stdin takes a JSON object {url, token} on stdin", 6)
+    url, token = given["url"], given["token"]
+    if not isinstance(url, str) or not re.fullmatch(r"https?://[A-Za-z0-9.-]+(?::[0-9]+)?/?", url):
+        raise NodeFailure("input", "the lent url is a Coolify instance root, "
+                          "http(s)://host[:port], without /api/v1", 6)
+    if not isinstance(token, str) or not re.fullmatch(r"\S+", token):
+        raise NodeFailure("input", "the lent token is one line with no spaces", 6)
+    _NODE_LENT.update(url=url.rstrip("/"), token=token)
+
+
+def _node_lent_address(value):
+    """Whether a node row's coolify connection is the address of a lent one."""
+    return isinstance(value, str) and re.match(r"https?://", value) is not None
+
+
+def _agent_node_target(row):
+    """The target a node is reached through: the connection its row names, or
+    the one lent to this run for the Coolify address the row names instead."""
+    recorded = row["coolify_connection"]
+    if _node_lent_address(recorded):
+        if not _NODE_LENT:
+            raise NodeFailure("coolify_connection_required", f"node {row['node']} was created "
+                              f"through a connection lent for {recorded}; lend it again with "
+                              "--coolify-stdin", 6)
+        if _NODE_LENT["url"] != recorded:
+            raise NodeFailure("lent_connection_mismatch", f"node {row['node']} was created on "
+                              f"{recorded}, not on {_NODE_LENT['url']}", 6)
+        return {"connection": None}
+    if _NODE_LENT:
+        raise NodeFailure("lent_connection_mismatch", f"node {row['node']} was created through "
+                          f"coolify connection {recorded!r}, not a lent one", 6)
+    return {"connection": recorded}
+
+
+def _node_origin(target):
+    """What a node row records as the connection it was created through: the
+    connection's id, or a lent connection's Coolify address."""
+    return _NODE_LENT["url"] if _NODE_LENT else target["connection"]
+
+
 def _node_connection(target, write=False):
+    if _NODE_LENT:
+        if target.get("connection"):
+            raise NodeFailure("lent_connection", "--coolify-stdin lends this run's only "
+                              "Coolify connection; --connection is refused beside it", 6)
+        return {"base_url": _NODE_LENT["url"]}
     rows = _records().connections("coolify", write_default=True, include_disabled=True)
     cid = target.get("connection")
     if not cid:
@@ -7646,10 +7724,9 @@ def _agent_node_reach(root, row, write):
     if not row.get("coolify_resource"):
         raise NodeFailure("node_not_coolify", f"node {row.get('node')} is not a Coolify "
                           "resource made by `deployment node create`", 6)
-    target = {"connection": row["coolify_connection"]}
+    target = _agent_node_target(row)
     entry = _node_connection(target, write)
-    host = {**_node_server_host(root, target, entry, row["coolify_server"]),
-            "connection": row["coolify_connection"]}
+    host = _node_server_host(root, target, entry, row["coolify_server"])
     return target, host, _agent_node_container(root, host, row)
 
 
@@ -8023,7 +8100,7 @@ def _agent_node_create(root, args):
                                                        name, build)
     try:
         row = _manager(root, "node", "add", node_id, "--label", node, "--kind", "server",
-                       "--coolify-connection", target["connection"],
+                       "--coolify-connection", _node_origin(target),
                        "--coolify-server", args.server, "--coolify-resource", resource)["node"]
     except NodeFailure:
         # A resource no row names would be reached by nothing: take it away again.
@@ -8130,7 +8207,8 @@ def _agent_node_enrol(root, row, services, wait, inputs, reached):
                              stdin=key)
         check.update({"placed": key is not None, "fingerprint": fingerprint})
     with _NodeStep("secrets", node=node) as check:
-        withheld = {"coolify": {row["coolify_connection"]}}
+        withheld = ({} if _node_lent_address(row["coolify_connection"])
+                    else {"coolify": {row["coolify_connection"]}})
         secrets, skipped, environment_only = _agent_node_secrets(
             root, sorted({*_usable_capabilities(root), *services}), withheld)
         held = {}
@@ -8260,7 +8338,7 @@ def cmd_node_add(args):
         raise NodeFailure("node_exists", f"{label} is the id of this agent's node "
                           f"{row.get('label')}; a new node takes a label of its own", 6)
     if row is not None and (row.get("coolify_server") != args.server
-                            or target["connection"] != row.get("coolify_connection")):
+                            or _node_origin(target) != row.get("coolify_connection")):
         raise NodeFailure("node_exists", f"this agent already has node {label} on server "
                           f"{row.get('coolify_server')} through connection "
                           f"{row.get('coolify_connection')}", 6)
@@ -8652,7 +8730,7 @@ def cmd_node_remove(args):
     if not row.get("coolify_resource"):
         raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
                           "`deployment node create`", 6)
-    target = {"connection": row["coolify_connection"]}
+    target = _agent_node_target(row)
     entry = _node_connection(target, write=True)
     resource = row["coolify_resource"]
     # A node of the standard image is a service, one built from a repository
@@ -8836,7 +8914,7 @@ def cmd_node_update(args):
     if not row.get("coolify_resource"):
         raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
                           "`deployment node create`", 6)
-    target = {"connection": row["coolify_connection"]}
+    target = _agent_node_target(row)
     entry = _node_connection(target, write=True)
     resource = row["coolify_resource"]
     # `node create` makes a node of the standard image a Compose service and
@@ -8849,8 +8927,7 @@ def cmd_node_update(args):
     if kind is None:
         raise NodeFailure("node_resource_missing", f"node {node}'s Coolify resource {resource} "
                           "is gone", 3)
-    host = {**_node_server_host(root, target, entry, row["coolify_server"]),
-            "connection": row["coolify_connection"]}
+    host = _node_server_host(root, target, entry, row["coolify_server"])
     if not _agent_node_containers(root, host, resource):
         # Without a container nothing confirms the volumes a new document
         # would mount; the stored document still names them, and deploying
@@ -9164,11 +9241,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--host-dir", action="append")
     p.add_argument("--memory", default=AGENT_NODE_MEMORY)
     p.add_argument("--connection")
+    p.add_argument("--coolify-stdin", action="store_true")
     p.set_defaults(fn=cmd_node_create)
     p = node.add_parser("enrol", add_help=False)
     p.add_argument("node")
     p.add_argument("--services", default="")
     p.add_argument("--wait", type=int, default=300)
+    p.add_argument("--coolify-stdin", action="store_true")
     p.set_defaults(fn=cmd_node_enrol)
     p = node.add_parser("add", add_help=False)
     p.add_argument("node")
@@ -9181,16 +9260,19 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--connection")
     p.add_argument("--wait", type=int, default=600)
     p.add_argument("--events", action="store_true")
+    p.add_argument("--coolify-stdin", action="store_true")
     p.set_defaults(fn=cmd_node_add)
     p = node.add_parser("update", add_help=False)
     p.add_argument("node")
     p.add_argument("--version", required=True)
     p.add_argument("--memory")
     p.add_argument("--wait", type=int, default=600)
+    p.add_argument("--coolify-stdin", action="store_true")
     p.set_defaults(fn=cmd_node_update)
     p = node.add_parser("remove", add_help=False)
     p.add_argument("node")
     p.add_argument("--yes", action="store_true")
+    p.add_argument("--coolify-stdin", action="store_true")
     p.set_defaults(fn=cmd_node_remove)
     p = node.add_parser("exec", add_help=False)
     p.add_argument("node")
@@ -9233,6 +9315,8 @@ def main(argv: list[str] | None = None) -> None:
                                              "update", "remove", "exec"):
         _read_only_gate(f"`deployment node {args.node_cmd}`")
     try:
+        if getattr(args, "coolify_stdin", False):
+            _node_lend()
         args.fn(args)
     except NodeFailure as e:
         _die(e.exit_code, e.code, e.message)

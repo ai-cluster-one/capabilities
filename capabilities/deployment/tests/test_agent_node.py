@@ -68,7 +68,7 @@ class Fake:
         self.projects: list[dict] = []
 
     def __call__(self, argv, root, *, stdin=None, timeout=120, check=True, env=None):
-        self.calls.append({"argv": list(argv), "stdin": stdin})
+        self.calls.append({"argv": list(argv), "stdin": stdin, "env": env})
         out = self.answer(list(argv), stdin)
         if isinstance(out, Exception):
             raise out
@@ -1367,3 +1367,76 @@ def test_create_and_add_without_a_version_take_the_current_release(lab, registry
     assert json.loads(capsys.readouterr().out)["image"] == "ghcr.io/agenium-dev/agent-node:0.0.10"
     [create] = [c for c in lab.fake.of("coolify") if c["argv"][3:5] == ["service", "create"]]
     assert 'image: "ghcr.io/agenium-dev/agent-node:0.0.10"' in create["stdin"]
+
+
+LENT = {"url": "https://coolify.lent.invalid", "token": "lent-secret"}
+
+
+def lend(lab, monkeypatch, connection=LENT):
+    monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO(json.dumps(connection)))
+    lab.m._NODE_LENT.clear()
+    lab.m._node_lend()
+
+
+def test_add_and_update_through_a_lent_connection_grant_nothing_and_keep_its_token(
+        lab, stream, monkeypatch, capsys):
+    # The agent holds no coolify grant: nothing may ask for one.
+    monkeypatch.setattr(lab.m, "_records", lambda: pytest.fail("a lent connection asks no grant"))
+    lend(lab, monkeypatch)
+    lab.m.cmd_node_add(add_args())
+    said = capsys.readouterr().out
+    [done] = [e for e in events(said) if e["event"] == "done"]
+    assert done["result"]["ok"] is True and done["result"]["created"] is True
+    # The row names the Coolify it was made on, not a connection of the agent's.
+    assert lab.fake.rows[BOX1]["coolify_connection"] == LENT["url"]
+
+    # A later update, by a caller that does not ask for events.
+    lab.m._EVENTS_ON[0] = False
+    lab.m.cmd_node_update(update_args())
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["ok"] is True and answer["redeployed"] is True
+
+    # Every coolify call that reaches the instance; `coolify help` reaches none.
+    coolify = [c for c in lab.fake.of("coolify") if c["argv"][1:] != ["help"]]
+    lent = {"COOLIFY_LENT_BASE_URL": LENT["url"], "COOLIFY_LENT_TOKEN": LENT["token"]}
+    assert coolify and all(c["env"] and {k: c["env"].get(k) for k in lent} == lent
+                           and "--connection" not in c["argv"] for c in coolify)
+    # Only coolify is lent it, and the token is on no command line, in no
+    # input, no answer and no row.
+    assert all(c["argv"][0] == "coolify" for c in lab.fake.calls if c["env"] is not None)
+    assert not [c for c in lab.fake.calls
+                if LENT["token"] in json.dumps(c["argv"]) or LENT["token"] in (c["stdin"] or "")]
+    assert LENT["token"] not in said + json.dumps(answer) + json.dumps(lab.fake.rows)
+
+
+def test_a_lent_node_takes_the_same_connection_and_a_granted_one_no_lent_one(
+        lab, monkeypatch, capsys):
+    lend(lab, monkeypatch)
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m._NODE_LENT.clear()
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_update(update_args())
+    assert refused.value.code == "coolify_connection_required"
+    lend(lab, monkeypatch, {"url": "https://other.invalid", "token": "t"})
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
+    assert refused.value.code == "lent_connection_mismatch"
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_create(create_args(node="box2", connection="infra"))
+    assert refused.value.code == "lent_connection"
+    # A node made through a granted connection is not reached through a lent one.
+    lab.fake.rows[BOX1]["coolify_connection"] = "infra"
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_update(update_args())
+    assert refused.value.code == "lent_connection_mismatch"
+
+
+@pytest.mark.parametrize("given", ["", "{}", '{"url": "https://c.invalid"}',
+                                   '{"url": "https://c.invalid/api/v1", "token": "t"}',
+                                   '{"url": "https://c.invalid", "token": "a b"}'])
+def test_a_lent_connection_is_a_url_and_a_token_on_stdin(lab, monkeypatch, given):
+    monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO(given))
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m._node_lend()
+    assert refused.value.code == "input" and "a b" not in refused.value.message
