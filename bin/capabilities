@@ -753,6 +753,7 @@ POLICY VERBS
 
 PROJECT VERBS (run inside a consuming project)
   init [--claude] [--codex] [--with-layers | --with-template | --id <id>]
+       [--new-id <id>]
         Wire the project: bind it to its id - CAPABILITIES_PROJECT_ID in the
         root's .env.local, which is the whole binding (init writes no
         capabilities/project.json; one an older init wrote is kept, without
@@ -786,10 +787,16 @@ PROJECT VERBS (run inside a consuming project)
         writes the id to .env.local and nothing else of the agent, refuses
         an id other than one the folder already resolves (project_id_exists),
         and answers raised {id, verified, migrated, name, store} or {id,
-        verified: false, reason}. Run once in each clone of a
-        repository: the id is not committed. When a database resolves for the
-        project, its agent row is registered in capabilities_agents (the
-        result's `agent`: registered, store_not_configured, or the store's
+        verified: false, reason}. --new-id <id> creates the new agent under
+        that id, twelve lowercase hex characters (exit 6 input otherwise),
+        instead of minting one, so its folder may be named after the id
+        before it exists; with --with-layers or --with-template too, never
+        with --id. The store must hold no agent under it (exit 6 id_in_use)
+        and the folder must be a new agent's bound to no other id (exit 6
+        input, project_id_exists); a refusal writes nothing. Run once in
+        each clone of a repository: the id is not committed. When a
+        database resolves for the project, its agent row is registered in
+        capabilities_agents (the result's `agent`: registered, store_not_configured, or the store's
         error, which never fails init), and the row of this node (its id,
         `node id`) among its nodes is given the folder as its
         `folder` where it records none and no other agent's row holds that
@@ -819,15 +826,17 @@ PROJECT VERBS (run inside a consuming project)
         created, changed, skipped, imported?}. A new agent whose init fails
         partway is undone: the entries it added to the folder are removed,
         the files it changed there put back, and its agent row deleted.
-  init --template <id> [--name <name>]
+  init --template <id> [--name <name>] [--new-id <id>]
         Create a new agent in an empty folder (a .git or .DS_Store aside)
         from one of the agent templates: git init, the agent --with-layers
         binds (through the new-agent path above, so it starts in the store
         and is refused there), the template's context, routines and assets
         written to the agent's store by `context import`, `routine import`
         and `assets import`, its icon, name - --name, or one the template
-        offers - description and onboarding in the agent row, its
-        capabilities enabled for the project and confirmed through `list`,
+        offers - description and onboarding in the agent row, under
+        --new-id where given (refused as init refuses it, before the folder
+        is touched), its capabilities enabled for the project and confirmed
+        through `list`,
         both hosts wired by `hooks install`, and the first build. The folder
         gets no .contextkit/ and no body folders. Answers {project, created,
         imported, template, ok, git, identity {id, name, description,
@@ -24475,8 +24484,8 @@ def _agent_wired_hosts(root: Path) -> list[str]:
 
 
 def cmd_init(claude: bool, codex: bool, layers: bool = False, starter: bool = False,
-             given_id: str | None = None) -> None:
-    _emit(_init(claude, codex, layers, starter, given_id))
+             given_id: str | None = None, new_id: str | None = None) -> None:
+    _emit(_init(claude, codex, layers, starter, given_id, new_id=new_id))
 
 
 # A project id: twelve hex characters, or the `prj_` and twelve hex characters
@@ -24514,6 +24523,26 @@ def _agent_to_raise(root: Path, agent_id: str) -> dict:
              "check the id with `capabilities agent show` in a checkout already bound to it")
     return {"verified": True, "migrated": bool(agent.get("migrated_at")),
             "name": agent.get("name"), "store": _kernel_store_report(setting)}
+
+
+def _refuse_held_new_id(root: Path, new_id: str) -> None:
+    """`init --new-id`: refuse, before anything is written, an id the store
+    already holds an agent under, since the new agent is created under it."""
+    conn, setting = _kernel_open(root)
+    import psycopg
+    try:
+        held = _agent_row(conn, new_id) is not None
+    except psycopg.Error as exc:
+        _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    finally:
+        conn.close()
+    if held:
+        _die(6, "id_in_use",
+             f"the store ({setting.level}, schema {setting.schema}) holds an agent under "
+             f"{new_id} already: --new-id creates a new agent",
+             "give another id, or bind a folder to that agent with "
+             f"`capabilities init --id {new_id}`")
 
 
 def _remove_env_local_id(root: Path) -> None:
@@ -24637,12 +24666,14 @@ class _Creation:
 
 def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False,
           given_id: str | None = None, name: str | None = None,
-          creation: _Creation | None = None, system: bool = False) -> dict:
+          creation: _Creation | None = None, system: bool = False,
+          new_id: str | None = None) -> dict:
     """What `init` does, answered rather than printed. With `layers` or
     `starter` it first lays the rest of a new agent's body in the folder it
     runs in. With `given_id` it binds the folder to the agent the store holds
-    under that id rather than creating one. With `system` the agent is a
-    system agent: made one, or an existing agent marked one in place. A new
+    under that id rather than creating one; with `new_id` the agent it
+    creates is given that id, which the store must not hold. With `system`
+    the agent is a system agent: made one, or an existing agent marked one in place. A new
     agent whose init fails partway is undone (`_Creation`), by the caller
     that passes `creation`."""
     # init ESTABLISHES the project root: an existing root wins, else cwd. A body
@@ -24654,7 +24685,7 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
         creation = _Creation(root)
     try:
         return _init_in(root, claude, codex, with_body, starter, given_id, name, creation,
-                        system)
+                        system, new_id)
     except BaseException:
         if own:
             creation.undo()
@@ -24663,7 +24694,7 @@ def _init(claude: bool, codex: bool, layers: bool = False, starter: bool = False
 
 def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bool,
              given_id: str | None, name: str | None, creation: _Creation,
-             system: bool = False) -> dict:
+             system: bool = False, new_id: str | None = None) -> dict:
     global _CONTEXT_WITHOUT_STORE
     _CONTEXT_WITHOUT_STORE = True
     raised = None
@@ -24680,6 +24711,15 @@ def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bo
             _BODY_ROOT.pop(root.resolve(), None)
     else:
         new_agent = _new_agent_project(root)
+        if new_id is not None:
+            current = _project_id_state(root)["id"]
+            if current and current != new_id:
+                _die(6, "project_id_exists",
+                     f"this project is already bound to {current}, not {new_id}: an id is "
+                     "never rewritten", "run `capabilities init --new-id` in a new folder")
+            if not new_agent:
+                _die(6, "input", f"--new-id creates a new agent, and {root} is an existing "
+                     "agent's", "run `capabilities init --new-id` in a new folder")
     envelope_ignore = _envelope_home(root) / ".gitignore"
     if new_agent and envelope_ignore.is_file() \
             and not (_handed_off_project_id(root) or _env_file_project_id(root)[0]):
@@ -24694,11 +24734,13 @@ def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bo
              f"checkout, or set {PROJECT_ID_ENV}")
     if new_agent:
         _preflight_new_agent(root)
+        if new_id is not None:
+            _refuse_held_new_id(root, new_id)
         creation.arm()
     had_file_id = _env_file_project_id(root)[0] is not None
     had_ignore = envelope_ignore.exists()
     body: dict = {"created": [], "changed": [], "skipped": []} if with_body else {}
-    migrated = _ensure_envelope(root, new_agent=new_agent, given_id=given_id,
+    migrated = _ensure_envelope(root, new_agent=new_agent, given_id=given_id or new_id,
                                 records_in_store=bool(raised and raised.get("migrated")))
     registration = _register_agent_on_init(root, new_agent=new_agent, name=name,
                                            system=system)
@@ -25227,10 +25269,11 @@ def _ck_enable_capabilities(root: Path, names: list[str]) -> list[dict]:
     return results
 
 
-def cmd_init_template(template_id: str, name: str | None) -> None:
+def cmd_init_template(template_id: str, name: str | None, new_id: str | None = None) -> None:
     """Create a new agent in the empty folder this runs in from one of the
-    agent templates, named `name` or one the template offers. A step that
-    fails leaves the folder empty again and no agent registered."""
+    agent templates, named `name` or one the template offers, under `new_id`
+    where it is given. A step that fails leaves the folder empty again and no
+    agent registered."""
     root = Path.cwd().resolve()
     templates = _ck_agent_template_dirs()
     if template_id not in templates:
@@ -25249,13 +25292,16 @@ def cmd_init_template(template_id: str, name: str | None) -> None:
              "with `capabilities bootstrap`")
     # The agent starts in the store: refuse it before the repository is made.
     _preflight_new_agent(root)
+    if new_id is not None:
+        _refuse_held_new_id(root, new_id)
     creation = _Creation(root)
     creation.arm()
     try:
         git = _ck_prepare_git(root, yes=True)
         if name is None:
             name = secrets.choice(template["agent_names"])
-        result = _init(claude=True, codex=False, layers=True, name=name, creation=creation)
+        result = _init(claude=True, codex=False, layers=True, name=name, creation=creation,
+                       new_id=new_id)
         base = Path(template["path"])
         result["imported"] = [_ck_import_layer(root, layer, base / layer)
                               for layer in CK_AGENT_TEMPLATE_LAYERS if (base / layer).is_dir()]
@@ -28705,8 +28751,13 @@ def main() -> None:
         template = opt("--template")
         name = opt("--name")
         layers, starter = flag("--with-layers"), flag("--with-template")
+        new_id = opt("--new-id")
+        if new_id is not None and not NEW_AGENT_ID_RE.match(new_id):
+            _die(6, "input", f"--new-id {new_id!r} is not an agent id of the current form",
+                 "a new agent id is twelve lowercase hex characters")
         if flag("--system"):
-            if template is not None or starter or opt("--id") is not None:
+            if template is not None or starter or opt("--id") is not None \
+                    or new_id is not None:
                 _die(6, "input", "init --system takes only --name, --claude, --codex, "
                      "--with-layers and --json: a system agent's doctrine comes from the "
                      "app that keeps it, and it is made or adopted in its own folder")
@@ -28716,19 +28767,23 @@ def main() -> None:
         elif template is not None:
             if flag("--claude") or flag("--codex") or layers or starter \
                     or opt("--id") is not None:
-                _die(6, "input", "init --template takes only --name and --json: it wires "
-                     "both hosts itself and creates the agent with an id of its own")
-            cmd_init_template(template, name)
+                _die(6, "input", "init --template takes only --name, --new-id and --json: it "
+                     "wires both hosts itself and creates the agent under --new-id or an id "
+                     "of its own")
+            cmd_init_template(template, name, new_id)
         elif name is not None:
             _die(6, "input", "--name applies only to `init --template` and `init --system`, "
                  "which name the agent",
                  "set an existing agent's name with `capabilities identity set --name`")
         else:
             given_id = opt("--id")
+            if given_id is not None and new_id is not None:
+                _die(6, "input", "--id binds the folder to an agent the store already holds "
+                     "and --new-id creates one: give one of them")
             if given_id is not None and (layers or starter):
                 _die(6, "input", "init --id binds a folder to an agent the store already "
                      "holds, so it lays no new body: drop --with-layers / --with-template")
-            cmd_init(flag("--claude"), flag("--codex"), layers, starter, given_id)
+            cmd_init(flag("--claude"), flag("--codex"), layers, starter, given_id, new_id)
     elif cmd == "templates":
         if pos:
             _die(6, "input", f"unknown templates argument {pos[0]!r}")

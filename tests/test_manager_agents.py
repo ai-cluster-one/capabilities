@@ -321,6 +321,40 @@ def test_init_id_raises_an_agent_the_store_holds_in_a_folder_of_its_own(lab, tmp
     assert not (stray / "capabilities").exists()
 
 
+def test_init_new_id_creates_the_new_agent_under_the_id_it_is_given(lab, tmp_path):
+    node = {**node_env("lab-node")}
+    migrated = lab.run("migrate", "--global", "--apply", **node)
+    assert migrated.returncode == 0, migrated.stderr
+    (lab.project / "capabilities" / "project.json").unlink()
+    setting = (lab.project / ".env.local").read_text()
+
+    # An id of another form is refused, and nothing is written.
+    code, error = lab.refused("init", "--new-id", "prj_abcdef012345", **node)
+    assert (code, error["code"]) == (6, "input")
+    assert (lab.project / ".env.local").read_text() == setting
+    assert list((lab.project / "capabilities").iterdir()) == []
+
+    created = lab.run("init", "--new-id", "abcdef012345", **node)
+    assert created.returncode == 0, created.stderr
+    assert json.loads(created.stdout)["agent"]["id"] == "abcdef012345"
+    assert _bound(lab.project) == "abcdef012345"
+    assert lab.sql(f"SELECT id FROM {SCHEMA}.capabilities_agents") == [("abcdef012345",)]
+
+    # An id the store holds an agent under is refused, and nothing is written.
+    taken = tmp_path / "taken"
+    taken.mkdir()
+    (taken / ".env.local").write_text(setting)
+    refused = subprocess.run(
+        [sys.executable, str(MANAGER), "init", "--with-layers", "--new-id", "abcdef012345"],
+        cwd=taken, env=lab.env(CLAUDE_PROJECT_DIR=str(taken), **node),
+        text=True, capture_output=True, timeout=120)
+    assert refused.returncode == 6, refused.stderr
+    assert json.loads(refused.stderr.strip().splitlines()[-1])["error"]["code"] == "id_in_use"
+    assert sorted(p.name for p in taken.iterdir()) == [".env.local"]
+    assert (taken / ".env.local").read_text() == setting
+    assert lab.sql(f"SELECT id FROM {SCHEMA}.capabilities_agents") == [("abcdef012345",)]
+
+
 def test_a_folder_an_agent_is_raised_in_does_not_name_it(lab, tmp_path):
     # A node raises an agent the store already holds in /app: an agent with no
     # slug and no name is not named "app" after it.
@@ -1343,6 +1377,27 @@ def test_init_template_that_fails_partway_leaves_nothing_behind(lab, tmp_path):
     assert again.returncode == 1, again.stderr
     assert lab.sql(f"SELECT name FROM {SCHEMA}.capabilities_agents WHERE id = %s",
                    (_bound(made.folder),)) == [("Probe",)]
+
+
+def test_init_template_creates_the_agent_under_the_new_id_it_is_given(lab, tmp_path):
+    made = Creation(lab, tmp_path)
+    result = made.run("init", "--template=demo", "--name=Probe", "--new-id=abcdef012345",
+                      "--json")
+    assert result.returncode == 1, result.stderr
+    assert json.loads(result.stdout)["identity"]["id"] == "abcdef012345"
+    assert _bound(made.folder) == "abcdef012345"
+    assert lab.sql(f"SELECT name FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+                   ("abcdef012345",)) == [("Probe",)]
+
+    # The id taken, another empty folder is refused before it is touched.
+    other = tmp_path / "other"
+    other.mkdir()
+    again = subprocess.run(
+        [sys.executable, str(MANAGER), "init", "--template=demo", "--new-id=abcdef012345"],
+        cwd=other, env=lab.env(**{**made.extra, "CLAUDE_PROJECT_DIR": str(other)}),
+        text=True, capture_output=True, timeout=120)
+    assert (again.returncode, json.loads(again.stderr)["error"]["code"]) == (6, "id_in_use")
+    assert list(other.iterdir()) == []
 
 
 def test_init_template_refuses_a_folder_that_is_not_empty(lab, tmp_path):
