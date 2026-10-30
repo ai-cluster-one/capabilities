@@ -615,7 +615,17 @@ STORE_SETTING, STORE_REFUSAL = _resolve_store_setting()
 
 _JOB_STORE = None
 _JOB_REGISTER = None
-JOB_OWNER_HOST = os.uname().nodename
+# A job's attempt names the node it runs on by the node's id, the key every
+# store row that names a node holds, and its lease owner starts with that id.
+# A release before this recorded the host name, which is still read as this
+# node's so an attempt leased before the upgrade is recovered as local.
+def _job_owner_node() -> str:
+    from capabilities_contract.capability import store
+    return store.node_id()
+
+
+JOB_OWNER_HOST = _job_owner_node()
+JOB_LEGACY_HOST = os.uname().nodename
 JOB_OWNER_ID = f"{JOB_OWNER_HOST}:{os.getpid()}:{time.time_ns()}"
 # The owner a call's task runs under: this daemon, outside the runner's slots.
 VOICE_OWNER_ID = jobs.direct_owner(JOB_OWNER_ID)
@@ -7722,7 +7732,7 @@ async def run_session(client):
         """Fence dead owners without touching a healthy overlapping daemon."""
         interrupted = []
         for row in register.expired_active():
-            local_owner = row.get("owner_host") == JOB_OWNER_HOST
+            local_owner = row.get("owner_host") in (JOB_OWNER_HOST, JOB_LEGACY_HOST)
             pgid = row.get("pgid") or row.get("pid")
 
             def stop_local_group():

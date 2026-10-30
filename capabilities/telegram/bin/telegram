@@ -3607,7 +3607,7 @@ def _profile_saver(root: Path, thing: str = "profile") -> str:
     states that role; the CLI trusts the daemon, not the model. `thing` is what
     is being saved - a profile, a prompt - as the refusal names it."""
     if not os.environ.get("TELEGRAM_DAEMON_CHILD", "").strip():
-        return f"{getpass.getuser()}@{os.uname().nodename}"
+        return f"{getpass.getuser()}@{node_name()}"
     requester = os.environ.get("TELEGRAM_AUTHORIZED_REQUESTER_ID", "").strip()
     role = os.environ.get(PROFILE_ROLE_ENV, "").strip()
     if not requester or not role:

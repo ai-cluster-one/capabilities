@@ -1131,6 +1131,13 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
 
     # -- restart --------------------------------------------------------------
 
+    async def test_an_attempt_names_its_node_by_id_not_by_host(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.dict(os.environ, {"AGENT_NODE_ID": "6e6f64652d74"}):
+            daemon = import_daemon(Path(td), job_settings())
+        self.assertEqual(daemon.JOB_OWNER_HOST, "6e6f64652d74")
+        self.assertTrue(daemon.JOB_OWNER_ID.startswith("6e6f64652d74:"))
+
     async def test_a_restart_recovers_work_that_claimed_to_be_running(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)

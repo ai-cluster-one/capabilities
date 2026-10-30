@@ -460,7 +460,6 @@ import json
 import os
 import signal
 import shutil
-import socket
 import stat
 import tempfile
 import subprocess
@@ -2901,7 +2900,7 @@ def _default_project_state_dir(slug: str) -> Path:
 
 def _actor() -> str:
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
-    return f"{user}@{socket.gethostname()}"
+    return f"{user}@{node_name()}"
 
 
 def _utc_moment(value) -> str:

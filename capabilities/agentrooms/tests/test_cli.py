@@ -1871,3 +1871,9 @@ def test_a_room_is_switched_on_and_off_and_opened_rooms_start_as_the_default_say
     assert {r["room_id"]: r["served"] for r in out["joined"]} == {"!lab": False, "!other": True}
     assert "agentrooms.served" in json.loads(homeserver.sync_params[-1]["filter"])[
         "room"]["account_data"]["types"]
+
+
+def test_an_actor_names_the_node_by_its_id(cli, monkeypatch):
+    monkeypatch.setenv("AGENT_NODE_ID", "6e6f64652d61")
+    monkeypatch.setenv("USER", "someone")
+    assert cli._actor() == "someone@6e6f64652d61"

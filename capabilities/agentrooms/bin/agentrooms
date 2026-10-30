@@ -794,7 +794,6 @@ import os
 import re
 import secrets
 import signal
-import socket
 import sys
 import threading
 import time
@@ -3517,7 +3516,7 @@ def _project_fingerprint(root: Path) -> str:
 
 def _actor() -> str:
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
-    return f"{user}@{socket.gethostname()}"
+    return f"{user}@{node_name()}"
 
 
 def _utc_now() -> str:

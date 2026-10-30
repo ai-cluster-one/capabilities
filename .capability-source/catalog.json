@@ -2,7 +2,7 @@
   "capabilities": {
     "agentrooms": {
       "path": "capabilities/agentrooms",
-      "payload_sha256": "a77bdea7f51e8203523d0156adf3cbca7738e5335628976c6d040f63afdead04",
+      "payload_sha256": "0b5ffc381b4ca0df96d1ac75733191c93baba5e569aa1cf9f40e5a991f495b95",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
     "agenttemplates": {
@@ -27,7 +27,7 @@
     },
     "automations": {
       "path": "capabilities/automations",
-      "payload_sha256": "e35400d199c0067c012e451552b7c6086e5eb2612416285be9f82b10739e1c75",
+      "payload_sha256": "72dc67f5dce5285319d71ee576f2ee87cb1a36a4e92becc59f60fed5711aeea4",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -177,7 +177,7 @@
     },
     "telegram": {
       "path": "capabilities/telegram",
-      "payload_sha256": "4bb41270c55949bd7024a38638ff300681356b325f9bbc678e85e83f12698179",
+      "payload_sha256": "09042849b9135b647d4672fda78727ae78c0dcf1991561c46205110c5368f3b2",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {

@@ -764,9 +764,13 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
 # A run may record a result on its own row (`0006-runs-result`), and the next
 # run of the automation is handed the last one recorded, whichever node ran
 # it, so state between runs lives in the store rather than on one machine.
+#
+# Every run is inserted with its node, so the trigger that filled a missing
+# node from the host is dropped (`0007-runs-node-written`): a host is a machine
+# name, never a node id, and an insert without a node is refused.
 LEDGER_OWNER = "automations"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 3
+LEDGER_MINOR = 4
 # The most a run may record: it is handed to the next run as one environment
 # variable, which the kernel caps at 128 KiB.
 RESULT_MAX_BYTES = 65536
@@ -939,6 +943,10 @@ LEDGER_STEPS = [
         '`automations result`; the next run is handed the result of the latest '
         'started run that recorded one, whichever node ran it. At most 64 KiB, '
         'since it is handed over as one environment variable.';
+    """),
+    ("0007-runs-node-written", """
+    DROP TRIGGER automations_runs_node_from_host ON automations_runs;
+    DROP FUNCTION automations_runs_node_from_host();
     """),
 ]
 

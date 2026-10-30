@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-30 — A saved worker's author names the node by its id, never the host
+
+`created_by` of a saved worker and the actor of a pause are written as `<user>@<node id>` instead of `<user>@<host name>`. Rows already written keep their values.
+
 ## 2026-10-29 — `service join` and `service leave` are removed; the node manager writes the machine service's list
 
 `agentrooms service join` and `agentrooms service leave` (with `leave --machine --project`) are removed. The machine service's list, `$XDG_CONFIG_HOME/agentrooms/service/projects.json`, is now written by the node manager alone (`capabilities node supervise agentrooms --machine`), from the agents placed on this node in mode shared whose leases it holds: it puts each there and takes off those it put there once they are no longer placed so. A project is served by the machine service by placing it so - `capabilities service start agentrooms`, or `capabilities place agentrooms --node <node> --mode shared` - and leaves it with `capabilities service stop agentrooms` or `capabilities unplace agentrooms --node <node> --mode shared`. A project already on the list stays on it. Hints that named `service join` or `leave` now name those commands; the list's format, `service status --machine` and every other machine verb answer as before.

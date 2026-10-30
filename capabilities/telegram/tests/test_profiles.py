@@ -950,8 +950,9 @@ class WhoMaySave(unittest.TestCase):
             env["TELEGRAM_AUTHORIZED_REQUESTER_ROLE"] = role
         return env
 
-    def test_a_terminal_saves_as_its_user_at_its_host(self):
-        self.assertRegex(self.saver({}), r"^[^@]+@.+$")
+    def test_a_terminal_saves_as_its_user_at_its_node_id(self):
+        self.assertEqual(self.saver({"LOGNAME": "someone", "AGENT_NODE_ID": "6e6f64652d74"}),
+                         "someone@6e6f64652d74")
 
     def test_a_worker_saves_for_a_role_that_may_set(self):
         for role in ("supervisor", "channel_admin"):

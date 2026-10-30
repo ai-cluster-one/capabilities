@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-30 — A job's attempt names its node by id, never the host
+
+The daemon records the node id (`AGENT_NODE_ID`, else the id the machine resolves for itself) in `telegram_jobs.owner_host`, and its `lease_owner` starts with that id, where both held the host name. An attempt leased under the host name before the upgrade is still recovered as this node's when its lease expires. A profile or prompt saved from a terminal records `created_by` as `<user>@<node id>` instead of `<user>@<host name>`. Rows already written keep their values.
+
 ## 2026-10-29 — A connection's session that is not live says why
 
 The `session` each connection `telegram connections` reports carries `reason` where `live` is false: `session_missing` where no session file of the connection is on this machine, else `not_signed_in` - a session file that holds no signed-in login, or one a service here recorded Telegram no longer accepts. A live session carries no reason. Still read from local files alone.

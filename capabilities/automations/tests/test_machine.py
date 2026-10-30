@@ -268,6 +268,12 @@ def bare(tmp_path, monkeypatch):
 
 # --- What is declared, and what is read ---------------------------------------
 
+def test_an_actor_names_the_node_by_its_id(monkeypatch):
+    monkeypatch.setenv("AGENT_NODE_ID", "6e6f64652d61")
+    monkeypatch.setenv("USER", "someone")
+    assert load_cli("automations_cli_actor")._actor() == "someone@6e6f64652d61"
+
+
 def test_the_manifest_declares_the_machine_service(bare):
     service = bare.ok(None, "manifest", "--json")["service"]
     assert service["machine"] == {

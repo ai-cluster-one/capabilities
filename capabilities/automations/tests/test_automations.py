@@ -1829,16 +1829,19 @@ def test_another_nodes_run_past_its_timeout_is_closed_for_the_automation(tmp_pat
     assert a.get(fresh["id"])["status"] == "pending"
 
 
-def test_a_writer_from_before_the_node_column_still_records_its_runs(tmp_path, ledger_env):
-    """A machine still on the release before `node` inserts none; its host was
-    its node name then, and the run is that node's rather than refused."""
+def test_a_run_inserted_without_a_node_is_refused_rather_than_recorded_under_its_host(
+        tmp_path, ledger_env):
+    """A host is a machine name, never a node id, so nothing fills a missing
+    node from it."""
+    import psycopg
     led = ledger_env()
-    led._execute(
-        "INSERT INTO automations_runs (id, project_id, automation_slug, environment, "
-        "trigger, status, queued_at, log_path, host) VALUES "
-        "(%s, %s, 'nightly', 'production', 'manual', 'pending', %s, '/tmp/x.log', 'old-node')",
-        [uuid.uuid4().hex, led.project_id, RUNTIME.iso()])
-    assert [row["node"] for row in led.list()] == ["old-node"]
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        led._execute(
+            "INSERT INTO automations_runs (id, project_id, automation_slug, environment, "
+            "trigger, status, queued_at, log_path, host) VALUES "
+            "(%s, %s, 'nightly', 'production', 'manual', 'pending', %s, '/tmp/x.log', 'old-node')",
+            [uuid.uuid4().hex, led.project_id, RUNTIME.iso()])
+    assert led.list() == []
 
 
 def test_a_run_reads_as_it_always_has_and_says_where_it_was_recorded(tmp_path, ledger_env):
