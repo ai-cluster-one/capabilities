@@ -38,8 +38,10 @@ MODEL
   on stderr; after the sixth skyscanner reports exit 7 `blocked` with what
   was tried. A site that refused is passed over for 30 minutes; the state
   home keeps when, per connection. Through an Oxylabs residential proxy every
-  attempt holds one sticky exit address in the chosen country for all its
-  requests; direct, every attempt leaves from this machine's address, which
+  attempt holds one sticky exit address for all its requests, by default in
+  the country of the site it uses (www.skyscanner.de from Germany,
+  www.skyscanner.net from Great Britain), so it reads as that site's own
+  visitor; direct, every attempt leaves from this machine's address, which
   is refused after roughly 15 to 25 searches in half an hour. The remedy is a
   fresh address and a fresh site, not a browser session.
   `skyscanner guide oxylabs` teaches the proxy fields, how they compose, and
@@ -62,6 +64,9 @@ CONNECTIONS
   username itself from oxylabs_username, oxylabs_country and
   oxylabs_session_minutes (default 10), with a fresh session id for every
   attempt, so the requests of one attempt share one exit address.
+  oxylabs_country defaults to auto, the country of each attempt's site; a
+  two-letter code pins every attempt to that country. The market, currency
+  and locale stay as configured whichever country the address is in.
   domains, when set, is the comma-separated list of Skyscanner site hosts to
   rotate across, in order of preference. oxylabs_username is the
   proxy user's own name, without the customer- prefix or any parameter;
@@ -91,14 +96,16 @@ COMMANDS
         Per connection (every configured one bare; one with --connection):
         resolve its fields, then, with an Oxylabs user, one request to
         https://ip.oxylabs.io/location through the proxy proving the exit
-        address and its country, then one autosuggest request to Skyscanner
+        address and its country against the one asked for the site a call
+        would use next (exit: {ip, country, providers, asked, site}), then
+        one autosuggest request to Skyscanner
         proving it answers rather than blocks, on the site a call would use
         next and on the following ones while a site refuses (up to 6). Emits
         {ok, connections: {<id>: {ok, proxy, exit?, skyscanner: {reachable,
         domain, refused, suggestions}, warning?}}}; domain is the site that
         answered, refused the sites that refused before it. Exit 0 all healthy / 2 a
         password missing or refused by the proxy / 5 unreachable / 7 blocked by
-        Skyscanner / 8 the proxy exits in another country than oxylabs_country.
+        Skyscanner / 8 the proxy exits in another country than it asked for.
     connections
         The resolution report: every connection, every value, its winning tier
         and source, the password masked, and the market, currency, locale and
@@ -198,7 +205,7 @@ EXIT CODES
   unknown or ambiguous connection, a malformed connection field, a request
   Skyscanner refused as invalid) · 7 blocked (Skyscanner's bot protection
   refused all 6 attempts) · 8 wrong exit country (doctor: the proxy exits in
-  another country than oxylabs_country).
+  another country than it asked for).
 
 EXAMPLES
   skyscanner doctor
@@ -254,8 +261,9 @@ CONN_FIELDS = [
      "type": "string", "secret": True, "required": False,
      "env": "SKYSCANNER_{ID}_OXYLABS_PASSWORD"},
     {"key": "oxylabs_country", "label": "Oxylabs exit country",
-     "help": "Two-letter country code the proxy's exit address is in.",
-     "type": "string", "required": False, "default": "EE"},
+     "help": "Two-letter country code the proxy's exit address is in, or auto for "
+             "the country of the Skyscanner site each attempt uses.",
+     "type": "string", "required": False, "default": "auto"},
     {"key": "oxylabs_host", "label": "Oxylabs proxy host",
      "help": "The Oxylabs residential proxy entry host.",
      "type": "string", "required": False, "default": "pr.oxylabs.io"},
@@ -305,6 +313,9 @@ DOMAINS = ("www.skyscanner.de", "www.skyscanner.fr", "www.skyscanner.it",
            "www.skyscanner.nl", "www.skyscanner.fi", "www.skyscanner.ie",
            "www.skyscanner.pl", "www.skyscanner.se", "www.skyscanner.net")
 LAST_RESORT = {"www.skyscanner.net"}   # the busiest site: used after the others
+# The country a site's own visitors are in, for oxylabs_country auto: the
+# two-letter top-level domain, save these.
+SITE_COUNTRY = {"net": "GB", "uk": "GB", "com": "US"}
 COOLDOWN = 30 * 60    # seconds a site that refused is passed over
 ATTEMPTS = 6          # whole attempts, each on a new site and a new exit address
 # A non-browser user agent is refused with 403.
@@ -350,7 +361,8 @@ def _proxy_summary(entry: dict) -> dict | None:
     return {"provider": "oxylabs",
             "host": _effective(entry, "oxylabs_host"),
             "port": _effective(entry, "oxylabs_port"),
-            "country": str(_effective(entry, "oxylabs_country")).upper(),
+            "country": str(_effective(entry, "oxylabs_country")).upper()
+                       .replace("AUTO", "auto"),
             "session_minutes": _effective(entry, "oxylabs_session_minutes")}
 
 
@@ -436,10 +448,13 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
             "customer- prefix, the country and the session itself "
             f"(`{NAME} guide oxylabs`)")
     country = str(_effective(entry, "oxylabs_country")).upper()
-    if not re.fullmatch(r"[A-Z]{2}", country):
+    if country == "AUTO":
+        country = "auto"
+    elif not re.fullmatch(r"[A-Z]{2}", country):
         return None, _problem(6, "bad_oxylabs_country",
                               f"connection {cid!r}: oxylabs_country {country!r} is "
-                              "not a two-letter country code", "e.g. EE, DE, US")
+                              "not a two-letter country code or auto",
+                              "e.g. auto, EE, DE, US")
     host = str(_effective(entry, "oxylabs_host")).strip()
     try:
         port = int(_effective(entry, "oxylabs_port"))
@@ -477,13 +492,31 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     return cfg, None
 
 
-def _proxy_url(proxy: dict | None, session_id: str) -> str | None:
-    """The Oxylabs residential proxy URL, composed the way Oxylabs specifies:
-    customer-<user>-cc-<COUNTRY>-sessid-<id>-sesstime-<minutes>."""
+def _site_country(domain: str | None) -> str | None:
+    """The country of a Skyscanner site's own visitors, from its host."""
+    tld = (domain or "").rsplit(".", 1)[-1].lower()
+    if tld in SITE_COUNTRY:
+        return SITE_COUNTRY[tld]
+    return tld.upper() if re.fullmatch(r"[a-z]{2}", tld) else None
+
+
+def _exit_country(cfg: dict, domain: str | None) -> str | None:
+    """The exit country an attempt on this site asks Oxylabs for: the pinned
+    oxylabs_country, or with auto the site's own country."""
+    proxy = cfg["proxy"]
     if not proxy:
         return None
-    user = (f"customer-{proxy['user']}-cc-{proxy['country']}"
-            f"-sessid-{session_id}-sesstime-{proxy['minutes']}")
+    return _site_country(domain) if proxy["country"] == "auto" else proxy["country"]
+
+
+def _proxy_url(proxy: dict | None, session_id: str, country: str | None) -> str | None:
+    """The Oxylabs residential proxy URL, composed the way Oxylabs specifies:
+    customer-<user>-cc-<COUNTRY>-sessid-<id>-sesstime-<minutes>; without a
+    country, Oxylabs picks one."""
+    if not proxy:
+        return None
+    user = (f"customer-{proxy['user']}" + (f"-cc-{country}" if country else "")
+            + f"-sessid-{session_id}-sesstime-{proxy['minutes']}")
     return (f"http://{quote(user, safe='')}:{quote(proxy['password'], safe='')}"
             f"@{proxy['host']}:{proxy['port']}")
 
@@ -614,10 +647,12 @@ class _Http:
     """One attempt's HTTP session: one Skyscanner site and, through an Oxylabs
     proxy, one sticky exit address that every request of the attempt shares."""
 
-    def __init__(self, cfg: dict, domain: str | None):
+    def __init__(self, cfg: dict, domain: str | None, skyscanner: bool = True):
         self.cfg = cfg
-        self.base = f"https://{domain}" if domain else None
-        self.c = _client(cfg, _proxy_url(cfg["proxy"], _new_session_id()), self.base)
+        self.base = f"https://{domain}" if domain and skyscanner else None
+        self.country = _exit_country(cfg, domain)
+        self.c = _client(cfg, _proxy_url(cfg["proxy"], _new_session_id(), self.country),
+                         self.base)
 
     def call(self, method: str, url: str, **kw):
         return _request(self.c, method, url, **kw)
@@ -893,9 +928,10 @@ def cmd_calendar(c, cfg, a) -> dict:
 
 # ── doctor ──────────────────────────────────────────────────────────────────
 
-def _exit_location(cfg: dict) -> dict:
-    """The exit address and the country each geolocation provider places it in."""
-    with _Http(cfg, None) as c:
+def _exit_location(cfg: dict, domain: str | None) -> dict:
+    """The exit address an attempt on this site gets, and the country each
+    geolocation provider places it in."""
+    with _Http(cfg, domain, skyscanner=False) as c:
         data = c.call("GET", EXIT_CHECK_URL)
     providers = data.get("providers") if isinstance(data, dict) else None
     countries = {name: str(p.get("country") or "").upper()
@@ -915,23 +951,24 @@ def _check_connection(cfg: dict) -> dict:
         result["warning"] = ("no Oxylabs proxy: requests leave from this machine's own "
                              "address, which Skyscanner blocks after roughly 15 to 25 "
                              f"searches in half an hour; `{NAME} guide oxylabs`")
-    else:
+    state = _domain_state(cfg["id"])
+    order = _domain_order(cfg["domains"], state, time.time())
+    if proxy is not None:
+        asked = _exit_country(cfg, order[0])
         try:
-            where = _exit_location(cfg)
+            where = _exit_location(cfg, order[0])
         except _Failure as f:
             return {**result, "ok": False, "category": f.exit_code,
                     "error": f.message, "code": f.code,
                     **({"hint": f.hint} if f.hint else {})}
-        result["exit"] = where
-        if where["country"] != proxy["country"]:
+        result["exit"] = {**where, "asked": asked, "site": order[0]}
+        if asked and where["country"] != asked:
             return {**result, "ok": False, "category": 8,
                     "code": "exit_country_mismatch",
                     "error": f"the proxy exits in {where['country']!r}, "
-                             f"not {proxy['country']!r}",
+                             f"not {asked!r}",
                     "hint": "check oxylabs_country; Oxylabs places the exit by the "
                             "-cc- parameter skyscanner composes from it"}
-    state = _domain_state(cfg["id"])
-    order = _domain_order(cfg["domains"], state, time.time())
     refused: list = []
     for domain in order[:ATTEMPTS]:
         try:

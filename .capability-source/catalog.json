@@ -188,7 +188,7 @@
     },
     "skyscanner": {
       "path": "capabilities/skyscanner",
-      "payload_sha256": "f178211037fbd5dc349897afc82d81a7f7a023aa917eb9c25a47ea4d52552117",
+      "payload_sha256": "84eb841e463cb58f6013c3c9897940144442827764ee242563f3de99262e09e1",
       "summary": "Skyscanner flight search over plain HTTP — resolve places, search live itineraries with prices, comfort facts (stops, layovers, self-transfer, airport changes) and booking links, and read the cached cheapest price per day; read-only, optionally through an Oxylabs residential proxy that keeps Skyscanner's bot protection from blocking the address."
     },
     "slack": {
