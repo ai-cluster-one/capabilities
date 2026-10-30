@@ -5,7 +5,7 @@
 #     "py-tgcalls==3.0.1b1",
 #     "ntgcalls==3.0.3",
 #     "telethon==1.45.0",
-#     "capabilities-contract>=0.25,<1",
+#     "capabilities-contract>=0.38,<1",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs

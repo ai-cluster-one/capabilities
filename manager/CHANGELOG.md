@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-30 — A release refuses a bundle script that could read the store setting with an older library
+
+`capabilities source verify`, `source index` and `dev check` refuse a capability whose bundle ships a script other than its executable - a service daemon, a helper run with `uv run --script` - declaring a `capabilities-contract` range under its own header that admits a release older than 0.38.0, the first to read the store setting `store set` writes. Install and update bring only the executable's library forward, so such a script kept the environment uv first made for it: telegram's `service/profiles.py` ran on 0.23.1 and refused a setting carrying `transaction_pooler`. The refusal is `contract-range` and names the file and the range to declare. Tests are not asked.
+
 ## 2026-10-30 — store doctor passes a pooler-backed store on its plain-text check
 
 `capabilities store doctor` no longer fails every store behind a connection pooler on `checks.plain_text_refused`. A plain-text attempt PgBouncer turns away with `FATAL: SSL required` now counts as a refusal for lacking TLS, beside `no encryption` and `SSL off`. And because a client whose sslmode is `require`, `verify-ca` or `verify-full` never reaches the store without TLS, a server that accepts the plain attempt - a hosted pooler whose SSL enforcement is off, or a `pg_hba.conf` that lets plain text in - or turns it away in words the doctor does not know is now a warning rather than a failure: the check stays `ok: true` with `warning: true` and its reason, and the answer's new `warnings` lists the name of each check that warns. A failing TLS, schema, transaction or session check still exits 7. Run `capabilities help` for the details.

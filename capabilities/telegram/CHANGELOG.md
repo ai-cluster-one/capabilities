@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-30 — The service and the profile reads run on a library that reads today's store setting
+
+`service/daemon.py`, `service/profiles.py` and `service/call_recorder.py` declare `capabilities-contract>=0.38,<1`, where they declared `>=0.25` and `>=0.12`. The environment uv had made for them earlier kept the library it held then, since install and update bring only the `telegram` executable's library forward, so on a machine whose store setting declares a transaction pooler `telegram profiles list` saw no store profiles and `telegram service run` stopped at start with `profile_refused`. The new range makes uv build each of them anew on the next run.
+
 ## 2026-10-30 — A job's attempt names its node by id, never the host
 
 The daemon records the node id (`AGENT_NODE_ID`, else the id the machine resolves for itself) in `telegram_jobs.owner_host`, and its `lease_owner` starts with that id, where both held the host name. An attempt leased under the host name before the upgrade is still recovered as this node's when its lease expires. A profile or prompt saved from a terminal records `created_by` as `<user>@<node id>` instead of `<user>@<host name>`. Rows already written keep their values.

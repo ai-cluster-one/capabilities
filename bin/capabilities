@@ -17049,7 +17049,9 @@ def _store_setting_document(values: dict, schema: str | None) -> dict:
 # it started with even after `update` replaces it in its environment: a node
 # manager, a service's supervisor or a service started before then stops
 # reading the store the moment the file carries the declaration. `store set`
-# therefore writes it only while no process reading the same file holds one.
+# therefore writes it only while no process reading the same file holds one,
+# and a release refuses a bundle script that could run on an older one
+# (`_bundle_library_problems`).
 STORE_POOLER_LIBRARY = "0.38.0"
 STORE_POOLER_NAMED = 12
 
@@ -26150,6 +26152,53 @@ def _contract_problems(text: str) -> list[str]:
         problems.append(f"the script binds unknown tiers: {', '.join(unknown)}")
     return problems
 
+def _bundle_library_problems(capdir: Path) -> list[str]:
+    """Why a script a bundle runs under its own header, other than its
+    executable, could run on a contract library older than the first to read
+    the store setting this manager writes. Install and update bring the
+    executable's environment to the newest library its range admits; nothing
+    brings another script's forward, so the environment uv first made for it
+    keeps whatever its range let in then. Tests are run by suites, never by an
+    installed capability, and are not asked."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.utils import canonicalize_name
+    from packaging.version import InvalidVersion, Version
+    floor = Version(STORE_POOLER_LIBRARY)
+    executable = capdir / "bin" / capdir.name
+    problems: list[str] = []
+    for path in sorted(p for p in capdir.rglob("*") if p.is_file()):
+        rel = path.relative_to(capdir)
+        if path == executable or rel.parts[0] == "tests" or "__pycache__" in rel.parts:
+            continue
+        try:
+            deps = _script_dependencies(path.read_text())
+        except (OSError, UnicodeDecodeError):
+            continue
+        for dep in deps or []:
+            try:
+                req = Requirement(dep)
+            except InvalidRequirement:
+                continue
+            if canonicalize_name(req.name) != CONTRACT_LIBRARY:
+                continue
+            lower = None
+            for spec in req.specifier:
+                if spec.operator not in (">=", ">", "==", "~=", "==="):
+                    continue
+                try:
+                    version = Version(spec.version.rstrip(".*"))
+                except InvalidVersion:
+                    continue
+                lower = version if lower is None else max(lower, version)
+            if lower is None or lower < floor:
+                problems.append(
+                    f"contract-range: {rel} declares {dep} under its own header, which "
+                    f"admits releases older than {STORE_POOLER_LIBRARY}, the first to read "
+                    f"the store setting this manager writes, and only the executable's "
+                    f"library is brought forward on install and update; declare "
+                    f"{CONTRACT_LIBRARY}>={floor.major}.{floor.minor},<1")
+    return problems
+
 # ---------------------------------------------------------------- audit
 
 def _tree_digest(root: Path) -> str:
@@ -27241,6 +27290,7 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
                 problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
             problems += [f"connections/machine-reads: {p}"
                          for p in _machine_reads_problems(script)]
+        problems += _bundle_library_problems(capdir)
         if problems:
             failures[name] = sorted(set(problems))
             continue
@@ -27292,6 +27342,7 @@ def _catalog_payload_scoped(
                     problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
                 problems += [f"connections/machine-reads: {p}"
                              for p in _machine_reads_problems(script)]
+            problems += _bundle_library_problems(capdir)
             if problems:
                 failures[name] = sorted(set(problems))
                 continue

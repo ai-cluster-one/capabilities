@@ -29,3 +29,10 @@ the change touches no capability script and is judged by the library's suite
 and the suites of the capabilities that need it. A change that would break a
 capability is released outside the range, and capabilities move to the new
 range one at a time.
+
+Only the executable is brought forward. Another script a bundle runs under its
+own PEP 723 header - a service daemon, a helper the CLI runs with
+`uv run --script` - keeps the environment uv first made for it, with whatever
+library its range let in then. A release therefore refuses such a script whose
+range admits a library older than the first to read the store setting the
+manager writes (`contract-range`).
