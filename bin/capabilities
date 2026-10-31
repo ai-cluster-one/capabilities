@@ -1946,15 +1946,21 @@ PROJECT VERBS (run inside a consuming project)
         read-only switch, 5 when the store cannot be reached.
   connections seal
         Write into every connection the values it resolves today from files
-        or the environment - the project's .env files, the machine's
-        credentials.env and shared.env, the process environment - sealed into
-        the vault of every agent it serves, so it resolves them the same on a
-        node with none of those files. It runs each installed capability's
+        - the project's .env files, the machine's credentials.env and
+        shared.env - sealed into the vault of every agent it serves, so it
+        resolves them the same on a node with none of those files; a value
+        only the process environment holds is the invoking shell's and is
+        left there (not_sealed). It runs each installed capability's
         `<name> connection seal` in this agent's folder and in the folder here
         of every other agent the store links to this node: first each agent's
         own, which also publishes its public sealing key, then with --share,
         so a connection the store shares is sealed for every agent granted
-        it, for its public key, those on other nodes included. A telegram
+        it, for its public key, those on other nodes included - under the
+        keys that are the connection's own only, since a vault answers for
+        every connection of its agent: a key another connection or a setup
+        field may read too reaches no other agent's vault (not_shared), and
+        `<name> connection add <id> --replace --stdin` gives the connection
+        a key of its own. A telegram
         connection naming no app of its own is given the machine's app as its
         own api_id and hash (TELEGRAM_<ID>_API_HASH), once every agent it is
         granted to holds the hash. Nothing a vault already holds is written
@@ -1965,6 +1971,7 @@ PROJECT VERBS (run inside a consuming project)
         by, from}], unchanged (how many names a vault already held), specs
         [{capability, connection, fields, by}], specs_pending [{capability,
         connection, fields}], unresolved [{capability, connection, key,
+        agent}], not_sealed and not_shared [{capability, connection, key,
         agent}], unpublished [{agent, capability, connection}], hint,
         not_sealing [{capability, code, message, agent, folder}], unread}:
         unpublished names each grantee whose public key is not yet published,
@@ -9794,6 +9801,10 @@ def _seal_collect(out: dict, agent_id: str, folder: Path, answers: dict,
             for key in res.get("unresolved") or []:
                 out["unresolved"].append({"capability": name, "connection": cid,
                                           "key": key, "agent": agent_id})
+            for field in ("not_sealed", "not_shared"):
+                for key in res.get(field) or []:
+                    out[field].append({"capability": name, "connection": cid,
+                                       "key": key, "agent": agent_id})
             if res.get("spec"):
                 out["specs"].append({"capability": name, "connection": cid,
                                      "fields": res["spec"], "by": agent_id})
@@ -9826,7 +9837,8 @@ def cmd_connections_seal(rest: list[str]) -> None:
                  "published": bool((published.get(folders[0][0]) or (None, None))[1]),
                  "agents": [{"agent": a, "folder": str(f)} for a, f in folders],
                  "sealed": [], "unchanged": 0, "specs": [], "specs_pending": [],
-                 "unresolved": [], "unpublished": [], "not_sealing": [], "unread": []}
+                 "unresolved": [], "not_sealed": [], "not_shared": [], "unpublished": [],
+                 "not_sealing": [], "unread": []}
     # Every agent here seals its own first, publishing its key as it does;
     # only then does each seal what the store shares for the agents granted it.
     for args in ([], ["--share"]):
@@ -9842,7 +9854,7 @@ def cmd_connections_seal(rest: list[str]) -> None:
                     for n in out["unread"])]
             _seal_collect(out, agent_id, folder, answers, refusing, unread)
     # Each pass may name the same thing again; it is answered once.
-    for field in ("unpublished", "unresolved", "specs_pending"):
+    for field in ("unpublished", "unresolved", "not_sealed", "not_shared", "specs_pending"):
         seen, rows = set(), []
         for row in out[field]:
             mark = json.dumps(row, sort_keys=True)
