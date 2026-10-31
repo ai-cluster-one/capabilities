@@ -16,9 +16,8 @@ its surface.
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
   connection. Its ASANA_TOKEN (an Asana Personal Access Token) is
-  resolved through the standard cascade — a project .env(.local), then
-  ~/.config/asana/credentials.env, then the process env. Never pass the
-  token on the command line.
+  resolved through the credential cascade (`Where a secret resolves`, at
+  the end of this help). Never pass the token on the command line.
 
   A project that acts as several Asana identities declares them as
   connections, kept where "Where connections live" below says:
@@ -377,24 +376,23 @@ _contract_bind(globals(), "store")
 # --- Credentials -------------------------------------------------------------
 
 def _load_token(key: str = "ASANA_TOKEN") -> str:
-    """Resolve a PAT by env-var NAME through the credential cascade — a project
-    .env(.local), then ~/.config/asana/credentials.env, then the process env;
-    first non-empty wins. `key` defaults to ASANA_TOKEN; the global
+    """Resolve a PAT by env-var NAME through the credential cascade
+    (`_resolve_env_key`: the project's .env files, the user's credentials.env,
+    the process env, then the agent's vault); first non-empty wins. `key` defaults to ASANA_TOKEN; the global
     `--token-env <KEY>` flag selects an alternate key to act as another identity.
     The token value never travels on the command line — only its name (so there is
     no value flag tier; the secret stays off argv, deliberately)."""
-    tok = (_project_env().get(key)
-           or _parse_env_file(CREDENTIALS_ENV).get(key)
-           or os.environ.get(key)
-           or "").strip()
+    tok = (_resolve_env_key(key)[0] or "").strip()
     if tok:
         return tok
     if key == "ASANA_TOKEN":
         _die(2, "missing_token",
-             f"ASANA_TOKEN not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+             f"ASANA_TOKEN not found in a project .env, {CREDENTIALS_ENV}, the environment, "
+             "or the agent's vault",
              "add ASANA_TOKEN=<your PAT> to the user config or a project .env")
     _die(2, "missing_token",
-         f"{key} not found in a project .env, {CREDENTIALS_ENV}, or the environment",
+         f"{key} not found in a project .env, {CREDENTIALS_ENV}, the environment, "
+         "or the agent's vault",
          f"add {key}=<PAT> to the user config or a project .env to use --token-env {key}")
 
 

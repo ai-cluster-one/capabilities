@@ -40,8 +40,8 @@ CONNECTIONS
   "Where connections live" below.
 
   Only the password is secret: the entry names the env var holding it
-  ("secret_env"); the value resolves through the cascade — project
-  .env/.env.local → ~/.config/mailbox/credentials.env → process env.
+  ("secret_env"); the value resolves through the credential cascade
+  (`Where a secret resolves`, at the end of this help).
 
   WRITES ARE OFF BY DEFAULT: mailbox writes leave the system (mail reaches
   real people), so send/move/seen (and fetch --mark-seen) exit 4 unless the

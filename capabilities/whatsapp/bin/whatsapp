@@ -92,12 +92,12 @@ Connections
   uses them there too, so a connection declared globally is linked on the
   machine; every other verb that needs a connection is refused there.
 
-Credentials (4-tier cascade; first non-empty wins)
-  flags > project .env(.local) > ~/.config/whatsapp/credentials.env > process env.
-        DEEPGRAM_API_KEY   only `whatsapp transcribe` reads it. Shared: kept once
-                           for the machine in ~/.config/capabilities/shared.env,
-                           which `whatsapp setup set` writes, asked before
-                           whatsapp's own credentials.env.
+Credentials
+  Flags win; otherwise a value resolves through the credential cascade
+  (`Where a secret resolves`, at the end of this help).
+        DEEPGRAM_API_KEY   only `whatsapp transcribe` reads it. Shared: set once
+                           with `whatsapp setup set`, which stores it, and read
+                           back, as `Where a secret resolves` says.
   The linked-device session is not a configured secret: it is minted by pairing
   and lives in the user state home, per account.
 

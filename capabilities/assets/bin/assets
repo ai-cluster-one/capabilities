@@ -60,10 +60,9 @@ THE FILE STORE CONNECTION
     access_key_id_env      the env key holding the access key id
     secret_access_key_env  the env key holding the secret access key
   The two keys never sit in the entry and have no flag: each resolves through
-  the cascade, first non-empty wins - the project's .env.local then .env, then
-  $XDG_CONFIG_HOME/assets/credentials.env, then the process environment.
-  `connection add` takes them on stdin and writes them to the project's
-  .env.local as ASSETS_<ID>_ACCESS_KEY_ID and ASSETS_<ID>_SECRET_ACCESS_KEY;
+  the credential cascade (`Where a secret resolves`, at the end of this help).
+  `connection add` takes them on stdin as ASSETS_<ID>_ACCESS_KEY_ID and
+  ASSETS_<ID>_SECRET_ACCESS_KEY and stores them as that section says;
   keys already set elsewhere are named instead, with --env
   access_key_id_env=<KEY> --env secret_access_key_env=<KEY>, and nothing is
   copied.

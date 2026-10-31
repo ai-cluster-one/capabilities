@@ -46,7 +46,7 @@ The non-secret identity, kept in the connection registry:
 - `workspace` — a human-recognisable label or domain, display only.
 - `expect_user` — a user id or handle `doctor` asserts the session resolves to.
 
-Write the connection and its secrets through the contract, so the secret values land in the credentials file and never in the registry:
+Write the connection and its secrets through the contract, so the secret values land in the agent's vault (or a credentials file, as `slacker help` says under `Where a secret resolves`) and never in the registry:
 
 ```
 slacker connection add mine --stdin

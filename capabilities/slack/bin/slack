@@ -141,9 +141,9 @@ TARGET
   A user target posts/reads a direct message; a channel/group target the channel.
 
 CREDENTIAL  (scope: project)
-  SLACK_BOT_TOKEN  bot token (xoxb-…). Resolves from project .env/.env.local,
-                   the user credentials.env, or process env. `slack connections`
-                   shows where it resolves.
+  SLACK_BOT_TOKEN  bot token (xoxb-…). Resolves through the credential cascade
+                   (`Where a secret resolves`, at the end of this help).
+                   `slack connections` shows where it resolves.
   SLACK_APP_TOKEN  optional app-level token (xapp-…) used only by
                    `slack service`; requires connections:write.
 

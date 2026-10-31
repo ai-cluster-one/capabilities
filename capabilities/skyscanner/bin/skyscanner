@@ -85,12 +85,8 @@ CONNECTIONS
   Outside any project, every verb below is a machine read: it uses the
   machine's own connections, unless a grant switched one off.
 
-  Secret resolution (first non-empty wins), for the key oxylabs_password_env
-  names:
-    1. project env   .env.local then .env at the project root
-    2. user config   $XDG_CONFIG_HOME/skyscanner/credentials.env
-                     (default ~/.config/skyscanner/)
-    3. process env   the key itself
+  The key oxylabs_password_env names resolves through the credential cascade
+  (`Where a secret resolves`, at the end of this help).
   There is no password flag: a secret never touches argv.
 
 COMMANDS

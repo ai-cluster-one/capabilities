@@ -31,11 +31,11 @@ and given to the machine once: `telegram setup set --field TELEGRAM_API_ID=<id>
 Telegram whether it accepts it before any account is linked.
 
 Configuration requires explicit connections with a positive
-`expected_account_id`, including the one-account case. The selected connection's app credentials and session resolve by the
-cascade (first non-empty wins): the `--session` flag
-(session path only) > a project .env(.local) > ~/.config/telegram/credentials.env
-> the process environment. Secrets (TELEGRAM_API_HASH, DEEPGRAM_API_KEY) have no
-flag — only their env-var NAME resolves them, never the command line.
+`expected_account_id`, including the one-account case. The selected connection's app credentials and session resolve
+through the credential cascade (`Where a secret resolves`, at the end of this
+help), after the `--session` flag (session path only). Secrets (TELEGRAM_API_HASH,
+DEEPGRAM_API_KEY) have no flag — only their env-var NAME resolves them, never the
+command line.
 
 More than one account is declared in a connections registry — the project's
 own, else the machine-level ~/.config/telegram/connections.json (the natural
@@ -96,10 +96,9 @@ the machine; every other verb that needs a connection is refused there.
                            default connection's session defaults to
                            $XDG_STATE_HOME/telegram/session, a named connection's
                            to <state-dir>/<id>/session.
-  DEEPGRAM_API_KEY         Required only by `transcribe` (secret). Shared: kept once
-                           for the machine in ~/.config/capabilities/shared.env,
-                           which `telegram setup set` writes, asked before
-                           telegram's own credentials.env.
+  DEEPGRAM_API_KEY         Required only by `transcribe` (secret). Shared: set once
+                           with `telegram setup set`, which stores it, and read
+                           back, as `Where a secret resolves` says.
 
   --session <PATH>         One-shot override of the session-file path, accepted
                            anywhere on the line. Names a path, not a secret.

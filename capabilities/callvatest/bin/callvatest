@@ -27,11 +27,9 @@ with "allow_write": false refuses them, and no flag lifts that gate.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
-  connection. Its values resolve by the cascade (first non-empty wins):
-    1. flags          --api-url (non-secret only; a secret never has a flag)
-    2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    3. user config    $XDG_CONFIG_HOME/callvatest/credentials.env
-    4. process env    CALLVA_API_KEY / CALLVA_API_URL
+  connection. A flag wins (--api-url, non-secret only; a secret never has a
+  flag); otherwise its values resolve through the credential cascade (`Where a
+  secret resolves`, at the end of this help).
   The key is only ever named, never passed on argv.
     CALLVA_API_KEY=<CallVA API key>        secret — the tenant that owns the agent
     CALLVA_API_URL=<base URL>              optional; default

@@ -19,12 +19,9 @@ the selected connection authorize.
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
   connection. Each entry names its key's env var ("secret_env"); the value
-  resolves in a cascade (first non-empty wins):
-    1. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    2. user config    $XDG_CONFIG_HOME/resend/credentials.env (default ~/.config/resend/)
-    3. process env    the named env var
-  The secret has no flag — only its env-var NAME resolves it, never the
-  command line. The write gate is off by default, so a project that sends
+  resolves through the credential cascade (`Where a secret resolves`, at the
+  end of this help). The secret has no flag — only its env-var NAME resolves
+  it, never the command line. The write gate is off by default, so a project that sends
   declares a connection granting it as
   connections, kept where "Where connections live" below says:
     {

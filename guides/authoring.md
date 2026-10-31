@@ -29,7 +29,7 @@ authentication shape, and where the capability will be used.
 
 - Identify the mutating verbs; `capabilities guide surfaces` shapes the verbs, arguments, and help body themselves.
 - Use `WRITE_DEFAULT = False` when writes leave the system.
-- Declare credentials and choose project or user scope.
+- Declare credentials and choose project or user scope. A secret's first home is the agent's vault: `connection add` and `setup set` seal one there by default, and the contract renders the credential cascade in the capability's help as `Where a secret resolves`, so the help never lists the tiers by hand.
 - Declare state when credentials mint sessions or caches.
 - Keep success on stdout and structured failures on stderr.
 

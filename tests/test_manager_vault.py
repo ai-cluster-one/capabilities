@@ -337,3 +337,103 @@ def test_move_keeps_a_key_the_vault_holds_otherwise_and_every_key_when_a_report_
         k["name"]: k["reason"] for k in blocked["kept"]}["API_TOKEN"]
     assert "API_TOKEN=tok-file" in env_local.read_text()
     assert lab.ok("secrets", "list")["secrets"] == []
+
+
+# --- a capability's secrets, written through the contract ---------------------
+# The declared-fields scaffold (test_declared_fields), standing in the lab's
+# agent folder: its `connection add` and `setup set` seal a secret into the
+# agent's vault by default, and write a file only when asked or when no vault
+# here takes it.
+
+def _declfix(lab: Lab):
+    from test_declared_fields import NAME as DECLFIX, _fixture_text
+    script = lab.tmp / "cap" / DECLFIX
+    script.parent.mkdir(exist_ok=True)
+    script.write_text(_fixture_text())
+    for settings in (lab.project / "capabilities" / "settings.json",
+                     lab.tmp / "config" / "capabilities" / "settings.json"):
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({"capabilities": {DECLFIX: {"enabled": True}}}))
+
+    def run(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(script), *args], cwd=lab.project,
+                              env=lab.env(), text=True, input=stdin, capture_output=True,
+                              timeout=120)
+    return run
+
+
+def _answer(result: subprocess.CompletedProcess) -> dict:
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def _lines(path) -> dict:
+    return dict(line.split("=", 1) for line in path.read_text().splitlines()
+                if "=" in line) if path.exists() else {}
+
+
+def test_connection_add_seals_a_secret_into_the_vault_and_a_file_takes_it_only_when_asked(lab):
+    lab.ok("key", "generate")
+    declfix = _declfix(lab)
+    env_local = lab.project / ".env.local"
+    added = _answer(declfix("connection", "add", "work", "--field", "url=https://a.example",
+                            "--stdin", stdin=json.dumps({"secret_env": "tok-123456789"})))
+    assert added["secrets_in"] == f"vault:{PROJECT_ID}" and added["credentials"] is None
+    assert "vault_skipped" not in added
+    secret = next(f for f in added["fields"] if f["key"] == "secret_env")
+    assert (secret["env"], secret["tier"], secret["value"]) == \
+        ("DECLFIX_WORK_TOKEN", "vault", "…6789")
+    assert "DECLFIX_WORK_TOKEN" not in _lines(env_local)
+    assert lab.run("secrets", "show", "DECLFIX_WORK_TOKEN").stdout == "tok-123456789\n"
+
+    # --file keeps the secret in the project's .env.local, as before.
+    filed = _answer(declfix("connection", "add", "home", "--field", "url=https://b.example",
+                            "--file", "--stdin", stdin=json.dumps({"secret_env": "tok-home-0001"})))
+    assert filed["secrets_in"] == filed["credentials"] == str(env_local)
+    assert _lines(env_local)["DECLFIX_HOME_TOKEN"] == "'tok-home-0001'"
+
+    # A key a file already sets stays in the file, since the file wins over the vault.
+    replaced = _answer(declfix("connection", "add", "home", "--replace", "--stdin",
+                               stdin=json.dumps({"secret_env": "tok-home-0002"})))
+    assert replaced["secrets_in"] == str(env_local)
+    assert "already set in" in replaced["vault_skipped"]
+    assert _lines(env_local)["DECLFIX_HOME_TOKEN"] == "'tok-home-0002'"
+
+    removed = _answer(declfix("connection", "remove", "work"))
+    assert removed["vault_removed"] == ["DECLFIX_WORK_TOKEN"] and removed["secrets_kept"] == []
+    assert lab.refused("secrets", "show", "DECLFIX_WORK_TOKEN")[1]["code"] == "not_set"
+
+    # With no key here the secret goes to the file, and the answer says why.
+    env_local.write_text("".join(line + "\n" for line in env_local.read_text().splitlines()
+                                 if not line.startswith(KEY_ENV + "=")))
+    fallen = _answer(declfix("connection", "add", "third", "--field", "url=https://c.example",
+                             "--stdin", stdin=json.dumps({"secret_env": "tok-third-001"})))
+    assert fallen["secrets_in"] == str(env_local)
+    assert KEY_ENV in fallen["vault_skipped"]
+    assert _lines(env_local)["DECLFIX_THIRD_TOKEN"] == "'tok-third-001'"
+
+
+def test_setup_set_seals_a_secret_into_the_vault_and_machine_keeps_the_credentials_file(lab):
+    lab.ok("key", "generate")
+    declfix = _declfix(lab)
+    credentials = lab.tmp / "config" / "declfix" / "credentials.env"
+    written = _answer(declfix("setup", "set", "--field", "DECLFIX_APP_ID=7", "--stdin",
+                              stdin=json.dumps({"DECLFIX_APP_HASH": "hash-0123456789"})))
+    assert written["secrets_in"] == f"vault:{PROJECT_ID}"
+    assert _lines(credentials) == {"DECLFIX_APP_ID": "'7'"}
+    assert next(f for f in written["fields"] if f["key"] == "DECLFIX_APP_HASH")["tier"] == "vault"
+    assert declfix("setup", "show", "--reveal", "DECLFIX_APP_HASH").stdout == "hash-0123456789\n"
+    unset = _answer(declfix("setup", "unset", "DECLFIX_APP_HASH"))
+    assert unset["vault_removed"] == ["DECLFIX_APP_HASH"]
+    machine = _answer(declfix("setup", "set", "--machine", "--stdin",
+                              stdin=json.dumps({"DECLFIX_APP_HASH": "hash-machine-99"})))
+    assert machine["secrets_in"] == str(credentials) and "vault_skipped" not in machine
+    assert _lines(credentials)["DECLFIX_APP_HASH"] == "'hash-machine-99'"
+    assert lab.ok("secrets", "list")["secrets"] == []
+
+
+def test_help_renders_where_a_secret_resolves_with_the_vault(lab):
+    text = _declfix(lab)("help").stdout
+    section = text[text.index("## Where a secret resolves"):]
+    assert "the agent's vault" in section and "process environment" in section
+    assert "--file" in text

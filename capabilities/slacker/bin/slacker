@@ -37,17 +37,18 @@ Connections
   A connection is one workspace session of one linked account. It carries the
   env vars that hold the session secrets (token_env, cookie_env), never the
   secret values, plus the non-secret workspace identity. A machine with several
-  workspaces declares one connection each. Secrets resolve through the 4-tier
-  cascade (flags > project .env(.local) > ~/.config/slacker/credentials.env >
-  process env); selection is `--connection <id>` (-c), else the registry's
-  default, else the sole entry.
+  workspaces declares one connection each. Secrets resolve through the
+  credential cascade (`Where a secret resolves`, at the end of this help);
+  selection is `--connection <id>` (-c), else the registry's default, else the
+  sole entry.
 
   Two ways to link. `slacker link` signs you in through a Chrome window it
   opens and reads the session out for you (needs an installed Chrome and a
   display). Or paste: read the xoxc- token and the `d` cookie from a browser
   you are already signed in to and run `connection add <id> --stdin` (see
-  `slacker guide linking`). Either way the two secrets land only in the
-  credentials file, never in the registry, a log, or output.
+  `slacker guide linking`). `link` writes the two secrets into the credentials
+  file; `connection add` stores them as `Where a secret resolves` says. Either
+  way they never land in the registry, a log, or output.
 
 Store
   Conversations, messages, thread replies, reactions, users and the sync cursor

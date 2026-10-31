@@ -45,8 +45,8 @@ CONNECTIONS
   homeserver   the homeserver's base URL.
   user_id      the agent's Matrix user id - its address.
   secret_env   names the env var holding the agent's access token; the value
-               resolves through the cascade: project .env.local then .env,
-               user ~/.config/agentrooms/credentials.env, then the process env.
+               resolves through the credential cascade (`Where a secret
+               resolves`, at the end of this help).
   device_id    the device the token was minted for (informational).
   supervisor   optional: whom to ask about the agent, a Matrix user id on the
                agent's own homeserver. It is the one home of the agent's

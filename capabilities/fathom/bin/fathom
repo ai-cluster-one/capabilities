@@ -23,14 +23,11 @@ the host agent (see `fathom guide enrichment`) and written back via `update`.
 
 CONNECTIONS
   Configuration requires an explicit connections registry. Each connection
-  bundles one Fathom account and one PostgreSQL database; its values resolve by
-  the cascade (first non-empty wins):
-    1. flags          --connection only (a secret never has a flag)
-    2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    3. user config    $XDG_CONFIG_HOME/fathom/credentials.env (default ~/.config/fathom/)
-    4. process env    the keys below
-  The project you're in wins; process env is the fallback (so a deployed
-  host's injected env governs when no config file is present).
+  bundles one Fathom account and one PostgreSQL database; its values resolve
+  through the credential cascade (`Where a secret resolves`, at the end of this
+  help). The only flag is --connection (a secret never has a flag). The project
+  you're in wins, so a deployed host's injected env governs when no config file
+  is present.
 
   Credential scope is `user` — install scaffolds the keys into
   ~/.config/fathom/credentials.env. A connection may name these keys:
@@ -62,7 +59,7 @@ CONNECTIONS
     }
   Non-secret DB wiring sits literally in the entry; the two secrets are named
   by env-key indirection (fathom_key_env, db_password_env) and resolve through
-  the cascade (project .env(.local) → user credentials.env → process env).
+  the credential cascade above.
   "allow_write": false makes the connection a read-only source: every mutating
   verb (sync, update, transcript, schema, vocab add/remove) exits 4, and no
   flag or env var lifts the gate. Read verbs (list, read, search, scan, grep,

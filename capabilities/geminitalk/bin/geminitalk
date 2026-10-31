@@ -68,14 +68,10 @@ COMMANDS
 
 CONNECTIONS
   An explicit connections registry is required, even for one connection. The
-  selected entry's key resolves from the standard cascade; the preferred env
+  selected entry's key resolves through the credential cascade (`Where a
+  secret resolves`, at the end of this help); the preferred env
   var is GEMINITALK_API_KEY, with
   GOOGLE_API_KEY and GEMINI_API_KEY accepted as compatibility aliases.
-
-  Resolved (first non-empty wins):
-    1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR
-    2. user config   $XDG_CONFIG_HOME/geminitalk/credentials.env
-    3. process env   GEMINITALK_API_KEY / GOOGLE_API_KEY / GEMINI_API_KEY
 
   Optional env keys a connection may inherit:
     GEMINITALK_MODEL              default gemini-3.1-flash-live-preview

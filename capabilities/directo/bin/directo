@@ -167,8 +167,8 @@ CONNECTIONS
   Which registry is read, and in what order, depends on the project: see
   "Where connections live" below.
   Only username/password are secret: the entry names the env keys holding them
-  ("username_env"/"password_env"), and the values resolve through the cascade —
-  project .env(.local) → user config → process env. "allow_write": false is
+  ("username_env"/"password_env"), and the values resolve through the credential
+  cascade (`Where a secret resolves`, at the end of this help). "allow_write": false is
   accepted, but this CLI's surface is read-only, so no verb is gated by it.
   Sessions are kept per connection in the state home, so two connections never
   share a session.

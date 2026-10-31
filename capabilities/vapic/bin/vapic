@@ -70,13 +70,11 @@ CONNECTIONS
   connection. Its VAPI_API_KEY is a Vapi API key. Because a key chooses
   the Vapi organization/environment the agent can reach, its natural home is the
   consuming project's .env when the project owns that integration.
-  Resolved (first non-empty wins):
-    1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    2. user config   $XDG_CONFIG_HOME/vapic/credentials.env (default ~/.config/vapic/)
-    3. process env   VAPI_API_KEY (deployed box, or one-shot `VAPI_API_KEY=... vapic ...`)
-  There is deliberately no token flag - a secret must not touch argv. One Vapi
-  account/environment per connection; projects with prod + staging declare one
-  connection per key:
+  It resolves through the credential cascade (`Where a secret resolves`, at the end
+  of this help); a deployed box or a one-shot `VAPI_API_KEY=... vapic ...` sets it in
+  the process env. There is deliberately no token flag - a secret must not touch
+  argv. One Vapi account/environment per connection; projects with prod + staging
+  declare one connection per key:
     {
       "default": "production",
       "connections": {

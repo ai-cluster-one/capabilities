@@ -1,5 +1,9 @@
 # calendar — change log
 
+## 2026-10-31 — `calendar help` names the agent's vault in the credential cascade
+
+Bare `calendar help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.
+
 ## 2026-10-13 — Outside any project, `calendar connections` and `calendar doctor` read the machine's own connections
 
 `calendar` declares `connections` and `doctor` as machine reads. Run outside any project, `calendar connections` lists the connections declared globally whose grant is not switched off, each under `machine_reads` with the scope `machine`, and `calendar doctor` checks their health, where both used to refuse with `connection_not_granted`. Each such connection is read-only there: a write through it exits 4 `read_only`, and every other verb outside a project is refused the machine's connections as before. Inside a project nothing changes; its grants alone decide.

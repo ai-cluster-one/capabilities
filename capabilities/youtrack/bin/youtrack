@@ -12,8 +12,8 @@ youtrack — agent-first CLI for YouTrack issues and knowledge-base articles.
 Run `youtrack help` before use; this is the complete contract.
 
 Configuration resolves as named connections. Without a registry, `default`
-uses YOUTRACK_URL and YOUTRACK_TOKEN from the standard cascade (project
-.env/.env.local, ~/.config/youtrack/credentials.env, then process env).
+uses YOUTRACK_URL and YOUTRACK_TOKEN from the credential cascade (`Where a
+secret resolves`, at the end of this help).
 YOUTRACK_URL is the YouTrack origin, for example https://acme.youtrack.cloud.
 YOUTRACK_TOKEN is a permanent token and never belongs on the command line.
 
@@ -298,12 +298,12 @@ _contract_bind(globals(), "core")
 _contract_bind(globals(), "store")
 
 def _load_token(key: str = "YOUTRACK_TOKEN") -> str:
-    value = (_project_env().get(key) or _parse_env_file(CREDENTIALS_ENV).get(key)
-             or os.environ.get(key) or "").strip()
+    value = (_resolve_env_key(key)[0] or "").strip()
     if value:
         return value
     _die(2, "missing_token", f"{key} is not configured",
-         f"set {key} in project .env, {CREDENTIALS_ENV}, or process env")
+         f"set {key} in project .env, {CREDENTIALS_ENV}, process env, or the agent's "
+         "vault (`capabilities secrets set`)")
 
 _contract_bind(globals(), "connections")
 

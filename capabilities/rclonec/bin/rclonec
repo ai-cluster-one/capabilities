@@ -83,8 +83,8 @@ CONNECTIONS
   passes them through and keeps no list of its own, so a backend option added upstream
   works here the day it ships.
 
-  Secrets are named by env key and resolve through the standard cascade — project
-  .env(.local), then user config, then process env. A secret must not touch argv, so
+  Secrets are named by env key and resolve through the credential cascade (`Where a
+  secret resolves`, at the end of this help). A secret must not touch argv, so
   there is deliberately no flag for one.
 
   `allow_write: false` makes the connection read-only. Verbs that mutate the remote exit

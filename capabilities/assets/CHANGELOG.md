@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-10-31 — `assets help` names the agent's vault in the credential cascade
+
+Bare `assets help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. It also says `connection add` stores the two keys it takes on stdin as that section says, where it used to say they are written to the project's `.env.local`. Nothing else changes.
+
 ## 2026-10-27 — Every write to a kept file is logged
 
 Every write to a file's records is logged in the same transaction as the write: a row of the new append-only table `assets_file_operations` names the record written or retired, the outcome the verb answered - `created` or `replaced` by `files add` and `import`, `linked` or `unlinked` by `files link`, `removed` by `files rm` - who did it and when. `files log [<name>] [--limit N]` reads it newest first, at most N records (default 100), each with the file's name, size, sha256 and document, and with a name it lists that file's records, a removed file's included, so a deleted file leaves a trace of who deleted it and when. It reads the store only. An `unchanged` answer logs nothing. The store refuses an edit or a delete of a log record. The assets tables move to schema 1.2 by the one new step `0006-file-operations`, applied on an existing store by the first command that opens it; the log starts there, and writes made before it are not backfilled. Only an `assets` at this change or later writes the log: an older `assets` still writes to a store at 1.2 - it reads the store as current - and its writes, a `files rm` included, are not in the log. A `TRUNCATE assets_files` without `CASCADE` is now refused by the log's reference to it before the guard trigger is reached; it is refused either way.

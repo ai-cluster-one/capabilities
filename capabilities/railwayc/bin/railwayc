@@ -64,16 +64,14 @@ CONNECTIONS
   connection. Its RAILWAY_TOKEN is a Railway PROJECT token (project →
   Settings → Tokens), scoped to ONE project and ONE environment. Because it is
   project-scoped, its home is the CONSUMING PROJECT's .env, not a global file.
-  Resolved (first non-empty wins):
-    1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    2. user config   $XDG_CONFIG_HOME/railwayc/credentials.env (default ~/.config/railwayc/)
-    3. process env   RAILWAY_TOKEN (deployed box, or one-shot `RAILWAY_TOKEN=… railwayc …`)
-  There is deliberately no token flag — a secret must not touch argv. A Railway
-  PROJECT token is scoped to one project + one environment, so its natural home is
-  the consuming project's .env (where install scaffolds it); doctor's expect_project
-  check (exit 7) catches a token that points at the wrong project. One token = one
-  project + one environment; a project with prod + staging uses one token per
-  environment — and declares them as connections as
+  It resolves through the credential cascade (`Where a secret resolves`, at the end
+  of this help); a deployed box or a one-shot `RAILWAY_TOKEN=… railwayc …` sets it
+  in the process env. There is deliberately no token flag — a secret must not
+  touch argv. A Railway PROJECT token is scoped to one project + one environment,
+  so its natural home is the consuming project's .env (where install scaffolds
+  it); doctor's expect_project check (exit 7) catches a token that points at the
+  wrong project. One token = one project + one environment; a project with prod +
+  staging uses one token per environment — and declares them as connections as
   connections, kept where "Where connections live" below says:
     {
       "default": "<id>",

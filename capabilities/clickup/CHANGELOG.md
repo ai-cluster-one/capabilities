@@ -1,5 +1,9 @@
 # clickup — change log
 
+## 2026-10-31 — `clickup` reads a connection's token from the agent's vault as well
+
+Every verb resolves its token - a connection's `secret_env`, `CLICKUP_API_TOKEN`, or the key `--token-env` names - through the contract's credential cascade, which asks the agent's vault last, after the project's .env files, ~/.config/clickup/credentials.env and the process environment; it used to stop at the process environment, so a token `clickup connection add` now seals into the vault by default would not have been found. A token a file or the environment holds resolves exactly as before. The help points to the contract-rendered `Where a secret resolves` section instead of listing the tiers by hand, and `missing_token` names the vault.
+
 ## 2026-10-30 — `clickup` carries its own icon
 
 The bundle holds its icon as `icon.png`; `capabilities icon clickup` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

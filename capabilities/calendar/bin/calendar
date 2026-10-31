@@ -62,8 +62,8 @@ CONNECTIONS
                when a server does not compose one from base_url + address.
   secret_env   The env key holding the password. Absent, CALENDAR_APP_PASSWORD
                is used. The KEY is named here; the VALUE resolves through the
-               cascade — project .env/.env.local -> ~/.config/calendar/
-               credentials.env -> process env. A secret never sits in the
+               credential cascade (`Where a secret resolves`, at the end of
+               this help). A secret never sits in the
                registry and never on argv.
   timezone     Optional IANA zone. See TIME.
   meeting_url  Optional standing room URL, attached by `create` when no --url

@@ -21,12 +21,9 @@ reads emit JSON to stdout. Date ranges are --from inclusive, --to exclusive
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
-  connection. Its STRIPE_SECRET_KEY resolves in a cascade (first
-  non-empty wins):
-    1. flag           --api-key
-    2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    3. user config    $XDG_CONFIG_HOME/stripe/credentials.env (default ~/.config/stripe/)
-    4. process env    STRIPE_SECRET_KEY
+  connection. Its STRIPE_SECRET_KEY comes from the --api-key flag when
+  given, else resolves through the credential cascade (`Where a secret
+  resolves`, at the end of this help).
 
   A project that reads several Stripe accounts declares them as
   connections, kept where "Where connections live" below says:
@@ -40,7 +37,7 @@ CONNECTIONS
   "Where connections live" below.
 
   The entry names the env var holding its key ("secret_env"); the value
-  resolves through cascade tiers 2-4 above. Every command is a read, so
+  resolves through the credential cascade above. Every command is a read, so
   "allow_write": false changes nothing here — the write gate guards a
   surface this CLI does not have.
 

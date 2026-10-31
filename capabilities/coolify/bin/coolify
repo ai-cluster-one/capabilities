@@ -22,14 +22,12 @@ to stdout.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
-  connection. Its values resolve from the cascade (first non-empty wins):
-    1. flag           --base-url / --token
-    2. project env    .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    3. user config    $XDG_CONFIG_HOME/coolify/credentials.env (default ~/.config/coolify/)
-    4. process env    COOLIFY_BASE_URL / COOLIFY_TOKEN
-  A secret never has a flag of its own that puts it on argv; --token exists for
-  parity but prefer config/env. COOLIFY_BASE_URL is the instance root WITHOUT
-  the /api/v1 suffix (e.g. https://coolify.example.com); the CLI appends it.
+  connection. A flag wins (--base-url / --token); otherwise COOLIFY_BASE_URL /
+  COOLIFY_TOKEN resolve through the credential cascade (`Where a secret
+  resolves`, at the end of this help). A secret never has a flag of its own
+  that puts it on argv; --token exists for parity but prefer config/env.
+  COOLIFY_BASE_URL is the instance root WITHOUT the /api/v1 suffix (e.g.
+  https://coolify.example.com); the CLI appends it.
 
   More than one instance or team is declared as
   connections, kept where "Where connections live" below says:
@@ -44,7 +42,7 @@ CONNECTIONS
   Which registry is read, and in what order, depends on the project: see
   "Where connections live" below. The entry
   names the env var holding its token ("secret_env"); the value resolves through
-  cascade tiers 2-4 above. "base_url" sits literally in the entry.
+  the credential cascade above. "base_url" sits literally in the entry.
 
   `coolify connect` (below) writes one entry and its token in one act.
 

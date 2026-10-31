@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-31 — `agentrooms help` names the agent's vault in the credential cascade
+
+Bare `agentrooms help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.
+
 ## 2026-10-30 — A saved worker's author names the node by its id, never the host
 
 `created_by` of a saved worker and the actor of a pause are written as `<user>@<node id>` instead of `<user>@<host name>`. Rows already written keep their values.

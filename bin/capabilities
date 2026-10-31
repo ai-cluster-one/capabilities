@@ -520,9 +520,14 @@ VAULT VERBS
   row of capabilities_vault, sealed with XChaCha20-Poly1305, the agent id and
   the name bound to it. The store keeps the fingerprint of the agent's key on
   its row of capabilities_agents, never the key; keeping the key is the
-  owner's. Every capability resolves a value its connections name through the
-  credential cascade and asks the vault last, after the project's .env files,
-  its credentials.env and the process environment. A secret several agents
+  owner's. The vault is the first home of an agent's secrets: a capability's
+  `connection add` and `setup set` seal a secret given on stdin into it by
+  default, and write a file only with --file, at --global or --machine (a
+  machine's secret, which every agent on it shares), or where no vault takes
+  it here, saying why. Every capability resolves a value its connections name
+  through the credential cascade and asks the vault last, after the project's
+  .env files, its credentials.env and the process environment, so a key a file
+  also holds resolves from the file. A secret several agents
   use is a copy in each agent's vault. A row sealed under another key than
   the agent's present one is unreadable: kept, reported, and read again only
   once it is set again. Each verb stands in the current project and its
@@ -2313,9 +2318,11 @@ CAPABILITIES_CONTEXT_INTRO = (
     "connection; ask the user, never lift a gate yourself. Global enable "
     "covers ordinary CLI use; a bundled service's init/start/run still requires "
     "explicit project enable.\n\n"
-    "An agent's secrets and API keys live in its vault, never in `.env.local` or "
-    "another environment file, which keep only the vault's own key: "
-    "`capabilities secrets list` names them, `capabilities secrets show <NAME>` "
+    "An agent's vault is the first and preferred home for its secrets and API "
+    "keys; a project or user environment file holds one only when it is needed "
+    "there, beside the vault's own key in `.env.local`. `<name> connection add` and "
+    "`<name> setup set` seal a secret given on stdin into the vault by default. "
+    "`capabilities secrets list` names what the vault holds, `capabilities secrets show <NAME>` "
     "prints one, `capabilities secrets set <NAME>` stores the value it reads on "
     "standard input, and `capabilities secrets rm <NAME>` removes one; "
     "`capabilities secrets help` gives the rest."

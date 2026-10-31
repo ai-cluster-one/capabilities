@@ -68,12 +68,10 @@ CONNECTIONS
   machine's own connections read-only, unless a grant switched one off; every
   other verb that needs a connection is refused there.
 
-  Secret resolution (first non-empty wins), for the var named by secret_env:
-    1. project env   .env.local then .env, walking up from $CLAUDE_PROJECT_DIR (else cwd)
-    2. user config   $XDG_CONFIG_HOME/calcomc/credentials.env (default ~/.config/calcomc/)
-    3. process env   the var itself (deployed box, or a one-shot `CAL_API_KEY=… calcomc …`)
-  There is deliberately no key flag — a secret must not touch argv. A Cal.com API key is
-  personal-account-scoped, so its home is the user config; install scaffolds it there.
+  The var named by secret_env resolves through the credential cascade (`Where a secret
+  resolves`, at the end of this help). There is deliberately no key flag — a secret
+  must not touch argv. A Cal.com API key is personal-account-scoped, so its home is
+  the user config; install scaffolds it there.
 
 COMMANDS
   Readiness
