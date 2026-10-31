@@ -881,13 +881,16 @@ PROJECT VERBS (run inside a consuming project)
         one; a folder bound to an existing agent has that agent marked one in
         place, its id, grants, settings and slug kept - one way: a system
         agent stays one. It lives on this node alone, linked as its master
-        where it has no node, and a node holds one: exit 6
-        system_agent_nodes for an agent on another node, system_agent_exists
-        where this node holds one already, node_unresolved without a node id,
-        store_not_configured without a store. --name is written as the agent
-        is made one; a system agent keeps its name (exit 4 system_agent for
-        another). System agents on different nodes may share a slug, which no
-        ordinary agent shares. For a system agent `agent set`, `identity set`,
+        where it has no node, and a node holds one: a new folder on a node
+        that holds one already is bound to it, as --id binds one, with this
+        folder recorded as its folder here, where --name is none or its own;
+        exit 6 system_agent_nodes for an agent on another node,
+        system_agent_exists where this node holds another already (an
+        existing agent's folder, or another --name), node_unresolved without
+        a node id, store_not_configured without a store. --name is written
+        as the agent is made one; a system agent keeps its name (exit 4
+        system_agent for another). System agents on different nodes may share
+        a slug, which no ordinary agent shares. For a system agent `agent set`, `identity set`,
         `relabel`, `agent convert`, `agent materialize` and `node add` exit 4
         system_agent, as do the `context` and `routine` write verbs; grants,
         settings, enable and the key verbs stay open. Its composed context
@@ -9968,7 +9971,8 @@ def _preflight_new_agent(root: Path) -> None:
 
 
 def _register_agent_on_init(root: Path, new_agent: bool = False,
-                            name: str | None = None, system: bool = False) -> dict:
+                            name: str | None = None, system: bool = False,
+                            adopted: bool = False) -> dict:
     """init's registration of the agent row: written where a database resolves
     for the project, and otherwise reported, never failing init. A new agent
     is registered migrated with this node as its master. With `system` the
@@ -9976,7 +9980,9 @@ def _register_agent_on_init(root: Path, new_agent: bool = False,
     everything naming it, with this node as its one node and `name` written
     as it is made one; what the store refuses of that is answered as
     `refused`. A row without a slug is given one (`_settle_agent_slug`,
-    `name` the one it is about to be given)."""
+    `name` the one it is about to be given). With `adopted` this folder is the
+    node's system agent's new home, recorded as its folder here in place of
+    the one it had."""
     agent_id = _project_id_state(root)["id"]
     if not agent_id:
         return {"registered": False, "reason": "no_project_identity"}
@@ -10028,12 +10034,14 @@ def _register_agent_on_init(root: Path, new_agent: bool = False,
                                      "ON CONFLICT (agent_id, node) DO NOTHING", (agent_id, node))
                 if node:
                     # This node's row records the folder the agent lives in here,
-                    # where it records none yet and no other agent holds the folder.
+                    # where it records none yet (or the agent is adopted into this
+                    # one) and no other agent holds the folder.
                     conn.execute("UPDATE capabilities_agent_nodes SET folder = %s "
-                                 "WHERE agent_id = %s AND node = %s AND folder IS NULL "
+                                 "WHERE agent_id = %s AND node = %s "
+                                 "AND (folder IS NULL OR %s) "
                                  "AND NOT EXISTS (SELECT 1 FROM capabilities_agent_nodes "
-                                 "WHERE node = %s AND folder = %s)",
-                                 (folder, agent_id, node, node, folder))
+                                 "WHERE node = %s AND folder = %s AND agent_id <> %s)",
+                                 (folder, agent_id, node, adopted, node, folder, agent_id))
                 # A folder bound to an agent the store already held - a node's
                 # /app, a checkout on another machine - does not name it.
                 slug = _settle_agent_slug(
@@ -10061,6 +10069,39 @@ class _SystemRefused(Exception):
     def __init__(self, refusal: dict):
         super().__init__(refusal["message"])
         self.refusal = refusal
+
+
+def _node_system_agent(root: Path, name: str | None) -> str | None:
+    """`init --system` in a new folder: the id of the system agent this node
+    holds already, which the folder is bound to rather than a second one made,
+    where `name` is none or that agent's own. None where the node holds none,
+    asks for another name, or no store or node resolves here - which the
+    registration then answers as it does for any new folder."""
+    db = _db_module()
+    store = _store_module()
+    try:
+        node = store.this_node()["id"]
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                          transaction=True)
+    except (db.DbError, store.StoreError):
+        return None
+    import psycopg
+    try:
+        major, minor = store.STORE_TABLES_VERSION
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
+                   major=major, minor=minor)
+        held = conn.execute(
+            "SELECT a.id, a.name FROM capabilities_agent_nodes l JOIN capabilities_agents a "
+            "ON a.id = l.agent_id WHERE l.node = %s AND a.kind = 'system' ORDER BY a.id",
+            (node,)).fetchone()
+    except (db.DbError, psycopg.Error):
+        return None
+    finally:
+        conn.close()
+    if held is None or (name is not None and name != held[1]):
+        return None
+    return held[0]
 
 
 def _make_system_agent(conn, agent_id: str, here: dict, name: str | None) -> dict | None:
@@ -25096,6 +25137,7 @@ def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bo
     global _CONTEXT_WITHOUT_STORE
     _CONTEXT_WITHOUT_STORE = True
     raised = None
+    adopted = False
     if given_id is not None:
         if not PROJECT_ID_RE.match(given_id):
             _die(6, "input", f"--id {given_id!r} is not a project id", PROJECT_ID_HINT)
@@ -25109,6 +25151,17 @@ def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bo
             _BODY_ROOT.pop(root.resolve(), None)
     else:
         new_agent = _new_agent_project(root)
+        held = (_node_system_agent(root, name)
+                if system and new_agent and new_id is None else None)
+        if held:
+            # A node holds one system agent: a new folder asking for it - a
+            # reinstalled app, another user of the machine - is bound to it.
+            given_id, new_agent, adopted = held, False, True
+            raised = _agent_to_raise(root, held)
+            if not _contextkit_managed(root) and not _project_id_state(root)["id"]:
+                _write_env_local_id(root, held)
+                _ENVELOPE_HOME.pop(root, None)
+                _BODY_ROOT.pop(root.resolve(), None)
         if new_id is not None:
             current = _project_id_state(root)["id"]
             if current and current != new_id:
@@ -25141,7 +25194,7 @@ def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bo
     migrated = _ensure_envelope(root, new_agent=new_agent, given_id=given_id or new_id,
                                 records_in_store=bool(raised and raised.get("migrated")))
     registration = _register_agent_on_init(root, new_agent=new_agent, name=name,
-                                           system=system)
+                                           system=system, adopted=adopted)
     if new_agent and registration.get("created"):
         creation.agent_id = registration["id"]
     if system and registration.get("refused"):

@@ -2542,11 +2542,29 @@ def test_a_system_agent_is_made_or_adopted_on_its_one_node_and_no_edit_changes_i
         result = run(*args)
         assert result.returncode != 4 and "system_agent" not in result.stderr, args
 
-    # One per node; another Mac's may share its slug, an ordinary agent may not.
+    # One per node: a new folder on its node is bound to it - a reinstalled app, another
+    # user of the machine - and becomes its folder there; another agent is refused.
     second = _store_folder(lab, tmp_path / "second")
-    assert _error_of(_in(lab, second, "init", "--system", "--name", "Keeper", **mac_a)) == (
+    assert _error_of(_in(lab, second, "init", "--system", "--name", "Other", **mac_a)) == (
         6, "system_agent_exists")
-    made = _in(lab, second, "init", "--system", "--name", "Keeper", **mac_b)
+    bound = _in(lab, second, "init", "--system", "--name", "Keeper", "--claude", **mac_a)
+    assert bound.returncode == 0, bound.stderr
+    rebound = json.loads(bound.stdout)["agent"]
+    assert (rebound["id"], rebound["kind"], rebound["created"]) == (agent_id, "system", False)
+    shown = _in(lab, second, "agent", "show", **mac_a)
+    assert json.loads(shown.stdout)["agent_id"] == agent_id, shown.stderr
+    assert lab.sql(f"SELECT id, name, slug FROM {SCHEMA}.capabilities_agents WHERE kind = "
+                   "'system'") == [(agent_id, "Keeper", "keeper")]
+    assert lab.sql(f"SELECT node, folder FROM {SCHEMA}.capabilities_agent_nodes "
+                   "WHERE agent_id = %s", (agent_id,)) == [(nid("mac-a"), str(second.resolve()))]
+    ordinary_a = _store_folder(lab, tmp_path / "ordinary-a")
+    assert _in(lab, ordinary_a, "init", **mac_a).returncode == 0
+    assert _error_of(_in(lab, ordinary_a, "init", "--system", **mac_a)) == (
+        6, "system_agent_exists")
+
+    # Another Mac's may share its slug, an ordinary agent may not.
+    on_b = _store_folder(lab, tmp_path / "on-b")
+    made = _in(lab, on_b, "init", "--system", "--name", "Keeper", **mac_b)
     assert made.returncode == 0, made.stderr
     other = json.loads(made.stdout)["agent"]
     assert (other["kind"], other["created"], other["slug"]) == ("system", True, "keeper")

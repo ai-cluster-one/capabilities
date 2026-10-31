@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-10-31 — init --system in a new folder binds it to the system agent its node holds
+
+`capabilities init --system` in a new folder on a node whose system agent the store already holds - an app reinstalled, another user of the same machine, a restored home - no longer exits 6 `system_agent_exists`. It binds the folder to that agent as `init --id` binds one, keeping its id, name, slug, grants and settings and making no second agent, and records the new folder as the agent's folder on this node in place of the one it had. This holds where `--name` is not given or names that agent's own name. A new folder asking for another `--name`, and an existing agent's folder, are still refused with `system_agent_exists`, so a node still holds one system agent.
+
 ## 2026-10-30 — store doctor proves TLS from the client's own connection, and knows a hosted pooler's plain-text refusal
 
 `capabilities store doctor` no longer fails a store whose login role has a role default (`ALTER ROLE <login> SET role = '<role>'`) setting a role that is not a member of it, as a hosted database is commonly set up for an agent. Postgres shows that role no `pg_stat_ssl` row for its own backend, and the tls check failed with `the server did not report this connection in pg_stat_ssl`, skipping the schema check and exiting 7. Whether TLS is in use is now taken from the client's own connection, which behind a pooler is also the only hop the client can speak for; `pg_stat_ssl` is read only for the TLS version and cipher, which are null where the server does not show the row. A plain-text attempt a hosted pooler turns away with `SSL connection is required` now counts as a refusal for lacking TLS, so `plain_text_refused` passes there rather than warning.
