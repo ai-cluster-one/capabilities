@@ -573,7 +573,7 @@ def test_a_store_mode_project_takes_up_a_config_home_connection_with_set(lab):
     assert ("GET", "/api/v1/resources") in lab["seen"]
 
 
-# --- the agent's vault, the cascade's last tier ----------------------------------------
+# --- the agent's vault, the cascade's first tier ---------------------------------------
 
 def _vault_token(lab, value: str = "vault-token-5678") -> None:
     """The agent's key made, COOLIFY_TOKEN kept in its vault and taken out of
@@ -593,7 +593,7 @@ def _token_key(report: dict) -> dict:
                 if k["key"] == "COOLIFY_TOKEN")
 
 
-def test_a_store_connection_finds_its_secret_in_the_agents_vault_last(lab):
+def test_a_store_connection_finds_its_secret_in_the_agents_vault_first(lab):
     _import(lab)
     _ok(_manager(lab, "init"))
     _vault_token(lab)
@@ -602,9 +602,13 @@ def test_a_store_connection_finds_its_secret_in_the_agents_vault_last(lab):
     assert key["source"] == f"vault:{PROJECT_ID}" and key["value"] == "…5678"
     _ok(_coolify(lab, "resources"))
     assert ("GET", "/api/v1/resources") in lab["seen"]
-    # Every tier above it still wins.
+    # It is read before every other tier: a file holding another value does not
+    # shadow it, and resolves only once the vault holds none.
     env = lab["project"] / ".env"
     env.write_text(env.read_text() + "COOLIFY_TOKEN=file-token-1234\n")
+    key = _token_key(_ok(_coolify(lab, "connections")))
+    assert key["tier"] == "vault" and key["value"] == "…5678"
+    _ok(_manager(lab, "secrets", "rm", "COOLIFY_TOKEN"))
     key = _token_key(_ok(_coolify(lab, "connections")))
     assert key["tier"] == "project" and key["value"] == "…1234"
 

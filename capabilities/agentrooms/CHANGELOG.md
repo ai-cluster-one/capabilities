@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-10-31 — agentrooms keeps no machine setup
+
+`register` and `login` take the homeserver from `--homeserver` or from the connection they complete, never from a machine default: `AGENTROOMS_HOMESERVER` is no longer read, and with neither they exit 6 `homeserver_missing`, naming `--homeserver`. `register` asks for a registration token only where the homeserver requires one, reading it from standard input then (no echo on a terminal); `AGENTROOMS_REGISTRATION_TOKEN` is no longer read, and `--registration-token -` still reads it from standard input before the homeserver is asked. The setup fields and the credential keys that named those two machine values are gone, so `agentrooms setup` and the install scaffold no longer ask for them.
+
 ## 2026-10-31 — `agentrooms help` names the agent's vault in the credential cascade
 
 Bare `agentrooms help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.

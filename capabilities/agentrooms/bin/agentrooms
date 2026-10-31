@@ -53,12 +53,9 @@ CONNECTIONS
                supervisor: its card shows it, the refusal names it, and the
                agent's profile publishes it for other readers (Directory).
 
-  A person configures the shared homeserver once per machine, in the user
-  credentials.env (`capabilities install` scaffolds both keys there):
-    AGENTROOMS_HOMESERVER            the homeserver's base URL
-    AGENTROOMS_REGISTRATION_TOKEN    the shared registration token, where the
-                                     homeserver's registration asks for one
-  Every agent then registers itself with `register`.
+  The machine keeps no agentrooms setup: each connection carries its own
+  homeserver, and `register` and `login` take it from --homeserver or from the
+  connection they complete. Every agent registers itself with `register`.
 
   A person's own account is a connection too, written by `login` with its
   password. With --global it is the machine's, in
@@ -88,16 +85,17 @@ COMMANDS
   Identity
     register NAME [--homeserver URL] [--as ID] [--default] [--supervisor WHO]
                   [--registration-token -]
-        Register @NAME on the shared homeserver (from --homeserver, else
-        AGENTROOMS_HOMESERVER). A homeserver whose registration is open
-        registers it at once or through m.login.dummy, with no token; only one
-        that asks for m.login.registration_token needs the registration token,
-        read from AGENTROOMS_REGISTRATION_TOKEN through the cascade, and exits
-        2 registration_token_missing without it. --registration-token - reads
-        the token from standard input instead (no echo on a terminal; - is
-        the only value it takes, so the token never sits on the command
-        line): that token is the one sent, whatever the cascade holds, and
-        an empty one exits 6 registration_token_missing. Writes connection
+        Register @NAME on the shared homeserver: --homeserver, else the
+        homeserver of the declared connection it completes (neither exits 6
+        homeserver_missing; no machine default is read). A homeserver whose
+        registration is open registers it at once or through m.login.dummy,
+        and nothing is asked; only one that asks for
+        m.login.registration_token needs the registration token, which is
+        then read from standard input (no echo on a terminal), and an empty
+        one exits 2 registration_token_missing. --registration-token - reads
+        it from standard input before the homeserver is asked (- is the only
+        value it takes, so the token never sits on the command line), and an
+        empty one exits 6 registration_token_missing. Writes connection
         ID (default NAME) into this project's registry and the minted access
         token into the project's .env.local under AGENTROOMS_<ID>_TOKEN, mode
         0600; the token is never printed. The account gets a random password, sent
@@ -141,7 +139,8 @@ COMMANDS
         store's global rows inside an agent whose records moved there) and the
         user credentials.env. The password is sent once to the homeserver
         (m.login.password) and never stored or printed; nor is the token. The
-        homeserver comes from --homeserver, else AGENTROOMS_HOMESERVER. Not
+        homeserver comes from --homeserver, else the connection ID already
+        names (neither exits 6 homeserver_missing). Not
         idempotent: each sign-in mints a new device and token. Signing in
         again to the account an ID already names replaces its token; an ID
         that names another account exits 6 connection_exists. A wrong
@@ -810,15 +809,8 @@ SUMMARY = ("Agents talking in rooms on one shared Matrix homeserver - register a
            "message or a marked room from a granted sender, holds the rest for the "
            "operator, admits and limits each turn through the worker bound to the "
            "agent, and answers through one resumed harness session per room.")
-SCOPE = "user"   # the declared keys are the machine's; each agent's token is its project's
-CRED_KEYS = [
-    {"key": "AGENTROOMS_HOMESERVER", "secret": False, "required": False,
-     "note": "the shared homeserver's base URL, set once per machine; `register` "
-             "takes it unless --homeserver names one"},
-    {"key": "AGENTROOMS_REGISTRATION_TOKEN", "secret": True, "required": False,
-     "note": "the shared registration token, set once per machine by a person "
-             "where the homeserver's registration asks for one; only `register` reads it"},
-]
+SCOPE = "user"   # a person's own account (`login --global`) is the machine's; each agent's token is its project's
+CRED_KEYS: list[dict] = []   # no machine setup: each connection carries its homeserver
 WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark", "serve", "grant",
                "remove", "archive", "block", "directory", "card"}
 
@@ -852,20 +844,6 @@ CONN_FIELDS = [{'key': 'homeserver',
   'help': "The Matrix user id, on this homeserver, of whom to ask about the agent; its "
           "card shows it and the refusal names it.",
   'type': 'string',
-  'required': False}]
-# What the machine is given once, before any connection; `setup` writes it.
-SETUP_FIELDS = [{'key': 'AGENTROOMS_HOMESERVER',
-  'label': 'Shared homeserver',
-  'help': "The shared homeserver's base URL; `register` takes it unless --homeserver "
-          'names one.',
-  'type': 'url',
-  'required': False},
- {'key': 'AGENTROOMS_REGISTRATION_TOKEN',
-  'label': 'Registration token',
-  'help': "The shared registration token, where the homeserver's registration asks for "
-          'one; only `register` reads it.',
-  'type': 'string',
-  'secret': True,
   'required': False}]
 # Where this capability's settings live, and the keys it declares; `settings` reads and writes them.
 SETTINGS = {'homes': [{'scope': 'project',
@@ -922,8 +900,6 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
-HOMESERVER_KEY = "AGENTROOMS_HOMESERVER"
-REGISTRATION_KEY = "AGENTROOMS_REGISTRATION_TOKEN"
 ROOM_VERSION = "12"
 DATA_KEY = "agentrooms.data"
 # A message the agent's supervisor wrote from the agent's account carries an
@@ -3038,12 +3014,10 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
             _die(6, "connection_exists",
                  f"connection {sharing[0]!r} already keeps its token in {secret_env}",
                  f"pass --as {sharing[0]} to register its account, or --as <another-id>")
-    homeserver = homeserver_flag or (declared or {}).get("homeserver") \
-        or _resolve_env_key(HOMESERVER_KEY)[0]
+    homeserver = homeserver_flag or (declared or {}).get("homeserver")
     if not homeserver:
         _die(6, "homeserver_missing", "no homeserver to register on",
-             f"a person sets {HOMESERVER_KEY} once per machine in {CREDENTIALS_ENV}, or pass "
-             "--homeserver https://matrix.example.org")
+             "pass --homeserver https://matrix.example.org")
     homeserver = homeserver.rstrip("/")
     if not re.match(r"https?://[^/\s]+$", homeserver):
         _die(6, "bad_homeserver", f"{homeserver!r} is not http(s)://host[:port]")
@@ -3056,8 +3030,8 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
         given_token = _read_password()
         if not given_token:
             _die(6, "registration_token_missing", "no registration token on standard input",
-                 "pipe the token to standard input, or drop --registration-token to read "
-                 f"{REGISTRATION_KEY} through the cascade")
+                 "pipe the token to standard input, or drop --registration-token to be "
+                 "asked for it only where the homeserver requires one")
     # A password nobody keeps: the token stays the only credential, and the
     # account is not a guest, which a homeserver makes of one without a password.
     password = secrets.token_urlsafe(32)
@@ -3087,11 +3061,14 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
             if ["m.login.dummy"] in flows:
                 auth = {"type": "m.login.dummy", "session": info.get("session")}
             elif ["m.login.registration_token"] in flows:
-                token = given_token or _resolve_env_key(REGISTRATION_KEY)[0]
+                # Asked for only now, where the homeserver requires one.
+                token = given_token or _read_secret("registration token: ")
                 if not token:
                     _die(2, "registration_token_missing",
-                         f"{homeserver} asks for a registration token and {REGISTRATION_KEY} is unset",
-                         f"a person sets it once per machine in {CREDENTIALS_ENV}; ask the user")
+                         f"{homeserver} asks for a registration token and none came on "
+                         "standard input",
+                         "pipe the token the homeserver accepts to standard input; ask the "
+                         "user, who has it from the homeserver's admin")
                 auth = {"type": "m.login.registration_token", "token": token,
                         "session": info.get("session")}
             else:
@@ -3106,9 +3083,7 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
                 if exc.status == 401 and auth["type"] == "m.login.registration_token":
                     _die(2, "registration_token_rejected",
                          "the homeserver rejected the registration token",
-                         "check the token you gave with the person who configured it"
-                         if given_token else
-                         f"check {REGISTRATION_KEY} with the person who configured it")
+                         "check the token with the person who runs the homeserver")
                 _fail(exc)
     user_id, access, device = done.get("user_id"), done.get("access_token"), done.get("device_id")
     if not user_id or not access:
@@ -3154,9 +3129,17 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
 def _read_password() -> str:
     """Standard input whole, less one trailing newline; without echo when it is
     a terminal."""
+    return _read_secret("")
+
+
+def _read_secret(prompt: str) -> str:
+    """Standard input whole, less one trailing newline; on a terminal asked for
+    with `prompt`, without echo."""
+    if sys.stdin is None:
+        return ""
     if sys.stdin.isatty():
         import getpass
-        return getpass.getpass("")
+        return getpass.getpass(prompt)
     value = sys.stdin.read()
     return value[:-1] if value.endswith("\n") else value
 
@@ -3190,11 +3173,10 @@ def cmd_login(user_id: str, homeserver_flag: str | None, as_id: str | None, scop
         _die(6, "connection_exists",
              f"connection {cid!r} is already declared for {declared.get('user_id')!r}",
              "pass --as <another-id>")
-    homeserver = homeserver_flag or _resolve_env_key(HOMESERVER_KEY)[0]
+    homeserver = homeserver_flag or (declared or {}).get("homeserver")
     if not homeserver:
         _die(6, "homeserver_missing", "no homeserver to sign in to",
-             f"pass --homeserver https://matrix.example.org, or a person sets {HOMESERVER_KEY} "
-             f"once per machine in {CREDENTIALS_ENV}")
+             "pass --homeserver https://matrix.example.org")
     homeserver = homeserver.rstrip("/")
     if not re.match(r"https?://[^/\s]+$", homeserver):
         _die(6, "bad_homeserver", f"{homeserver!r} is not http(s)://host[:port]")

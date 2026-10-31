@@ -392,12 +392,15 @@ def test_connection_add_seals_a_secret_into_the_vault_and_a_file_takes_it_only_w
     assert filed["secrets_in"] == filed["credentials"] == str(env_local)
     assert _lines(env_local)["DECLFIX_HOME_TOKEN"] == "'tok-home-0001'"
 
-    # A key a file already sets stays in the file, since the file wins over the vault.
+    # A key a file already sets is sealed into the vault, which the cascade reads
+    # first; the file keeps what it held.
     replaced = _answer(declfix("connection", "add", "home", "--replace", "--stdin",
                                stdin=json.dumps({"secret_env": "tok-home-0002"})))
-    assert replaced["secrets_in"] == str(env_local)
-    assert "already set in" in replaced["vault_skipped"]
-    assert _lines(env_local)["DECLFIX_HOME_TOKEN"] == "'tok-home-0002'"
+    assert replaced["secrets_in"] == f"vault:{PROJECT_ID}"
+    assert "vault_skipped" not in replaced
+    secret = next(f for f in replaced["fields"] if f["key"] == "secret_env")
+    assert (secret["tier"], secret["value"]) == ("vault", "…0002")
+    assert _lines(env_local)["DECLFIX_HOME_TOKEN"] == "'tok-home-0001'"
 
     removed = _answer(declfix("connection", "remove", "work"))
     assert removed["vault_removed"] == ["DECLFIX_WORK_TOKEN"] and removed["secrets_kept"] == []

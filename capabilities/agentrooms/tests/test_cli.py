@@ -307,6 +307,21 @@ def homeserver_profile(cli, user=f"@alpha:{SERVER}") -> dict:
         return client.get(f"/_matrix/client/v3/profile/{user}").json()
 
 
+class Piped:
+    """Standard input that gives `text` to each command reading it, as a pipe
+    into each command would: the registration token, asked for only where the
+    homeserver requires one."""
+
+    def __init__(self, text: str):
+        self.text = text
+
+    def isatty(self) -> bool:
+        return False
+
+    def read(self, *_args) -> str:
+        return self.text
+
+
 def connect(project: Path, allow_write: bool) -> None:
     conns = project / "capabilities" / "agentrooms"
     conns.mkdir(parents=True, exist_ok=True)
@@ -318,7 +333,7 @@ def connect(project: Path, allow_write: bool) -> None:
 
 
 def test_register_writes_connection_and_token(cli, project, homeserver, capsys, monkeypatch):
-    monkeypatch.setenv("AGENTROOMS_REGISTRATION_TOKEN", "reg-token")
+    monkeypatch.setattr(sys, "stdin", Piped("reg-token\n"))
     code, out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
     assert code == 0, err
     assert out["user_id"] == f"@alpha:{SERVER}" and out["secret_env"] == "AGENTROOMS_ALPHA_TOKEN"
@@ -351,7 +366,7 @@ def test_register_writes_connection_and_token(cli, project, homeserver, capsys, 
 
 def test_a_registered_agent_is_visible_and_names_its_supervisor(cli, project, homeserver, capsys,
                                                                  monkeypatch):
-    monkeypatch.setenv("AGENTROOMS_REGISTRATION_TOKEN", "reg-token")
+    monkeypatch.setattr(sys, "stdin", Piped("reg-token\n"))
     homeserver.aliases[DIRECTORY] = "!dir"
     code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS,
                           "--supervisor", "not-a-user")
@@ -367,7 +382,8 @@ def test_a_registered_agent_is_visible_and_names_its_supervisor(cli, project, ho
     assert out["connections"]["alpha"]["supervisor"] == f"@boss:{SERVER}"
 
 
-def test_register_needs_the_registration_token(cli, project, homeserver, capsys):
+def test_register_needs_the_registration_token(cli, project, homeserver, capsys, monkeypatch):
+    monkeypatch.setattr(sys, "stdin", Piped(""))
     code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
     assert code == 2 and err["error"]["code"] == "registration_token_missing"
     # Only the handshake reached the homeserver, which creates no account.
@@ -400,6 +416,19 @@ def test_register_takes_the_registration_token_on_standard_input(cli, project, h
     assert not homeserver.requests
 
 
+def test_register_and_login_read_no_machine_homeserver(cli, project, homeserver, capsys,
+                                                         monkeypatch):
+    # The machine keeps no agentrooms setup: a homeserver it holds is not a default.
+    monkeypatch.setenv("AGENTROOMS_HOMESERVER", HS)
+    (cli.CREDENTIALS_ENV.parent).mkdir(parents=True, exist_ok=True)
+    cli.CREDENTIALS_ENV.write_text(f"AGENTROOMS_HOMESERVER={HS}\n")
+    for argv in (["register", "alpha"], ["login", f"@alpha:{SERVER}"]):
+        code, _out, err = run(cli, capsys, *argv)
+        assert code == 6 and err["error"]["code"] == "homeserver_missing", (argv, err)
+    assert not homeserver.requests
+    assert not hasattr(cli, "SETUP_FIELDS") and cli.CRED_KEYS == []
+
+
 def test_register_on_an_open_homeserver_needs_no_token(cli, project, homeserver, capsys):
     homeserver.registration_flows = [["m.login.registration_token"], ["m.login.dummy"]]
     code, out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
@@ -427,7 +456,7 @@ def test_register_refuses_a_homeserver_offering_no_usable_flow(cli, project, hom
 
 
 def test_register_refuses_a_bad_registration_token(cli, project, homeserver, capsys, monkeypatch):
-    monkeypatch.setenv("AGENTROOMS_REGISTRATION_TOKEN", "wrong")
+    monkeypatch.setattr(sys, "stdin", Piped("wrong\n"))
     code, _out, err = run(cli, capsys, "register", "alpha", "--homeserver", HS)
     assert code == 2 and err["error"]["code"] == "registration_token_rejected"
     assert not (project / ".env.local").exists()
@@ -886,7 +915,7 @@ def test_a_connection_held_in_the_store_is_bound_in_this_projects_settings(cli, 
 @needs_store
 def test_register_completes_a_declared_connection_and_defaults_only_to_a_granted_one(
         cli, project, stored, capsys, homeserver, monkeypatch):
-    monkeypatch.setenv("AGENTROOMS_REGISTRATION_TOKEN", "reg-token")
+    monkeypatch.setattr(sys, "stdin", Piped("reg-token\n"))
     identity = project / "capabilities" / "project.json"
     identity.write_text(json.dumps({"slug": "project", "connections": "store"}))
     records = cli._records()

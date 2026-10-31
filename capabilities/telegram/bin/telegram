@@ -26,9 +26,15 @@ Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
 
 The app every account signs in through is registered once at my.telegram.org/apps
 and given to the machine once: `telegram setup set --field TELEGRAM_API_ID=<id>
---stdin` with {"TELEGRAM_API_HASH": "<hash>"} on stdin. A connection naming no
-`api_id` or `secret_env` of its own inherits it, and `telegram app-check` asks
-Telegram whether it accepts it before any account is linked.
+--stdin` with {"TELEGRAM_API_HASH": "<hash>"} on stdin, and `telegram app-check`
+asks Telegram whether it accepts it before any account is linked. `connection add`
+of a connection naming no `api_id` or `secret_env` of its own copies that app into
+it - the id as its `api_id`, the hash sealed into the agent's vault under the
+connection's own TELEGRAM_<ID>_API_HASH - so it is the connection's own from then
+on and signs in the same on a node with no machine file; where no vault takes the
+hash nothing is copied and the connection inherits the machine's app as before.
+`connection seal` (and `capabilities connections seal`) does the same for a
+connection that still inherits it.
 
 Configuration requires explicit connections with a positive
 `expected_account_id`, including the one-account case. The selected connection's app credentials and session resolve
@@ -88,9 +94,10 @@ the machine; every other verb that needs a connection is refused there.
   --connection <id>        Select a connection; accepted by every verb. Optional
                            with a default pointer or a sole connection.
   TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps: the machine's
-                           app, which every connection naming no `api_id` inherits.
-  TELEGRAM_API_HASH        App hash paired with the id (secret); a connection naming
-                           no `secret_env` inherits it.
+                           app, which a connection naming no `api_id` is given as its
+                           own when it is added, and inherits until it is.
+  TELEGRAM_API_HASH        App hash paired with the id (secret); copied with the id
+                           under the connection's own key, else inherited.
   TELEGRAM_SESSION         Session path, no extension — Telethon writes
                            <path>.session on disk. Optional one-shot override; the
                            default connection's session defaults to
@@ -523,14 +530,15 @@ CRED_KEYS = [    # an override-free registry entry resolves these flat keys
 # a connection entry's own fields, which `connection add` writes.
 CONN_FIELDS = [{'key': 'api_id',
   'label': 'App id',
-  'help': "A numeric app id of this connection's own; the machine's app (`telegram setup`) "
-          'when empty.',
+  'help': "A numeric app id of this connection's own; when empty, `connection add` copies "
+          "the machine's app (`telegram setup`) into it, else the machine's is used.",
   'type': 'integer',
   'required': False},
  {'key': 'secret_env',
   'label': 'App hash',
-  'help': "The hash of this connection's own app; the machine's app (`telegram setup`) "
-          'when empty.',
+  'help': "The hash of this connection's own app; when empty, `connection add` copies "
+          "the machine's (`telegram setup`) into the vault under the connection's own key, "
+          "else the machine's is used.",
   'type': 'string',
   'secret': True,
   'required': False,
@@ -1065,6 +1073,29 @@ def _app_keys(cid: str | None, entry: dict | None) -> tuple[str | None, str]:
         field = next(f for f in CONN_FIELDS if f["key"] == "secret_env")
         secret_env = _connection_env_name(field, cid)
     return literal_id, secret_env or "TELEGRAM_API_HASH"
+
+
+def _connection_prefill(cid: str, entry: dict) -> dict:
+    """What a connection naming no app of its own is given of the machine's
+    (the contract's `connection add` of a new connection, and `connection
+    seal`): the machine's TELEGRAM_API_ID as its own `api_id`, and the hash
+    paired with it under the connection's own key, so no two connections read
+    one app hash from one machine key and the connection signs in the same on
+    a node with no machine file. Nothing where it names an app, or the
+    machine has none."""
+    if not cid or entry.get("api_id") is not None or entry.get("secret_env"):
+        return {}
+    api_id = _resolve_env_key("TELEGRAM_API_ID")[0]
+    api_hash = _resolve_env_key("TELEGRAM_API_HASH")[0]
+    if not api_id or not api_hash:
+        return {}
+    try:
+        api_id = int(str(api_id))
+    except (TypeError, ValueError):
+        return {}
+    field = next(f for f in CONN_FIELDS if f["key"] == "secret_env")
+    own = _connection_env_name(field, cid)
+    return {"fields": {"api_id": api_id, "secret_env": own}, "secrets": {own: api_hash}}
 
 
 def _app_credentials(cid: str | None, entry: dict | None

@@ -65,5 +65,30 @@ class ConnectionKeysTests(unittest.TestCase):
                          + ["GOOGLE_API_KEY", "OPENAI_API_KEY"])
 
 
+class ConnectionPrefillTests(unittest.TestCase):
+    """A connection naming no app is given the machine's as its own, so no two
+    connections read one hash from one machine key."""
+
+    def setUp(self):
+        self.cli = import_cli()
+        self.addCleanup(restore_modules, self.cli)
+        machine = {"TELEGRAM_API_ID": ("7654321", "user", "/c/credentials.env"),
+                   "TELEGRAM_API_HASH": ("hash-of-the-machine", "user", "/c/credentials.env")}
+        patcher = mock.patch.object(self.cli, "_resolve_env_key",
+                                    lambda key: machine.get(key, (None, None, None)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_connection_naming_no_app_gets_the_machines_under_its_own_key(self):
+        self.assertEqual(self.cli._connection_prefill("personal", {"expected_account_id": 1}),
+                         {"fields": {"api_id": 7654321,
+                                     "secret_env": "TELEGRAM_PERSONAL_API_HASH"},
+                          "secrets": {"TELEGRAM_PERSONAL_API_HASH": "hash-of-the-machine"}})
+
+    def test_a_connection_naming_an_app_gets_nothing(self):
+        for entry in ({"api_id": 1}, {"secret_env": "TELEGRAM_OTHER_HASH"}):
+            self.assertEqual(self.cli._connection_prefill("personal", entry), {})
+
+
 if __name__ == "__main__":
     unittest.main()

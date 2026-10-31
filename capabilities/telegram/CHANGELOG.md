@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-10-31 — A telegram connection carries its own app
+
+`telegram connection add` of a connection naming no `api_id` or `secret_env` of its own copies the machine's app into it, where the agent's vault takes the hash: the machine's `TELEGRAM_API_ID` becomes its `api_id` and the hash is sealed into the vault under the connection's own `TELEGRAM_<ID>_API_HASH`, which its `secret_env` names, so two connections no longer read one hash from one machine key and the connection signs in the same on a node with no machine file. `telegram connection seal` and `capabilities connections seal` do the same for a connection that still inherits the machine's app, once every agent it is granted to holds the hash. Where no vault takes the hash nothing is copied and the connection inherits the machine's app as before. `Where a secret resolves` now lists the vault first.
+
 ## 2026-10-31 — `telegram help` names the agent's vault in the credential cascade
 
 Bare `telegram help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. It also says `telegram setup set` stores DEEPGRAM_API_KEY as that section says, where it used to say it writes `~/.config/capabilities/shared.env`. Nothing else changes.

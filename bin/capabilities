@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.38,<1",
+#     "capabilities-contract>=0.40,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -535,32 +535,42 @@ VAULT VERBS
   and a vault of named secrets in its store that only that key opens: each a
   row of capabilities_vault, sealed with XChaCha20-Poly1305, the agent id and
   the name bound to it. The store keeps the fingerprint of the agent's key on
-  its row of capabilities_agents, never the key; keeping the key is the
-  owner's. The vault is the first home of an agent's secrets: a capability's
-  `connection add` and `setup set` seal a secret given on stdin into it by
-  default, and write a file only with --file, at --global or --machine (a
-  machine's secret, which every agent on it shares), or where no vault takes
-  it here, saying why. Every capability resolves a value its connections name
-  through the credential cascade and asks the vault last, after the project's
-  .env files, its credentials.env and the process environment, so a key a file
-  also holds resolves from the file. A secret several agents
-  use is a copy in each agent's vault. A row sealed under another key than
+  its row of capabilities_agents, never the key, and beside it the agent's
+  public sealing key (vault_public_key), the X25519 public key the key gives,
+  so another writer seals a value only the agent's key opens - a shared
+  connection's secret for each agent granted it - without holding the key;
+  keeping the key is the owner's. The key verbs, a secret written here and
+  `connections seal` publish it; a key that changes leaves it unpublished
+  until one of them runs again. The vault is the first home of an agent's
+  secrets: a capability's `connection add` and `setup set` seal a secret
+  given on stdin into it by default, and write a file only with --file, at
+  --global or --machine where no grantee's vault takes it, or where no vault
+  takes it here, saying why. Every capability resolves a value its
+  connections name through the credential cascade and asks the vault first,
+  before the project's .env files, its credentials.env and shared.env and the
+  process environment, which still answer every name the vault does not
+  hold: a connection whose values are in the vault resolves them the same on
+  every node holding the agent's key. A connection the store shares carries
+  its secret in each granted agent's vault. A row sealed under another key than
   the agent's present one is unreadable: kept, reported, and read again only
   once it is set again. Each verb stands in the current project and its
   store, and answers JSON unless it says otherwise.
   key generate
-        Make the agent's first key, record its fingerprint, and write it into
-        the project's .env.local. Exit 6 key_exists where a key resolves here,
+        Make the agent's first key, record its fingerprint, publish its public
+        sealing key (public_key in the answer), and write it into the
+        project's .env.local. Exit 6 key_exists where a key resolves here,
         key_recorded where the agent already keeps its vault under a key that
         is not here (bring it with key set). Never prints the key.
   key set
         Take the agent's key on stdin - to bring it to another machine or
         folder of the same agent - and write it into the project's .env.local;
-        recorded where the agent has none yet. Exit 6 bad_key for text that
-        is not a key, key_mismatch for a key that is not the agent's.
+        recorded where the agent has none yet, and its public sealing key
+        published. Exit 6 bad_key for text that is not a key, key_mismatch
+        for a key that is not the agent's.
   key change
-        Make a new key, record its fingerprint, and write it into the
-        project's .env.local. Everything sealed under the previous key becomes
+        Make a new key, record its fingerprint, publish its public sealing
+        key, and write it into the project's .env.local. Everything sealed
+        under or for the previous key becomes
         unreadable; the answer names how many (unreadable) and the previous
         fingerprint. Set those secrets again.
   secrets help
@@ -594,8 +604,9 @@ VAULT VERBS
         from the vault once the file no longer holds it. A reader is an
         installed capability whose `connections --json` here resolves the key
         from one of those files, the per-key resolution its doctor gates on;
-        each key is sealed (files still win, so this changes nothing), removed
-        from its files, and every reader asked again. A key some reader then
+        each key is sealed with the value the file holds (the vault is read
+        first, so each reader resolves the same value from it), removed from
+        its files, and every reader asked again. A key some reader then
         does not resolve from the vault with the same value goes back on its
         own line and out of the vault as it was. Answers moved [{name, files,
         readers}] and kept [{name, files, reason}], one reason per key that
@@ -606,7 +617,8 @@ VAULT VERBS
         A key a capability reads from the machine's credentials.env or
         shared.env is kept, since every agent on the machine reads it there.
         not_reading names the capabilities that refuse to resolve a connection
-        here. The cascade's order does not change.
+        here. `connections seal` writes the values the machine's files hold
+        into each connection instead, and leaves every file as it is.
   Without a key here, key-bound verbs exit 6 key_missing; with a key that is
   not the one the agent's vault is kept under, 6 key_mismatch. A project with
   no id exits 6 no_project_identity, an agent the store does not register 6
@@ -1860,7 +1872,12 @@ PROJECT VERBS (run inside a consuming project)
         `<name> connection rename` gave it, and the row holds its id. Such a
         write stamps the
         project id, so it refuses (exit 6) where the id is not verified, and
-        `records.mode` answers `store` with the table as `source`. A store
+        `records.mode` answers `store` with the table as `source`. A grant
+        that enables a connection the store shares also seals its secret into
+        this agent's vault, as `<name> connection seal <id> --share` here,
+        else in the folder here of another agent granted it, for this
+        agent's public key; vault {sealed, by, pending, hint} says which keys
+        it reached and what is still to be sealed. A store
         that cannot be reached is exit 5 store_unreachable.
   connections list [<name> ...]
         Every connection the store holds, per capability - of the capabilities
@@ -1927,6 +1944,36 @@ PROJECT VERBS (run inside a consuming project)
         naming this node with its service placed (service.placed), as
         `place` would. Exit 4 under the
         read-only switch, 5 when the store cannot be reached.
+  connections seal
+        Write into every connection the values it resolves today from files
+        or the environment - the project's .env files, the machine's
+        credentials.env and shared.env, the process environment - sealed into
+        the vault of every agent it serves, so it resolves them the same on a
+        node with none of those files. It runs each installed capability's
+        `<name> connection seal` in this agent's folder and in the folder here
+        of every other agent the store links to this node: first each agent's
+        own, which also publishes its public sealing key, then with --share,
+        so a connection the store shares is sealed for every agent granted
+        it, for its public key, those on other nodes included. A telegram
+        connection naming no app of its own is given the machine's app as its
+        own api_id and hash (TELEGRAM_<ID>_API_HASH), once every agent it is
+        granted to holds the hash. Nothing a vault already holds is written
+        over and no file is changed, so a second run changes nothing; once it
+        ran, removing the machine's files changes no resolution. JSON {ok,
+        agent, published (this agent's public sealing key, published first),
+        agents [{agent, folder}], sealed [{capability, connection, key, for,
+        by, from}], unchanged (how many names a vault already held), specs
+        [{capability, connection, fields, by}], specs_pending [{capability,
+        connection, fields}], unresolved [{capability, connection, key,
+        agent}], unpublished [{agent, capability, connection}], hint,
+        not_sealing [{capability, code, message, agent, folder}], unread}:
+        unpublished names each grantee whose public key is not yet published,
+        never skipped in silence, and hint says how it is - the first command
+        that uses its key against the store in its folder, this one there
+        included. not_sealing names a capability that refuses here (not
+        enabled, no connection granted) or whose library predates the verb.
+        Exit 4 under the read-only switch, 6 without a project id, 6
+        key_missing without the agent's key here.
 
   migrate [--dry-run|--apply] [--answers FILE]
         Move this agent's file-held configuration into the store, on its
@@ -9260,9 +9307,10 @@ def _kernel_store_report(setting) -> dict:
 # ---------------------------------------------------------------- the agent's vault
 # Each agent's secrets are rows of the store, sealed with the agent's own key,
 # AGENT_ENCRYPTION_KEY, which lives in the agent's environment and never in the
-# store (capabilities_contract.vault). The manager carries the verbs that keep
-# the key and the secrets; every capability reads a secret as the last tier of
-# its credential cascade.
+# store, or for the public sealing key that key gives, which the agent's row
+# publishes (capabilities_contract.vault). The manager carries the verbs that
+# keep the key and the secrets; every capability reads a secret from the vault
+# first, before the files and the environment of its credential cascade.
 
 VAULT_TEXT_SET_FLAG = "--set"
 
@@ -9326,12 +9374,15 @@ def _vault_key_matches(conn, agent_id: str, key: bytes, record: bool = True) -> 
     if recorded is None:
         if record:
             vault.record_key(conn, agent_id, vault.fingerprint(key))
+            vault.publish(conn, agent_id, key)
     elif recorded != vault.fingerprint(key):
         _die(6, "key_mismatch",
              f"the {vault.KEY_ENV} here is not the key agent {agent_id}'s vault is kept "
              f"under (fingerprint {recorded[:16]}…)",
              "bring the agent's key with `capabilities key set`, or replace it with "
              "`capabilities key change`, which leaves what was sealed before unreadable")
+    elif record:
+        vault.publish(conn, agent_id, key)
 
 
 def _vault_stdin(what: str) -> str:
@@ -9387,17 +9438,19 @@ def cmd_key(rest: list[str]) -> None:
                  "sealed before unreadable")
         if recorded != fingerprint:
             vault.record_key(conn, agent_id, fingerprint)
+        published = vault.publish(conn, agent_id, key)
         if sub == "change":
             unreadable = vault.sealed_under_other(conn, agent_id, fingerprint)
         # Written inside the transaction, so a file that cannot be written
         # leaves the store as it was.
         changed_file = _write_env_local_keys(root, {vault.KEY_ENV: vault.encode_key(key)})
-        return recorded, unreadable, changed_file
+        return recorded, unreadable, changed_file, published
 
-    (recorded, unreadable, changed_file), setting = _kernel_run(root, write)
+    (recorded, unreadable, changed_file, published), setting = _kernel_run(root, write)
     answer = {"ok": True, "agent": _kernel_agent_id(root), "fingerprint": fingerprint,
+              "public_key": vault.public_text(key),
               "written": str(root / ".env.local"),
-              "changed": changed_file or recorded != fingerprint,
+              "changed": changed_file or recorded != fingerprint or bool(published),
               "store": _kernel_store_report(setting)}
     if sub == "change":
         answer["previous_fingerprint"] = recorded
@@ -9428,7 +9481,8 @@ def _vault_public(entries: list) -> list:
 # only where every capability that reads it here reads it from the vault once
 # the file no longer holds it - which is what a capability's doctor gates on,
 # since its readiness gate reads the same per-key resolution `connections`
-# reports. Files still win in the cascade, so sealing first changes nothing.
+# reports. A key is sealed with the value its file holds, so the vault, read
+# first, answers what the file did and sealing first changes no value.
 VAULT_MOVE_FILES = (".env.local", ".env")
 VAULT_MOVE_TIMEOUT = 60
 
@@ -9599,7 +9653,7 @@ def _vault_move(root: Path) -> dict:
 
     def stopped(signum, _frame):
         # A stop during the trial puts the lines back before it ends the run;
-        # a key left sealed is harmless, since the files still win.
+        # a key left sealed is harmless, since it holds the file's own value.
         for each in stops:
             signal.signal(each, signal.SIG_IGN)
         restore()
@@ -9648,6 +9702,209 @@ def _vault_move(root: Path) -> dict:
                        "readers": sorted({r[0] for r in readers[n]})} for n in moved],
             "kept": [kept[n] for n in sorted(kept)],
             "not_reading": refusing, "unread": unread}
+
+
+# `connections seal`: each connection's values written into the vault of every
+# agent it serves, from where they resolve today, by each capability's own
+# `connection seal` run in each agent's folder on this machine - the
+# capability resolves and seals as that agent, so the manager reads no value
+# and no key of its own. Every folder seals its own agent first, so every agent
+# here has its key published before any folder seals a shared connection for
+# the agents granted it elsewhere (--share).
+SEAL_TIMEOUT = 120
+
+
+def _seal_folders(root: Path) -> list[tuple[str, Path]]:
+    """(agent, folder) for this folder's agent, then every other agent the
+    store links to this node whose folder here is bound to it."""
+    own = _kernel_agent_id(root)
+    here = _node_id_or(None)
+    linked: list = []
+    if here is not None:
+        def read(conn, _agent_id):
+            return conn.execute("SELECT agent_id, folder FROM capabilities_agent_nodes "
+                                "WHERE node = %s ORDER BY agent_id", (here,)).fetchall()
+        linked, _setting = _kernel_run(root, read)
+    folders = [(own, root)]
+    for agent_id, folder in linked:
+        if agent_id == own:
+            continue
+        path = _node_agent_folder(root, own, agent_id, folder)
+        if path is not None:
+            folders.append((agent_id, path))
+    return folders
+
+
+def _seal_runs(folder: Path, own: bool, args: list[str],
+               names: list[str] | None = None) -> tuple[dict, list, list]:
+    """Each installed capability's `connection seal <args>` in `folder`:
+    ({capability: answer}, [{capability, code, message}] for one that refuses,
+    [{capability, problem}] for one whose answer could not be read). Another
+    agent's folder is run without this process's agent key in the
+    environment, which is this agent's."""
+    vault = _vault_module()
+    env = _snapshot_env()
+    if not own:
+        env.pop(vault.KEY_ENV, None)
+
+    def ask(name):
+        return name, _run_script(_script_path(name), ["connection", "seal", *args],
+                                 cwd=folder, env=env, timeout=SEAL_TIMEOUT)
+
+    answers, refusing, unread = {}, [], []
+    wanted = sorted(names if names is not None else _installed())
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        for name, (rc, stdout, stderr) in pool.map(ask, wanted):
+            if rc == 0:
+                try:
+                    answer = json.loads(stdout)
+                except ValueError:
+                    answer = None
+                if isinstance(answer, dict) and isinstance(answer.get("connections"), dict):
+                    answers[name] = answer
+                else:
+                    unread.append({"capability": name,
+                                   "problem": "its seal answer is not a JSON object"})
+                continue
+            error = None
+            for line in reversed(stderr.splitlines()):
+                try:
+                    error = json.loads(line)["error"]
+                    break
+                except (ValueError, KeyError, TypeError):
+                    continue
+            if isinstance(error, dict) and isinstance(error.get("code"), str):
+                refusing.append({"capability": name, "code": error["code"],
+                                 "message": error.get("message")})
+            else:
+                unread.append({"capability": name, "problem": f"connection seal exited {rc}"})
+    return answers, refusing, unread
+
+
+def _seal_collect(out: dict, agent_id: str, folder: Path, answers: dict,
+                  refusing: list, unread: list) -> None:
+    for name, answer in sorted(answers.items()):
+        for cid, res in sorted(answer["connections"].items()):
+            for whom, keys in sorted((res.get("sealed") or {}).items()):
+                for key in keys:
+                    out["sealed"].append({"capability": name, "connection": cid, "key": key,
+                                          "for": whom, "by": agent_id,
+                                          "from": (res.get("from") or {}).get(key)})
+            out["unchanged"] += len(res.get("unchanged") or [])
+            for key in res.get("unresolved") or []:
+                out["unresolved"].append({"capability": name, "connection": cid,
+                                          "key": key, "agent": agent_id})
+            if res.get("spec"):
+                out["specs"].append({"capability": name, "connection": cid,
+                                     "fields": res["spec"], "by": agent_id})
+            if res.get("spec_pending"):
+                out["specs_pending"].append({"capability": name, "connection": cid,
+                                             "fields": res["spec_pending"]})
+            for whom in res.get("unpublished") or []:
+                out["unpublished"].append({"agent": whom, "capability": name,
+                                           "connection": cid})
+    for row in refusing:
+        out["not_sealing"].append({**row, "agent": agent_id, "folder": str(folder)})
+    for row in unread:
+        out["unread"].append({**row, "agent": agent_id, "folder": str(folder)})
+
+
+def cmd_connections_seal(rest: list[str]) -> None:
+    if rest:
+        _die(6, "input", "connections seal takes nothing more", "run `capabilities help`")
+    _read_only_gate("connections seal")
+    root = _require_project()
+    vault = _vault_module()
+    key = _vault_require_key(root)
+    # This agent's public sealing key is published first, whatever its
+    # capabilities answer, so a writer elsewhere can seal for it.
+    published, _setting = _kernel_run(
+        root, lambda conn, agent_id: (_vault_key_matches(conn, agent_id, key),
+                                      vault.recipients(conn, [agent_id]))[1])
+    folders = _seal_folders(root)
+    out: dict = {"ok": True, "agent": folders[0][0],
+                 "published": bool((published.get(folders[0][0]) or (None, None))[1]),
+                 "agents": [{"agent": a, "folder": str(f)} for a, f in folders],
+                 "sealed": [], "unchanged": 0, "specs": [], "specs_pending": [],
+                 "unresolved": [], "unpublished": [], "not_sealing": [], "unread": []}
+    # Every agent here seals its own first, publishing its key as it does;
+    # only then does each seal what the store shares for the agents granted it.
+    for args in ([], ["--share"]):
+        for agent_id, folder in folders:
+            answers, refusing, unread = _seal_runs(folder, folder == root, args)
+            if args:
+                # What the first pass refused it refuses again; it is named once.
+                refusing = [r for r in refusing if not any(
+                    n["capability"] == r["capability"] and n["agent"] == agent_id
+                    for n in out["not_sealing"])]
+                unread = [u for u in unread if not any(
+                    n["capability"] == u["capability"] and n["agent"] == agent_id
+                    for n in out["unread"])]
+            _seal_collect(out, agent_id, folder, answers, refusing, unread)
+    # Each pass may name the same thing again; it is answered once.
+    for field in ("unpublished", "unresolved", "specs_pending"):
+        seen, rows = set(), []
+        for row in out[field]:
+            mark = json.dumps(row, sort_keys=True)
+            if mark not in seen:
+                seen.add(mark)
+                rows.append(row)
+        out[field] = rows
+    unpublished = out["unpublished"]
+    if unpublished:
+        out["hint"] = vault.UNPUBLISHED_HINT
+    _emit(out)
+
+
+def _grant_seal(root: Path, name: str, cid: str) -> dict | None:
+    """Seal a connection the store shares into the vault of the agent just
+    granted it: from what it resolves in this folder, and else from the
+    folder here of another agent granted it, whose capability seals it for
+    this agent's public key. None for a connection the store does not share;
+    else {sealed, by, pending, hint?}."""
+    store = _store_module()
+    adapter = _records_for(root)
+    try:
+        grantees = adapter.shared_grantees(name, cid) if hasattr(
+            adapter, "shared_grantees") else None
+    except store.StoreError:
+        grantees = None
+    finally:
+        adapter.close()
+    if grantees is None:
+        return None
+    agent_id = _kernel_agent_id(root)
+    result: dict = {"sealed": [], "by": [], "pending": []}
+
+    def run(agent: str, folder: Path) -> list:
+        answers, refusing, _unread = _seal_runs(folder, folder == root, [cid, "--share"],
+                                                names=[name])
+        if refusing and folder == root:
+            result["refused"] = refusing[0]
+        res = ((answers.get(name) or {}).get("connections") or {}).get(cid) or {}
+        mine = (res.get("sealed") or {}).get(agent_id) or []
+        if mine:
+            result["sealed"] = sorted(set(result["sealed"]) | set(mine))
+            result["by"].append(agent)
+        return [k for k in res.get("unresolved") or []] if folder == root else []
+
+    pending = run(agent_id, root)
+    if pending:
+        try:
+            others = [(a, f) for a, f in _seal_folders(root) if a in grantees and a != agent_id]
+        except SystemExit:
+            others = []
+        for agent, folder in others:
+            run(agent, folder)
+            if set(pending) <= set(result["sealed"]):
+                break
+    result["pending"] = sorted(set(pending) - set(result["sealed"]))
+    if result["pending"]:
+        result["hint"] = (f"no folder here resolves {', '.join(result['pending'])} for this "
+                          f"agent: run `capabilities connections seal` in the folder of an agent "
+                          f"granted {cid} that resolves it, or give the secret again with "
+                          f"`{name} connection add {cid} --replace --stdin` there")
+    return result
 
 
 def _help_section(heading: str) -> str:
@@ -19042,17 +19299,25 @@ def cmd_set(name: str, collection: str, key: str,
             _project_id_for_write(root)
         adapter.set(name, collection, key, value,
                     actor="capabilities set", note=note)
-        _emit({"set": {"capability": name, "collection": collection,
-                       "key": key, "value": value},
-               "records": {"mode": adapter.mode_of(collection, key),
-                           "source": (adapter.collection_source(
-                               name, "grant" if collection == "setting"
-                               and key == "connection.default" else collection)
-                               if in_store else adapter.source)}})
+        answer = {"set": {"capability": name, "collection": collection,
+                          "key": key, "value": value},
+                  "records": {"mode": adapter.mode_of(collection, key),
+                              "source": (adapter.collection_source(
+                                  name, "grant" if collection == "setting"
+                                  and key == "connection.default" else collection)
+                                  if in_store else adapter.source)}}
     except _store_module().StoreError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     finally:
         adapter.close()
+    if (collection == "grant" and in_store and isinstance(value, dict)
+            and value.get("enabled") is True and name in _installed()):
+        # A connection the store shares carries its secret in the vault of
+        # every agent granted it, this one now included.
+        sealed = _grant_seal(root, name, key)
+        if sealed is not None:
+            answer["vault"] = sealed
+    _emit(answer)
 
 
 def _connection_key(adapter, name: str, wanted: str) -> str:
@@ -29402,8 +29667,10 @@ def main() -> None:
             cmd_connections_list(rest[1:])
         elif rest == ["import"]:
             cmd_connections_import()
+        elif rest[:1] == ["seal"]:
+            cmd_connections_seal(rest[1:])
         else:
-            _die(6, "input", "connections needs the subcommand list or import",
+            _die(6, "input", "connections needs the subcommand list, import or seal",
                  "run `capabilities help`")
     elif cmd == "get":
         if len(pos) != 3:
