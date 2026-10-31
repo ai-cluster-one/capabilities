@@ -1,5 +1,19 @@
 # memory — change log
 
+## 2026-10-31 — `memory` carries its own icon
+
+The bundle holds its icon as `icon.png`, a brain: Lucide's `brain` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon memory` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
+Lucide's notice, which ships with the icon:
+
+ISC License
+
+Copyright (c) 2026 Lucide Icons and Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 ## 2026-10-29 — `service join` and `service leave` are removed; the node manager writes the machine service's list
 
 `memory service join` and `memory service leave` (with `leave --machine --project`) are removed. The machine service's list, `$XDG_CONFIG_HOME/memory/service/projects.json`, is now written by the node manager alone (`capabilities node supervise memory --machine`), from the agents placed on this node in mode shared whose leases it holds: it puts each there and takes off those it put there once they are no longer placed so. A project is served by the machine service by placing it so - `capabilities service start memory`, or `capabilities place memory --node <node> --mode shared` - and leaves it with `capabilities service stop memory` or `capabilities unplace memory --node <node> --mode shared`. A project already on the list stays on it. `memory adopt --apply` still opts each project it adopts in: in a project whose records are in the store it writes the shared placement on this node (`capabilities place memory --node <this node> --mode shared`), answered under `joined` {joined, placement}; a project in files mode is answered `joined` {joined: false, why}, since only a placed project reaches the list now. Hints that named `service join` or `leave` now name those commands; the list's format, `service status --machine` and every other machine verb answer as before.

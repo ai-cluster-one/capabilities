@@ -1,5 +1,19 @@
 # agentrooms — change log
 
+## 2026-10-31 — `agentrooms` carries its own icon
+
+The bundle holds its icon as `icon.png`, two speech bubbles: Lucide's `messages-square` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon agentrooms` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
+Lucide's notice, which ships with the icon:
+
+ISC License
+
+Copyright (c) 2026 Lucide Icons and Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 ## 2026-10-31 — agentrooms keeps no machine setup
 
 `register` and `login` take the homeserver from `--homeserver` or from the connection they complete, never from a machine default: `AGENTROOMS_HOMESERVER` is no longer read, and with neither they exit 6 `homeserver_missing`, naming `--homeserver`. `register` asks for a registration token only where the homeserver requires one, reading it from standard input then (no echo on a terminal); `AGENTROOMS_REGISTRATION_TOKEN` is no longer read, and `--registration-token -` still reads it from standard input before the homeserver is asked. The setup fields and the credential keys that named those two machine values are gone, so `agentrooms setup` and the install scaffold no longer ask for them.

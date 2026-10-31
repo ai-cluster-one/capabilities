@@ -1,5 +1,9 @@
 # slacker — change log
 
+## 2026-10-31 — `slacker` carries its own icon
+
+The bundle holds its icon as `icon.png`, Slack's mark, the same file `slack` carries, byte for byte. The mark is a trademark of Slack, used here only to identify the service the capability reads. `capabilities icon slacker` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
 ## 2026-10-31 — `slacker help` names the agent's vault in the credential cascade
 
 Bare `slacker help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. It also says `connection add` stores the pasted secrets as that section says, where it used to say they land only in the credentials file; `link` still writes them there. Nothing else changes. The `linking` guide says the pasted secrets land in the agent's vault, or a credentials file as that section says.

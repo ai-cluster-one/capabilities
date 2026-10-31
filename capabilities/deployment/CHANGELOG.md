@@ -1,5 +1,19 @@
 # deployment — change log
 
+## 2026-10-31 — `deployment` carries its own icon
+
+The bundle holds its icon as `icon.png`, a rocket: Lucide's `rocket` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon deployment` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
+Lucide's notice, which ships with the icon:
+
+ISC License
+
+Copyright (c) 2026 Lucide Icons and Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 ## 2026-10-29 — Services start only under the node manager; the watchdogs and the launchd starters are removed, and the runner hands over unless the manager is too old
 
 `deployment watchdog`, `deployment machine sync`, `deployment machine next`, `deployment machine status` and `deployment machine watchdog` are removed, and so is the `host-agents` profile's compilation of a launchd agent per service and of the project watchdog's agent: `sync` for that profile now writes only the interval agent per Coolify target that carries the body to its node, its answer no longer carries `agents`, `deployment next` there points the services at the node manager (`capabilities node install --apply`, then `capabilities service start <name>`) and prints launchctl steps only for those body agents, and `deployment doctor` warns about a service agent an older compilation left loaded instead of judging it. On a Mac and on a server a service now starts only under the capabilities manager's node manager (`capabilities node run`, each service under `capabilities node supervise`), as the placements in the store say. A `compiler.host.watchdog` a runtime still declares is ignored and dropped by the next `sync`. The help summary no longer says deployment compiles launchd-supervised processes.

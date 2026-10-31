@@ -1,5 +1,19 @@
 # automations — change log
 
+## 2026-10-31 — `automations` carries its own icon
+
+The bundle holds its icon as `icon.png`, a timer: Lucide's `timer` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon automations` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
+
+Lucide's notice, which ships with the icon:
+
+ISC License
+
+Copyright (c) 2026 Lucide Icons and Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any purpose with or without fee is hereby granted, provided that the above copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
 ## 2026-10-30 — A run's node and a saved definition's author name the node by its id, never the host
 
 Ledger step `0007-runs-node-written` (automations 1.4) drops trigger `automations_runs_node_from_host`, which filled a run inserted without a node with the inserting machine's host name. Every run is inserted with its node, as it has been since `0004-runs-node`, so an insert without one is now refused rather than recorded under a host name. `created_by` of a saved definition and `by` of a pause are written as `<user>@<node id>` instead of `<user>@<host name>`. Rows already written keep their values.

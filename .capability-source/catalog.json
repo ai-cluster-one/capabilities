@@ -1,15 +1,15 @@
 {
   "capabilities": {
     "agentrooms": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/agentrooms",
-      "payload_sha256": "664dfaedf703ea140b2fa300e4ff0b9c3e4c50e451a03105c884cd20e5e55df1",
+      "payload_sha256": "8bb518af0b5366af3e2652fbd11f72cecc3cd3c063bdbb2541df21808fb0e620",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
     "agenttemplates": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/agenttemplates",
-      "payload_sha256": "0184dc43d01d4b8afb873c3fb682ac1ada17bedc243764757402b20c1c6f51d6",
+      "payload_sha256": "6c53f21b14c070a6fa699d4cb22b31bdef41875e29da00c50d952dd5c434a95d",
       "summary": "The agent templates a new agent is made from - the starter context files and each agent template (its manifest, icon, context, routines) - carried as files in this capability's bundle; list them and show one, and the manager's `templates` and `init --template` read them from here."
     },
     "asana": {
@@ -19,21 +19,21 @@
       "summary": "Asana CLI over the REST API — read/create/comment-on tasks and subtasks, @mention, manage tags, board sections, dependencies, and the API-only machine-state field."
     },
     "askproject": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/askproject",
-      "payload_sha256": "db3996f2aa6f664842849dc529ae4f0a33e4a30daee0e681bd5deba8d38f15dd",
+      "payload_sha256": "05be14e6f7d121aad0d32c67a001fe5a34b52b8fd282da7229d28a24705effe2",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability."
     },
     "assets": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/assets",
-      "payload_sha256": "0730676fe410a4d32de8149f8625e1e4791f8e34707699f8e1d9edab026df5f9",
+      "payload_sha256": "9fca7bf5194cc393b54d94ec815cebc7e99ed1563308dc6319f0ceae2f0fd66b",
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder."
     },
     "automations": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/automations",
-      "payload_sha256": "72dc67f5dce5285319d71ee576f2ee87cb1a36a4e92becc59f60fed5711aeea4",
+      "payload_sha256": "aaa55ced9a5d99535e63c6b07695b0e7e98d242c5b87136d670989e969501d23",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -43,9 +43,9 @@
       "summary": "Cal.com CLI over the Cal.com API v2 — list, read and cancel bookings, read event types, available slots, schedules, connected calendars and their busy times, and reach any other endpoint through `api`; writes are refused unless the connection grants them, and `doctor` proves the key and the account it resolves to."
     },
     "calendar": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/calendar",
-      "payload_sha256": "f05f16850d067f4c9113987e04079b6f4a64ef1d7173a39d21fb3cfeca4ef84b",
+      "payload_sha256": "8664d4572d00e94a4ee71ee5daca718fbd132d43400c56c645cd8e7414850ca4",
       "summary": "CalDAV CLI for remote calendars — list calendars, read, search and check busy blocks, and book events on a principal."
     },
     "callva": {
@@ -67,9 +67,9 @@
       "summary": "ClickUp CLI over the REST API — read/create/update/comment-on tasks and subtasks, complete via status, manage assignees, tags, dependencies, custom fields, attachments, and webhooks across spaces and lists."
     },
     "context": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/context",
-      "payload_sha256": "5ed992db036b7deb6890dbe1194b1a4d57e28fd35f956e006d050a2c6abe23c0",
+      "payload_sha256": "1e80655a8a64cae2b7743a14f400273378599ed608ce353e14fae68a98a24ab8",
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte."
     },
     "coolify": {
@@ -79,9 +79,9 @@
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
     "deployment": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/deployment",
-      "payload_sha256": "2401f07686e9c29bea35b42c08f3d57215ab830505e6d4abc75d037d5b049791",
+      "payload_sha256": "47a3e4ba56c6ac21074a93c229c0956fe3d6c7d8d4a0b0a50d1e578b62af9269",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to."
     },
     "directo": {
@@ -109,9 +109,9 @@
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay."
     },
     "ical": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/ical",
-      "payload_sha256": "de873ab2bd073231a61f78c91e434fa31ff922a9cd713f5e5718acdf11e77041",
+      "payload_sha256": "b3fc6088535d0a5ae032e79eba101ecf5c5debdc35c261bca0760bccc8b358f4",
       "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk."
     },
     "instagram": {
@@ -121,27 +121,27 @@
       "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first."
     },
     "journal": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/journal",
-      "payload_sha256": "630c01133e35b4b486fbe684d4dd6217139c9dc32b5ee8e8f32ea7546343cf88",
+      "payload_sha256": "76ebd0621a2a072ce02ea0f3c7dd764412064a87560a30ab5547ac1cf73512ec",
       "summary": "Journal CLI over a PostgreSQL store — list and read voice-journal entries, write enrichment back, chunk transcripts for embedding, and search the store at three levels."
     },
     "macmail": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/macmail",
-      "payload_sha256": "ddd7750604902da485b23d409b0d1b5498220215c3569234d20b431437d66f10",
+      "payload_sha256": "4a442946320b5171184cf95c687a58654de96ae3a7fafd12b152f333d2339e2b",
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON."
     },
     "mailbox": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/mailbox",
-      "payload_sha256": "ace4d41a8429854e7dc78216baf4dc489b4485428c97d3517e9e62eeff2805b8",
+      "payload_sha256": "1e8674c71ce09621e16342dbbb35d949d34348cab13a43274cb7a7ccfa0a38e3",
       "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, and send."
     },
     "memory": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/memory",
-      "payload_sha256": "7c7a97cbb1c070fe2b9c5ca8484ac1324dd90e7df0ac8e9640b5cde2f789fc16",
+      "payload_sha256": "5ac0c4b3c9c79f906522681e7ae8c71431827f22dcd39413f1756b04420e072e",
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
     },
     "notion": {
@@ -169,9 +169,9 @@
       "summary": "Send-only email CLI over the Resend HTTP API — deliver mail from a verified sending domain (send, write-gated with an optional recipient allow-list), list sending domains and their verification status (domains), and prove key + reachability (doctor). One-way by construction: no read or receive surface."
     },
     "routine": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/routine",
-      "payload_sha256": "8e135538681719214c0ece714aaaaf292616af3c7221d8c7e2e17107d328e66e",
+      "payload_sha256": "f254dfe0c335291f2d48c75fca6654673cdff3eebdfedfa392b5e0142099b05a",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte."
     },
     "signoz": {
@@ -199,9 +199,9 @@
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "slacker": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/slacker",
-      "payload_sha256": "01e53b8fccd0586a46854c184e5c04b06b011783a3c593577f289c63725dcc82",
+      "payload_sha256": "b17ababad3016a721837f978ad3091c27ee5f9e4625b323960a112d314499021",
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live. Read-only: it never writes to Slack."
     },
     "stripe": {
@@ -211,9 +211,9 @@
       "summary": "Read-only Stripe CLI over the REST API — emit a neutral JSON contract of account activity (sync-plan), check identity/reachability (doctor), list invoices and download their PDFs, and read balance-transactions and payouts."
     },
     "tasks": {
-      "icon": false,
+      "icon": true,
       "path": "capabilities/tasks",
-      "payload_sha256": "5fe5d5d4e4bf32e0559ca066acd3aa46495657030967abd5906483d345586ed5",
+      "payload_sha256": "bd146349814577a2065a6d22f47c04aa8ba857a17ca57bc31c5ea76474f7e94b",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
