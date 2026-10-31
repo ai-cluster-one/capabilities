@@ -187,8 +187,9 @@
       "summary": "SimpleBooks accounting CLI over a browser session (no public API) — read clients/invoices/purchases/accounts/bank-transactions/financial_transactions, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist. Stateful — run `simplbooks doctor` first."
     },
     "skyscanner": {
+      "icon": false,
       "path": "capabilities/skyscanner",
-      "payload_sha256": "84eb841e463cb58f6013c3c9897940144442827764ee242563f3de99262e09e1",
+      "payload_sha256": "38ba7f59268072fe96323452839e89d65a655990dfe048e1b9306f05936cd042",
       "summary": "Skyscanner flight search over plain HTTP — resolve places, search live itineraries with prices, comfort facts (stops, layovers, self-transfer, airport changes) and booking links, and read the cached cheapest price per day; read-only, optionally through an Oxylabs residential proxy that keeps Skyscanner's bot protection from blocking the address."
     },
     "slack": {

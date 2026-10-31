@@ -34,10 +34,13 @@ MODEL
   often: a 403, an answer that points at its captcha, or a search that never
   completes. A refused call is started again as a whole - every request of it,
   from the first autosuggest - on the next site and, through an Oxylabs
-  connection, from a new exit address, up to 6 attempts, each refusal named
-  on stderr; after the sixth skyscanner reports exit 7 `blocked` with what
+  connection, from a new exit address, up to 12 attempts, each refusal named
+  on stderr; after the twelfth skyscanner reports exit 7 `blocked` with what
   was tried. A site that refused is passed over for 30 minutes; the state
-  home keeps when, per connection. Through an Oxylabs residential proxy every
+  home keeps when, per connection. Each site is tried once per call before
+  any is tried again, and once all have been, the attempts go on to the site
+  refused longest ago, each on a fresh session: the cooldown orders the
+  sites and never ends a call before its 12 attempts are spent. Through an Oxylabs residential proxy every
   attempt holds one sticky exit address for all its requests, by default in
   the country of the site it uses (www.skyscanner.de from Germany,
   www.skyscanner.net from Great Britain), so it reads as that site's own
@@ -100,7 +103,8 @@ COMMANDS
         would use next (exit: {ip, country, providers, asked, site}), then
         one autosuggest request to Skyscanner
         proving it answers rather than blocks, on the site a call would use
-        next and on the following ones while a site refuses (up to 6). Emits
+        next and on the following ones while a site refuses (each site at
+        most once). Emits
         {ok, connections: {<id>: {ok, proxy, exit?, skyscanner: {reachable,
         domain, refused, suggestions}, warning?}}}; domain is the site that
         answered, refused the sites that refused before it. Exit 0 all healthy / 2 a
@@ -204,7 +208,7 @@ EXIT CODES
   5xx, 429 after retries, the proxy unreachable) · 6 input (bad arguments, an
   unknown or ambiguous connection, a malformed connection field, a request
   Skyscanner refused as invalid) · 7 blocked (Skyscanner's bot protection
-  refused all 6 attempts) · 8 wrong exit country (doctor: the proxy exits in
+  refused all 12 attempts) · 8 wrong exit country (doctor: the proxy exits in
   another country than it asked for).
 
 EXAMPLES
@@ -317,7 +321,7 @@ LAST_RESORT = {"www.skyscanner.net"}   # the busiest site: used after the others
 # two-letter top-level domain, save these.
 SITE_COUNTRY = {"net": "GB", "uk": "GB", "com": "US"}
 COOLDOWN = 30 * 60    # seconds a site that refused is passed over
-ATTEMPTS = 6          # whole attempts, each on a new site and a new exit address
+ATTEMPTS = 12         # whole attempts, each on the next site and a new exit address
 # A non-browser user agent is refused with 403.
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
@@ -713,7 +717,11 @@ def _restartable(f: _Failure, cfg: dict) -> bool:
 
 def _attempts(cfg: dict, run):
     """run(c) on one site and one exit address; on a refusal, the whole of it
-    again on the next site and a new address, up to ATTEMPTS times."""
+    again on the next site and a new address, up to ATTEMPTS times. Each site
+    is tried once first; once every site has been tried, each further attempt
+    goes to the head of the cooldown order - the site refused longest ago -
+    on a fresh session, so the cooldown orders sites and never ends the run
+    before the budget is spent."""
     state = _domain_state(cfg["id"])
     tried: list = []
     for n in range(1, ATTEMPTS + 1):
@@ -735,8 +743,8 @@ def _attempts(cfg: dict, run):
                 _save_domain_state(cfg["id"], state)
             tried.append({"domain": domain, "why": f.message})
             sys.stderr.write(f"{NAME}: attempt {n}/{ATTEMPTS} on {domain}: {f.message}"
-                             + ("; starting again on another site"
-                                + (" and exit address" if cfg["proxy"] else "")
+                             + ("; starting again on the next site"
+                                + (" and a new exit address" if cfg["proxy"] else "")
                                 if n < ATTEMPTS else "") + "\n")
     _die(7, "blocked", f"every attempt was refused ({ATTEMPTS}): "
          + "; ".join(f"{t['domain']}: {t['why']}" for t in tried), BLOCK_HINT)
@@ -970,7 +978,7 @@ def _check_connection(cfg: dict) -> dict:
                     "hint": "check oxylabs_country; Oxylabs places the exit by the "
                             "-cc- parameter skyscanner composes from it"}
     refused: list = []
-    for domain in order[:ATTEMPTS]:
+    for domain in order:
         try:
             with _Http(cfg, domain) as c:
                 items = c.call(
