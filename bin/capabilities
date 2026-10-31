@@ -1991,8 +1991,10 @@ PROJECT VERBS (run inside a consuming project)
         settings as the global rows every agent inherits, converging the
         store's global rows on them, except that a global enable the store
         holds and the config home does not name stays (install writes a core
-        capability's arrival enable to the store only), and set
-        global_migrated_at; the dry run
+        capability's arrival enable to the store only), adding the arrival
+        enable of each core capability installed while no database answered
+        where neither names an entry for it (plan.policy rows with arrival:
+        true), and set global_migrated_at; the dry run
         lists each row it would add, change or remove and every agent whose
         effective gate would flip (gate_flips), counting only agents that
         read the same database. --apply first brings the contract's tables
@@ -2205,6 +2207,9 @@ GLOBAL_GATE_FILE = _CONFIG_HOME / "capabilities" / "settings.json"
 # The machine ceiling above both policy scopes. It is this machine's alone, so
 # it is a local file of its own, apart from the global policy scope.
 MACHINE_FILE = _CONFIG_HOME / "capabilities" / "machine.json"
+# The core capabilities whose arrival global enable no database could take, so
+# the first `migrate --global --apply` writes it; no gate is read from here.
+ARRIVAL_PENDING_FILE = _CONFIG_HOME / "capabilities" / "arrival-pending.json"
 MACHINE_SCHEMA = "capabilities.machine.v1"
 MACHINE_STATES = ("allowed", "quarantined")
 GITIGNORE_BODY = "*/state/\n"
@@ -4942,7 +4947,9 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
     except BaseException:
         if fresh or allow:
             _write_machine(name, previous["state"] if previous else None)
-        if global_policy and not global_policy.get("pending"):
+        if global_policy and global_policy.get("pending"):
+            _arrival_pending_mark({name: False})
+        elif global_policy:
             _arrival_global_enable(name, undo=True)
         shutil.rmtree(stage, ignore_errors=True)
         raise
@@ -17799,31 +17806,58 @@ def _global_gate_delete(name: str) -> tuple[bool, str]:
     gate = _load_gate_file(GLOBAL_GATE_FILE)
     removed = gate["capabilities"].pop(name, None) is not None
     _write_json(GLOBAL_GATE_FILE, gate)
+    # Inheriting is the user's choice for this scope, so an arrival enable
+    # still pending no longer stands.
+    _arrival_pending_mark({name: False})
     return removed, str(GLOBAL_GATE_FILE)
+
+
+def _arrival_pending() -> list[str]:
+    """The core capabilities whose arrival global enable is still pending."""
+    names = _read_json(ARRIVAL_PENDING_FILE)
+    return sorted(n for n in names if isinstance(n, str)) if isinstance(names, list) else []
+
+
+def _arrival_pending_mark(names: dict[str, bool]) -> None:
+    """Add (True) or drop (False) names from the pending arrival enables."""
+    pending = set(_arrival_pending())
+    wanted = (pending | {n for n, on in names.items() if on}) - {
+        n for n, on in names.items() if not on}
+    if wanted == pending:
+        return
+    if wanted:
+        _write_json(ARRIVAL_PENDING_FILE, sorted(wanted))
+    else:
+        ARRIVAL_PENDING_FILE.unlink(missing_ok=True)
 
 
 def _arrival_global_enable(name: str, undo: bool = False) -> dict | None:
     """Write the global enable a core capability arrives with, as the global
     policy row of the store (the row for every agent and every node), and say
-    where it went. No file is written: where no database resolves, or it does
-    not answer, nothing is written and the enable is reported pending, for the
-    master's `install` (or `capabilities enable --global`) to write. A row the
-    store already holds for it is the user's and is left as it is, so nothing
-    is written and None is returned. `undo` removes the row again when the
+    where it went. No gate file is written: where no database resolves, or it
+    does not answer, nothing is written and the enable is reported pending and
+    recorded as such, for the first `migrate --global --apply` (or the master's
+    `install`, or `capabilities enable --global`) to write. A row the store
+    already holds for it is the user's and is left as it is, so nothing is
+    written and None is returned. `undo` removes the row again when the
     install that wrote it fails."""
     db = _db_module()
     store = _store_module()
     root = _project_root()
     pending = {"enabled": True, "pending": True,
-               "hint": f"no database answered, so no gate was written: run `capabilities "
-                       f"enable {name} --global` in an agent whose records are in the "
-                       "store, on its master"}
+               "hint": f"no database answered, so no gate was written: `capabilities "
+                       "migrate --global --apply` writes it once a store is set, or run "
+                       f"`capabilities enable {name} --global` in an agent whose records "
+                       "are in the store, on its master"}
     try:
         setting = db.resolve_setting(root)
         conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
                           transaction=True)
     except db.DbError as exc:
-        return None if undo else {**pending, "reason": exc.slug}
+        if undo:
+            return None
+        _arrival_pending_mark({name: True})
+        return {**pending, "reason": exc.slug}
     import psycopg
     try:
         major, minor = store.STORE_TABLES_VERSION
@@ -17845,6 +17879,7 @@ def _arrival_global_enable(name: str, undo: bool = False) -> dict | None:
     except (db.DbError, psycopg.Error) as exc:
         if undo:
             return None
+        _arrival_pending_mark({name: True})
         return {**pending, "reason": getattr(exc, "slug", None) or "store_unreachable"}
     finally:
         conn.close()
@@ -21933,6 +21968,14 @@ def _migrate_global_plan(conn, manifests: dict, answers: dict) -> dict:
                                "store": held,
                                "outcome": "held" if held == value["enabled"] else
                                "add" if held is None else "change"})
+    # A core capability installed while no database answered arrives enabled
+    # here, unless the files or the store already hold the user's entry for it.
+    installed = _installed()
+    for name in _arrival_pending():
+        if name in gate or (name, None) in held_policy or name not in installed:
+            continue
+        plan["policy"].append({"capability": name, "enabled": True, "store": None,
+                               "outcome": "add", "arrival": True})
     # A global enable the files do not name stays: install writes a core
     # capability's arrival enable to the store only.
     for (name, node), enabled in sorted(held_policy.items(), key=lambda k: (k[0][0], k[0][1] or "")):
@@ -22271,6 +22314,9 @@ def cmd_migrate_global(opts: dict) -> None:
         _die(5, "store_write_failed", f"marking the global rows written failed: {exc}")
     finally:
         conn.close()
+    # Every pending arrival enable is settled now: written, or left to the
+    # user's own entry.
+    _arrival_pending_mark({name: False for name in _arrival_pending()})
     answer.update(state="migrated", changed=True, settings_written=settings_written,
                   files_kept=("the config home's files stay until every agent on this "
                               "machine has moved; agents not yet moved still read them"))
@@ -28399,9 +28445,13 @@ def cmd_search(query: str | None, source_id: str | None) -> None:
         root = _source_author_root(sid)
         # The built-in source is registered on every machine but fetched by no
         # step of its own, so the first read of it fetches it; a fetch that
-        # fails leaves it unavailable, as a missing tree always was.
+        # fails, for any reason, leaves it unavailable, as a missing tree
+        # always was.
         if sid == OFFICIAL_SOURCE_ID and not root.is_dir():
-            _captured(_refresh_source, sid)
+            try:
+                _captured(_refresh_source, sid)
+            except OSError:
+                pass
         catalog = _read_json(root / ".capability-source" / "catalog.json") if root.is_dir() else None
         if not isinstance(catalog, dict) or not isinstance(catalog.get("capabilities"), dict):
             unavailable.append({"source": sid,

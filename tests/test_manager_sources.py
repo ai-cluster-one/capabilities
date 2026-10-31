@@ -311,10 +311,23 @@ def test_search_fetches_the_official_source_a_fresh_machine_has_not_cached(tmp_p
                  "GIT_CONFIG_VALUE_0": official},
             text=True, capture_output=True, timeout=120)
 
+    # A cache it cannot write to and a source it cannot reach both leave
+    # official unavailable, as before the fetch.
+    old_answer = {"matches": [], "unavailable_sources": [
+        {"source": "official", "hint": "capabilities source refresh official"}]}
+    cache = machine / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    cache.chmod(0o555)
+    try:
+        unwritable = search(workspace)
+    finally:
+        cache.chmod(0o755)
+    assert unwritable.returncode == 0, unwritable.stderr
+    assert json.loads(unwritable.stdout) == old_answer
+
     unreachable = search(tmp_path / "nowhere")
     assert unreachable.returncode == 0, unreachable.stderr
-    assert json.loads(unreachable.stdout) == {"matches": [], "unavailable_sources": [
-        {"source": "official", "hint": "capabilities source refresh official"}]}
+    assert json.loads(unreachable.stdout) == old_answer
 
     fetched = search(workspace)
     assert fetched.returncode == 0, fetched.stderr

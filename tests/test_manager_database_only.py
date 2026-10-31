@@ -747,6 +747,40 @@ def test_a_core_arrival_is_a_global_row_where_a_database_resolves(blank, tmp_pat
           (CORE,))
 
 
+def test_core_arrivals_made_before_a_store_are_written_by_the_global_migration(
+        blank, tmp_path):
+    from test_manager_core_tier import M, _catalogue, _machine_env, _outside
+    w = blank
+    schema = "arrivals"
+    first, second = sorted(M.CORE_CAPABILITIES)[:2]
+    with _catalogue(tmp_path / "catalogue", first, second) as source:
+        env = _machine_env(tmp_path, source)
+        here = _outside(tmp_path)
+
+        def manager(*args: str) -> dict:
+            done = subprocess.run([str(MANAGER), *args], cwd=here, env=env, text=True,
+                                  capture_output=True, timeout=300)
+            assert done.returncode == 0, (args, done.stderr)
+            return json.loads(done.stdout)
+
+        installed = {name: manager("install", name) for name in (first, second)}
+        # The user's own choice, made before any store, is kept over the arrival.
+        manager("disable", second, "--global")
+        env.update({"AGENTKIT_DB_URL": w.url(), "AGENTKIT_DB_SCHEMA": schema})
+        migrated = manager("migrate", "--global", "--apply")
+    _say("arrivals-before-a-store", {"installed": installed, "migrated": migrated})
+    assert all(i["global_policy"]["pending"] for i in installed.values())
+    arrivals = [r for r in migrated["plan"]["policy"] if r.get("arrival")]
+    assert [r["capability"] for r in arrivals] == [first]
+    with w.admin(w.database) as conn:
+        rows = conn.execute(f"SELECT capability, enabled FROM {schema}.capabilities_policy "
+                            "WHERE agent_id IS NULL AND node IS NULL ORDER BY capability"
+                            ).fetchall()
+        conn.execute(f"DROP SCHEMA {schema} CASCADE")
+    assert rows == [(first, True), (second, False)]
+    assert not (tmp_path / "config" / "capabilities" / "arrival-pending.json").exists()
+
+
 def test_a_dev_session_keeps_its_records_in_a_schema_of_its_own(world, tmp_path):
     from test_manager_dev_sessions import _commit_all, _source_repo
     w = world
