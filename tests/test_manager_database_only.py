@@ -781,6 +781,56 @@ def test_core_arrivals_made_before_a_store_are_written_by_the_global_migration(
     assert not (tmp_path / "config" / "capabilities" / "arrival-pending.json").exists()
 
 
+def test_a_new_store_gets_the_core_enables_a_machine_installed_against_another(
+        blank, tmp_path):
+    from test_manager_core_tier import M, _catalogue, _machine_env, _outside
+    w = blank
+    first, second = sorted(M.CORE_CAPABILITIES)[:2]
+    with _catalogue(tmp_path / "catalogue", first, second) as source:
+        env = _machine_env(tmp_path, source)
+        here = _outside(tmp_path)
+
+        def manager(*args: str) -> dict:
+            done = subprocess.run([str(MANAGER), *args], cwd=here, env=env, text=True,
+                                  capture_output=True, timeout=300)
+            assert done.returncode == 0, (args, done.stderr)
+            return json.loads(done.stdout)
+
+        def rows(schema: str) -> list:
+            with w.admin(w.database) as conn:
+                return conn.execute(f"SELECT capability, enabled FROM {schema}.capabilities_policy "
+                                    "WHERE agent_id IS NULL AND node IS NULL ORDER BY capability"
+                                    ).fetchall()
+
+        # Installed against store A, which takes both arrival enables.
+        env.update({"AGENTKIT_DB_URL": w.url(), "AGENTKIT_DB_SCHEMA": "store_a"})
+        installed = {name: manager("install", name) for name in (first, second)}
+        # Set to an empty store B: the same reconcile fills it.
+        env["AGENTKIT_DB_SCHEMA"] = "store_b"
+        migrated = manager("migrate", "--global", "--apply")
+        filled = rows("store_b")
+        # A store that holds the state keeps the user's choices: a switch-off
+        # and an inherit stand through an update and another migration.
+        manager("disable", second, "--global")
+        manager("inherit", first, "--global")
+        updated = manager("update")
+        again = subprocess.run([str(MANAGER), "migrate", "--global", "--apply"], cwd=here,
+                               env=env, text=True, capture_output=True, timeout=300)
+        kept = rows("store_b")
+    _say("a-new-store-after-another", {"installed": installed, "migrated": migrated,
+                                       "updated": updated})
+    assert all("gate" in i["global_policy"] for i in installed.values())
+    assert rows("store_a") == [(first, True), (second, True)]
+    assert [r["capability"] for r in migrated["plan"]["policy"] if r.get("arrival")] == [
+        first, second]
+    assert filled == [(first, True), (second, True)]
+    assert "core_enabled" not in updated
+    assert kept == [(second, False)], again.stdout
+    with w.admin(w.database) as conn:
+        conn.execute("DROP SCHEMA store_a CASCADE")
+        conn.execute("DROP SCHEMA store_b CASCADE")
+
+
 def test_a_dev_session_keeps_its_records_in_a_schema_of_its_own(world, tmp_path):
     from test_manager_dev_sessions import _commit_all, _source_repo
     w = world

@@ -1,10 +1,11 @@
 """The core tier on the manager's capability rows, and its verification.
 
 Which capabilities are core is declared once, by the manager. `list` and
-`inventory` carry it on every row as `tier`. The tier acts once, at a core
-capability's first install from the official catalogue, which leaves it
-allowed on the machine and enabled at global scope; from then on it is
-enabled, granted and gated exactly as a standard one is.
+`inventory` carry it on every row as `tier`. The tier acts where no decision
+stands: a core capability's first install from the official catalogue leaves
+it allowed on the machine and enabled at global scope, and a store the machine
+is set to gets the same enable where it records no decision about it; from
+then on it is enabled, granted and gated exactly as a standard one is.
 """
 
 from __future__ import annotations
