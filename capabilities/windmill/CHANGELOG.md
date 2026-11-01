@@ -1,5 +1,9 @@
 # windmill — change log
 
+## 2026-11-01 — `windmill` carries Windmill's own logo as its icon
+
+The bundle's `icon.png` is now Windmill's official icon, `windmill_icon.png` from the brand assets windmill.dev/brand links, unmodified: 1123 x 1123, full colour on a transparent ground, where it was a 32 x 32 image. The mark is Windmill's, used here only to identify the service the capability reaches. `capabilities icon windmill` answers its path and size. Nothing else changes.
+
 ## 2026-10-31 — `windmill help` names the agent's vault in the credential cascade
 
 Bare `windmill help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.

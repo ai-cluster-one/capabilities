@@ -1,5 +1,19 @@
 # rclonec — change log
 
+## 2026-11-01 — `rclonec` carries rclone's own logo as its icon
+
+The bundle's `icon.png` is now rclone's official logo symbol, `graphics/logo/logo_symbol/logo_symbol_color_128px.png` from the rclone repository, unmodified: 128 x 128, full colour on a transparent ground, where it was a 32 x 32 image. `capabilities icon rclonec` answers its path and size. Nothing else changes.
+
+rclone's notice, which ships with the logo:
+
+Copyright (C) 2012 by Nick Craig-Wood http://www.craig-wood.com/nick/
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 ## 2026-10-31 — `rclonec help` names the agent's vault in the credential cascade
 
 Bare `rclonec help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.

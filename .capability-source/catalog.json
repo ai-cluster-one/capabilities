@@ -159,7 +159,7 @@
     "rclonec": {
       "icon": true,
       "path": "capabilities/rclonec",
-      "payload_sha256": "fc16454c8f9a61242070b25b89307a0ddfd2cbde9a405a258cba288bc53321f8",
+      "payload_sha256": "5b6d49612065016e15e7cb254baaf82ce04242c68610704eee58b9ff5aa09752",
       "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`."
     },
     "resend": {
@@ -195,7 +195,7 @@
     "slack": {
       "icon": true,
       "path": "capabilities/slack",
-      "payload_sha256": "f99aa9ff52371431082fccdc65282b09abbe512a58a17c7df555794253182156",
+      "payload_sha256": "c87456fd27d5d523ca0c98d3d60a9dc6054375043dddba3c195c0ae2fdc3eec0",
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "slacker": {
@@ -237,7 +237,7 @@
     "windmill": {
       "icon": true,
       "path": "capabilities/windmill",
-      "payload_sha256": "42020db577faa3a1822dbfd3648454bbe15eef0aecabf667471e77a7c6c23ea2",
+      "payload_sha256": "fbeeb386ed9557e1ed378478675a6c1d00476ff7bb01f26cc343dd507fa0c3b4",
       "summary": "Windmill CLI over the REST API — deploy scripts, attach cron schedules, run jobs, read run history/logs, and manage secret variables and folders."
     },
     "youtrack": {

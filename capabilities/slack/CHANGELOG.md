@@ -1,5 +1,9 @@
 # slack — change log
 
+## 2026-11-01 — `slack` carries Slack's official logo as its icon
+
+The bundle's `icon.png` is now Slack's official full-colour mark on its aubergine square, the 256 x 256 image Slack serves for its media kit, unmodified, where it was a 35 x 34 image. The mark is a trademark of Slack, used here only to identify the service the capability reaches. `capabilities icon slack` answers its path and size. Nothing else changes.
+
 ## 2026-10-31 — `slack help` names the agent's vault in the credential cascade
 
 Bare `slack help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.
