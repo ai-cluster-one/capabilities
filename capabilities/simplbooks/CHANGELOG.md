@@ -1,5 +1,9 @@
 # simplbooks — change log
 
+## 2026-11-01 — `simplbooks` never posts a payment or incoming with a negative or zero amount
+
+`simplbooks bank-transactions save <id> --as payment --sum <amount>` drops a minus that matches the row's own outflow and posts the amount unsigned, and refuses with exit 6 a zero sum or a minus on an inflow row. `simplbooks payments create` and `simplbooks incomings create` refuse a `--sum` of zero or below with exit 6 before anything is sent. A positive `--sum`, an omitted one, `--as incoming` and `--as kanne` behave as before.
+
 ## 2026-11-01 — `simplbooks clients list --search` no longer shrinks the client cache
 
 `simplbooks clients list --search <text>` merges the clients it finds into the local client cache instead of replacing the cache with them, so a later `invoices create`, `purchases create` or other booking still resolves a client that was not among the hits. An unfiltered `simplbooks clients list` still rebuilds the cache from what it fetched. Output is unchanged.

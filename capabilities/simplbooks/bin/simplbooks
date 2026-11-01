@@ -729,7 +729,9 @@ normalised to Estonian format ('1 234,50') for the SimpleBooks form.
   4  policy refusal — disabled by project policy (capabilities/settings.json),
      or a write verb on a read-only connection (ask the user, never lift the
      gate or enable the capability yourself)
-  (contract verbs add 3 not-found / 5 network / 6 input)
+  6  input — a payment/incoming amount refused: <= 0, or a --sum sign that
+     contradicts the bank row (contract verbs also use 6 for input)
+  (contract verbs add 3 not-found / 5 network)
 """
 
 # ─── Tax classification map ─────────────────────────────────────────────────
@@ -761,6 +763,10 @@ DEFAULT_FOOTER = "Täname õigeaegselt tasutud arve eest!"
 
 class AuthError(click.ClickException):
     exit_code = 2
+
+
+class InputError(click.ClickException):
+    exit_code = 6
 
 
 # The four credential keys, in the order login/refresh persists them.
@@ -1419,6 +1425,21 @@ def normalize_number(price) -> str:
     else:
         s = s.replace(" ", "")
     return s
+
+
+def money_amount(sum_amount, flag: str = "--sum") -> float:
+    """The amount a money document (payment/incoming) carries. SB stores it
+    unsigned — the document type is the direction — so a sum <= 0 is refused
+    (exit 6) rather than posted as a reversed document."""
+    try:
+        val = float(normalize_number(sum_amount))
+    except ValueError:
+        raise InputError(f"{flag} {sum_amount!r} is not an amount.")
+    if val <= 0:
+        raise InputError(
+            f"{flag} {sum_amount} refused: a payment or incoming carries a positive "
+            f"amount; the document type already says which way the money moved.")
+    return val
 
 
 def to_estonian_number(price) -> str:
@@ -7253,6 +7274,7 @@ def payments_create(client_id, bank_cashbook_id, account_id, sum_amount, date_st
     """
     account_id = _one_cashbook_flag(bank_cashbook_id, account_id,
                                     "--bank-cashbook-id", "--account-id")
+    money_amount(sum_amount)
     pid, touched = _create_money("Payment", client_id, account_id, sum_amount,
                                  date_str, description, object_type)
     cookies, account = session_or_die()
@@ -7355,6 +7377,7 @@ def incomings_create(client_id, bank_cashbook_id, account_id, sum_amount,
     """Create an incoming payment (laekumine). Returns new incoming id."""
     account_id = _one_cashbook_flag(bank_cashbook_id, account_id,
                                     "--bank-cashbook-id", "--account-id")
+    money_amount(sum_amount)
     iid, touched = _create_money("Incoming", client_id, account_id, sum_amount,
                                  date_str, description)
     cookies, account = session_or_die()
@@ -8807,6 +8830,21 @@ def bt_save(bt_id, save_as, client_id, invoice_ids, purchase_ids, counter_coa,
 
     # Sum / date defaults from the BT row itself.
     effective_sum = sum_amount if sum_amount is not None else f"{abs(row['sum']):.2f}"
+    if save_as == "payment" and sum_amount is not None:
+        # A payment is stored unsigned. A minus that matches the outflow row
+        # is the row's own sign and is dropped; one on an inflow row, or a
+        # zero, is refused rather than posted as a reversed payment.
+        try:
+            explicit = float(normalize_number(sum_amount))
+        except ValueError:
+            raise InputError(f"--sum {sum_amount!r} is not an amount.")
+        if explicit == 0 or (explicit < 0 and row['sum'] >= 0):
+            raise InputError(
+                f"--sum {sum_amount} refused: BT {bt_id} is "
+                f"{'an outflow' if row['sum'] < 0 else 'an inflow'} of "
+                f"{abs(row['sum']):.2f} EUR; pass the payment amount as a positive number.")
+        if explicit < 0:
+            effective_sum = f"{abs(explicit):.2f}"
     effective_date = date_str or row['date']
     dt = datetime.strptime(effective_date, "%Y-%m-%d")
 
