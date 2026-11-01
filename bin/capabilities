@@ -2150,8 +2150,8 @@ VERIFICATION VERBS
         .env.local. warnings names AGENT_NODE_ID set in the environment
         (node_id_in_environment), as `node id` does; it is not drift. A
         store-mode project whose store cannot be used is drift. In store mode `information` lists, never
-        as drift, each agent_id holding grants in the store that ContextKit's
-        registry (contextkit_agents) does not know (grant_agent_unknown), or
+        as drift, each agent_id holding grants in the store that the agent
+        registry (capabilities_agents) does not know (grant_agent_unknown), or
         that the registry is not in the store (agents_registry_absent).
         It also lists, never as drift, each program an installed capability
         declares in its manifest's `programs` that is neither on PATH nor in
@@ -26356,10 +26356,10 @@ def _check_skill(findings: list[str]) -> None:
 
 
 def _grant_agents_information(root: Path) -> list[dict]:
-    """Grants in this project's store whose agent ContextKit's registry does
-    not know, as information and never as a failure: an agent id is a soft
-    reference to an identity that lives outside these tables, and the registry
-    may not exist in this store at all."""
+    """Grants in this project's store whose agent the agent registry
+    (capabilities_agents) does not know, as information and never as a
+    failure: an agent id is a soft reference to an identity that lives outside
+    these tables, and the registry may not exist in this store at all."""
     db = _db_module()
     try:
         conn = db.connect(application_name="capabilities", project_root=root,
@@ -26374,22 +26374,22 @@ def _grant_agents_information(root: Path) -> list[dict]:
             "GROUP BY agent_id ORDER BY agent_id").fetchall()
         if not grants:
             return out
-        registry = conn.execute("SELECT to_regclass('contextkit_agents')").fetchone()[0]
+        registry = conn.execute("SELECT to_regclass('capabilities_agents')").fetchone()[0]
         if registry is None:
             out.append({"code": "agents_registry_absent",
-                        "message": "ContextKit's agent registry (contextkit_agents) is "
+                        "message": "the agent registry (capabilities_agents) is "
                                    "not in this store, so no grant's agent_id was "
                                    "checked against it"})
             return out
         known = {row[0] for row in conn.execute(
-            "SELECT id::text FROM contextkit_agents WHERE id::text = ANY(%s)",
+            "SELECT id::text FROM capabilities_agents WHERE id::text = ANY(%s)",
             ([agent for agent, _count in grants],)).fetchall()}
         for agent, count in grants:
             if agent not in known:
                 out.append({"code": "grant_agent_unknown", "agent_id": agent,
                             "grants": count,
                             "message": f"{count} connection grant(s) name agent {agent}, "
-                                       "which ContextKit's registry does not know"})
+                                       "which the agent registry does not know"})
     except psycopg.Error as exc:
         out.append({"code": "agents_unchecked",
                     "message": f"the grants' agents could not be checked: {exc}"})

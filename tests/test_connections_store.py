@@ -878,20 +878,21 @@ def test_doctor_reports_unknown_agents_as_information_only(lab):
         conn.execute("INSERT INTO lab.capabilities_connection_grants "
                      "(agent_id, capability, connection, enabled) "
                      "VALUES ('prj_999999999999', 'coolify', 'spare', true)")
+        conn.execute("INSERT INTO lab.capabilities_agents (id) VALUES (%s)", (PROJECT_ID,))
     first = _doctor(lab)
-    assert [entry["code"] for entry in first["information"]] == ["agents_registry_absent"]
-    with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("CREATE TABLE lab.contextkit_agents (id text PRIMARY KEY, name text)")
-        conn.execute("INSERT INTO lab.contextkit_agents VALUES (%s, 'lab')", (PROJECT_ID,))
-    second = _doctor(lab)
-    assert second["information"] == [{
+    assert first["information"] == [{
         "code": "grant_agent_unknown", "agent_id": "prj_999999999999", "grants": 1,
         "message": "1 connection grant(s) name agent prj_999999999999, which "
-                   "ContextKit's registry does not know"}]
+                   "the agent registry does not know"}]
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("INSERT INTO lab.capabilities_agents (id) VALUES ('prj_999999999999')")
+    second = _doctor(lab)
+    assert "information" not in second
     assert second["findings"] == first["findings"]
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("INSERT INTO lab.contextkit_agents VALUES ('prj_999999999999', 'x')")
-    assert "information" not in _doctor(lab)
+        conn.execute("DROP TABLE lab.capabilities_agents CASCADE")
+    assert [entry["code"] for entry in _doctor(lab)["information"]] \
+        == ["agents_registry_absent"]
 
 
 def test_doctor_in_files_mode_does_not_reach_the_store(lab):
