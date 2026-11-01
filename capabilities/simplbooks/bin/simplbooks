@@ -297,8 +297,9 @@ Then re-run `simplbooks doctor` to confirm.
   simplbooks invoices list [--search TERM] [--limit N]
                                                 List recent invoices.
   simplbooks invoices show <invoice_id> [--json]
-                                                Read one invoice: line items +
-                                                client metadata.
+                                                Read one invoice: line items,
+                                                client metadata and its saved
+                                                reference (additional_info).
   simplbooks invoices meta [--json] [--refresh]
                                                 Live SALES vat types (id → rate,
                                                 income account), read from the
@@ -339,7 +340,11 @@ Then re-run `simplbooks doctor` to confirm.
                                                 Live PURCHASE vat types, read from
                                                 /purchases/add + cached to
                                                 purchases_meta.json.
-  simplbooks purchases show <id>                 Read a purchase invoice.
+  simplbooks purchases show <id> [--view] [--json]
+                                                Read a purchase invoice. --view
+                                                reads the rendered view page:
+                                                status and bound payments/
+                                                incomings, for any purchase.
   simplbooks purchases attachments <purchase_id> [--json]
                                                 List the purchase's stored
                                                 attachments: attachment id,
@@ -612,8 +617,10 @@ Then re-run `simplbooks doctor` to confirm.
 
   simplbooks financial_transactions delete <id> Delete a kanne by id.
 
-  simplbooks payments  list|create|bind|delete  Outgoing bank movements
-  simplbooks incomings list|create|bind|delete  Incoming bank movements
+  simplbooks payments  list|show|create|bind|delete
+                                                Outgoing bank movements
+  simplbooks incomings list|show|create|bind|delete
+                                                Incoming bank movements
                                                 (supplier/customer payments;
                                                 `--help` on each for flags).
 
@@ -2487,6 +2494,13 @@ def invoices_show(invoice_id: int, as_json: bool) -> None:
         if r.status_code != 200:
             raise click.ClickException(f"HTTP {r.status_code}")
         soup = BeautifulSoup(r.text, "html.parser")
+        # The saved reference is read from the edit form, as `invoices update`
+        # reads it; a payment-bound invoice redirects off it, so it is then
+        # read from the copy form, which carries the original's text.
+        edit_page = http.get(f"{BASE}/{account}/invoices/edit/{invoice_id}")
+        edit_soup = (BeautifulSoup(edit_page.text, "html.parser")
+                     if edit_page.status_code == 200 else None)
+    additional_info, info_source = _invoice_additional_info(edit_soup, soup)
 
     def field(name: str) -> str:
         inp = soup.find("input", {"name": name})
@@ -2507,6 +2521,8 @@ def invoices_show(invoice_id: int, as_json: bool) -> None:
         "client_country": field("data[Invoice][client_address_country]"),
         "client_vat_no": field("data[Invoice][client_vat_no]"),
         "client_reg_no": field("data[Invoice][client_reg_no]"),
+        "additional_info": additional_info,
+        "additional_info_source": info_source,
     }
 
     indices: set[int] = set()
@@ -2535,6 +2551,7 @@ def invoices_show(invoice_id: int, as_json: bool) -> None:
 
     click.echo(f"Client : {info['client_name']} [{info['client_id']}] ({info['client_country']})")
     click.echo(f"VAT no : {info['client_vat_no']}   Reg no : {info['client_reg_no']}")
+    click.echo(f"Ref    : {info['additional_info'] or '(none)'}   ({info_source})")
     click.echo()
     click.secho(f"  {'DESCRIPTION':<50}  {'PRICE':>10}  {'AMT':>4}  {'VAT%':>4}  {'VTYP':>4}  {'ACCT':>4}", bold=True)
     for li in line_items:
@@ -2543,6 +2560,18 @@ def invoices_show(invoice_id: int, as_json: bool) -> None:
             f"{li['price_per_unit']:>10}  {li['amount']:>4}  "
             f"{li['vat_rate']:>4}  {li['vat_type_id']:>4}  {li['income_account_id']:>4}"
         )
+
+
+def _invoice_additional_info(edit_soup, copy_soup) -> tuple[str, str]:
+    """(additional_info text, which form it came from) — the edit form when
+    the invoice is editable, else the copy form."""
+    for soup, source in ((edit_soup, "edit form"), (copy_soup, "copy form")):
+        if soup is None:
+            continue
+        ta = soup.find("textarea", {"name": "additional_info"})
+        if ta is not None:
+            return ta.text or "", source
+    return "", "not found"
 
 
 @invoices.command("meta")
@@ -4782,10 +4811,29 @@ def _echo_attachment_line(attachments: list[dict], surface: bool) -> None:
         click.echo("Attach   : (none)")
 
 
-def _purchases_show_view(html: str, as_json: bool, account: str) -> None:
+def _purchase_bound_money(html: str) -> list[dict]:
+    """Payments/incomings a purchase view page links to, in page order, each
+    with its 'Katte summa' cell where the page has that column ('' if not)."""
+    amounts = {"payments": _parse_bound_docs(html, "payments"),
+               "incomings": _parse_bound_docs(html, "incomings")}
+    out: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for path, num in re.findall(r'href="[^"]*/(incomings|payments)/view/(\d+)"', html):
+        key = (path, int(num))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"kind": path[:-1], "id": key[1],
+                    "amount": amounts[path].get(key[1], "")})
+    return out
+
+
+def _purchases_show_view(html: str, as_json: bool, account: str,
+                         locked: bool = True) -> None:
     """Render a purchase from its /purchases/view page — the read surface for
-    payment-locked invoices. The page shows display values: row account and
-    vat-type ids are not in its markup (the vat-type name rides in a tooltip)."""
+    payment-locked invoices, and for any purchase under `--view`. The page
+    shows display values: row account and vat-type ids are not in its markup
+    (the vat-type name rides in a tooltip)."""
     soup = BeautifulSoup(html, "html.parser")
 
     pairs: dict[str, str] = {}
@@ -4838,7 +4886,9 @@ def _purchases_show_view(html: str, as_json: bool, account: str) -> None:
         "gross_total": pairs.get("Arve kokku", ""),
         "attachments": attachments,
         "attachments_readable": attachments_surface,
-        "source": "view page (payment-locked; row account/vat-type ids not exposed)",
+        "bindings": _purchase_bound_money(html),
+        "source": ("view page (payment-locked; row account/vat-type ids not exposed)"
+                   if locked else "view page (row account/vat-type ids not exposed)"),
     }
 
     if as_json:
@@ -4861,23 +4911,43 @@ def _purchases_show_view(html: str, as_json: bool, account: str) -> None:
         )
     click.echo()
     _echo_attachment_line(attachments, attachments_surface)
-    click.echo("(read from the view page — invoice is payment-locked; "
-               "row account / vat-type ids are not exposed there)")
+    if info["bindings"]:
+        click.echo("Bound    : " + ", ".join(
+            f"{b['kind']} {b['id']}" + (f" ({b['amount']})" if b["amount"] else "")
+            for b in info["bindings"]))
+    else:
+        click.echo("Bound    : (none)")
+    click.echo("(read from the view page — "
+               + ("invoice is payment-locked; " if locked else "")
+               + "row account / vat-type ids are not exposed there)")
 
 
 @purchases.command("show")
 @click.argument("expense_id", type=int)
+@click.option("--view", "from_view", is_flag=True,
+              help="Read the rendered view page (status, bound payments/incomings) "
+                   "instead of the edit form.")
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
-def purchases_show(expense_id: int, as_json: bool) -> None:
+def purchases_show(expense_id: int, from_view: bool, as_json: bool) -> None:
     """Read an existing purchase invoice's header + line items.
 
     Reads the edit form, which carries the exact stored values including each
     row's account and vat-type ids. A payment-bound invoice is locked out of
     editing (SB redirects to its view page), so it is read from the rendered
     view instead — same header data, but rows expose display values only.
+    --view reads that rendered view for any purchase: its status and the
+    payments/incomings bound to it.
     """
     cookies, account = session_or_die()
     with build_http(cookies, account) as http:
+        if from_view:
+            rv = http.get(f"{BASE}/{account}/purchases/view/{expense_id}")
+            if rv.status_code != 200:
+                raise click.ClickException(
+                    f"GET /purchases/view/{expense_id} → HTTP {rv.status_code}"
+                )
+            _purchases_show_view(rv.text, as_json, account, locked=False)
+            return
         r = http.get(f"{BASE}/{account}/purchases/edit/{expense_id}")
         if r.status_code in (301, 302):
             loc = r.headers.get("location", "")
@@ -7043,6 +7113,57 @@ def _do_bind(direction: str, money_id: int, bind_ids: list[int]) -> dict[int, st
     return {b: bound[b] for b in bind_ids}
 
 
+def _money_view(html: str, money_id: int, doc_path: str) -> dict:
+    """A payment/incoming view page → its record and bound documents.
+
+    `fields` keeps the page's own label → value pairs; `bound` is each
+    /<doc_path>/view/<id> row with its 'Katte summa' amount."""
+    soup = BeautifulSoup(html, "html.parser")
+    fields: dict[str, str] = {}
+    for grid in soup.select("div.summary-grid"):
+        cells = [d.get_text(" ", strip=True) for d in grid.find_all("div", recursive=False)]
+        for lab, val in zip(cells[::2], cells[1::2]):
+            fields.setdefault(lab, val)
+    link = soup.find("a", href=re.compile(r"/clients/view/(\d+)"))
+    client_id = re.search(r"/clients/view/(\d+)", link["href"]).group(1) if link else ""
+    bound = _parse_bound_docs(html, doc_path)
+    return {
+        "id": money_id,
+        "client_id": client_id,
+        "fields": fields,
+        "bound": [{"document": doc_path[:-1], "id": doc, "amount": amount}
+                  for doc, amount in bound.items()],
+    }
+
+
+def _money_show(view_path: str, doc_path: str, money_id: int, as_json: bool) -> None:
+    cookies, account = session_or_die()
+    with build_http(cookies, account) as http:
+        r = http.get(f"{BASE}/{account}/{view_path}/view/{money_id}")
+    if r.status_code in (301, 302):
+        raise click.ClickException(
+            f"{view_path[:-1].capitalize()} {money_id} not accessible "
+            f"(redirect → {r.headers.get('location', '')}). Likely deleted."
+        )
+    if r.status_code != 200:
+        raise click.ClickException(f"GET /{view_path}/view/{money_id} → HTTP {r.status_code}")
+    rec = _money_view(r.text, money_id, doc_path)
+    if as_json:
+        # MACHINE CONTRACT — additive only: keys are added, never renamed or removed.
+        click.echo(json.dumps(rec, ensure_ascii=False, indent=2))
+        return
+    click.echo(f"{view_path[:-1].capitalize()} {money_id}   client [{rec['client_id'] or '?'}]")
+    for lab, val in rec["fields"].items():
+        click.echo(f"  {lab:<24} {val}")
+    click.echo()
+    if rec["bound"]:
+        for b in rec["bound"]:
+            click.echo(f"  {b['document']} {b['id']}: covers {b['amount'] or '?'}")
+    else:
+        click.echo(f"  bound to no {doc_path}")
+    click.echo(f"  URL: {BASE}/{account}/{view_path}/view/{money_id}")
+
+
 @cli.group()
 def payments() -> None:
     """Outgoing bank movements (supplier payments, expense reimbursements).
@@ -7087,6 +7208,15 @@ def payments_list(search, bank_cashbook_id, account_id, limit, as_json) -> None:
             f"{strip_html(r.get('account_name'))[:22]:<22}  "
             f"{strip_html(r.get('description'))[:80]}"
         )
+
+
+@payments.command("show")
+@click.argument("payment_id", type=int)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def payments_show(payment_id, as_json) -> None:
+    """Read one outgoing payment and the purchase invoices it is bound to,
+    each with the amount it covers (read-only)."""
+    _money_show("payments", "purchases", payment_id, as_json)
 
 
 @payments.command("create")
@@ -7192,6 +7322,15 @@ def incomings_list(search, bank_cashbook_id, account_id, limit, as_json) -> None
             f"{strip_html(r.get('account_name'))[:22]:<22}  "
             f"{strip_html(r.get('description'))[:80]}"
         )
+
+
+@incomings.command("show")
+@click.argument("incoming_id", type=int)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON.")
+def incomings_show(incoming_id, as_json) -> None:
+    """Read one incoming payment and the sales invoices it is bound to,
+    each with the amount it covers (read-only)."""
+    _money_show("incomings", "invoices", incoming_id, as_json)
 
 
 @incomings.command("create")
