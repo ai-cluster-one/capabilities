@@ -6693,6 +6693,11 @@ def _node_container(root, host, uuid):
     containers = _node_ssh(root, host, "docker ps --filter " + shlex.quote(
         "label=" + owner) + " --filter " + shlex.quote(
         "label=com.docker.compose.service=" + service) + " --format '{{.ID}}'").splitlines()
+    if not containers:
+        # An application Coolify builds from a repository has one container,
+        # a Compose service named after the application rather than `agent`.
+        containers = _node_ssh(root, host, "docker ps --filter " + shlex.quote(
+            "label=" + owner) + " --format '{{.ID}}'").splitlines()
     if len(containers) != 1 or not re.fullmatch(r"[a-f0-9]+", containers[0]):
         raise NodeFailure("node_container", "expected one running agent container", 3)
     return containers[0]

@@ -765,6 +765,22 @@ def test_container_discovery_without_numeric_api_id(node, monkeypatch):
     assert "label=com.docker.compose.project=application-fixture" in node.ssh[-1][0]
 
 
+@pytest.mark.parametrize("owned, found", [("aabbccddeeff", "aabbccddeeff"), ("", None),
+                                          ("aabbccddeeff\n112233445566", None)])
+def test_container_of_an_application_built_from_a_repository(node, monkeypatch, owned, found):
+    # Coolify names the one container of an application it builds from a
+    # repository after the application, not `agent`, so only the owner matches.
+    def ssh(root, host, script, **kw):
+        return "" if "com.docker.compose.service=" in script else owned
+    monkeypatch.setattr(node.m, "_node_ssh", ssh)
+    host = {"connection": "fixture"}
+    if found:
+        assert node.m._node_container(node.root, host, "application-fixture") == found
+    else:
+        with pytest.raises(node.m.NodeFailure, match="expected one running agent container"):
+            node.m._node_container(node.root, host, "application-fixture")
+
+
 def test_database_probe_resolves_the_node_environment_through_the_library(tmp_path):
     loader = importlib.machinery.SourceFileLoader("probe_deployment", str(SCRIPT))
     spec = importlib.util.spec_from_loader(loader.name, loader)

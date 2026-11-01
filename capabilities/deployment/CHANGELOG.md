@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-01 — `node status` finds the container of a node Coolify builds from a repository
+
+`deployment node status` and `deployment node login` look for the agent container under the Compose service `agent`. A node that is a Coolify application built from a repository has one container whose Compose service is named after the application, so the lookup found nothing: status failed with `node_container` and reported the server unreachable, while `node exec` reached the same node. When no container carries the `agent` service, the lookup now takes the application's one running container, as `node exec` already does; none or several still fail with `node_container`.
+
 ## 2026-10-31 — `deployment` carries its own icon
 
 The bundle holds its icon as `icon.png`, a rocket: Lucide's `rocket` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon deployment` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
