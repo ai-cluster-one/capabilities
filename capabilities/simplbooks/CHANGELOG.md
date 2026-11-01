@@ -1,5 +1,9 @@
 # simplbooks — change log
 
+## 2026-11-01 — `simplbooks clients list --search` no longer shrinks the client cache
+
+`simplbooks clients list --search <text>` merges the clients it finds into the local client cache instead of replacing the cache with them, so a later `invoices create`, `purchases create` or other booking still resolves a client that was not among the hits. An unfiltered `simplbooks clients list` still rebuilds the cache from what it fetched. Output is unchanged.
+
 ## 2026-11-01 — `simplbooks` reads back bindings, an invoice's reference and any purchase's view
 
 `simplbooks payments show <id>` and `simplbooks incomings show <id>` read one payment or incoming from its view page: its client, its own label/value fields, and each bound purchase or invoice with the amount it covers (`bound`). `simplbooks invoices show` also returns the invoice's saved reference text as `additional_info`, read from the edit form, or from the copy form when the invoice is payment-locked, with `additional_info_source` naming which. `simplbooks purchases show --view` reads the rendered view page of any purchase, not only a payment-locked one, and the view output now carries the purchase's bound payments and incomings as `bindings`. Nothing else changes.

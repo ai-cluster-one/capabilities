@@ -1477,7 +1477,11 @@ def load_clients_cache() -> dict[str, dict]:
 
 
 def _refresh_clients_cache(search: str = "", limit: int = 200) -> tuple[list[dict], int]:
-    """Fetch /clients/listdata, overwrite CLIENTS_CACHE, return (rows, recordsTotal)."""
+    """Fetch /clients/listdata into CLIENTS_CACHE, return (rows, recordsTotal).
+
+    An unfiltered fetch replaces the cache; a search merges its hits into it by
+    id, so a filtered listing never drops the clients bookings resolve against.
+    """
     cookies, account = session_or_die()
     cols = [
         ("", "_select"),
@@ -1504,7 +1508,12 @@ def _refresh_clients_cache(search: str = "", limit: int = 200) -> tuple[list[dic
         payload = r.json()
     rows = payload.get("data", [])
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CLIENTS_CACHE.write_text(json.dumps(rows, indent=2, ensure_ascii=False))
+    cached = rows
+    if search and CLIENTS_CACHE.exists():
+        merged = load_clients_cache()
+        merged.update({str(c["id"]): c for c in rows})
+        cached = list(merged.values())
+    CLIENTS_CACHE.write_text(json.dumps(cached, indent=2, ensure_ascii=False))
     return rows, payload.get("recordsTotal", len(rows))
 
 
