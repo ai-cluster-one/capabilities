@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.37,<1",
+#     "capabilities-contract>=0.42,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -230,7 +230,7 @@ def _cmd_connections() -> None:
 # versions reference their document by a foreign key: both tables are this
 # capability's own and a document is retired rather than deleted, so the key
 # never blocks a write and refuses only a version of no document.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 1
+LEDGER_MAJOR, LEDGER_MINOR = 2, 0
 _NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
 LEDGER_STEPS = [
     ("0001-documents", f"""
@@ -341,6 +341,40 @@ LEDGER_STEPS = [
         'The global document enabled: a context_documents row with no project.';
     COMMENT ON COLUMN context_enablements.enabled_by IS
         'Who enabled it: user@node.';
+    """),
+    # The store names an agent where it named a project: the columns that hold
+    # one, every constraint named for them, and every comment that says it. The
+    # rows stay where they are; this is major 2, so a release that still reads
+    # the old names refuses the store instead of failing on a missing column.
+    ("0006-agent-names", """
+    ALTER TABLE context_documents RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE context_documents RENAME COLUMN author_project_id TO author_agent_id;
+    ALTER TABLE context_enablements RENAME COLUMN project_id TO agent_id;
+    DO $$
+    DECLARE r record;
+    BEGIN
+        FOR r IN SELECT c.conrelid::regclass AS tab, c.conname
+                   FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+                  WHERE t.relnamespace = current_schema()::regnamespace
+                    AND t.relname IN ('context_documents', 'context_enablements')
+                    AND c.conname LIKE '%project%'
+        LOOP
+            EXECUTE format('ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+                           r.tab, r.conname, replace(r.conname, 'project', 'agent'));
+        END LOOP;
+    END $$;
+    COMMENT ON COLUMN context_documents.agent_id IS
+        'The agent''s declared id; NULL for a global document, which belongs to no agent and reaches one only once that agent enables it.';
+    COMMENT ON COLUMN context_documents.name IS
+        'The document''s path inside the context folder without .md, e.g. identity/MISSION; unique per agent among unretired documents.';
+    COMMENT ON COLUMN context_documents.author_agent_id IS
+        'For a global document, the agent that alone saves its versions, retires it and hands authorship on; NULL for an agent''s own document, and for a global one saved before documents had authors until an agent writes it.';
+    COMMENT ON TABLE context_enablements IS
+        'A global document an agent has enabled: the agent lists it and composes its active version unless a document of its own has the same name. Disabling deletes the row.';
+    COMMENT ON COLUMN context_enablements.agent_id IS
+        'The declared id of the agent that enabled the document.';
+    COMMENT ON COLUMN context_enablements.document_id IS
+        'The global document enabled: a context_documents row with no agent.';
     """),
 ]
 
@@ -556,9 +590,9 @@ _VERSION_COLUMNS = ("v.id, v.document_id, v.title, v.description, v.load, v.posi
 
 
 def _document(conn, project: str | None, name: str, lock: bool = False) -> dict | None:
-    return _one(conn, "SELECT id, project_id, name, created_at, created_by, author_project_id "
+    return _one(conn, "SELECT id, agent_id, name, created_at, created_by, author_agent_id "
                 "FROM context_documents "
-                "WHERE coalesce(project_id, '') = %s AND name = %s AND retired_at IS NULL"
+                "WHERE coalesce(agent_id, '') = %s AND name = %s AND retired_at IS NULL"
                 + (" FOR UPDATE" if lock else ""), (project or "", name))
 
 
@@ -574,9 +608,9 @@ def _need_document(conn, project: str | None, name: str, lock: bool = False) -> 
 def _authored(document: dict, project: str) -> None:
     """Refuse a change to a global document by any project but its author; one
     with no author yet is changed by the project that writes it."""
-    if document["author_project_id"] not in (None, project):
+    if document["author_agent_id"] not in (None, project):
         _die(4, "not_author", f"the global document {document['name']!r} is authored by "
-             f"{document['author_project_id']}, not by this project ({project})",
+             f"{document['author_agent_id']}, not by this project ({project})",
              "only its author project saves it, retires it or hands it on with "
              f"`{NAME} transfer`")
 
@@ -657,28 +691,28 @@ def _version_view(version: dict, with_body: bool = True) -> dict:
 # A global document a project has enabled and holds no document of its own
 # name for: the documents it sees are its own and these. The manager's build
 # composes by the same rule.
-_ENABLED_GLOBAL = ("d.project_id IS NULL AND EXISTS (SELECT 1 FROM context_enablements e "
-                   "WHERE e.document_id = d.id AND e.project_id = %(project)s) "
+_ENABLED_GLOBAL = ("d.agent_id IS NULL AND EXISTS (SELECT 1 FROM context_enablements e "
+                   "WHERE e.document_id = d.id AND e.agent_id = %(project)s) "
                    "AND NOT EXISTS (SELECT 1 FROM context_documents o "
-                   "WHERE o.project_id = %(project)s AND o.name = d.name "
+                   "WHERE o.agent_id = %(project)s AND o.name = d.name "
                    "AND o.retired_at IS NULL)")
 
 
 def cmd_list(args) -> None:
     if args.is_global:
         scope, project = None, _reader()
-        where = "d.project_id IS NULL"
+        where = "d.agent_id IS NULL"
     else:
         scope = project = _scope(False, write=False)
-        where = f"(d.project_id = %(project)s OR ({_ENABLED_GLOBAL}))"
+        where = f"(d.agent_id = %(project)s OR ({_ENABLED_GLOBAL}))"
     with _store() as conn:
-        rows = _rows(conn, "SELECT d.name, d.project_id IS NULL AS global, d.author_project_id, "
+        rows = _rows(conn, "SELECT d.name, d.agent_id IS NULL AS global, d.author_agent_id, "
                      "v.id, v.title, v.load, v.position, v.created_at, "
                      "EXISTS (SELECT 1 FROM context_enablements e WHERE e.document_id = d.id "
-                     "AND e.project_id = %(project)s) AS enabled, "
-                     "(d.project_id IS NOT NULL AND EXISTS (SELECT 1 FROM context_documents g "
+                     "AND e.agent_id = %(project)s) AS enabled, "
+                     "(d.agent_id IS NOT NULL AND EXISTS (SELECT 1 FROM context_documents g "
                      "JOIN context_enablements e ON e.document_id = g.id "
-                     "AND e.project_id = d.project_id WHERE g.project_id IS NULL "
+                     "AND e.agent_id = d.agent_id WHERE g.agent_id IS NULL "
                      "AND g.name = d.name AND g.retired_at IS NULL)) AS shadows_global "
                      "FROM context_documents d JOIN context_versions v "
                      "ON v.document_id = d.id AND v.active "
@@ -692,7 +726,7 @@ def cmd_list(args) -> None:
                     "saved_at": _moment(r["created_at"]),
                     "origin": "global" if r["global"] else "own"}
             if r["global"]:
-                item["author"] = r["author_project_id"]
+                item["author"] = r["author_agent_id"]
                 if project is not None:
                     item["enabled"] = r["enabled"]
             elif r["shadows_global"]:
@@ -706,7 +740,7 @@ def cmd_list(args) -> None:
         return
     width = max(len(r["name"]) for r in rows)
     _emit("\n".join(f"{r['name']:<{width}}  {r['load']:<6} {r['position']:>5}  {r['title']}"
-                    + (f"  (global, by {r['author_project_id'] or 'no author'})"
+                    + (f"  (global, by {r['author_agent_id'] or 'no author'})"
                        if r["global"] else "")
                     + ("  (shadows a global document)" if r["shadows_global"] else "")
                     + ("  (enabled)" if args.is_global and project and r["enabled"] else "")
@@ -788,16 +822,16 @@ def _save_version(conn, project: str | None, name: str, fields: dict, base: str 
     document = _document(conn, project, name, lock=True)
     if document is not None and project is None:
         _authored(document, author)
-        if document["author_project_id"] is None:
-            _rows(conn, "UPDATE context_documents SET author_project_id = %s WHERE id = %s",
+        if document["author_agent_id"] is None:
+            _rows(conn, "UPDATE context_documents SET author_agent_id = %s WHERE id = %s",
                   (author, document["id"]))
     if document is None:
         if base is not None:
             _die(7, "stale_base", f"--base names a version of {name!r}, which is no longer a "
                  "document", f"`{NAME} list` shows the documents; save without --base to "
                  "start it again")
-        document = _one(conn, "INSERT INTO context_documents (project_id, name, created_by, "
-                        "author_project_id) VALUES (%s, %s, %s, %s) RETURNING id, name",
+        document = _one(conn, "INSERT INTO context_documents (agent_id, name, created_by, "
+                        "author_agent_id) VALUES (%s, %s, %s, %s) RETURNING id, name",
                         (project, name, by, author if project is None else None))
         active = None
     else:
@@ -888,9 +922,9 @@ def cmd_transfer(args) -> None:
         with conn.transaction():
             document = _need_document(conn, None, name, lock=True)
             _authored(document, project)
-            changed = document["author_project_id"] != to
+            changed = document["author_agent_id"] != to
             if changed:
-                _rows(conn, "UPDATE context_documents SET author_project_id = %s WHERE id = %s",
+                _rows(conn, "UPDATE context_documents SET author_agent_id = %s WHERE id = %s",
                       (to, document["id"]))
     _emit({"name": name, "scope": "global", "from": project, "author": to, "changed": changed})
 
@@ -901,12 +935,12 @@ def cmd_enable(args) -> None:
     with _store() as conn:
         with conn.transaction():
             document = _need_document(conn, None, name)
-            added = _one(conn, "INSERT INTO context_enablements (project_id, document_id, "
+            added = _one(conn, "INSERT INTO context_enablements (agent_id, document_id, "
                          "enabled_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING "
                          "RETURNING enabled_at", (project, document["id"], _actor()))
             shadowed = _document(conn, project, name) is not None
     found = {"name": name, "scope": "global", "project": project, "enabled": True,
-             "changed": added is not None, "author": document["author_project_id"]}
+             "changed": added is not None, "author": document["author_agent_id"]}
     if shadowed:
         found["shadowed_by_project_document"] = True
     _emit(found)
@@ -918,10 +952,10 @@ def cmd_disable(args) -> None:
     with _store() as conn:
         with conn.transaction():
             document = _need_document(conn, None, name)
-            gone = _rows(conn, "DELETE FROM context_enablements WHERE project_id = %s "
+            gone = _rows(conn, "DELETE FROM context_enablements WHERE agent_id = %s "
                          "AND document_id = %s RETURNING document_id", (project, document["id"]))
     _emit({"name": name, "scope": "global", "project": project, "enabled": False,
-           "changed": bool(gone), "author": document["author_project_id"]})
+           "changed": bool(gone), "author": document["author_agent_id"]})
 
 
 def _folder(given: str | None, is_global: bool) -> Path:
@@ -1011,7 +1045,7 @@ def cmd_export(args) -> None:
     with _store() as conn:
         rows = _rows(conn, f"SELECT d.name, {_VERSION_COLUMNS} FROM context_documents d "
                      "JOIN context_versions v ON v.document_id = d.id AND v.active "
-                     "WHERE coalesce(d.project_id, '') = %s AND d.retired_at IS NULL "
+                     "WHERE coalesce(d.agent_id, '') = %s AND d.retired_at IS NULL "
                      "ORDER BY d.name", (project or "",))
     outcomes, names = [], set()
     for row in rows:
@@ -1061,8 +1095,8 @@ def cmd_doctor() -> None:
                             "changed": found.changed, "warnings": found.warnings}
         if found.state == "current":
             conn.autocommit = True
-            counts = _one(conn, "SELECT count(*) FILTER (WHERE project_id IS NULL) AS global, "
-                          "count(*) FILTER (WHERE project_id = %s) AS project "
+            counts = _one(conn, "SELECT count(*) FILTER (WHERE agent_id IS NULL) AS global, "
+                          "count(*) FILTER (WHERE agent_id = %s) AS project "
                           "FROM context_documents WHERE retired_at IS NULL", (project or "",))
             report["documents"] = {"project": counts["project"] if project else None,
                                    "global": counts["global"]}

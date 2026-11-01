@@ -9,7 +9,7 @@ import json
 import psycopg
 import pytest
 
-from _cli import drop_schema, engine, needs_store, new_schema, setting
+from _cli import drop_schema, dsn_url, engine, needs_store, new_schema, setting
 
 E = engine()
 P = "prj_000000000001"
@@ -87,7 +87,7 @@ def test_a_write_to_another_projects_entry_is_refused(store):
     with pytest.raises(E.Refusal) as caught:
         store.drop(P, str(theirs["id"]), reason="x", to=None, purge=False, actor="a", node="n")
     assert caught.value.exit_code == 4 and caught.value.code == "foreign_project"
-    assert store.resolve(P, str(theirs["id"]))["project_id"] == OTHER
+    assert store.resolve(P, str(theirs["id"]))["agent_id"] == OTHER
 
 
 def test_prefix_resolution(store):
@@ -141,7 +141,7 @@ def test_every_change_is_announced_on_commit(store):
     finally:
         listener.close()
     payload = json.loads(notes[0].payload)
-    assert payload == {"schema": store.schema, "project": P, "kind": "add",
+    assert payload == {"schema": store.schema, "agent_id": P, "kind": "add",
                        "entry": str(row["id"]), "event": payload["event"]}
 
 
@@ -218,7 +218,7 @@ def test_one_pass_at_a_time_per_project(store):
     try:
         assert one.try_groom_lock(P, 600, node="node-a")
         [lease] = store.rows("SELECT * FROM memory_groom_leases")
-        assert lease["project_id"] == P and lease["node"] == "node-a"
+        assert lease["agent_id"] == P and lease["node"] == "node-a"
         assert lease["lock_pid"] == one.one("SELECT pg_backend_pid() AS p")["p"]
         assert not other.try_groom_lock(P, 600)
         assert other.try_groom_lock(OTHER, 600)
@@ -248,7 +248,7 @@ def test_the_lease_keeps_a_pass_out_without_the_session_lock(store):
     try:
         assert not other.try_groom_lock(P, 600)
         store.one("UPDATE memory_groom_leases SET expires_at = now() - interval '1 second' "
-                  "RETURNING project_id")
+                  "RETURNING agent_id")
         assert other.try_groom_lock(P, 600)
     finally:
         other.close()
@@ -300,7 +300,7 @@ def test_on_a_transaction_only_store_a_pass_holds_its_lease_alone(store, monkeyp
         assert opened == [True, True] and not one.session and not other.session
         assert one.try_groom_lock(P, 600, node="node-a")
         [lease] = store.rows("SELECT * FROM memory_groom_leases")
-        assert lease["project_id"] == P and lease["lock_pid"] is None
+        assert lease["agent_id"] == P and lease["lock_pid"] is None
         assert store.one(advisory)["n"] == 0
         assert not other.try_groom_lock(P, 600)
         one.groom_unlock(P)
@@ -330,3 +330,98 @@ def test_adopt_carries_once_per_key(store):
     assert row["created_at"] == when
     counts = store.counts(P)
     assert counts["entries"]["active"] == 1 and counts["writes"]["last_7_days"] == 0
+
+
+# Every name and comment in an owner's tables that still says project, where the
+# store now says agent: table columns, relations, constraints, triggers, comments, and
+# the bodies of the owner's functions.
+_SAYS_PROJECT = """
+SELECT 'column ' || c.relname || '.' || a.attname FROM pg_attribute a
+  JOIN pg_class c ON c.oid = a.attrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+   AND a.attname ~* 'project'
+UNION ALL SELECT 'relation ' || c.relname FROM pg_class c
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relname ~* 'project'
+UNION ALL SELECT 'constraint ' || o.conname FROM pg_constraint o
+  JOIN pg_class c ON c.oid = o.conrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND o.conname ~* 'project'
+UNION ALL SELECT 'trigger ' || g.tgname FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND g.tgname ~* 'project'
+UNION ALL SELECT 'comment on ' || c.relname || coalesce('.' || a.attname, '')
+  FROM pg_description d JOIN pg_class c ON c.oid = d.objoid AND d.classoid = 'pg_class'::regclass
+  LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid AND d.objsubid > 0
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND d.description ~* 'project'
+UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
+ WHERE p.pronamespace = %(schema)s::regnamespace AND p.proname LIKE %(like)s
+   AND p.prosrc ~* 'project'
+"""
+
+
+def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows():
+    """A store at the last major-1 minor, with an entry, its trail and a lease,
+    takes the agent names in place: the rows read under them, the guard and the
+    notification read the renamed column, and a major-1 release is refused."""
+    from capabilities_contract import db
+    old = [step for step in E.LEDGER_STEPS if step[0] != "0007-agent-names"]
+    schema = new_schema()
+    try:
+        with psycopg.connect(dsn_url(), autocommit=True) as conn:
+            db.migrate(conn, "memory", old, major=1, minor=2, schema=schema)
+            conn.execute(f'SET search_path TO "{schema}"')
+            entry = conn.execute(
+                "INSERT INTO memory_entries (project_id, title, body, created_by, node, origin, "
+                "body_hash) VALUES (%s, 'kept', 'kept body', 'tester', 'node-a', 'agent', 'h') "
+                "RETURNING id", (P,)).fetchone()[0]
+            conn.execute("INSERT INTO memory_events (project_id, entry_id, kind, actor, node) "
+                         "VALUES (%s, %s, 'add', 'tester', 'node-a')", (P, entry))
+            conn.execute("INSERT INTO memory_groom_leases (project_id, holder, expires_at) "
+                         "VALUES (%s, gen_random_uuid(), now() - interval '1 second')", (P,))
+
+            result = db.migrate(conn, "memory", E.LEDGER_STEPS, major=E.LEDGER_MAJOR,
+                                minor=E.LEDGER_MINOR, schema=schema)
+            assert result.applied == ["0007-agent-names"]
+            assert (result.major, result.minor) == (2, 0)
+            conn.execute(f'SET search_path TO "{schema}"')
+            for table in ("memory_entries", "memory_events", "memory_groom_leases"):
+                assert conn.execute(f"SELECT agent_id FROM {table}").fetchall() == [(P,)], table
+            assert conn.execute(_SAYS_PROJECT, {"schema": schema, "like": "memory\\_%"}
+                                ).fetchall() == []
+            # A major-1 release refuses the store rather than misreading it.
+            with pytest.raises(db.DbError) as refused:
+                db.migrate(conn, "memory", old, major=1, minor=2, schema=schema)
+            assert refused.value.slug == "schema_too_new"
+
+        store = E.Store(setting(schema)).open()
+        try:
+            assert [row["title"] for row in store.rows(
+                "SELECT title FROM memory_entries WHERE agent_id = %s", (P,))] == ["kept"]
+            assert E.entry_out(store.resolve(P, str(entry)))["project_id"] == P
+            with pytest.raises(psycopg.errors.CheckViolation):
+                store.one("UPDATE memory_entries SET body = 'changed' WHERE id = %s "
+                          "RETURNING id", (entry,))
+            listener = db.connect(application_name="memory-test", setting=store.setting)
+            listener.autocommit = True
+            listener.execute(f"LISTEN {E.CHANNEL}")
+            try:
+                row = add(store, "announced")
+                notes = list(listener.notifies(timeout=5, stop_after=1))
+            finally:
+                listener.close()
+            payload = json.loads(notes[0].payload)
+            assert (payload["agent_id"], payload["entry"]) == (P, str(row["id"]))
+            assert "project" not in payload
+        finally:
+            store.close()
+        groomer = E.Store(setting(schema), session=True).open()
+        try:
+            assert groomer.try_groom_lock(P, 600, node="node-a")
+            groomer.groom_unlock(P)
+        finally:
+            groomer.close()
+    finally:
+        drop_schema(schema)

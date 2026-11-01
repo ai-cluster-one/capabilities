@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-11-01 — The session map names the caller as an agent, at store version 2.0
+
+Breaking for an older release on the same store. Ledger step `0002-agent-id` (askproject 2.0) renames `askproject_sessions.project_id` to `agent_id`, and its constraints with it, in place: every session row stays. A release of askproject 1.x that meets the store at 2.0 refuses with `schema_too_new` and asks for an update; this release migrates a store at 1.0 on its first call. Nothing askproject prints changes. The runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions` at its store version 2.0; a profile resolves as before.
+
 ## 2026-10-31 — `askproject` carries its own icon
 
 The bundle holds its icon as `icon.png`, a speech bubble with a question mark: Lucide's `message-circle-question-mark` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon askproject` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

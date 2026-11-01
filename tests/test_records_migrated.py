@@ -1,10 +1,10 @@
 """An agent whose records moved into the store.
 
 The contract ledger gives grants a form for every agent and identifiers a node,
-and keeps settings as rows: `capabilities_settings` (one row per leaf path),
-`capabilities_settings_documents` (the documents that exist, with their
-generation) and `capabilities_settings_changes` (the append-only trail). An
-agent whose `capabilities_agents.migrated_at` is set reads every record and its
+and keeps settings as rows: `settings` (one row per leaf path),
+`settings_documents` (the documents that exist, with their
+generation) and `settings_changes` (the append-only trail). An
+agent whose `agents.migrated_at` is set reads every record and its
 settings from those rows - its own over every agent's, and this node's over
 every node's - on a node it registered, the one whose id `node_id()` resolves
 (AGENT_NODE_ID in these tests); its files are not read. Its master, and every
@@ -65,6 +65,13 @@ SERVER = nid(SERVER_LABEL)
 LABELS = {MASTER: MASTER_LABEL, SERVER: SERVER_LABEL}
 
 from capabilities_contract.capability import store as S  # noqa: E402
+from test_manager_migrate import legacy_store  # noqa: E402
+
+
+def legacy_steps() -> tuple:
+    """The steps owner `capabilities` had before the core took its tables."""
+    from capabilities_contract.db import _legacy
+    return _legacy.LEGACY_STEPS
 
 
 # --- a throwaway PostgreSQL ------------------------------------------------------
@@ -209,7 +216,7 @@ class Lab:
         moved into the store."""
         self.ok(MANAGER, "node", "add", master, "--label", LABELS[master], "--kind", "mac",
                 "--master", AGENT_NODE_ID=master, AGENT_NODE_NAME=LABELS[master])
-        self.sql("UPDATE capabilities_agents SET migrated_at = now() WHERE id = %s",
+        self.sql("UPDATE agents SET migrated_at = now() WHERE id = %s",
                  (PROJECT_ID,))
 
 
@@ -236,12 +243,13 @@ def _stale_files(lab: Lab) -> None:
 # --- the schema -------------------------------------------------------------------
 
 def _ledger_at_p2(lab: Lab) -> None:
-    """A store the previous release migrated: steps 0001-0013 at version 1.2."""
+    """A store the previous release migrated: steps 0001-0013 of owner
+    `capabilities` at version 1.2."""
     from capabilities_contract import db
-    conn = db.connect(application_name="test",
-                      setting=db.resolve_setting(lab.project))
+    setting = db.resolve_setting(lab.project)
+    conn = db.connect(application_name="test", setting=setting)
     try:
-        db.migrate(conn, S.STORE_OWNER, S.record_table_steps()[:13], major=1, minor=2)
+        legacy_store(conn, setting.schema, 13, 1, 2)
     finally:
         conn.close()
 
@@ -257,55 +265,51 @@ def test_the_ledger_applies_the_new_steps_on_a_fresh_store_and_on_one_at_p2(lab,
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
 
+    # The core's step brings either store to the same tables; the steps the
+    # store held as owner `capabilities` are the core's history now, and that
+    # owner stays at major 2.
     steps = [r[0] for r in lab.sql(
-        "SELECT step FROM schema_ledger WHERE owner = 'capabilities' ORDER BY step")]
-    assert steps[-25:] == ["0014-connection-grants-global", "0015-identifiers-node",
-                           "0016-settings", "0017-settings-documents",
-                           "0018-settings-changes", "0019-references", "0020-connection-owner",
-                           "0021-agent-slug", "0022-agent-node-coolify", "0023-agent-binding",
-                           "0024-agent-node-folder", "0025-policy-service", "0026-nodes",
-                           "0027-agent-node-fields-kept", "0028-service-instances",
-                           "0029-vault", "0030-node-states", "0031-node-expectations",
-                           "0032-node-updates", "0033-node-logs",
-                           "0034-node-session-reasons", "0035-node-disabled",
-                           "0036-connection-label", "0037-agent-kind",
-                           "0038-agent-public-key"]
-    assert lab.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
-        == [(1, 23)]
+        "SELECT step FROM schema_ledger WHERE owner = 'core' ORDER BY step")]
+    held = ([step for step, _sql in legacy_steps()[:13]] if from_p2 else [])
+    assert steps == held + [step for step, _sql in S.record_table_steps()]
+    assert lab.sql("SELECT count(*) FROM schema_ledger WHERE owner = 'capabilities'") == [(0,)]
+    assert lab.sql("SELECT owner, major, minor FROM schema_version WHERE owner IN "
+                   "('capabilities', 'core') ORDER BY owner") \
+        == [("capabilities", 2, 0), ("core", *S.STORE_TABLES_VERSION)]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
-    assert "COALESCE(agent_id, ''::text)" in indexes["capabilities_connection_grants_scope_key"]
-    assert "WHERE is_default" in indexes["capabilities_connection_grants_scope_default"]
-    assert "COALESCE(node, ''::text)" in indexes["capabilities_identifiers_key"]
-    assert "path" in indexes["capabilities_settings_key"]
-    assert "COALESCE(agent_id" in indexes["capabilities_settings_documents_key"]
+    assert "COALESCE(agent_id, ''::text)" in indexes["grants_scope_key"]
+    assert "WHERE is_default" in indexes["grants_scope_default"]
+    assert "COALESCE(node, ''::text)" in indexes["identifiers_key"]
+    assert "path" in indexes["settings_key"]
+    assert "COALESCE(agent_id" in indexes["settings_documents_key"]
     triggers = {r[0] for r in lab.sql(
         "SELECT tgname FROM pg_trigger WHERE NOT tgisinternal")}
-    assert {"capabilities_settings_guard", "capabilities_settings_changes_append_only",
-            "capabilities_settings_changes_no_truncate", "capabilities_connections_owner",
-            "capabilities_connection_grants_owner"} <= triggers
-    for table in ("capabilities_connections", "capabilities_settings",
-                  "capabilities_settings_documents",
-                  "capabilities_settings_changes", "capabilities_connection_grants",
-                  "capabilities_identifiers"):
+    assert {"settings_guard", "settings_changes_append_only",
+            "settings_changes_no_truncate", "connections_owner",
+            "grants_owner"} <= triggers
+    for table in ("connections", "settings",
+                  "settings_documents",
+                  "settings_changes", "grants",
+                  "identifiers"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
         assert comment, table
-    [(comment,)] = lab.sql("SELECT obj_description('lab.capabilities_settings'::regclass)")
+    [(comment,)] = lab.sql("SELECT obj_description('lab.settings'::regclass)")
     assert "pg_advisory_xact_lock(hashtext(concat_ws(chr(31), schema" in comment
     for column in ("path", "value", "node", "agent_id", "updated_by"):
-        [(said,)] = lab.sql("SELECT col_description('lab.capabilities_settings'::regclass, "
+        [(said,)] = lab.sql("SELECT col_description('lab.settings'::regclass, "
                             "attnum) FROM pg_attribute WHERE attrelid = "
-                            "'lab.capabilities_settings'::regclass AND attname = %s", (column,))
+                            "'lab.settings'::regclass AND attname = %s", (column,))
         assert said, column
     if from_p2:
-        assert lab.sql("SELECT value, node FROM capabilities_identifiers") == [("kept", None)]
+        assert lab.sql("SELECT value, node FROM identifiers") == [("kept", None)]
 
 
 def test_the_settings_triggers_refuse_an_object_and_an_overlapping_path(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
-    insert = ("INSERT INTO capabilities_settings (agent_id, capability, node, path, value, "
+    insert = ("INSERT INTO settings (agent_id, capability, node, path, value, "
               "updated_by) VALUES (%s, 'memory', %s, %s, %s::jsonb, 'tester@mac1')")
     lab.sql(insert, (PROJECT_ID, None, ["a", "b"], "1"))
     lab.sql(insert, (PROJECT_ID, None, ["e"], "{}"))
@@ -323,31 +327,31 @@ def test_the_settings_triggers_refuse_an_object_and_an_overlapping_path(lab):
     with pytest.raises(psycopg.errors.UniqueViolation):
         lab.sql(insert, (None, None, ["a", "b", "c"], "3"))
     with pytest.raises(psycopg.errors.CheckViolation, match="object with keys"):
-        lab.sql("UPDATE capabilities_settings SET value = '{\"k\": 1}' WHERE path = '{e}'")
+        lab.sql("UPDATE settings SET value = '{\"k\": 1}' WHERE path = '{e}'")
 
 
 def test_the_trail_is_append_only(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
-    lab.sql("INSERT INTO capabilities_settings_changes (agent_id, capability, action, path, "
+    lab.sql("INSERT INTO settings_changes (agent_id, capability, action, path, "
             "new_value, changed_by) VALUES (%s, 'memory', 'set', '{a}', '1', 'x@y')",
             (PROJECT_ID,))
-    for statement in ("UPDATE capabilities_settings_changes SET changed_by = 'z@y'",
-                      "DELETE FROM capabilities_settings_changes",
-                      "TRUNCATE capabilities_settings_changes"):
+    for statement in ("UPDATE settings_changes SET changed_by = 'z@y'",
+                      "DELETE FROM settings_changes",
+                      "TRUNCATE settings_changes"):
         with pytest.raises(psycopg.errors.RestrictViolation, match="append-only"):
             lab.sql(statement)
-    assert lab.sql("SELECT count(*) FROM capabilities_settings_changes") == [(1,)]
+    assert lab.sql("SELECT count(*) FROM settings_changes") == [(1,)]
 
 
 def test_grants_and_defaults_for_every_agent_cannot_duplicate(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
-    lab.sql("INSERT INTO capabilities_connections (capability, name, spec) "
+    lab.sql("INSERT INTO connections (capability, name, spec) "
             "VALUES ('coolify', 'box', '{}'), ('coolify', 'two', '{}')")
-    grant = ("INSERT INTO capabilities_connection_grants (agent_id, capability, connection, "
+    grant = ("INSERT INTO grants (agent_id, capability, connection, "
              "node, allow_write, is_default) VALUES (NULL, 'coolify', %s, %s, true, %s)")
     lab.sql(grant, ("box", None, True))
     with pytest.raises(psycopg.errors.UniqueViolation):
@@ -365,18 +369,20 @@ OTHER = "prj_" + "9f8e7d6c5b4a"
 
 
 def _ledger_before_owners(lab: Lab) -> None:
-    """A store the previous release migrated: steps 0001-0019 at version 1.4."""
+    """A store the previous release migrated: steps 0001-0019 of owner
+    `capabilities` at version 1.4."""
     from capabilities_contract import db
-    conn = db.connect(application_name="test", setting=db.resolve_setting(lab.project))
+    setting = db.resolve_setting(lab.project)
+    conn = db.connect(application_name="test", setting=setting)
     try:
-        db.migrate(conn, S.STORE_OWNER, S.record_table_steps()[:19], major=1, minor=4)
+        legacy_store(conn, setting.schema, 19, 1, 4)
     finally:
         conn.close()
 
 
 def _owners(lab: Lab) -> dict:
     return {(cap, name): owner for cap, name, owner in lab.sql(
-        "SELECT capability, name, owner FROM capabilities_connections")}
+        "SELECT capability, name, owner_agent_id FROM connections")}
 
 
 def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
@@ -431,9 +437,9 @@ def test_an_agents_own_connection_is_granted_to_no_other_agent(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
-    lab.sql("INSERT INTO capabilities_connections (capability, name, spec, owner) VALUES "
+    lab.sql("INSERT INTO connections (capability, name, spec, owner_agent_id) VALUES "
             "('telegram', 'mine', '{}', %s), ('telegram', 'ours', '{}', NULL)", (PROJECT_ID,))
-    grant = ("INSERT INTO capabilities_connection_grants "
+    grant = ("INSERT INTO grants "
              "(agent_id, capability, connection, node, allow_write) "
              "VALUES (%s, 'telegram', %s, %s, %s)")
     lab.sql(grant, (PROJECT_ID, "mine", None, False))
@@ -445,10 +451,10 @@ def test_an_agents_own_connection_is_granted_to_no_other_agent(lab):
     lab.sql(grant, (OTHER, "ours", None, True))
     lab.sql(grant, (PROJECT_ID, "ours", None, False))
     with pytest.raises(psycopg.errors.CheckViolation):
-        lab.sql("UPDATE capabilities_connections SET owner = %s WHERE name = 'ours'",
+        lab.sql("UPDATE connections SET owner_agent_id = %s WHERE name = 'ours'",
                 (PROJECT_ID,))
     with pytest.raises(psycopg.errors.CheckViolation):
-        lab.sql("UPDATE capabilities_connection_grants SET agent_id = %s "
+        lab.sql("UPDATE grants SET agent_id = %s "
                 "WHERE connection = 'mine'", (OTHER,))
     [ours] = [c for c in lab.ok(MANAGER, "connections", "list", "telegram")
               ["capabilities"]["telegram"] if c["connection"] == "ours"]
@@ -463,10 +469,10 @@ def test_a_moved_agent_adds_its_own_connection_with_its_grant_and_a_machine_one_
     assert added["granted"] is True and "hint" not in added
     assert _owners(lab) == {("coolify", "mine"): PROJECT_ID}
     assert lab.sql("SELECT agent_id, node, enabled, allow_write FROM "
-                   "capabilities_connection_grants") == [(PROJECT_ID, None, True, None)]
+                   "grants") == [(PROJECT_ID, None, True, None)]
     lab.ok(COOLIFY, "connection", "add", "box", "--machine", *fields)
     assert _owners(lab)[("coolify", "box")] is None
-    assert lab.sql("SELECT count(*) FROM capabilities_connection_grants "
+    assert lab.sql("SELECT count(*) FROM grants "
                    "WHERE connection = 'box'") == [(0,)]
     lab.ok(MANAGER, "set", "coolify", "grant", "mine", '{"allow_write": false}')
     listed = {c["connection"]: c for c in
@@ -476,7 +482,7 @@ def test_a_moved_agent_adds_its_own_connection_with_its_grant_and_a_machine_one_
     assert [(g["agent"], g["enabled"], g["allow_write"]) for g in listed["mine"]["grants"]] \
         == [(PROJECT_ID, True, False)]
     # Another agent's own connection is neither changed nor removed from here.
-    lab.sql("INSERT INTO capabilities_connections (capability, name, spec, owner) "
+    lab.sql("INSERT INTO connections (capability, name, spec, owner_agent_id) "
             "VALUES ('coolify', 'theirs', '{}', %s)", (OTHER,))
     _code, error = lab.refused(COOLIFY, "connection", "add", "theirs", "--project",
                                "--replace", *fields)
@@ -493,10 +499,10 @@ def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
     lab = moved
     fields = ("--field", "base_url=http://box.invalid", "--env", "secret_env=COOLIFY_TOKEN")
     lab.ok(COOLIFY, "connection", "add", "mine", "--project", *fields)
-    lab.sql("INSERT INTO capabilities_connections (capability, name, spec) VALUES "
+    lab.sql("INSERT INTO connections (capability, name, spec) VALUES "
             "('coolify', 'stray', '{\"base_url\": \"http://stray.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}')")
-    lab.sql("INSERT INTO capabilities_connection_grants "
+    lab.sql("INSERT INTO grants "
             "(agent_id, capability, connection, enabled) VALUES (%s, 'coolify', 'stray', true)",
             (OTHER,))
     # Granted to another agent, it is not taken from it, at either name of the scope.
@@ -504,7 +510,7 @@ def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
         _code, error = lab.refused(COOLIFY, "connection", "remove", "stray", scope)
         assert error["code"] == "connection_granted" and OTHER in error["message"]
     assert ("coolify", "stray") in _owners(lab)
-    lab.sql("UPDATE capabilities_connection_grants SET enabled = false "
+    lab.sql("UPDATE grants SET enabled = false "
             "WHERE connection = 'stray'")
     removed = lab.ok(COOLIFY, "connection", "remove", "stray", "--machine")
     assert removed["action"] == "remove" and removed["scope"] == "global"
@@ -522,12 +528,12 @@ def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
 def _rows_for_reads(lab: Lab) -> None:
     """Rows that say what the agent should read: its own, every agent's, this
     node's and every node's, each differing from the stale files."""
-    lab.sql("INSERT INTO capabilities_connections (capability, name, spec) VALUES "
+    lab.sql("INSERT INTO connections (capability, name, spec) VALUES "
             "('coolify', 'box', '{\"base_url\": \"http://box.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}'), "
             "('coolify', 'glob', '{\"base_url\": \"http://glob.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}')")
-    lab.sql("INSERT INTO capabilities_connection_grants "
+    lab.sql("INSERT INTO grants "
             "(agent_id, capability, connection, node, enabled, allow_write, is_default) VALUES "
             "(%s, 'coolify', 'box', NULL, true, NULL, false), "
             "(%s, 'coolify', 'glob', NULL, true, NULL, false), "
@@ -535,24 +541,24 @@ def _rows_for_reads(lab: Lab) -> None:
             "(NULL, 'coolify', 'glob', NULL, true, false, true), "
             "(%s, 'coolify', 'box', %s, NULL, false, true)",
             (PROJECT_ID, PROJECT_ID, PROJECT_ID, SERVER))
-    lab.sql("INSERT INTO capabilities_identifiers (agent_id, capability, node, label, value) "
+    lab.sql("INSERT INTO identifiers (agent_id, capability, node, label, value) "
             "VALUES (%s, 'coolify', NULL, 'team', '\"agent-team\"'), "
             "(NULL, 'coolify', NULL, 'team', '\"global-team\"'), "
             "(NULL, 'coolify', NULL, 'region', '\"global-region\"'), "
             "(%s, 'coolify', %s, 'team', '\"server-team\"'), "
             "(NULL, 'coolify', %s, 'region', '\"server-region\"')",
             (PROJECT_ID, PROJECT_ID, SERVER, SERVER))
-    lab.sql("INSERT INTO capabilities_policy (agent_id, capability, node, enabled) VALUES "
+    lab.sql("INSERT INTO policies (agent_id, capability, node, enabled) VALUES "
             "(%s, 'coolify', NULL, true), (NULL, 'memory', NULL, true), "
             "(NULL, 'tasks', NULL, true), (%s, 'tasks', %s, false)",
             (PROJECT_ID, PROJECT_ID, SERVER))
-    settings = ("INSERT INTO capabilities_settings (agent_id, capability, node, path, value, "
+    settings = ("INSERT INTO settings (agent_id, capability, node, path, value, "
                 "updated_by) VALUES (%s, 'memory', %s, %s, %s::jsonb, 'seed@mac1')")
     lab.sql(settings, (PROJECT_ID, None, ["window_days"], "5"))
     lab.sql(settings, (PROJECT_ID, SERVER, ["window_days"], "6"))
     lab.sql(settings, (None, None, ["window_days"], "30"))
     lab.sql(settings, (None, None, ["max_entries"], "40"))
-    lab.sql("INSERT INTO capabilities_settings_documents (agent_id, capability, node, "
+    lab.sql("INSERT INTO settings_documents (agent_id, capability, node, "
             "generation) VALUES (%s, 'memory', NULL, 11), (%s, 'memory', %s, 12), "
             "(NULL, 'memory', NULL, 7)", (PROJECT_ID, PROJECT_ID, SERVER))
 
@@ -583,7 +589,7 @@ def test_a_migrated_agent_reads_rows_and_never_its_stale_files(lab):
     assert settings["generations"] == {"project": 11, "global": 7}
     homes = {h["scope"]: h for h in settings["homes"]}
     assert homes["project"]["document"] == {"window_days": 5}
-    assert homes["project"]["path"] == f"store:{SCHEMA}.capabilities_settings"
+    assert homes["project"]["path"] == f"store:{SCHEMA}.settings"
     assert homes["global"]["document"] == {"window_days": 30, "max_entries": 40}
     assert lab.ok(MEMORY, "settings", "get", "window_days") == 5
 
@@ -613,18 +619,18 @@ def test_rows_for_this_node_are_read_over_the_shared_rows(lab):
 
 def test_a_global_grant_never_enables_a_connection_by_itself(lab):
     lab.migrate()
-    lab.sql("INSERT INTO capabilities_connections (capability, name, spec) VALUES "
+    lab.sql("INSERT INTO connections (capability, name, spec) VALUES "
             "('coolify', 'glob', '{\"base_url\": \"http://glob.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}')")
-    lab.sql("INSERT INTO capabilities_connection_grants "
+    lab.sql("INSERT INTO grants "
             "(agent_id, capability, connection, enabled, allow_write) "
             "VALUES (NULL, 'coolify', 'glob', true, true)")
-    lab.sql("INSERT INTO capabilities_policy (agent_id, capability, enabled) "
+    lab.sql("INSERT INTO policies (agent_id, capability, enabled) "
             "VALUES (NULL, 'coolify', true)")
     code, error = lab.refused(COOLIFY, "connections")
     assert (code, error["code"]) == (4, "connection_not_granted")
     assert "withheld: glob" in error["message"]
-    lab.sql("INSERT INTO capabilities_connection_grants "
+    lab.sql("INSERT INTO grants "
             "(agent_id, capability, connection, enabled) VALUES (%s, 'coolify', 'glob', true)",
             (PROJECT_ID,))
     assert "glob" in lab.ok(COOLIFY, "connections")["connections"]
@@ -632,7 +638,7 @@ def test_a_global_grant_never_enables_a_connection_by_itself(lab):
 
 def test_a_migrated_agent_refuses_without_a_node_name_or_on_an_unregistered_node(lab):
     lab.migrate()
-    lab.sql("INSERT INTO capabilities_policy (agent_id, capability, enabled) "
+    lab.sql("INSERT INTO policies (agent_id, capability, enabled) "
             "VALUES (%s, 'coolify', true)", (PROJECT_ID,))
     # Without AGENT_NODE_ID the process mints this machine's id, which is not
     # one of the agent's nodes; an AGENT_NODE_ID that is no id is refused.
@@ -654,9 +660,9 @@ def test_a_files_mode_agent_marked_migrated_reads_rows_too(lab):
     _stale_files(lab)
     lab.identity({})
     lab.migrate()
-    lab.sql("INSERT INTO capabilities_policy (agent_id, capability, enabled) "
+    lab.sql("INSERT INTO policies (agent_id, capability, enabled) "
             "VALUES (%s, 'coolify', true)", (PROJECT_ID,))
-    lab.sql("INSERT INTO capabilities_identifiers (agent_id, capability, label, value) "
+    lab.sql("INSERT INTO identifiers (agent_id, capability, label, value) "
             "VALUES (%s, 'coolify', 'team', '\"row-team\"')", (PROJECT_ID,))
     assert lab.ok(COOLIFY, "ids", "get", "team") == "row-team"
 
@@ -665,12 +671,12 @@ def test_a_files_mode_agent_marked_migrated_reads_rows_too(lab):
 
 def _trail(lab: Lab) -> list[tuple]:
     return lab.sql("SELECT action, path, old_value, new_value, changed_by, node, agent_id "
-                   "FROM capabilities_settings_changes ORDER BY id")
+                   "FROM settings_changes ORDER BY id")
 
 
 def _document(lab: Lab, capability: str = "memory", agent: str | None = PROJECT_ID,
               node: str | None = None) -> dict:
-    rows = lab.sql("SELECT path, value FROM capabilities_settings WHERE capability = %s "
+    rows = lab.sql("SELECT path, value FROM settings WHERE capability = %s "
                    "AND coalesce(agent_id, '') = coalesce(%s, '') "
                    "AND coalesce(node, '') = coalesce(%s, '')", (capability, agent, node))
     return S.settings_tree(rows)
@@ -678,7 +684,7 @@ def _document(lab: Lab, capability: str = "memory", agent: str | None = PROJECT_
 
 def _generation(lab: Lab, capability: str = "memory", agent: str | None = PROJECT_ID,
                 node: str | None = None):
-    found = lab.sql("SELECT generation FROM capabilities_settings_documents "
+    found = lab.sql("SELECT generation FROM settings_documents "
                     "WHERE capability = %s AND coalesce(agent_id, '') = coalesce(%s, '') "
                     "AND coalesce(node, '') = coalesce(%s, '')", (capability, agent, node))
     return found[0][0] if found else None
@@ -688,7 +694,7 @@ def _generation(lab: Lab, capability: str = "memory", agent: str | None = PROJEC
 def moved(lab):
     _stale_files(lab)
     lab.migrate()
-    lab.sql("INSERT INTO capabilities_policy (agent_id, capability, enabled) VALUES "
+    lab.sql("INSERT INTO policies (agent_id, capability, enabled) VALUES "
             "(%s, 'memory', true), (%s, 'tasks', true), (%s, 'coolify', true)",
             (PROJECT_ID, PROJECT_ID, PROJECT_ID))
     return lab
@@ -698,12 +704,12 @@ def test_settings_set_writes_rows_a_trail_and_a_generation(moved):
     lab = moved
     out = lab.ok(MEMORY, "settings", "set", "window_days", "9")
     assert out["previous"] is None and out["value"] == 9
-    assert out["path"] == f"store:{SCHEMA}.capabilities_settings"
+    assert out["path"] == f"store:{SCHEMA}.settings"
     assert _document(lab) == {"window_days": 9}
     [(action, path, old, new, by, node, agent)] = _trail(lab)
     assert (action, path, old, new, by, node, agent) == (
         "set", ["window_days"], None, 9, f"tester@{MASTER}", None, PROJECT_ID)
-    [(trail_id,)] = lab.sql("SELECT max(id) FROM capabilities_settings_changes")
+    [(trail_id,)] = lab.sql("SELECT max(id) FROM settings_changes")
     assert out["generation"] == trail_id == _generation(lab)
     again = lab.ok(MEMORY, "settings", "set", "window_days", "10")
     assert again["previous"] == 9 and again["generation"] > out["generation"]
@@ -733,7 +739,7 @@ def test_removing_the_last_child_leaves_an_empty_object_and_unset_removes(moved)
     out = lab.ok(TASKS, "settings", "--scope", "project", "unset", "lanes.alpha.max_parallel")
     assert out["previous"] == 2
     assert _document(lab, "tasks") == {"version": 1, "lanes": {"alpha": {}}}
-    rows = lab.sql("SELECT path, value FROM capabilities_settings WHERE capability = 'tasks' "
+    rows = lab.sql("SELECT path, value FROM settings WHERE capability = 'tasks' "
                    "ORDER BY path")
     assert rows == [(["lanes", "alpha"], {}), (["version"], 1)]
     trail = [row[:4] for row in _trail(lab)]
@@ -773,10 +779,10 @@ def test_capabilities_set_writes_a_literal_top_level_key_and_the_default_to_gran
     lab.ok(MANAGER, "set", "coolify", "connection", "box",
            '{"base_url": "http://box.invalid", "secret_env": "COOLIFY_TOKEN"}')
     out = lab.ok(MANAGER, "set", "coolify", "setting", "connection.default", "box")
-    assert out["records"]["source"] == f"store:{SCHEMA}.capabilities_connection_grants"
+    assert out["records"]["source"] == f"store:{SCHEMA}.grants"
     assert lab.sql("SELECT agent_id, connection, node, is_default FROM "
-                   "capabilities_connection_grants") == [(PROJECT_ID, "box", None, True)]
-    assert lab.sql("SELECT count(*) FROM capabilities_settings WHERE capability = 'coolify'") \
+                   "grants") == [(PROJECT_ID, "box", None, True)]
+    assert lab.sql("SELECT count(*) FROM settings WHERE capability = 'coolify'") \
         == [(0,)]
 
 
@@ -813,20 +819,20 @@ def test_export_and_edit_keep_hand_editing(moved, tmp_path):
 def test_identifiers_policy_and_grants_are_written_as_rows(moved):
     lab = moved
     lab.ok(COOLIFY, "ids", "set", "team", "row-team")
-    assert lab.sql("SELECT agent_id, node, value FROM capabilities_identifiers") \
+    assert lab.sql("SELECT agent_id, node, value FROM identifiers") \
         == [(PROJECT_ID, None, "row-team")]
     lab.ok(MANAGER, "disable", "memory", "--project")
-    assert lab.sql("SELECT enabled FROM capabilities_policy WHERE capability = 'memory' "
+    assert lab.sql("SELECT enabled FROM policies WHERE capability = 'memory' "
                    "AND agent_id = %s", (PROJECT_ID,)) == [(False,)]
     # The stale gate file is neither read nor written.
     assert json.loads((lab.envelope / "settings.json").read_text()) == {
         "capabilities": {"coolify": {"enabled": False}, "memory": {"enabled": False}}}
     assert lab.ok(MANAGER, "enable", "memory", "--project")["gate"] \
-        == f"store:{SCHEMA}.capabilities_policy"
+        == f"store:{SCHEMA}.policies"
     lab.ok(MANAGER, "set", "coolify", "connection", "box",
            '{"base_url": "http://box.invalid", "secret_env": "COOLIFY_TOKEN"}')
     lab.ok(MANAGER, "set", "coolify", "grant", "box", '{"enabled": true}')
-    assert lab.sql("SELECT agent_id, node, enabled FROM capabilities_connection_grants") \
+    assert lab.sql("SELECT agent_id, node, enabled FROM grants") \
         == [(PROJECT_ID, None, True)]
 
 
@@ -843,8 +849,8 @@ def test_off_the_master_shared_writes_are_refused(moved):
         code, error = lab.refused(exe, *args, **on_server)
         assert error["code"] == "node_read_only", (exe, error)
         assert MASTER in error["message"] + error.get("hint", "")
-    assert lab.sql("SELECT count(*) FROM capabilities_settings") == [(0,)]
-    assert lab.sql("SELECT count(*) FROM capabilities_identifiers") == [(0,)]
+    assert lab.sql("SELECT count(*) FROM settings") == [(0,)]
+    assert lab.sql("SELECT count(*) FROM identifiers") == [(0,)]
 
 
 def test_a_node_allowed_to_write_writes_the_shared_rows_as_the_master_does(moved):
@@ -859,27 +865,27 @@ def test_a_node_allowed_to_write_writes_the_shared_rows_as_the_master_does(moved
     assert _trail(lab)[-1][4:6] == (f"tester@{SERVER}", None)
     assert lab.ok(MEMORY, "settings", "get", "window_days") == 3
     lab.ok(COOLIFY, "ids", "set", "team", "shared-team", **on_server)
-    assert lab.sql("SELECT node, value FROM capabilities_identifiers") \
+    assert lab.sql("SELECT node, value FROM identifiers") \
         == [(None, "shared-team")]
     lab.ok(MANAGER, "set", "coolify", "connection", "box",
            '{"base_url": "http://box.invalid", "secret_env": "COOLIFY_TOKEN"}')
     lab.ok(MANAGER, "set", "coolify", "connection", "box",
            '{"base_url": "http://other.invalid", "secret_env": "COOLIFY_TOKEN"}',
            **on_server)
-    assert lab.sql("SELECT spec->>'base_url' FROM capabilities_connections "
+    assert lab.sql("SELECT spec->>'base_url' FROM connections "
                    "WHERE name = 'box'") == [("http://other.invalid",)]
     lab.ok(MANAGER, "set", "coolify", "grant", "box", '{"enabled": true}', **on_server)
-    assert lab.sql("SELECT agent_id, node, enabled FROM capabilities_connection_grants") \
+    assert lab.sql("SELECT agent_id, node, enabled FROM grants") \
         == [(PROJECT_ID, None, True)]
     # A row naming its own node it writes; a row naming another node is the master's.
     lab.ok(MANAGER, "disable", "tasks", "--project", "--node", SERVER, **on_server)
-    assert lab.sql("SELECT node, enabled FROM capabilities_policy WHERE capability = 'tasks' "
+    assert lab.sql("SELECT node, enabled FROM policies WHERE capability = 'tasks' "
                    "AND node IS NOT NULL") == [(SERVER, False)]
     code, error = lab.refused(MANAGER, "disable", "tasks", "--project", "--node", MASTER,
                               **on_server)
     assert error["code"] == "node_read_only" and MASTER in error["message"]
     # The migration is still the master's alone.
-    lab.sql("UPDATE capabilities_agents SET migrating_since = now()")
+    lab.sql("UPDATE agents SET migrating_since = now()")
     code, error = lab.refused(MEMORY, "settings", "set", "window_days", "4", **on_server)
     assert error["code"] == "agent_migrating"
     assert _document(lab) == {"window_days": 3}
@@ -892,12 +898,12 @@ def test_a_node_allowed_to_write_writes_a_row_it_holds_of_its_own_there(moved, t
     # Rows naming the server, as a node allowed to write left them before it
     # wrote the shared rows.
     lab.ok(MEMORY, "settings", "set", "window_days", "5")
-    lab.sql("INSERT INTO capabilities_settings (agent_id, capability, node, path, value, "
+    lab.sql("INSERT INTO settings (agent_id, capability, node, path, value, "
             "updated_by) VALUES (%s, 'memory', %s, %s, '6'::jsonb, 'seed')",
             (PROJECT_ID, SERVER, ["window_days"]))
-    lab.sql("INSERT INTO capabilities_settings_documents (agent_id, capability, node, "
+    lab.sql("INSERT INTO settings_documents (agent_id, capability, node, "
             "generation) VALUES (%s, 'memory', %s, 1)", (PROJECT_ID, SERVER))
-    lab.sql("INSERT INTO capabilities_identifiers (agent_id, capability, node, label, value) "
+    lab.sql("INSERT INTO identifiers (agent_id, capability, node, label, value) "
             "VALUES (%s, 'coolify', %s, 'team', '\"server-team\"')", (PROJECT_ID, SERVER))
     # An edit keeps the server's own value off the shared document.
     editor = tmp_path / "editor.py"
@@ -924,11 +930,11 @@ def test_a_node_allowed_to_write_writes_a_row_it_holds_of_its_own_there(moved, t
     assert lab.ok(MEMORY, "settings", "get", "window_days") == 7
     lab.ok(COOLIFY, "ids", "set", "team", "new-team", **on_server)
     assert lab.ok(COOLIFY, "ids", "get", "team", **on_server) == "new-team"
-    assert lab.sql("SELECT node, value FROM capabilities_identifiers") \
+    assert lab.sql("SELECT node, value FROM identifiers") \
         == [(SERVER, "new-team")]
     lab.ok(COOLIFY, "ids", "rm", "team", **on_server)
     lab.ok(COOLIFY, "ids", "set", "team", "shared-team", **on_server)
-    assert lab.sql("SELECT node, value FROM capabilities_identifiers") \
+    assert lab.sql("SELECT node, value FROM identifiers") \
         == [(None, "shared-team")]
 
 
@@ -966,14 +972,14 @@ def test_an_edit_another_node_wrote_under_is_refused_and_read_again_it_lands(mov
 
 def test_an_open_migration_freezes_every_write_but_the_migration_on_the_master(moved):
     lab = moved
-    lab.sql("UPDATE capabilities_agents SET migrating_since = now()")
+    lab.sql("UPDATE agents SET migrating_since = now()")
     for args, exe in ((("settings", "set", "window_days", "9"), MEMORY),
                       (("ids", "set", "team", "x"), COOLIFY),
                       (("set", "telegram", "setting", "a", "1"), MANAGER)):
         code, error = lab.refused(exe, *args)
         assert error["code"] == "agent_migrating", error
         assert MASTER in error["message"]
-    assert lab.sql("SELECT count(*) FROM capabilities_settings") == [(0,)]
+    assert lab.sql("SELECT count(*) FROM settings") == [(0,)]
     env = lab.env()
     previous = {k: os.environ.get(k) for k in env}
     os.environ.update(env)
@@ -982,7 +988,7 @@ def test_an_open_migration_freezes_every_write_but_the_migration_on_the_master(m
                                      ("migrate", SERVER, False)):
             os.environ.update(AGENT_NODE_ID=node, AGENT_NODE_NAME=LABELS[node])
             if node == SERVER and not lab.sql(
-                    "SELECT 1 FROM capabilities_agent_nodes WHERE node = %s", (SERVER,)):
+                    "SELECT 1 FROM agent_nodes WHERE node = %s", (SERVER,)):
                 _register(lab, SERVER)
             adapter = S.open_records(lab.envelope, lab.config, project_root=lab.project,
                                      actor=actor)
@@ -1012,7 +1018,7 @@ def test_an_open_migration_freezes_a_files_mode_agents_file_writes(lab):
            "--master")
     before = lab.ok(MEMORY, "settings", "set", "window_days", "9")
     assert before["path"].endswith("memory/service/settings.json")
-    lab.sql("UPDATE capabilities_agents SET migrating_since = now()")
+    lab.sql("UPDATE agents SET migrating_since = now()")
     code, error = lab.refused(MEMORY, "settings", "set", "window_days", "10")
     assert error["code"] == "agent_migrating"
     code, error = lab.refused(MANAGER, "set", "telegram", "setting", "a", "1")
@@ -1035,7 +1041,7 @@ def test_an_agent_without_migrated_at_keeps_its_files_and_store_mode(lab):
     lab.ok(MEMORY, "settings", "set", "window_days", "9")
     assert json.loads((lab.envelope / "memory/service/settings.json").read_text()) \
         == {"window_days": 9}
-    assert lab.sql("SELECT count(*) FROM capabilities_settings") == [(0,)]
+    assert lab.sql("SELECT count(*) FROM settings") == [(0,)]
 
 
 def test_a_files_mode_project_with_a_store_configured_creates_no_tables(lab):

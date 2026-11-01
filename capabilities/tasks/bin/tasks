@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.33,<1",
+#     "capabilities-contract>=0.42,<1",
 #     "psycopg[binary]>=3.2",
-#     "callva-harness-runner==0.10.1",
+#     "callva-harness-runner==0.11.0",
 #     "pyyaml>=6",
 # ]
 # ///
@@ -1904,7 +1904,7 @@ STORE
   older than this version brings them up to it once, and says so on stderr
   before its answer,
     {"migrated": {"schema": S, "applied": [STEP...]}}
-  The harness profiles workers run on live in `harness_profiles`, the table
+  The harness profiles workers run on live in `harness_profile_versions`, the table
   callva-harness-runner owns under its own ledger, `harness`; tasks applies
   the library's steps before its own wherever it migrates, since
   `tasks_executions.profile_id` references it, and says so the same way, with
@@ -2362,7 +2362,7 @@ def _tables_status(conn, owner: str = NAME):
     """Where this capability's tables stand in the store `conn` reaches, or
     the harness library's profile table for its `owner`, read by the library
     without a lock and changing nothing."""
-    from psycopg.rows import dict_row, tuple_row
+    from psycopg.rows import tuple_row
     if owner == NAME:
         steps, major, minor = _tables()
     else:
@@ -2371,7 +2371,7 @@ def _tables_status(conn, owner: str = NAME):
     try:
         return _db().status(conn, owner, steps, major=major, minor=minor)
     finally:
-        conn.row_factory = dict_row
+        conn.row_factory = _dict_row
 
 
 # How long a command goes on asking for a store it cannot reach before it gives
@@ -2505,8 +2505,25 @@ def _connect(entry: dict | None, *, raising: bool = False, waiting: bool | None 
     except BaseException:
         conn.close()
         raise
-    conn.row_factory = dict_row
+    conn.row_factory = _dict_row
     return conn
+
+
+# The store names the agent's columns for the agent; a row read from it keeps
+# the keys it has always been read and printed under, and a row written from
+# one of those keys writes the store's column.
+_READ_KEYS = {"agent_id": "project_id", "origin_agent_id": "origin_project"}
+_STORE_COLUMNS = {key: column for column, key in _READ_KEYS.items()}
+
+
+def _dict_row(cursor):
+    """psycopg's dict_row, each agent column under the key it is read as."""
+    from psycopg.rows import no_result
+    description = cursor.description
+    if description is None:
+        return no_result
+    names = [_READ_KEYS.get(column.name, column.name) for column in description]
+    return lambda values: dict(zip(names, values))
 
 
 def _follow(follower, conn) -> dict:
@@ -2833,8 +2850,8 @@ def _task_id(cur, ref: str, *, writing: bool = False, answering: bool = False) -
         # A write outside a project is refused for that before anything is
         # looked up, whichever way the task is named.
         _writing_project()
-    cur.execute(f"select id, project_id, assignee from {SCHEMA}.tasks_tasks "
-                f"where id::text = %s or (unique_key = %s and project_id = %s)",
+    cur.execute(f"select id, agent_id, assignee from {SCHEMA}.tasks_tasks "
+                f"where id::text = %s or (unique_key = %s and agent_id = %s)",
                 (ref, ref, PROJECT))
     hit = cur.fetchall()
     if not hit and not PROJECT and not _is_uuid(ref):
@@ -2970,7 +2987,7 @@ _LIST_FLAGS = (("project", "type", "status", "tag", "assignee", "per-page",
 # What a scan needs to choose where to look next. `objective` and `description`
 # are the expensive half of a task and stay out until asked for: a list is read
 # to pick one row, not to read every row's reasoning.
-_LEAN = ("id, project_id, type, unique_key, title, status, assignee, tags, "
+_LEAN = ("id, agent_id, type, unique_key, title, status, assignee, tags, "
          "pickup_at, blocked_by, created_at, updated_at")
 _LIST_BOOLS = ("pickup-set", "pickup-unset", "full", "assigned-here")
 # `ready` is the queue one project's worker consumes, so the whole store is a
@@ -3124,7 +3141,7 @@ def _where(opts: dict, tz=None) -> tuple[str, list]:
                  "project in the store")
         clauses, params = [], []
     else:
-        clauses = ["project_id = %s"]
+        clauses = ["agent_id = %s"]
         params = [_reading_project(opts.get("project"))]
     for flag, (column, op) in _DATE_FILTERS.items():
         if opts.get(flag):
@@ -3181,7 +3198,7 @@ def _attach_activities(cur, tasks: list[dict], opts: dict, *, embed: bool) -> li
     # say that: rows[-0:] is the whole list, which is the opposite of the ask.
     embed = (embed if want is None else True) and depth != 0
     ids = [t["id"] for t in tasks]
-    cur.execute(f"""select id, task_id, description, actor, origin_project,
+    cur.execute(f"""select id, task_id, description, actor, origin_agent_id,
                            created_at
                       from {SCHEMA}.tasks_activities where task_id = any(%s::uuid[])
                      order by created_at asc""", (ids,))
@@ -3271,7 +3288,7 @@ def cmd_show(entry, args: list[str]) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
         tid = _task_id(cur, opts["_loose"][0])
         task = _task_shown(cur, tid)
-        cur.execute(f"""select id, description, actor, origin_project, created_at
+        cur.execute(f"""select id, description, actor, origin_agent_id, created_at
                           from {SCHEMA}.tasks_activities where task_id = %s
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
@@ -3744,8 +3761,8 @@ def _line_named(cur, project: str, given: str) -> str | None:
     if not _WORKER_NAME.fullmatch(given):
         _die(6, "input", f"{given!r} is not a line name: lowercase letters, digits, "
              "`-` and `_`, starting with a letter or digit")
-    cur.execute(f"""select 1 from {SCHEMA}.tasks_lines
-                     where project_id = %s and name = %s and active""", (project, given))
+    cur.execute(f"""select 1 from {SCHEMA}.tasks_line_versions
+                     where agent_id = %s and name = %s and active""", (project, given))
     if not cur.fetchone():
         _die(3, "not_found", f"no line named {given!r} in this project",
              f"`{NAME} lines list` shows this project's lines; `{DEFAULT_LINE}` is the "
@@ -3800,7 +3817,7 @@ def cmd_add(entry, args: list[str]) -> None:
         key = values.get("unique_key")
         if key:
             cur.execute(f"select id from {SCHEMA}.tasks_tasks "
-                        f"where unique_key = %s and project_id = %s",
+                        f"where unique_key = %s and agent_id = %s",
                         (key, values["project_id"]))
             found = cur.fetchall()
             if found:
@@ -3844,7 +3861,8 @@ def cmd_add(entry, args: list[str]) -> None:
             _die(4, "not_accepted", judged["refused"],
                  _acceptance_hint(values["assignee"].strip()))
         cols = list(values)
-        cur.execute(f"""insert into {SCHEMA}.tasks_tasks ({', '.join(cols)})
+        cur.execute(f"""insert into {SCHEMA}.tasks_tasks
+                          ({', '.join(_STORE_COLUMNS.get(c, c) for c in cols)})
                         values ({', '.join(_PLACEHOLDER.get(c, '%s') for c in cols)})
                         returning id, type, unique_key, title, status""",
                     [values[c] for c in cols])
@@ -3945,7 +3963,8 @@ def cmd_set(entry, args: list[str]) -> None:
         settled, spent = _settle_the_wait(cur, values.get("status"), before,
                                           "pickup_at" in values, "blocked_by" in values)
         cols = list(values)
-        assignments = ([f"{c} = {_PLACEHOLDER.get(c, '%s')}" for c in cols] + settled
+        assignments = ([f"{_STORE_COLUMNS.get(c, c)} = {_PLACEHOLDER.get(c, '%s')}"
+                        for c in cols] + settled
                        + ["updated_at = now()"])
         cur.execute(f"""update {SCHEMA}.tasks_tasks set {', '.join(assignments)}
                          where id = %s returning *""", [values[c] for c in cols] + [tid])
@@ -4154,8 +4173,8 @@ def _add_activity(cur, tid: str, text: str, actor: str) -> dict:
     """One entry on the trail. Every caller writes it the same way, so what an
     entry is - a moment, a sentence and who recorded it - stays one fact."""
     cur.execute(f"""insert into {SCHEMA}.tasks_activities
-                      (task_id, description, actor, origin_project)
-                    values (%s, %s, %s, %s) returning id, created_at, origin_project""",
+                      (task_id, description, actor, origin_agent_id)
+                    values (%s, %s, %s, %s) returning id, created_at, origin_agent_id""",
                 (tid, text, actor, _writing_project()))
     return _rows(cur)[0]
 
@@ -4233,7 +4252,7 @@ def _record_change(cur, tid: str, field: str, old, new,
         return False
     cur.execute(f"""insert into {SCHEMA}.tasks_changes
                       (task_id, field, old_value, new_value, execution_id, actor,
-                       origin_project)
+                       origin_agent_id)
                     values (%s, %s, %s, %s, %s, %s, %s)""",
                 (tid, field, before, after, execution_id, actor,
                  origin or _writing_project()))
@@ -4360,7 +4379,7 @@ def _sweep_waiting(cur, project: str) -> list[dict]:
     looking for its own work never moves somebody else's task."""
     cur.execute(f"""select *, (pickup_at is not null and pickup_at <= now()) as due
                       from {SCHEMA}.tasks_tasks
-                     where status = 'waiting' and project_id = %s
+                     where status = 'waiting' and agent_id = %s
                        and {_open_raise_clause(False)}
                      for update skip locked""", (project,))
     waiting = _rows(cur)
@@ -4380,7 +4399,7 @@ def _sweep_waiting(cur, project: str) -> list[dict]:
         _record_moves(cur, tid, task, after, actor=SWEEP_ACTOR, origin=project)
         said = f"Returned to the queue from waiting: {why}."
         cur.execute(f"""insert into {SCHEMA}.tasks_activities
-                          (task_id, description, actor, origin_project)
+                          (task_id, description, actor, origin_agent_id)
                         values (%s, %s, %s, %s)""", (tid, said, SWEEP_ACTOR, project))
         returned.append(after)
     return returned
@@ -4493,7 +4512,7 @@ def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, l
     where, params = _not_ids(where, params, opts.get("not_ids"))
     clauses: list[str] = []
     if granted is not None:
-        clauses += ["project_id = any(%s)", "assignee = %s",
+        clauses += ["agent_id = any(%s)", "assignee = %s",
                     f"not {_taken_in_clause(f'{SCHEMA}.tasks_tasks')}"]
         params = [*params, list(granted), project, project]
     if "line" in opts and granted is None:
@@ -4539,14 +4558,14 @@ def _taken_in_clause(table: str) -> str:
     """SQL, one parameter - the project: whether that project holds a task
     taking in the task `table` names."""
     return (f"exists (select 1 from {SCHEMA}.tasks_tasks l "
-            f"where l.project_id = %s and l.metadata ->> 'origin' = '{_ORIGIN_TASKS}' "
+            f"where l.agent_id = %s and l.metadata ->> 'origin' = '{_ORIGIN_TASKS}' "
             f"and l.metadata ->> 'origin_ref' = {table}.id::text)")
 
 
 def _taken_in(cur, tid: str, project: str) -> str | None:
     """The task of `project` that takes in the task `tid`, or None."""
     cur.execute(f"""select id from {SCHEMA}.tasks_tasks
-                     where project_id = %s and metadata ->> 'origin' = %s
+                     where agent_id = %s and metadata ->> 'origin' = %s
                        and metadata ->> 'origin_ref' = %s
                      order by created_at limit 1""", (project, _ORIGIN_TASKS, tid))
     row = cur.fetchone()
@@ -4557,8 +4576,8 @@ def _ours_clause(execution: str, task: str) -> str:
     """SQL, two parameters - the project, twice: whether the raise `execution`
     names is this project's: on a task of its own, or opened by one of its
     workers on a task another project assigned to it."""
-    return (f"({task}.project_id = %s or {execution}.worker_id in "
-            f"(select w.id from {SCHEMA}.tasks_workers w where w.project_id = %s))")
+    return (f"({task}.agent_id = %s or {execution}.worker_id in "
+            f"(select w.id from {SCHEMA}.tasks_worker_versions w where w.agent_id = %s))")
 
 
 def _raised_here_clause(execution: str, task: str) -> str:
@@ -4567,9 +4586,9 @@ def _raised_here_clause(execution: str, task: str) -> str:
     version, or a shipped one, which records none, on a task of its own. A
     lane is this project's, so another project's worker of the same name holds
     none of it."""
-    return (f"({execution}.worker_id in (select w.id from {SCHEMA}.tasks_workers w "
-            f"where w.project_id = %s) or ({execution}.worker_id is null "
-            f"and {task}.project_id = %s))")
+    return (f"({execution}.worker_id in (select w.id from {SCHEMA}.tasks_worker_versions w "
+            f"where w.agent_id = %s) or ({execution}.worker_id is null "
+            f"and {task}.agent_id = %s))")
 
 
 def _held_over(cur, opts: dict, project: str, tz) -> list[dict]:
@@ -4869,7 +4888,7 @@ def _claim(entry, opts: dict) -> dict:
         # its status, assignee and pickup untouched, no move recorded - and is
         # shown `in_progress` for as long as this raise holds it.
         after = _task_shown(cur, tid)
-        cur.execute(f"""select id, description, actor, origin_project, created_at
+        cur.execute(f"""select id, description, actor, origin_agent_id, created_at
                           from {SCHEMA}.tasks_activities where task_id = %s
                          order by created_at asc""", (tid,))
         trail = _rows(cur)
@@ -4999,7 +5018,7 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
         # every other write is held to, refused in the same words, and asked
         # before the raise's own state so that a foreign raise is never told
         # whether it is still open.
-        cur.execute(f"select project_id from {SCHEMA}.tasks_tasks where id = %s",
+        cur.execute(f"select agent_id from {SCHEMA}.tasks_tasks where id = %s",
                     (execution["task_id"],))
         owner = _rows(cur)[0]["project_id"]
         here = _writing_project()
@@ -5008,8 +5027,8 @@ def _release(entry, ref: str, outcome: str, status: str | None, detail: str | No
         # that task it moves the assignee alone, as `set` would.
         guest = False
         if owner != here and execution.get("worker_id"):
-            cur.execute(f"""select 1 from {SCHEMA}.tasks_workers
-                             where id = %s and project_id = %s""",
+            cur.execute(f"""select 1 from {SCHEMA}.tasks_worker_versions
+                             where id = %s and agent_id = %s""",
                         (execution["worker_id"], here))
             guest = cur.fetchone() is not None
         if owner != here and not guest:
@@ -5458,7 +5477,7 @@ def _in_place_sql() -> str:
                                                and r.started_at >= h.started_at)
                             and not exists (select 1 from {raises} l
                                               join {SCHEMA}.tasks_tasks lt on lt.id = l.task_id
-                                             where lt.project_id = t.project_id
+                                             where lt.agent_id = t.agent_id
                                                and l.worker is not distinct from h.worker
                                                and l.metrics ? 'lane_hold'
                                                and {_lane_until('l')} > h.started_at)
@@ -5633,7 +5652,7 @@ def _lane_moving(cur, task: dict, escalation: dict) -> bool:
     cur.execute(f"""select exists (
                       select 1 from {SCHEMA}.tasks_executions e
                         join {SCHEMA}.tasks_tasks et on et.id = e.task_id
-                       where et.project_id = %s and e.worker is not distinct from %s
+                       where et.agent_id = %s and e.worker is not distinct from %s
                          and {_a_raise()}
                          and greatest(e.started_at, e.ended_at)
                                > now() - make_interval(secs => %s)) as moving""",
@@ -5889,8 +5908,8 @@ def _blockers_given(cur, project: str, task: dict | None, refs) -> list[str]:
             names.append(one)
     if not names:
         return []
-    cur.execute(f"""select id, unique_key, project_id from {SCHEMA}.tasks_tasks
-                     where id::text = any(%s) or (unique_key = any(%s) and project_id = %s)""",
+    cur.execute(f"""select id, unique_key, agent_id from {SCHEMA}.tasks_tasks
+                     where id::text = any(%s) or (unique_key = any(%s) and agent_id = %s)""",
                 (names, names, project))
     found = _rows(cur)
     ids: list[str] = []
@@ -5964,10 +5983,10 @@ def _dead_ends(cur, project: str, structure: dict, spare=()) -> list[tuple[dict,
     with why, from one read of its open tasks no raise holds. A task on a
     person is none: the chain ends at one, and a person moves it. `spare` names
     tasks to leave alone - the one a run was asked to take by --key."""
-    cur.execute(f"""select id, unique_key, project_id, status, type, assignee, tags,
+    cur.execute(f"""select id, unique_key, agent_id, status, type, assignee, tags,
                            pickup_at, blocked_by
                       from {SCHEMA}.tasks_tasks
-                     where project_id = %s and status in ('todo', 'waiting')
+                     where agent_id = %s and status in ('todo', 'waiting')
                        and {_open_raise_clause(False)}
                      order by created_at asc""", (project,))
     rows = [row for row in _rows(cur) if str(row["id"]) not in spare]
@@ -6087,7 +6106,7 @@ def _serving(cur, project: str) -> bool:
     """Whether a tasks service serving `project` on this store is running."""
     cur.execute(f"""select exists (
                        select 1 from {SCHEMA}.tasks_presences
-                        where project_id = %s and expires_at > now())
+                        where agent_id = %s and expires_at > now())
                     or exists (
                        select 1 from pg_locks
                         where locktype = 'advisory' and objsubid = 2
@@ -6119,28 +6138,29 @@ def _earlier_services(cur) -> list[str]:
         return bool(cur.fetchone()["present"])
 
     presences = there("tasks_presences")
-    known = [f"select project_id from {SCHEMA}.{table}"
-             for table in ("tasks_workers", "tasks_tasks", "tasks_presences") if there(table)]
-    instances = there("capabilities_service_instances")
+    known = [f"select agent_id from {SCHEMA}.{table}"
+             for table in ("tasks_worker_versions", "tasks_tasks", "tasks_presences")
+             if there(table)]
+    instances = there("service_instances")
     if instances:
-        known.append(f"select project_id from {SCHEMA}.capabilities_service_instances "
+        known.append(f"select agent_id from {SCHEMA}.service_instances "
                      "where capability = 'tasks'")
     named = (f"exists (select 1 from {SCHEMA}.tasks_presences p "
              "where p.lock_pid = l.pid and p.expires_at > now())" if presences else "false")
-    cur.execute(f"""select p.project_id, l.pid, a.client_hostname, host(a.client_addr) as client_addr,
+    cur.execute(f"""select p.agent_id, l.pid, a.client_hostname, host(a.client_addr) as client_addr,
                            a.application_name, a.backend_start
                       from pg_locks l
-                      join (select %s::text as project_id
+                      join (select %s::text as agent_id
                             {''.join(f' union {one}' for one in known)}) p
-                        on l.objid::bigint = (hashtext(%s || ':' || p.project_id)::bigint
+                        on l.objid::bigint = (hashtext(%s || ':' || p.agent_id)::bigint
                                               & 4294967295)
                       left join pg_stat_activity a on a.pid = l.pid
                      where l.locktype = 'advisory' and l.objsubid = 2 and l.granted
                        and l.classid = %s::oid
                        and l.database = (select oid from pg_database
                                           where datname = current_database())
-                       and p.project_id is not null and not {named}
-                     order by p.project_id, l.pid""",
+                       and p.agent_id is not null and not {named}
+                     order by p.agent_id, l.pid""",
                 (PROJECT, SCHEMA, _PRESENCE_CLASS))
     holders = cur.fetchall()
     said = []
@@ -6148,9 +6168,9 @@ def _earlier_services(cur) -> list[str]:
         nodes = []
         if instances:
             live = (f"and node not in (select node from {SCHEMA}.tasks_presences "
-                    "where project_id = %s and expires_at > now())" if presences else "")
-            cur.execute(f"""select node, host from {SCHEMA}.capabilities_service_instances
-                             where project_id = %s and capability = 'tasks' {live}
+                    "where agent_id = %s and expires_at > now())" if presences else "")
+            cur.execute(f"""select node, host from {SCHEMA}.service_instances
+                             where agent_id = %s and capability = 'tasks' {live}
                              order by node""",
                         (row["project_id"],) + ((row["project_id"],) if presences else ()))
             nodes = [f"node {one['node']}" + (f" (host {one['host']})" if one["host"] else "")
@@ -6175,8 +6195,8 @@ def _earlier_services(cur) -> list[str]:
 def _is_project(cur, name: str) -> bool:
     """Whether `name` is a project of this store: one that keeps a task or a
     worker in it. Any other name is a person or a name."""
-    cur.execute(f"""select exists (select 1 from {SCHEMA}.tasks_workers where project_id = %s)
-                           or exists (select 1 from {SCHEMA}.tasks_tasks where project_id = %s)
+    cur.execute(f"""select exists (select 1 from {SCHEMA}.tasks_worker_versions where agent_id = %s)
+                           or exists (select 1 from {SCHEMA}.tasks_tasks where agent_id = %s)
                            as known""", (name, name))
     return bool(_rows(cur)[0]["known"])
 
@@ -6186,8 +6206,8 @@ def _grants(cur, project: str) -> list[tuple[str, dict]]:
     `accepts_from` of each enabled worker it keeps in the store, read as
     written. A worker whose `takes` that project could not read takes nothing,
     so it grants nothing."""
-    cur.execute(f"""select name, spec from {SCHEMA}.tasks_workers
-                     where project_id = %s and active order by name""", (project,))
+    cur.execute(f"""select name, spec from {SCHEMA}.tasks_worker_versions
+                     where agent_id = %s and active order by name""", (project,))
     found: list[tuple[str, dict]] = []
     for row in _rows(cur):
         spec = row["spec"]
@@ -6441,17 +6461,17 @@ def _stored_routines() -> set[str] | None:
                 cur.execute("select to_regclass(%s) is not null as held",
                             (f"{SCHEMA}.routine_enablements",))
                 enabling = cur.fetchone()["held"]
-                enabled = (f" or (d.project_id is null and exists (select 1 from "
+                enabled = (f" or (d.agent_id is null and exists (select 1 from "
                            f"{SCHEMA}.routine_enablements e where e.document_id = d.id "
-                           f"and e.project_id = %(project)s) and not exists (select 1 from "
-                           f"{SCHEMA}.routine_documents o where o.project_id = %(project)s "
+                           f"and e.agent_id = %(project)s) and not exists (select 1 from "
+                           f"{SCHEMA}.routine_documents o where o.agent_id = %(project)s "
                            "and o.name = d.name and o.retired_at is null))"
                            if enabling else "")
                 cur.execute(f"""select d.name from {SCHEMA}.routine_documents d
                                   join {SCHEMA}.routine_versions v
                                     on v.document_id = d.id and v.active
                                  where d.retired_at is null
-                                   and (d.project_id = %(project)s{enabled})""",
+                                   and (d.agent_id = %(project)s{enabled})""",
                             {"project": project})
                 names = {row["name"] for row in cur.fetchall()} or None
             except psycopg.errors.UndefinedTable:
@@ -6563,8 +6583,8 @@ def _stored_workers(fresh: bool = False, waiting: bool | None = None) -> list[di
                       migrating=False) as conn, conn.cursor() as cur:
             try:
                 cur.execute(f"""select id, name, spec, body, created_at, created_by
-                                  from {SCHEMA}.tasks_workers
-                                 where project_id = %s and active
+                                  from {SCHEMA}.tasks_worker_versions
+                                 where agent_id = %s and active
                                  order by name""", (project,))
                 rows = [dict(row) for row in cur.fetchall()]
             except psycopg.errors.UndefinedTable:
@@ -6572,8 +6592,8 @@ def _stored_workers(fresh: bool = False, waiting: bool | None = None) -> list[di
                 conn.rollback()
             try:
                 cur.execute(f"""select id, name, spec, created_at, created_by
-                                  from {SCHEMA}.tasks_lines
-                                 where project_id = %s and active
+                                  from {SCHEMA}.tasks_line_versions
+                                 where agent_id = %s and active
                                  order by name""", (project,))
                 lines = [dict(row) for row in cur.fetchall()]
             except psycopg.errors.UndefinedTable:
@@ -6644,8 +6664,8 @@ def _stored_hooks(fresh: bool = False, waiting: bool | None = None) -> list[dict
                       migrating=False) as conn, conn.cursor() as cur:
             try:
                 cur.execute(f"""select id, name, description, body, created_at, created_by
-                                  from {SCHEMA}.tasks_hooks
-                                 where project_id = %s and active
+                                  from {SCHEMA}.tasks_hook_versions
+                                 where agent_id = %s and active
                                  order by name""", (project,))
                 rows = [dict(row) for row in cur.fetchall()]
             except psycopg.errors.UndefinedTable:
@@ -7617,8 +7637,8 @@ def _workers_write_gate(action: str) -> None:
 
 
 def _active_row(cur, project: str, name: str, lock: bool = False) -> dict | None:
-    cur.execute(f"""select * from {SCHEMA}.tasks_workers
-                     where project_id = %s and name = %s and active
+    cur.execute(f"""select * from {SCHEMA}.tasks_worker_versions
+                     where agent_id = %s and name = %s and active
                      {"for update" if lock else ""}""", (project, name))
     rows = _rows(cur)
     return rows[0] if rows else None
@@ -7640,14 +7660,14 @@ def _save_version(cur, project: str, name: str, spec: dict, body: str,
     if active and active["spec"] == spec and (active["body"] or "") == body:
         return active, False
     if active:
-        cur.execute(f"""update {SCHEMA}.tasks_workers set active = false
+        cur.execute(f"""update {SCHEMA}.tasks_worker_versions set active = false
                          where id = %s and active""", (str(active["id"]),))
         if cur.rowcount != 1:
             _die(6, "conflict", f"worker {name!r} was saved by someone else first",
                  f"read it again with `{NAME} workers show {name}`")
     try:
-        cur.execute(f"""insert into {SCHEMA}.tasks_workers
-                          (project_id, name, spec, body, active, created_by)
+        cur.execute(f"""insert into {SCHEMA}.tasks_worker_versions
+                          (agent_id, name, spec, body, active, created_by)
                         values (%s, %s, %s::jsonb, %s, true, %s)
                         returning *""",
                     (project, name, json.dumps(spec), body, _actor()))
@@ -7731,14 +7751,14 @@ def cmd_workers(entry, args: list[str]) -> None:
                      f"worker {name!r} has no active version" if active is None
                      else f"worker {name!r} is no longer at version {opts['base']}",
                      f"`{NAME} workers list` shows this project's workers")
-            cur.execute(f"""update {SCHEMA}.tasks_workers set active = false
+            cur.execute(f"""update {SCHEMA}.tasks_worker_versions set active = false
                              where id = %s and active""", (str(active["id"]),))
             conn.commit()
             _emit({"worker": name, "removed": str(active["id"])})
             return
         if action == "history":
-            cur.execute(f"""select * from {SCHEMA}.tasks_workers
-                             where project_id = %s and name = %s
+            cur.execute(f"""select * from {SCHEMA}.tasks_worker_versions
+                             where agent_id = %s and name = %s
                              order by created_at asc, id asc""", (project, name))
             rows = _rows(cur)
             conn.commit()
@@ -7749,8 +7769,8 @@ def cmd_workers(entry, args: list[str]) -> None:
                    "versions": [_version_answer(r, whole=False) for r in rows]})
             return
         if opts.get("version"):
-            cur.execute(f"""select * from {SCHEMA}.tasks_workers
-                             where project_id = %s and name = %s and id::text = %s""",
+            cur.execute(f"""select * from {SCHEMA}.tasks_worker_versions
+                             where agent_id = %s and name = %s and id::text = %s""",
                         (project, name, opts["version"]))
             rows = _rows(cur)
             row = rows[0] if rows else None
@@ -8031,8 +8051,8 @@ def _line_answer(row: dict, *, whole: bool = True) -> dict:
 
 
 def _active_line(cur, project: str, name: str, lock: bool = False) -> dict | None:
-    cur.execute(f"""select * from {SCHEMA}.tasks_lines
-                     where project_id = %s and name = %s and active
+    cur.execute(f"""select * from {SCHEMA}.tasks_line_versions
+                     where agent_id = %s and name = %s and active
                      {"for update" if lock else ""}""", (project, name))
     rows = _rows(cur)
     return rows[0] if rows else None
@@ -8053,14 +8073,14 @@ def _save_line_version(cur, project: str, name: str, spec: dict,
     if active and active["spec"] == spec:
         return active, False
     if active:
-        cur.execute(f"""update {SCHEMA}.tasks_lines set active = false
+        cur.execute(f"""update {SCHEMA}.tasks_line_versions set active = false
                          where id = %s and active""", (str(active["id"]),))
         if cur.rowcount != 1:
             _die(6, "conflict", f"line {name!r} was saved by someone else first",
                  f"read it again with `{NAME} lines show {name}`")
     try:
-        cur.execute(f"""insert into {SCHEMA}.tasks_lines
-                          (project_id, name, spec, active, created_by)
+        cur.execute(f"""insert into {SCHEMA}.tasks_line_versions
+                          (agent_id, name, spec, active, created_by)
                         values (%s, %s, %s::jsonb, true, %s)
                         returning *""",
                     (project, name, json.dumps(spec), _actor()))
@@ -8086,7 +8106,7 @@ def _lines_write_gate(action: str) -> None:
 def _line_states(cur, project: str) -> dict:
     """Every line state row of this project, by line."""
     cur.execute(f"""select line, state, reason, set_by, set_at
-                      from {SCHEMA}.tasks_line_states where project_id = %s""", (project,))
+                      from {SCHEMA}.tasks_line_states where agent_id = %s""", (project,))
     return {row["line"]: {"state": row["state"], "reason": row["reason"],
                           "set_by": row["set_by"], "set_at": _stamp(row["set_at"])}
             for row in _rows(cur)}
@@ -8140,8 +8160,8 @@ def cmd_lines(entry, args: list[str]) -> None:
         except Refusal as refused:
             _die(refused.exit_code, refused.code, refused.message, refused.hint)
         with _connect(entry) as conn, conn.cursor() as cur:
-            cur.execute(f"""select name, spec from {SCHEMA}.tasks_lines
-                             where project_id = %s and active and name <> %s""",
+            cur.execute(f"""select name, spec from {SCHEMA}.tasks_line_versions
+                             where agent_id = %s and active and name <> %s""",
                         (project, name))
             for row in _rows(cur):
                 taken = sorted(set(spec["workers"]) & set(_line_workers(row["spec"])))
@@ -8177,14 +8197,14 @@ def cmd_lines(entry, args: list[str]) -> None:
                      f"line {name!r} has no active version" if active is None
                      else f"line {name!r} is no longer at version {opts['base']}",
                      f"`{NAME} lines list` shows this project's lines")
-            cur.execute(f"""update {SCHEMA}.tasks_lines set active = false
+            cur.execute(f"""update {SCHEMA}.tasks_line_versions set active = false
                              where id = %s and active""", (str(active["id"]),))
             conn.commit()
             _emit({"line": name, "retired": str(active["id"])})
             return
         if action == "history":
-            cur.execute(f"""select * from {SCHEMA}.tasks_lines
-                             where project_id = %s and name = %s
+            cur.execute(f"""select * from {SCHEMA}.tasks_line_versions
+                             where agent_id = %s and name = %s
                              order by created_at asc, id asc""", (project, name))
             rows = _rows(cur)
             conn.commit()
@@ -8194,8 +8214,8 @@ def cmd_lines(entry, args: list[str]) -> None:
             _emit({"line": name, "versions": [_line_answer(r, whole=False) for r in rows]})
             return
         if opts.get("version"):
-            cur.execute(f"""select * from {SCHEMA}.tasks_lines
-                             where project_id = %s and name = %s and id::text = %s""",
+            cur.execute(f"""select * from {SCHEMA}.tasks_line_versions
+                             where agent_id = %s and name = %s and id::text = %s""",
                         (project, name, opts["version"]))
             rows = _rows(cur)
             row = rows[0] if rows else None
@@ -8211,8 +8231,8 @@ def cmd_lines(entry, args: list[str]) -> None:
 
 def _lines_list(entry, project: str) -> None:
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select * from {SCHEMA}.tasks_lines
-                         where project_id = %s and active order by name""", (project,))
+        cur.execute(f"""select * from {SCHEMA}.tasks_line_versions
+                         where agent_id = %s and active order by name""", (project,))
         rows = _rows(cur)
         conn.commit()
     _emit({"lines": [{"line": row["name"], "version": str(row["id"]),
@@ -8244,9 +8264,9 @@ def _line_hold(entry, project: str, name: str, action: str, reason: str | None) 
                  "line of every worker no line names")
         state = "paused" if action == "pause" else "running"
         cur.execute(f"""insert into {SCHEMA}.tasks_line_states as s
-                          (project_id, line, state, reason, set_by)
+                          (agent_id, line, state, reason, set_by)
                         values (%s, %s, %s, %s, %s)
-                        on conflict (project_id, line) do update
+                        on conflict (agent_id, line) do update
                            set state = excluded.state, reason = excluded.reason,
                                set_by = excluded.set_by, set_at = now()
                         returning state, reason, set_by, set_at""",
@@ -8292,8 +8312,8 @@ def _lines_status(entry, project: str, wanted: str | None) -> None:
     declared = _declarations()
     tz = _zone(entry)
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select * from {SCHEMA}.tasks_lines
-                         where project_id = %s and active order by name""", (project,))
+        cur.execute(f"""select * from {SCHEMA}.tasks_line_versions
+                         where agent_id = %s and active order by name""", (project,))
         rows = _rows(cur)
         states = _line_states(cur, project)
         named = {one for row in rows for one in _line_workers(row["spec"])}
@@ -8423,8 +8443,8 @@ def _hook_answer(row: dict, *, whole: bool = True) -> dict:
 
 
 def _active_hook(cur, project: str, name: str, lock: bool = False) -> dict | None:
-    cur.execute(f"""select * from {SCHEMA}.tasks_hooks
-                     where project_id = %s and name = %s and active
+    cur.execute(f"""select * from {SCHEMA}.tasks_hook_versions
+                     where agent_id = %s and name = %s and active
                      {"for update" if lock else ""}""", (project, name))
     rows = _rows(cur)
     return rows[0] if rows else None
@@ -8455,8 +8475,8 @@ def cmd_hooks(entry, args: list[str]) -> None:
     project = _writing_project()
     with _connect(entry) as conn, conn.cursor() as cur:
         if action == "list":
-            cur.execute(f"""select * from {SCHEMA}.tasks_hooks
-                             where project_id = %s and active order by name""", (project,))
+            cur.execute(f"""select * from {SCHEMA}.tasks_hook_versions
+                             where agent_id = %s and active order by name""", (project,))
             rows = _rows(cur)
             conn.commit()
             _emit({"hooks": [_hook_answer(r, whole=False) for r in rows]})
@@ -8492,14 +8512,14 @@ def cmd_hooks(entry, args: list[str]) -> None:
                 return
             try:
                 if active:
-                    cur.execute(f"""update {SCHEMA}.tasks_hooks set active = false
+                    cur.execute(f"""update {SCHEMA}.tasks_hook_versions set active = false
                                      where id = %s and active""", (str(active["id"]),))
                     if cur.rowcount != 1:
                         conn.rollback()
                         _die(6, "conflict", f"hook {name!r} was saved by someone else first",
                              f"read it again with `{NAME} hooks show {name}`")
-                cur.execute(f"""insert into {SCHEMA}.tasks_hooks
-                                  (project_id, name, description, body, active, created_by)
+                cur.execute(f"""insert into {SCHEMA}.tasks_hook_versions
+                                  (agent_id, name, description, body, active, created_by)
                                 values (%s, %s, %s, %s, true, %s) returning *""",
                             (project, name, description, body, _actor()))
             except psycopg.errors.UniqueViolation:
@@ -8519,15 +8539,15 @@ def cmd_hooks(entry, args: list[str]) -> None:
                      f"hook {name!r} has no active version" if active is None
                      else f"hook {name!r} is no longer at version {opts['base']}",
                      f"`{NAME} hooks list` shows this project's hooks")
-            cur.execute(f"""update {SCHEMA}.tasks_hooks set active = false
+            cur.execute(f"""update {SCHEMA}.tasks_hook_versions set active = false
                              where id = %s and active""", (str(active["id"]),))
             conn.commit()
             _forget_hooks()
             _emit({"hook": name, "retired": str(active["id"])})
             return
         if action == "history":
-            cur.execute(f"""select * from {SCHEMA}.tasks_hooks
-                             where project_id = %s and name = %s
+            cur.execute(f"""select * from {SCHEMA}.tasks_hook_versions
+                             where agent_id = %s and name = %s
                              order by created_at asc, id asc""", (project, name))
             rows = _rows(cur)
             conn.commit()
@@ -8537,8 +8557,8 @@ def cmd_hooks(entry, args: list[str]) -> None:
             _emit({"hook": name, "versions": [_hook_answer(r, whole=False) for r in rows]})
             return
         if opts.get("version"):
-            cur.execute(f"""select * from {SCHEMA}.tasks_hooks
-                             where project_id = %s and name = %s and id::text = %s""",
+            cur.execute(f"""select * from {SCHEMA}.tasks_hook_versions
+                             where agent_id = %s and name = %s and id::text = %s""",
                         (project, name, opts["version"]))
             rows = _rows(cur)
             row = rows[0] if rows else None
@@ -10776,7 +10796,7 @@ def _runs_by_ref(entry, opts: dict) -> None:
     # The scope `list` reads, and only that: the other filters are about tasks.
     scope = {k: opts[k] for k in ("project", "all-projects") if opts.get(k)}
     where, params = _where(scope)
-    clauses = [where.removeprefix(" where ").replace("project_id", "t.project_id")] \
+    clauses = [where.removeprefix(" where ").replace("agent_id", "t.agent_id")] \
         if where else []
     clauses.append("e.run_ref is not null")
     if systems:
@@ -10787,7 +10807,7 @@ def _runs_by_ref(entry, opts: dict) -> None:
         clauses.append("e.started_at >= %s")
         params.append(_moment(opts["since"], _zone(entry)))
     with _connect(entry) as conn, conn.cursor() as cur:
-        cur.execute(f"""select e.id as execution, t.id as task_id, t.project_id,
+        cur.execute(f"""select e.id as execution, t.id as task_id, t.agent_id,
                                t.unique_key, t.title, e.worker, e.status,
                                e.started_at, e.ended_at, e.run_system, e.run_ref
                           from {SCHEMA}.tasks_executions e
@@ -11754,7 +11774,7 @@ def _service_sweep_due(conn) -> bool:
             return True
         cur.execute(f"""select *, (pickup_at is not null and pickup_at <= now()) as due
                           from {SCHEMA}.tasks_tasks
-                         where status = 'waiting' and project_id = %s
+                         where status = 'waiting' and agent_id = %s
                            and {_open_raise_clause(False)}""", (project,))
         waiting = _rows(cur)
         ended = _ended_among(cur, sorted({one for task in waiting
@@ -11775,7 +11795,7 @@ def _service_next_moment(conn, cool_downs: dict | None = None) -> float | None:
     with conn.cursor() as cur:
         cur.execute(f"""select extract(epoch from (min(at) - now()))::float8 as seconds
                           from (select pickup_at as at from {SCHEMA}.tasks_tasks
-                                 where project_id = %s and status in ('todo', 'waiting')
+                                 where agent_id = %s and status in ('todo', 'waiting')
                                    and pickup_at > now()
                                 union all
                                 select e.lease_until from {SCHEMA}.tasks_executions e
@@ -11790,7 +11810,7 @@ def _service_next_moment(conn, cool_downs: dict | None = None) -> float | None:
                                      where e.task_id = t.id and e.status <> 'running'
                                        and {_a_raise()}
                                      order by e.started_at desc limit 1) l
-                                 where t.project_id = %s and t.status in ('todo', 'waiting')
+                                 where t.agent_id = %s and t.status in ('todo', 'waiting')
                                    and l.status in ('failed', 'abandoned')
                                    and {cooling} > now()
                                 union all
@@ -11848,9 +11868,9 @@ def _service_renew_leases(conn, held: list) -> dict:
                              where e.id::text = h.execution and e.task_id::text = h.task_id
                                and e.status = 'running'
                                and (e.task_id in (select id from {SCHEMA}.tasks_tasks
-                                                   where project_id = %s)
-                                    or e.worker_id in (select w.id from {SCHEMA}.tasks_workers w
-                                                        where w.project_id = %s))
+                                                   where agent_id = %s)
+                                    or e.worker_id in (select w.id from {SCHEMA}.tasks_worker_versions w
+                                                        where w.agent_id = %s))
                          returning e.id""", (short, executions, tasks, caps, project, project))
             renewed = [str(row["id"]) for row in _rows(cur)]
     return {"renewed": renewed, "every": every}
@@ -12123,20 +12143,20 @@ class _ServiceHost:
         # naming no session.
         locking = self.setting.has_session_address
         if not on:
-            conn.execute(f"delete from {rows} where project_id = %s and holder = %s",
+            conn.execute(f"delete from {rows} where agent_id = %s and holder = %s",
                          (self.project, self.presence))
             if locking:
                 conn.execute("select pg_advisory_unlock(%s, hashtext(%s))", key)
             return
         if not renew and locking:
             conn.execute("select pg_try_advisory_lock(%s, hashtext(%s))", key)
-        conn.execute(f"delete from {rows} where project_id = %s and expires_at <= now()",
+        conn.execute(f"delete from {rows} where agent_id = %s and expires_at <= now()",
                      (self.project,))
         conn.execute(f"""insert into {rows} as p
-                             (project_id, holder, node, lock_pid, expires_at)
+                             (agent_id, holder, node, lock_pid, expires_at)
                          values (%s, %s, %s, {'pg_backend_pid()' if locking else 'null'},
                                  now() + make_interval(secs => %s))
-                         on conflict (project_id, holder) do update
+                         on conflict (agent_id, holder) do update
                             set lock_pid = excluded.lock_pid, renewed_at = now(),
                                 expires_at = excluded.expires_at""",
                      (self.project, self.presence, node_name(), PRESENCE_SECONDS))
@@ -13921,11 +13941,11 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # moved here hold the same tables, columns, indexes, constraints, triggers and
 # functions.
 #
-# The harness profiles a raise runs on are kept in `harness_profiles`, a table
+# The harness profiles a raise runs on are kept in `harness_profile_versions`, a table
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
-STORE_MAJOR = 1
-STORE_MINOR = 9
+STORE_MAJOR = 2
+STORE_MINOR = 0
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -14377,6 +14397,36 @@ comment on column tasks_executions.profile_id is
   'profile the harness library ships, and for a claim that named no worker.';
 """
 
+# `0004-profiles` named the harness library's table by its name before 2.0,
+# `harness_profiles`, which the library's own step `0002-profile-versions`
+# renames. The library's steps are applied before these, and another
+# capability may have taken them to 2.0 before tasks first ran, so on a store
+# where 0004 was never applied that name is gone. The plan carries this step in
+# its place: on a store where 0004 was applied it finds the column and the key,
+# which followed the rename, and changes nothing; elsewhere it makes them,
+# naming the table by whichever name it has on that store, so the key is the
+# same whether the library's rename ran before or comes after. 0004's text is
+# kept for the record and for the tests that build a store at 1.9.
+_PROFILE_COLUMN_VERSIONS = r"""
+alter table tasks_executions add column if not exists profile_id uuid;
+do $fk$
+begin
+  if not exists (select 1 from pg_constraint
+                  where conrelid = 'tasks_executions'::regclass
+                    and conname = 'tasks_executions_profile_id_fkey') then
+    execute format('alter table tasks_executions add constraint '
+                   'tasks_executions_profile_id_fkey foreign key (profile_id) '
+                   'references %s (id)',
+                   coalesce(to_regclass('harness_profile_versions'),
+                            to_regclass('harness_profiles')));
+  end if;
+end
+$fk$;
+comment on column tasks_executions.profile_id is
+  'The stored harness profile version the raise ran on. Null for a raise on a '
+  'profile the harness library ships, and for a claim that named no worker.';
+"""
+
 _WORKERS_HISTORY_GUARD = r"""
 -- A worker version is history: the store refuses every write to it but moving
 -- active, whoever the writer is, so a raise's worker_id keeps meaning the role
@@ -14818,11 +14868,326 @@ comment on column tasks_tasks.line is
   'takes a task of this project only for a worker of the same line.';
 """
 
+_AGENT_NAMES = r"""
+-- 2.0 names the store for agents. The column that holds the agent is agent_id,
+-- and the one that says which agent wrote an entry or a move origin_agent_id;
+-- the versioned families are tasks_worker_versions, tasks_hook_versions and
+-- tasks_line_versions, and every object named for one of those tables or for
+-- the project takes the new name. Every row stays.
+alter table tasks_tasks rename column project_id to agent_id;
+alter table tasks_activities rename column origin_project to origin_agent_id;
+alter table tasks_changes rename column origin_project to origin_agent_id;
+alter table tasks_line_states rename column project_id to agent_id;
+alter table tasks_presences rename column project_id to agent_id;
+alter table tasks_workers rename to tasks_worker_versions;
+alter table tasks_worker_versions rename column project_id to agent_id;
+alter table tasks_hooks rename to tasks_hook_versions;
+alter table tasks_hook_versions rename column project_id to agent_id;
+alter table tasks_lines rename to tasks_line_versions;
+alter table tasks_line_versions rename column project_id to agent_id;
+
+alter function tasks_workers_keep_history() rename to tasks_worker_versions_keep_history;
+alter function tasks_workers_notify_declaration()
+  rename to tasks_worker_versions_notify_declaration;
+alter function tasks_hooks_keep_history() rename to tasks_hook_versions_keep_history;
+alter function tasks_hooks_notify_declaration() rename to tasks_hook_versions_notify_declaration;
+alter function tasks_lines_keep_history() rename to tasks_line_versions_keep_history;
+alter function tasks_lines_notify_declaration() rename to tasks_line_versions_notify_declaration;
+alter function tasks_lines_one_line_per_worker() rename to tasks_line_versions_one_line_per_worker;
+
+-- Constraints first, so a key's index and a constraint trigger move with their
+-- constraint, then every index and trigger still named the old way.
+create function tasks_agent_name(name text) returns text language sql immutable as $$
+  select replace(replace(replace(replace(replace(replace(name,
+           'tasks_workers_', 'tasks_worker_versions_'),
+           'tasks_hooks_', 'tasks_hook_versions_'),
+           'tasks_lines_', 'tasks_line_versions_'),
+           'tasks_project_', 'tasks_agent_'),
+           'origin_project', 'origin_agent_id'),
+           'project_id', 'agent_id')
+$$;
+do $rename$
+declare
+    one record;
+begin
+    for one in
+        select c.conname as old, t.relname as rel from pg_constraint c
+          join pg_class t on t.oid = c.conrelid
+         where t.relnamespace = current_schema()::regnamespace
+           and t.relname like 'tasks\_%' and t.relname not like 'tasks\_premig\_%'
+    loop
+        if tasks_agent_name(one.old) <> one.old then
+            execute format('alter table %I rename constraint %I to %I',
+                           one.rel, one.old, tasks_agent_name(one.old));
+        end if;
+    end loop;
+    for one in
+        select i.relname as old from pg_index x
+          join pg_class i on i.oid = x.indexrelid
+          join pg_class t on t.oid = x.indrelid
+         where t.relnamespace = current_schema()::regnamespace
+           and t.relname like 'tasks\_%' and t.relname not like 'tasks\_premig\_%'
+    loop
+        if tasks_agent_name(one.old) <> one.old then
+            execute format('alter index %I rename to %I', one.old, tasks_agent_name(one.old));
+        end if;
+    end loop;
+    for one in
+        select g.tgname as old, t.relname as rel from pg_trigger g
+          join pg_class t on t.oid = g.tgrelid
+         where t.relnamespace = current_schema()::regnamespace and not g.tgisinternal
+           and t.relname like 'tasks\_%' and t.relname not like 'tasks\_premig\_%'
+    loop
+        if tasks_agent_name(one.old) <> one.old then
+            execute format('alter trigger %I on %I rename to %I',
+                           one.old, one.rel, tasks_agent_name(one.old));
+        end if;
+    end loop;
+end
+$rename$;
+drop function tasks_agent_name(text);
+
+-- The functions the triggers run, recreated over the new names: a body is read
+-- only when it runs, so one left naming a column that moved breaks at the next
+-- write rather than here. A notification says agent_id where it said project.
+create or replace function tasks_worker_versions_keep_history() returns trigger as $$
+begin
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a worker version is never edited or deleted: % on tasks_worker_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_worker_versions_history';
+end;
+$$ language plpgsql;
+
+create or replace function tasks_hook_versions_keep_history() returns trigger as $$
+begin
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a hook version is never edited or deleted: % on tasks_hook_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_hook_versions_history';
+end;
+$$ language plpgsql;
+
+create or replace function tasks_line_versions_keep_history() returns trigger as $$
+begin
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a line version is never edited or deleted: % on tasks_line_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_line_versions_history';
+end;
+$$ language plpgsql;
+
+create or replace function tasks_worker_versions_notify_declaration() returns trigger
+language plpgsql as $$
+begin
+    perform pg_notify('tasks_declaration', json_build_object(
+        'schema', tg_table_schema, 'agent_id', new.agent_id,
+        'kind', 'worker', 'worker', new.name)::text);
+    if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+        execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                       'values (%L, $1, 1) on conflict (channel, scope) '
+                       'do update set version = c.version + 1',
+                       tg_table_schema, 'tasks_declaration')
+            using new.agent_id;
+    end if;
+    return null;
+end;
+$$;
+
+create or replace function tasks_hook_versions_notify_declaration() returns trigger
+language plpgsql as $$
+begin
+    perform pg_notify('tasks_declaration', json_build_object(
+        'schema', tg_table_schema, 'agent_id', new.agent_id,
+        'kind', 'hook', 'hook', new.name)::text);
+    if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+        execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                       'values (%L, $1, 1) on conflict (channel, scope) '
+                       'do update set version = c.version + 1',
+                       tg_table_schema, 'tasks_declaration')
+            using new.agent_id;
+    end if;
+    return null;
+end;
+$$;
+
+create or replace function tasks_line_versions_notify_declaration() returns trigger
+language plpgsql as $$
+begin
+    perform pg_notify('tasks_declaration', json_build_object(
+        'schema', tg_table_schema, 'agent_id', new.agent_id,
+        'kind', 'line', 'line', new.name)::text);
+    if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+        execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                       'values (%L, $1, 1) on conflict (channel, scope) '
+                       'do update set version = c.version + 1',
+                       tg_table_schema, 'tasks_declaration')
+            using new.agent_id;
+    end if;
+    return null;
+end;
+$$;
+
+create or replace function tasks_line_versions_one_line_per_worker() returns trigger
+language plpgsql as $$
+declare
+    worker  text;
+    held_on text;
+begin
+    perform pg_advisory_xact_lock(hashtext('tasks_lines'), hashtext(new.agent_id));
+    execute format('select w.name, l.name '
+                   '  from jsonb_array_elements_text($1) as w(name) '
+                   '  join %I.tasks_line_versions l on l.agent_id = $2 and l.active and l.id <> $3 '
+                   '                       and l.spec -> ''workers'' ? w.name '
+                   ' limit 1', tg_table_schema)
+        into worker, held_on using new.spec -> 'workers', new.agent_id, new.id;
+    if worker is not null then
+        raise exception 'worker % is on line % already: a worker is on one line of its agent', worker, held_on
+          using errcode = 'exclusion_violation', constraint = 'tasks_line_versions_one_line_per_worker';
+    end if;
+    return new;
+end;
+$$;
+
+create or replace function tasks_line_states_notify() returns trigger
+language plpgsql as $$
+begin
+    perform pg_notify('tasks_lines', json_build_object(
+        'schema', tg_table_schema, 'agent_id', new.agent_id,
+        'kind', 'line_state', 'line', new.line)::text);
+    if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+        execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                       'values (%L, $1, 1) on conflict (channel, scope) '
+                       'do update set version = c.version + 1',
+                       tg_table_schema, 'tasks_lines')
+            using new.agent_id;
+    end if;
+    return null;
+end;
+$$;
+
+create or replace function tasks_notify_claimable() returns trigger
+language plpgsql as $$
+begin
+    if new.status = 'todo' and (tg_op = 'INSERT'
+            or old.status is distinct from new.status
+            or old.pickup_at is distinct from new.pickup_at) then
+        perform pg_notify('tasks_claimable', json_build_object(
+            'schema', tg_table_schema, 'agent_id', new.agent_id,
+            'task', new.id, 'pickup_at', new.pickup_at)::text);
+        if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_watch')
+                using new.agent_id;
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_claimable')
+                using new.agent_id;
+        end if;
+    end if;
+    return null;
+end;
+$$;
+
+create or replace function tasks_notify_watch() returns trigger
+language plpgsql as $$
+declare
+    task    uuid;
+    agent   text;
+    kind    text;
+begin
+    if tg_table_name = 'tasks_tasks' then
+        task := new.id;
+        agent := new.agent_id;
+        kind := 'task_changed';
+    else
+        -- A hold episode's row is no raise: it records when a worker's before
+        -- hook first held the task back, and nothing a reader shows changed.
+        if tg_table_name = 'tasks_executions' then
+            if new.metrics ? 'hold' then
+                return null;
+            end if;
+        end if;
+        task := new.task_id;
+        execute format('select agent_id from %I.tasks_tasks where id = $1', tg_table_schema)
+           into agent using task;
+        if tg_table_name = 'tasks_activities' then
+            kind := 'activity_added';
+        elsif tg_op = 'INSERT' then
+            kind := 'run_started';
+        elsif old.ended_at is null and new.ended_at is not null then
+            kind := 'run_ended';
+        else
+            return null;
+        end if;
+    end if;
+    perform pg_notify('tasks_watch', json_build_object(
+        'schema', tg_table_schema, 'agent_id', agent,
+        'task', task, 'kind', kind)::text);
+    if agent is not null then
+        if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_watch')
+                using agent;
+        end if;
+    end if;
+    return null;
+end;
+$$;
+
+comment on column tasks_tasks.agent_id is
+  'Which agent the task belongs to, as that agent declares its own id. The only key: a '
+  'readable name for an agent lives with the agent, and a copy of it here would be a '
+  'second source of one fact. Reads may name another agent; a write only ever reaches '
+  'the agent it runs in, with one exception: the agent a task is assigned to may add to '
+  'its trail and set its assignee.';
+comment on column tasks_tasks.blocked_by is
+  'The tasks this one waits on, by id, in any agent. Every id names a task when it is '
+  'written and none leads back to this task through blockers still open. While one of '
+  'them has not ended the task is offered to no claim, whatever its open status; a '
+  'blocker that ended stays listed and holds nothing.';
+comment on column tasks_tasks.line is
+  'The line the task is worked on, by its name; null is the default line. A claim '
+  'takes a task of this agent only for a worker of the same line.';
+comment on column tasks_tasks.unique_key is
+  'Idempotency handle computed by whoever seeds the row, unique within its agent. '
+  'Nullable: many nulls coexist.';
+comment on column tasks_activities.origin_agent_id is
+  'The agent that wrote the entry, stamped by the CLI from the writer''s own declared id '
+  'and never from anything it was given. Null on an entry written before origins were '
+  'kept, which is the task''s own agent.';
+comment on column tasks_changes.origin_agent_id is
+  'The agent that made the move, stamped by the CLI from the writer''s own declared id. '
+  'Null on a move recorded before origins were kept, which is the task''s own agent.';
+comment on table tasks_line_states is
+  'Whether a line of an agent runs or is paused: runtime state, overwritten in place, '
+  'so a pause creates no line version. A line with no row runs. Every service of the '
+  'agent starts no new turn on a worker of a paused line.';
+comment on column tasks_line_states.line is
+  'The line by its name: an active line of the agent, or `default`, the line of every '
+  'worker no line names.';
+comment on table tasks_presences is
+  'A running tasks service serving an agent: one row per service, renewed while it runs '
+  'and removed when it stops; a row past expires_at says nothing.';
+comment on column tasks_presences.expires_at is
+  'When the row stops saying the agent is served unless renewed first.';
+comment on column tasks_presences.holder is
+  'The service process serving the agent; only it renews or removes the row.';
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
     ("0003-workers", _WORKERS_TABLE),
-    ("0004-profiles", _PROFILE_COLUMN),
+    ("0004-profile-versions", _PROFILE_COLUMN_VERSIONS),
     ("0005-workers-history", _WORKERS_HISTORY_GUARD),
     ("0006-execution-node", _EXECUTION_NODE),
     ("0007-hooks", _HOOKS_TABLE),
@@ -14830,6 +15195,7 @@ STORE_STEPS = [
     ("0009-change-versions", _CHANGE_VERSIONS),
     ("0010-service-presence", _SERVICE_PRESENCE),
     ("0011-lines", _LINES),
+    ("0012-agent-names", _AGENT_NAMES),
 ]
 
 

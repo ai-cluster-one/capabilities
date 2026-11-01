@@ -185,7 +185,7 @@ class FakeCursor:
         text = sql.strip()
         if "tasks_executions" in text:
             self.answer = [dict(OPEN)]
-        elif text.startswith("select id, project_id"):
+        elif text.startswith("select id, agent_id"):
             self.answer = [{"id": params[0], "project_id": HERE}]
         elif text.startswith("select * from"):
             self.answer = [{"id": params[0], "metadata": dict(self.carried)}]

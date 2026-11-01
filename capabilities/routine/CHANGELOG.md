@@ -1,5 +1,9 @@
 # routine — change log
 
+## 2026-11-01 — The store names the agent: routine's tables go to schema major 2
+
+`routine`'s tables name an agent where they named a project: `routine_documents.project_id` is `agent_id`, `routine_documents.author_project_id` is `author_agent_id` and `routine_enablements.project_id` is `agent_id`, and every constraint and comment named for them moves with them. Step `0007-agent-names` renames them in place with every row kept and takes the ledger to 2.0, so a `routine` of an earlier release refuses a migrated store with `schema_too_new` instead of misreading it, and this release brings a store at 1.2 to 2.0 on its first call. The capability now needs `capabilities-contract` 0.42.0, whose core tables carry the manager's new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-10-31 — `routine` carries its own icon
 
 The bundle holds its icon as `icon.png`, a numbered list: Lucide's `list-ordered` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon routine` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

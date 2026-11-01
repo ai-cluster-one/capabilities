@@ -310,6 +310,84 @@ def _rows(port: int, database: str, query: str) -> list[tuple]:
         return conn.execute(query).fetchall()
 
 
+# Every name and comment in an owner's tables that still says project, where the
+# store now says agent: table columns, relations, constraints, triggers, comments, and
+# the bodies of the owner's functions.
+_SAYS_PROJECT = """
+SELECT 'column ' || c.relname || '.' || a.attname FROM pg_attribute a
+  JOIN pg_class c ON c.oid = a.attrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+   AND a.attname ~* 'project'
+UNION ALL SELECT 'relation ' || c.relname FROM pg_class c
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relname ~* 'project'
+UNION ALL SELECT 'constraint ' || o.conname FROM pg_constraint o
+  JOIN pg_class c ON c.oid = o.conrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND o.conname ~* 'project'
+UNION ALL SELECT 'trigger ' || g.tgname FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND g.tgname ~* 'project'
+UNION ALL SELECT 'comment on ' || c.relname || coalesce('.' || a.attname, '')
+  FROM pg_description d JOIN pg_class c ON c.oid = d.objoid AND d.classoid = 'pg_class'::regclass
+  LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid AND d.objsubid > 0
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND d.description ~* 'project'
+UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
+ WHERE p.pronamespace = %(schema)s::regnamespace AND p.proname LIKE %(like)s
+   AND p.prosrc ~* 'project'
+"""
+
+
+def test_a_lease_table_at_major_1_is_renamed_in_place_and_keeps_its_rows(
+        tmp_path: Path, cluster) -> None:
+    """A store whose lease table is at 1.1, holding a lease, takes the agent
+    name in place: the row reads under it, the runner's own lease turns read
+    and write it, and a release that knows only major 1 is refused."""
+    import importlib.machinery
+    import importlib.util
+
+    import psycopg
+    from capabilities_contract import db
+    loader = importlib.machinery.SourceFileLoader("deployment_lease_m1", str(DEPLOYMENT))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    m = importlib.util.module_from_spec(spec)
+    loader.exec_module(m)
+    old = [step for step in m.LEASE_STEPS if step[0] != "0003-agent-names"]
+    database, rows = _database(cluster)
+    with psycopg.connect(host="127.0.0.1", port=cluster, user=ADMIN, dbname=database,
+                         autocommit=True) as conn:
+        db.migrate(conn, "deployment", old, major=1, minor=1, schema="lab")
+        conn.execute("SET search_path TO lab")
+        conn.execute("INSERT INTO deployment_service_leases (project, capability, node, "
+                     "expires_at, last_exit) VALUES (%s, 'fixture', '6e6f64652d61', "
+                     "now() + interval '1 hour', 3)", (PROJECT_ID,))
+        result = db.migrate(conn, "deployment", m.LEASE_STEPS, major=m.LEASE_MAJOR,
+                            minor=m.LEASE_MINOR, schema="lab")
+        assert result.applied == ["0003-agent-names"]
+        assert (result.major, result.minor) == (2, 0)
+        conn.execute("SET search_path TO lab")
+        assert conn.execute(_SAYS_PROJECT, {"schema": "lab", "like": "deployment\\_%"}
+                            ).fetchall() == []
+        with pytest.raises(db.DbError) as refused:
+            db.migrate(conn, "deployment", old, major=1, minor=1, schema="lab")
+        assert refused.value.slug == "schema_too_new"
+    assert rows("SELECT agent_id, capability, node, last_exit "
+                "FROM deployment_service_leases") == [(PROJECT_ID, "fixture", "6e6f64652d61", 3)]
+
+    root = _project(tmp_path / "a", {"id": PROJECT_ID, "slug": "lab", "records": "store"},
+                    dotenv=(f"AGENTKIT_DB_URL=postgresql://{ADMIN}@127.0.0.1:{cluster}/"
+                            f"{database}?sslmode=disable\nAGENTKIT_DB_SCHEMA=lab\n"))
+    seen = m._lease_read(root, PROJECT_ID, "6e6f64652d62", "fixture")
+    assert (seen["state"], seen["holder"]) == ("held_elsewhere", "6e6f64652d61")
+    holder = m._Lease(root, PROJECT_ID, "6e6f64652d61", ttl=30)
+    assert holder.acquire("fixture")["state"] == "held"
+    assert holder.record_error("fixture", 7, "it failed") == {"recorded": True}
+    assert holder.release("fixture")["released"] is True
+    assert rows("SELECT * FROM deployment_service_leases") == []
+
+
 def _manager(root: Path, env: dict[str, str], *args: str) -> dict:
     proc = subprocess.run([str(MANAGER), *args], cwd=root, env=env, capture_output=True,
                           text=True, timeout=240)
@@ -622,7 +700,7 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
 
     def seen() -> dict:
         return dict(rows("SELECT id, last_seen_at > now() - interval '1 minute' "
-                         "FROM capabilities_nodes WHERE last_seen_at IS NOT NULL"))
+                         "FROM nodes WHERE last_seen_at IS NOT NULL"))
 
     def until_seen(want: dict) -> None:
         deadline = time.monotonic() + 40
@@ -644,7 +722,7 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
         for node, root in roots.items():
             runners[node] = Runner(root, env, node, tmp_path / f"{node}.log")
         until_seen({"6d61632d6100": True, "626f782d6200": True})
-        rows("UPDATE capabilities_nodes SET last_seen_at = now() - interval '1 hour' "
+        rows("UPDATE nodes SET last_seen_at = now() - interval '1 hour' "
              "WHERE last_seen_at IS NOT NULL RETURNING id")
         until_seen({"6d61632d6100": True, "626f782d6200": True})
         for runner in runners.values():
@@ -659,7 +737,7 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
 
         # box-b falls silent: past three reconciles it no longer reads live.
         runners.pop("626f782d6200").stop()
-        rows("UPDATE capabilities_nodes SET last_seen_at = now() - interval '16 seconds' "
+        rows("UPDATE nodes SET last_seen_at = now() - interval '16 seconds' "
              "WHERE id = '626f782d6200' RETURNING id")
         nodes = {n["node"]: n for n in listed()["nodes"]}
         assert (nodes["626f782d6200"]["live"], nodes["6d61632d6100"]["live"]) == (False, True)
@@ -700,7 +778,7 @@ def _installed_fixture(env: dict[str, str], placement: str) -> None:
 
 INSTANCES = ("SELECT node, state, ready, problem, problem_code, pid, host, payload_sha256, "
              "last_exit_code, last_error, skipped_settings "
-             "FROM capabilities_service_instances WHERE project_id = '" + PROJECT_ID
+             "FROM service_instances WHERE agent_id = '" + PROJECT_ID
              + "' AND capability = 'fixture' ORDER BY node")
 
 

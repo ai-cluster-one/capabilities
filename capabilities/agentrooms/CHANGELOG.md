@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-11-01 — The service's tables name the agent as `agent_id`, at store version 2.0
+
+Breaking for an older release on the same store. Ledger step `0012-agent-names` (agentrooms 2.0) renames, in place and keeping every row: `project_id` to `agent_id` in every agentrooms table, and `agentrooms_workers` to `agentrooms_worker_versions`, with its key, indexes, triggers and their function. The notification a held wake sends on `agentrooms_held` names the agent as `agent_id` where it said `project`; the channel and its change versions are as before. A release of agentrooms 1.x that meets the store at 2.0 refuses with `schema_too_new`; this release migrates a store at 1.5 when it opens it. Nothing agentrooms prints changes. The runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions`.
+
 ## 2026-10-31 — `agentrooms` carries its own icon
 
 The bundle holds its icon as `icon.png`, two speech bubbles: Lucide's `messages-square` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon agentrooms` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

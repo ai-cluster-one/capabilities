@@ -227,8 +227,8 @@ def test_automations_reads_and_writes_its_settings_as_rows(world):
 
 def test_automations_agent_profiles_are_harness_profiles(world):
     w = world
-    rows = dict(w.sql("SELECT name, spec FROM harness_profiles WHERE scope = 'project' "
-                      "AND scope_id = %s AND active AND name LIKE 'automations-%%'",
+    rows = dict(w.sql("SELECT name, spec FROM harness_profile_versions WHERE "
+                      "agent_id = %s AND active AND name LIKE 'automations-%%'",
                       (IDS["moved"],)))
     _say("automations-harness-profiles", rows)
     assert set(rows) == {f"automations-{n}" for n in WANTED_AGENTS}
@@ -239,7 +239,7 @@ def test_automations_agent_profiles_are_harness_profiles(world):
     assert rows["automations-sonnet"]["tools"] == ["Read", "Glob", "Grep"]
     # The default stays a key of the settings document: a profile row has no
     # place for it.
-    assert w.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
+    assert w.sql("SELECT value FROM settings WHERE agent_id = %s AND "
                  "capability = 'automations' AND path = '{agents,default}'",
                  (IDS["moved"],)) == [("researcher",)]
     moved = w.answer(run(w, "moved", "automations", "agents"))
@@ -250,12 +250,12 @@ def test_automations_agent_profiles_are_harness_profiles(world):
     for name, profile in WANTED_AGENTS.items():
         assert moved["workers"][name] == profile, name
     # A profile saved in the store later is the one a run resolves.
-    w.sql("UPDATE harness_profiles SET spec = jsonb_set(spec, '{model}', '\"haiku\"') "
-          "WHERE scope_id = %s AND name = 'automations-terra' AND active", (IDS["moved"],))
+    w.sql("UPDATE harness_profile_versions SET spec = jsonb_set(spec, '{model}', '\"haiku\"') "
+          "WHERE agent_id = %s AND name = 'automations-terra' AND active", (IDS["moved"],))
     assert w.answer(run(w, "moved", "automations", "agents"))["workers"]["terra"]["model"] \
         == "haiku"
-    w.sql("UPDATE harness_profiles SET spec = jsonb_set(spec, '{model}', '\"gpt-x-terra\"') "
-          "WHERE scope_id = %s AND name = 'automations-terra' AND active", (IDS["moved"],))
+    w.sql("UPDATE harness_profile_versions SET spec = jsonb_set(spec, '{model}', '\"gpt-x-terra\"') "
+          "WHERE agent_id = %s AND name = 'automations-terra' AND active", (IDS["moved"],))
 
 
 def test_the_automations_daemon_starts_and_reloads_without_a_config_file(world):
@@ -295,7 +295,7 @@ def test_askproject_resolves_its_profiles_from_the_store(world):
     # Only its own: the other capabilities' harness profiles at the agent's
     # scope - automations' agents, whatsapp's dialogue profile - are neither
     # listed nor resolved, as its folder never held them.
-    held = {name for (name,) in w.sql("SELECT name FROM harness_profiles WHERE scope_id = %s "
+    held = {name for (name,) in w.sql("SELECT name FROM harness_profile_versions WHERE agent_id = %s "
                                       "AND active", (IDS["moved"],))}
     assert "askproject-peer-read" in held and "automations-researcher" in held
     assert "clinic-claude" in held
@@ -327,7 +327,7 @@ def test_tasks_reads_its_conveyor_and_settings_as_rows(world):
     # naming the store.
     assert out["settings"]["homes"][0]["document"]["escalation"] == {
         "escalate_to": ["Owner"], "stall_after": "6h"}
-    w.sql("UPDATE capabilities_settings SET value = '[\"nobody\", \"Owner\"]' WHERE agent_id "
+    w.sql("UPDATE settings SET value = '[\"nobody\", \"Owner\"]' WHERE agent_id "
           "= %s AND capability = 'tasks' AND path = '{escalation,escalate_to}'", (IDS["moved"],))
     doctor = run(w, "moved", "tasks", "doctor")
     _say("tasks-doctor-conveyor", {"stdout": doctor.stdout, "stderr": doctor.stderr})
@@ -342,7 +342,7 @@ def test_tasks_reads_its_conveyor_and_settings_as_rows(world):
                                      "escalation.stall_after", "2h"))}
     _say("tasks-settings-escalation", edits)
     assert edits["chain"]["value"] == ["Owner"] and edits["ceiling"]["value"] == "2h"
-    assert w.sql("SELECT path, value FROM capabilities_settings WHERE agent_id = %s AND "
+    assert w.sql("SELECT path, value FROM settings WHERE agent_id = %s AND "
                  "capability = 'tasks' AND path[1] = 'escalation' ORDER BY path",
                  (IDS["moved"],)) == [(["escalation", "escalate_to"], ["Owner"]),
                                       (["escalation", "stall_after"], "2h")]
@@ -378,7 +378,7 @@ def test_slack_reads_its_allow_list_as_rows(world):
     _say("slack-policy-allowed", {"stderr": allowed.stderr, "exit": allowed.returncode})
     assert w.error(allowed)["code"] != "policy_refusal"
     # policy.json is the slack settings' own allow-list now.
-    assert w.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
+    assert w.sql("SELECT value FROM settings WHERE agent_id = %s AND "
                  "capability = 'slack' AND path = '{allowed_users,U01}'",
                  (IDS["moved"],)) == [({},)]
     # Edited with the settings verb, and the gate reads the edit.
@@ -429,7 +429,7 @@ def test_policy_and_service_settings_move_as_one_allow_list(world):
             "allowed_users": {"U01": "drop", "U05": "keep"},
             "allowed_channels": {"C01": "keep", "C03": "drop"}}}})))
     document = {tuple(path): value for path, value in w.sql(
-        "SELECT path, value FROM capabilities_settings WHERE agent_id = %s AND "
+        "SELECT path, value FROM settings WHERE agent_id = %s AND "
         "capability = 'slack'", ("prj_dbonly00004",))}
     _say("slack-one-allow-list", {"questions": asked, "refused": refused,
                                   "verify": applied["verify"], "document": {
@@ -472,7 +472,7 @@ def test_conveyor_moves_into_the_tasks_settings_unless_they_carry_one(world):
     w.agentkit_list()
     applied = w.answer(w.manager(root, "migrate", "--apply", "--answers",
                                  answers_file(w, "queue", {})))
-    rows = w.sql("SELECT path, value FROM capabilities_settings WHERE agent_id = %s AND "
+    rows = w.sql("SELECT path, value FROM settings WHERE agent_id = %s AND "
                  "capability = 'tasks' ORDER BY path", ("prj_dbonly00005",))
     _say("tasks-conveyor-folded", {"rows": rows, "verify": applied["verify"]})
     assert applied["state"] == "migrated" and not applied["verify"]["differences"]
@@ -482,7 +482,7 @@ def test_conveyor_moves_into_the_tasks_settings_unless_they_carry_one(world):
     assert status["initialized"] is False
     init = w.answer(w.cap(root, "tasks", "service", "init"))
     assert init["written"] and w.sql(
-        "SELECT value FROM capabilities_settings WHERE agent_id = %s AND capability = 'tasks' "
+        "SELECT value FROM settings WHERE agent_id = %s AND capability = 'tasks' "
         "AND path = '{escalation,escalate_to}'", ("prj_dbonly00005",)) == [(["Owner"],)]
     # Settings that carry the table already keep it; the file is not moved.
     kept = w.agent("queue-kept", "prj_dbonly00006", {
@@ -495,7 +495,7 @@ def test_conveyor_moves_into_the_tasks_settings_unless_they_carry_one(world):
     assert any("conveyor.toml is not moved" in line for line in dry["plan"]["warnings"]), dry
     w.answer(w.manager(kept, "migrate", "--apply", "--answers",
                        answers_file(w, "queue-kept", {})))
-    assert w.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
+    assert w.sql("SELECT value FROM settings WHERE agent_id = %s AND "
                  "path = '{escalation,escalate_to}'", ("prj_dbonly00006",)) == [(["Lead"],)]
 
 
@@ -536,7 +536,7 @@ def test_service_init_in_a_moved_agent_writes_rows_and_no_file(world):
     }
     _say("service-init-fresh", out)
     assert before == [] and w.files_left(root) == []
-    docs = {d for (d,) in w.sql("SELECT capability FROM capabilities_settings_documents "
+    docs = {d for (d,) in w.sql("SELECT capability FROM settings_documents "
                                 "WHERE agent_id = %s", (IDS["fresh"],))}
     assert {"automations", "tasks", "memory", "slack"} <= docs
     again = w.answer(run(w, "fresh", "automations", "service", "init"))
@@ -639,21 +639,21 @@ def test_global_marks_the_rows_written_only_once_every_document_is(blank):
     # the records rows and before the marker.
     w.sql("CREATE FUNCTION refuse_settings() RETURNS trigger LANGUAGE plpgsql AS "
           "$$ BEGIN RAISE EXCEPTION 'refused for the test'; END $$")
-    w.sql("CREATE TRIGGER refuse_settings BEFORE INSERT ON capabilities_settings "
+    w.sql("CREATE TRIGGER refuse_settings BEFORE INSERT ON settings "
           "FOR EACH ROW EXECUTE FUNCTION refuse_settings()")
     failed = w.manager(root, "migrate", "--global", "--apply")
     _say("global-interrupted", {"exit": failed.returncode, "stderr": failed.stderr})
     assert failed.returncode != 0
-    assert w.sql("SELECT global_migrated_at FROM capabilities_global") == [(None,)]
-    assert w.sql("SELECT capability FROM capabilities_policy WHERE agent_id IS NULL "
+    assert w.sql("SELECT global_migrated_at FROM store_state") == [(None,)]
+    assert w.sql("SELECT capability FROM policies WHERE agent_id IS NULL "
                  "ORDER BY capability") == [("coolify",), ("memory",)]
-    w.sql("DROP TRIGGER refuse_settings ON capabilities_settings")
+    w.sql("DROP TRIGGER refuse_settings ON settings")
     w.sql("DROP FUNCTION refuse_settings()")
     again = w.answer(w.manager(root, "migrate", "--global", "--apply"))
     _say("global-resumed", again)
     assert again["global_migrated_at"] and again["settings_written"] == {"memory": again[
         "settings_written"]["memory"]}
-    assert w.sql("SELECT path, value FROM capabilities_settings WHERE agent_id IS NULL") == [
+    assert w.sql("SELECT path, value FROM settings WHERE agent_id IS NULL") == [
         (["max_entries"], 500)]
 
 
@@ -677,7 +677,7 @@ def test_an_agent_made_after_discard_migrates_without_the_config_home(blank):
     _say("migrate-after-discard", {"dry": dry, "applied": applied})
     assert applied["state"] == "migrated", applied
     assert not applied["verify"]["differences"], applied["verify"]
-    assert w.sql("SELECT connection, enabled FROM capabilities_connection_grants WHERE "
+    assert w.sql("SELECT connection, enabled FROM grants WHERE "
                  "agent_id = 'prj_blank0000002'") == [("ops", True)]
 
 
@@ -686,13 +686,13 @@ def test_a_refused_write_while_an_agent_moves_creates_no_file(blank):
     root = w.agent("moving", "prj_blank0000003", {"{env}/settings.json": gate("memory")})
     w.answer(w.manager(root, "agent", "show"))
     w.answer(w.manager(root, "node", "add", nid(MASTER), "--kind", "mac", "--master"))
-    w.sql("UPDATE capabilities_agents SET migrating_since = now() WHERE id = 'prj_blank0000003'")
+    w.sql("UPDATE agents SET migrating_since = now() WHERE id = 'prj_blank0000003'")
     before = w.files(root)
     refused = w.error(w.manager(root, "enable", "coolify", "--project"))
     _say("frozen-enable", refused)
     assert refused["code"] == "agent_migrating"
     assert w.files(root) == before and not (root / "capabilities" / ".gitignore").exists()
-    w.sql("UPDATE capabilities_agents SET migrating_since = NULL "
+    w.sql("UPDATE agents SET migrating_since = NULL "
           "WHERE id = 'prj_blank0000003'")
 
 
@@ -729,7 +729,7 @@ def test_a_core_arrival_is_a_global_row_where_a_database_resolves(blank, tmp_pat
         assert installed.returncode == 0, installed.stderr
         first = json.loads(installed.stdout)
         # A row the store holds already is the user's, and is kept.
-        w.sql("UPDATE capabilities_policy SET enabled = false WHERE agent_id IS NULL AND "
+        w.sql("UPDATE policies SET enabled = false WHERE agent_id IS NULL AND "
               "capability = %s", (CORE,))
         subprocess.run([str(MANAGER), "uninstall", CORE], cwd=_outside(tmp_path), env=env,
                        text=True, capture_output=True, timeout=120, check=True)
@@ -738,12 +738,12 @@ def test_a_core_arrival_is_a_global_row_where_a_database_resolves(blank, tmp_pat
             capture_output=True, timeout=300, check=True).stdout)
     _say("install-arrival-with-database", {"first": first, "again": again})
     assert first["global_policy"] == {"enabled": True,
-                                      "gate": f"store:{SCHEMA}.capabilities_policy"}
+                                      "gate": f"store:{SCHEMA}.policies"}
     assert "global_policy" not in again
-    assert w.sql("SELECT enabled FROM capabilities_policy WHERE agent_id IS NULL AND "
+    assert w.sql("SELECT enabled FROM policies WHERE agent_id IS NULL AND "
                  "capability = %s AND node IS NULL", (CORE,)) == [(False,)]
     assert not (tmp_path / "config" / "capabilities" / "settings.json").exists()
-    w.sql("DELETE FROM capabilities_policy WHERE agent_id IS NULL AND capability = %s",
+    w.sql("DELETE FROM policies WHERE agent_id IS NULL AND capability = %s",
           (CORE,))
 
 
@@ -773,7 +773,7 @@ def test_core_arrivals_made_before_a_store_are_written_by_the_global_migration(
     arrivals = [r for r in migrated["plan"]["policy"] if r.get("arrival")]
     assert [r["capability"] for r in arrivals] == [first]
     with w.admin(w.database) as conn:
-        rows = conn.execute(f"SELECT capability, enabled FROM {schema}.capabilities_policy "
+        rows = conn.execute(f"SELECT capability, enabled FROM {schema}.policies "
                             "WHERE agent_id IS NULL AND node IS NULL ORDER BY capability"
                             ).fetchall()
         conn.execute(f"DROP SCHEMA {schema} CASCADE")
@@ -798,7 +798,7 @@ def test_a_new_store_gets_the_core_enables_a_machine_installed_against_another(
 
         def rows(schema: str) -> list:
             with w.admin(w.database) as conn:
-                return conn.execute(f"SELECT capability, enabled FROM {schema}.capabilities_policy "
+                return conn.execute(f"SELECT capability, enabled FROM {schema}.policies "
                                     "WHERE agent_id IS NULL AND node IS NULL ORDER BY capability"
                                     ).fetchall()
 
@@ -883,16 +883,16 @@ def test_a_dev_session_keeps_its_records_in_a_schema_of_its_own(world, tmp_path)
         diagnostic = next(json.loads(line)["dev_run"] for line in ran.stderr.splitlines()
                           if line.startswith('{"dev_run"'))
         assert diagnostic["database_schema"] == "dev_dbonly_lane"
-        assert diagnostic["projected_rows"]["capabilities_agents"] == 1
+        assert diagnostic["projected_rows"]["agents"] == 1
         # The payload read the projected rows of its own schema, as the agent's
         # own command reads the store's.
         lane_homes = json.loads(ran.stdout)["homes"]
         real_homes = json.loads(direct.stdout)["homes"]
         assert [h["document"] for h in lane_homes] == [h["document"] for h in real_homes]
-        assert lane_homes[0]["path"] == "store:dev_dbonly_lane.capabilities_settings"
-        assert real_homes[0]["path"] == f"store:{SCHEMA}.capabilities_settings"
+        assert lane_homes[0]["path"] == "store:dev_dbonly_lane.settings"
+        assert real_homes[0]["path"] == f"store:{SCHEMA}.settings"
         held = w.sql("SELECT id, migrated_at IS NOT NULL FROM dev_dbonly_lane."
-                     "capabilities_agents")
+                     "agents")
         assert held == [(IDS["moved"], True)]
     finally:
         manager("dev", "stop", "dbonly-lane", "--discard-work")
@@ -981,7 +981,7 @@ def test_the_machine_scheduler_serves_a_moved_agent(world):
     # On its list as the node manager puts an agent placed on the node in
     # mode shared there (`node supervise automations --machine`).
     root = w.roots["moved"]
-    [(slug,)] = w.sql("SELECT slug FROM capabilities_agents WHERE id = %s", (IDS["moved"],))
+    [(slug,)] = w.sql("SELECT slug FROM agents WHERE id = %s", (IDS["moved"],))
     slug = slug or json.loads((root / "capabilities" / "project.json").read_text()).get(
         "slug") or IDS["moved"]
     listing = w.config / "automations" / "service" / "projects.toml"

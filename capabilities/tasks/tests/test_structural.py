@@ -54,7 +54,7 @@ def raw_task(conn, schema: str, key: str, *, kind: str = "alpha", status: str = 
     refuses to write it. Its blockers are ids."""
     return str(conn.execute(
         f"""insert into {schema}.tasks_tasks
-              (project_id, type, title, unique_key, status, assignee, blocked_by)
+              (agent_id, type, title, unique_key, status, assignee, blocked_by)
             values (%s, %s, %s, %s, %s, %s, %s::uuid[]) returning id""",
         (hooks.HERE, kind, f"a {kind}", key, status, assignee,
          list(blocked_by))).fetchone()[0])

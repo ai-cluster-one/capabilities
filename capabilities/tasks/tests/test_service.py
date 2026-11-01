@@ -556,7 +556,7 @@ def test_a_running_daemon_is_seen_as_serving_its_project(project, store):
             return mod._serving(cur, HERE)
 
     def rows() -> list:
-        return conn.execute(f"select project_id, lock_pid, expires_at > now() as live "
+        return conn.execute(f"select agent_id, lock_pid, expires_at > now() as live "
                             f"from {schema}.tasks_presences").fetchall()
 
     def locks() -> int:
@@ -600,7 +600,7 @@ def test_on_a_transaction_only_store_the_daemon_serves_by_its_row_alone(
             return mod._serving(cur, HERE)
 
     def rows() -> list:
-        return conn.execute(f"select project_id, lock_pid, expires_at > now() as live "
+        return conn.execute(f"select agent_id, lock_pid, expires_at > now() as live "
                             f"from {schema}.tasks_presences").fetchall()
 
     def locks() -> int:
@@ -678,7 +678,7 @@ def test_a_transaction_only_store_is_migrated_on_transaction_connections(
         mod._migrate_profile_tables()
         with psycopg.connect(DSN, autocommit=True) as conn:
             assert conn.execute("select to_regclass(%s) is not null",
-                                (f"{schema}.harness_profiles",)).fetchone()[0]
+                                (f"{schema}.harness_profile_versions",)).fetchone()[0]
         with mod._connect({"allow_write": True}):
             pass
         with psycopg.connect(DSN, autocommit=True) as conn:
@@ -699,7 +699,7 @@ def test_a_task_moved_to_todo_or_given_a_new_pickup_is_announced(project, store,
     mod.cmd_set(entry, [tid, "--status", "todo"])
     capsys.readouterr()
     [moved] = heard()
-    assert (moved["schema"], moved["project"], moved["task"]) == (schema, HERE, tid)
+    assert (moved["schema"], moved["agent_id"], moved["task"]) == (schema, HERE, tid)
     mod.cmd_set(entry, [tid, "--pickup", "2099-01-01"])
     capsys.readouterr()
     [held] = heard()

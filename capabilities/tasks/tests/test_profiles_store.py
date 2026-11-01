@@ -151,8 +151,9 @@ def refused(proc: subprocess.CompletedProcess, exit_code: int) -> dict:
 def rows(lab, name: str) -> list[tuple]:
     import psycopg
     with psycopg.connect(DSN) as conn:
-        return conn.execute(f"""select scope, scope_id, active, id::text
-                                  from {lab['schema']}.harness_profiles
+        return conn.execute(f"""select case when agent_id is null then 'global'
+                                       else 'project' end, agent_id, active, id::text
+                                  from {lab['schema']}.harness_profile_versions
                                  where name = %s order by created_at, id""", (name,)).fetchall()
 
 
@@ -166,12 +167,12 @@ def test_the_librarys_table_is_migrated_first_under_its_own_ledger(lab):
     with psycopg.connect(DSN) as conn:
         ledger = conn.execute(f"""select owner, step from {lab['schema']}.schema_ledger
                                    order by applied_at, owner, step""").fetchall()
-    assert ("harness", "0001-profiles") in ledger and ("tasks", "0004-profiles") in ledger
-    assert ledger.index(("harness", "0001-profiles")) < ledger.index(("tasks", "0004-profiles"))
+    assert ("harness", "0001-profiles") in ledger and ("tasks", "0004-profile-versions") in ledger
+    assert ledger.index(("harness", "0001-profiles")) < ledger.index(("tasks", "0004-profile-versions"))
     doctor = ok(cli(lab, "doctor"))
     assert doctor["profile_tables"]["owner"] == "harness"
     assert doctor["profile_tables"]["state"] == "current"
-    assert doctor["tables"]["code"] == {"major": 1, "minor": 9}
+    assert doctor["tables"]["code"] == {"major": 2, "minor": 0}
 
 
 @needs_store

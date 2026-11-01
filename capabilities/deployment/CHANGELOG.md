@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-01 — The store names the agent: the service lease table goes to schema major 2
+
+`deployment_service_leases.project` is `agent_id`, and the not-null constraint named for it moves with it where the store names one. Step `0003-agent-names` renames it in place with every lease kept and takes deployment's ledger to 2.0; the manager applies the same steps where it supervises a service, so a runner or manager of an earlier release refuses a migrated store with `schema_too_new` instead of misreading it, and this release's runner brings a store at 1.1 to 2.0 on its first lease turn. `deployment services` reads the lease, and the service instance rows the node manager keeps are read from the store's `service_instances`. The capability now needs `capabilities-contract` 0.42.0, whose core tables carry the manager's new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-11-01 — `node status` finds the container of a node Coolify builds from a repository
 
 `deployment node status` and `deployment node login` look for the agent container under the Compose service `agent`. A node that is a Coolify application built from a repository has one container whose Compose service is named after the application, so the lookup found nothing: status failed with `node_container` and reported the server unreachable, while `node exec` reached the same node. When no container carries the `agent` service, the lookup now takes the application's one running container, as `node exec` already does; none or several still fail with `node_container`.

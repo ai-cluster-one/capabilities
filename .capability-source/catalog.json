@@ -3,7 +3,7 @@
     "agentrooms": {
       "icon": true,
       "path": "capabilities/agentrooms",
-      "payload_sha256": "8bb518af0b5366af3e2652fbd11f72cecc3cd3c063bdbb2541df21808fb0e620",
+      "payload_sha256": "9ac78b15bdb6f0da382b92576d002710d257f6f18c634506bd98a08dd2c34693",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
     "agenttemplates": {
@@ -21,19 +21,19 @@
     "askproject": {
       "icon": true,
       "path": "capabilities/askproject",
-      "payload_sha256": "05be14e6f7d121aad0d32c67a001fe5a34b52b8fd282da7229d28a24705effe2",
+      "payload_sha256": "90072f177d25e01f6aa8d424e9e8813b8328b8a48db291c64a1ba7925041f93f",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability."
     },
     "assets": {
       "icon": true,
       "path": "capabilities/assets",
-      "payload_sha256": "9fca7bf5194cc393b54d94ec815cebc7e99ed1563308dc6319f0ceae2f0fd66b",
+      "payload_sha256": "62092a316875a28f80229e06c52a4fcb6e6ee7bce0a3a6891dce99fd902bcbc8",
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder."
     },
     "automations": {
       "icon": true,
       "path": "capabilities/automations",
-      "payload_sha256": "aaa55ced9a5d99535e63c6b07695b0e7e98d242c5b87136d670989e969501d23",
+      "payload_sha256": "c524e5afd0db94d6cbf3646bc62f53ff05f7bae66f2d4a1f57c82bf32fbfcf19",
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
     "calcomc": {
@@ -69,7 +69,7 @@
     "context": {
       "icon": true,
       "path": "capabilities/context",
-      "payload_sha256": "1e80655a8a64cae2b7743a14f400273378599ed608ce353e14fae68a98a24ab8",
+      "payload_sha256": "418faaaa5de8ea84f591b7df278acd107bf6c45af07afd043b164132a712ca33",
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte."
     },
     "coolify": {
@@ -81,7 +81,7 @@
     "deployment": {
       "icon": true,
       "path": "capabilities/deployment",
-      "payload_sha256": "4901f88a2b3df64056bf8579bc9425460b15de66c432831ab30f819207c795a3",
+      "payload_sha256": "163c7f4dc235d653bf4d549ecee543bcaf26f0120286958a713036d86c6675f5",
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to."
     },
     "directo": {
@@ -141,7 +141,7 @@
     "memory": {
       "icon": true,
       "path": "capabilities/memory",
-      "payload_sha256": "5ac0c4b3c9c79f906522681e7ae8c71431827f22dcd39413f1756b04420e072e",
+      "payload_sha256": "194756a822c445aa71f4c7a5e832cec7c535ff136f85b239a447831840cad64b",
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
     },
     "notion": {
@@ -171,7 +171,7 @@
     "routine": {
       "icon": true,
       "path": "capabilities/routine",
-      "payload_sha256": "f254dfe0c335291f2d48c75fca6654673cdff3eebdfedfa392b5e0142099b05a",
+      "payload_sha256": "4fb14750c55801ffcf2f2b6ef9d50d9bea88344589e81c822c631ae6449e6438",
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte."
     },
     "signoz": {
@@ -213,13 +213,13 @@
     "tasks": {
       "icon": true,
       "path": "capabilities/tasks",
-      "payload_sha256": "bd146349814577a2065a6d22f47c04aa8ba857a17ca57bc31c5ea76474f7e94b",
+      "payload_sha256": "7723293917117502a7a1c11db743cae4ad3f7446a34386405d96e32edb03811c",
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "c116ad6f0e558acce20621afab3e863948a1cf9d233a3775b472a43027c71f57",
+      "payload_sha256": "e80a1c0e0f096a16ddb3ab902f9d304de65c5a009340080971c4a46312f592ef",
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "vapic": {
@@ -231,7 +231,7 @@
     "whatsapp": {
       "icon": true,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "7765d68d5b53661393e1e5dd6732382ebb9933673c507c3eda7771ba87ab924b",
+      "payload_sha256": "27110c736c9bfec98235858b85010347568aabe97770085901c31cca76eee314",
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {

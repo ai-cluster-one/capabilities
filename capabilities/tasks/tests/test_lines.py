@@ -101,7 +101,7 @@ def test_a_worker_is_on_one_line_and_the_store_says_so(lab):
     assert error["code"] == "conflict" and "'alpha' is on line 'one'" in error["message"]
     # The store refuses it whoever writes.
     with psycopg.connect(stored.DSN) as conn, pytest.raises(psycopg.errors.ExclusionViolation):
-        conn.execute(f"""insert into {lab['schema']}.tasks_lines (project_id, name, spec)
+        conn.execute(f"""insert into {lab['schema']}.tasks_line_versions (agent_id, name, spec)
                          values (%s, 'two', '{{"workers": ["alpha"]}}')""", (lab["ids"]["here"],))
     # Another project's line may name a worker of the same name.
     ok(cli(lab, "lines", "save", "two", "-", where="there",

@@ -217,11 +217,11 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'context' ORDER BY step")]
     assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
-                     "0005-enablements"]
+                     "0005-enablements", "0006-agent-names"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["context_versions_active"]
-    assert "COALESCE(project_id, ''::text), name" in indexes["context_documents_name"]
+    assert "COALESCE(agent_id, ''::text), name" in indexes["context_documents_name"]
     assert "WHERE (retired_at IS NULL)" in indexes["context_documents_name"]
     for table in ("context_documents", "context_versions"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
@@ -230,6 +230,80 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
         "SELECT a.attname FROM pg_attribute a WHERE a.attrelid = %s::regclass "
         "AND col_description(a.attrelid, a.attnum) IS NOT NULL", (f"{SCHEMA}.context_versions",))}
     assert {"load", "position", "body", "active", "note"} <= commented
+
+
+# Every name and comment in an owner's tables that still says project, where the
+# store now says agent: table columns, relations, constraints, triggers, comments, and
+# the bodies of the owner's functions.
+_SAYS_PROJECT = """
+SELECT 'column ' || c.relname || '.' || a.attname FROM pg_attribute a
+  JOIN pg_class c ON c.oid = a.attrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+   AND a.attname ~* 'project'
+UNION ALL SELECT 'relation ' || c.relname FROM pg_class c
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relname ~* 'project'
+UNION ALL SELECT 'constraint ' || o.conname FROM pg_constraint o
+  JOIN pg_class c ON c.oid = o.conrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND o.conname ~* 'project'
+UNION ALL SELECT 'trigger ' || g.tgname FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND g.tgname ~* 'project'
+UNION ALL SELECT 'comment on ' || c.relname || coalesce('.' || a.attname, '')
+  FROM pg_description d JOIN pg_class c ON c.oid = d.objoid AND d.classoid = 'pg_class'::regclass
+  LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid AND d.objsubid > 0
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND d.description ~* 'project'
+UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
+ WHERE p.pronamespace = %(schema)s::regnamespace AND p.proname LIKE %(like)s
+   AND p.prosrc ~* 'project'
+"""
+
+
+def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab):
+    import psycopg
+    from capabilities_contract import db
+    cli = load_module()
+    old = [step for step in cli.LEDGER_STEPS if step[0] != "0006-agent-names"]
+    with psycopg.connect(lab.cluster.url(lab.database), autocommit=True) as conn:
+        db.migrate(conn, "context", old, major=1, minor=1, schema=SCHEMA)
+        conn.execute(f"SET search_path TO {SCHEMA}")
+        insert = ("INSERT INTO context_documents (project_id, name, created_by, author_project_id) "
+                  "VALUES (%s, %s, 'u@n', %s) RETURNING id")
+        own = conn.execute(insert, (PROJECT_ID, "identity/MISSION", None)).fetchone()[0]
+        shared = conn.execute(insert, (None, "guidelines/SHARED", OTHER_ID)).fetchone()[0]
+        for document, title in ((own, "Mission"), (shared, "Shared")):
+            conn.execute("INSERT INTO context_versions (document_id, title, description, load, "
+                         "position, body, created_by) VALUES (%s, %s, 'Load it.', 'inline', 1, "
+                         "'kept', 'u@n')", (document, title))
+        conn.execute("INSERT INTO context_enablements (project_id, document_id, enabled_by) "
+                     "VALUES (%s, %s, 'u@n')", (PROJECT_ID, shared))
+
+        result = db.migrate(conn, "context", cli.LEDGER_STEPS, major=cli.LEDGER_MAJOR,
+                            minor=cli.LEDGER_MINOR, schema=SCHEMA)
+        assert result.applied == ["0006-agent-names"]
+        assert (result.major, result.minor) == (2, 0)
+        conn.execute(f"SET search_path TO {SCHEMA}")
+        assert conn.execute("SELECT name, agent_id, author_agent_id FROM context_documents "
+                            "ORDER BY name").fetchall() == [
+            ("guidelines/SHARED", None, OTHER_ID), ("identity/MISSION", PROJECT_ID, None)]
+        assert conn.execute("SELECT agent_id, document_id FROM context_enablements"
+                            ).fetchall() == [(PROJECT_ID, shared)]
+        assert conn.execute(_SAYS_PROJECT, {"schema": SCHEMA, "like": "context\\_%"}
+                            ).fetchall() == []
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("UPDATE context_documents SET agent_id = '' WHERE id = %s", (own,))
+        # A release that knows only major 1 refuses the store rather than misreading it.
+        with pytest.raises(db.DbError) as refused:
+            db.migrate(conn, "context", old, major=1, minor=1, schema=SCHEMA)
+        assert refused.value.slug == "schema_too_new"
+
+    listed = lab.ok("list", "--json")["documents"]
+    assert [(d["name"], d["origin"]) for d in listed] == [
+        ("guidelines/SHARED", "global"), ("identity/MISSION", "own")]
+    assert listed[0]["author"] == OTHER_ID and listed[0]["enabled"] is True
 
 
 def test_the_store_keeps_versions_immutable_but_for_clearing_active(lab):
@@ -356,7 +430,7 @@ def test_global_documents_are_apart_from_the_projects_and_retire_frees_a_name(la
     assert lab.ok("save", "identity/MISSION", "--global", "--from", "-",
                   stdin=FILES["identity/MISSION.md"])["outcome"] == "created"
     [(count,)] = lab.sql(f"SELECT count(*) FROM {SCHEMA}.context_documents "
-                         "WHERE project_id IS NULL AND name = 'identity/MISSION'")
+                         "WHERE agent_id IS NULL AND name = 'identity/MISSION'")
     assert count == 2
 
 
@@ -416,7 +490,7 @@ def test_only_the_author_project_changes_a_global_document_or_hands_it_on(lab):
     # A global document saved before documents had authors has none, and the
     # first project that writes it becomes its author.
     lab.ok("save", "guidelines/OLD", "--global", "--from", "-", stdin=mission)
-    lab.sql(f"UPDATE {SCHEMA}.context_documents SET author_project_id = NULL "
+    lab.sql(f"UPDATE {SCHEMA}.context_documents SET author_agent_id = NULL "
             "WHERE name = 'guidelines/OLD'")
     assert lab.ok("list", "--global", "--json")["documents"][0]["author"] is None
     claimed = json.loads(_in(lab, other, "save", "guidelines/OLD", "--global", "--from", "-",
@@ -492,7 +566,7 @@ def test_a_system_agent_s_documents_are_not_written(lab):
     shown = subprocess.run([sys.executable, str(MANAGER), "agent", "show"], cwd=lab.project,
                            env=lab.env(), text=True, capture_output=True, timeout=180)
     assert shown.returncode == 0, shown.stderr
-    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id, kind) VALUES (%s, 'system') "
+    lab.sql(f"INSERT INTO {SCHEMA}.agents (id, kind) VALUES (%s, 'system') "
             "ON CONFLICT (id) DO UPDATE SET kind = 'system'", (PROJECT_ID,))
     for args in (("save", "identity/MISSION", "--from", "-"), ("retire", "identity/MISSION"),
                  ("import",), ("transfer", "identity/MISSION", "--to", "prj_x"),

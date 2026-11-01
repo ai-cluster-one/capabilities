@@ -1,5 +1,11 @@
 # tasks — change log
 
+## 2026-11-01 — The store names tasks' rows for agents, at store version 2.0
+
+Breaking for an older release on the same store. Step `0012-agent-names` (tasks 2.0) renames, in place and keeping every row: `project_id` to `agent_id` in `tasks_tasks`, `tasks_line_states`, `tasks_presences` and the versioned tables; `origin_project` to `origin_agent_id` in `tasks_activities` and `tasks_changes`; and `tasks_workers`, `tasks_hooks` and `tasks_lines` to `tasks_worker_versions`, `tasks_hook_versions` and `tasks_line_versions`, with their keys, indexes, constraints, triggers and trigger functions. The notifications on `tasks_claimable`, `tasks_declaration`, `tasks_lines` and `tasks_watch` name the agent as `agent_id` where they said `project`; the channels and their change versions are as before. A release of tasks 1.x that meets the store at 2.0 refuses with `schema_too_new`; this release migrates a store at 1.9. Every key tasks prints, `project_id` and `origin_project` included, is as before. The manager's service rows are read as `service_instances` and a stored routine through `agent_id`, so tasks declares `capabilities-contract>=0.42,<1`; the runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions`.
+
+The runner's 2.0 step renames `harness_profiles`, which the applied step `0004-profiles` names in the key from `tasks_executions.profile_id`; on a store where that step never ran - a fresh store, or one whose harness table another capability already took to 2.0 - it could no longer be applied. The steps now carry `0004-profile-versions` in its place: on a store where `0004-profiles` was applied it finds the column and the key, which followed the rename, and changes nothing; elsewhere it makes them against `harness_profile_versions`. Either way the store ends with the same key. The ledger row of `0004-profiles` stays where it was applied.
+
 ## 2026-10-31 — `tasks` carries its own icon
 
 The bundle holds its icon as `icon.png`, a checklist: Lucide's `list-checks` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon tasks` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

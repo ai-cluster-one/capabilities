@@ -419,7 +419,7 @@ class DialogueCase(unittest.TestCase):
 
     def register_row(self, chat, project_id="prj_test"):
         return self.db.execute(
-            "SELECT * FROM whatsapp_register WHERE project_id = %s AND account = %s"
+            "SELECT * FROM whatsapp_register WHERE agent_id = %s AND account = %s"
             " AND chat_id = %s", (project_id, self.db.account, chat)).fetchone()
 
 
@@ -435,11 +435,12 @@ class Register(DialogueCase):
         self.assertEqual(steps[12], "0013-register")
         version = self.db.execute(
             "SELECT major, minor FROM schema_version WHERE owner = 'whatsapp'").fetchone()
-        self.assertEqual((version["major"], version["minor"]), (1, wa.STORE_SCHEMA_MINOR))
+        self.assertEqual((version["major"], version["minor"]),
+                         (wa.STORE_SCHEMA_MAJOR, wa.STORE_SCHEMA_MINOR))
         columns = {r["column_name"] for r in self.db.execute(
             "SELECT column_name FROM information_schema.columns"
             " WHERE table_name = 'whatsapp_register'")}
-        self.assertTrue({"project_id", "environment", "account", "chat_id", "watermark",
+        self.assertTrue({"agent_id", "environment", "account", "chat_id", "watermark",
                          "processed", "overrides", "counters"} <= columns)
 
     def test_the_reservation_is_written_before_the_turn_starts(self):

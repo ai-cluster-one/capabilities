@@ -46,7 +46,7 @@ LEGACY_AUTOMATION_KEYS = frozenset(
      "overlap", "retries", "arguments", "environments"}
 )
 
-# What one definition holds, each its own column of automations_definitions.
+# What one definition holds, each its own column of automations_definition_versions.
 # `max_parallel`, `max_pending` and `overlap` are not among them: no project
 # ever set them to anything but 1, 1 and skip, so those are fixed here, and
 # one run of an automation at a time holds across every machine on the store.
@@ -768,9 +768,15 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
 # Every run is inserted with its node, so the trigger that filled a missing
 # node from the host is dropped (`0007-runs-node-written`): a host is a machine
 # name, never a node id, and an insert without a node is refused.
+#
+# 2.0 (`0008-agent-names`) names the store for agents: the column that holds
+# the agent is `agent_id` in both tables, the versioned definitions are
+# `automations_definition_versions` with every object named for that table,
+# and the notification a saved definition sends says `agent_id`. Every row
+# stays; a release of 1.x meets 2.0 as too new and refuses.
 LEDGER_OWNER = "automations"
-LEDGER_MAJOR = 1
-LEDGER_MINOR = 4
+LEDGER_MAJOR = 2
+LEDGER_MINOR = 0
 # The most a run may record: it is handed to the next run as one environment
 # variable, which the kernel caps at 128 KiB.
 RESULT_MAX_BYTES = 65536
@@ -948,7 +954,81 @@ LEDGER_STEPS = [
     DROP TRIGGER automations_runs_node_from_host ON automations_runs;
     DROP FUNCTION automations_runs_node_from_host();
     """),
+    ("0008-agent-names", r"""
+    ALTER TABLE automations_runs RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE automations_definitions RENAME TO automations_definition_versions;
+    ALTER TABLE automations_definition_versions RENAME COLUMN project_id TO agent_id;
+    ALTER INDEX automations_definitions_one_active
+        RENAME TO automations_definition_versions_one_active;
+    ALTER INDEX automations_definitions_history_idx
+        RENAME TO automations_definition_versions_history_idx;
+    ALTER TRIGGER automations_definitions_keep_history_row ON automations_definition_versions
+        RENAME TO automations_definition_versions_keep_history_row;
+    ALTER TRIGGER automations_definitions_keep_history_truncate ON automations_definition_versions
+        RENAME TO automations_definition_versions_keep_history_truncate;
+    ALTER TRIGGER automations_definitions_changed ON automations_definition_versions
+        RENAME TO automations_definition_versions_changed;
+    ALTER FUNCTION automations_definitions_keep_history()
+        RENAME TO automations_definition_versions_keep_history;
+    ALTER FUNCTION automations_definitions_announce()
+        RENAME TO automations_definition_versions_announce;
+
+    -- Every constraint named for the old table or for project_id - the primary
+    -- key, the checks, and the not-null constraints where the server names
+    -- them - takes the new names; a key's index is renamed with it.
+    DO $rename$
+    DECLARE
+      one record;
+    BEGIN
+      FOR one IN
+        SELECT c.conname, t.relname FROM pg_constraint c
+        JOIN pg_class t ON t.oid = c.conrelid
+        WHERE c.conrelid IN ('automations_runs'::regclass,
+                             'automations_definition_versions'::regclass)
+          AND (c.conname LIKE 'automations\_definitions\_%' OR c.conname LIKE '%project\_id%')
+      LOOP
+        EXECUTE format('ALTER TABLE %I RENAME CONSTRAINT %I TO %I', one.relname, one.conname,
+                       replace(replace(one.conname, 'automations_definitions_',
+                                       'automations_definition_versions_'),
+                               'project_id', 'agent_id'));
+      END LOOP;
+    END
+    $rename$;
+
+    CREATE OR REPLACE FUNCTION automations_definition_versions_keep_history() RETURNS trigger AS $$
+    BEGIN
+      IF tg_op = 'UPDATE' AND (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') THEN
+        RETURN new;
+      END IF;
+      RAISE EXCEPTION 'an automation version is never edited or deleted: % on automations_definition_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+        USING errcode = 'restrict_violation', constraint = 'automations_definition_versions_history';
+    END;
+    $$ LANGUAGE plpgsql;
+
+    CREATE OR REPLACE FUNCTION automations_definition_versions_announce() RETURNS trigger AS $$
+    BEGIN
+      PERFORM pg_notify('automations_changed', json_build_object(
+          'schema', tg_table_schema, 'agent_id', new.agent_id, 'slug', new.slug)::text);
+      EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                     'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                     'DO UPDATE SET version = c.version + 1',
+                     tg_table_schema, 'automations_changed')
+          USING new.agent_id;
+      RETURN NULL;
+    END;
+    $$ LANGUAGE plpgsql;
+
+    COMMENT ON COLUMN automations_definition_versions.script_path IS
+        'The script as a file in the agent''s folder, relative to its root, on the node '
+        'that runs it. Exactly one of script_path and script_body is set.';
+    """),
 ]
+
+
+def _row_names(cursor) -> list[str]:
+    """The keys a row is read under: the store's column names, but the agent's
+    column keeps the key `project_id` it has always been read and printed as."""
+    return ["project_id" if c[0] == "agent_id" else c[0] for c in cursor.description]
 
 
 class StoreUnavailable(Exception):
@@ -1283,7 +1363,7 @@ class RunLedger:
     # -- the scope, applied once ----------------------------------------------
 
     def _where(self, *predicates: str) -> tuple[str, list]:
-        return " WHERE " + " AND ".join(("project_id = %s", *predicates)), [self.project_id]
+        return " WHERE " + " AND ".join(("agent_id = %s", *predicates)), [self.project_id]
 
     @staticmethod
     def _value(value: Any) -> Any:
@@ -1297,7 +1377,7 @@ class RunLedger:
 
     @classmethod
     def _dicts(cls, cursor) -> list[dict[str, Any]]:
-        names = [c[0] for c in cursor.description]
+        names = _row_names(cursor)
         return [{name: cls._value(value) for name, value in zip(names, row)}
                 for row in cursor.fetchall()]
 
@@ -1395,11 +1475,11 @@ class RunLedger:
         node = node or self.node
         with self.transaction():
             inserted = self._execute(
-                "INSERT INTO automations_runs (id, project_id, automation_slug, "
+                "INSERT INTO automations_runs (id, agent_id, automation_slug, "
                 "environment, trigger, scheduled_for, dedupe_key, status, attempt, "
                 "parent_run_id, queued_at, log_path, host, node, definition_id) "
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s) "
-                "ON CONFLICT (project_id, dedupe_key) DO NOTHING",
+                "ON CONFLICT (agent_id, dedupe_key) DO NOTHING",
                 (run_id, self.project_id, slug, node, trigger,
                  scheduled_for, dedupe_key, attempt, parent_run_id, iso(),
                  str(log_path), self.host, node, definition_id)).rowcount
@@ -1443,10 +1523,10 @@ class RunLedger:
 
     def _definition_rows(self, predicates: str, params: Sequence[Any],
                          order: str = "slug", lock: bool = False) -> list[dict[str, Any]]:
-        sql = ("SELECT * FROM automations_definitions WHERE project_id = %s AND "
+        sql = ("SELECT * FROM automations_definition_versions WHERE agent_id = %s AND "
                + predicates + f" ORDER BY {order}" + (" FOR UPDATE" if lock else ""))
         cursor = self._execute(sql, [self.project_id, *params])
-        names = [c[0] for c in cursor.description]
+        names = _row_names(cursor)
         return [{name: (str(value) if isinstance(value, uuid.UUID) else value)
                  for name, value in zip(names, row)} for row in cursor.fetchall()]
 
@@ -1463,7 +1543,7 @@ class RunLedger:
         try:
             with self.conn.transaction():
                 rows = self._execute(
-                    "SELECT node FROM capabilities_policy WHERE agent_id = %s "
+                    "SELECT node FROM policies WHERE agent_id = %s "
                     "AND capability = %s AND service AND node IS NOT NULL ORDER BY node",
                     (self.project_id, PLACEMENT_CAPABILITY)).fetchall()
         except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
@@ -1497,13 +1577,13 @@ class RunLedger:
                     for name in DEFINITION_FIELDS):
                 return active, False
             if active is not None:
-                self._execute("UPDATE automations_definitions SET active = false "
+                self._execute("UPDATE automations_definition_versions SET active = false "
                               "WHERE id = %s AND active", [active["id"]])
-            columns = ["project_id", "slug", *DEFINITION_FIELDS, "created_by"]
+            columns = ["agent_id", "slug", *DEFINITION_FIELDS, "created_by"]
             values = [self.project_id, slug, *(fields[name] for name in DEFINITION_FIELDS), by]
             try:
                 cursor = self._execute(
-                    f"INSERT INTO automations_definitions ({', '.join(columns)}) "
+                    f"INSERT INTO automations_definition_versions ({', '.join(columns)}) "
                     f"VALUES ({', '.join(['%s'] * len(columns))}) RETURNING id", values)
             except Exception as exc:
                 if type(exc).__name__ != "UniqueViolation":
@@ -1523,7 +1603,7 @@ class RunLedger:
             if base is not None and rows[0]["id"] != base:
                 raise ConfigError(f"automation {slug!r} is no longer at version {base}: "
                                   f"{rows[0]['id']} is active")
-            self._execute("UPDATE automations_definitions SET active = false "
+            self._execute("UPDATE automations_definition_versions SET active = false "
                           "WHERE id = %s AND active", [rows[0]["id"]])
         return rows[0]
 

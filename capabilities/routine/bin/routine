@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.37,<1",
+#     "capabilities-contract>=0.42,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -511,7 +511,7 @@ def cmd_groom(args) -> None:
 # versions reference their routine by a foreign key: both tables are this
 # capability's own and a routine is retired rather than deleted, so the key
 # never blocks a write and refuses only a version of no routine.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 2
+LEDGER_MAJOR, LEDGER_MINOR = 2, 0
 _STORE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
 LEDGER_STEPS = [
     ("0001-documents", f"""
@@ -639,6 +639,44 @@ LEDGER_STEPS = [
         'When the project switched its own routine off: it leaves the routine index the manager builds and stays in the store. NULL while it is on, and always for a global routine.';
     COMMENT ON COLUMN routine_documents.disabled_by IS
         'Who switched it off: user@node.';
+    """),
+    # The store names an agent where it named a project: the columns that hold
+    # one, every constraint named for them, and every comment that says it. The
+    # rows stay where they are; this is major 2, so a release that still reads
+    # the old names refuses the store instead of failing on a missing column.
+    ("0007-agent-names", """
+    ALTER TABLE routine_documents RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE routine_documents RENAME COLUMN author_project_id TO author_agent_id;
+    ALTER TABLE routine_enablements RENAME COLUMN project_id TO agent_id;
+    DO $$
+    DECLARE r record;
+    BEGIN
+        FOR r IN SELECT c.conrelid::regclass AS tab, c.conname
+                   FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+                  WHERE t.relnamespace = current_schema()::regnamespace
+                    AND t.relname IN ('routine_documents', 'routine_enablements')
+                    AND c.conname LIKE '%project%'
+        LOOP
+            EXECUTE format('ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+                           r.tab, r.conname, replace(r.conname, 'project', 'agent'));
+        END LOOP;
+    END $$;
+    COMMENT ON TABLE routine_documents IS
+        'One routine of an agent: what never changes about it. Its content is in routine_versions.';
+    COMMENT ON COLUMN routine_documents.agent_id IS
+        'The agent''s declared id; NULL for a global routine, which belongs to no agent and reaches one only once that agent enables it.';
+    COMMENT ON COLUMN routine_documents.name IS
+        'The routine''s front-matter name, equal to its file''s stem; unique per agent among unretired routines.';
+    COMMENT ON COLUMN routine_documents.author_agent_id IS
+        'For a global routine, the agent that alone saves its versions, retires it and hands authorship on; NULL for an agent''s own routine.';
+    COMMENT ON COLUMN routine_documents.disabled_at IS
+        'When the agent switched its own routine off: it leaves the routine index the manager builds and stays in the store. NULL while it is on, and always for a global routine.';
+    COMMENT ON TABLE routine_enablements IS
+        'A global routine an agent has enabled: the agent lists, shows and indexes its active version unless a routine of its own has the same name. Disabling deletes the row.';
+    COMMENT ON COLUMN routine_enablements.agent_id IS
+        'The declared id of the agent that enabled the routine.';
+    COMMENT ON COLUMN routine_enablements.document_id IS
+        'The global routine enabled: a routine_documents row with no agent.';
     """),
 ]
 
@@ -850,24 +888,24 @@ _VERSION_COLUMNS = ("d.name, v.id, v.document_id, v.title, v.description, v.body
 _VERSIONS = "routine_versions v JOIN routine_documents d ON d.id = v.document_id"
 
 
-_DOCUMENT_COLUMNS = ("d.id, d.project_id, d.name, d.created_at, d.created_by, "
-                     "d.author_project_id, d.project_id IS NULL AS global")
+_DOCUMENT_COLUMNS = ("d.id, d.agent_id, d.name, d.created_at, d.created_by, "
+                     "d.author_agent_id, d.agent_id IS NULL AS global")
 
 # A global routine a project has enabled and holds no routine of its own name
 # for: the routines it sees are its own and these. The manager's routine index
 # reads the same rule.
-_ENABLED_GLOBAL = ("d.project_id IS NULL AND EXISTS (SELECT 1 FROM routine_enablements e "
-                   "WHERE e.document_id = d.id AND e.project_id = %(project)s) "
+_ENABLED_GLOBAL = ("d.agent_id IS NULL AND EXISTS (SELECT 1 FROM routine_enablements e "
+                   "WHERE e.document_id = d.id AND e.agent_id = %(project)s) "
                    "AND NOT EXISTS (SELECT 1 FROM routine_documents o "
-                   "WHERE o.project_id = %(project)s AND o.name = d.name "
+                   "WHERE o.agent_id = %(project)s AND o.name = d.name "
                    "AND o.retired_at IS NULL)")
-_SEEN = f"(d.project_id = %(project)s OR ({_ENABLED_GLOBAL}))"
+_SEEN = f"(d.agent_id = %(project)s OR ({_ENABLED_GLOBAL}))"
 
 
 def _document(conn, project: str | None, name: str, lock: bool = False) -> dict | None:
     """The unretired routine of `name` in the project, or the global one for None."""
     return _one(conn, f"SELECT {_DOCUMENT_COLUMNS} FROM routine_documents d "
-                "WHERE coalesce(d.project_id, '') = %s AND d.name = %s AND d.retired_at IS NULL"
+                "WHERE coalesce(d.agent_id, '') = %s AND d.name = %s AND d.retired_at IS NULL"
                 + (" FOR UPDATE" if lock else ""), (project or "", name))
 
 
@@ -899,9 +937,9 @@ def _seen_document(conn, project: str | None, name: str, is_global: bool) -> dic
 
 def _authored(document: dict, project: str) -> None:
     """Refuse a change to a global routine by any project but its author."""
-    if document["author_project_id"] != project:
+    if document["author_agent_id"] != project:
         _die(4, "not_author", f"the global routine {document['name']!r} is authored by "
-             f"{document['author_project_id']}, not by this project ({project})",
+             f"{document['author_agent_id']}, not by this project ({project})",
              "only its author project saves it, retires it or hands it on with "
              f"`{NAME} transfer`")
 
@@ -949,20 +987,20 @@ def _version_view(version: dict, with_body: bool = True) -> dict:
 def cmd_store_list(args) -> None:
     if args.is_global:
         project = _reader(True)
-        where, params = "d.project_id IS NULL", {"project": project}
+        where, params = "d.agent_id IS NULL", {"project": project}
     else:
         project = _scope(write=False)
         where, params = _SEEN, {"project": project}
     with _store() as conn:
-        rows = _rows(conn, "SELECT d.name, d.project_id IS NULL AS global, d.author_project_id, "
+        rows = _rows(conn, "SELECT d.name, d.agent_id IS NULL AS global, d.author_agent_id, "
                      "v.id, v.title, v.description, v.created_at, "
                      + ("EXISTS (SELECT 1 FROM routine_enablements e WHERE e.document_id = d.id "
-                        "AND e.project_id = %(project)s)" if args.is_global and project
-                        else "(d.project_id IS NULL OR d.disabled_at IS NULL)")
+                        "AND e.agent_id = %(project)s)" if args.is_global and project
+                        else "(d.agent_id IS NULL OR d.disabled_at IS NULL)")
                      + " AS enabled, "
-                     "(d.project_id IS NOT NULL AND EXISTS (SELECT 1 FROM routine_documents g "
+                     "(d.agent_id IS NOT NULL AND EXISTS (SELECT 1 FROM routine_documents g "
                      "JOIN routine_enablements e ON e.document_id = g.id "
-                     "AND e.project_id = d.project_id WHERE g.project_id IS NULL "
+                     "AND e.agent_id = d.agent_id WHERE g.agent_id IS NULL "
                      "AND g.name = d.name AND g.retired_at IS NULL)) AS shadows_global "
                      "FROM routine_documents d JOIN routine_versions v "
                      "ON v.document_id = d.id AND v.active "
@@ -976,7 +1014,7 @@ def cmd_store_list(args) -> None:
             if project is not None:
                 item["enabled"] = r["enabled"]
             if r["global"]:
-                item["author"] = r["author_project_id"]
+                item["author"] = r["author_agent_id"]
             elif r["shadows_global"]:
                 item["shadows_global"] = True
             listed.append(item)
@@ -989,7 +1027,7 @@ def cmd_store_list(args) -> None:
         return
     width = max(len(r["name"]) for r in rows)
     _emit("\n".join(f"{r['name']:<{width}}  {str(r['id'])[:8]}  {r['description']}"
-                    + (f"  (global, by {r['author_project_id']})" if r["global"] else "")
+                    + (f"  (global, by {r['author_agent_id']})" if r["global"] else "")
                     + ("  (shadows a global routine)" if r["shadows_global"] else "")
                     + ("  (off)" if project is not None and not r["enabled"] else "")
                     for r in rows))
@@ -999,7 +1037,7 @@ def _where(project: str | None, document: dict) -> dict:
     """What a read answers about where the routine it read lives."""
     found = {"name": document["name"], "project": project, "global": document["global"]}
     if document["global"]:
-        found["author"] = document["author_project_id"]
+        found["author"] = document["author_agent_id"]
     return found
 
 
@@ -1132,8 +1170,8 @@ def _save_version(conn, project: str | None, name: str, fields: dict, base: str 
             _die(7, "stale_base", f"--base names a version of {name!r}, which is no longer a "
                  "routine", f"`{NAME} list --store` shows the routines; save without --base "
                  "to start it again")
-        document = _one(conn, "INSERT INTO routine_documents (project_id, name, created_by, "
-                        "author_project_id) VALUES (%s, %s, %s, %s) RETURNING id, name",
+        document = _one(conn, "INSERT INTO routine_documents (agent_id, name, created_by, "
+                        "author_agent_id) VALUES (%s, %s, %s, %s) RETURNING id, name",
                         (project, name, by, author if project is None else None))
         active = None
     else:
@@ -1217,7 +1255,7 @@ def cmd_transfer(args) -> None:
             document = _need_document(conn, None, name, lock=True)
             _authored(document, project)
             if to != project:
-                _rows(conn, "UPDATE routine_documents SET author_project_id = %s WHERE id = %s",
+                _rows(conn, "UPDATE routine_documents SET author_agent_id = %s WHERE id = %s",
                       (to, document["id"]))
     _emit({"name": name, "global": True, "from": project, "author": to,
            "changed": to != project})
@@ -1248,7 +1286,7 @@ def cmd_enable(args) -> None:
             own = _switch_own(conn, project, name, True, args.is_global)
             if own is None:
                 document = _need_document(conn, None, name)
-                added = _one(conn, "INSERT INTO routine_enablements (project_id, document_id, "
+                added = _one(conn, "INSERT INTO routine_enablements (agent_id, document_id, "
                              "enabled_by) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING "
                              "RETURNING enabled_at", (project, document["id"], _actor()))
                 shadowed = _document(conn, project, name) is not None
@@ -1256,7 +1294,7 @@ def cmd_enable(args) -> None:
         _emit(own)
         return
     found = {"name": name, "project": project, "origin": "global", "enabled": True,
-             "changed": added is not None, "author": document["author_project_id"]}
+             "changed": added is not None, "author": document["author_agent_id"]}
     if shadowed:
         found["shadowed_by_project_routine"] = True
     _emit(found)
@@ -1270,7 +1308,7 @@ def cmd_disable(args) -> None:
             own = _switch_own(conn, project, name, False, args.is_global)
             if own is None:
                 document = _need_document(conn, None, name)
-                gone = _rows(conn, "DELETE FROM routine_enablements WHERE project_id = %s "
+                gone = _rows(conn, "DELETE FROM routine_enablements WHERE agent_id = %s "
                              "AND document_id = %s RETURNING document_id",
                              (project, document["id"]))
     if own is not None:
@@ -1364,7 +1402,7 @@ def cmd_export(args) -> None:
     folder = _folder(args.dir)
     with _store() as conn:
         rows = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM {_VERSIONS} "
-                     "WHERE v.active AND d.project_id = %s AND d.retired_at IS NULL "
+                     "WHERE v.active AND d.agent_id = %s AND d.retired_at IS NULL "
                      "ORDER BY d.name", (project,))
     present, _skipped = _files(folder) if folder.is_dir() else ([], [])
     where: dict = {}
@@ -1490,10 +1528,10 @@ def _stored_routines(root: Path, project: str) -> list[dict]:
         try:
             enabling = _one(conn, "SELECT to_regclass('routine_enablements') IS NOT NULL AS held")
             return _rows(conn, "SELECT d.name, v.id, v.title, v.description, "
-                         + ("d.project_id IS NULL" if enabling["held"] else "false")
+                         + ("d.agent_id IS NULL" if enabling["held"] else "false")
                          + " AS global FROM routine_documents d JOIN routine_versions v "
                          "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL AND "
-                         + (_SEEN if enabling["held"] else "d.project_id = %(project)s")
+                         + (_SEEN if enabling["held"] else "d.agent_id = %(project)s")
                          + " ORDER BY d.name", {"project": project})
         except psycopg.errors.UndefinedTable:
             return []

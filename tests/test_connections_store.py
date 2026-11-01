@@ -1,11 +1,11 @@
 """A project's records in its store.
 
 A project in store mode resolves its connections and grants from the contract's
-tables, `capabilities_connections` and `capabilities_connection_grants`,
+tables, `connections` and `grants`,
 exactly as a project in files mode resolves them from its files: the same
 entries, grant before use, the write gate, the read-only switch and the same
-reports. Its identifiers and its gate come from `capabilities_identifiers` and
-`capabilities_policy` the same way, a global row beneath the project's own.
+reports. Its identifiers and its gate come from `identifiers` and
+`policies` the same way, a global row beneath the project's own.
 `capabilities connections import` moves a project from its files into its
 store; a project that was never moved keeps its files, store or no store, and
 one that moved only its connections and grants keeps the rest in files.
@@ -363,18 +363,18 @@ def test_import_moves_the_project_and_it_resolves_the_same_set(lab):
     after = _ok(_coolify(lab, "connections"))
     assert _without_sources(after) == _without_sources(before)
     assert after["connections"]["box"]["keys"][0]["source"] == \
-        "store:lab.capabilities_connections"
+        "store:lab.connections"
     assert _ok(_manager(lab, "get", "coolify", "connection", "box")) == connection_before
     assert _ok(_manager(lab, "get", "coolify", "grant", "box")) == {
         "enabled": True, "allow_write": True, "node": None, "is_default": True}
     assert _manager(lab, "get", "coolify", "setting", "connection.default").stdout.strip() \
         == "box"
     rows = _rows(lab, "SELECT agent_id, connection, node, enabled, allow_write, is_default "
-                      "FROM capabilities_connection_grants ORDER BY connection")
+                      "FROM grants ORDER BY connection")
     assert rows == [(PROJECT_ID, "box", None, True, True, True),
                     (PROJECT_ID, "off", None, False, None, False),
                     (PROJECT_ID, "spare", None, True, None, False)]
-    specs = dict(_rows(lab, "SELECT name, spec FROM capabilities_connections"))
+    specs = dict(_rows(lab, "SELECT name, spec FROM connections"))
     assert specs["box"] == {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN"}
     assert "test-token" not in json.dumps(specs)
 
@@ -387,7 +387,7 @@ def test_help_names_the_home_the_project_keeps_its_connections_in(lab):
     after = _text(_coolify(lab, "help"))
     home = after.split("═══ Where connections live", 1)[1]
     assert "This project keeps its connections in its store" in home
-    assert "capabilities_connections" in home
+    assert "connections" in home
     assert str(lab["envelope"] / "coolify" / "connections.json") not in after
 
 
@@ -404,12 +404,12 @@ def test_a_second_import_changes_nothing(lab):
 def test_import_refuses_a_row_that_differs_and_writes_nothing(lab):
     _import(lab)
     _ok(_manager(lab, "set", "coolify", "grant", "box", '{"allow_write": false}'))
-    before = _rows(lab, "SELECT * FROM capabilities_connection_grants ORDER BY connection")
+    before = _rows(lab, "SELECT * FROM grants ORDER BY connection")
     refused = _manager(lab, "connections", "import")
     assert refused.returncode == 6, refused.stdout + refused.stderr
     error = _error(refused)
     assert error["code"] == "import_conflict" and "'box'" in error["message"]
-    assert _rows(lab, "SELECT * FROM capabilities_connection_grants ORDER BY connection") \
+    assert _rows(lab, "SELECT * FROM grants ORDER BY connection") \
         == before
 
 
@@ -426,7 +426,7 @@ def test_import_refuses_a_connection_another_project_declared_differently(lab):
     refused = _manager(lab, "connections", "import")
     assert refused.returncode == 6 and _error(refused)["code"] == "import_conflict"
     assert "connections" not in json.loads(identity.read_text())
-    assert _rows(lab, "SELECT count(*) FROM capabilities_connection_grants "
+    assert _rows(lab, "SELECT count(*) FROM grants "
                       "WHERE agent_id = 'prj_ffffffffffff'") == [(0,)]
 
 
@@ -481,13 +481,13 @@ def _grant_in_envelope(lab, **grants: dict) -> None:
 
 
 def _stored_connections(lab) -> list[str]:
-    return [row[0] for row in _rows(lab, "SELECT name FROM capabilities_connections "
+    return [row[0] for row in _rows(lab, "SELECT name FROM connections "
                                          "ORDER BY name")]
 
 
 def _stored_grants(lab) -> list[str]:
     return [row[0] for row in _rows(lab, "SELECT connection FROM "
-                                         "capabilities_connection_grants ORDER BY connection")]
+                                         "grants ORDER BY connection")]
 
 
 def test_import_writes_the_declared_and_used_connections_and_skips_the_rest(lab):
@@ -513,7 +513,7 @@ def test_import_writes_a_config_home_default_of_an_enabled_capability(lab):
     assert result["skipped"] == {"coolify": ["hidden"]}
     assert _stored_connections(lab) == ["box", "off", "shared", "spare"]
     assert _rows(lab, "SELECT connection, enabled, is_default FROM "
-                      "capabilities_connection_grants WHERE connection = 'shared'") \
+                      "grants WHERE connection = 'shared'") \
         == [("shared", None, True)]
     assert _manager(lab, "get", "coolify", "setting", "connection.default").stdout.strip() \
         == "shared"
@@ -534,16 +534,16 @@ def test_a_second_import_with_config_home_connections_changes_nothing(lab):
     _offer_global(lab, {"shared": {}, "hidden": {}})
     _grant_in_envelope(lab, shared={"enabled": True})
     _import(lab)
-    rows = _rows(lab, "SELECT * FROM capabilities_connections ORDER BY name")
-    grants = _rows(lab, "SELECT * FROM capabilities_connection_grants ORDER BY connection")
+    rows = _rows(lab, "SELECT * FROM connections ORDER BY name")
+    grants = _rows(lab, "SELECT * FROM grants ORDER BY connection")
     again = _import(lab)
     assert again["capabilities"]["coolify"]["connections"] == {
         "imported": [], "unchanged": ["box", "off", "shared", "spare"]}
     assert again["capabilities"]["coolify"]["grants"] == {
         "imported": [], "unchanged": ["box", "off", "shared", "spare"]}
     assert again["skipped"] == {"coolify": ["hidden"]}
-    assert _rows(lab, "SELECT * FROM capabilities_connections ORDER BY name") == rows
-    assert _rows(lab, "SELECT * FROM capabilities_connection_grants "
+    assert _rows(lab, "SELECT * FROM connections ORDER BY name") == rows
+    assert _rows(lab, "SELECT * FROM grants "
                       "ORDER BY connection") == grants
 
 
@@ -553,7 +553,7 @@ def test_import_keeps_a_config_home_row_an_earlier_import_wrote(lab):
     spec = {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN"}
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("SET search_path TO lab")
-        conn.execute("INSERT INTO capabilities_connections (capability, name, spec) "
+        conn.execute("INSERT INTO connections (capability, name, spec) "
                      "VALUES ('coolify', 'hidden', %s::jsonb)", (json.dumps(spec),))
     again = _import(lab)
     assert again["capabilities"]["coolify"]["connections"]["unchanged"] == [
@@ -644,7 +644,7 @@ def test_an_ungranted_store_connection_is_refused_until_granted(lab):
     declared = _ok(_manager(lab, "set", "coolify", "connection", "other", json.dumps(
         {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN"})))
     assert declared["records"] == {"mode": "store",
-                                   "source": "store:lab.capabilities_connections"}
+                                   "source": "store:lab.connections"}
     refused = _coolify(lab, "--connection", "other", "resources")
     assert refused.returncode == 4, refused.stdout + refused.stderr
     assert _error(refused)["code"] == "connection_not_granted"
@@ -661,7 +661,7 @@ def test_a_store_connection_another_project_is_granted_is_not_removed(lab):
     other = "prj_" + "9f8e7d6c5b4a"
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("SET search_path TO lab")
-        conn.execute("INSERT INTO capabilities_connection_grants "
+        conn.execute("INSERT INTO grants "
                      "(agent_id, capability, connection, node, enabled) "
                      "VALUES (%s, 'coolify', 'spare', 'elsewhere', true)", (other,))
     _ok(_manager(lab, "set", "coolify", "grant", "spare", '{"enabled": false}'))
@@ -673,7 +673,7 @@ def test_a_store_connection_another_project_is_granted_is_not_removed(lab):
     assert "spare" in _stored_connections(lab)
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("SET search_path TO lab")
-        conn.execute("UPDATE capabilities_connection_grants SET enabled = false "
+        conn.execute("UPDATE grants SET enabled = false "
                      "WHERE agent_id = %s", (other,))
     removed = _ok(_coolify(lab, "connection", "remove", "spare"))
     assert removed["action"] == "remove"
@@ -684,11 +684,11 @@ def test_a_store_connection_is_written_over_only_with_replace(lab):
     _import(lab)
     refused = _coolify(lab, "connection", "add", "box", "--field", f"base_url={lab['url']}/x")
     assert refused.returncode == 6 and _error(refused)["code"] == "connection_exists"
-    spec = _rows(lab, "SELECT spec FROM capabilities_connections WHERE name = 'box'")[0][0]
+    spec = _rows(lab, "SELECT spec FROM connections WHERE name = 'box'")[0][0]
     assert spec["base_url"] == lab["url"]
     _ok(_coolify(lab, "connection", "add", "box", "--replace",
                  "--field", f"base_url={lab['url']}/x"))
-    spec = _rows(lab, "SELECT spec FROM capabilities_connections WHERE name = 'box'")[0][0]
+    spec = _rows(lab, "SELECT spec FROM connections WHERE name = 'box'")[0][0]
     assert spec["base_url"] == lab["url"] + "/x"
 
 
@@ -698,14 +698,14 @@ def test_a_store_connection_added_in_the_project_is_its_own_and_granted(lab):
                          "--field", f"base_url={lab['url']}",
                          "--env", "secret_env=COOLIFY_TOKEN"))
     assert added["granted"] is True and "hint" not in added
-    assert _rows(lab, "SELECT owner FROM capabilities_connections WHERE name = 'fresh'") \
+    assert _rows(lab, "SELECT owner_agent_id FROM connections WHERE name = 'fresh'") \
         == [(PROJECT_ID,)]
-    assert _rows(lab, "SELECT agent_id, node, enabled FROM capabilities_connection_grants "
+    assert _rows(lab, "SELECT agent_id, node, enabled FROM grants "
                       "WHERE connection = 'fresh'") == [(PROJECT_ID, None, True)]
     replaced = _ok(_coolify(lab, "connection", "add", "box", "--replace",
                             "--field", f"base_url={lab['url']}"))
     assert replaced["granted"] is True and "hint" not in replaced
-    assert _rows(lab, "SELECT owner FROM capabilities_connections WHERE name = 'box'") \
+    assert _rows(lab, "SELECT owner_agent_id FROM connections WHERE name = 'box'") \
         == [(None,)]
     removed = _ok(_coolify(lab, "connection", "remove", "fresh"))
     assert removed["action"] == "remove" and "fresh" not in _stored_connections(lab)
@@ -741,14 +741,14 @@ def test_a_granted_connection_renamed_keeps_its_id_and_every_agent_resolves_it(l
         _ok(_manager(agent, "set", "coolify", "grant", "team", '{"enabled": true}'))
     _ok(_manager(lab, "set", "coolify", "setting", "connection.default", "team"))
     grants = ("SELECT agent_id, capability, connection, node, enabled, allow_write, "
-              "is_default FROM capabilities_connection_grants ORDER BY agent_id, connection")
+              "is_default FROM grants ORDER BY agent_id, connection")
     before = _rows(lab, grants)
 
     renamed = _ok(_coolify(lab, "connection", "rename", "team", "office"))
     assert (renamed["connection"], renamed["label"], renamed["previous_label"],
             renamed["changed"]) == ("team", "office", "team", True)
     assert _rows(lab, grants) == before
-    assert _rows(lab, "SELECT name, label FROM capabilities_connections "
+    assert _rows(lab, "SELECT name, label FROM connections "
                       "WHERE name = 'team'") == [("team", "office")]
 
     # Every agent granted it resolves it by its id and by its new label, and
@@ -763,12 +763,12 @@ def test_a_granted_connection_renamed_keeps_its_id_and_every_agent_resolves_it(l
         assert report["connections"]["team"]["label"] == "office"
     assert _ok(_coolify(lab, "connections"))["connections"]["box"]["label"] == "box"
     _ok(_coolify(lab, "doctor"))
-    assert _rows(lab, "SELECT connection FROM capabilities_connection_grants "
+    assert _rows(lab, "SELECT connection FROM grants "
                       "WHERE agent_id = %s AND is_default" % repr(PROJECT_ID)) == [("team",)]
 
     # The manager names it by its label too, and the row holds its id.
     _ok(_manager(peer, "set", "coolify", "grant", "office", '{"allow_write": false}'))
-    assert _rows(lab, "SELECT allow_write FROM capabilities_connection_grants WHERE "
+    assert _rows(lab, "SELECT allow_write FROM grants WHERE "
                       "agent_id = %s AND connection = 'team'" % repr(peer["id"])) == [(False,)]
     listed = {c["connection"]: c for c in
               _ok(_manager(lab, "connections", "list"))["capabilities"]["coolify"]}
@@ -781,7 +781,7 @@ def test_a_granted_connection_renamed_keeps_its_id_and_every_agent_resolves_it(l
         assert refused.returncode == 6 and _error(refused)["code"] == "connection_exists"
     back = _ok(_coolify(peer, "connection", "rename", "office", "team"))
     assert (back["label"], back["previous_label"]) == ("team", "office")
-    assert _rows(lab, "SELECT label FROM capabilities_connections WHERE name = 'team'") \
+    assert _rows(lab, "SELECT label FROM connections WHERE name = 'team'") \
         == [(None,)]
     gone = _coolify(lab, "--connection", "office", "resources")
     assert gone.returncode == 6 and _error(gone)["code"] == "unknown_connection"
@@ -875,22 +875,22 @@ def _doctor(lab) -> dict:
 def test_doctor_reports_unknown_agents_as_information_only(lab):
     _import(lab)
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("INSERT INTO lab.capabilities_connection_grants "
+        conn.execute("INSERT INTO lab.grants "
                      "(agent_id, capability, connection, enabled) "
                      "VALUES ('prj_999999999999', 'coolify', 'spare', true)")
-        conn.execute("INSERT INTO lab.capabilities_agents (id) VALUES (%s)", (PROJECT_ID,))
+        conn.execute("INSERT INTO lab.agents (id) VALUES (%s)", (PROJECT_ID,))
     first = _doctor(lab)
     assert first["information"] == [{
         "code": "grant_agent_unknown", "agent_id": "prj_999999999999", "grants": 1,
         "message": "1 connection grant(s) name agent prj_999999999999, which "
                    "the agent registry does not know"}]
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("INSERT INTO lab.capabilities_agents (id) VALUES ('prj_999999999999')")
+        conn.execute("INSERT INTO lab.agents (id) VALUES ('prj_999999999999')")
     second = _doctor(lab)
     assert "information" not in second
     assert second["findings"] == first["findings"]
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("DROP TABLE lab.capabilities_agents CASCADE")
+        conn.execute("DROP TABLE lab.agents CASCADE")
     assert [entry["code"] for entry in _doctor(lab)["information"]] \
         == ["agents_registry_absent"]
 
@@ -932,13 +932,13 @@ def test_import_moves_identifiers_and_the_gate_and_they_resolve_the_same(lab):
         "global": {"imported": ["region", "team"], "unchanged": []}}
     assert result["policy"] == {"project": {"imported": ["coolify"], "unchanged": []},
                                 "global": {"imported": ["lab-other"], "unchanged": []}}
-    assert set(result["store"]["tables"]) >= {"capabilities_identifiers",
-                                             "capabilities_policy"}
-    assert _rows(lab, "SELECT agent_id, label, value, note FROM capabilities_identifiers "
+    assert set(result["store"]["tables"]) >= {"identifiers",
+                                             "policies"}
+    assert _rows(lab, "SELECT agent_id, label, value, note FROM identifiers "
                       "ORDER BY agent_id NULLS FIRST, label") == [
         (None, "region", "eu", "where it runs"), (None, "team", "global-team", ""),
         (PROJECT_ID, "team", "one", "the team")]
-    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM capabilities_policy "
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM policies "
                       "ORDER BY agent_id NULLS FIRST") == [
         (None, "lab-other", None, True), (PROJECT_ID, "coolify", None, True)]
     assert _ok(_coolify(lab, "ids", "list")) == before
@@ -959,30 +959,30 @@ def test_the_gate_is_written_to_and_read_from_the_store(lab):
     _import(lab)
     settings_before = (lab["envelope"] / "settings.json").read_text()
     disabled = _ok(_manager(lab, "disable", "coolify", "--project"))
-    assert disabled["gate"] == "store:lab.capabilities_policy"
+    assert disabled["gate"] == "store:lab.policies"
     refused = _coolify(lab, "deploy", "x")
     assert refused.returncode == 4
     assert _error(refused)["code"] == "disabled"
-    assert "store:lab.capabilities_policy" in _error(refused)["message"]
+    assert "store:lab.policies" in _error(refused)["message"]
     assert (lab["envelope"] / "settings.json").read_text() == settings_before
     _ok(_manager(lab, "inherit", "coolify", "--project"))
     assert _error(_coolify(lab, "deploy", "x"))["code"] == "not_enabled"
     _ok(_manager(lab, "enable", "coolify", "--global"))
     assert _rows(lab, "SELECT agent_id, capability, node, enabled "
-                      "FROM capabilities_policy") == [(None, "coolify", None, True)]
+                      "FROM policies") == [(None, "coolify", None, True)]
     _ok(_coolify(lab, "deploy", "x"))
     # A row naming this node is read before the row for every node.
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, node, "
+        conn.execute("INSERT INTO lab.policies (agent_id, capability, node, "
                      "enabled) VALUES (NULL, 'coolify', %s, false)", (NODE,))
-        conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, node, "
+        conn.execute("INSERT INTO lab.policies (agent_id, capability, node, "
                      "enabled) VALUES (%s, 'coolify', 'another-node', false)",
                      (PROJECT_ID,))
     declared = {"AGENT_NODE_ID": NODE}
     assert _error(_coolify(lab, "deploy", "x", extra=declared))["code"] == "not_enabled"
     _ok(_coolify(lab, "deploy", "x"))
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, node, "
+        conn.execute("INSERT INTO lab.policies (agent_id, capability, node, "
                      "enabled) VALUES (%s, 'coolify', %s, true)", (PROJECT_ID, NODE))
     _ok(_coolify(lab, "deploy", "x", extra=declared))
 
@@ -996,8 +996,8 @@ def test_a_policy_row_is_written_and_removed_for_one_node(lab):
     disabled = _ok(_manager(lab, "disable", "coolify", "--project", "--node", NODE))
     assert {k: disabled[k] for k in ("disabled", "scope", "node", "gate")} == {
         "disabled": "coolify", "scope": "project", "node": NODE,
-        "gate": "store:lab.capabilities_policy"}
-    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM capabilities_policy "
+        "gate": "store:lab.policies"}
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM policies "
                       "WHERE capability = 'coolify' ORDER BY node NULLS FIRST") == [
         (PROJECT_ID, "coolify", None, True), (PROJECT_ID, "coolify", NODE, False)]
     # The row naming this node answers before the row for every node.
@@ -1006,7 +1006,7 @@ def test_a_policy_row_is_written_and_removed_for_one_node(lab):
     _ok(_manager(lab, "enable", "coolify", "--global", "--node", "another-node"))
     removed = _ok(_manager(lab, "inherit", "coolify", "--project", "--node", NODE))
     assert removed["removed"] is True and removed["node"] == NODE
-    assert _rows(lab, "SELECT agent_id, node, enabled FROM capabilities_policy "
+    assert _rows(lab, "SELECT agent_id, node, enabled FROM policies "
                       "WHERE capability = 'coolify' ORDER BY agent_id NULLS FIRST") == [
         (None, "another-node", True), (PROJECT_ID, None, True)]
     _ok(_coolify(lab, "deploy", "x", extra=declared))
@@ -1029,7 +1029,7 @@ def test_a_service_moves_between_nodes_and_its_capability_stays_usable_on_both(l
             "name": "svc", "summary": "s", "verbs": [], "placement": placement}}))
 
     def rows():
-        return _rows(lab, "SELECT node, enabled, service FROM capabilities_policy "
+        return _rows(lab, "SELECT node, enabled, service FROM policies "
                           "WHERE capability = 'coolify' ORDER BY node NULLS FIRST")
 
     here, there = {"AGENT_NODE_ID": NODE}, {"AGENT_NODE_ID": BOX}
@@ -1079,7 +1079,7 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
             "name": "svc", "summary": "s", "verbs": [], "placement": placement}}))
 
     def placed() -> list[tuple]:
-        return _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+        return _rows(lab, "SELECT node FROM policies WHERE capability = 'coolify' "
                           "AND service ORDER BY node")
 
     def sql(query: str) -> None:
@@ -1096,7 +1096,7 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
                  extra=here))
     # An agent on several nodes keeps its records in the store, under its
     # nodes' write authority.
-    sql("UPDATE capabilities_agents SET migrated_at = now()")
+    sql("UPDATE agents SET migrated_at = now()")
     both = _manager(lab, "place", "coolify", "--all", "--node", NODE, extra=here)
     assert both.returncode == 6 and _error(both)["code"] == "input"
 
@@ -1115,12 +1115,12 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
     sql("CREATE FUNCTION lab.refuse_lab_node() RETURNS trigger LANGUAGE plpgsql AS "
         f"$$ BEGIN IF NEW.node = '{NODE}' THEN RAISE EXCEPTION 'refused'; END IF; "
         "RETURN NEW; END $$; CREATE TRIGGER refuse_lab_node BEFORE INSERT OR UPDATE "
-        "ON lab.capabilities_policy FOR EACH ROW EXECUTE FUNCTION lab.refuse_lab_node()")
+        "ON lab.policies FOR EACH ROW EXECUTE FUNCTION lab.refuse_lab_node()")
     partial = _manager(lab, "place", "coolify", "--all", extra=here)
     assert partial.returncode != 0
     assert _error(partial)["detail"] == {"placed": [BOX], "failed": NODE}
     assert placed() == [(BOX,)]
-    sql("DROP TRIGGER refuse_lab_node ON lab.capabilities_policy")
+    sql("DROP TRIGGER refuse_lab_node ON lab.policies")
     every = _ok(_manager(lab, "place", "coolify", "--all", extra=here))
     assert {k: every[k] for k in ("placed", "nodes", "placement", "changed", "placed_on",
                                   "enabled_on_nodes")} == {
@@ -1141,11 +1141,11 @@ def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lea
     report = _ok(_manager(lab, "place", "coolify", extra=here))
     assert (report["placed_on"], report["holder"], report["lease"], report["agrees"]) == (
         [BOX], None, None, False)
-    sql("CREATE TABLE lab.deployment_service_leases (project text NOT NULL, "
+    sql("CREATE TABLE lab.deployment_service_leases (agent_id text NOT NULL, "
         "capability text NOT NULL, node text NOT NULL, acquired_at timestamptz NOT "
         "NULL DEFAULT now(), renewed_at timestamptz NOT NULL DEFAULT now(), expires_at "
-        "timestamptz NOT NULL, PRIMARY KEY (project, capability)); "
-        "INSERT INTO lab.deployment_service_leases (project, capability, node, "
+        "timestamptz NOT NULL, PRIMARY KEY (agent_id, capability)); "
+        "INSERT INTO lab.deployment_service_leases (agent_id, capability, node, "
         f"expires_at) VALUES ('{PROJECT_ID}', 'coolify', '{NODE}', "
         "now() + interval '3 minutes')")
     moving = _ok(_manager(lab, "place", "coolify", extra=here))
@@ -1173,7 +1173,7 @@ def test_nothing_is_placed_on_a_disabled_node_and_what_is_there_stays_until_unpl
         "name": "svc", "summary": "s", "verbs": [], "placement": "shared"}}))
 
     def placed() -> list[tuple]:
-        return _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+        return _rows(lab, "SELECT node FROM policies WHERE capability = 'coolify' "
                           "AND service ORDER BY node")
 
     here = {"AGENT_NODE_ID": NODE}
@@ -1182,7 +1182,7 @@ def test_nothing_is_placed_on_a_disabled_node_and_what_is_there_stays_until_unpl
     _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "server",
                  extra=here))
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("UPDATE lab.capabilities_agents SET migrated_at = now()")
+        conn.execute("UPDATE lab.agents SET migrated_at = now()")
     _ok(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
     _ok(_manager(lab, "node", "disable", "box-node", extra=here))
     # What was placed there stays on record.
@@ -1232,7 +1232,7 @@ def test_placing_a_service_on_another_node_warns_of_a_connection_at_loopback(lab
     assert f"connection box has base_url {lab['url']}" in away
     assert f"connection spare has base_url {lab['url']}" in away
     assert "connection off" not in away and BOX in away
-    assert _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+    assert _rows(lab, "SELECT node FROM policies WHERE capability = 'coolify' "
                       "AND service") == [(BOX,)]
     assert "connection box" in warned(_manager(lab, "enable", "coolify", "--project",
                                                "--node", BOX, extra=here))
@@ -1240,17 +1240,17 @@ def test_placing_a_service_on_another_node_warns_of_a_connection_at_loopback(lab
     assert warned(_manager(lab, "place", "coolify", "--node", NODE, extra=here)) is None
     # Credentials in the address are left out of the warning.
     port = lab["url"].rsplit(":", 1)[1]
-    _rows(lab, "UPDATE capabilities_connections SET spec = jsonb_set(spec, '{base_url}', "
+    _rows(lab, "UPDATE connections SET spec = jsonb_set(spec, '{base_url}', "
                f"'\"http://user:pw@localhost:{port}/api\"') WHERE name = 'spare' "
                "RETURNING name")
     away = warned(_manager(lab, "place", "coolify", "--node", BOX, extra=here))
     assert f"connection spare has base_url http://localhost:{port}/api" in away
     assert "pw" not in away
     # A routable address, and a field that is not an address, say nothing.
-    _rows(lab, "UPDATE capabilities_connections SET spec = jsonb_set(spec, '{base_url}', "
+    _rows(lab, "UPDATE connections SET spec = jsonb_set(spec, '{base_url}', "
                "'\"https://coolify.example.org\"') RETURNING name")
     assert warned(_manager(lab, "place", "coolify", "--node", BOX, extra=here)) is None
-    _rows(lab, "UPDATE capabilities_connections SET spec = jsonb_set(spec, '{base_url}', "
+    _rows(lab, "UPDATE connections SET spec = jsonb_set(spec, '{base_url}', "
                "'\"http://[::1]:8008\"') RETURNING name")
     assert "http://[::1]:8008" in warned(_manager(lab, "place", "coolify", "--node", NODE,
                                                   extra={"AGENT_NODE_ID": BOX}))
@@ -1265,7 +1265,7 @@ def test_a_writer_that_predates_the_service_column_places_where_it_enables(lab):
 
     def write(node: str, enabled: bool) -> tuple:
         return _rows(lab, (
-            "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+            "INSERT INTO policies (agent_id, capability, node, enabled) "
             f"VALUES ('{PROJECT_ID}', 'coolify', '{node}', {enabled}) ON CONFLICT "
             "((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
             "DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now() "
@@ -1274,7 +1274,7 @@ def test_a_writer_that_predates_the_service_column_places_where_it_enables(lab):
     assert write(NODE, True) == (NODE, True, True)
     assert write(NODE, False) == (NODE, False, False)
     assert write(NODE, True) == (NODE, True, True)
-    assert _rows(lab, "INSERT INTO capabilities_policy (agent_id, capability, enabled) "
+    assert _rows(lab, "INSERT INTO policies (agent_id, capability, enabled) "
                       f"VALUES ('{PROJECT_ID}', 'slack', true) RETURNING service") == [
         (False,)]
 
@@ -1286,7 +1286,7 @@ def test_a_store_mode_project_marked_only_by_project_json_gets_no_file_gate(lab)
     (lab["envelope"] / "settings.json").unlink()
     gate = lab["envelope"] / "settings.json"
     enabled = _ok(_manager(lab, "enable", "coolify", "--project"))
-    assert enabled["gate"] == "store:lab.capabilities_policy"
+    assert enabled["gate"] == "store:lab.policies"
     assert not gate.exists()
     _ok(_manager(lab, "enable", "coolify", "--project", "--node", NODE))
     assert not gate.exists()
@@ -1294,7 +1294,7 @@ def test_a_store_mode_project_marked_only_by_project_json_gets_no_file_gate(lab)
     assert not gate.exists()
     _ok(_manager(lab, "inherit", "coolify", "--project", "--node", NODE))
     assert not gate.exists()
-    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM capabilities_policy "
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM policies "
                       "WHERE capability = 'coolify' ORDER BY node NULLS FIRST") == [
         (PROJECT_ID, "coolify", None, False)]
     assert _error(_coolify(lab, "deploy", "x"))["code"] == "disabled"
@@ -1311,7 +1311,7 @@ def test_ids_set_global_writes_a_global_row_beneath_the_project_row(lab):
     assert _ok(_coolify(lab, "ids", "list"))["shared"] == {
         "value": "g", "note": "", "scope": "global"}
     _ok(_coolify(lab, "ids", "set", "shared", "p"))
-    assert _rows(lab, "SELECT agent_id, value FROM capabilities_identifiers "
+    assert _rows(lab, "SELECT agent_id, value FROM identifiers "
                       "WHERE label = 'shared' ORDER BY agent_id NULLS FIRST") == [
         (None, "g"), (PROJECT_ID, "p")]
     assert _text(_coolify(lab, "ids", "get", "shared")) == "p"
@@ -1319,7 +1319,7 @@ def test_ids_set_global_writes_a_global_row_beneath_the_project_row(lab):
     assert _text(_coolify(lab, "ids", "get", "shared")) == "g"
     _ok(_coolify(lab, "ids", "rm", "shared", "--global"))
     assert _coolify(lab, "ids", "get", "shared").returncode == 3
-    assert _rows(lab, "SELECT count(*) FROM capabilities_identifiers") == [(0,)]
+    assert _rows(lab, "SELECT count(*) FROM identifiers") == [(0,)]
 
 
 def test_ids_set_global_in_files_mode_writes_the_config_home(lab):
@@ -1335,8 +1335,8 @@ def test_a_project_with_only_its_connections_in_the_store_keeps_the_rest_in_file
     _ok(_coolify(lab, "ids", "set", "team", "one"))
     _import(lab)
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("DELETE FROM lab.capabilities_identifiers")
-        conn.execute("DELETE FROM lab.capabilities_policy")
+        conn.execute("DELETE FROM lab.identifiers")
+        conn.execute("DELETE FROM lab.policies")
     identity_file = lab["envelope"] / "project.json"
     identity = json.loads(identity_file.read_text())
     identity.pop("records")
@@ -1345,7 +1345,7 @@ def test_a_project_with_only_its_connections_in_the_store_keeps_the_rest_in_file
     # Connections from the store, the gate and identifiers from files.
     report = _ok(_coolify(lab, "connections"))
     assert report["connections"]["box"]["keys"][0]["source"] == \
-        "store:lab.capabilities_connections"
+        "store:lab.connections"
     assert _text(_coolify(lab, "ids", "get", "team")) == "one"
     _ok(_coolify(lab, "deploy", "x"))
     assert _ok(_manager(lab, "disable", "coolify", "--project"))["gate"].endswith(
@@ -1361,11 +1361,11 @@ def test_a_project_with_only_its_connections_in_the_store_keeps_the_rest_in_file
 
 def test_import_refuses_store_rows_that_would_change_what_the_project_resolves(lab):
     _import(lab)
-    held = _rows(lab, "SELECT count(*) FROM capabilities_identifiers")
+    held = _rows(lab, "SELECT count(*) FROM identifiers")
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("INSERT INTO lab.capabilities_identifiers (agent_id, capability, "
+        conn.execute("INSERT INTO lab.identifiers (agent_id, capability, "
                      "label, value) VALUES (NULL, 'coolify', 'stray', '\"x\"')")
-        conn.execute("INSERT INTO lab.capabilities_policy (agent_id, capability, "
+        conn.execute("INSERT INTO lab.policies (agent_id, capability, "
                      "enabled) VALUES (NULL, 'lab-stray', true)")
     refused = _manager(lab, "connections", "import")
     assert refused.returncode == 6, refused.stdout + refused.stderr
@@ -1373,7 +1373,7 @@ def test_import_refuses_store_rows_that_would_change_what_the_project_resolves(l
     assert error["code"] == "import_conflict"
     assert "global identifier 'stray'" in error["message"]
     assert "lab-stray global policy" in error["message"]
-    assert _rows(lab, "SELECT count(*) FROM capabilities_identifiers") == [(held[0][0] + 1,)]
+    assert _rows(lab, "SELECT count(*) FROM identifiers") == [(held[0][0] + 1,)]
 
 
 def test_a_store_holding_the_gate_that_cannot_be_reached_refuses_with_exit_5(lab):
@@ -1482,20 +1482,20 @@ def test_outside_a_project_a_machine_connection_is_a_store_row_once_the_global_r
     registry.unlink()
     _global_rows_in_force(lab)
     added = _add_machine(lab, "mach")
-    assert added["registry"] == "store:lab.capabilities_connections"
+    assert added["registry"] == "store:lab.connections"
     assert not registry.exists()
-    assert _rows(lab, "SELECT name, owner, spec FROM capabilities_connections "
+    assert _rows(lab, "SELECT name, owner_agent_id, spec FROM connections "
                       "WHERE name = 'mach'") == [
         ("mach", None, {"base_url": lab["url"], "secret_env": "COOLIFY_TOKEN"})]
     listed = _ok(_outside(lab, COOLIFY, "connections"))
     assert listed["connections"]["mach"]["keys"][0]["source"] == \
-        "store:lab.capabilities_connections"
+        "store:lab.connections"
     refused = _outside(lab, COOLIFY, "connection", "add", "mach", "--machine",
                        "--field", f"base_url={lab['url']}/x")
     assert _error(refused)["code"] == "connection_exists"
     _ok(_outside(lab, COOLIFY, "connection", "add", "mach", "--machine", "--replace",
                  "--field", f"base_url={lab['url']}/x"))
-    assert _rows(lab, "SELECT spec FROM capabilities_connections WHERE name = 'mach'")[0][0][
+    assert _rows(lab, "SELECT spec FROM connections WHERE name = 'mach'")[0][0][
         "base_url"] == lab["url"] + "/x"
     _ok(_outside(lab, COOLIFY, "connection", "remove", "mach", "--machine"))
     assert _stored_connections(lab) == []
@@ -1508,7 +1508,7 @@ def test_a_config_home_file_answers_only_for_a_connection_the_store_holds_no_row
     _offer_global(lab, {"legacy": {}, "mach": {"base_url": "http://stale.invalid"}})
     listed = _ok(_outside(lab, COOLIFY, "connections"))["connections"]
     assert set(listed) == {"legacy", "mach"}
-    assert listed["mach"]["keys"][0]["source"] == "store:lab.capabilities_connections"
+    assert listed["mach"]["keys"][0]["source"] == "store:lab.connections"
     assert listed["mach"]["keys"][0]["value"] == lab["url"]
     assert listed["legacy"]["keys"][0]["source"] == str(lab["config"] / "coolify"
                                                         / "connections.json")
@@ -1519,7 +1519,7 @@ def test_outside_a_project_an_agents_own_connection_is_not_the_machines(lab):
     _add_machine(lab, "mach")
     other = "prj_" + "9f8e7d6c5b4a"
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("INSERT INTO lab.capabilities_connections (capability, name, spec, owner) "
+        conn.execute("INSERT INTO lab.connections (capability, name, spec, owner_agent_id) "
                      "VALUES ('coolify', 'theirs', %s::jsonb, %s)",
                      ('{"base_url": "http://theirs.invalid"}', other))
     listed = _ok(_outside(lab, COOLIFY, "connections"))
@@ -1531,7 +1531,7 @@ def test_a_machine_connection_an_agent_is_granted_is_not_removed(lab):
     _add_machine(lab, "mach")
     other = "prj_" + "9f8e7d6c5b4a"
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("INSERT INTO lab.capabilities_connection_grants "
+        conn.execute("INSERT INTO lab.grants "
                      "(agent_id, capability, connection, enabled) "
                      "VALUES (%s, 'coolify', 'mach', true)", (other,))
     refused = _outside(lab, COOLIFY, "connection", "remove", "mach", "--machine")
@@ -1556,7 +1556,7 @@ def test_a_project_in_files_mode_writes_no_connection_to_a_file_once_the_global_
     added = _ok(_coolify(lab, "connection", "add", "shared", "--global",
                          "--field", f"base_url={lab['url']}", "--env",
                          "secret_env=COOLIFY_TOKEN"))
-    assert added["registry"] == "store:lab.capabilities_connections"
+    assert added["registry"] == "store:lab.connections"
     assert _stored_connections(lab) == ["shared"]
     assert not (lab["config"] / "coolify" / "connections.json").exists()
     assert set(_ok(_coolify(lab, "connections"))["connections"]) == {"box", "spare"}
@@ -1567,13 +1567,13 @@ def test_a_global_gate_set_outside_a_project_is_a_store_row_once_the_global_rows
     _global_rows_in_force(lab)
     held = gate.read_text() if gate.exists() else None
     enabled = _ok(_outside(lab, MANAGER, "enable", "coolify", "--global"))
-    assert enabled["gate"] == "store:lab.capabilities_policy"
-    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM capabilities_policy"
+    assert enabled["gate"] == "store:lab.policies"
+    assert _rows(lab, "SELECT agent_id, capability, node, enabled FROM policies"
                       " WHERE capability = 'coolify'") == [(None, "coolify", None, True)]
     assert (gate.read_text() if gate.exists() else None) == held
     inherited = _ok(_outside(lab, MANAGER, "inherit", "coolify", "--global"))
-    assert inherited["removed"] is True and inherited["gate"] == "store:lab.capabilities_policy"
-    assert _rows(lab, "SELECT 1 FROM capabilities_policy WHERE capability = 'coolify'") == []
+    assert inherited["removed"] is True and inherited["gate"] == "store:lab.policies"
+    assert _rows(lab, "SELECT 1 FROM policies WHERE capability = 'coolify'") == []
 
 
 def test_retire_connections_moves_the_config_home_files_once_the_store_holds_them(lab):
@@ -1672,19 +1672,19 @@ def _service_lab(lab, placement: str = "exclusive", folder: bool = True) -> dict
                  extra=here))
     if folder:
         with lab["cluster"].admin(lab["database"]) as conn:
-            conn.execute("UPDATE lab.capabilities_agent_nodes SET folder = %s",
+            conn.execute("UPDATE lab.agent_nodes SET folder = %s",
                          (str(lab["project"]),))
     return here
 
 
 def _instance(lab, node: str, state: str, **columns) -> None:
     """Write the row a runner on `node` writes of coolify's service."""
-    row = {"project_id": PROJECT_ID, "capability": "coolify", "node": node,
+    row = {"agent_id": PROJECT_ID, "capability": "coolify", "node": node,
            "state": state, "started_at": "2026-10-25T10:00:00+00:00", **columns}
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("SET search_path TO lab")
-        conn.execute("DELETE FROM capabilities_service_instances WHERE node = %s", (node,))
-        conn.execute(f"INSERT INTO capabilities_service_instances ({', '.join(row)}) "
+        conn.execute("DELETE FROM service_instances WHERE node = %s", (node,))
+        conn.execute(f"INSERT INTO service_instances ({', '.join(row)}) "
                      f"VALUES ({', '.join(['%s'] * len(row))})", list(row.values()))
 
 
@@ -1716,7 +1716,7 @@ with open({str(calls)!r}, "a") as log:
 if args[2:3] == ["restart"]:
     with psycopg.connect(host="127.0.0.1", port={lab["cluster"].port}, user="{ADMIN}",
                          dbname="{lab["database"]}", autocommit=True) as conn:
-        conn.execute("UPDATE lab.capabilities_service_instances SET started_at = now()")
+        conn.execute("UPDATE lab.service_instances SET started_at = now()")
 """)
     (bin_dir / "supervisorctl").chmod(0o755)
     env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
@@ -1772,7 +1772,7 @@ if args[2:3] == ["restart"]:
 def test_node_run_runs_its_own_agents_services_where_the_store_records_no_folder(
         lab, tmp_path):
     here = _service_lab(lab, folder=False)
-    assert _rows(lab, "SELECT folder FROM capabilities_agent_nodes") == [(None,)]
+    assert _rows(lab, "SELECT folder FROM agent_nodes") == [(None,)]
     _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -1808,7 +1808,7 @@ def test_node_run_writes_this_nodes_state_on_its_beat_and_after_a_change(lab, tm
     job = tmp_path / "jobs" / f"coolify.{PROJECT_ID}.conf"
 
     def stamp():
-        found = _rows(lab, "SELECT reported_at FROM capabilities_node_states "
+        found = _rows(lab, "SELECT reported_at FROM node_states "
                            f"WHERE node = '{NODE}'")
         return found[0][0] if found else None
 
@@ -1832,13 +1832,13 @@ def test_node_run_writes_this_nodes_state_on_its_beat_and_after_a_change(lab, tm
         assert beat is not None
         # A store that refuses the write: said once, whatever the beats.
         with lab["cluster"].admin(lab["database"]) as conn:
-            conn.execute("ALTER TABLE lab.capabilities_node_states "
+            conn.execute("ALTER TABLE lab.node_states "
                          "ADD CONSTRAINT refuse_writes CHECK (false) NOT VALID")
         import time
         time.sleep(32)
         assert stamp() == beat and job.exists()
         with lab["cluster"].admin(lab["database"]) as conn:
-            conn.execute("ALTER TABLE lab.capabilities_node_states DROP CONSTRAINT refuse_writes")
+            conn.execute("ALTER TABLE lab.node_states DROP CONSTRAINT refuse_writes")
         assert _wait_for(after(beat), 20) is not None
     finally:
         node_run.terminate()
@@ -1848,7 +1848,7 @@ def test_node_run_writes_this_nodes_state_on_its_beat_and_after_a_change(lab, tm
     assert err.count("writes this node's state again") == 1, err
     [row] = _rows(lab, "SELECT cpu_count > 0, memory_limit_bytes > 0, disk_total_bytes > 0, "
                        "booted_at IS NOT NULL, fresh_until > reported_at "
-                       f"FROM capabilities_node_states WHERE node = '{NODE}'")
+                       f"FROM node_states WHERE node = '{NODE}'")
     assert row == (True, True, True, True, True)
 
 
@@ -1866,8 +1866,8 @@ def test_a_slow_probe_does_not_hold_back_the_state_beat_on_a_mac(lab, tmp_path):
     env = {**lab["env"], **here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
 
     def stamps():
-        return _rows(lab, "SELECT reported_at, claude_login FROM capabilities_node_states s "
-                          "LEFT JOIN capabilities_node_logins l USING (node) "
+        return _rows(lab, "SELECT reported_at, claude_login FROM node_states s "
+                          "LEFT JOIN node_logins l USING (node) "
                           f"WHERE s.node = '{NODE}'")
 
     node_run = subprocess.Popen([str(MANAGER), "node", "run", "--launchd", "--every", "300"],
@@ -1911,7 +1911,7 @@ def test_node_run_restarts_onto_the_manager_on_path_once_it_is_another_release(
                                 cwd=lab["project"], env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True)
     try:
-        assert _wait_for(lambda: _rows(lab, "SELECT 1 FROM capabilities_node_states "
+        assert _wait_for(lambda: _rows(lab, "SELECT 1 FROM node_states "
                                             f"WHERE node = '{NODE}'"), 30)
         import time
         time.sleep(3)
@@ -1982,7 +1982,7 @@ def test_node_run_and_each_supervisor_keep_their_last_lines_in_the_store(lab, tm
     env = {**lab["env"], **here}
 
     def lines(source: str):
-        found = _rows(lab, "SELECT lines FROM capabilities_node_logs WHERE project_id = "
+        found = _rows(lab, "SELECT lines FROM node_logs WHERE agent_id = "
                            f"'{PROJECT_ID}' AND node = '{NODE}' AND source = '{source}'")
         return found[0][0] if found else None
 
@@ -2058,7 +2058,7 @@ def test_node_run_records_a_placed_service_it_will_not_run_and_keeps_a_listed_ma
 
     def row():
         return _rows(lab, "SELECT state, problem_code, problem FROM "
-                          "capabilities_service_instances WHERE capability = 'coolify'")
+                          "service_instances WHERE capability = 'coolify'")
 
     jobs = tmp_path / "jobs"
     node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor", str(jobs),
@@ -2150,7 +2150,7 @@ elif args == ["service", "doctor", "--machine"]:
     _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "server",
                  extra=here))
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("UPDATE lab.capabilities_agent_nodes SET folder = %s",
+        conn.execute("UPDATE lab.agent_nodes SET folder = %s",
                      (str(lab["project"]),))
     env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
            "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
@@ -2171,7 +2171,7 @@ elif args == ["service", "doctor", "--machine"]:
         node_run.communicate(timeout=60)
 
     def row():
-        found = _rows(lab, "SELECT state, problem_code FROM capabilities_service_instances "
+        found = _rows(lab, "SELECT state, problem_code FROM service_instances "
                       "WHERE capability = 'coolify'")
         return found[0] if found else None
 
@@ -2204,7 +2204,7 @@ elif args == ["service", "doctor", "--machine"]:
         assert ["service", "run", "--machine"] not in calls()
         # Its problem names the command that retires that agent.
         assert "`deployment machine handover coolify`" in _rows(
-            lab, "SELECT problem FROM capabilities_service_instances "
+            lab, "SELECT problem FROM service_instances "
             "WHERE capability = 'coolify'")[0][0]
 
         # Gone, it takes the agent's lease, puts it on the list, runs the
@@ -2266,7 +2266,7 @@ elif args[0] == "print":
 elif args[0] == "kickstart":
     with psycopg.connect(host="127.0.0.1", port={lab["cluster"].port}, user="{ADMIN}",
                          dbname="{lab["database"]}", autocommit=True) as conn:
-        conn.execute("UPDATE lab.capabilities_service_instances SET started_at = now()")
+        conn.execute("UPDATE lab.service_instances SET started_at = now()")
 """)
     (bin_dir / "launchctl").chmod(0o755)
     return bin_dir, calls, loaded
@@ -2303,7 +2303,7 @@ def test_node_run_on_a_mac_keeps_a_launchd_agent_per_service_placed_here(lab, tm
         assert "coolify service run" not in text
         assert ["bootstrap", domain, str(plist)] in _logged(calls)
         # The node's state is written on a Mac's node manager as on a box's.
-        assert _wait_for(lambda: _rows(lab, "SELECT 1 FROM capabilities_node_states "
+        assert _wait_for(lambda: _rows(lab, "SELECT 1 FROM node_states "
                                             f"WHERE node = '{NODE}'"), 20)
 
         # Taken down by hand: the next reconcile loads it again.
@@ -2471,7 +2471,7 @@ def _both_commands(lab, placement: str = "shared", machine: bool = True) -> None
 
 
 def _modes(lab) -> list[tuple]:
-    return _rows(lab, "SELECT node, service, mode FROM capabilities_policy "
+    return _rows(lab, "SELECT node, service, mode FROM policies "
                       "WHERE capability = 'coolify' AND node IS NOT NULL ORDER BY node")
 
 
@@ -2513,7 +2513,7 @@ def test_a_placement_records_its_mode_shared_by_default_where_a_machine_service_
     # A row that records no mode is served as before: by its own service,
     # where the capability declares a project command.
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("UPDATE lab.capabilities_policy SET mode = NULL")
+        conn.execute("UPDATE lab.policies SET mode = NULL")
     assert _ok(_manager(lab, "place", "coolify", extra=here))["modes"] == {
         BOX: "own", NODE: "own"}
 
@@ -2574,13 +2574,13 @@ def test_a_leave_naming_shared_leaves_a_machine_service_placed_before_modes(lab)
                     "doctor": ["coolify", "service", "doctor", "--machine"]}}}))
     _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("UPDATE lab.capabilities_policy SET mode = NULL")
+        conn.execute("UPDATE lab.policies SET mode = NULL")
     # A join placing it again is told the placement is not its own.
     again = _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "shared",
                          extra=here))
     assert again["placed_before"] == "unrecorded"
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("UPDATE lab.capabilities_policy SET mode = NULL")
+        conn.execute("UPDATE lab.policies SET mode = NULL")
     kept = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, "--mode", "shared",
                         extra=here))
     assert kept["changed"] is False and kept["mode"] == "shared" and "note" in kept
@@ -2632,14 +2632,14 @@ elif args[1:2] == ["doctor"]:
     _ok(_manager(lab, "place", "coolify", "--node", NODE, "--mode", "shared", extra=here))
 
     def holder():
-        if _rows(lab, "SELECT to_regclass('capabilities_service_leases')") == [(None,)]:
+        if _rows(lab, "SELECT to_regclass('service_leases')") == [(None,)]:
             return []
-        return _rows(lab, "SELECT node, mode FROM capabilities_service_leases "
-                          "WHERE project_id = '" + PROJECT_ID + "' AND capability = 'coolify' "
+        return _rows(lab, "SELECT node, mode FROM service_leases "
+                          "WHERE agent_id = '" + PROJECT_ID + "' AND capability = 'coolify' "
                           "AND expires_at > now()")
 
     def row():
-        found = _rows(lab, "SELECT state, pid FROM capabilities_service_instances "
+        found = _rows(lab, "SELECT state, pid FROM service_instances "
                            "WHERE capability = 'coolify'")
         return found[0] if found else None
 
@@ -2738,7 +2738,7 @@ def test_a_start_or_place_without_a_node_on_a_mac_beside_a_server_says_where_it_
             "name": "svc", "summary": "s", "verbs": [], "placement": placement}}))
 
     def placed() -> list[tuple]:
-        return _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+        return _rows(lab, "SELECT node FROM policies WHERE capability = 'coolify' "
                           "AND service ORDER BY node")
 
     here = {"AGENT_NODE_ID": NODE}
@@ -2755,7 +2755,7 @@ def test_a_start_or_place_without_a_node_on_a_mac_beside_a_server_says_where_it_
     _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "server",
                  "--may-write", extra=here))
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("UPDATE lab.capabilities_agents SET migrated_at = now()")
+        conn.execute("UPDATE lab.agents SET migrated_at = now()")
 
     # An exclusive service is not started on the Mac unasked: the refusal names
     # every node and writes nothing.
@@ -2835,10 +2835,10 @@ def test_the_service_handles_place_and_answer_what_the_node_reports(lab):
     # stop unplaces it and waits for the node to give its row up.
     still = _manager(lab, "service", "stop", "coolify", "--wait", "1", extra=here)
     assert still.returncode == 6 and _error(still)["code"] == "service_still_running"
-    assert _rows(lab, "SELECT node FROM capabilities_policy WHERE capability = 'coolify' "
+    assert _rows(lab, "SELECT node FROM policies WHERE capability = 'coolify' "
                       "AND service") == []
     with lab["cluster"].admin(lab["database"]) as conn:
-        conn.execute("DELETE FROM lab.capabilities_service_instances")
+        conn.execute("DELETE FROM lab.service_instances")
     stopped = _ok(_manager(lab, "service", "stop", "coolify", "--wait", "5", extra=here))
     assert stopped["stopped"] == "coolify" and stopped["nodes"] == [NODE]
 

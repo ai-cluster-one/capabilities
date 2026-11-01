@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.12,<1",
+#     "capabilities-contract>=0.42,<1",
 #     "httpx>=0.27",
 #     "psycopg[binary]>=3.2",
 # ]
@@ -676,7 +676,7 @@ class _Bucket:
 # the step is applied: what happened to a file before then is not known, so
 # nothing is backfilled. The executable writes it, not the store, so an older
 # assets writing to a migrated store leaves no record; the help says so.
-TABLES_MAJOR, TABLES_MINOR = 1, 2
+TABLES_MAJOR, TABLES_MINOR = 2, 0
 TABLE_STEPS = [
     ("0001-documents", """
     CREATE TABLE assets_documents (
@@ -858,6 +858,80 @@ TABLE_STEPS = [
         FOR EACH ROW EXECUTE FUNCTION assets_file_operations_guard();
     CREATE TRIGGER assets_file_operations_truncate BEFORE TRUNCATE ON assets_file_operations
         FOR EACH STATEMENT EXECUTE FUNCTION assets_file_operations_guard();
+    """),
+    # The store names an agent where it named a project: the column that holds
+    # one in each table, every index and constraint named for it, the guards
+    # that compare it, and every comment that says it. The rows and objects
+    # stay where they are; this is major 2, so a release that still reads the
+    # old names refuses the store instead of failing on a missing column.
+    ("0007-agent-names", """
+    ALTER TABLE assets_documents RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE assets_files RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE assets_file_operations RENAME COLUMN project_id TO agent_id;
+    ALTER INDEX assets_file_operations_project RENAME TO assets_file_operations_agent;
+    DO $$
+    DECLARE r record;
+    BEGIN
+        FOR r IN SELECT c.conrelid::regclass AS tab, c.conname
+                   FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+                  WHERE t.relnamespace = current_schema()::regnamespace
+                    AND t.relname IN ('assets_documents', 'assets_files', 'assets_file_operations')
+                    AND c.conname LIKE '%project%'
+        LOOP
+            EXECUTE format('ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+                           r.tab, r.conname, replace(r.conname, 'project', 'agent'));
+        END LOOP;
+    END $$;
+
+    CREATE OR REPLACE FUNCTION assets_documents_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'asset documents are never deleted: retire them'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.id <> old.id OR new.agent_id <> old.agent_id OR new.kind <> old.kind
+                OR new.name <> old.name OR new.created_at <> old.created_at
+                OR new.created_by <> old.created_by
+                OR old.retired_at IS NOT NULL
+                   AND new.retired_at IS DISTINCT FROM old.retired_at THEN
+            RAISE EXCEPTION 'an asset document changes only by being retired, once'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+
+    CREATE OR REPLACE FUNCTION assets_files_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'asset files are never deleted: retire them'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.id <> old.id OR new.agent_id <> old.agent_id
+                OR new.document_id IS DISTINCT FROM old.document_id
+                OR new.name <> old.name OR new.media_type <> old.media_type
+                OR new.bytes <> old.bytes OR new.sha256 <> old.sha256
+                OR new.storage_key <> old.storage_key OR new.created_at <> old.created_at
+                OR new.created_by <> old.created_by
+                OR old.retired_at IS NOT NULL
+                   AND new.retired_at IS DISTINCT FROM old.retired_at THEN
+            RAISE EXCEPTION 'an asset file changes only by being retired, once: keep the new bytes as a new file'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+
+    COMMENT ON TABLE assets_documents IS
+        'A text asset of an agent: what never changes about it. Its content is in assets_versions.';
+    COMMENT ON COLUMN assets_documents.name IS
+        'The path under the agent''s assets/ folder without .md, e.g. plans/2026-10-20_x; unique per agent and kind among unretired documents.';
+    COMMENT ON TABLE assets_files IS
+        'A file of an agent that is not a markdown document: its bytes are the object storage_key in the bucket of the agent''s file store connection, this row says it exists. Immutable: a replaced file is a new row and the old one is retired.';
+    COMMENT ON COLUMN assets_files.name IS
+        'The path under the agent''s assets/ folder, extension included, e.g. research/x/crash.ips; unique per agent among unretired files.';
+    COMMENT ON COLUMN assets_files.storage_key IS
+        'The object key in the bucket: <agent_id>/<id>/<name>, so no two rows share an object.';
+    COMMENT ON TABLE assets_file_operations IS
+        'Every write to an agent''s file records, one row each, written in the transaction of the write. Append-only: never edited or deleted.';
     """),
 ]
 
@@ -1068,11 +1142,11 @@ def _document_out(row: dict) -> dict:
 
 
 VERSION_COLUMNS = "id, document_id, title, body, active, created_at, created_by, note"
-DOCUMENT_COLUMNS = "id, project_id, kind, name, created_at, created_by, retired_at"
+DOCUMENT_COLUMNS = "id, agent_id, kind, name, created_at, created_by, retired_at"
 
 
 def _document(conn, project: str, name: str, *, lock: bool = False) -> dict | None:
-    return _one(conn, f"SELECT {DOCUMENT_COLUMNS} FROM assets_documents WHERE project_id = %s "
+    return _one(conn, f"SELECT {DOCUMENT_COLUMNS} FROM assets_documents WHERE agent_id = %s "
                       "AND kind = %s AND name = %s AND retired_at IS NULL"
                       + (" FOR UPDATE" if lock else ""), (project, _kind(name), name))
 
@@ -1134,8 +1208,8 @@ def _save(conn, project: str, name: str, body: str, *, base: str | None,
         if base is not None:
             raise _StaleBase(None)
         document = _one(
-            conn, "INSERT INTO assets_documents (project_id, kind, name, created_by) "
-                  "VALUES (%s, %s, %s, %s) ON CONFLICT (project_id, kind, name) "
+            conn, "INSERT INTO assets_documents (agent_id, kind, name, created_by) "
+                  "VALUES (%s, %s, %s, %s) ON CONFLICT (agent_id, kind, name) "
                   f"WHERE retired_at IS NULL DO NOTHING RETURNING {DOCUMENT_COLUMNS}",
             (project, kind, name, actor))
         created = document is not None
@@ -1176,7 +1250,7 @@ def _refused_by_store(exc) -> NoReturn:
 
 # ── files ────────────────────────────────────────────────────────────────────
 
-FILE_COLUMNS = ("id, project_id, document_id, name, media_type, bytes, sha256, storage_key, "
+FILE_COLUMNS = ("id, agent_id, document_id, name, media_type, bytes, sha256, storage_key, "
                 "created_at, created_by, retired_at")
 _LINK = re.compile(r"\]\(\s*(?:<([^>\n]*)>|([^)\s]+))|^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*<?([^>\s]+)",
                    re.MULTILINE)
@@ -1232,7 +1306,7 @@ def _file_out(row: dict, document: str | None = None) -> dict:
 
 
 def _current_file(conn, project: str, name: str, *, lock: bool = False) -> dict | None:
-    return _one(conn, f"SELECT {FILE_COLUMNS} FROM assets_files WHERE project_id = %s "
+    return _one(conn, f"SELECT {FILE_COLUMNS} FROM assets_files WHERE agent_id = %s "
                       "AND name = %s AND retired_at IS NULL" + (" FOR UPDATE" if lock else ""),
                 (project, name))
 
@@ -1271,7 +1345,7 @@ def _write_file_row(conn, project: str, name: str, sha: str, size: int, put: dic
 
 def _log_file(conn, project: str, file_id, operation: str, actor: str) -> None:
     """Log a write to a file's records, inside the caller's transaction."""
-    _rows(conn, "INSERT INTO assets_file_operations (project_id, file_id, operation, "
+    _rows(conn, "INSERT INTO assets_file_operations (agent_id, file_id, operation, "
                 "created_by) VALUES (%s, %s, %s, %s)", (project, file_id, operation, actor))
 
 
@@ -1282,7 +1356,7 @@ def _replace_file_row(conn, project: str, name: str, sha: str, size: int, put: d
     if current is not None:
         _rows(conn, "UPDATE assets_files SET retired_at = now() WHERE id = %s",
               (current["id"],))
-    return _one(conn, "INSERT INTO assets_files (project_id, id, document_id, name, media_type, "
+    return _one(conn, "INSERT INTO assets_files (agent_id, id, document_id, name, media_type, "
                       "bytes, sha256, storage_key, created_by) VALUES (%s, %s, %s, %s, %s, %s, "
                       f"%s, %s, %s) RETURNING {FILE_COLUMNS}",
                 (project, put["id"], document_id, name, put["media_type"], size, sha,
@@ -1336,7 +1410,7 @@ def cmd_list(_args) -> None:
     rows = _rows(conn, "SELECT d.name, d.kind, d.created_at, v.id AS version, v.title, "
                        "v.created_at AS saved_at FROM assets_documents d LEFT JOIN "
                        "assets_versions v ON v.document_id = d.id AND v.active "
-                       "WHERE d.project_id = %s AND d.retired_at IS NULL ORDER BY d.name",
+                       "WHERE d.agent_id = %s AND d.retired_at IS NULL ORDER BY d.name",
                  (project,))
     _emit({"project": project, "count": len(rows), "documents": [
         {"name": r["name"], "kind": r["kind"], "title": r["title"],
@@ -1357,7 +1431,7 @@ def cmd_show(args) -> None:
             _die(6, "bad_version", f"{args.version!r} is not a version id",
                  "give the whole id or its first 6 or more characters")
         documents = _rows(conn, f"SELECT {DOCUMENT_COLUMNS} FROM assets_documents WHERE "
-                                "project_id = %s AND kind = %s AND name = %s "
+                                "agent_id = %s AND kind = %s AND name = %s "
                                 "ORDER BY created_at DESC", (project, _kind(name), name))
         if not documents:
             _need_document(conn, project, name)
@@ -1436,7 +1510,7 @@ def cmd_search(args) -> None:
     if not terms:
         _die(6, "input", "search takes the terms to look for")
     conn = _open(_root())
-    where = ("d.project_id = %(project)s AND d.retired_at IS NULL AND v.active "
+    where = ("d.agent_id = %(project)s AND d.retired_at IS NULL AND v.active "
              "AND v.search @@ websearch_to_tsquery('simple', %(terms)s)")
     params = {"project": project, "terms": terms, "limit": args.limit}
     matched = _one(conn, "SELECT count(*) AS n FROM assets_versions v JOIN assets_documents d "
@@ -1650,9 +1724,9 @@ def cmd_export(args) -> None:
     conn = _open(_root())
     rows = _rows(conn, "SELECT d.name, v.id, v.body FROM assets_documents d JOIN "
                        "assets_versions v ON v.document_id = d.id AND v.active "
-                       "WHERE d.project_id = %s AND d.retired_at IS NULL ORDER BY d.name",
+                       "WHERE d.agent_id = %s AND d.retired_at IS NULL ORDER BY d.name",
                  (project,))
-    file_rows = _rows(conn, f"SELECT {FILE_COLUMNS} FROM assets_files WHERE project_id = %s "
+    file_rows = _rows(conn, f"SELECT {FILE_COLUMNS} FROM assets_files WHERE agent_id = %s "
                             "AND retired_at IS NULL ORDER BY name", (project,))
     bucket, why = (_file_store(args.connection, "export", required=False)
                    if file_rows or args.connection else (None, None))
@@ -1837,7 +1911,7 @@ def cmd_files_rm(args) -> None:
     # bytes leaving the bucket and its record being retired. The bytes go first:
     # a refusal half way leaves the name current, so the same rm finishes it.
     keys = [row["storage_key"] for row in _rows(
-        conn, "SELECT storage_key FROM assets_files WHERE project_id = %s AND name = %s "
+        conn, "SELECT storage_key FROM assets_files WHERE agent_id = %s AND name = %s "
               "ORDER BY created_at", (project, name))]
     try:
         for key in keys:
@@ -1866,7 +1940,7 @@ def cmd_files_list(_args) -> None:
     project = _project(write=False)
     conn = _open(_root())
     rows = _rows(conn, "SELECT f.*, d.name AS document FROM assets_files f LEFT JOIN "
-                       "assets_documents d ON d.id = f.document_id WHERE f.project_id = %s "
+                       "assets_documents d ON d.id = f.document_id WHERE f.agent_id = %s "
                        "AND f.retired_at IS NULL ORDER BY f.name", (project,))
     _emit({"project": project, "count": len(rows),
            "files": [_file_out(row, row["document"]) for row in rows]})
@@ -1880,7 +1954,7 @@ def cmd_files_log(args) -> None:
                        "f.name, f.bytes, f.sha256, d.name AS document "
                        "FROM assets_file_operations o JOIN assets_files f ON f.id = o.file_id "
                        "LEFT JOIN assets_documents d ON d.id = f.document_id "
-                       "WHERE o.project_id = %s AND (%s::text IS NULL OR f.name = %s) "
+                       "WHERE o.agent_id = %s AND (%s::text IS NULL OR f.name = %s) "
                        "ORDER BY o.created_at DESC, o.id DESC LIMIT %s",
                  (project, name, name, args.limit))
     _emit({"project": project, "name": name, "count": len(rows),
@@ -1995,7 +2069,7 @@ def cmd_doctor(wanted: str | None = None) -> None:
         if found.state == "current" and project:
             conn.rollback()
             store["documents"] = _one(conn, "SELECT count(*) AS n FROM assets_documents "
-                                            "WHERE project_id = %s AND retired_at IS NULL",
+                                            "WHERE agent_id = %s AND retired_at IS NULL",
                                       (project,))["n"]
     except db.DbError as exc:
         store.update(ok=False, code=exc.slug, error=exc.message, hint=exc.hint)

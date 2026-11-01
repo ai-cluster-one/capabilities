@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.33,<1",
+#     "capabilities-contract>=0.42,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -345,9 +345,9 @@ Commands:
                                                The service's prompts - context,
                                                delegation, job-worker, the voice
                                                prompts and each context/<x> - as
-                                               versions in telegram_prompts in the
-                                               project's store. The service reads
-                                               a key's active version, and its
+                                               versions in telegram_prompt_versions
+                                               in the project's store. The service
+                                               reads a key's active version, and its
                                                file under capabilities/telegram/
                                                service only while the store holds
                                                no version of that key. `import`
@@ -3202,13 +3202,13 @@ _SIGN_IN_HARNESSES = ("claude", "codex")
 # daemon resumes on its own (jobs.SELF_RESUMING).
 _HARNESS_OPEN_JOBS = """
     SELECT id, profile, engine FROM telegram_jobs
-     WHERE project_id = %s AND surface = 'telegram' AND environment = %s
+     WHERE agent_id = %s AND surface = 'telegram' AND environment = %s
        AND (state IN ('draft', 'waiting', 'running')
             OR (state = 'stopped' AND outcome IN ('quota', 'interrupted')))
      ORDER BY created_at, id"""
 _HARNESS_CHAT_PROFILES = """
     SELECT channel_key, settings->>'profile' FROM telegram_channels
-     WHERE project_id = %s AND environment = %s AND settings->>'profile' IS NOT NULL
+     WHERE agent_id = %s AND environment = %s AND settings->>'profile' IS NOT NULL
      ORDER BY channel_key"""
 
 
@@ -3683,7 +3683,7 @@ def cmd_profiles(args) -> dict:
 
 # --- Service prompts --------------------------------------------------------------
 #
-# The service's prompts are versioned rows of `telegram_prompts` in the project's
+# The service's prompts are versioned rows of `telegram_prompt_versions` in the project's
 # store (`service/prompts.py`); the files under the service directory are what
 # `prompts import` reads and `prompts export` writes, and what the service reads
 # for a key only while the store holds no version of it.
@@ -3889,9 +3889,11 @@ def _job_row(view: dict) -> dict:
 
     The stored columns, with the flag turned into the sentence it stands for:
     "stop_requested=1, state=running" is two halves a reader has to assemble,
-    and "stopping" is not.
+    and "stopping" is not. The agent column keeps the key it has always been
+    reported under, `project_id`.
     """
-    row = dict(view)
+    row = {("project_id" if key == "agent_id" else key): value
+           for key, value in view.items()}
     row["stopping"] = bool(row.pop("stop_requested", 0))
     return row
 

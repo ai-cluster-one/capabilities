@@ -124,7 +124,7 @@ def test_a_dry_run_plans_every_mover_on_tables_not_made_yet(world):
     assert {"automations", "tasks", "telegram", "harness"} <= set(pending)
     assert pending["telegram"].startswith("0001") and pending["tasks"].startswith("0001")
     assert all(entry["from"] is None for owner, entry in dry["tables_to_upgrade"].items()
-               if owner != "capabilities")
+               if owner != "core")
 
 
 def test_a_dry_run_plans_every_mover_on_tables_a_step_behind(world):

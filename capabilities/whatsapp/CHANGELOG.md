@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-11-01 — The store names the agent: whatsapp's tables go to schema major 2
+
+`whatsapp`'s tables name an agent where they named a project: `project_id` is `agent_id` in `whatsapp_register`, `whatsapp_jobs`, `whatsapp_job_amendments` and `whatsapp_job_slots`, and every constraint named for the column moves with it. Step `0023-agent-names` renames them in place with every row kept and takes the ledger to 2.0, so a `whatsapp` of an earlier release refuses a migrated store with `schema_too_new` instead of misreading it, and this release brings a store at 1.4 to 2.0 on its first store call. The capability now needs `capabilities-contract` 0.42.0, whose core tables carry the manager's new names, and pins `callva-harness-runner` 0.11.0, whose profiles are kept in `harness_profile_versions`, so the profiles the service reads and saves are the store's under their new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-10-31 — `whatsapp help` names the agent's vault in the credential cascade
 
 Bare `whatsapp help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. It also says `whatsapp setup set` stores DEEPGRAM_API_KEY as that section says, where it used to say it writes `~/.config/capabilities/shared.env`. Nothing else changes.

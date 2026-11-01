@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-11-01 — The store names automations' rows for agents, at store version 2.0
+
+Breaking for an older release on the same store. Ledger step `0008-agent-names` (automations 2.0) renames, in place and keeping every row: `project_id` to `agent_id` in `automations_runs` and in the definitions, and `automations_definitions` to `automations_definition_versions`, with its key, indexes, constraints, triggers and their functions. The notification a saved definition sends on `automations_changed` names the agent as `agent_id` where it said `project`; the channel and its change versions are as before. A release of automations 1.x that meets the store at 2.0 refuses with `schema_too_new`; this release migrates a store at 1.4 when it opens it. Every key automations prints, `project_id` of a run included, is as before. The placement read names the manager's table `policies`, so automations declares `capabilities-contract>=0.42,<1`, and the runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions`.
+
 ## 2026-10-31 — `automations` carries its own icon
 
 The bundle holds its icon as `icon.png`, a timer: Lucide's `timer` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon automations` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

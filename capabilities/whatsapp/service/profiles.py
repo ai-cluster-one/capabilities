@@ -1,13 +1,13 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "callva-harness-runner==0.10.1",
+#     "callva-harness-runner==0.11.0",
 # ]
 # ///
 """The profiles a WhatsApp dialogue turn or job may run on, and whether one fits.
 
 A profile says how the model runs; it is a callva-harness-runner profile kept
-in the store, in the `harness_profiles` table the runner owns. A name resolves
+in the store, in the `harness_profile_versions` table the runner owns. A name resolves
 as agentrooms and tasks resolve it: the project's active version, then the
 global one, then the runner's shipped profiles; then the four this bundle
 ships in `service/profiles/` - `whatsapp-claude` and `whatsapp-codex` for
@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-RUNNER_PIN = "callva-harness-runner==0.10.1"
+RUNNER_PIN = "callva-harness-runner==0.11.0"
 DEFAULT_PROFILE = "whatsapp-claude"
 DEFAULT_JOB_PROFILE = "whatsapp-job-claude"
 BUNDLED = ("whatsapp-claude", "whatsapp-codex", "whatsapp-job-claude",

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.33,<1",
+#     "capabilities-contract>=0.42,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.10.1",
 # ]
@@ -264,7 +264,7 @@ STORE
   scope the project id) in the writer's own transaction, so a reader follows
   the version rather than listening. For a reader of an earlier release the
   store also sends the notification `memory_changed` as the change commits,
-  with the payload {"schema", "project", "kind", "entry", "event"} - ids
+  with the payload {"schema", "agent_id", "kind", "entry", "event"} - ids
   only, never text.
 
 CONTRACT VERBS
@@ -1249,7 +1249,7 @@ def _adopt_one(root: Path, apply: bool, pin_titles, zone=None) -> dict:
                     item["decision"] = "carried" if created else "already"
                     item["entry"] = engine.short(made["id"])
                 elif store is not None:
-                    hit = store.one("SELECT entry_id FROM memory_events WHERE project_id = %s "
+                    hit = store.one("SELECT entry_id FROM memory_events WHERE agent_id = %s "
                                     "AND kind = 'add' AND detail ? 'adopt_key' AND "
                                     "detail->>'adopt_key' = %s", (project, key))
                     if hit:

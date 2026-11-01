@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-11-01 — The store names the agent: memory's tables go to schema major 2
+
+`memory`'s tables name an agent where they named a project: `project_id` is `agent_id` in `memory_entries`, `memory_events` and `memory_groom_leases`, the indexes `memory_entries_project` and `memory_events_project` are `memory_entries_agent` and `memory_events_agent`, every constraint named for the column and the lease table's comment move with it, and the entries' guard and the change trigger read the renamed column. The `memory_changed` notification's payload names the agent under `agent_id` where it said `project`; the channel and the change versions are unchanged. Step `0007-agent-names` renames them in place with every row kept and takes the ledger to 2.0, so a `memory` of an earlier release refuses a migrated store with `schema_too_new` instead of misreading it, and this release brings a store at 1.2 to 2.0 on its first call. The capability now needs `capabilities-contract` 0.42.0, whose core tables carry the manager's new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-10-31 — `memory` carries its own icon
 
 The bundle holds its icon as `icon.png`, a brain: Lucide's `brain` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon memory` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.
