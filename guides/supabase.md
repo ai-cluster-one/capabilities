@@ -31,6 +31,6 @@ The earlier two-address setup - the session pooler as `--host`/`--port` and the 
 
 Supabase's transaction pooler is recognised by its host and port 6543, so it needs no declaration. A transaction pooler of any other kind as the store's one address - a self-hosted connection pooler in transaction mode, or another provider's transaction-mode pool - is declared with `--transaction-pooler` beside `--host` and `--port`, and the store is then transaction-only as it is here; see `capabilities guide migrate-to-database` for when it may be set.
 
-## The session locks end on 2027-01-05
+## Sizing and checking it
 
-Until 2027-01-05, tasks and memory still take transitional session locks where the store has a session address, because earlier releases of them read those locks. On that date the locks are retired. Until then, `tasks doctor` names a machine where an earlier tasks service still serves against the store, and `memory doctor` one where an earlier memory is grooming; update those machines before 2027-01-05.
+How many connections each address takes, the limits that bind on each compute size, the pool sizes AgentKit sets, the session locks that end on 2027-01-05, and what to change when the pool runs short are in `capabilities guide store-connections`.

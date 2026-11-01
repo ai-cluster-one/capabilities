@@ -2183,8 +2183,9 @@ AUTHORING
         exact read commands. With a topic, print that guide's Markdown body.
         Start here for capability authoring, repositories, contract work,
         development, review, sanitizing, and publishing, for moving agents
-        from files to the database (migrate-to-database), and for a store on
-        Supabase (supabase).
+        from files to the database (migrate-to-database), for a store on
+        Supabase (supabase), and for sizing and checking a store's
+        connections (store-connections).
 
 I/O CONTRACT
   Success: JSON on stdout, except the documented Markdown renderers
@@ -2415,7 +2416,8 @@ _AUTHORING_ASSETS = (
 )
 _MANAGER_GUIDE_TOPICS = (
     "authoring", "conforming", "contract", "dev", "grooming",
-    "migrate-to-database", "publishing", "reporting", "repositories", "sanitizing", "supabase",
+    "migrate-to-database", "publishing", "reporting", "repositories", "sanitizing",
+    "store-connections", "supabase",
     "surfaces",
 )
 SKILL_ASSET = "skill/SKILL.md"

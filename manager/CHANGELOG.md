@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-01 — `capabilities guide store-connections`: how agents and AgentKit connect to a store, and how to size and check it
+
+A new manager guide, `store-connections`, is the one place an agent reads to set up and judge a store's connections: the transaction address every ordinary connection uses and the session address only LISTEN and, until 2027-01-05, the tasks and memory session locks use; a pooler (Supavisor, PgBouncer) against a direct Postgres; how many connections a Mac and a server node hold; the limits that bind (`max_connections`, the pooler's client limit, the pool size per mode) with Supabase's compute table; the pool sizes AgentKit sets when it connects Supabase; and the symptoms of a short pool (`EMAXCONNSESSION`, `EMAXCONN`, `ECHECKOUTTIMEOUT`, `ECIRCUITBREAKER`) with what to change and the `capabilities store` and Supabase Management API commands that read and change it. The section on the session locks ending on 2027-01-05 moves there from `capabilities guide supabase`, which now points to it.
+
 ## 2026-11-01 — doctor checks the grants' agents against the agent registry, `capabilities_agents`
 
 In a store-mode project, `capabilities doctor` now checks each `agent_id` holding connection grants against the agent registry the store keeps, `capabilities_agents`, rather than ContextKit's `contextkit_agents`. A store without ContextKit's table no longer lists `agents_registry_absent` for good: that notice now means the store has no `capabilities_agents`, and `grant_agent_unknown` names a grant's agent that `capabilities_agents` does not register. Both stay under `information` and are never drift; the codes and fields are unchanged, and the messages name the agent registry instead of ContextKit's.
