@@ -3,7 +3,7 @@
     "agentrooms": {
       "icon": true,
       "path": "capabilities/agentrooms",
-      "payload_sha256": "9ac78b15bdb6f0da382b92576d002710d257f6f18c634506bd98a08dd2c34693",
+      "payload_sha256": "64991776ae637856bb3da6d1e6ae43a06d16c740972f1b8a07c583809a45c4a6",
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
     "agenttemplates": {
@@ -21,7 +21,7 @@
     "askproject": {
       "icon": true,
       "path": "capabilities/askproject",
-      "payload_sha256": "90072f177d25e01f6aa8d424e9e8813b8328b8a48db291c64a1ba7925041f93f",
+      "payload_sha256": "0b44c34b2189e89e9d8f89235033e56a6f92862db9779a6b5c4f0d5eeb04678b",
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability."
     },
     "assets": {

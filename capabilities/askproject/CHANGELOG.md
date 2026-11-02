@@ -2,7 +2,7 @@
 
 ## 2026-11-01 — The session map names the caller as an agent, at store version 2.0
 
-Breaking for an older release on the same store. Ledger step `0002-agent-id` (askproject 2.0) renames `askproject_sessions.project_id` to `agent_id`, and its constraints with it, in place: every session row stays. A release of askproject 1.x that meets the store at 2.0 refuses with `schema_too_new` and asks for an update; this release migrates a store at 1.0 on its first call. Nothing askproject prints changes. The runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions` at its store version 2.0; a profile resolves as before.
+Breaking for an older release on the same store. Ledger step `0002-agent-id` (askproject 2.0) renames `askproject_sessions.project_id` to `agent_id`, and its constraints with it, in place: every session row stays. A release of askproject 1.x that meets the store at 2.0 refuses with `schema_too_new` and asks for an update; this release migrates a store at 1.0 on its first call. Nothing askproject prints changes. The runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions` at its store version 2.0; a profile resolves as before. Declares `capabilities-contract>=0.42,<1`, so a release on an older library, which reads the renamed core tables as empty, is not run against the store.
 
 ## 2026-10-31 — `askproject` carries its own icon
 
