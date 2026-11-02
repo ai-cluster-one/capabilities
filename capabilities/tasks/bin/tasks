@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.33,<1",
+#     "capabilities-contract>=0.42,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.10.2",
 #     "pyyaml>=6",
@@ -1911,7 +1911,9 @@ STORE
   `"owner": "harness"`. `doctor` reports where it stands as `profile_tables`.
   and takes no lock when they are current. `doctor` reports the store - where
   its setting was read, and the schema - and where the tables stand, and
-  changes nothing.
+  changes nothing. `migrate` and `migrate status` answer the harness table
+  under `other_owners`, and the manifest names both owners as `owners`,
+  ["harness", "tasks"].
 
   A store an earlier release kept in a schema of its own, `tasks`, is moved by
   the first step into the schema the setting binds: its four tables and the
@@ -14846,6 +14848,14 @@ def _profile_tables():
     runner = _profile_store()
     return (runner.PROFILE_STORE_OWNER, runner.PROFILE_STORE_STEPS,
             runner.PROFILE_STORE_MAJOR, runner.PROFILE_STORE_MINOR)
+
+
+def _owner_tables():
+    """The further owners the contract's `migrate` migrates before this
+    capability's own and answers under `other_owners`, and the manifest names
+    in `owners`: the harness library's profile table, so the manager's store
+    upgrade knows tasks migrates it."""
+    return [_profile_tables()]
 
 
 def _bundle_dir() -> Path:

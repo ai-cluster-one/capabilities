@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.40,<1",
+#     "capabilities-contract>=0.42,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -71,8 +71,8 @@ ENVIRONMENT
                        disable, node enable, node remove, node seen, node set,
                        place (but its report),
                        quarantine, relabel, secrets set, secrets rm, secrets
-                       raw --set, secrets move, set, store set, store unset
-                       and unplace.
+                       raw --set, secrets move, set, store set, store unset,
+                       store upgrade (but --check) and unplace.
                        doctor reports it. Unset, `0` or `false` leaves it off.
   AGENT_ENCRYPTION_KEY
                        the agent's one encryption key, which opens its vault
@@ -162,7 +162,13 @@ MACHINE VERBS
         then carries global_policy {enabled, gate} naming the store's table,
         or {enabled, pending, reason, hint}. Reinstalling or updating an
         installed capability keeps its machine state; uninstall drops the
-        machine state.
+        machine state. From the official catalogue it takes the release
+        update would take (store majors, under self-update --check): the
+        one that reads the store's schema major, from that major's line
+        where main reads another, recorded against the canonical source and
+        answered as store_major, and the newest where no store is configured,
+        it does not answer, or it holds no schema yet; where no release of
+        the store's major can be taken it exits 6 no_release_for_store_major.
         Install, update, `store set` and `migrate --global` run one reconcile
         of the store this machine is set to: every installed core capability
         from the official catalogue gets its global enable row there, where
@@ -222,6 +228,18 @@ MACHINE VERBS
         deployment keeps the payload it has, answered as {name, changed: false,
         kept {reason, next, agents, processes, move?}}, and the rest of the
         update goes on; the next update tries again.
+        Update takes only a release that reads the store's schema major (store
+        majors, under self-update --check): the store this folder resolves through the store
+        cascade is read once, and the answer carries it as store_major {store,
+        reason?} - store null, with the reason, where no store is configured,
+        the store does not answer, or it holds no schema yet, and then each
+        capability takes the newest release as before. A capability whose
+        release reads another major than the store's is taken from the store's
+        major's line of the canonical source and recorded against the canonical
+        source, else keeps the payload it has ({name, changed: false}); its row
+        carries store_major (store majors). A line that names the
+        capabilities-contract range it reads (library) keeps each environment's
+        sync inside that range.
   update --check [<name>] [--json]
         Report, for every installed capability or the one named, whether
         `update` would change it: its recorded source carries a different
@@ -239,8 +257,13 @@ MACHINE VERBS
         installed {catalog_sha256, version, source_commit?},
         available {catalog_sha256, version} | null,
         contract_library? {installed, available}, update_available,
-        error? {code, message, hint?}}], update_available}; the top-level
-        update_available is true when any row's is. A source that cannot be
+        store_major?, error? {code, message, hint?}}], store_major {store,
+        reason?}, update_available}; the top-level update_available is true
+        when any row's is. A row whose source's release reads another major
+        than the store's is answered as `update` would take it: from the
+        store's major's line (its source and available that line's), or kept,
+        with available the release it refuses and update_available false; its
+        store_major says which (store majors). A source that cannot be
         reached or read leaves that row's available null and update_available
         false and names it in error; the other rows are still answered. Exit 0
         when every row was answered, behind or current alike; 5 when any row
@@ -257,6 +280,19 @@ MACHINE VERBS
         capability that arrives with the manager (agenttemplates) where this
         machine does not have it, answered as carried_capabilities [{name,
         installed, error?}]; one that fails never fails the update.
+        It takes only a release that reads the store's schema major (store
+        majors, below): the release manifest's store_major against the store this
+        folder resolves. A release of the store's major is taken, as is the
+        newest where no store is configured, the store does not answer, or it
+        holds no schema yet. From the canonical source, a release of another
+        major gives way to the store's major's line; where that line does not
+        exist or cannot be read, and from --from always, the installed release
+        is kept and the answer is {self_update: "kept", manager, source,
+        store_major}, exit 0. Every answer carries store_major. A release
+        whose manifest names the capabilities-contract range its line reads
+        (library) holds the manager's own environment inside that range, as
+        update holds each capability's, before anything runs it; the answer
+        then names it as library.
   self-update --check [--from <checkout>] [--json]
         Report whether the canonical source (or --from) carries a manager
         release other than the one the PATH symlink selects. Reads only the
@@ -266,11 +302,37 @@ MACHINE VERBS
         the version is the newest heading of that release's manager change log,
         null where none can be read. JSON {installed {release, manager_sha256,
         version} | null, available {release, manager_sha256, version, source},
-        update_available}; installed is null when the PATH symlink selects no
-        versioned release, which self-update replaces. Exit 0 when the check
+        update_available, store_major}; installed is null when the PATH symlink
+        selects no versioned release, which self-update replaces. available is
+        the release self-update would take - the store's major's line where it
+        gives way to it - or, where it would keep the installed release, the
+        release it refuses, with update_available false. Exit 0 when the check
         answered, behind or current alike; 5 when the source cannot be reached
         or carries no valid release manifest. Output is always JSON, so --json
         changes nothing.
+        Store majors, for update, self-update and their --check: every
+        manager release and capability names the store
+        schema major it reads: STORE_MAJOR in the manager, stamped by `source
+        index` as store_major into the release manifest and the catalogue (top
+        level and every entry); a release that names none reads major 1. The
+        store's major is its `core` owner's major in schema_version, 1 for a
+        store whose owners were migrated before the core was. `main` carries
+        the newest major; when a newer one lands there, the last commit of the
+        older major is kept as branch store-major-<n>, which takes only fixes
+        and what that major needs to reach the upgrade, and names the
+        capabilities-contract range it reads as library. The canonical
+        source's line for major n is that source with its trailing /main
+        replaced by /store-major-<n>; no other source has lines. A major is
+        crossed only by `capabilities store upgrade`; a store already on a
+        newer major than the installed release takes main's release of it.
+        store_major {store, release, taken (release | line | installed),
+        line_source?, reason?, upgrade_needed, command?, message?}: store is
+        the store's major (null with reason where it is unknown), release the
+        major of the release the source offers, taken what is taken - that
+        release, the store's major's line (line_source), or nothing, keeping
+        what is installed - and upgrade_needed true when the release reads a
+        newer major than the store, with command "capabilities store upgrade"
+        and message saying so.
   allow <name> / quarantine <name>
         Set this machine's ceiling for an installed capability, kept in
         $XDG_CONFIG_HOME/capabilities/machine.json, which only the manager
@@ -423,7 +485,8 @@ STORE VERBS
   its gate, connections, grants, identifiers and settings - are files only
   until it has moved into the store (see migrate); from then they are rows
   of the contract's tables in the store, beside the tables each capability
-  migrates for itself. These verbs never create a table.
+  migrates for itself. These verbs never create a table, but store
+  upgrade, which migrates every owner across a schema major.
   store set --host H --database D --user U [--port P]
             [--sslmode require|verify-ca|verify-full|disable]
             [--sslrootcert PATH|system] [--schema NAME]
@@ -523,6 +586,105 @@ STORE VERBS
         Exit 0 when every check holds, 7 when any fails, 3 no_store_setting when
         no level answers, 6 with the library's code when the level in force
         is refused.
+  store upgrade --check [--json]
+        Change nothing, and answer for the store this folder resolves (the
+        cascade above) whether a schema major is to be crossed and whether
+        `store upgrade` can cross it. A store's major is its core owner's
+        major in schema_version, 1 for a store whose owners were migrated
+        before the core was; a major is crossed only by `store upgrade` (the
+        library refuses it elsewhere as store_upgrade_needed), a minor change
+        applies by itself. It reads the store's majors, asks each owner what
+        the installed releases read - the manager's own owners (core,
+        capabilities, deployment) here, each installed capability that keeps
+        tables through its `<name> migrate status`, a quarantined one under
+        the upgrade's flag, for every owner its manifest declares (owners:
+        a library's tables it migrates before its own, such as tasks'
+        harness, answered under other_owners) - and reads the store_major of
+        the newest line's
+        manager release (the canonical source, main). JSON {ok, state,
+        upgrade_needed, can_run, message, store {key, level, schema, host,
+        port, database, reachable, major, since, server_major, tables,
+        bytes}, manager {reads, library}, available {major, source, error?},
+        target_major, owners [{owner, by (manager | capability),
+        capability?, quarantined?, further?, store {major, minor} | null,
+        reads {major, minor} | null, release_store_major?, state (current, pending,
+        upgrade_needed, schema_too_new, checksum_mismatch, empty, unknown),
+        crosses, error?}], blockers [{code, message, hint, owner?}], next
+        [command], backup {dir, needed_bytes, free_bytes}, tools {pg_dump,
+        pg_restore: {path, version, major} | null}, nodes [{node, label,
+        kind, disabled, last_seen_at, reported_at, reachable, runs
+        {image_version, boot_line, versions}, reads_store, reason, command}],
+        progress {started_at, target_major, phases, manager_release} | null}.
+        state is empty (the store holds no schema: nothing to cross), current
+        (nothing to cross), behind (the store is on a newer major than this
+        machine's releases read: next is self-update, then update),
+        upgrade_available, blocked, unreachable or unconfigured. upgrade_needed
+        is true where the newest line reads a newer major than the store's,
+        or an installed release crosses an owner's major. A blocker is each
+        thing that stops it: owner_not_installed (the store holds tables of an
+        owner no release here declares), owner_unreadable, pg_dump_missing,
+        pg_dump_too_old (older than the server), pg_restore_missing,
+        pg_restore_too_old, no_room_for_dump (the schema's size against the
+        free space where the dump goes), read_only_switch, and
+        store_unreachable. A node cannot read the store when the store is
+        above major 1 and the node was last seen, or last reported, before
+        the store got there (since); command is what brings it up: `coolify
+        restart <resource> --type service` for a standard-image node, whose
+        boot self-updates the manager and updates every capability, `coolify
+        deploy <resource>` for one built from a repository, else self-update,
+        update and its node manager restarted on that machine. progress is
+        an upgrade of this store that has not finished. Allowed under the
+        read-only switch. Exit 0 when the store was read, whatever it
+        found; 3 store_not_configured, 5 when the store does not answer, 6
+        when the level in force is refused, each with the answer printed.
+        Output is always JSON, so --json changes nothing.
+  store upgrade [--events]
+        The one procedure that crosses a schema major, and the only one that
+        runs the library's major steps (CAPABILITIES_STORE_UPGRADE=1 for its
+        migrations alone). It runs the check above first: with nothing to
+        cross it changes nothing and answers {upgraded: false, state,
+        message, store, owners, nodes, next}; with a blocker it exits 6
+        store_upgrade_blocked, the check as the error's detail. Otherwise, in
+        phases: manager - where the newest line's manager reads a newer major
+        than this one, it is fetched from the canonical source (main),
+        whatever the store's major, which only this verb does, activated as
+        self-update activates a release, and handed over to: the new manager
+        runs `store upgrade` on, so the new major's own code does the rest;
+        capabilities - where the store crosses its major, every installed
+        capability is updated from the newest line, as update takes it with
+        no store major to keep to; dump - pg_dump of the store's schema, in
+        custom format, to $XDG_DATA_HOME/capabilities/backups/<store
+        key>/<UTC time>.dump (~/.local/share/capabilities/backups when
+        XDG_DATA_HOME is unset), proven: `pg_restore --list` reads the whole
+        archive and its table of contents holds the data of every table the
+        schema held; migrate - every owner under the upgrade's flag: core
+        and the manager's own owners the store holds, then each installed
+        capability that keeps tables through its `<name> migrate`, once for
+        every owner it declares (an owner it migrates for another, by), a
+        quarantined one included, which the flag lets move. Progress is kept
+        per store in $XDG_STATE_HOME/capabilities/store-upgrade/<store
+        key>.json: a rerun after an interruption skips each phase and owner
+        done (a proven dump is kept and reused, not taken again) and goes on;
+        one upgrade of a store runs at a time (exit 6
+        store_upgrade_running). A phase that fails exits with its error and
+        the progress as detail (store_upgrade_blocked, dump_failed,
+        dump_unproven, update_failed, migrate_failed - the library's message
+        and hint kept - or the fetch's own), and the same command goes on
+        from there. Answers {upgraded: true, state, resumed, store, major
+        {before, after}, owners [{owner, before, after, applied, version, by?,
+        quarantined?}], manager {release, manager} | null, capabilities
+        [{name, changed}], backup {path, bytes, sha256, taken_at, proven {ok,
+        restore_list, tables, table_data, missing}, kept}, progress, nodes,
+        nodes_to_bring_up [{node, label, kind, last_seen_at, reason,
+        command}], next}: nodes_to_bring_up are the enabled nodes the store
+        holds that cannot read it yet, those not seen since the upgrade moved
+        it among them, each with the command that brings it up. With
+        --events each phase is a JSON line on stdout, step {step (check,
+        manager, capabilities, dump, migrate), state started | done | skipped
+        | failed, capability? | owner?, check | reason | error}, handover
+        {manager, release} before the new manager carries on, ending in done
+        {result} or error {exit, error}. Exit 4 under the read-only switch.
+        capabilities guide store-upgrade says how to go through it.
   store unset
         Remove the machine level's setting file under the manager's lock. A
         file of a format version this manager does not know is left as it is
@@ -1323,13 +1485,18 @@ PROJECT VERBS (run inside a consuming project)
         itself and no other. `node run` and every `node supervise` run it on
         each reconcile, and `agent state` says when a node counts as live.
         Answers {ok, project, agent_id, node, last_seen_at, store}. Exit 6
-        node_unknown for a node not registered.
+        node_unknown for a node not registered. A manager whose STORE_MAJOR
+        is not the store's schema major writes nothing that says its node
+        reads the store - node seen, node state report, node update (the run
+        and --check), and node run's own writes and update requests alike:
+        each exits 6 schema_too_new or store_upgrade_needed with the
+        library's hint, and node run says so once in its log.
   node state
         What each of this agent's nodes last said of itself, as its row of
         capabilities_node_states holds it, one row per machine shared by
         every agent on it, with this agent's own sign-ins there from
         capabilities_node_logins: {ok, project, agent_id, nodes [{node,
-        label, disabled_at, reachable, load_1, load_5, load_15, cpu_count,
+        label, disabled_at, reachable, cannot_read_store, load_1, load_5, load_15, cpu_count,
         memory_used_bytes, memory_limit_bytes, disk_used_bytes,
         disk_total_bytes, booted_at, uptime_seconds, boot_line,
         image_version, claude_login, claude_account, claude_needed,
@@ -1346,7 +1513,12 @@ PROJECT VERBS (run inside a consuming project)
         seconds after it is written (fresh_until, the store's time):
         reachable is whether that has not yet passed, by the store's now,
         and a node that never wrote one reads unreachable with every field
-        null. Memory is the container's under a memory limit, its usage
+        null. A node that cannot read the store - the store is above schema
+        major 1 and the node was last seen, or last reported, before the
+        store got there - reads unreachable whatever its row says, and
+        cannot_read_store {store_major, since, last_seen_at, message,
+        command} says why and what brings it up (as `store upgrade --check`
+        names it); null otherwise. Memory is the container's under a memory limit, its usage
         less the file cache it can give back, else the machine's; disk is
         the filesystem holding the home; booted_at is the container's
         start on a container node, the machine's boot otherwise. boot_line
@@ -1425,7 +1597,11 @@ PROJECT VERBS (run inside a consuming project)
         `node run` takes up within seconds: {ok, project, agent_id, node,
         requested {id, state, requested_at, requested_by, ...}, store}; exit
         6 update_pending while one is requested or running for that node,
-        which the store holds to one. Without either, this node now: it
+        which the store holds to one. A request nothing would take up is
+        refused, writing nothing: exit 6 node_cannot_read_store for a node
+        that cannot read the store (as `node state` says it), its hint the
+        command that brings it up, and node_unreachable for a node whose
+        manager has not reported within the last 90 seconds. Without either, this node now: it
         takes up the row asked for it, or makes its own, marks it running,
         and runs `capabilities self-update` then `capabilities update`,
         each through the manager the links select then, and asks the doctor
@@ -2310,8 +2486,9 @@ AUTHORING
         Start here for capability authoring, repositories, contract work,
         development, review, sanitizing, and publishing, for moving agents
         from files to the database (migrate-to-database), for a store on
-        Supabase (supabase), and for sizing and checking a store's
-        connections (store-connections).
+        Supabase (supabase), for sizing and checking a store's
+        connections (store-connections), and for crossing a store's schema
+        major on every machine and node that uses it (store-upgrade).
 
 I/O CONTRACT
   Success: JSON on stdout, except the documented Markdown renderers
@@ -2535,6 +2712,20 @@ _ASSET_ROOT = _REPO_ROOT if (_REPO_ROOT / "SHEBANG.md").is_file() \
 # that admits a version older than the first to carry the shared code.
 CONTRACT_LIBRARY = "capabilities-contract"
 CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
+# The store schema major this release line reads - the major of the `core`
+# owner in the store's schema_version - and, on a line kept for an older major,
+# the capabilities-contract range that line reads (None on main, which carries
+# the newest major and takes no constraint). `source index` stamps both into
+# the manager release manifest and the catalogue; `self-update` and `update`
+# take only a release that reads the store's major. `main` always carries the
+# newest major; when a newer one lands there, the last commit of the older
+# major is kept as branch STORE_LINE_REF, and a major is crossed only by
+# STORE_UPGRADE_COMMAND.
+STORE_MAJOR = 1
+STORE_LIBRARY: str | None = None
+STORE_CANONICAL_REF = "main"
+STORE_LINE_REF = "store-major-{major}"
+STORE_UPGRADE_COMMAND = "capabilities store upgrade"
 _CONTRACT_TIERS = ("core", "store", "connections")
 _REQUIRED_CONTRACT_TIERS = ("core", "store")
 _AUTHORING_ASSETS = (
@@ -2543,7 +2734,7 @@ _AUTHORING_ASSETS = (
 _MANAGER_GUIDE_TOPICS = (
     "authoring", "conforming", "contract", "dev", "grooming",
     "migrate-to-database", "publishing", "reporting", "repositories", "sanitizing",
-    "store-connections", "supabase",
+    "store-connections", "store-upgrade", "supabase",
     "surfaces",
 )
 SKILL_ASSET = "skill/SKILL.md"
@@ -2669,7 +2860,7 @@ READ_ONLY_REFUSED_VERBS = ("agent convert", "agent set", "allow", "connections i
                            "secrets set",
                            "service move", "service restart", "service start",
                            "service stop",
-                           "set", "store set", "store unset", "unplace")
+                           "set", "store set", "store unset", "store upgrade", "unplace")
 
 
 def _read_only_gate(verb: str) -> None:
@@ -2734,7 +2925,11 @@ def _global_kept(adapter) -> str:
     not answer leaves the read on the files."""
     try:
         return adapter.global_kept()
-    except _store_module().StoreError:
+    except _store_module().StoreError as exc:
+        # A store at another schema major is no store missing: its refusal,
+        # naming what to run, is the answer rather than the files' gate.
+        if exc.slug in STORE_MAJOR_SLUGS:
+            _die(6, exc.slug, exc.message, exc.hint)
         return "files"
 
 
@@ -4967,14 +5162,18 @@ def _contract_library_paths(script: Path) -> list[Path]:
     return paths
 
 
-def _contract_library_sync(uv: str, path: Path) -> list[str]:
+def _contract_library_sync(uv: str, path: Path, library: str | None = None) -> list[str]:
     """The uv call that brings one environment's contract library to the
-    newest release the script's declared range admits."""
+    newest release the script's declared range admits - and, where the release
+    line the payload came from names the library range it reads (`library`),
+    the newest inside that range too: uv takes a requirement given to
+    --upgrade-package as a constraint on the resolution."""
+    upgrade = f"{CONTRACT_LIBRARY}{library}" if library else CONTRACT_LIBRARY
     return [uv, "sync", "--quiet", "--script", str(path),
-            "--upgrade-package", CONTRACT_LIBRARY, "--refresh-package", CONTRACT_LIBRARY]
+            "--upgrade-package", upgrade, "--refresh-package", CONTRACT_LIBRARY]
 
 
-def _refresh_contract_library(script: Path) -> None:
+def _refresh_contract_library(script: Path, library: str | None = None) -> None:
     """Bring the contract library in an installed capability's environment to
     the newest release its declared range admits. uv keeps a script's
     environment while it still satisfies the script's requirements, so without
@@ -4989,7 +5188,7 @@ def _refresh_contract_library(script: Path) -> None:
     for path in _contract_library_paths(script):
         try:
             proc = subprocess.run(
-                _contract_library_sync(uv, path),
+                _contract_library_sync(uv, path, library),
                 capture_output=True, text=True, timeout=300, env=_snapshot_env())
         except (OSError, subprocess.TimeoutExpired) as exc:
             _warn(f"{path}: {CONTRACT_LIBRARY} was not refreshed: {exc}")
@@ -4999,7 +5198,7 @@ def _refresh_contract_library(script: Path) -> None:
             _warn(f"{path}: {CONTRACT_LIBRARY} was not refreshed: {detail}")
 
 
-def _contract_library_behind(script: Path) -> dict | None:
+def _contract_library_behind(script: Path, library: str | None = None) -> dict | None:
     """What `_refresh_contract_library` would move, asked of uv as a dry run of
     the same call.
 
@@ -5016,7 +5215,8 @@ def _contract_library_behind(script: Path) -> dict | None:
     for path in _contract_library_paths(script):
         try:
             proc = subprocess.run(
-                [*_contract_library_sync(uv, path), "--dry-run", "--output-format", "json"],
+                [*_contract_library_sync(uv, path, library), "--dry-run",
+                 "--output-format", "json"],
                 capture_output=True, text=True, timeout=300, env=_snapshot_env())
             changes = json.loads(proc.stdout)["sync"]["changes"] if proc.returncode == 0 else []
             moved = {change["action"]: Version(change["version"]) for change in changes
@@ -5159,8 +5359,26 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
         if from_ref:
             _die(6, "input", "install accepts either --from or --source, not both")
         from_ref, provenance = _source_install_ref(name, source_id)
-    content, source, bundle_dir, temp_root = _resolve_source(name, from_ref)
-    stage, manifest = _prepare_payload(name, content, bundle_dir, temp_root, source)
+    store_major, library = None, None
+    if from_ref is None:
+        # From the canonical source a capability is taken as `update` takes
+        # it: the release that reads the store's major, from that major's line
+        # where main reads another, and the newest where the store's major is
+        # unknown; recorded against the canonical source either way.
+        canonical = f"{SOURCE}/capabilities/{name}/bin/{name}"
+        fetched, store_major, library = _update_source_choice(
+            name, canonical, True, _store_major_here(), {})
+        if fetched is None:
+            _die(6, "no_release_for_store_major", store_major.get("message")
+                 or f"no release of {name} reads the store's schema major",
+                 store_major.get("command") and f"`{store_major['command']}` crosses the "
+                 "store to the major the newest release reads")
+        content, fetched_from, bundle_dir, temp_root = fetched
+        source = canonical if store_major is not None else fetched_from
+    else:
+        content, source, bundle_dir, temp_root = _resolve_source(name, from_ref)
+        fetched_from = source
+    stage, manifest = _prepare_payload(name, content, bundle_dir, temp_root, fetched_from)
     _write_json(stage / "meta.json", {
         "name": name, "source": source, "source_type": "directory" if bundle_dir else "script",
         "sha256": _sha256(stage / name), "payload_sha256": _payload_sha256(stage),
@@ -5199,7 +5417,7 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
     reg = _registry_dir(name)
     (UPDATE_FAILED_DIR / f"{name}.json").unlink(missing_ok=True)
     link = _symlink(name, script)
-    _refresh_contract_library(script)
+    _refresh_contract_library(script, library)
     migrated = _migrate_tables(name, script, manifest)
     notes = _scaffold_credentials(name, manifest)
     post = manifest.get("post_install") or []
@@ -5224,6 +5442,8 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
             "lifts a quarantine itself")
     if global_policy:
         result["global_policy"] = global_policy
+    if store_major is not None:
+        result["store_major"] = store_major
     if migrated is not None:
         result["migrate"] = migrated
     if notes:
@@ -5265,6 +5485,128 @@ def cmd_uninstall(name: str, purge_credentials: bool) -> None:
         else:
             result["credentials_kept"] = str(cred_file)
     _emit(result)
+
+
+# ---------------------------------------------------------------- store majors
+
+def _release_store_major(declared: object) -> int:
+    """The store major a release manifest or catalogue names; one that names
+    none comes from before releases named it, which all read major 1."""
+    if isinstance(declared, int) and not isinstance(declared, bool) and declared >= 1:
+        return declared
+    return 1
+
+
+def _read_store_major(conn, schema: str) -> int | None:
+    """The store's schema major: the library's answer where it has one
+    (capabilities-contract 0.42), else read here - None for a store that holds
+    no schema yet, the `core` owner's major, else 1 for a store whose owners
+    were migrated before the core was."""
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        db = None
+    reader = getattr(db, "store_major", None) if db is not None else None
+    if reader is not None:
+        value = reader(conn, schema)
+        if isinstance(value, (tuple, list)):
+            value = value[0] if value else None
+        elif isinstance(value, dict):
+            value = value.get("major")
+        elif value is not None and not isinstance(value, int):
+            value = getattr(value, "major", None)
+        return value if isinstance(value, int) else None
+    from psycopg import sql
+    found = conn.execute("SELECT to_regclass(%s)",
+                         (f'"{schema}".schema_version',)).fetchone()[0]
+    if found is None:
+        return None
+    rows = conn.execute(sql.SQL("SELECT owner, major FROM {}.schema_version").format(
+        sql.Identifier(schema))).fetchall()
+    if not rows:
+        return None
+    majors = {owner: major for owner, major in rows}
+    return int(majors["core"]) if "core" in majors else 1
+
+
+def _store_major_here() -> dict:
+    """{store, reason?}: the schema major of the store this folder resolves
+    through the store cascade, or null with the reason the newest release is
+    taken - no store configured, a store that does not answer, or one that
+    holds no schema yet."""
+    taken = "so the newest release is taken"
+    store = _store_module()
+    db = _db_module()
+    # Connected directly rather than through the store tier, whose guard
+    # refuses a store at another major than the library's - the very store
+    # whose major this asks.
+    try:
+        setting = db.resolve_setting(_project_root())
+        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                          transaction=True, connect_timeout=store._PROBE_TIMEOUT)
+        schema = setting.schema
+    except db.DbError as exc:
+        if exc.slug == "store_not_configured":
+            return {"store": None, "reason": f"no store is configured here, {taken}"}
+        return {"store": None,
+                "reason": f"the store did not answer ({exc.slug}: {exc.message}), {taken}"}
+    try:
+        major = _read_store_major(conn, schema)
+    except Exception as exc:
+        return {"store": None,
+                "reason": f"the store's schema major cannot be read ({exc}), {taken}"}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if major is None:
+        return {"store": None, "reason": f"the store holds no schema yet, {taken}"}
+    return {"store": major}
+
+
+def _store_line_source(base: str | None, major: int) -> str | None:
+    """The canonical source's line for `major`, its trailing /main ref replaced
+    by STORE_LINE_REF; None for any other source, whose lines are not known."""
+    canonical = SOURCE.rstrip("/")
+    tail = "/" + STORE_CANONICAL_REF
+    if base is None or base.rstrip("/") != canonical or not canonical.endswith(tail):
+        return None
+    return canonical[:-len(tail)] + "/" + STORE_LINE_REF.format(major=major)
+
+
+def _store_major_field(here: dict, release: int, taken: str,
+                       line_source: str | None = None) -> dict:
+    """What an answer says of the store's major against a release's: {store,
+    release, taken (release, line or installed), line_source?, reason?,
+    upgrade_needed, command?, message?}."""
+    store = here["store"]
+    field: dict = {"store": store, "release": release, "taken": taken}
+    if line_source is not None:
+        field["line_source"] = line_source
+    if store is None:
+        field["reason"] = here["reason"]
+        field["upgrade_needed"] = False
+        return field
+    field["upgrade_needed"] = release > store
+    if release == store:
+        return field
+    if field["upgrade_needed"]:
+        field["command"] = STORE_UPGRADE_COMMAND
+        field["message"] = (
+            f"a release that reads store schema major {release} exists; this store is "
+            f"on major {store}, so "
+            + (f"major {store}'s line is taken" if taken == "line"
+               else "what is installed is kept, since no release of that major could be "
+                    "taken from this source")
+            + f"; `{STORE_UPGRADE_COMMAND}` crosses the store to major {release}")
+    else:
+        field["message"] = (
+            f"the store is on schema major {store}, newer than the major {release} the "
+            "source's release reads, so "
+            + (f"major {store}'s line is taken" if taken == "line"
+               else "what is installed is kept"))
+    return field
 
 
 class _Tee(io.TextIOBase):
@@ -5315,22 +5657,102 @@ def cmd_update(name: str | None) -> None:
     if name and not _registry_dir(name).is_dir():
         _die(3, "not_found", f"{name} is not installed")
     results = []
+    here = _store_major_here()
+    catalogues: dict = {}
     # deployment goes first: where its new payload no longer has the runner,
     # the machine is moved off the runner's agents before anything is replaced.
     for n in sorted(targets, key=lambda name: name != "deployment"):
         _assert_payload_mutable(n)
         with _update_recorded(n):
-            results.append(_update_one(n))
+            results.append(_update_one(n, here, catalogues))
     _sync_skill()
-    answer = {"updated": sorted(results, key=lambda entry: entry["name"])}
+    answer = {"updated": sorted(results, key=lambda entry: entry["name"]),
+              "store_major": here}
     reconciled = _core_reconcile()
     if reconciled["written"]:
         answer["core_enabled"] = reconciled["written"]
     _emit(answer)
 
 
-def _update_one(n: str) -> dict:
-    """Update one installed capability from its recorded source."""
+def _release_library(value: object) -> str | None:
+    """The capabilities-contract range a release line names, where it names a
+    valid one."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    try:
+        SpecifierSet(value.strip())
+    except InvalidSpecifier:
+        return None
+    return value.strip()
+
+
+def _catalogue_release(catalog: object, name: str) -> tuple[int, str | None]:
+    """(store major, library range) a catalogue names for `name`: the entry's
+    store_major, else the catalogue's, else 1; its library range, else none."""
+    catalog = catalog if isinstance(catalog, dict) else {}
+    entries = catalog.get("capabilities")
+    entry = entries.get(name) if isinstance(entries, dict) else None
+    declared = entry.get("store_major") if isinstance(entry, dict) else None
+    if declared is None:
+        declared = catalog.get("store_major")
+    return _release_store_major(declared), _release_library(catalog.get("library"))
+
+
+def _fetched_catalogue(name: str, source: str, bundle_dir: Path | None,
+                       catalogues: dict) -> object:
+    """The catalogue of the tree a payload was fetched from: the one beside its
+    bundle in a checkout or catalogue archive, else the one its catalogue URL
+    publishes, fetched once per run; None where there is none."""
+    if bundle_dir is not None and bundle_dir.parent.name == "capabilities":
+        return _read_json(bundle_dir.parent.parent / ".capability-source" / "catalog.json")
+    script_rel = f"/capabilities/{name}/bin/{name}"
+    if re.match(r"^https?://", source) and source.endswith(script_rel):
+        base = source[:-len(script_rel)]
+        if base not in catalogues:
+            catalogues[base] = _captured(
+                _fetch_json, f"{base}/.capability-source/catalog.json", "catalogue")
+        return catalogues[base][0]
+    return None
+
+
+def _update_source_choice(n: str, source: str, canonical: bool, here: dict,
+                          catalogues: dict):
+    """Fetch what `update` takes for `n` against the store's major.
+
+    Returns (fetched, store_major field or None, library range); fetched is
+    the `_resolve_source` tuple, or None where what is installed is kept. A
+    release reading the store's major - or any release where the store's
+    major is unknown - is taken; from the canonical source, one reading
+    another major gives way to the store's major's line, else nothing."""
+    fetched = _resolve_source(n, source)
+    release, library = _catalogue_release(
+        _fetched_catalogue(n, fetched[1], fetched[2], catalogues), n)
+    store = here["store"]
+    if store is None or release == store:
+        return fetched, None, library
+    if fetched[3] is not None:
+        shutil.rmtree(fetched[3], ignore_errors=True)
+    script_rel = f"/capabilities/{n}/bin/{n}"
+    line = _store_line_source(source[:-len(script_rel)], store) \
+        if canonical and source.endswith(script_rel) else None
+    if line is not None:
+        found, _error = _captured(_resolve_source, n, line + script_rel)
+        if found is not None:
+            line_release, line_library = _catalogue_release(
+                _fetched_catalogue(n, found[1], found[2], catalogues), n)
+            if line_release == store:
+                return found, _store_major_field(here, release, "line", line), line_library
+            if found[3] is not None:
+                shutil.rmtree(found[3], ignore_errors=True)
+    return None, _store_major_field(here, release, "installed", line), None
+
+
+def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None) -> dict:
+    """Update one installed capability from its recorded source, taking only
+    a release that reads the store's major (`_update_source_choice`)."""
+    here = here if here is not None else _store_major_here()
+    catalogues = catalogues if catalogues is not None else {}
     meta = _read_json(_registry_dir(n) / "meta.json") or {}
     source_id = meta.get("source_id")
     provenance = {}
@@ -5341,8 +5763,19 @@ def _update_one(n: str) -> dict:
     before = meta.get("payload_sha256")
     if before is None and _script_path(n).exists():
         before = _sha256(_script_path(n))
-    content, source, bundle_dir, temp_root = _resolve_source(n, source)
-    stage, manifest = _prepare_payload(n, content, bundle_dir, temp_root, source)
+    if not source_id and not source:
+        source = f"{SOURCE}/capabilities/{n}/bin/{n}"
+    canonical = not source_id and source == f"{SOURCE}/capabilities/{n}/bin/{n}"
+    fetched, store_major, library = _update_source_choice(
+        n, source, canonical, here, catalogues)
+    if fetched is None:
+        return {"name": n, "changed": False, "store_major": store_major}
+    content, fetched_from, bundle_dir, temp_root = fetched
+    # A payload taken from the store's major's line is recorded against the
+    # canonical source, so the next update starts from main again.
+    if store_major is None:
+        source = fetched_from
+    stage, manifest = _prepare_payload(n, content, bundle_dir, temp_root, fetched_from)
     after = _payload_sha256(stage)
     _write_json(stage / "meta.json", {
         "name": n, "source": source, "source_type": "directory" if bundle_dir else "script",
@@ -5356,8 +5789,10 @@ def _update_one(n: str) -> dict:
             shutil.rmtree(stage, ignore_errors=True)
             return {"name": n, "changed": False, "kept": kept}
     script = _activate_payload(n, stage)
-    _refresh_contract_library(script)
+    _refresh_contract_library(script, library)
     entry = {"name": n, "changed": before != after}
+    if store_major is not None:
+        entry["store_major"] = store_major
     if moved is not None:
         entry["moved"] = moved
     migrated = _migrate_tables(n, script, manifest)
@@ -5563,11 +5998,12 @@ def _catalogue_entry(catalog: object, name: str, where: str) -> dict:
     return entry
 
 
-def _available_payload(name: str, meta: dict, refreshed: dict,
-                       catalogues: dict) -> tuple[str, str, Callable[[], str | None]]:
+def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
+                       ) -> tuple[str, str, Callable[[], str | None], tuple[int, str | None]]:
     """Where `update` would fetch `name` from, and the payload it would find.
 
-    Returns (source, catalogue hash, version reader). A registered source is
+    Returns (source, catalogue hash, version reader, (store major, library
+    range) its catalogue names, as `_catalogue_release`). A registered source is
     brought forward exactly as `update` brings it forward, once per run; a
     catalogue URL is answered from the catalogue it publishes, fetched once.
     """
@@ -5581,19 +6017,21 @@ def _available_payload(name: str, meta: dict, refreshed: dict,
                  error.get("hint"))
         root = _source_root(source_id)
         capdir = root / "capabilities" / name
-        entry = _catalogue_entry(_read_json(root / ".capability-source" / "catalog.json"),
-                                 name, f"source {source_id!r}")
+        catalog = _read_json(root / ".capability-source" / "catalog.json")
+        entry = _catalogue_entry(catalog, name, f"source {source_id!r}")
         return source_id, entry["payload_sha256"], \
-            lambda: _changelog_version_at(capdir / CHANGELOG_NAME)
+            lambda: _changelog_version_at(capdir / CHANGELOG_NAME), \
+            _catalogue_release(catalog, name)
     recorded = meta.get("source") or f"{SOURCE}/capabilities/{name}/bin/{name}"
     if not re.match(r"^https?://", recorded):
         p = Path(recorded)
         if p.is_dir():
             return recorded, _payload_sha256(p, name), \
-                lambda: _changelog_version_at(p / CHANGELOG_NAME)
+                lambda: _changelog_version_at(p / CHANGELOG_NAME), \
+                _catalogue_release(_fetched_catalogue(name, recorded, p, catalogues), name)
         if p.is_file():
             return recorded, _single_script_catalogue_sha256(name, p.read_bytes()), \
-                lambda: None
+                lambda: None, _catalogue_release(None, name)
         _die(3, "not_found", f"{name}'s recorded source no longer exists: {p}")
     script_rel = f"/capabilities/{name}/bin/{name}"
     if recorded.endswith(script_rel):
@@ -5607,7 +6045,7 @@ def _available_payload(name: str, meta: dict, refreshed: dict,
                  error.get("hint"))
         entry = _catalogue_entry(catalog, name, f"the catalogue at {base}")
         return recorded, entry["payload_sha256"], lambda: _changelog_version_from_url(
-            f"{base}/capabilities/{name}/{CHANGELOG_NAME}")
+            f"{base}/capabilities/{name}/{CHANGELOG_NAME}"), _catalogue_release(catalog, name)
     httpx = _httpx()
     try:
         resp = httpx.get(recorded, follow_redirects=True, timeout=30.0)
@@ -5615,7 +6053,8 @@ def _available_payload(name: str, meta: dict, refreshed: dict,
         _die(5, "network_error", f"fetch failed: {exc}", recorded)
     if resp.status_code != 200:
         _die(5, "server_error", f"fetch returned {resp.status_code}", recorded)
-    return recorded, _single_script_catalogue_sha256(name, resp.content), lambda: None
+    return recorded, _single_script_catalogue_sha256(name, resp.content), lambda: None, \
+        _catalogue_release(None, name)
 
 
 def _single_script_catalogue_sha256(name: str, content: bytes) -> str:
@@ -5644,6 +6083,7 @@ def _update_check_answer(name: str | None) -> dict:
         _die(3, "not_found", f"{name} is not installed")
     refreshed: dict = {}
     catalogues: dict = {}
+    here = _store_major_here()
     rows = []
     for n in targets:
         reg = _registry_dir(n)
@@ -5658,19 +6098,45 @@ def _update_check_answer(name: str | None) -> dict:
         if error is not None:
             row["error"] = error
         else:
-            source, available_sha, version_reader = found
+            source, available_sha, version_reader, (release, range_) = found
+            kept = False
+            if here["store"] is not None and release != here["store"]:
+                found, row["store_major"] = _available_line(
+                    n, meta, release, here, refreshed, catalogues)
+                kept = found is None
+                if found is not None:
+                    source, available_sha, version_reader, (_release, range_) = found
             behind = available_sha != installed["catalog_sha256"]
             row["source"] = source
             row["available"] = {
                 "catalog_sha256": available_sha,
                 "version": version_reader() if behind else installed["version"]}
-            library = _contract_library_behind(_script_path(n))
+            library = None if kept else _contract_library_behind(_script_path(n), range_)
             if library is not None:
                 row["contract_library"] = library
-            row["update_available"] = behind or library is not None
+            row["update_available"] = not kept and (behind or library is not None)
         rows.append(row)
-    return {"checked": rows,
+    return {"checked": rows, "store_major": here,
             "update_available": any(row["update_available"] for row in rows)}
+
+
+def _available_line(name: str, meta: dict, release: int, here: dict, refreshed: dict,
+                    catalogues: dict) -> tuple[tuple | None, dict]:
+    """For a release reading another major than the store's: the payload
+    `update` would take from the store's major's line of the canonical source,
+    as `_available_payload` answers it, or None where it keeps what is
+    installed; with the store_major field the row carries."""
+    default = f"{SOURCE}/capabilities/{name}/bin/{name}"
+    recorded = meta.get("source") or default
+    script_rel = f"/capabilities/{name}/bin/{name}"
+    line = (_store_line_source(recorded[:-len(script_rel)], here["store"])
+            if not meta.get("source_id") and recorded == default else None)
+    if line is not None:
+        found, _error = _captured(_available_payload, name, {"source": line + script_rel},
+                                  refreshed, catalogues)
+        if found is not None and found[3][0] == here["store"]:
+            return found, _store_major_field(here, release, "line", line)
+    return None, _store_major_field(here, release, "installed", line)
 
 
 # ---------------------------------------------------------------- change logs
@@ -5882,6 +6348,12 @@ def _validate_manager_release_manifest(manifest: object) -> list[str]:
                 f"release manifest manager.path must be {MANAGER_EXECUTABLE_REL!r}")
         if not re.fullmatch(r"[0-9a-f]{64}", str(manager.get("sha256") or "")):
             problems.append("release manifest manager.sha256 is invalid")
+    if "store_major" in manifest and (
+            not isinstance(manifest["store_major"], int)
+            or isinstance(manifest["store_major"], bool) or manifest["store_major"] < 1):
+        problems.append("release manifest store_major must be a positive integer")
+    if "library" in manifest and _release_library(manifest["library"]) is None:
+        problems.append("release manifest library must be a version range")
     assets = manifest.get("assets")
     if not isinstance(assets, dict) or not assets:
         problems.append("release manifest assets must be a non-empty object")
@@ -5906,6 +6378,53 @@ def _validate_manager_release_manifest(manifest: object) -> list[str]:
     return problems
 
 
+def _tree_store_line(root: Path) -> dict:
+    """{store_major, library?} a source tree's release line names: the
+    STORE_MAJOR and STORE_LIBRARY its own manager declares, read from that
+    manager rather than the running one, so any manager indexes and verifies a
+    tree as the tree declares it. A tree whose manager predates the
+    declaration names nothing; a tree that carries no manager, as a
+    capability source of its own does, names the running manager's line."""
+    import ast as _ast
+    manager = root / MANAGER_EXECUTABLE_REL
+    if not manager.is_file():
+        declared = {"STORE_MAJOR": STORE_MAJOR, "STORE_LIBRARY": STORE_LIBRARY}
+    else:
+        try:
+            module = _ast.parse(manager.read_text())
+        except (OSError, SyntaxError):
+            return {}
+        declared = {}
+        for node in module.body:
+            target = node.target if isinstance(node, _ast.AnnAssign) else (
+                node.targets[0] if isinstance(node, _ast.Assign) and len(node.targets) == 1
+                else None)
+            if (isinstance(target, _ast.Name)
+                    and target.id in ("STORE_MAJOR", "STORE_LIBRARY")
+                    and node.value is not None):
+                try:
+                    declared[target.id] = _ast.literal_eval(node.value)
+                except ValueError:
+                    pass
+    if "STORE_MAJOR" not in declared:
+        return {}
+    line: dict = {"store_major": declared["STORE_MAJOR"]}
+    if declared.get("STORE_LIBRARY") is not None:
+        line["library"] = declared["STORE_LIBRARY"]
+    return line
+
+
+def _stamp_catalog(root: Path, entries: dict) -> dict:
+    """The catalogue of a tree: its entries, each and the whole stamped with
+    the store major the tree's line reads, and the library range a kept line
+    names (`_tree_store_line`)."""
+    line = _tree_store_line(root)
+    if "store_major" in line:
+        entries = {name: {**entry, "store_major": line["store_major"]}
+                   for name, entry in entries.items()}
+    return {"capabilities": entries, **line}
+
+
 def _manager_release_payload(root: Path) -> tuple[dict | None, list[str]]:
     """Expected manifest for a source carrying the official manager."""
     manager = root / MANAGER_EXECUTABLE_REL
@@ -5926,6 +6445,7 @@ def _manager_release_payload(root: Path) -> tuple[dict | None, list[str]]:
         "assets": {
             rel: _sha256(root / rel) for rel in _MANAGER_RELEASE_ASSETS
         },
+        **_tree_store_line(root),
     }
     problems = _validate_manager_release_manifest(payload)
     if problems:
@@ -5993,8 +6513,14 @@ def _manager_release_from_root(
     return content, assets, manifest
 
 
-def _manager_release_from_remote(httpx) -> tuple[bytes, dict[str, bytes], dict, str]:
-    manifest_url = f"{SOURCE.rstrip('/')}/{MANAGER_RELEASE_MANIFEST_REL}"
+def _manager_release_from_remote(httpx, base: str | None = None,
+                                 parsed: dict | None = None
+                                 ) -> tuple[bytes, dict[str, bytes], dict, str]:
+    """The release the canonical source (or `base`, a line of it) carries,
+    every file verified against its manifest - `parsed`, where it was already
+    fetched to choose the release, else fetched first."""
+    base = (base or SOURCE).rstrip("/")
+    manifest_url = f"{base}/{MANAGER_RELEASE_MANIFEST_REL}"
 
     def fetch(url: str, label: str) -> bytes:
         try:
@@ -6006,17 +6532,18 @@ def _manager_release_from_remote(httpx) -> tuple[bytes, dict[str, bytes], dict, 
                  f"{label} fetch returned {response.status_code}", url)
         return response.content
 
-    raw_manifest = fetch(manifest_url, "manager release manifest")
-    try:
-        parsed = json.loads(raw_manifest)
-    except ValueError as exc:
-        _die(5, "manager_release_invalid",
-             f"incoming manager release manifest is not JSON: {exc}", manifest_url)
+    if parsed is None:
+        raw_manifest = fetch(manifest_url, "manager release manifest")
+        try:
+            parsed = json.loads(raw_manifest)
+        except ValueError as exc:
+            _die(5, "manager_release_invalid",
+                 f"incoming manager release manifest is not JSON: {exc}", manifest_url)
     manifest, manager_rel, asset_hashes = _manager_release_parts(
         parsed, manifest_url)
-    content = fetch(f"{SOURCE.rstrip('/')}/{manager_rel}", "manager executable")
+    content = fetch(f"{base}/{manager_rel}", "manager executable")
     assets = {
-        rel: fetch(f"{SOURCE.rstrip('/')}/{rel}", f"manager asset {rel}")
+        rel: fetch(f"{base}/{rel}", f"manager asset {rel}")
         for rel in asset_hashes
     }
     _verify_manager_release_bytes(manifest, content, assets, manifest_url)
@@ -6169,12 +6696,18 @@ def cmd_self_update(from_ref: str | None = None) -> None:
     """
     with _manager_mutation_guard():
         if from_ref:
+            choice = _manager_release_choice(from_ref)
+            if choice["kept"]:
+                _emit(_manager_release_kept(choice))
+                return
             source_root = Path(from_ref).expanduser().resolve()
-            asset_root = source_root if source_root.is_dir() else source_root.parent.parent
             content, assets, manifest = _manager_release_from_root(
-                asset_root, f"local:{source_root}")
-            _emit(_activate_manager_release(
-                content, assets, f"local:{source_root}", manifest))
+                choice["root"], f"local:{source_root}")
+            result = _activate_manager_release(
+                content, assets, f"local:{source_root}", manifest)
+            result["store_major"] = choice["store_major"]
+            _hold_manager_library(result, manifest)
+            _emit(result)
             return
         httpx = _httpx()
         checkout_result = None
@@ -6186,14 +6719,37 @@ def cmd_self_update(from_ref: str | None = None) -> None:
             if common.parent.resolve() == checkout:
                 checkout_result = cmd_source_register_checkout(
                     OFFICIAL_SOURCE_ID, emit_result=False)
-        content, assets, manifest, source = _manager_release_from_remote(httpx)
+        choice = _manager_release_choice(None)
+        if choice["kept"]:
+            result = _manager_release_kept(choice)
+            if checkout_result is not None:
+                result["official_checkout"] = checkout_result
+            _emit(result)
+            return
+        content, assets, manifest, source = _manager_release_from_remote(
+            httpx, choice["base"], choice["manifest"])
         result = _activate_manager_release(content, assets, source, manifest)
+        result["store_major"] = choice["store_major"]
+        _hold_manager_library(result, manifest)
         if checkout_result is not None:
             result["official_checkout"] = checkout_result
     carried = _install_carried_capabilities(Path(result["manager"]))
     if carried:
         result["carried_capabilities"] = carried
     _emit(result)
+
+
+def _hold_manager_library(result: dict, manifest: dict) -> None:
+    """Hold the activated manager's own environment inside the
+    capabilities-contract range its release line names (`library`), as
+    `update` holds each capability's, before anything runs it: a line kept for
+    an older major reads that major only through the library releases of it.
+    The answer names the range as library."""
+    library = _release_library(manifest.get("library"))
+    if library is None:
+        return
+    _refresh_contract_library(Path(result["manager"]), library)
+    result["library"] = library
 
 
 # The capabilities that arrive with the manager: the manager's install and its
@@ -6226,13 +6782,19 @@ def cmd_self_update_check(from_ref: str | None = None) -> None:
     _emit(_self_update_check_answer(from_ref))
 
 
-def _self_update_check_answer(from_ref: str | None = None) -> dict:
-    """What `self-update --check` answers, switching nothing.
+def _manager_release_choice(from_ref: str | None) -> dict:
+    """The manager release `self-update` takes for the store this folder
+    resolves, reading only release manifests: {manifest, source, root (--from)
+    | base (a URL), store_major, kept}.
 
-    A release is named by the sha256 of its normalised manifest, the name
-    `self-update` stages it under, so two releases are the same release exactly
-    when `self-update` would leave the PATH symlink where it is.
-    """
+    A release that reads the store's major is taken, as is the newest where
+    the store's major is unknown (no store, one that does not answer, or one
+    holding no schema). From the canonical source, a release that reads
+    another major gives way to the store's major's line (`_store_line_source`)
+    where that line carries a release of it; from --from or a line that is
+    missing or unreadable, what is installed is kept (kept true, manifest the
+    release refused)."""
+    here = _store_major_here()
     if from_ref:
         source_root = Path(from_ref).expanduser().resolve()
         root = source_root if source_root.is_dir() else source_root.parent.parent
@@ -6244,13 +6806,59 @@ def _self_update_check_answer(from_ref: str | None = None) -> dict:
                  f"incoming manager release has no {MANAGER_RELEASE_MANIFEST_REL}",
                  f"{source}: index the release with `capabilities source index official`")
         manifest, _rel, _assets = _manager_release_parts(incoming, str(manifest_path))
-        read_version = lambda: _changelog_version_at(root / MANAGER_CHANGELOG_REL)
+        choice = {"manifest": manifest, "source": source, "root": root, "base": None}
     else:
-        source = f"{SOURCE.rstrip('/')}/{MANAGER_RELEASE_MANIFEST_REL}"
+        base = SOURCE.rstrip("/")
+        source = f"{base}/{MANAGER_RELEASE_MANIFEST_REL}"
         manifest, _rel, _assets = _manager_release_parts(
             _fetch_json(source, "manager release manifest"), source)
+        choice = {"manifest": manifest, "source": source, "root": None, "base": base}
+    release = _release_store_major(manifest.get("store_major"))
+    store = here["store"]
+    if store is None or release == store:
+        return {**choice, "kept": False,
+                "store_major": _store_major_field(here, release, "release")}
+    line = _store_line_source(choice["base"], store)
+    if line is not None:
+        url = f"{line}/{MANAGER_RELEASE_MANIFEST_REL}"
+        found, _error = _captured(_fetch_json, url, "manager release manifest")
+        if (found is not None and not _validate_manager_release_manifest(found)
+                and _release_store_major(found.get("store_major")) == store):
+            return {"manifest": found, "source": url, "root": None, "base": line,
+                    "kept": False,
+                    "store_major": _store_major_field(here, release, "line", line)}
+    return {**choice, "kept": True,
+            "store_major": _store_major_field(here, release, "installed", line)}
+
+
+def _manager_release_kept(choice: dict) -> dict:
+    """What `self-update` answers when it keeps the installed release."""
+    try:
+        manager = str((_bin_dir() / "capabilities").resolve(strict=True))
+    except OSError:
+        manager = None
+    return {"self_update": "kept", "manager": manager, "source": choice["source"],
+            "store_major": choice["store_major"]}
+
+
+def _self_update_check_answer(from_ref: str | None = None) -> dict:
+    """What `self-update --check` answers, switching nothing.
+
+    A release is named by the sha256 of its normalised manifest, the name
+    `self-update` stages it under, so two releases are the same release exactly
+    when `self-update` would leave the PATH symlink where it is. The release
+    available is the one `_manager_release_choice` takes, or, where it keeps
+    what is installed, the one it refused, with update_available false.
+    """
+    choice = _manager_release_choice(from_ref)
+    manifest, source = choice["manifest"], choice["source"]
+    if choice["root"] is not None:
+        root = choice["root"]
+        read_version = lambda: _changelog_version_at(root / MANAGER_CHANGELOG_REL)
+    else:
+        base = choice["base"]
         read_version = lambda: _changelog_version_from_url(
-            f"{SOURCE.rstrip('/')}/{MANAGER_CHANGELOG_REL}")
+            f"{base}/{MANAGER_CHANGELOG_REL}")
     available_release = hashlib.sha256(
         _manager_release_manifest_bytes(manifest)).hexdigest()
 
@@ -6281,7 +6889,8 @@ def _self_update_check_answer(from_ref: str | None = None) -> dict:
             "version": read_version() if behind else installed["version"],
             "source": source,
         },
-        "update_available": behind,
+        "update_available": behind and not choice["kept"],
+        "store_major": choice["store_major"],
     }
 
 
@@ -12866,18 +13475,27 @@ class _NodeManager:
                 self.say(message)
 
     def _connect(self):
+        """A connection to the store, its tables migrated once - refused as
+        the library refuses it, before anything is migrated or written, where
+        the store is at another schema major than this manager reads, so a
+        node that cannot read the store writes no state, last-seen or update
+        that says it can."""
         db = self.db
         if self.setting is None:
             self.setting = db.resolve_setting(self.root)
         conn = db.connect(application_name=self.store.STORE_OWNER, setting=self.setting,
                           transaction=True)
-        if not self.migrated:
-            try:
+        try:
+            with conn.transaction():
+                refusal = _store_major_refusal(conn, self.setting.schema)
+            if refusal is not None:
+                raise db.DbError(*refusal)
+            if not self.migrated:
                 _placement_migrate(conn, db)
-            except Exception:
-                conn.close()
-                raise
-            self.migrated = True
+                self.migrated = True
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     def read_store(self) -> tuple[list[tuple], list[tuple]] | None:
@@ -12889,8 +13507,10 @@ class _NodeManager:
             conn = self._connect()
         except Exception as exc:
             self.say_once("store", getattr(exc, "slug", type(exc).__name__),
-                          f"cannot read the store, so every job stays as it is: "
-                          f"{getattr(exc, 'message', exc)}")
+                          "cannot read the store, so every job stays as it is: "
+                          + _upgrade_message(getattr(exc, "slug", None),
+                                             getattr(exc, "message", exc),
+                                             getattr(exc, "hint", None)))
             return None
         try:
             with conn.transaction():
@@ -13239,7 +13859,10 @@ class _NodeManager:
             conn = self._connect()
         except Exception as exc:
             self.say_once("state", getattr(exc, "slug", type(exc).__name__),
-                          f"cannot write this node's state: {getattr(exc, 'message', exc)}")
+                          "cannot write this node's state: "
+                          + _upgrade_message(getattr(exc, "slug", None),
+                                             getattr(exc, "message", exc),
+                                             getattr(exc, "hint", None)))
             return
         lines = self.log.take()
         try:
@@ -13287,20 +13910,34 @@ class _NodeManager:
 
     def update_requested(self) -> bool:
         """Whether a row asks this node to update; False where the store
-        cannot say, to look again on the next reconcile."""
+        cannot say, to look again on the next reconcile. What kept it from
+        saying - a store refusal, with the commands it names - is said once,
+        and that it reads the requests again once it does."""
         try:
             conn = self._connect()
-        except Exception:
+        except Exception as exc:
+            self.say_once("update_request", getattr(exc, "slug", type(exc).__name__),
+                          "cannot read whether an update is asked: "
+                          + _upgrade_message(getattr(exc, "slug", None),
+                                             getattr(exc, "message", exc),
+                                             getattr(exc, "hint", None)))
             return False
         try:
             with conn.transaction():
-                return conn.execute(
+                asked = conn.execute(
                     "SELECT 1 FROM capabilities_node_updates WHERE node = %s "
                     "AND state = 'requested'", (self.here,)).fetchone() is not None
-        except Exception:
+        except Exception as exc:
+            self.say_once("update_request", type(exc).__name__,
+                          "cannot read whether an update is asked: "
+                          + " ".join(f"{type(exc).__name__}: {exc}".split())[:300])
             return False
         finally:
             conn.close()
+        if self.said.get("update_request") is not None:
+            self.say("reads whether an update is asked again")
+        self.said["update_request"] = None
+        return asked
 
     def check_age(self) -> float | None:
         """Seconds since this node's update availability was last checked, by
@@ -14427,7 +15064,9 @@ class _SuperviseStore:
                 self._migrate(conn, db)
             except db.DbError as exc:
                 conn.close()
-                raise _SuperviseProblem("unreachable", exc.slug, exc.message) from None
+                raise _SuperviseProblem("unreachable", exc.slug,
+                                        _upgrade_message(exc.slug, exc.message,
+                                                         exc.hint)) from None
             except _SuperviseProblem:
                 conn.close()
                 raise
@@ -16488,6 +17127,7 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         needed, _harness = _node_needed_sign_ins(folders, placed)
 
         def write(conn, agent_id):
+            _node_major_gate(conn)
             _node_state_write(conn, here, facts, logins, sessions, sorted(folders), needed)
             # What it wrote: the update availability is the check's, not this write's.
             written = {k: v for k, v in store.node_states(conn, [here])[0].items()
@@ -16518,15 +17158,19 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         placed = conn.execute(
             "SELECT node, capability FROM capabilities_policy WHERE agent_id = %s "
             "AND node = ANY (%s) AND enabled AND service", (agent_id, ids)).fetchall()
+        major, since = _store_major_since(
+            conn, conn.execute("SELECT current_schema()").fetchone()[0])
         out = []
         for node in nodes:
             state = states.get(node["node"]) or dict.fromkeys(
                 ("node", *store.NODE_STATE_COLUMNS, *store.NODE_UPDATE_OFFER_COLUMNS,
                  "uptime_seconds"))
             state = {**state, **_node_state_logins(store, logins, node["node"])}
+            unread = _node_store_unread(node, state, major, since)
             entry = {"node": node["node"], "label": node["label"],
                      "disabled_at": node["disabled_at"],
-                     "reachable": bool(state.pop("reachable", False))}
+                     "reachable": bool(state.pop("reachable", False)) and unread is None,
+                     "cannot_read_store": unread}
             entry["update"] = {"available": state.pop("update_available", None),
                                "checked_at": store._stamp(state.pop("update_checked_at",
                                                                     None)),
@@ -16641,7 +17285,9 @@ def _node_update_error(stderr: str, code: int) -> str:
     for line in reversed(stderr.strip().splitlines()):
         try:
             error = json.loads(line)["error"]
-            return f"{error.get('code')}: {error.get('message')}"
+            return (f"{error.get('code')}: "
+                    + _upgrade_message(error.get("code"), error.get("message"),
+                                       error.get("hint")))
         except (ValueError, KeyError, TypeError, AttributeError):
             continue
     lines = stderr.strip().splitlines()
@@ -16975,6 +17621,7 @@ def _node_update_check_write(root: Path, here: str) -> dict:
     available, offer = _node_update_offer()
 
     def write(conn, _agent_id):
+        _node_major_gate(conn)
         said = store.node_update_offer_put(conn, here, available=available, offer=offer)
         if said is None:
             store.node_state_put(conn, here, **_node_facts())
@@ -17015,10 +17662,32 @@ def _node_update_verb(root: Path, args: list[str]) -> None:
 
         def ask(conn, agent_id):
             node = _node_ref(conn, agent_id, ref)
-            if _node_rows(conn, agent_id, node)[0]["disabled_at"] is not None:
+            row = _node_rows(conn, agent_id, node)[0]
+            if row["disabled_at"] is not None:
                 raise _KernelRefusal("node_disabled", f"node {node} is disabled, so it "
                                      "takes no update", "enable it first: "
                                      f"`capabilities node enable {node}`")
+            # A request is delivered only to a node whose manager reads the
+            # store and reports itself: any other would leave it requested.
+            state = (store.node_states(conn, [node]) or [{}])[0]
+            unread = _node_store_unread(row, state, *_store_major_since(
+                conn, conn.execute("SELECT current_schema()").fetchone()[0]))
+            if unread is not None:
+                raise _KernelRefusal("node_cannot_read_store",
+                                     f"node {node} cannot take the request: "
+                                     + unread["message"],
+                                     f"bring it up first: {unread['command']}")
+            if not state.get("reachable"):
+                raise _KernelRefusal(
+                    "node_unreachable", f"node {node} cannot take the request: its manager "
+                    "has not reported within the last "
+                    f"{store.NODE_STATE_FRESH_SECONDS} seconds (last "
+                    f"{store._stamp(state.get('reported_at')) or 'never'}), so nothing "
+                    "there would take it up",
+                    "bring its node manager up - `capabilities node run` on the node, or "
+                    "restart the node"
+                    + (f" (`{_node_bring_up(row, state.get('image_version'))}`)"
+                       if row.get("coolify_resource") else "") + " - then ask again")
             try:
                 return agent_id, store.node_update_request(conn, node, by=_vault_actor())
             except store.StoreError as exc:
@@ -17048,8 +17717,10 @@ def _node_update_verb(root: Path, args: list[str]) -> None:
     except OSError as exc:
         _die(5, "node_update_unwritable", f"cannot keep the update's lock: {exc}")
     actor = _vault_actor()
-    (taken, setting) = _kernel_run(root, lambda conn, _a: store.node_update_claim(
-        conn, here, by=actor))
+    def claim(conn, _agent_id):
+        _node_major_gate(conn)
+        return store.node_update_claim(conn, here, by=actor)
+    (taken, setting) = _kernel_run(root, claim)
     run = taken["run"]
     try:
         outcome = _node_update_run(root, here, str(run["id"]))
@@ -19017,6 +19688,7 @@ def cmd_node(args: list[str]) -> None:
         here = _this_node()["id"]
 
         def seen(conn, agent_id):
+            _node_major_gate(conn)
             if conn.execute("UPDATE capabilities_nodes SET last_seen_at = now() "
                             "WHERE id = %s AND EXISTS (SELECT 1 FROM capabilities_agent_nodes "
                             "WHERE agent_id = %s AND node = %s)",
@@ -20155,6 +20827,1037 @@ def cmd_store_doctor(project: str | None) -> None:
     _emit(out)
     if not out["ok"]:
         sys.exit(7)
+
+
+# ---------------------------------------------------------------- the store upgrade
+# A schema major crosses only through `capabilities store upgrade`, a procedure a
+# person starts. The library refuses every crossing anywhere else
+# (store_upgrade_needed) and applies one only under CAPABILITIES_STORE_UPGRADE=1,
+# which nothing but this procedure sets: for the manager's own migrations and the
+# `migrate` of every installed capability it runs, a quarantined one included.
+# Its progress is kept per store under STORE_UPGRADE_DIR, so a rerun skips what is
+# done and goes on; the dump it takes first is kept under STORE_BACKUP_DIR.
+
+STORE_UPGRADE_DIR = _STATE_HOME / "capabilities" / "store-upgrade"
+STORE_BACKUP_DIR = _DATA_HOME / "capabilities" / "backups"
+STORE_UPGRADE_PHASES = ("manager", "capabilities", "dump", "migrate")
+# The library's refusals whose hint names the commands that cross a major or
+# catch up with one: wherever the manager words such a refusal, it keeps them.
+STORE_MAJOR_SLUGS = ("schema_too_new", "store_upgrade_needed")
+STORE_UPGRADE_TIMEOUT_SECONDS = 3600
+STORE_UPGRADE_HANDOVER_ENV = "CAPABILITIES_STORE_UPGRADE_HANDOVER"
+
+
+def _upgrade_message(code: object, message: object, hint: object) -> str:
+    """One line of what a store refusal says: its message, and for a refusal
+    of the store's major (STORE_MAJOR_SLUGS) its hint after it, which names the
+    commands to run."""
+    message = str(message or "")
+    if code in STORE_MAJOR_SLUGS and hint:
+        return f"{message}; {hint}"
+    return message
+
+
+def _store_major_since(conn, schema: str) -> tuple[int | None, object]:
+    """(major, since) of the store, read on `conn` inside or outside a
+    transaction, changing nothing: major None for a store holding no schema,
+    1 for one whose owners were migrated before the core was, else the core's;
+    since when the core reached it - when its latest major step the library
+    knows was applied, else, above major 1, when the store last recorded the
+    core's version - None where it is major 1 or unknown."""
+    from psycopg import sql
+    if conn.execute("SELECT to_regclass(%s)",
+                    (f'"{schema}".schema_version',)).fetchone()[0] is None:
+        return None, None
+    rows = conn.execute(sql.SQL("SELECT owner, major, updated_at FROM {}.schema_version")
+                        .format(sql.Identifier(schema))).fetchall()
+    if not rows:
+        return None, None
+    core = next((row for row in rows if row[0] == "core"), None)
+    if core is None:
+        return 1, None
+    major = int(core[1])
+    try:
+        from capabilities_contract.db import _migrate as migrate_module
+        steps = [step.id for step in getattr(migrate_module, "CORE_STEPS", ())
+                 if getattr(step, "major", None) is not None]
+    except ImportError:
+        steps = []
+    since = None
+    if steps and conn.execute("SELECT to_regclass(%s)",
+                              (f'"{schema}".schema_ledger',)).fetchone()[0] is not None:
+        since = conn.execute(sql.SQL(
+            "SELECT max(applied_at) FROM {}.schema_ledger WHERE owner = 'core' "
+            "AND step = ANY (%s)").format(sql.Identifier(schema)), (steps,)).fetchone()[0]
+    if since is None and major > 1:
+        since = core[2]
+    return major, since
+
+
+def _node_reads_store(major: int | None, since, seen) -> bool:
+    """Whether a node last seen (or last reporting) at `seen` can read a store
+    at `major` since `since`: a store above major 1 is read only by a node
+    seen since it got there."""
+    if major is None or major <= 1 or since is None:
+        return True
+    return seen is not None and seen >= since
+
+
+def _node_store_unread(node: dict, state: dict, major: int | None, since) -> dict | None:
+    """Why one of the agent's nodes cannot read the store, or None where it
+    can: {store_major, since, last_seen_at, message, command}, for a node
+    whose last sign of life (its registry row's last_seen_at, its state row's
+    reported_at) is older than the store's move to its major."""
+    import datetime as _dt
+    seen = []
+    for value in (node.get("last_seen_at"), state.get("reported_at")):
+        if isinstance(value, str):
+            try:
+                value = _dt.datetime.fromisoformat(value)
+            except ValueError:
+                value = None
+        if isinstance(value, _dt.datetime):
+            seen.append(value)
+    last = max(seen, default=None)
+    if _node_reads_store(major, since, last):
+        return None
+    stamp = _store_module()._stamp
+    command = _node_bring_up(node, state.get("image_version"))
+    return {"store_major": major, "since": stamp(since), "last_seen_at": stamp(last),
+            "message": f"the store moved to schema major {major} at {stamp(since)} and this "
+                       f"node was last seen {stamp(last) if last else 'never'}, before it, so "
+                       "what it runs cannot read the store: it answers nothing and takes no "
+                       "update asked through the store",
+            "command": command}
+
+
+def _store_major_refusal(conn, schema: str | None = None) -> tuple[str, str, str] | None:
+    """(code, message, hint) where the store `conn` reaches is at another
+    schema major than this manager reads (STORE_MAJOR), else None - a store at
+    it, or one holding no schema. Read on `conn` in or out of a transaction."""
+    if schema is None:
+        schema = conn.execute("SELECT current_schema()").fetchone()[0]
+    major, _since = _store_major_since(conn, schema)
+    if major is None or major == STORE_MAJOR:
+        return None
+    if major > STORE_MAJOR:
+        return ("schema_too_new",
+                f"the store is at schema major {major}, newer than the major {STORE_MAJOR} "
+                "this manager reads",
+                "the store moved to a newer major than this release reads: run "
+                "`capabilities self-update`, then `capabilities update`")
+    return ("store_upgrade_needed",
+            f"the store is at schema major {major}, older than the major {STORE_MAJOR} "
+            "this manager reads",
+            f"a person runs `{STORE_UPGRADE_COMMAND}`, the one way to cross a major; "
+            f"`{STORE_UPGRADE_COMMAND} --check` says what it will do")
+
+
+def _node_major_gate(conn) -> None:
+    """Refuse, writing nothing, a node's own state, last-seen or update write
+    from a manager whose major is not the store's: such a write would say the
+    node reads a store it cannot read."""
+    refusal = _store_major_refusal(conn)
+    if refusal is not None:
+        code, message, hint = refusal
+        _die(6, code, message + ", so this node writes nothing that says it reads it", hint)
+
+
+def _node_bring_up(row: dict, image_version: object) -> str:
+    """The command that brings a node up to read the store after it moved: a
+    standard-image node restarts (its boot self-updates the manager and
+    updates every capability), a Coolify resource built from a repository is
+    rebuilt, any other machine updates itself and restarts its node manager."""
+    resource = row.get("coolify_resource")
+    if resource and image_version:
+        return f"coolify restart {resource} --type service"
+    if resource:
+        return f"coolify deploy {resource}"
+    return ("on that machine: capabilities self-update, then capabilities update, then "
+            "restart its node manager (capabilities node run)")
+
+
+def _store_setting_env(setting) -> dict[str, str]:
+    """The AGENTKIT_DB_* keys that name `setting` at the environment level, so
+    a process the upgrade runs reaches the store it upgrades whichever level
+    named it here."""
+    keys = {"AGENTKIT_DB_SCHEMA": setting.schema}
+    if setting.transaction_host is not None:
+        keys["AGENTKIT_DB_TRANSACTION_HOST"] = setting.transaction_host
+    if setting.transaction_port is not None:
+        keys["AGENTKIT_DB_TRANSACTION_PORT"] = str(setting.transaction_port)
+    if setting.transaction_pooler:
+        keys["AGENTKIT_DB_TRANSACTION_POOLER"] = "true"
+    if setting.url is not None:
+        keys["AGENTKIT_DB_URL"] = setting.url
+        return keys
+    for key, value in (("AGENTKIT_DB_HOST", setting.host), ("AGENTKIT_DB_PORT", setting.port),
+                       ("AGENTKIT_DB_NAME", setting.database),
+                       ("AGENTKIT_DB_USER", setting.user),
+                       ("AGENTKIT_DB_SSLMODE", setting.sslmode),
+                       ("AGENTKIT_DB_SSLROOTCERT", setting.sslrootcert),
+                       ("AGENTKIT_DB_PASSWORD", setting.password)):
+        if value is not None and value != "":
+            keys[key] = str(value)
+    return keys
+
+
+def _store_upgrade_env(setting, upgrading: bool) -> dict:
+    """The environment of a capability the upgrade runs: outside any project,
+    the store named at the environment level, and the upgrade's flag only
+    where it migrates."""
+    db = _db_module()
+    env = {key: value for key, value in _snapshot_env().items()
+           if key not in db.KEYS and key != db.UPGRADE_ENV}
+    env.update(_store_setting_env(setting))
+    if upgrading:
+        env[db.UPGRADE_ENV] = "1"
+    return env
+
+
+@contextmanager
+def _upgrade_flag(on: bool):
+    """This process inside (`on`) or outside the store upgrade, for the span of
+    the library calls it makes."""
+    db = _db_module()
+    held = os.environ.pop(db.UPGRADE_ENV, None)
+    if on:
+        os.environ[db.UPGRADE_ENV] = "1"
+    try:
+        yield
+    finally:
+        os.environ.pop(db.UPGRADE_ENV, None)
+        if held is not None:
+            os.environ[db.UPGRADE_ENV] = held
+
+
+def _store_params(setting) -> dict:
+    """The libpq parameters of the store's session address."""
+    from psycopg.conninfo import conninfo_to_dict
+    kwargs = setting.connect_kwargs()
+    params = conninfo_to_dict(kwargs.pop("conninfo")) if "conninfo" in kwargs else {}
+    params.update({key: value for key, value in kwargs.items() if value is not None})
+    if isinstance(params.get("port"), str) and params["port"].isdigit():
+        params["port"] = int(params["port"])
+    return params
+
+
+def _store_upgrade_key(setting) -> str:
+    """The name the upgrade keeps a store's progress and dumps under: its
+    database and schema, and a digest of its address, database and schema."""
+    params = _store_params(setting)
+    ident = (f"{params.get('host') or ''}:{params.get('port') or 5432}/"
+             f"{params.get('dbname') or ''}/{setting.schema}")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-",
+                  f"{params.get('dbname') or 'store'}-{setting.schema}").strip("-.")[:60]
+    return f"{slug or 'store'}-{hashlib.sha256(ident.encode()).hexdigest()[:12]}"
+
+
+def _pg_tool(name: str) -> dict | None:
+    """{path, version, major} of a PostgreSQL client tool on PATH, or None."""
+    path = shutil.which(name)
+    if path is None:
+        return None
+    try:
+        proc = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    found = re.search(r"(\d+)(?:\.(\d+))?", proc.stdout or "")
+    if proc.returncode != 0 or found is None:
+        return None
+    return {"path": path, "version": proc.stdout.strip().split()[-1],
+            "major": int(found.group(1))}
+
+
+def _store_survey(setting) -> dict:
+    """What the store holds, read in one transaction, changing nothing: its
+    major and since when, each owner's version, the tables of its schema and
+    their size, the server's major, its now, and every node it holds with what
+    it last said it runs."""
+    db = _db_module()
+    store = _store_module()
+    from psycopg import sql
+    conn = db.connect(application_name=store.STORE_OWNER, setting=setting, transaction=True)
+    schema = setting.schema
+
+    def exists(table: str) -> bool:
+        return conn.execute("SELECT to_regclass(%s)",
+                            (f'"{schema}".{table}',)).fetchone()[0] is not None
+    try:
+        with conn.transaction():
+            server = int(conn.execute("SHOW server_version_num").fetchone()[0])
+            now = conn.execute("SELECT now()").fetchone()[0]
+            major, since = _store_major_since(conn, schema)
+            owners = {}
+            if exists("schema_version"):
+                owners = {owner: {"major": owner_major, "minor": owner_minor}
+                          for owner, owner_major, owner_minor in conn.execute(
+                              sql.SQL("SELECT owner, major, minor FROM {}.schema_version "
+                                      "ORDER BY owner").format(sql.Identifier(schema)))}
+            tables = [row[0] for row in conn.execute(
+                "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND c.relkind = 'r' ORDER BY c.relname", (schema,))]
+            size = int(conn.execute(
+                "SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s "
+                "AND c.relkind IN ('r', 'm')", (schema,)).fetchone()[0])
+            nodes = []
+            if exists("capabilities_nodes"):
+                states = runs = {}
+                if exists("capabilities_node_states"):
+                    states = {row[0]: row[1:] for row in conn.execute(sql.SQL(
+                        "SELECT node, image_version, boot_line, reported_at, "
+                        "fresh_until > now() FROM {}.capabilities_node_states").format(
+                            sql.Identifier(schema)))}
+                if exists("capabilities_node_updates"):
+                    runs = {row[0]: row[1] or row[2] for row in conn.execute(sql.SQL(
+                        "SELECT DISTINCT ON (node) node, versions_after, versions_before "
+                        "FROM {}.capabilities_node_updates ORDER BY node, requested_at DESC, "
+                        "id").format(sql.Identifier(schema)))}
+                for node, label, kind, last_seen, disabled, resource in conn.execute(sql.SQL(
+                        "SELECT id, label, kind, last_seen_at, disabled_at, coolify_resource "
+                        "FROM {}.capabilities_nodes ORDER BY label, id").format(
+                            sql.Identifier(schema))):
+                    image, boot, reported, fresh = states.get(node, (None, None, None, False))
+                    nodes.append({"node": node, "label": label, "kind": kind,
+                                  "last_seen_at": last_seen, "reported_at": reported,
+                                  "disabled_at": disabled, "coolify_resource": resource,
+                                  "reachable": bool(fresh), "image_version": image,
+                                  "boot_line": boot, "versions": runs.get(node)})
+    finally:
+        conn.close()
+    return {"server_major": server // 10000, "now": now, "major": major, "since": since,
+            "owners": owners, "tables": tables, "size": size, "nodes": nodes}
+
+
+def _store_nodes_answer(survey: dict, crossed_at=None) -> list[dict]:
+    """Every node the store holds, with what it runs, whether it can read the
+    store, and the command that brings it up; after a crossing (`crossed_at`)
+    a node not seen since cannot read it yet."""
+    stamp = _store_module()._stamp
+    out = []
+    for node in survey["nodes"]:
+        seen = max((at for at in (node["last_seen_at"], node["reported_at"]) if at is not None),
+                   default=None)
+        reads = _node_reads_store(survey["major"], survey["since"], seen)
+        reason = None
+        last = f"last seen {stamp(seen)}" if seen else "never seen"
+        if not reads:
+            reason = (f"{last}, before the store reached schema major {survey['major']} at "
+                      f"{stamp(survey['since'])}")
+        if crossed_at is not None and reads and (seen is None or seen < crossed_at):
+            reads = False
+            reason = f"{last} since this upgrade moved the store at {stamp(crossed_at)}"
+        out.append({
+            "node": node["node"], "label": node["label"], "kind": node["kind"],
+            "disabled": node["disabled_at"] is not None,
+            "last_seen_at": stamp(node["last_seen_at"]),
+            "reported_at": stamp(node["reported_at"]), "reachable": node["reachable"] and reads,
+            "runs": {"image_version": node["image_version"], "boot_line": node["boot_line"],
+                     "versions": node["versions"]},
+            "reads_store": reads, "reason": reason,
+            "command": _node_bring_up(node, node["image_version"])})
+    return out
+
+
+def _store_upgrade_readers(setting, survey: dict) -> list[dict]:
+    """What the installed releases read of each owner, as `migrate status`
+    answers it without the upgrade's flag - the manager's own owners asked
+    here, each installed capability that keeps tables asked through its own
+    `migrate status`, a quarantined one under the flag, which alone lets it
+    answer - against what the store holds: {owner, by, capability?,
+    quarantined?, store, reads, state, crosses, error?}."""
+    db = _db_module()
+    store = _store_module()
+    out = []
+    lib_major = db.STORE_MAJOR
+    core_store = survey["owners"].get("core")
+    held = survey["major"]
+    state = ("empty" if held is None else "schema_too_new" if held > lib_major
+             else "upgrade_needed" if held < lib_major else "current")
+    out.append({"owner": "core", "by": "manager", "store": core_store,
+                "reads": {"major": lib_major, "minor": None}, "state": state,
+                "crosses": state == "upgrade_needed"})
+    manager_owners = (
+        (store.STORE_OWNER, store.record_table_steps() + PLACEMENT_STEPS,
+         store.STORE_TABLES_VERSION),
+        (SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS, SUPERVISE_LEASE_VERSION))
+    for owner, steps, (major, minor) in manager_owners:
+        if owner not in survey["owners"]:
+            continue
+        entry = {"owner": owner, "by": "manager", "store": survey["owners"][owner],
+                 "reads": {"major": major, "minor": minor}}
+        conn = None
+        try:
+            with _upgrade_flag(False):
+                conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                                  transaction=True)
+                found = db.status(conn, owner, steps, major=major, minor=minor)
+            entry["state"] = found.state
+        except db.DbError as exc:
+            entry["state"] = "unknown"
+            entry["error"] = _db_error(exc)
+        finally:
+            if conn is not None:
+                conn.close()
+        entry["crosses"] = entry["state"] == "upgrade_needed"
+        out.append(entry)
+    for name in sorted(_installed()):
+        manifest = _read_json(_registry_dir(name) / "manifest.json") or {}
+        if manifest.get("tables") is not True:
+            continue
+        quarantined = _machine_state(name) == "quarantined"
+        flagged = quarantined
+        rc, stdout, stderr = _run_script(
+            _script_path(name), ["migrate", "status"],
+            env=_store_upgrade_env(setting, upgrading=flagged),
+            timeout=MIGRATE_TIMEOUT_SECONDS)
+        if rc != 0 and not flagged \
+                and _script_error(stderr, rc).get("code") in STORE_MAJOR_SLUGS:
+            # A release whose library refuses a store at another major
+            # answers only under the upgrade's flag, which `status` reads as
+            # the upgrade would.
+            flagged = True
+            rc, stdout, stderr = _run_script(
+                _script_path(name), ["migrate", "status"],
+                env=_store_upgrade_env(setting, upgrading=True),
+                timeout=MIGRATE_TIMEOUT_SECONDS)
+        base = {"by": "capability", "capability": name, "quarantined": quarantined,
+                "release_store_major": _release_store_major(manifest.get("store_major"))}
+        # The owners it migrates, further ones first and its own last, as its
+        # manifest names them; one that names none migrates its own alone.
+        declared = [owner for owner in manifest.get("owners") or []
+                    if isinstance(owner, str) and owner] or [name]
+        try:
+            report = json.loads(stdout) if rc == 0 else None
+        except ValueError:
+            report = None
+        if not isinstance(report, dict):
+            error = _script_error(stderr, rc)
+            out += [{"owner": owner, **base, "store": survey["owners"].get(owner),
+                     "reads": None, "state": "unknown", "crosses": False, "error": error}
+                    for owner in declared]
+            continue
+        answers = [answer for answer in report.get("other_owners") or []
+                   if isinstance(answer, dict)] + [report]
+        for answer in answers:
+            entry = {"owner": answer.get("owner") or name, **base,
+                     "store": answer.get("store"), "reads": answer.get("code")}
+            if entry["owner"] != name:
+                entry["further"] = True
+            state = answer.get("state")
+            # Under the flag `migrate status` answers a crossing as pending.
+            if flagged and state == "pending" and entry["store"] and entry["reads"] \
+                    and entry["reads"].get("major", 0) > entry["store"].get("major", 0):
+                state = "upgrade_needed"
+            entry["state"] = state
+            entry["crosses"] = state == "upgrade_needed"
+            out.append(entry)
+        answered = {answer.get("owner") for answer in answers}
+        # An owner the manifest declares that the answer leaves out is known
+        # to be migrated here, but not where it stands.
+        out += [{"owner": owner, **base, "store": survey["owners"].get(owner), "reads": None,
+                 "state": "unknown", "crosses": False,
+                 "error": {"code": "owner_unanswered",
+                           "message": f"`{name} migrate status` does not answer the {owner} "
+                                      "tables its manifest declares",
+                           "hint": f"update {name}: `capabilities update {name}`"}}
+                for owner in declared if owner not in answered]
+    return out
+
+
+def _script_error(stderr: str, rc: int) -> dict:
+    """The error envelope a capability printed last, else its last words."""
+    for line in reversed((stderr or "").strip().splitlines()):
+        try:
+            error = json.loads(line)["error"]
+            if isinstance(error, dict):
+                return error
+        except (ValueError, KeyError, TypeError):
+            continue
+    return {"code": "capability_failed",
+            "message": (stderr or "").strip()[-500:] or f"exited {rc}"}
+
+
+def _store_upgrade_available() -> dict:
+    """The schema major the newest line - the canonical source - reads, from
+    its manager release manifest: {major, source}, with error where it cannot
+    be read."""
+    url = f"{SOURCE.rstrip('/')}/{MANAGER_RELEASE_MANIFEST_REL}"
+    found, error = _quiet_captured(_fetch_json, url, "manager release manifest")
+    if found is None or _validate_manager_release_manifest(found):
+        return {"major": None, "source": url,
+                "error": error or {"code": "manager_release_invalid",
+                                   "message": "the newest line's release manifest is invalid"}}
+    return {"major": _release_store_major(found.get("store_major")), "source": url}
+
+
+def _quiet_captured(fn, *args):
+    """`_captured`, with no event said for an error it catches."""
+    events, _EVENTS_ON[0] = _EVENTS_ON[0], False
+    try:
+        return _captured(fn, *args)
+    finally:
+        _EVENTS_ON[0] = events
+
+
+def _store_upgrade_state_path(key: str) -> Path:
+    return STORE_UPGRADE_DIR / f"{key}.json"
+
+
+def _store_upgrade_check(root: Path | None, *, available: dict | None = None) -> dict:
+    """What `store upgrade --check` answers, changing nothing; the setting,
+    the survey and the readers ride along under `_` for the procedure."""
+    db = _db_module()
+    store = _store_module()
+    lib_major = db.STORE_MAJOR
+    answer: dict = {"ok": True, "state": None, "upgrade_needed": False, "can_run": False,
+                    "store": None, "manager": {"reads": STORE_MAJOR, "library": lib_major},
+                    "available": None, "target_major": None, "owners": [], "blockers": [],
+                    "next": [], "backup": None, "tools": None, "nodes": [], "progress": None}
+    try:
+        setting = db.resolve_setting(root)
+    except db.DbError as exc:
+        answer.update(ok=False, state="unconfigured" if exc.slug == "store_not_configured"
+                      else "refused")
+        answer["blockers"].append(_db_error(exc))
+        answer["_exit"] = 3 if exc.slug == "store_not_configured" else 6
+        return answer
+    key = _store_upgrade_key(setting)
+    params = _store_params(setting)
+    answer["store"] = {"key": key, "level": setting.level, "schema": setting.schema,
+                       "host": params.get("host"), "port": params.get("port"),
+                       "database": params.get("dbname"), "reachable": False}
+    try:
+        survey = _store_survey(setting)
+    except Exception as exc:  # DbError, psycopg.Error: the store did not answer
+        error = (_db_error(exc) if isinstance(exc, db.DbError) else
+                 {"code": "store_unreachable", "message": _store_scrub(exc, setting)})
+        error.setdefault("hint", "check the database setting with `capabilities store doctor`")
+        answer.update(ok=False, state="unreachable")
+        answer["blockers"].append(error)
+        answer["_exit"] = 5
+        return answer
+    stamp = store._stamp
+    answer["store"].update(reachable=True, major=survey["major"], since=stamp(survey["since"]),
+                           server_major=survey["server_major"], tables=len(survey["tables"]),
+                           bytes=survey["size"])
+    answer["nodes"] = _store_nodes_answer(survey)
+    progress = _read_json(_store_upgrade_state_path(key))
+    if isinstance(progress, dict) and not progress.get("finished_at"):
+        answer["progress"] = {k: progress.get(k) for k in
+                              ("started_at", "target_major", "phases", "manager_release")}
+    if survey["major"] is None:
+        answer.update(state="empty")
+        answer["message"] = ("the store holds no schema yet, so there is nothing to cross: the "
+                             "first migration of each owner takes its newest steps")
+        answer["_"] = {"setting": setting, "survey": survey, "key": key}
+        return answer
+    answer["available"] = available = available or _store_upgrade_available()
+    target = max(available["major"] or STORE_MAJOR, STORE_MAJOR)
+    answer["target_major"] = target
+    readers = _store_upgrade_readers(setting, survey)
+    answer["owners"] = readers
+    answer["_"] = {"setting": setting, "survey": survey, "key": key, "readers": readers}
+    if survey["major"] > STORE_MAJOR or survey["major"] > lib_major or any(
+            entry["state"] == "schema_too_new" for entry in readers):
+        answer.update(state="behind")
+        answer["message"] = (f"the store is on a newer schema than this machine's releases "
+                             f"read (store major {survey['major']}, this manager reads "
+                             f"{STORE_MAJOR}): this machine catches up rather than crossing")
+        answer["next"] = ["capabilities self-update", "capabilities update"]
+        return answer
+    crossing = target > survey["major"]
+    answer["upgrade_needed"] = needed = crossing or any(entry["crosses"] for entry in readers)
+    if not needed:
+        answer.update(state="current")
+        answer["message"] = (f"the store is on schema major {survey['major']} and every "
+                             "installed release reads it: there is nothing to cross")
+        return answer
+    blockers = answer["blockers"]
+    if store.read_only_switch():
+        blockers.append({"code": "read_only_switch",
+                         "message": f"{store.READ_ONLY_ENV} is set, so this process changes "
+                                    "nothing and the upgrade is refused",
+                         "hint": "Do not lift the switch yourself - ask the user; the upgrade "
+                                 f"runs in a process without {store.READ_ONLY_ENV}."})
+    known = {entry["owner"] for entry in readers}
+    for owner in sorted(survey["owners"]):
+        if owner not in known:
+            blockers.append({"code": "owner_not_installed", "owner": owner,
+                             "message": f"the store holds the {owner} tables and no release "
+                                        f"installed here migrates them",
+                             "hint": f"install it here (`capabilities install {owner}`), or "
+                                     "run the upgrade on a machine that has it"})
+    for entry in readers:
+        if entry["state"] in ("checksum_mismatch", "unknown"):
+            error = entry.get("error") or {}
+            blockers.append({"code": "owner_unreadable", "owner": entry["owner"],
+                             "message": f"the {entry['owner']} tables cannot be judged: "
+                                        + (error.get("message") or entry["state"]),
+                             "hint": error.get("hint")
+                             or f"check them with `{entry['owner']} migrate status`"})
+    dump, restore = _pg_tool("pg_dump"), _pg_tool("pg_restore")
+    answer["tools"] = {"pg_dump": dump, "pg_restore": restore}
+    for name, tool in (("pg_dump", dump), ("pg_restore", restore)):
+        if tool is None:
+            blockers.append({"code": f"{name}_missing",
+                             "message": f"{name} is not on PATH, so the dump the upgrade takes "
+                                        "first cannot be " + ("taken" if name == "pg_dump"
+                                                              else "proven"),
+                             "hint": f"install the PostgreSQL client tools of version "
+                                     f"{survey['server_major']} or newer and put them on PATH"})
+        elif tool["major"] < survey["server_major"]:
+            blockers.append({"code": f"{name}_too_old",
+                             "message": f"{name} {tool['version']} is older than the server "
+                                        f"(PostgreSQL {survey['server_major']}), which it "
+                                        "cannot dump",
+                             "hint": f"install the PostgreSQL client tools of version "
+                                     f"{survey['server_major']} or newer and put them first on "
+                                     "PATH"})
+    backups = STORE_BACKUP_DIR / key
+    probe = backups
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError:
+        free = None
+    answer["backup"] = {"dir": str(backups), "needed_bytes": survey["size"],
+                        "free_bytes": free}
+    if free is not None and free < survey["size"]:
+        blockers.append({"code": "no_room_for_dump",
+                         "message": f"the dump needs up to {survey['size']} bytes and "
+                                    f"{probe} has {free} free",
+                         "hint": "free space there, then check again"})
+    answer["can_run"] = not blockers
+    answer["state"] = "upgrade_available" if not blockers else "blocked"
+    crossing_owners = [entry["owner"] for entry in readers if entry["crosses"]]
+    answer["message"] = (
+        (f"the store is on schema major {survey['major']} and the newest release reads major "
+         f"{target}" if crossing else f"the store is on schema major {survey['major']}")
+        + (f"; the installed releases cross the {', '.join(crossing_owners)} tables"
+           if crossing_owners else "")
+        + ("; `capabilities store upgrade` takes a dump, then crosses" if not blockers
+           else "; what stops the upgrade is under blockers, each with what to do"))
+    answer["next"] = ([STORE_UPGRADE_COMMAND] if not blockers
+                      else [b["hint"] for b in blockers if b.get("hint")])
+    return answer
+
+
+def cmd_store_upgrade_check() -> None:
+    os.environ.pop(_db_module().UPGRADE_ENV, None)
+    answer = _store_upgrade_check(_project_root())
+    code = answer.pop("_exit", 0)
+    answer.pop("_", None)
+    _emit(answer)
+    if code:
+        sys.exit(code)
+
+
+def _store_upgrade_fail(exit_code: int, code: str, message: str, hint: str | None,
+                        detail: dict) -> NoReturn:
+    """End the upgrade on a refusal or a failed phase, with what was done as
+    the error's detail; a rerun goes on from there."""
+    err = {"code": code, "message": message}
+    if hint:
+        err["hint"] = hint
+    err["detail"] = detail
+    if _EVENTS_ON[0]:
+        sys.stdout.write(json.dumps({"event": "error", "exit": exit_code, "error": err},
+                                    ensure_ascii=False, default=str) + "\n")
+        sys.stdout.flush()
+    sys.stderr.write(json.dumps({"error": err}, ensure_ascii=False, default=str) + "\n")
+    sys.exit(exit_code)
+
+
+def _store_dump(setting, survey: dict, key: str) -> dict:
+    """Take the dump of the store's schema with pg_dump to the standard place,
+    STORE_BACKUP_DIR/<store key>/<UTC time>.dump (custom format), and prove it:
+    pg_restore reads its whole table of contents, and it holds the data of
+    every table the schema held when it was taken. Raises _UpgradeFailed."""
+    backups = STORE_BACKUP_DIR / key
+    backups.mkdir(parents=True, exist_ok=True)
+    path = backups / (time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + ".dump")
+    partial = path.with_name(path.name + ".partial")
+    params = _store_params(setting)
+    password = params.pop("password", None)
+    from psycopg.conninfo import make_conninfo
+    env = {k: v for k, v in os.environ.items() if k != "PGPASSWORD"}
+    if password:
+        env["PGPASSWORD"] = str(password)
+    argv = ["pg_dump", "--format=custom", f"--schema={setting.schema}", "--no-password",
+            f"--file={partial}", f"--dbname={make_conninfo(**params)}"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, env=env,
+                              timeout=STORE_UPGRADE_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        partial.unlink(missing_ok=True)
+        raise _UpgradeFailed(5, "dump_failed", f"pg_dump did not run: {exc}",
+                             "check pg_dump with `capabilities store upgrade --check`")
+    if proc.returncode != 0:
+        partial.unlink(missing_ok=True)
+        raise _UpgradeFailed(5, "dump_failed", "pg_dump failed: "
+                             + _store_scrub(proc.stderr.strip()[-500:], setting),
+                             "fix what it says and run `capabilities store upgrade` again")
+    partial.rename(path)
+    proven = _store_dump_proof(path, setting.schema, survey["tables"])
+    if not proven["ok"]:
+        raise _UpgradeFailed(6, "dump_unproven", f"the dump at {path} does not prove: "
+                             + proven["reason"],
+                             "run `capabilities store upgrade` again, which takes a new one",
+                             {"path": str(path), "proven": proven})
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": _sha256(path),
+            "taken_at": _utc_now(), "proven": proven}
+
+
+def _store_dump_proof(path: Path, schema: str, tables: list[str]) -> dict:
+    """{ok, reason?, restore_list, table_data, tables, missing}: whether
+    `pg_restore --list` reads the archive whole and its table of contents
+    carries the data of each of `tables`."""
+    try:
+        proc = subprocess.run(["pg_restore", "--list", str(path)], capture_output=True,
+                              text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "reason": f"pg_restore did not run: {exc}", "restore_list": False,
+                "tables": len(tables), "table_data": 0, "missing": tables}
+    if proc.returncode != 0:
+        return {"ok": False, "reason": "pg_restore cannot read it: "
+                + proc.stderr.strip()[-300:], "restore_list": False,
+                "tables": len(tables), "table_data": 0, "missing": tables}
+    data = set()
+    for line in proc.stdout.splitlines():
+        found = re.search(r"\bTABLE DATA (\S+) (\S+) ", line)
+        if found and found.group(1).strip('"') == schema:
+            data.add(found.group(2).strip('"'))
+    missing = [table for table in tables if table not in data]
+    out = {"ok": not missing, "restore_list": True, "tables": len(tables),
+           "table_data": len(data), "missing": missing}
+    if missing:
+        out["reason"] = "it holds no data of " + ", ".join(missing)
+    return out
+
+
+class _UpgradeFailed(Exception):
+    def __init__(self, exit_code: int, code: str, message: str, hint: str | None = None,
+                 detail: dict | None = None):
+        super().__init__(message)
+        self.exit_code, self.code, self.message = exit_code, code, message
+        self.hint, self.detail = hint, detail or {}
+
+
+def _store_upgrade_migrate_owner(setting, entry: dict) -> dict:
+    """Migrate one owner under the upgrade's flag: the core and the manager's
+    own owners here, a capability through its own `migrate`. Answers {owner,
+    applied, version}; raises _UpgradeFailed."""
+    db = _db_module()
+    store = _store_module()
+    owner = entry["owner"]
+    if entry["by"] == "capability":
+        rc, stdout, stderr = _run_script(
+            _script_path(entry["capability"]), ["migrate"],
+            env=_store_upgrade_env(setting, upgrading=True), timeout=MIGRATE_TIMEOUT_SECONDS)
+        if rc != 0:
+            error = _script_error(stderr, rc)
+            raise _UpgradeFailed(5 if rc == 5 else 6, "migrate_failed",
+                                 f"`{entry['capability']} migrate` failed: "
+                                 + _upgrade_message(error.get("code"), error.get("message"),
+                                                    error.get("hint")),
+                                 "fix what it says and run `capabilities store upgrade` "
+                                 "again, which goes on from here", {"owner": owner,
+                                                                     "error": error})
+        try:
+            report = json.loads(stdout)
+        except ValueError:
+            report = {}
+        # Its further owners, migrated first, answer under other_owners.
+        others = {answer.get("owner"): {"applied": answer.get("applied") or [],
+                                        "version": answer.get("version")}
+                  for answer in report.get("other_owners") or []
+                  if isinstance(answer, dict) and answer.get("owner")}
+        return {"owner": report.get("owner") or owner, "applied": report.get("applied") or [],
+                "version": report.get("version"), "others": others}
+    from capabilities_contract.db import _migrate as migrate_module
+    if owner == "core":
+        steps = tuple(getattr(migrate_module, "CORE_STEPS", ()))
+        major, minor = getattr(migrate_module, "CORE_VERSION", (0, 0))
+    elif owner == store.STORE_OWNER:
+        steps = store.record_table_steps() + PLACEMENT_STEPS
+        major, minor = store.STORE_TABLES_VERSION
+    else:
+        steps, (major, minor) = SUPERVISE_LEASE_STEPS, SUPERVISE_LEASE_VERSION
+    if not steps:
+        return {"owner": owner, "applied": [], "version": None}
+    conn = None
+    try:
+        with _upgrade_flag(True):
+            conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                              transaction=True)
+            done = db.migrate(conn, owner, steps, major=major, minor=minor)
+    except db.DbError as exc:
+        raise _UpgradeFailed(_store_error_exit(exc), "migrate_failed",
+                             f"the {owner} tables did not migrate: "
+                             + _upgrade_message(exc.slug, exc.message, exc.hint),
+                             "fix what it says and run `capabilities store upgrade` again, "
+                             "which goes on from here", {"owner": owner,
+                                                         "error": _db_error(exc)}) from None
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"owner": owner, "applied": list(done.applied),
+            "version": {"major": done.major, "minor": done.minor}}
+
+
+def cmd_store_upgrade(events: bool) -> None:
+    """`store upgrade`: the one procedure that crosses a schema major - the
+    newest line's manager (handed over to, so it carries on), every installed
+    capability from the newest line, a proven dump, then every owner migrated
+    under the upgrade's flag - resuming from its kept progress."""
+    import fcntl
+    if events:
+        _events_begin()
+    _read_only_gate("store upgrade")
+    # Only the migrations below run under the upgrade's flag, never the
+    # updates before the dump.
+    os.environ.pop(_db_module().UPGRADE_ENV, None)
+    root = _project_root()
+    _event("step", step="check", state="started")
+    check = _store_upgrade_check(root)
+    code = check.pop("_exit", 0)
+    carried = check.pop("_", None) or {}
+    if code:
+        blocker = check["blockers"][0]
+        _store_upgrade_fail(code, blocker["code"], blocker["message"], blocker.get("hint"),
+                            {"check": check})
+    _event("step", step="check", state="done",
+           check={k: check[k] for k in ("state", "upgrade_needed", "can_run", "target_major")})
+    setting, survey, key = carried["setting"], carried["survey"], carried["key"]
+    if not check["upgrade_needed"]:
+        _emit({"upgraded": False, "state": check["state"], "message": check.get("message"),
+               "store": check["store"], "owners": check["owners"], "nodes": check["nodes"],
+               "next": check["next"]})
+        return
+    if not check["can_run"]:
+        _store_upgrade_fail(6, "store_upgrade_blocked",
+                            "the store upgrade cannot run: " + "; ".join(
+                                b["message"] for b in check["blockers"]),
+                            "; ".join(b["hint"] for b in check["blockers"] if b.get("hint")),
+                            {"check": check})
+    STORE_UPGRADE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(STORE_UPGRADE_DIR / f"{key}.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        _die(6, "store_upgrade_running", "an upgrade of this store is running already",
+             "wait for it to end; run `capabilities store upgrade --check` to see where it is")
+    path = _store_upgrade_state_path(key)
+    progress = _read_json(path)
+    target = check["target_major"]
+    resumed = (isinstance(progress, dict) and not progress.get("finished_at")
+               and progress.get("target_major") == target)
+    # A manager handed over to carries on the run that handed over, which it
+    # does not count as resumed.
+    handed = os.environ.pop(STORE_UPGRADE_HANDOVER_ENV, None)
+    if not resumed:
+        progress = {"store": key, "target_major": target, "started_at": _utc_now(),
+                    "store_before": {"major": survey["major"], "owners": survey["owners"]},
+                    "phases": {}, "finished_at": None}
+        _write_json(path, progress)
+    phases = progress["phases"]
+    crossing = target > survey["major"]
+
+    def done(phase: str, **fields) -> None:
+        phases[phase] = {"state": "done", "at": _utc_now(), **fields}
+        _write_json(path, progress)
+        _event("step", step=phase, state="done", check=fields)
+
+    def skipped(phase: str, reason: str) -> None:
+        _event("step", step=phase, state="skipped", reason=reason)
+
+    def failed(phase: str, exc: _UpgradeFailed) -> NoReturn:
+        phases[phase] = {**phases.get(phase, {}), "state": "failed", "at": _utc_now(),
+                         "error": {"code": exc.code, "message": exc.message}}
+        _write_json(path, progress)
+        _event("step", step=phase, state="failed",
+               error={"code": exc.code, "message": exc.message})
+        _store_upgrade_fail(exc.exit_code, exc.code, exc.message, exc.hint,
+                            {**exc.detail, "phase": phase, "progress": phases,
+                             "resume": STORE_UPGRADE_COMMAND})
+
+    # The newest line's manager, handed over to, so the new major's own code
+    # carries on from here.
+    if phases.get("manager", {}).get("state") == "done":
+        skipped("manager", "done before")
+    elif (check["available"]["major"] or 0) <= STORE_MAJOR:
+        skipped("manager", f"this manager reads schema major {STORE_MAJOR}, the newest")
+    else:
+        _event("step", step="manager", state="started")
+        with _manager_mutation_guard():
+            fetched, error = _quiet_captured(_manager_release_from_remote, _httpx())
+            if fetched is None:
+                failed("manager", _UpgradeFailed(
+                    5, error.get("code") or "manager_fetch_failed",
+                    "the newest line's manager could not be fetched: "
+                    + str(error.get("message")), error.get("hint")
+                    or "run `capabilities store upgrade` again once the source answers"))
+            content, assets, manifest, source = fetched
+            result, error = _quiet_captured(_activate_manager_release, content, assets,
+                                            source, manifest)
+            if result is None:
+                failed("manager", _UpgradeFailed(5, error.get("code") or "manager_failed",
+                                                 str(error.get("message")), error.get("hint")))
+        progress["manager_release"] = result["release"]
+        done("manager", release=result["release"], manager=result["manager"],
+             store_major=_release_store_major(manifest.get("store_major")))
+        _event("handover", manager=result["manager"], release=result["release"])
+        sys.stdout.flush()
+        sys.stderr.flush()
+        lock.close()
+        argv = [result["manager"], "store", "upgrade", *(["--events"] if events else [])]
+        try:
+            os.execve(result["manager"], argv,
+                      {**os.environ, STORE_UPGRADE_HANDOVER_ENV: result["release"]})
+        except OSError as exc:
+            failed("manager", _UpgradeFailed(5, "handover_failed",
+                                             f"the new manager could not be run: {exc}",
+                                             "run `capabilities store upgrade` again"))
+    # Every installed capability from the newest line, whatever the store's
+    # major, where the store crosses to a newer one.
+    capabilities_done = phases.get("capabilities", {})
+    updated = list(capabilities_done.get("updated") or [])
+    if capabilities_done.get("state") == "done":
+        skipped("capabilities", "done before")
+    elif not crossing:
+        skipped("capabilities", "the store crosses no store major, so the installed releases "
+                "are the ones that migrate")
+    else:
+        _event("step", step="capabilities", state="started")
+        here = {"store": None, "reason": "the store upgrade takes the newest line"}
+        catalogues: dict = {}
+        names = {entry["name"] for entry in updated}
+        for name in sorted(_installed(), key=lambda n: (n != "deployment", n)):
+            if name in names:
+                _event("step", step="capabilities", capability=name, state="skipped",
+                       reason="done before")
+                continue
+
+            def one(name=name):
+                _assert_payload_mutable(name)
+                with _update_recorded(name):
+                    return _update_one(name, here, catalogues)
+            entry, error = _quiet_captured(one)
+            if entry is None:
+                _event("step", step="capabilities", capability=name, state="failed",
+                       error=error)
+                phases["capabilities"] = {"state": "running", "updated": updated}
+                failed("capabilities", _UpgradeFailed(
+                    5, "update_failed", f"{name} could not be taken from the newest line: "
+                    + str(error.get("message")), error.get("hint")
+                    or "run `capabilities store upgrade` again, which goes on from here",
+                    {"capability": name, "error": error}))
+            updated.append({"name": name, "changed": entry.get("changed", False)})
+            phases["capabilities"] = {"state": "running", "updated": updated}
+            _write_json(path, progress)
+            _event("step", step="capabilities", capability=name, state="done",
+                   check={"changed": entry.get("changed", False)})
+        done("capabilities", updated=updated)
+        readers = _store_upgrade_readers(setting, survey)
+        carried["readers"] = readers
+    readers = carried.get("readers") or check["owners"]
+    # The dump, taken once and kept for a rerun once proven.
+    dump = phases.get("dump", {})
+    kept = dump.get("state") == "done" and Path(dump.get("path") or "").is_file() \
+        and _sha256(Path(dump["path"])) == dump.get("sha256")
+    if kept:
+        skipped("dump", f"kept from before: {dump['path']}")
+    else:
+        _event("step", step="dump", state="started", dir=str(STORE_BACKUP_DIR / key))
+        try:
+            dump = _store_dump(setting, survey, key)
+        except _UpgradeFailed as exc:
+            failed("dump", exc)
+        done("dump", **dump)
+        dump = phases["dump"]
+    # Every owner, the core first, then the manager's own, then each installed
+    # capability that keeps tables, a quarantined one included.
+    migrated = dict(phases.get("migrate", {}).get("owners") or {})
+    after = None
+    if phases.get("migrate", {}).get("state") == "done":
+        skipped("migrate", "done before")
+    else:
+        _event("step", step="migrate", state="started")
+        # A capability's `migrate` migrates every owner it declares, its
+        # further ones first, so it runs once for all of them.
+        units = [[entry] for entry in readers if entry["by"] == "manager"]
+        for entry in readers:
+            if entry["by"] == "capability" and not entry.get("further"):
+                units.append([e for e in readers if e["by"] == "capability"
+                              and e["capability"] == entry["capability"]])
+        for unit in units:
+            owners = [entry["owner"] for entry in unit]
+            if all(owner in migrated for owner in owners):
+                for owner in owners:
+                    _event("step", step="migrate", owner=owner, state="skipped",
+                           reason="done before")
+                continue
+            for owner in owners:
+                _event("step", step="migrate", owner=owner, state="started")
+            entry = unit[-1]
+            try:
+                result = _store_upgrade_migrate_owner(setting, entry)
+            except _UpgradeFailed as exc:
+                for owner in owners:
+                    _event("step", step="migrate", owner=owner, state="failed",
+                           error={"code": exc.code, "message": exc.message})
+                phases["migrate"] = {"state": "running", "owners": migrated}
+                failed("migrate", exc)
+            moved = {**(result.get("others") or {}),
+                     entry["owner"]: {"applied": result["applied"],
+                                      "version": result["version"]}}
+            for owner in owners:
+                migrated[owner] = {**moved.get(owner, {"applied": [], "version": None}),
+                                   **({"by": entry["capability"]}
+                                      if owner != entry["owner"] else {}),
+                                   **({"quarantined": True} if entry.get("quarantined")
+                                      else {})}
+            phases["migrate"] = {"state": "running", "owners": migrated}
+            _write_json(path, progress)
+            for owner in owners:
+                _event("step", step="migrate", owner=owner, state="done",
+                       check=migrated[owner])
+        after = _store_survey(setting)
+        done("migrate", owners=migrated, crossed_at=_store_module()._stamp(after["now"]))
+    after = after or _store_survey(setting)
+    crossed_at = phases["migrate"].get("crossed_at")
+    import datetime as _dt
+    crossed = _dt.datetime.fromisoformat(crossed_at) if isinstance(crossed_at, str) else None
+    nodes = _store_nodes_answer(after, crossed)
+    left = [{k: node[k] for k in ("node", "label", "kind", "last_seen_at", "reason", "command")}
+            for node in nodes if not node["disabled"] and not node["reads_store"]]
+    progress["finished_at"] = _utc_now()
+    _write_json(path, progress)
+    lock.close()
+    before = progress.get("store_before") or {}
+    _emit({"upgraded": True, "state": "upgraded", "resumed": bool(resumed) and not handed,
+           "store": {**check["store"], "major": after["major"],
+                     "since": _store_module()._stamp(after["since"])},
+           "major": {"before": before.get("major"), "after": after["major"]},
+           "owners": [{"owner": owner, "before": (before.get("owners") or {}).get(owner),
+                       "after": after["owners"].get(owner), **migrated.get(owner, {})}
+                      for owner in sorted(set(after["owners"]) | set(migrated))],
+           "manager": ({"release": phases["manager"].get("release"),
+                        "manager": phases["manager"].get("manager")}
+                       if "manager" in phases else None),
+           "capabilities": (phases.get("capabilities") or {}).get("updated") or [],
+           "backup": {"path": dump.get("path"), "bytes": dump.get("bytes"),
+                      "sha256": dump.get("sha256"), "taken_at": dump.get("taken_at"),
+                      "proven": dump.get("proven"), "kept": kept},
+           "progress": str(path),
+           "nodes": nodes, "nodes_to_bring_up": left,
+           "next": ([f"bring up each node under nodes_to_bring_up with its command; "
+                     "`capabilities guide store-upgrade` says how"] if left else [])
+           + ["on every other machine that uses this store: capabilities self-update, then "
+              "capabilities update"]})
 
 
 def _deny_rule(name: str) -> str:
@@ -28656,7 +30359,8 @@ def cmd_doctor() -> None:
             # other; the rest of the project is still worth reconciling.
             caps = {}
             store_finding = (f"project: records store unavailable "
-                             f"({exc.slug}): {exc.message}")
+                             f"({exc.slug}): "
+                             + _upgrade_message(exc.slug, exc.message, exc.hint))
             findings.append(store_finding)
         gi = envelope / ".gitignore"
         if not gi.exists() or "*/state/" not in gi.read_text():
@@ -28675,13 +30379,16 @@ def cmd_doctor() -> None:
                 except store.StoreError as exc:
                     if store_finding is None:
                         findings.append(f"project: connections store unavailable "
-                                        f"({exc.slug}): {exc.message}")
+                                        f"({exc.slug}): "
+                                        + _upgrade_message(exc.slug, exc.message, exc.hint))
             if not in_store or records._failure is None:
                 _check_record_connections(findings, records, _installed())
             if in_store and records._failure is None:
                 information = _grant_agents_information(root)
         except store.StoreError as exc:
-            findings.append(f"project: records unavailable: {exc.message}")
+            if exc.slug not in STORE_MAJOR_SLUGS or store_finding is None:
+                findings.append("project: records unavailable: "
+                                + _upgrade_message(exc.slug, exc.message, exc.hint))
         finally:
             if records is not None:
                 records.close()
@@ -29724,7 +31431,7 @@ def _scaffold_source_repo(source_id: str, root: Path) -> None:
         if source_asset.resolve() != target.resolve():
             shutil.copy2(source_asset, target)
     _write_json(root / "capabilities.repo.json", {"kind": "capability-source"})
-    _write_json(root / ".capability-source" / "catalog.json", {"capabilities": {}})
+    _write_json(root / ".capability-source" / "catalog.json", _stamp_catalog(root, {}))
     (root / "AUTHORING.md").write_text(_authoring_markdown(source_id))
     agent_text = _repo_agent_markdown(source_id)
     (root / "AGENTS.md").write_text(agent_text)
@@ -30000,7 +31707,7 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
             "payload_sha256": _payload_sha256(capdir),
             "icon": _has_icon(capdir),
         }
-    return {"capabilities": entries}, failures
+    return _stamp_catalog(root, entries), failures
 
 
 def _catalog_payload_scoped(
@@ -30061,7 +31768,7 @@ def _catalog_payload_scoped(
             "payload_sha256": _payload_sha256(capdir),
             "icon": _has_icon(capdir),
         }
-    return {"capabilities": entries}, failures
+    return _stamp_catalog(root, entries), failures
 
 
 def _source_contract_failures(root: Path) -> list[str]:
@@ -31664,8 +33371,18 @@ def main() -> None:
             if extra:
                 _die(6, "input", f"store {sub} takes only --project PATH and --json")
             cmd_store_doctor(project) if sub == "doctor" else cmd_store_show(project)
+        elif sub == "upgrade":
+            extra = [arg for arg in rest[1:] if arg not in ("--check", "--json", "--events")]
+            if extra or ("--check" in rest and "--events" in rest):
+                _die(6, "input", "store upgrade takes --check [--json], or --events",
+                     "capabilities store upgrade --check | capabilities store upgrade "
+                     "[--events]")
+            if "--check" in rest:
+                cmd_store_upgrade_check()
+            else:
+                cmd_store_upgrade("--events" in rest)
         else:
-            _die(6, "input", "store needs a subcommand: set, show, doctor or unset",
+            _die(6, "input", "store needs a subcommand: set, show, doctor, upgrade or unset",
                  "run `capabilities help`")
     elif cmd == "path":
         if pos:

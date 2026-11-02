@@ -124,8 +124,6 @@ capabilities/
   manager-release.json  generated for the official manager source
 ```
 
-The executable manifest remains the source of truth. `catalog.json` is only a
-generated discovery index and is rejected when its summaries, payload hashes
-or icon flags are stale. In the official source, `manager-release.json` is also generated: it
-binds the incoming manager and its complete runtime/authoring asset set to
-SHA-256 hashes so `self-update` can stage the whole release before activation.
+The executable manifest remains the source of truth. `catalog.json` is only a generated discovery index and is rejected when its summaries, payload hashes, icon flags or store majors are stale. In the official source, `manager-release.json` is also generated: it binds the incoming manager and its complete runtime/authoring asset set to SHA-256 hashes so `self-update` can stage the whole release before activation.
+
+Both name the store schema major the tree's release line reads as `store_major` - the catalogue at its top level and on every entry - taken from the `STORE_MAJOR` the tree's own manager declares, or the indexing manager's for a source that carries no manager; a line kept for an older major also names the capabilities-contract range it reads as `library`. `self-update` and `update` take only a release that reads the store's major; `capabilities help` says how.

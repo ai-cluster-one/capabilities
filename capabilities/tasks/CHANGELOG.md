@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-02 — `tasks` declares the harness profile table it migrates
+
+`tasks migrate` and `tasks migrate status` answer the harness library's profile table, owner `harness`, under `other_owners`, beside tasks' own tables at the top level, and the manifest names both owners as `owners`, `["harness", "tasks"]`. The manager's `capabilities store upgrade` reads them, so a store holding the `harness` tables is upgraded through tasks rather than refused as an owner no installed release migrates. What `migrate` applies, and when, is unchanged.
+
 ## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
 
 The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning; codex is unchanged. Nothing a turn does changes.

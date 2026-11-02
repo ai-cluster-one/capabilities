@@ -88,7 +88,8 @@ for asset in SHEBANG.md DOCTRINE.md TEMPLATE.md SOURCES.md ROUTINES.md \
   guides/contract.md guides/dev.md guides/grooming.md \
   guides/migrate-to-database.md guides/publishing.md \
   guides/reporting.md guides/repositories.md guides/sanitizing.md \
-  guides/store-connections.md guides/supabase.md guides/surfaces.md skill/SKILL.md \
+  guides/store-connections.md guides/store-upgrade.md guides/supabase.md \
+  guides/surfaces.md skill/SKILL.md \
   manager/CHANGELOG.md contract/CHANGELOG.md; do
     mkdir -p "$assets_tmp/$(dirname "$asset")"
     curl -fsSL "$REPO/$asset" -o "$assets_tmp/$asset" || err "fetch failed: $REPO/$asset"
@@ -148,7 +149,7 @@ with lock_path.open("a+") as lock:
                 "guides/publishing.md",
                 "guides/reporting.md", "guides/repositories.md",
                 "guides/sanitizing.md", "guides/store-connections.md",
-                "guides/supabase.md",
+                "guides/store-upgrade.md", "guides/supabase.md",
                 "guides/surfaces.md",
                 "skill/SKILL.md", "manager/CHANGELOG.md",
                 "contract/CHANGELOG.md"):
