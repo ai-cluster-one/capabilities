@@ -1406,7 +1406,10 @@ PROJECT VERBS (run inside a consuming project)
         created through a lent connection takes the same one lent again
         (exit 6 coolify_connection_required, lent_connection_mismatch). The
         node itself is reached over SSH to its server and docker exec into
-        its container. <node> is the node's id, or the label exactly one of
+        its container; a node created through a lent connection is reached
+        through the server address its row records, which the first reach
+        with that connection lent (add, enrol) writes, so exec, login and
+        enrol reach it with nothing lent. <node> is the node's id, or the label exactly one of
         the agent's nodes carries (node_ambiguous otherwise).
         image: the image's current release, the newest <major>.<minor>.<patch>
         tag its registry holds, read anonymously - the reference alone, or
@@ -18002,7 +18005,8 @@ def _agent_node_target(row):
         if not _NODE_LENT:
             raise NodeFailure("coolify_connection_required", f"node {row['node']} was created "
                               f"through a connection lent for {recorded}; lend it again with "
-                              "--coolify-stdin", 6)
+                              "--coolify-stdin to a verb that takes it, or record its "
+                              "server's address with `node set --address`", 6)
         if _NODE_LENT["url"] != recorded:
             raise NodeFailure("lent_connection_mismatch", f"node {row['node']} was created on "
                               f"{recorded}, not on {_NODE_LENT['url']}", 6)
@@ -18057,13 +18061,16 @@ def _node_server_host(root, target, entry, uuid):
     if not isinstance(address, str) or not re.fullmatch(r"[a-zA-Z0-9.:-]+", address):
         raise NodeFailure("server_address", "Coolify server has no usable SSH address", 6)
     ssh = entry.get("ssh") or {}
-    key_path = ssh.get("key_path")
-    if not key_path:
-        config = _agent_node_run(["ssh", "-G", f"root@{address}"], root).stdout
-        key_path = next((line.split(None, 1)[1] for line in config.splitlines()
-                         if line.startswith("identityfile ") and Path(line.split(None, 1)[1]).expanduser().is_file()), None)
+    key_path = ssh.get("key_path") or _node_ssh_key(root, address)
     return {"uuid": uuid, "address": address, "name": server.get("name"),
             "key_path": key_path, "url": entry.get("base_url"), "connection": target.get("connection")}
+
+
+def _node_ssh_key(root, address):
+    """The identity file this machine's SSH configuration gives root@`address`."""
+    config = _agent_node_run(["ssh", "-G", f"root@{address}"], root).stdout
+    return next((line.split(None, 1)[1] for line in config.splitlines()
+                 if line.startswith("identityfile ") and Path(line.split(None, 1)[1]).expanduser().is_file()), None)
 
 
 def _node_ssh_argv(host, *, tty=False, user="root"):
@@ -18276,10 +18283,26 @@ def _agent_node_reach(root, row, write):
         raise NodeFailure("node_not_coolify", f"node {row.get('node')} is not a Coolify "
                           "resource made by `capabilities node create` or `deployment node "
                           "create --repository`", 6)
+    recorded, address = row.get("coolify_connection"), row.get("address")
+    if _node_lent_address(recorded) and not _NODE_LENT and address:
+        # A node created through a lent connection is reached through the
+        # server address its row records, asking Coolify nothing: the caller
+        # may hold no connection to lend.
+        if not re.fullmatch(r"[a-zA-Z0-9.:-]+", address):
+            raise NodeFailure("server_address", f"node {row['node']} records no usable "
+                              "SSH address", 6)
+        host = {"uuid": row["coolify_server"], "address": address, "name": None,
+                "key_path": _node_ssh_key(root, address), "url": recorded, "connection": None}
+        return {"connection": None}, host, _agent_node_container(root, host, row)
     target = _agent_node_target(row)
     entry = _node_connection(target, write)
     host = _node_server_host(root, target, entry, row["coolify_server"])
-    return target, host, _agent_node_container(root, host, row)
+    container = _agent_node_container(root, host, row)
+    if _NODE_LENT and not address:
+        # The first lent reach records the address, for the reaches with none lent.
+        _agent_node_manager(root, "node", "set", row["node"], "--address", host["address"])
+        row["address"] = host["address"]
+    return target, host, container
 
 
 def _agent_node_container(root, host, row):

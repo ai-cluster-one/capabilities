@@ -158,7 +158,8 @@ class Fake:
                                       "public_key": None}
                 return json.dumps({"node": self.rows[args[2]]})
             if args[:2] == ["node", "set"]:
-                self.rows[args[2]]["public_key"] = args[4]
+                for flag, value in zip(args[3::2], args[4::2]):
+                    self.rows[args[2]][flag[2:].replace("-", "_")] = value
                 return json.dumps({"node": self.rows[args[2]]})
             if args[:2] == ["node", "remove"]:
                 return json.dumps({"removed": self.rows.pop(args[2])})
@@ -1401,6 +1402,31 @@ def test_a_lent_node_takes_the_same_connection_and_a_granted_one_no_lent_one(
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_update(update_args())
     assert refused.value.code == "lent_connection_mismatch"
+
+
+def test_a_lent_node_is_reached_through_the_address_its_first_lent_reach_records(
+        lab, stream, monkeypatch, capsys):
+    lend(lab, monkeypatch)
+    lab.m.cmd_node_add(add_args())
+    capsys.readouterr()
+    assert lab.fake.rows[BOX1]["address"] == "203.0.113.7"
+    # Nothing is lent now, and no coolify connection is granted or asked.
+    lab.m._NODE_LENT.clear()
+    monkeypatch.setattr(lab.m, "_agent_node_records", lambda: pytest.fail("asked for a grant"))
+    lab.fake.calls.clear()
+    _target, host, container = lab.m._agent_node_reach(lab.root, lab.fake.rows[BOX1], write=True)
+    assert (host["address"], container) == ("203.0.113.7", "abc123")
+    ran = []
+    monkeypatch.setattr(lab.m.subprocess, "call", lambda argv, **kw: ran.append(argv) or 0)
+    with pytest.raises(SystemExit) as exited:
+        lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["true"]))
+    assert exited.value.code == 0 and ran[0][-2] == "root@203.0.113.7"
+    assert not lab.fake.of("coolify")
+    # A lent node whose row records no address still needs it lent.
+    lab.fake.rows[BOX1]["address"] = None
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["true"]))
+    assert refused.value.code == "coolify_connection_required"
 
 
 @pytest.mark.parametrize("given", ["", "{}", '{"url": "https://c.invalid"}',
