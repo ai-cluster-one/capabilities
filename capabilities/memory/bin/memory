@@ -4,7 +4,7 @@
 # dependencies = [
 #     "capabilities-contract>=0.33,<1",
 #     "psycopg[binary]>=3.2",
-#     "callva-harness-runner==0.10.1",
+#     "callva-harness-runner==0.10.2",
 # ]
 # ///
 """memory — the project's memory, one entry at a time, in the project's store.

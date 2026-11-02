@@ -9,7 +9,7 @@
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
 #     "capabilities-contract>=0.38,<1",
-#     "callva-harness-runner==0.10.1",
+#     "callva-harness-runner==0.10.2",
 # ]
 # ///
 # callva-harness-runner launches every worker turn - dialogue, durable job,

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "callva-harness-runner==0.10.1",
+#     "callva-harness-runner==0.10.2",
 #     "capabilities-contract>=0.38,<1",
 # ]
 # ///
@@ -57,7 +57,7 @@ import tempfile
 import time
 from pathlib import Path
 
-RUNNER_PIN = "callva-harness-runner==0.10.1"
+RUNNER_PIN = "callva-harness-runner==0.10.2"
 PREFIX = "telegram-"
 BUNDLED = ("telegram-claude", "telegram-codex")
 # The reply gate's profiles, bundled beside the turn's at the same lowest layer.

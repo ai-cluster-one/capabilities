@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
+
+The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning; codex is unchanged. Nothing a turn does changes.
+
 ## 2026-10-31 — `whatsapp help` names the agent's vault in the credential cascade
 
 Bare `whatsapp help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. It also says `whatsapp setup set` stores DEEPGRAM_API_KEY as that section says, where it used to say it writes `~/.config/capabilities/shared.env`. Nothing else changes.

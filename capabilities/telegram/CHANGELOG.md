@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
+
+The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning in the log; codex is unchanged. Nothing a turn does changes.
+
 ## 2026-10-31 — A telegram connection carries its own app
 
 `telegram connection add` of a connection naming no `api_id` or `secret_env` of its own copies the machine's app into it, where the agent's vault takes the hash: the machine's `TELEGRAM_API_ID` becomes its `api_id` and the hash is sealed into the vault under the connection's own `TELEGRAM_<ID>_API_HASH`, which its `secret_env` names, so two connections no longer read one hash from one machine key and the connection signs in the same on a node with no machine file. `telegram connection seal` and `capabilities connections seal` do the same for a connection that still inherits the machine's app, once every agent it is granted to holds the hash. Where no vault takes the hash nothing is copied and the connection inherits the machine's app as before. `Where a secret resolves` now lists the vault first.

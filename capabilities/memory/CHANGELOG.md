@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
+
+The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning; codex is unchanged. Nothing a turn does changes.
+
 ## 2026-10-31 — `memory` carries its own icon
 
 The bundle holds its icon as `icon.png`, a brain: Lucide's `brain` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon memory` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

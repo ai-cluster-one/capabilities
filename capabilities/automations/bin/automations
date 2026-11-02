@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "capabilities-contract>=0.33,<1",
-#     "callva-harness-runner==0.10.1",
+#     "callva-harness-runner==0.10.2",
 # ]
 # ///
 """automations — project-local scheduler and subprocess runner.
