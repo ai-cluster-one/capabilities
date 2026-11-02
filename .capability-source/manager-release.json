@@ -1,6 +1,6 @@
 {
   "assets": {
-    "DOCTRINE.md": "17e385fc446295280245dbe89ba8c9bb832d526f25bd62906052f426a8b94817",
+    "DOCTRINE.md": "21b04ec801bee9ef2b5aa63ea255428ee76015c1c6569376daee5c556438b4be",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
     "SHEBANG.md": "60c949ac3dfb9ae23f9ce14a89e36152da6f680943909400984b93082c7f7a32",
     "SOURCES.md": "2bddcf041b3c4175c36fa64cf26cc1aabf8b2defa0640ced302570f60c6444eb",
@@ -25,7 +25,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "6471e9aed93e56ed8d564d3e2f0c9302c7ae1cd2447a6ba6f7ab7760ee7f1b8c"
+    "sha256": "d66bdf9907be68e77b324a81020016c8ade3dee2564c2f72ec7264f194311e3c"
   },
   "schema": "capabilities.manager-release.v1",
   "store_major": 1

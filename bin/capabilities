@@ -2468,7 +2468,10 @@ VERIFICATION VERBS
         shapes, exercise the gate (enabled / disabled / absent) in a
         sandbox, and check that the script binds the shared code from the
         capabilities-contract library by a range this manager supports
-        (contract-range). Exit 0 pass, 7 failures found.
+        (contract-range), and ask each node or service verb the manager owns
+        that the capability's help names in the manager's own form, read-only,
+        where any answer but exit 6 moved fails (manager-verbs). Exit 0 pass,
+        7 failures found.
   selfcheck
         Prove the repo's own wholeness (the inward companion to audit): the
         enforcer parses, both audit branches (core-only / connection-bearing)
@@ -4106,12 +4109,13 @@ def _snapshot_env() -> dict:
 
 
 def _run_script(script: Path, args: list[str], cwd: Path | None = None,
-                env: dict | None = None, timeout: int = 60) -> tuple[int, str, str]:
+                env: dict | None = None, timeout: int = 60,
+                input: str | None = None) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
             [str(script), *args], capture_output=True, text=True,
             cwd=str(cwd or script.parent), env=env or _snapshot_env(), timeout=timeout,
-            start_new_session=True)
+            start_new_session=True, input=input)
     except subprocess.TimeoutExpired:
         return (124, "", f"timed out after {timeout}s")
     except OSError as e:
@@ -30681,6 +30685,69 @@ def _validate_inventory(name: str, out: str, manifest) -> list[str]:
     return problems
 
 
+# The node and service verbs the manager owns, each with one invocation in the
+# manager's own form (`capabilities help`, node). A capability whose help names
+# `<name> <form>` must answer that invocation with exit 6 `moved`, naming the
+# manager command; one whose help names none of them is not asked. A form of
+# the same words that the manager does not take - `deployment node create
+# --repository`, `deployment node login claude|codex` - is told apart by the
+# capability's answer to the manager's form, never by the words.
+MANAGER_VERB_PROBES = {
+    "node list": ["node", "list"],
+    "node id": ["node", "id"],
+    "node add": ["node", "add", "probe", "--server", "probe"],
+    "node set": ["node", "set", "probe", "--label", "probe"],
+    "node remove": ["node", "remove", "probe", "--yes"],
+    "node image": ["node", "image"],
+    "node create": ["node", "create", "probe", "--project", "probe",
+                    "--server", "probe", "--environment", "probe"],
+    "node enrol": ["node", "enrol", "probe"],
+    "node update": ["node", "update", "probe", "--version", "probe"],
+    "node exec": ["node", "exec", "probe", "--", "true"],
+    "node login": ["node", "login", "probe", "claude", "--events"],
+    "node seen": ["node", "seen"],
+    "node state": ["node", "state"],
+    "node disable": ["node", "disable", "probe"],
+    "node enable": ["node", "enable", "probe"],
+    "node expect": ["node", "expect", "probe", "sign-in", "claude", "on"],
+    "node rekey": ["node", "rekey", "probe", "--dry-run"],
+    "node run": ["node", "run", "--supervisor", "probe"],
+    "node install": ["node", "install"],
+    "node supervise": ["node", "supervise", "--probe"],
+    "handover": ["handover", "--dry-run"],
+}
+
+
+def _manager_verbs_problems(name: str, script: Path, help_text: str,
+                            cwd: Path, env: dict) -> list[str]:
+    """Each manager-owned form the capability's help names, asked in the
+    manager's own form under the read-only switch with nothing on stdin; any
+    answer but exit 6 `moved` declares the verb as the capability's own."""
+    problems: list[str] = []
+    probe_env = {**env, "CAPABILITIES_READ_ONLY": "1"}
+    for form, argv in MANAGER_VERB_PROBES.items():
+        if not re.search(rf"(?<![\w-]){re.escape(name)} {re.escape(form)}(?![\w-])",
+                         help_text):
+            continue
+        rc, out, errs = _run_script(script, argv, cwd=cwd, env=probe_env,
+                                    timeout=30, input="")
+        code = None
+        for line in reversed((errs or "").strip().splitlines()):
+            try:
+                envelope = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(envelope, dict) and isinstance(envelope.get("error"), dict):
+                code = envelope["error"].get("code")
+                break
+        if rc != 6 or code != "moved":
+            problems.append(
+                f"`{name} {form}` is the manager's (`capabilities {form}`): help "
+                f"names it and `{name} {' '.join(argv)}` answered exit {rc}"
+                f"{f' {code}' if code else ''}, not exit 6 moved")
+    return problems
+
+
 def _audit_script(
     name: str, script: Path, manifest_result: list[dict] | None = None
 ) -> list[str]:
@@ -30782,6 +30849,7 @@ def _audit_script(
         failures.append("doctor: scaffold readiness placeholder remains")
 
     rc, out, err = _run_script(script, ["help"], env=env)
+    help_text = out if rc == 0 else ""
     if rc != 0:
         failures.append(f"help: exit {rc}")
     else:
@@ -30909,6 +30977,11 @@ def _audit_script(
                                         cwd=sandbox, env=genv)
             if rc != 0:
                 failures.append(f"ids rm: exit {rc}")
+
+        # The node and service verbs are the manager's (DOCTRINE rule 15): a
+        # capability whose help names one answers it as moved.
+        failures += [f"manager-verbs: {p}" for p in _manager_verbs_problems(
+            name, script, help_text, sandbox, genv)]
 
         # inventory — the project self-report every reader renders the same way
         # (DOCTRINE rule 20). Bare, it costs nothing: the sandbox tree is
@@ -32944,7 +33017,7 @@ def cmd_source_sync(source_id: str) -> None:
 _AUDIT_CHECKS = {
     "contract-range", "stub", "manifest", "help", "gate",
     "refs", "ids", "connections", "connections/core-only", "guide", "doctor",
-    "inventory",
+    "inventory", "manager-verbs",
 }
 
 
