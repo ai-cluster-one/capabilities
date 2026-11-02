@@ -1597,11 +1597,10 @@ PROJECT VERBS (run inside a consuming project)
         `node run` takes up within seconds: {ok, project, agent_id, node,
         requested {id, state, requested_at, requested_by, ...}, store}; exit
         6 update_pending while one is requested or running for that node,
-        which the store holds to one. A request nothing would take up is
-        refused, writing nothing: exit 6 node_cannot_read_store for a node
-        that cannot read the store (as `node state` says it), its hint the
-        command that brings it up, and node_unreachable for a node whose
-        manager has not reported within the last 90 seconds. Without either, this node now: it
+        which the store holds to one. A request for a node that cannot read
+        the store (as `node state` says it) is refused, writing nothing:
+        exit 6 node_cannot_read_store, its hint the command that brings it
+        up. Without either, this node now: it
         takes up the row asked for it, or makes its own, marks it running,
         and runs `capabilities self-update` then `capabilities update`,
         each through the manager the links select then, and asks the doctor
@@ -17667,8 +17666,8 @@ def _node_update_verb(root: Path, args: list[str]) -> None:
                 raise _KernelRefusal("node_disabled", f"node {node} is disabled, so it "
                                      "takes no update", "enable it first: "
                                      f"`capabilities node enable {node}`")
-            # A request is delivered only to a node whose manager reads the
-            # store and reports itself: any other would leave it requested.
+            # A node that cannot read the store would leave the request
+            # requested; a node merely not running takes it up when it starts.
             state = (store.node_states(conn, [node]) or [{}])[0]
             unread = _node_store_unread(row, state, *_store_major_since(
                 conn, conn.execute("SELECT current_schema()").fetchone()[0]))
@@ -17677,17 +17676,6 @@ def _node_update_verb(root: Path, args: list[str]) -> None:
                                      f"node {node} cannot take the request: "
                                      + unread["message"],
                                      f"bring it up first: {unread['command']}")
-            if not state.get("reachable"):
-                raise _KernelRefusal(
-                    "node_unreachable", f"node {node} cannot take the request: its manager "
-                    "has not reported within the last "
-                    f"{store.NODE_STATE_FRESH_SECONDS} seconds (last "
-                    f"{store._stamp(state.get('reported_at')) or 'never'}), so nothing "
-                    "there would take it up",
-                    "bring its node manager up - `capabilities node run` on the node, or "
-                    "restart the node"
-                    + (f" (`{_node_bring_up(row, state.get('image_version'))}`)"
-                       if row.get("coolify_resource") else "") + " - then ask again")
             try:
                 return agent_id, store.node_update_request(conn, node, by=_vault_actor())
             except store.StoreError as exc:

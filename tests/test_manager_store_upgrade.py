@@ -556,10 +556,6 @@ def test_a_node_seen_before_the_crossing_reads_unreachable_and_takes_no_request(
 ) -> None:
     machine.nodes()
     machine.ok("node", "add", NODE_NEW, "--label", "new-node", "--kind", "server")
-    # A node that does not report takes no request, whatever the store's major.
-    code, error = machine.refused("node", "update", "--node", "silent-node")
-    assert (code, error["code"]) == (6, "node_unreachable")
-    assert "capabilities node run" in error["hint"]
     # The core crosses to major 2 the way the upgrade writes it, after the old
     # node last reported; the new node reports after.
     machine.sql("INSERT INTO schema_version (owner, major, minor) VALUES ('core', 2, 0)")
