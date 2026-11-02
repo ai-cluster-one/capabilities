@@ -46,9 +46,16 @@ PURCHASE_VIEW = """
 <div class="text-success card-title">Supplier</div>
 <div class="text-success card-title">x</div>
 <div class="text-success card-title">Tasutud</div>
-<div class="summary-grid"><div>Arve number</div><div>A-1</div></div>
+<div class="summary-grid"><div>Arve number</div><div>A-1</div>
+<div>Viitenumber</div><div>1234 5678</div></div>
 <table><tr><th>Makse</th><th>Katte summa</th></tr>
 <tr><td><a href="/acct/payments/view/77">77</a></td><td>19,76</td></tr></table>
+"""
+
+PURCHASE_EDIT = """
+<input name="data[Purchase][number]" value="A-1">
+<input name="data[Purchase][reference]" value="1234 5678">
+<textarea name="data[Purchase][payment_description]">invoice A-1</textarea>
 """
 
 INVOICE_COPY = """
@@ -94,14 +101,24 @@ class MoneyShowTests(_Case):
         self.assertEqual(rec["client_id"], "12")
         self.assertEqual(rec["fields"]["Summa"], "150,00")
         self.assertEqual(rec["bound"], [
-            {"document": "invoice", "id": 301, "amount": "100,00"},
-            {"document": "invoice", "id": 302, "amount": "50,00"},
+            {"document": "invoice", "id": 301, "amount": "100,00",
+             "columns": {"Arve": "301", "Kuupäev": "01.02.2026", "Katte summa": "100,00"}},
+            {"document": "invoice", "id": 302, "amount": "50,00",
+             "columns": {"Arve": "302", "Kuupäev": "01.02.2026", "Katte summa": "50,00"}},
         ])
 
     def test_payment_show_returns_bound_purchases(self) -> None:
         rec = json.loads(self.run_cli("payments", "show", "8", "--json"))
         self.assertEqual([b["id"] for b in rec["bound"]], [301, 302])
         self.assertEqual(rec["bound"][0]["document"], "purchase")
+
+    def test_unlabelled_and_repeated_headers_keep_every_cell(self) -> None:
+        html = ('<table><tr><th>Arve</th><th></th><th>Arve</th></tr>'
+                '<tr><td><a href="/acct/invoices/view/5">5</a></td><td>x</td>'
+                '<td>y</td></tr></table>')
+        rows = simplbooks._parse_bound_rows(html, "invoices")
+        self.assertEqual(rows[5]["columns"], {"Arve": "5", "column 2": "x", "Arve 3": "y"})
+        self.assertEqual(simplbooks._parse_bound_docs(html, "invoices"), {5: ""})
 
 
 class InvoiceReferenceTests(_Case):
@@ -130,6 +147,24 @@ class PurchaseViewTests(_Case):
         self.assertEqual(out["status"], "Tasutud")
         self.assertEqual(out["bindings"], [{"kind": "payment", "id": 77, "amount": "19,76"}])
         self.assertNotIn("payment-locked", out["source"])
+        self.assertEqual(out["fields"]["Viitenumber"], "1234 5678")
+
+
+class PurchaseEditTests(_Case):
+    def test_edit_form_read_carries_reference_and_bindings(self) -> None:
+        self.pages = {"/purchases/edit/42": httpx.Response(200, text=PURCHASE_EDIT),
+                      "/purchases/view/42": httpx.Response(200, text=PURCHASE_VIEW)}
+        out = json.loads(self.run_cli("purchases", "show", "42", "--json"))
+        self.assertEqual(out["number"], "A-1")
+        self.assertEqual(out["reference"], "1234 5678")
+        self.assertEqual(out["payment_description"], "invoice A-1")
+        self.assertEqual(out["bindings"], [{"kind": "payment", "id": 77, "amount": "19,76"}])
+
+    def test_unreadable_view_page_leaves_bindings_unknown(self) -> None:
+        self.pages = {"/purchases/edit/42": httpx.Response(200, text=PURCHASE_EDIT)}
+        out = json.loads(self.run_cli("purchases", "show", "42", "--json"))
+        self.assertIsNone(out["bindings"])
+        self.assertEqual(out["reference"], "1234 5678")
 
 
 if __name__ == "__main__":

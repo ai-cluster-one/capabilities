@@ -1,5 +1,9 @@
 # simplbooks — change log
 
+## 2026-11-02 — `simplbooks` reads back every column of a binding and a purchase's reference
+
+`simplbooks payments show <id> --json` and `simplbooks incomings show <id> --json` give each `bound` row a `columns` object: every cell of that row of the bound-documents table under the page's own header label, with an unlabelled or repeated header keyed by its position. `simplbooks purchases show <id>` read from the edit form also returns the saved reference number (`reference`), the payment description (`payment_description`) and the payments and incomings bound to the purchase (`bindings`, read from its view page; `null` when that page cannot be read). The view-page read (`--view`, or a payment-locked purchase) returns every label/value pair the page shows as `fields`. Every existing key keeps its name and value.
+
 ## 2026-11-01 — `simplbooks` never posts a payment or incoming with a negative or zero amount
 
 `simplbooks bank-transactions save <id> --as payment --sum <amount>` drops a minus that matches the row's own outflow and posts the amount unsigned, and refuses with exit 6 a zero sum or a minus on an inflow row. `simplbooks payments create` and `simplbooks incomings create` refuse a `--sum` of zero or below with exit 6 before anything is sent. A positive `--sum`, an omitted one, `--as incoming` and `--as kanne` behave as before.

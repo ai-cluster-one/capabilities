@@ -4917,6 +4917,7 @@ def _purchases_show_view(html: str, as_json: bool, account: str,
         "attachments": attachments,
         "attachments_readable": attachments_surface,
         "bindings": _purchase_bound_money(html),
+        "fields": pairs,
         "source": ("view page (payment-locked; row account/vat-type ids not exposed)"
                    if locked else "view page (row account/vat-type ids not exposed)"),
     }
@@ -4965,8 +4966,11 @@ def purchases_show(expense_id: int, from_view: bool, as_json: bool) -> None:
     row's account and vat-type ids. A payment-bound invoice is locked out of
     editing (SB redirects to its view page), so it is read from the rendered
     view instead — same header data, but rows expose display values only.
-    --view reads that rendered view for any purchase: its status and the
-    payments/incomings bound to it.
+    The edit-form read also carries the saved reference number and payment
+    description, and the payments/incomings bound to it from the view page.
+    --view reads that rendered view for any purchase: its status, every
+    label/value pair it shows (`fields`), and the payments/incomings bound
+    to it.
     """
     cookies, account = session_or_die()
     with build_http(cookies, account) as http:
@@ -4996,6 +5000,8 @@ def purchases_show(expense_id: int, from_view: bool, as_json: bool) -> None:
             raise click.ClickException(f"HTTP {r.status_code}")
         edit_html = r.text
         soup = BeautifulSoup(edit_html, "html.parser")
+        rv = http.get(f"{BASE}/{account}/purchases/view/{expense_id}")
+        bindings = _purchase_bound_money(rv.text) if rv.status_code == 200 else None
 
     def field(name: str) -> str:
         inp = soup.find("input", {"name": name})
@@ -5027,8 +5033,11 @@ def purchases_show(expense_id: int, from_view: bool, as_json: bool) -> None:
         "currency": field("data[Purchase][currency_name]"),
         "vat_total": field("data[Purchase][vat]"),
         "row_sum_with_vat": field("data[Purchase][row_sum_with_vat]"),
+        "reference": field("data[Purchase][reference]"),
+        "payment_description": field("data[Purchase][payment_description]"),
         "attachments": attachments,
         "attachments_readable": attachments_surface,
+        "bindings": bindings,
     }
 
     rows: list[dict] = []
@@ -5060,6 +5069,7 @@ def purchases_show(expense_id: int, from_view: bool, as_json: bool) -> None:
     click.echo(f"Number   : {info['number']}   (internal: {info['internal_number']})")
     click.echo(f"Dates    : created {info['created']}  txn {info['transaction_date']}  due {info['due']}")
     click.echo(f"VAT tot  : {info['vat_total']} {info['currency']}  (row_sum_with_vat={info['row_sum_with_vat']})")
+    click.echo(f"Ref no   : {info['reference'] or '(none)'}   Pay desc : {info['payment_description'] or '(none)'}")
     click.echo()
     click.secho(f"{'#':<3} {'NAME':<40} {'VAT_T':<6} {'VAT%':<5} {'AMT':>6} {'SUM':>14} ACCT", bold=True)
     for i, r in enumerate(rows, 1):
@@ -5069,6 +5079,14 @@ def purchases_show(expense_id: int, from_view: bool, as_json: bool) -> None:
         )
     click.echo()
     _echo_attachment_line(attachments, attachments_surface)
+    if bindings is None:
+        click.echo("Bound    : (unknown — view page unreadable)")
+    elif bindings:
+        click.echo("Bound    : " + ", ".join(
+            f"{b['kind']} {b['id']}" + (f" ({b['amount']})" if b["amount"] else "")
+            for b in bindings))
+    else:
+        click.echo("Bound    : (none)")
 
 
 def _filename_from_response(r: httpx.Response, fallback: str) -> str:
@@ -7045,9 +7063,17 @@ def _parse_bound_docs(html: str, doc_path: str) -> dict[int, str]:
     Returns {document id: 'Katte summa' cell text} for each row linking to
     /<doc_path>/view/<id> ('' if the column isn't found).
     """
+    return {doc: row["amount"] for doc, row in _parse_bound_rows(html, doc_path).items()}
+
+
+def _parse_bound_rows(html: str, doc_path: str) -> dict[int, dict]:
+    """Each bound-documents row linking to /<doc_path>/view/<id> →
+    {"amount": its 'Katte summa' cell, "columns": every header → cell text,
+    under the page's own header labels; an unlabelled or repeated header is
+    keyed by its 1-based position}."""
     soup = BeautifulSoup(html, "html.parser")
     href_re = re.compile(rf"/{doc_path}/view/(\d+)")
-    out: dict[int, str] = {}
+    out: dict[int, dict] = {}
     for a in soup.find_all("a", href=href_re):
         row = a.find_parent("tr")
         table = a.find_parent("table")
@@ -7061,7 +7087,13 @@ def _parse_bound_docs(html: str, doc_path: str) -> dict[int, str]:
             idx = headers.index("Katte summa")
             if idx < len(tds):
                 katte = tds[idx].get_text(strip=True).replace("\xa0", " ")
-        out[doc_id] = katte
+        columns: dict[str, str] = {}
+        for i, td in enumerate(tds):
+            label = headers[i] if i < len(headers) else ""
+            if not label or label in columns:
+                label = f"{label or 'column'} {i + 1}"
+            columns[label] = td.get_text(" ", strip=True).replace("\xa0", " ")
+        out[doc_id] = {"amount": katte, "columns": columns}
     return out
 
 
@@ -7147,7 +7179,8 @@ def _money_view(html: str, money_id: int, doc_path: str) -> dict:
     """A payment/incoming view page → its record and bound documents.
 
     `fields` keeps the page's own label → value pairs; `bound` is each
-    /<doc_path>/view/<id> row with its 'Katte summa' amount."""
+    /<doc_path>/view/<id> row with its 'Katte summa' amount and `columns`,
+    every cell of that row under its table header."""
     soup = BeautifulSoup(html, "html.parser")
     fields: dict[str, str] = {}
     for grid in soup.select("div.summary-grid"):
@@ -7156,13 +7189,14 @@ def _money_view(html: str, money_id: int, doc_path: str) -> dict:
             fields.setdefault(lab, val)
     link = soup.find("a", href=re.compile(r"/clients/view/(\d+)"))
     client_id = re.search(r"/clients/view/(\d+)", link["href"]).group(1) if link else ""
-    bound = _parse_bound_docs(html, doc_path)
+    bound = _parse_bound_rows(html, doc_path)
     return {
         "id": money_id,
         "client_id": client_id,
         "fields": fields,
-        "bound": [{"document": doc_path[:-1], "id": doc, "amount": amount}
-                  for doc, amount in bound.items()],
+        "bound": [{"document": doc_path[:-1], "id": doc, "amount": row["amount"],
+                   "columns": row["columns"]}
+                  for doc, row in bound.items()],
     }
 
 
