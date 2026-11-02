@@ -13917,14 +13917,15 @@ SUPERVISE_PROBE_EXIT_CODES = {2: "auth", 3: "not_found", 4: "policy", 5: "unreac
 SUPERVISE_ERROR_CHARS = 2000
 SUPERVISE_SCHEMA = "capabilities.deployment.runner.v1"
 SUPERVISE_UNLOCKED = object()
-# The lease table keeps the name and the migration ledger entry deployment gave
-# it when its runner held the leases, so a store either side made reads alike:
-# the first two steps are the ones deployment applied, byte for byte, which the
-# ledger's checksum holds to, and which deployment's runner still applies where
-# it supervises a service itself under a manager too old to. The instance rows
-# carry what a failing service said, so nothing here reads or writes the
-# lease's last_error any more; the column stays, since a released manager still
-# on another node, and that runner, name it.
+# The lease table's migration is the manager's alone. The table keeps the name
+# and the migration ledger entry deployment gave it when its runner held the
+# leases, since the ledger lets only that owner make a deployment_* table, and
+# released managers, deployment's runner and the apps reading the store name
+# it: the first two steps are the ones deployment applied, byte for byte, which
+# the ledger's checksum holds to. Deployment declares and applies none. The
+# instance rows carry what a failing service said, so nothing here reads or
+# writes the lease's last_error any more; the column stays, since a released
+# manager still on another node, and that runner, name it.
 SUPERVISE_LEASE_OWNER = "deployment"
 SUPERVISE_LEASE_VERSION = (1, 1)
 SUPERVISE_LEASE_STEPS = [

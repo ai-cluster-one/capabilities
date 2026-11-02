@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-02 — the service lease table's migration is the manager's alone
+
+`deployment_service_leases` is made and migrated only by the capabilities manager's `node supervise`, under the ledger entry `deployment` gave it, with the same two steps, so a store either made reads alike. deployment no longer declares tables: its manifest answers `tables: false`, `deployment migrate [status]` is gone, and installing or updating deployment migrates nothing. The runner an older launcher still starts under a manager too old to take its service makes no table and uses the one the store holds; `deployment services` and `node status` read the lease as before.
+
 ## 2026-11-02 — `node login` takes a connection bound by its identity as bound
 
 `deployment node login <node> <capability>` refused a connection bound by its identity with `connection_unbound` whenever another node held a session for it, because it looked only for `expected_account_id` among the entry's `keys` in `<capability> connections --json`, where telegram reports no such key and whatsapp reports it unset for a connection bound with `--identity` or by its sign-in. The contract reports who a connection is as the entry's `identity`; node login now takes a connection as bound when its `identity` names an account or, as before, when its `expected_account_id` key is set, and runs the ceremony. A connection with neither is still refused `connection_unbound` with the bind command. The tests read `connections --json` captured from telegram and whatsapp instead of a hand-written entry.

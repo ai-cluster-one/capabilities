@@ -50,15 +50,24 @@ def _literal(path: Path, name: str):
 
 
 class LeaseStepsTests(unittest.TestCase):
-    def test_the_supervisor_makes_the_lease_table_with_deployments_own_steps(self):
-        # The manager's supervisor makes deployment_service_leases under
-        # deployment's ledger entry, which refuses a step whose SQL changed.
-        deployment = REPO / "capabilities" / "deployment" / "bin" / "deployment"
-        self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_STEPS"),
-                         _literal(deployment, "LEASE_STEPS"))
-        self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_VERSION"),
-                         (_literal(deployment, "LEASE_MAJOR"),
-                          _literal(deployment, "LEASE_MINOR")))
+    def test_the_manager_alone_makes_the_lease_table_with_the_steps_stores_hold(self):
+        # The manager's supervisor makes deployment_service_leases under the
+        # ledger entry deployment gave it, which refuses a step whose SQL
+        # changed, so each step keeps the checksum stores already hold; and
+        # deployment declares and applies none of it.
+        import hashlib
+        steps = _literal(MANAGER, "SUPERVISE_LEASE_STEPS")
+        self.assertEqual(
+            [(step, hashlib.sha256(sql.encode("utf-8")).hexdigest()) for step, sql in steps],
+            [("0001-service-leases",
+              "fa19c921e39a42a9070e78efabe9d05de191cf41acfc113a000f84a575d72d7b"),
+             ("0002-service-lease-errors",
+              "c2b45f216e881d2140b3d1f4d41a2bca31513e52f6efe0ec86463c5aa0fff16c")])
+        self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_OWNER"), "deployment")
+        self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_VERSION"), (1, 1))
+        deployment = (REPO / "capabilities" / "deployment" / "bin" / "deployment").read_text()
+        for name in ("TABLES", "LEASE_STEPS", "_tables"):
+            self.assertNotRegex(deployment, rf"(?m)^(def )?{name}\b")
 
 
 if __name__ == "__main__":

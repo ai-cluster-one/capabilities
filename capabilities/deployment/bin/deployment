@@ -551,7 +551,6 @@ Contract commands:
   deployment stub
   deployment manifest --json
   deployment guide [agent-node|bootstrap|profiles|standard|targets]
-  deployment migrate [status]
   deployment connections
   deployment ids list|get <label>|set <label> <value>|rm <label> [--note <text>]
   deployment refs
@@ -626,7 +625,7 @@ EXIT CODES
   0 success
   3 not found (no project, no runtime, unknown target)
   4 project policy refused this capability
-  5 the store cannot be reached (migrate)
+  5 the store cannot be reached
   6 malformed input, validation failure, or init conflict
   7 deployment sync --check drift
 """
@@ -662,7 +661,6 @@ WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/deployment/guides/")
 STATE = True        # each service supervisor's record under capabilities/deployment/state/
-TABLES = True       # deployment_service_leases in the project's store, built by _tables()
 INVENTORY = {"network": "none"}   # the declarations are files in this project
 POST_INSTALL: list = []
 
@@ -5175,41 +5173,14 @@ def _hand_over_agent(agent: dict, aside_dir: Path, dry_run: bool) -> dict:
 # a record of what it runs under this capability's state, where `deployment
 # services` reads it. The supervision below is what `deployment runner` does
 # itself, as an older deployment's launcher asks, where the manager is too old
-# to take the service; it goes once no machine runs a manager that old.
+# to take the service; it goes once no machine runs a manager that old. The
+# lease table's migration is the manager's alone, under the ledger entry
+# deployment gave it: this runner makes no table and uses the one the store
+# holds.
 
-LEASE_STEPS = [
-    ("0001-service-leases",
-     "CREATE TABLE deployment_service_leases ("
-     " project text NOT NULL,"
-     " capability text NOT NULL,"
-     " node text NOT NULL CHECK (node <> ''),"
-     " acquired_at timestamptz NOT NULL DEFAULT now(),"
-     " renewed_at timestamptz NOT NULL DEFAULT now(),"
-     " expires_at timestamptz NOT NULL,"
-     " PRIMARY KEY (project, capability))"),
-    ("0002-service-lease-errors",
-     "ALTER TABLE deployment_service_leases"
-     " ADD COLUMN last_exit integer,"
-     " ADD COLUMN last_error text,"
-     " ADD COLUMN last_error_at timestamptz;"
-     " COMMENT ON COLUMN deployment_service_leases.last_exit IS"
-     " 'the exit code the service last failed with on the holding node; null when it"
-     " could not be started at all';"
-     " COMMENT ON COLUMN deployment_service_leases.last_error IS"
-     " 'the last lines the service printed to stderr when it last failed, or why it"
-     " could not be started; cleared when another node takes the lease';"
-     " COMMENT ON COLUMN deployment_service_leases.last_error_at IS"
-     " 'when the service last failed on the holding node'"),
-]
-LEASE_MAJOR, LEASE_MINOR = 1, 1
 LEASE_ERROR_CHARS = 2000
 RUNNER_SCHEMA = "capabilities.deployment.runner.v1"
 RUNNER_UNLOCKED = object()
-
-
-def _tables():
-    """The steps and version of deployment's tables, for the contract's `migrate`."""
-    return LEASE_STEPS, LEASE_MAJOR, LEASE_MINOR
 
 
 def _now_iso() -> str:
@@ -5381,8 +5352,7 @@ class _Lease(_StoreTurns):
         self.maybe_held = True
 
     def _migrate(self, conn, db) -> None:
-        steps, major, minor = _tables()
-        db.migrate(conn, NAME, steps, major=major, minor=minor)
+        pass
 
     @staticmethod
     def _holding(row, node: str) -> dict:
