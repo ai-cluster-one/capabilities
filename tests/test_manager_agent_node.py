@@ -720,6 +720,11 @@ def signin(lab, monkeypatch, tmp_path):
         return lab.node_run(argv, root, **kw)
 
     monkeypatch.setattr(lab.m, "_agent_node_run", run)
+
+    def unread(root):
+        raise lab.m._db_module().DbError("store_not_configured", "fixture", "")
+
+    monkeypatch.setattr(lab.m._db_module(), "resolve_setting", unread)
     lab.m._EVENTS_ON[0] = True
     yield SimpleNamespace(tool=tool, sessions=sessions, dir=tmp_path)
     lab.m._EVENTS_ON[0] = False
@@ -743,11 +748,14 @@ def test_login_on_a_node_speaks_the_tools_link_code_and_wait_as_events(lab, sign
     lab.m.cmd_node_login(login_args("gh"))
     out = capfd.readouterr()
     said = events(out.out)
-    assert [e["event"] for e in said] == ["link", "code", "waiting", "done"]
+    assert [e["event"] for e in said] == ["link", "code", "waiting", "checking", "done"]
     assert said[0] == {"event": "link", "node": BOX1, "tool": "gh",
                        "url": "https://github.com/login/device"}
     assert said[1]["code"] == "AB12-CD34"
-    assert said[3]["result"] == {"ok": True, "node": BOX1, "tool": "gh"}
+    assert said[3] == {"event": "checking", "node": BOX1, "tool": "gh"}
+    # A store that cannot be read leaves the row unsaid.
+    assert said[4]["result"] == {"ok": True, "node": BOX1, "tool": "gh", "sign_in": None,
+                                 "account": None, "checked_at": None}
     assert (signin.dir / "gh-argv").read_text().split() == [
         "auth", "login", "--hostname", "github.com", "--git-protocol", "https", "--web",
         "--skip-ssh-key"]
@@ -765,9 +773,62 @@ def test_claude_asks_for_the_code_back_and_gets_the_line_on_stdin(lab, signin, c
     monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO("abc#def\n"))
     lab.m.cmd_node_login(login_args("claude"))
     said = events(capfd.readouterr().out)
-    assert [e["event"] for e in said] == ["link", "code_needed", "waiting", "done"]
+    assert [e["event"] for e in said] == ["link", "code_needed", "waiting", "checking", "done"]
     assert said[0]["url"] == "https://claude.example/oauth?code=true&state=s"
     assert (signin.dir / "pasted").read_text() == "abc#def\n"
+
+
+def test_a_sign_in_ends_once_the_nodes_own_row_says_signed_in(lab, monkeypatch):
+    """After the tool's sign-in ends well, login asks the node to read its
+    sign-ins now and answers only once the row the node writes says signed
+    in, newer than before it asked."""
+    from datetime import datetime, timedelta, timezone
+    m = lab.m
+    old = datetime(2026, 11, 2, 20, 0, tzinfo=timezone.utc)
+    rows = iter([
+        {"node": BOX1, "gh_login": "signed_out", "gh_account": None, "checked_at": old},
+        # The probe that was under way when the sign-in ended.
+        {"node": BOX1, "gh_login": "signed_out", "gh_account": None, "checked_at": old},
+        {"node": BOX1, "gh_login": "signed_out", "gh_account": None,
+         "checked_at": old + timedelta(seconds=20)},
+        {"node": BOX1, "gh_login": "signed_in", "gh_account": "octocat",
+         "checked_at": old + timedelta(seconds=21)},
+    ])
+    asked = []
+
+    class Conn:
+        def transaction(self):
+            import contextlib
+            return contextlib.nullcontext()
+
+        def close(self):
+            asked.append("closed")
+
+    monkeypatch.setattr(m._db_module(), "resolve_setting", lambda root: "setting")
+    monkeypatch.setattr(m._db_module(), "connect", lambda **kw: Conn())
+    monkeypatch.setattr(m._store_module(), "node_logins",
+                        lambda conn, agent_id, nodes: [next(rows)])
+    monkeypatch.setattr(m, "_folder_agent_id", lambda root: "prj_00000000a1a1")
+    monkeypatch.setattr(m, "_announce",
+                        lambda root, channel, scope: asked.append((channel, scope)) or True)
+    said = m._node_login_confirmed(lab.root, BOX1, "gh")
+    assert asked == [("capabilities_node_probe", BOX1), "closed"]
+    assert said == {"sign_in": "signed_in", "account": "octocat",
+                    "checked_at": m._store_module()._stamp(old + timedelta(seconds=21))}
+
+
+def test_a_sign_in_the_row_never_confirms_ends_with_what_the_row_says(lab, monkeypatch):
+    m = lab.m
+    monkeypatch.setattr(m._db_module(), "resolve_setting", lambda root: "setting")
+    monkeypatch.setattr(m._db_module(), "connect", lambda **kw: SimpleNamespace(
+        transaction=lambda: __import__("contextlib").nullcontext(), close=lambda: None))
+    monkeypatch.setattr(m._store_module(), "node_logins", lambda conn, agent_id, nodes: [])
+    monkeypatch.setattr(m, "_folder_agent_id", lambda root: "prj_00000000a1a1")
+    monkeypatch.setattr(m, "_announce", lambda root, channel, scope: False)
+    clock = iter(range(0, 10_000, 30))
+    monkeypatch.setattr(m.time, "monotonic", lambda: next(clock))
+    assert m._node_login_confirmed(lab.root, BOX1, "claude") == {
+        "sign_in": None, "account": None, "checked_at": None}
 
 
 def test_a_sign_in_that_fails_says_why_with_the_tools_exit_code(lab, signin, capfd):
@@ -1201,6 +1262,52 @@ def test_add_takes_a_node_from_nothing_to_raised_and_says_each_step(lab, stream,
     assert result["project"] == {"uuid": "prj-made", "name": "lab-agent"}
     assert result["placed"] == ["tasks"] and result["resource"] == "svc-new"
     assert "bot-secret" not in said
+
+
+def test_raised_says_what_the_node_is_doing_each_time_its_line_changes(lab, stream, capsys,
+                                                                       monkeypatch):
+    m = lab.m
+    lines = iter([
+        "idle: waiting for store-setting",
+        "raising agent prj_00000000a1a1",
+        "raising agent prj_00000000a1a1: bringing its capabilities to the catalogue: 1 of 3 "
+        "(assets)",
+        "raising agent prj_00000000a1a1: bringing its capabilities to the catalogue: 1 of 3 "
+        "(assets)",
+        "raising agent prj_00000000a1a1: bringing its capabilities to the catalogue: 3 of 3 "
+        "(telegram)",
+        "raising agent prj_00000000a1a1: composing its context",
+        "running agent prj_00000000a1a1 as node box1",
+    ])
+    exec_ = m._agent_node_exec
+
+    def node_exec(root, host, container, argv, **kw):
+        if argv == ["cat", m.AGENT_NODE_STATE]:
+            return next(lines)
+        return exec_(root, host, container, argv, **kw)
+
+    monkeypatch.setattr(m, "_agent_node_exec", node_exec)
+    m.cmd_node_add(add_args(wait=600))
+    said = events(capsys.readouterr().out)
+    progress = [e for e in said if e["event"] == "progress"]
+    doing = "raising agent prj_00000000a1a1: bringing its capabilities to the catalogue"
+    assert [{k: v for k, v in e.items() if k not in ("event", "state")} for e in progress] == [
+        {"step": "raised", "node": BOX1, "doing": "idle: waiting for store-setting"},
+        {"step": "raised", "node": BOX1, "doing": "raising agent prj_00000000a1a1"},
+        {"step": "raised", "node": BOX1, "doing": doing, "done": 1, "total": 3,
+         "item": "assets"},
+        {"step": "raised", "node": BOX1, "doing": doing, "done": 3, "total": 3,
+         "item": "telegram"},
+        {"step": "raised", "node": BOX1, "doing": "raising agent prj_00000000a1a1: "
+                                                  "composing its context"},
+        {"step": "raised", "node": BOX1,
+         "doing": "running agent prj_00000000a1a1 as node box1"}]
+    assert progress[2]["state"] == doing + ": 1 of 3 (assets)"
+    # Each is said inside raised, between its start and its end.
+    names = [(e["event"], e.get("step"), e.get("state")) for e in said]
+    start = names.index(("step", "raised", "started"))
+    end = names.index(("step", "raised", "done"))
+    assert all(start < said.index(e) < end for e in progress)
 
 
 def test_add_makes_the_environment_a_given_project_lacks(lab, stream, capsys):

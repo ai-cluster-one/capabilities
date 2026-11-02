@@ -1887,6 +1887,50 @@ def test_a_slow_probe_does_not_hold_back_the_state_beat_on_a_mac(lab, tmp_path):
     assert node_run.returncode == 0, err
 
 
+def test_node_run_asks_the_tools_at_once_when_a_sign_in_asks_it(lab, tmp_path):
+    """A sign-in that ended well raises the probe channel for its node: node
+    run asks the tools then rather than at its next probe, a minute on, and
+    writes what they answer, so the row says signed in within seconds."""
+    here = _service_lab(lab)
+    bin_dir, _calls, _loaded = _stand_in_launchctl(lab, tmp_path)
+    signed = tmp_path / "signed-in"
+    (bin_dir / "claude").write_text(
+        f'#!/bin/sh\nif [ -f "{signed}" ]; then '
+        """echo '{"loggedIn": true, "email": "someone@example.com"}'; """
+        """else echo '{"loggedIn": false}'; fi\n""")
+    (bin_dir / "codex").write_text("#!/bin/sh\necho 'Not logged in'\n")
+    (bin_dir / "gh").write_text("#!/bin/sh\necho '{\"hosts\": {}}'\n")
+    for tool in ("claude", "codex", "gh"):
+        (bin_dir / tool).chmod(0o755)
+    env = {**lab["env"], **here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+
+    def claude():
+        found = _rows(lab, "SELECT claude_login, claude_account FROM capabilities_node_logins "
+                           f"WHERE node = '{NODE}'")
+        return found[0] if found else None
+
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--launchd", "--every", "300"],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(lambda: claude() == ("signed_out", None), 20)
+        # The node follows its channels once it has read the store.
+        import time
+        time.sleep(3)
+        signed.write_text("")
+        # What `node login` raises once a sign-in ended well (db.announce).
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("INSERT INTO lab.schema_channel AS c (channel, scope, version) "
+                         "VALUES ('capabilities_node_probe', %s, 1) ON CONFLICT (channel, "
+                         "scope) DO UPDATE SET version = c.version + 1", (NODE,))
+            conn.execute("SELECT pg_notify('capabilities_node_probe', %s)", (NODE,))
+        assert _wait_for(lambda: claude() == ("signed_in", "someone@example.com"), 15)
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+
+
 def test_node_run_restarts_onto_the_manager_on_path_once_it_is_another_release(
         lab, tmp_path):
     """The manager on PATH moving to another release by any route - not only

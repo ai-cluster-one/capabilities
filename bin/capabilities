@@ -1446,6 +1446,13 @@ PROJECT VERBS (run inside a consuming project)
         exits 6 node_exists before anything is written. With --events each
         step is a JSON line on stdout, step {step, state started|done|failed,
         check | error}, ending in done {result} or error {exit, error}.
+        Inside raised (enrol and add), each time the line the node writes of
+        what it is doing (/tmp/agent-node.state, read every 5 seconds)
+        changes: progress {step, node, state, doing}, state the line as it
+        reads, doing what the node is doing now; where the line ends in a
+        count, `<doing>: <done> of <total> (<item>)` as the boot path writes
+        it while it brings capabilities to the catalogue, also done, total
+        and item.
         update <node> --version: writes the node's Coolify service the whole
         Compose document create writes, with the new tag and --memory (else
         the limit its container runs with), and redeploys it with its volumes
@@ -1470,8 +1477,12 @@ PROJECT VERBS (run inside a consuming project)
         login <node> <tool> --events: the tool's own headless sign-in on the
         node (`claude auth login`, `codex login --device-auth`, `gh auth login
         --web`), spoken as JSON lines: link {url}, code {code}, code_needed
-        (one line answers it on stdin), waiting, then done {result {ok, node,
-        tool}} or error {exit, error} - login_failed, input_closed,
+        (one line answers it on stdin), waiting, and once the tool's sign-in
+        ended well checking {node, tool} while the node is asked to read its
+        sign-ins now, then done {result {ok, node, tool, sign_in, account,
+        checked_at}} once the node's own sign-in row (node state) says
+        signed_in, or after 90 seconds with sign_in as the row says it (null
+        where there is none); or error {exit, error} - login_failed, input_closed,
         node_unreachable (255), cancelled (6) on SIGTERM, SIGINT or SIGHUP,
         which stops the tool on the node. A device-bound capability's
         connection (telegram, whatsapp) signs in as a new device through its
@@ -12773,6 +12784,9 @@ NODE_RUN_BOUNDS = (5, 3600)
 NODE_RUN_FOLLOW_SECONDS = 2.0
 NODE_PLACEMENT_CHANNEL = "capabilities_placement"
 NODE_RESTART_CHANNEL = "capabilities_service_restart"
+# A request that a node ask its tools' sign-ins now rather than at its next
+# probe, scoped by the node's id: `node login` raises it once a sign-in ends.
+NODE_PROBE_CHANNEL = "capabilities_node_probe"
 NODE_JOB_MARK = "; written by `capabilities node run`, which rewrites or removes it\n"
 NODE_JOB_STOP_SECONDS = 30
 # On a Mac each job is a launchd agent of this OS user, and the node manager
@@ -13443,6 +13457,7 @@ class _NodeManager:
         self.state_due = 0.0
         self.probe_due = 0.0
         self.probe: tuple | None = None
+        self.probe_asked = False
         self.logins: dict | None = None
         self.sessions: dict | None = None
         # What each agent's placed services need signed in here, asked with
@@ -13765,7 +13780,7 @@ class _NodeManager:
             | {(NODE_RESTART_CHANNEL, f"{agent_id}/{job['capability']}/{self.here}")
                for job in self.jobs.values()
                for agent_id in (job.get("agents") or [job["agent_id"]])}
-            | {(NODE_UPDATE_CHANNEL, self.here)}))
+            | {(NODE_UPDATE_CHANNEL, self.here), (NODE_PROBE_CHANNEL, self.here)}))
         if keys == self.follow_keys or not keys:
             return
         db = self.db
@@ -13795,6 +13810,10 @@ class _NodeManager:
         placement = any(channel == NODE_PLACEMENT_CHANNEL for channel, _scope in moved)
         if any(channel == NODE_UPDATE_CHANNEL for channel, _scope in moved):
             self.update_asked = True
+        # A probe already under way may have asked before the sign-in it is
+        # asked for ended, so the asked one starts after it.
+        if any(channel == NODE_PROBE_CHANNEL for channel, _scope in moved):
+            self.probe_asked = True
         restarts = []
         for channel, scope in moved:
             if channel != NODE_RESTART_CHANNEL:
@@ -13859,7 +13878,8 @@ class _NodeManager:
         self.state_due = now + NODE_STATE_BEAT_SECONDS
         self.moved = False
         self.take_probe()
-        if self.probe is None and now >= self.probe_due:
+        if self.probe is None and (now >= self.probe_due or self.probe_asked):
+            self.probe_asked = False
             self.start_probe()
         try:
             conn = self._connect()
@@ -14092,7 +14112,8 @@ class _NodeManager:
             self.follow_release(stopping)
             if self.disabled:
                 self.moved = False
-            elif self.moved or self.probed() or time.monotonic() >= self.state_due:
+            elif (self.moved or self.probed() or (self.probe_asked and self.probe is None)
+                  or time.monotonic() >= self.state_due):
                 self.report_state()
             deadline = time.monotonic() + NODE_RUN_FOLLOW_SECONDS
             while not stopping["now"] and time.monotonic() < deadline:
@@ -18110,6 +18131,11 @@ AGENT_NODE_VOLUMES = (("config", "/home/agent/.config"),
 # Under the node user's home, on its config volume.
 AGENT_NODE_KEY = ".config/agent-node/node-key.pem"
 AGENT_NODE_STATE = "/tmp/agent-node.state"
+# How often `raised` reads that line, and the count the boot path ends it in
+# while it works through a list: `<doing>: <done> of <total> (<item>)`.
+AGENT_NODE_STATE_POLL_SECONDS = 5
+AGENT_NODE_STATE_COUNT = re.compile(r"(?P<doing>.*?): (?P<done>\d+) of (?P<total>\d+)"
+                                    r"(?: \((?P<item>[^()]*)\))?")
 AGENT_NODE_VERSION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
 # The standard image's current release is the newest version its registry
 # holds: a release publishes ghcr.io/agenium-dev/agent-node:<version> and moves
@@ -18714,13 +18740,16 @@ def _agent_node_enrol(root, row, services, wait, inputs, reached):
         check["written"] = True
     with _NodeStep("raised", node=node) as check:
         deadline = time.monotonic() + wait
-        state = ""
+        state = said = ""
         while True:
             state = _agent_node_exec(root, host, container, ["cat", AGENT_NODE_STATE],
                                      timeout=60)
+            if state and state != said:
+                said = state
+                _agent_node_progress("raised", node, state)
             if state.startswith("running agent") or time.monotonic() >= deadline:
                 break
-            time.sleep(10)
+            time.sleep(AGENT_NODE_STATE_POLL_SECONDS)
         check["state"] = state
         answer = {"ok": state.startswith("running agent"), "node": node,
                   "label": row.get("label"), "public_key": public_key,
@@ -18741,6 +18770,20 @@ def _agent_node_enrol(root, row, services, wait, inputs, reached):
             failure.answer = answer
             raise failure
     return answer
+
+
+def _agent_node_progress(step, node, state):
+    """Say, inside a waiting step, what the node's own state line says it is
+    doing now: progress {step, node, state, doing}, with done, total and item
+    where the line ends in the boot path's count."""
+    fields = {"step": step, "node": node, "state": state, "doing": state}
+    count = AGENT_NODE_STATE_COUNT.fullmatch(state)
+    if count:
+        fields.update({"doing": count["doing"], "done": int(count["done"]),
+                       "total": int(count["total"])})
+        if count["item"]:
+            fields["item"] = count["item"]
+    _event("progress", **fields)
 
 
 def _agent_node_coolify_project(root, target, given, name):
@@ -19072,7 +19115,9 @@ def _node_login_tool(root, host, container, node, tool):
                 _event("waiting", node=node, tool=tool)
         rc = channel.proc.wait()
     if rc == 0:
-        _emit({"ok": True, "node": node, "tool": tool})
+        _event("checking", node=node, tool=tool)
+        _emit({"ok": True, "node": node, "tool": tool,
+               **_node_login_confirmed(root, node, tool)})
         return
     if channel.cancelled:
         raise NodeFailure("cancelled", f"the {tool} sign-in on node {node} was cancelled "
@@ -19088,6 +19133,55 @@ def _node_login_tool(root, host, container, node, tool):
     said_last = next((l.strip() for l in reversed(seen.splitlines()) if l.strip()), "")
     raise NodeFailure("login_failed", f"the {tool} sign-in on node {node} failed (exit {rc})"
                       + (f": {said_last[-500:]}" if said_last else ""), rc)
+
+
+# How long a sign-in that ended well waits for the node's own row to say so:
+# past one probe of a node that does not follow the request, which asks again
+# at most a probe later.
+NODE_LOGIN_CONFIRM_SECONDS = NODE_STATE_PROBE_SECONDS + 30
+
+
+def _node_login_confirmed(root, node, tool):
+    """Once the tool's sign-in on `node` ended well, ask the node to ask its
+    tools now (NODE_PROBE_CHANNEL), and wait until the sign-in row the node
+    itself writes says signed_in, newer than before the ask, so whoever reads
+    the node's state after `done` reads the sign-in. Answers {sign_in,
+    account, checked_at} as the row says them when the wait ends: sign_in is
+    null where the store could not be read or holds no row for the node."""
+    store, db = _store_module(), _db_module()
+    agent_id = _folder_agent_id(root)
+    said = {"sign_in": None, "account": None, "checked_at": None}
+    try:
+        conn = db.connect(application_name=store.STORE_OWNER,
+                          setting=db.resolve_setting(root), transaction=True)
+    except Exception:
+        return said
+
+    def row():
+        with conn.transaction():
+            rows = store.node_logins(conn, agent_id, [node])
+        return rows[0] if rows else {}
+
+    try:
+        before = row().get("checked_at")
+        _announce(root, NODE_PROBE_CHANNEL, node)
+        deadline = time.monotonic() + NODE_LOGIN_CONFIRM_SECONDS
+        while True:
+            now = row()
+            said = {"sign_in": now.get(f"{tool}_login"), "account": now.get(f"{tool}_account"),
+                    "checked_at": store._stamp(now.get("checked_at"))}
+            newer = now.get("checked_at") is not None and (
+                before is None or now["checked_at"] > before)
+            if (newer and said["sign_in"] == "signed_in") or time.monotonic() >= deadline:
+                return said
+            time.sleep(1)
+    except Exception:
+        return said
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _node_login_device(root, host, container, node, capability, wanted, method_id):
