@@ -878,12 +878,25 @@ def test_cancelling_a_sign_in_stops_the_tool_on_the_node(lab, signin, capfd):
 WHATSAPP = {"connections": {"device_bound": True, "link": [
     {"id": "qr", "argv": ["whatsapp", "pair", "--qr", "--events"]},
     {"id": "code", "argv": ["whatsapp", "pair", "--events"]}]}}
+TELEGRAM = {"connections": {"device_bound": True, "link": [
+    {"id": "qr", "argv": ["telegram", "login", "--events"]},
+    {"id": "phone", "argv": ["telegram", "login", "--phone", "--events"]}]}}
+# `<capability> connections --json` as the capability prints it, captured from
+# connections added with `--identity` (`main`, `personal`), with `--field
+# expected_account_id` (`fielded`) and with neither (`spare`).
+CAPTURED = Path(__file__).parent / "fixtures" / "node"
 
 
-def whatsapp_tool(signin, *, live=False, bound=True):
-    connections = {"connections": {"main": {
-        "keys": [{"key": "expected_account_id", "set": bound}],
-        "session": {"live": live, "account": "15550001111" if live else None}}}}
+def captured_connections(capability):
+    return json.loads((CAPTURED / f"{capability}-connections.json").read_text())
+
+
+def whatsapp_tool(signin, *, live=False, bound="main"):
+    held = captured_connections("whatsapp")["connections"]
+    entry = held[bound or "spare"]
+    if live:
+        entry["session"] = {"live": True, "account": "15550001111"}
+    connections = {"connections": {"main": entry}}
     signin.tool("whatsapp", f"""case "$1" in
 manifest) echo '{json.dumps(WHATSAPP)}';;
 connections) echo '{json.dumps(connections)}';;
@@ -916,13 +929,45 @@ def test_a_device_sign_in_runs_the_capabilitys_ceremony_and_says_the_devices_in_
     assert (signin.dir / "number").read_text() == "15550001111\n"
 
 
+def test_a_connection_bound_by_its_account_field_signs_in_where_another_node_holds_it(
+        lab, signin, capfd, monkeypatch):
+    whatsapp_tool(signin, bound="fielded")
+    signin.sessions.append({"capability": "whatsapp", "connection": "main", "live": True,
+                            "account": "15550001111"})
+    monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO("\n"))
+    with pytest.raises(SystemExit):
+        lab.m.cmd_node_login(login_args("whatsapp"))
+    assert (signin.dir / "ceremony").read_text().split() == [
+        "pair", "--qr", "--events", "--connection", "main"]
+
+
+def test_a_bound_telegram_connection_signs_in_where_another_node_holds_it(
+        lab, signin, capfd, monkeypatch):
+    signin.tool("telegram", f"""case "$1" in
+manifest) echo '{json.dumps(TELEGRAM)}';;
+connections) echo '{json.dumps(captured_connections("telegram"))}';;
+*) echo "$*" > "$(dirname "$0")/../ceremony"; exit 0;;
+esac
+""")
+    signin.sessions.append({"capability": "telegram", "connection": "personal", "live": True,
+                            "account": "4200000001"})
+    monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO(""))
+    with pytest.raises(SystemExit) as exited:
+        lab.m.cmd_node_login(login_args("telegram", connection="personal"))
+    assert exited.value.code == 0
+    assert (signin.dir / "ceremony").read_text().split() == [
+        "login", "--events", "--connection", "personal"]
+    assert events(capfd.readouterr().out)[0]["in_use"] == [
+        {"node": "a1a1a1a1a1a1", "label": "mac", "account": "4200000001", "live": True}]
+
+
 def test_a_device_sign_in_never_replaces_a_session(lab, signin, capfd):
     whatsapp_tool(signin, live=True)
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_login(login_args("whatsapp"))
     assert refused.value.code == "already_signed_in"
     # Nor takes a connection another node signs in through out from under it.
-    whatsapp_tool(signin, bound=False)
+    whatsapp_tool(signin, bound=None)
     signin.sessions.append({"capability": "whatsapp", "connection": "main", "live": True,
                             "account": "15550001111"})
     with pytest.raises(lab.m.NodeFailure) as refused:

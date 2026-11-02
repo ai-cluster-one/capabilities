@@ -1,0 +1,229 @@
+{
+  "connections": {
+    "main": {
+      "allow_write": false,
+      "keys": [
+        {
+          "key": "engine",
+          "secret": false,
+          "required": false,
+          "set": true,
+          "tier": "derived",
+          "source": null,
+          "value": "whatsmeow"
+        },
+        {
+          "key": "number",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "expected_account_id",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "device_name",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "initial_sync_days",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "messages_dir",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "DEEPGRAM_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        }
+      ],
+      "session": {
+        "live": false,
+        "account": "15550001111"
+      },
+      "identity": {
+        "id": "15550001111",
+        "display_name": null
+      },
+      "label": "main"
+    },
+    "spare": {
+      "allow_write": false,
+      "keys": [
+        {
+          "key": "engine",
+          "secret": false,
+          "required": false,
+          "set": true,
+          "tier": "derived",
+          "source": null,
+          "value": "whatsmeow"
+        },
+        {
+          "key": "number",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "expected_account_id",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "device_name",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "initial_sync_days",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "messages_dir",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "DEEPGRAM_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        }
+      ],
+      "session": {
+        "live": false,
+        "account": null
+      },
+      "identity": null,
+      "label": "spare"
+    },
+    "fielded": {
+      "allow_write": false,
+      "keys": [
+        {
+          "key": "engine",
+          "secret": false,
+          "required": false,
+          "set": true,
+          "tier": "derived",
+          "source": null,
+          "value": "whatsmeow"
+        },
+        {
+          "key": "number",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "expected_account_id",
+          "secret": false,
+          "required": false,
+          "set": true,
+          "tier": "connection",
+          "source": "/home/user/.local/state/capabilities/config/whatsapp/connections.json",
+          "value": "15550001111"
+        },
+        {
+          "key": "device_name",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "initial_sync_days",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "messages_dir",
+          "secret": false,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "DEEPGRAM_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        }
+      ],
+      "session": {
+        "live": false,
+        "account": "15550001111"
+      },
+      "identity": null,
+      "label": "fielded"
+    }
+  }
+}

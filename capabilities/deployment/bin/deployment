@@ -468,8 +468,9 @@ USAGE
       to it line by line. It never replaces a session: a node that already
       holds a live session for the connection is refused (exit 6
       already_signed_in) and --recreate is never passed. A connection that
-      binds no expected_account_id while another of the agent's nodes holds
-      a session for it is refused (exit 6 connection_unbound, naming the
+      binds no account - its `connections` entry names no identity and sets
+      no expected_account_id - while another of the agent's nodes holds a
+      session for it is refused (exit 6 connection_unbound, naming the
       account to bind), since a first link that failed would take the
       shared connection out again. Before the ceremony one event devices
       {node, capability, connection, in_use [{node, label, account, live}],
@@ -8665,8 +8666,13 @@ def _node_login_device(root, host, container, node, capability, wanted, method_i
         raise NodeFailure("already_signed_in", f"node {node} already holds a live {capability} "
                           f"session for {wanted!r}"
                           + (f" ({session['account']})" if session.get("account") else ""), 6)
-    bound = any(isinstance(k, dict) and k.get("key") == "expected_account_id" and k.get("set")
-                for k in entry.get("keys") or [])
+    # A connection is bound when the contract's `identity` beside the entry
+    # names its account, or, for a capability that declares no main
+    # identifier, when its expected_account_id key is set.
+    identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
+    bound = identity.get("id") not in (None, "") or any(
+        isinstance(k, dict) and k.get("key") == "expected_account_id" and k.get("set")
+        for k in entry.get("keys") or [])
     elsewhere = []
     for other in _manager(root, "node", "state").get("nodes") or []:
         if other.get("node") == node:

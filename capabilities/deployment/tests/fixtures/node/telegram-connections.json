@@ -1,0 +1,139 @@
+{
+  "connections": {
+    "personal": {
+      "allow_write": false,
+      "keys": [
+        {
+          "key": "TELEGRAM_API_ID",
+          "secret": false,
+          "required": true,
+          "set": true,
+          "tier": "user",
+          "source": "/home/user/.local/state/capabilities/config/telegram/credentials.env",
+          "value": "1234567"
+        },
+        {
+          "key": "TELEGRAM_API_HASH",
+          "secret": true,
+          "required": true,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "session",
+          "secret": false,
+          "required": false,
+          "set": true,
+          "tier": "connection",
+          "source": "/home/user/.local/state/capabilities/config/telegram/connections.json",
+          "value": "/home/user/.local/state/capabilities/runtime-state/telegram/personal/session"
+        },
+        {
+          "key": "GOOGLE_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "OPENAI_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "DEEPGRAM_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        }
+      ],
+      "session": {
+        "live": false,
+        "account": "4200000001",
+        "reason": "session_missing"
+      },
+      "identity": {
+        "id": "4200000001",
+        "display_name": "Test Account"
+      },
+      "label": "personal"
+    },
+    "spare": {
+      "allow_write": false,
+      "keys": [
+        {
+          "key": "TELEGRAM_API_ID",
+          "secret": false,
+          "required": true,
+          "set": true,
+          "tier": "user",
+          "source": "/home/user/.local/state/capabilities/config/telegram/credentials.env",
+          "value": "1234567"
+        },
+        {
+          "key": "TELEGRAM_API_HASH",
+          "secret": true,
+          "required": true,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "session",
+          "secret": false,
+          "required": false,
+          "set": true,
+          "tier": "connection",
+          "source": "/home/user/.local/state/capabilities/config/telegram/connections.json",
+          "value": "/home/user/.local/state/capabilities/runtime-state/telegram/spare/session"
+        },
+        {
+          "key": "GOOGLE_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "OPENAI_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        },
+        {
+          "key": "DEEPGRAM_API_KEY",
+          "secret": true,
+          "required": false,
+          "set": false,
+          "tier": null,
+          "source": null,
+          "value": null
+        }
+      ],
+      "session": {
+        "live": false,
+        "account": null,
+        "reason": "session_missing"
+      },
+      "identity": null,
+      "label": "spare"
+    }
+  }
+}
