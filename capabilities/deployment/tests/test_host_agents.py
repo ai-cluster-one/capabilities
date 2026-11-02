@@ -162,122 +162,6 @@ def _module():
     return module
 
 
-# --- Handing the host agents over to the node's service manager --------------
-
-def test_handover_takes_down_the_service_agents_and_the_watchdog_only(
-        tmp_path, monkeypatch, capsys) -> None:
-    root, env = _host_project(tmp_path, ())
-    for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CAPABILITIES_HOME"):
-        monkeypatch.setenv(key, env[key])
-    monkeypatch.chdir(root)
-    module = _module()
-    agents = root / "deployment" / "launchd"
-    agents.mkdir(parents=True, exist_ok=True)
-    library = Path(env["HOME"]) / "Library" / "LaunchAgents"
-    library.mkdir(parents=True)
-    xml = '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict/></plist>\n'
-    for label in ("project.telegram", "project.watchdog", "project.node-sync-production"):
-        path = agents / f"{label}.plist"
-        path.write_text(module._mark_generated(path, xml))
-    (agents / "project.mine.plist").write_text(xml)
-    (library / "project.telegram.plist").symlink_to(agents / "project.telegram.plist")
-    (library / "project.watchdog.plist").write_text("copied in by hand\n")
-    (library / "project.node-sync-production.plist").symlink_to(
-        agents / "project.node-sync-production.plist")
-    loaded = {"project.telegram", "project.watchdog", "project.node-sync-production"}
-    calls = []
-
-    def launchctl(*argv):
-        calls.append(argv)
-        label = argv[1].rsplit("/", 1)[-1]
-        if argv[0] == "print":
-            return (0, "") if label in loaded else (113, "not found")
-        if argv[0] == "bootout":
-            loaded.discard(label)
-        return 0, ""
-
-    monkeypatch.setattr(module, "_launchctl", launchctl)
-
-    def handover(dry_run):
-        module.cmd_handover(type("Args", (), {"dry_run": dry_run})())
-        return json.loads(capsys.readouterr().out)
-
-    preview = handover(True)
-    assert [(a["label"], a["kind"], a["action"]) for a in preview["agents"]] == [
-        ("project.telegram", "service", "would_hand_over"),
-        ("project.watchdog", "watchdog", "would_hand_over")]
-    assert all(argv[0] == "print" for argv in calls) and len(loaded) == 3
-
-    done = handover(False)
-    assert done["ok"] and [a["action"] for a in done["agents"]] == ["handed_over"] * 2
-    assert [argv[1].rsplit("/", 1)[-1] for argv in calls if argv[0] == "bootout"] == [
-        "project.telegram", "project.watchdog"]
-    assert loaded == {"project.node-sync-production"}
-    assert not (library / "project.telegram.plist").exists()
-    assert (library / "project.node-sync-production.plist").is_symlink()
-    kept = agents / "project.watchdog.plist.handed-over"
-    assert done["agents"][1]["kept_at"] == str(kept) and kept.read_text() == "copied in by hand\n"
-    # The compiled files stay; a second run finds nothing to hand over.
-    assert (agents / "project.telegram.plist").is_file()
-    again = handover(False)
-    assert [a["action"] for a in again["agents"]] == ["absent", "absent"]
-
-
-def test_handover_finds_every_loaded_agent_of_the_folder_whatever_compiled_it(
-        tmp_path, monkeypatch, capsys) -> None:
-    """An older compilation's agents under another label, loaded from a file
-    put in ~/Library/LaunchAgents, are this folder's too."""
-    root, env = _host_project(tmp_path, ("telegram",))
-    for key in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "CAPABILITIES_HOME"):
-        monkeypatch.setenv(key, env[key])
-    monkeypatch.chdir(root)
-    module = _module()
-    library = Path(env["HOME"]) / "Library" / "LaunchAgents"
-    library.mkdir(parents=True)
-    launchers = root / "deployment" / "launchd"
-
-    def agent(label, program, **extra):
-        (library / f"{label}.plist").write_bytes(plistlib.dumps(
-            {"Label": label, "ProgramArguments": [str(program)], **extra}))
-
-    agent("legacy.telegram", launchers / "legacy-telegram")
-    agent("legacy.watchdog", launchers / "legacy-watchdog")
-    agent("legacy.backup", root / "scripts" / "backup")
-    agent("elsewhere.telegram", tmp_path / "elsewhere" / "telegram")
-    agent("capabilities.node", "/usr/local/bin/capabilities", WorkingDirectory=str(root))
-    loaded = {"legacy.telegram", "legacy.watchdog", "legacy.backup", "elsewhere.telegram",
-              "capabilities.node"}
-
-    def launchctl(*argv):
-        label = argv[1].rsplit("/", 1)[-1]
-        if argv[0] == "print":
-            return (0, "") if label in loaded else (113, "not found")
-        if argv[0] == "bootout":
-            loaded.discard(label)
-        return 0, ""
-
-    monkeypatch.setattr(module, "_launchctl", launchctl)
-
-    def handover(dry_run):
-        module.cmd_handover(type("Args", (), {"dry_run": dry_run})())
-        return json.loads(capsys.readouterr().out)
-
-    preview = handover(True)
-    assert [(a["label"], a["kind"], a.get("service"), a["action"])
-            for a in preview["agents"]] == [
-        ("legacy.backup", "other", None, "kept"),
-        ("legacy.telegram", "service", "telegram", "would_hand_over"),
-        ("legacy.watchdog", "watchdog", None, "would_hand_over")]
-    done = handover(False)
-    assert done["ok"] and [a["action"] for a in done["agents"]] == [
-        "kept", "handed_over", "handed_over"]
-    # What runs nothing the node manager takes over keeps running, and so
-    # does what is not this folder's.
-    assert loaded == {"legacy.backup", "elsewhere.telegram", "capabilities.node"}
-    assert not (library / "legacy.telegram.plist").exists()
-    assert (launchers / "legacy.telegram.plist.handed-over").is_file()
-
-
 def test_a_mac_handed_over_to_its_node_manager_is_not_told_to_load_its_agents(
         tmp_path, monkeypatch, capsys) -> None:
     root, env = _host_project(tmp_path, ("telegram",))
@@ -317,4 +201,6 @@ def test_a_mac_handed_over_to_its_node_manager_is_not_told_to_load_its_agents(
     # One loaded again beside the node manager is the one thing said.
     loaded.add("project.telegram")
     finding = next(f for f in doctor()["findings"] if f["path"] == "project.telegram")
-    assert finding["severity"] == "warning" and "deployment handover" in finding["hint"]
+    assert finding["severity"] == "warning"
+    assert "`capabilities node install --apply`" in finding["hint"]
+    assert "deployment handover" not in finding["hint"]

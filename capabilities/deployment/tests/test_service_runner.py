@@ -633,10 +633,9 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
             time.sleep(0.3)
 
     def listed() -> dict:
-        proc = subprocess.run([str(DEPLOYMENT), "node", "list"], cwd=a, env=env,
-                              capture_output=True, text=True, timeout=120)
-        assert proc.returncode == 0, proc.stderr
-        return json.loads(proc.stdout)
+        # The manager reads which nodes are live itself, against the cadence
+        # of the agent's folder here.
+        return _manager(a, env, "agent", "state", PROJECT_ID)
 
     runners = {}
     try:
@@ -653,7 +652,7 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
             assert "cannot report" not in runner.text()
 
         report = listed()
-        assert (report["reconcile_seconds"], report["live_within_seconds"]) == (5, 15)
+        assert report["liveness"]["live_within_seconds"] == 15
         assert {n["node"]: n["live"] for n in report["nodes"]} == {
             "626f782d6200": True, "626f782d6300": False, "6d61632d6100": True}
 

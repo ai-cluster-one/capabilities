@@ -1,8 +1,7 @@
 """The standard agent node: `capabilities node create`, `enrol`, `add`, `update`,
 `remove`, `exec` and `login` drive coolify for the resource, the manager for the
 node row and the placements, and SSH with docker exec for the node itself.
-`deployment node` hands these forms to the manager, which answers them as
-deployment did."""
+`deployment node` refuses these forms as moved, naming the manager command."""
 from __future__ import annotations
 
 import importlib.machinery
@@ -325,7 +324,7 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
                                      "coolify_resource": "svc-new", "public_key": None}
     answer = json.loads(capsys.readouterr().out)
     assert answer["node"]["coolify_resource"] == "svc-new"
-    assert answer["next"] == f"deployment node enrol {BOX1}"
+    assert answer["next"] == f"capabilities node enrol {BOX1}"
 
 
 def test_create_refuses_a_node_the_agent_has_and_takes_back_a_resource_it_cannot_register(lab):

@@ -146,44 +146,23 @@ USAGE
       failed with on the holder, else null). Writes nothing; a store that
       holds no lease table yet answers free.
 
-  deployment handover [--dry-run]
-      Hand this project's host agents over to the node's service manager on
-      a Mac (`capabilities node install`, which runs this in every folder
-      whose services it will run): boot out each loaded launchd agent an
-      older deployment's host-agents compilation left in
-      compiler.host.agents_dir - every service agent and the project
-      watchdog, not the node-sync agents - and
-      every other agent in ~/Library/LaunchAgents or that folder whose
-      program or working directory lies inside the project, whatever
-      compiled it, where its label ends in `watchdog` or in the name of an
-      installed capability that bundles a service; and take its entry out
-      of ~/Library/LaunchAgents, so a login does not load it again (a link
-      is removed; a file put there by hand is kept beside the agents as
-      <label>.plist.handed-over). Such an agent that runs neither is
-      reported as kind other and left running, and the node manager's own
-      agents (capabilities.*) are never touched. The compiled files stay.
-      Run again it changes nothing. --dry-run changes nothing and answers
-      the same. Answers {project, profile, dry_run, ok, agents [{label, kind
-      (service|watchdog|other), service?, loaded, installed, action
-      (handed_over, would_hand_over, kept, absent or failed, with step and
-      detail), kept_at?}]}, or skipped where the project compiles no host
-      agents and no agent of it is found; exit 6 when an agent could not be
-      handed over.
-
   deployment machine handover [<name> ...] [--dry-run]
       Hand this Mac's machine-service agents - the
       `capabilities.machine.<name>` launchd agents an older deployment
       compiled for the services that run once per machine, and the
       `capabilities.machine.watchdog` over them, in
       `$XDG_STATE_HOME/deployment/machine/launchd/` - over to the node's
-      service manager (`capabilities node install`, which runs it for the
-      machine services the node manager will run there): it boots out each
-      loaded `capabilities.machine.<name>` of the named services (every one
-      found when none is named) and takes its entry out of
-      ~/Library/LaunchAgents, as `deployment handover` does a project's, and
-      the machine watchdog with them once no other machine service agent
-      stays loaded. The compiled files stay. Run again it changes nothing;
-      --dry-run changes nothing and answers the same. Answers {dry_run, ok,
+      service manager (`capabilities node install --apply` does the same for
+      the machine services the node manager will run there): it boots out
+      each loaded `capabilities.machine.<name>` of the named services (every
+      one found when none is named) and takes its entry out of
+      ~/Library/LaunchAgents, as `capabilities node install --apply` does a
+      project's, and the machine watchdog with them once no other machine
+      service agent stays loaded. The compiled files stay. Run again it
+      changes nothing; --dry-run changes nothing and answers the same. It
+      stays for the machine agents of a service no agent on this Mac places
+      in mode shared, which `capabilities node install` does not reach.
+      Answers {dry_run, ok,
       agents_dir, agents [{label, kind (service|watchdog), service?, loaded,
       installed, action, kept_at?}]}; exit 6 when an agent could not be
       handed over.
@@ -234,270 +213,65 @@ USAGE
       fails rolls back the same way.
   deployment logs [--target <name>] [--build] [--follow]
       Read runtime logs or the recorded deployment build log; --follow polls.
-  deployment node image [--json]
-      The standard image's current release, read from its registry
-      (ghcr.io, anonymously): the newest <major>.<minor>.<patch> tag of
-      ghcr.io/agenium-dev/agent-node, which its release publishes and moves
-      :latest to. Prints that image reference; --json answers {ok, version,
-      image}. Exit 5 image_release_unknown when the registry cannot be read
-      or holds no release. node add and node create take this version when
-      no --version is given.
-  deployment node add <label> --server <uuid> [--version <tag>] [--memory 2g]
-                      [--services <name,...>] [--project <uuid>]
-                      [--environment production] [--connection <id>]
-                      [--wait 600] [--events] [--coolify-stdin]
-      The whole path from nothing to a raised node of the standard image on
-      a server Coolify already runs, one step after another: project, the
-      Coolify project - --project, else the one named after the agent's
-      slug, created when there is none (exit 6 project_ambiguous when
-      several carry that name); environment, --environment in it, created
-      when missing (`coolify projects environment create`); create, what
-      `node create` does with --version (the current release, as `node
-      image` answers it, when not given) and --memory; container, until the
-      node's container runs (exit 5 node_not_running after --wait seconds);
-      then what `node enrol` does with --services and --wait, as the steps
-      id, key_pair, encryption_key, secrets, place (one per service) and
-      store, and raised, until the node reports its agent running (exit 5
-      node_not_raised). With --events each step is said as a JSON line on
-      stdout, step {step, state started}, then done with its check or
-      failed with its error {code, message}, beside the step's own fields
-      (project, label, node, service); the stream ends in done {result},
-      enrol's answer with project, environment, created and resource, or
-      error {exit, error}. Without --events the answer alone is printed.
-      What a step finds done it keeps (created false), so the same command
-      again resumes after a failure: a node already labelled <label> on
-      this server through this connection is that node, and one on another
-      server or connection is refused (exit 6 node_exists) before anything
-      is written; so are an AGENT_ENCRYPTION_KEY that does not open the
-      vault and a connection that does not allow writes. A fresh server is
-      installed with Coolify first, as before; node add starts from one
-      Coolify runs.
-      --coolify-stdin (node add, create, enrol, update and remove): reach
-      Coolify through a connection the caller lends this one run instead of
-      one granted to the agent - a JSON object {"url", "token"} on standard
-      input, the instance root without /api/v1 and its API token - which
-      each coolify the verb runs is given in its environment alone
-      (COOLIFY_LENT_BASE_URL, COOLIFY_LENT_TOKEN; coolify help) and which is
-      never on a command line, printed or written. --connection beside it is
-      refused (exit 6 lent_connection). A node created so records that
-      Coolify's address as its connection, and every later verb on it
-      takes the same connection lent again: without one it is refused (exit 6
-      coolify_connection_required), and one lent for another address, or
-      for a node created through a granted connection, is refused (exit 6
-      lent_connection_mismatch). enrol carries the agent's own coolify
-      connections to such a node, since none of them created it.
-  deployment node create <node> --project <uuid> --server <uuid>
-                         --environment <name> [--version <tag>]
-                         [--memory 2g] [--connection <id> | --coolify-stdin]
   deployment node create <node> --project <uuid> --server <uuid>
                          --environment <name> --repository <url>
                          --branch <branch> --dockerfile <path> [--context <dir>]
                          [--deploy-key <uuid> | --github-app <uuid>]
                          [--docker-socket] [--host-dir <path>]...
                          [--memory 2g] [--connection <id> | --coolify-stdin]
-      For an agent that lives in the store: create a Coolify resource
-      running the standard image ghcr.io/agenium-dev/agent-node:<tag>, the
-      current release as `node image` answers it when --version is not given,
-      through the coolify connection (the only one granted, or --connection),
-      in that project's existing environment on that server. It is a Compose
-      service of one container with the memory limit, a volume of its own
-      for each state path of the image (~/.config, ~/.local/state,
-      ~/.claude, ~/.codex) and for ~/work, where the agent keeps its
-      checkouts and git worktrees, and only CAPABILITIES_PROJECT_ID and
-      CAPABILITIES_PROJECT_ID_ROOT (/app); no repository, no build, and no
-      node identity in its environment. Then mint the node's id, twelve
-      lowercase hex characters, and register the node row under it with
-      <node> as its label, the name it is shown by, and the connection,
-      server and
-      resource (`capabilities node add`); a row that cannot be written takes
-      the resource away again. The node starts idle, knowing no store; the
-      answer's node.node is its id, which enrol puts on its config volume.
-      Exit 6 node_exists (a node of this agent already labelled so),
-      not_store_mode, environment_missing (3).
-      With --repository instead of --version, Coolify builds the node's
-      image on that server from the Dockerfile at --dockerfile in the
+      For an agent that lives in the store: a node whose image Coolify
+      builds on that server from the Dockerfile at --dockerfile in the
       repository's --branch, with --context as the build context (the
       repository root by default; the Dockerfile lies inside it) - a
-      Dockerfile FROM the standard image, with no CI and no registry. The
-      repository is cloned with a Coolify deploy key or GitHub App
-      (`coolify sources` lists their uuids), else as public. The node is
-      then a Coolify application with no domain, no automatic deploy on
-      push and the same memory limit, keys and volumes, and only it
-      takes host paths, each bound at the same path in the container:
-      --docker-socket the host's /var/run/docker.sock, and each --host-dir
-      an existing directory on the server (not /home/agent, /app or above
-      them). Coolify never creates, writes or deletes a host path. The
+      Dockerfile FROM the standard image ghcr.io/agenium-dev/agent-node,
+      with no CI and no registry - through the coolify connection (the only
+      one granted, or --connection), in that project's existing environment
+      on that server. The repository is cloned with a Coolify deploy key or
+      GitHub App (`coolify sources` lists their uuids), else as public. The
+      node is a Coolify application with no domain, no automatic deploy on
+      push, the memory limit, a volume of its own for each state path of the
+      image (~/.config, ~/.local/state, ~/.claude, ~/.codex) and for ~/work,
+      where the agent keeps its checkouts and git worktrees, and only
+      CAPABILITIES_PROJECT_ID and CAPABILITIES_PROJECT_ID_ROOT (/app) in its
+      environment. It takes host paths, each bound at the same path in the
+      container: --docker-socket the host's /var/run/docker.sock, and each
+      --host-dir an existing directory on the server (not /home/agent, /app
+      or above them). Coolify never creates, writes or deletes a host path.
+      Then mint the node's id, twelve lowercase hex characters, and register
+      the node row under it with <node> as its label, the name it is shown
+      by, and the connection, server and resource (`capabilities node
+      add`); a row that cannot be written takes the application away again,
+      as does a step that fails once it exists. The node starts idle,
+      knowing no store; the answer's node.node is its id, and next the
+      `capabilities node enrol` that puts it on its config volume. The
       answer names the application and the build's deployment; `coolify
       wait <uuid> --deployment <uuid>` waits for the build before enrol.
-      A step that fails once the application exists takes it away again.
-  deployment node enrol <node> [--services <name,...>] [--wait 300]
-                         [--coolify-stdin]
-      <node> is the node's id, or the label exactly one of the agent's
-      nodes carries (node_ambiguous otherwise); so for exec and remove.
-      Over SSH to the node's server and docker exec into its container:
-      write the node's id onto its config volume with the node's own
-      `capabilities node id --set <id>`, which the node resolves its id
-      from from then on; make the node's X25519 key pair there (the private key stays in
-      ~/.config/agent-node/node-key.pem, mode 0600) and record its public
-      key on the node row; write the agent's encryption key,
-      AGENT_ENCRYPTION_KEY as it resolves here, into the node's
-      ~/.config/capabilities/shared.env on its config volume, which opens the
-      agent's vault there (`capabilities secrets`; refused as key_mismatch
-      when the key here is not the one the vault is kept under; the answer's
-      key says whether it was placed and secrets_in_vault names, per
-      capability, each secret key the node reads from the vault instead of
-      a file); write the agent's other secrets - every secret key of a
-      connection each capability the agent can use resolves here (enabled
-      for the project or globally), read where each capability's
-      `connections` says it is, except a name the vault holds and the
-      coolify connection the node was created through, whose token the node
-      does not hold - into each capability's credentials.env on the node's
-      config volume. The answer's
-      secrets_skipped names each secret key it did not carry and why (not
-      set here, a value spanning lines, a key declared not secret, the
-      withheld coolify connection, a capability whose `connections` gave no
-      report), and environment_only names, per capability, each
-      secret-looking key its service reads from its environment
-      (service.deploy.environment, the database's aside) that no connection
-      reports: one it reads from the process environment alone - a target's
-      container environment, say - which no node receives until it is kept
-      in a connection. Keys only, never values. Place each named service
-      on the node (`capabilities place <name> --node <node>`), which takes an
-      exclusive service off the node it ran on before (unplaced) and leaves
-      where the capability is usable as it is;
-      and write the store setting this project resolves with the node's own
-      `capabilities store set`, last, since it is what the waiting node
-      raises the agent on. Secrets travel on standard input and are never
-      printed. Waits up to --wait seconds for the node to report its agent
-      running (exit 5 node_not_raised otherwise). A store setting naming a
-      root certificate file exits 6 store_setting_not_portable.
+      Exit 6 node_exists (a node of this agent already labelled so),
+      not_store_mode, environment_missing (3).
+      --coolify-stdin: reach Coolify through a connection the caller lends
+      this one run instead of one granted to the agent - a JSON object
+      {"url", "token"} on standard input, the instance root without /api/v1
+      and its API token - which each coolify the verb runs is given in its
+      environment alone (COOLIFY_LENT_BASE_URL, COOLIFY_LENT_TOKEN; coolify
+      help) and which is never on a command line, printed or written.
+      --connection beside it is refused (exit 6 lent_connection). A node
+      created so records that Coolify's address as its connection.
+      Every other verb on a node, once it exists, is the capabilities
+      manager's (`capabilities node`), whose rows it reaches as any other.
       The logins are not handed over: a person makes them on the node, over
-      SSH to its server and `docker exec -it <container>` into the container
-      labelled com.docker.compose.project=<resource> and
-      com.docker.compose.service=agent (a node built from a repository: the
-      one container labelled with the project alone) - `claude auth login`, `codex login
-      --device-auth`, and `gh auth login` for the GitHub CLI (agent-node
-      0.0.2 and later), through which git also reaches github.com over
-      https. Each is kept on the node's volumes and outlives a new image
-      tag.
-  deployment node update <node> --version <tag> [--memory <size>] [--wait 600]
-                          [--coolify-stdin]
-      Move a node of the standard image to ghcr.io/agenium-dev/agent-node:<tag>
-      through the coolify connection its row names: write its Coolify
-      service the whole Compose document `node create` writes for it, with
-      the new tag (`coolify service set-compose`, which reads no field the
-      token needs read:sensitive for), and redeploy it (`coolify deploy`)
-      with its volumes kept, so its id, key, store setting, secrets, logins
-      and work stay; then wait up to --wait seconds for its container to run
-      that image, report healthy (when the image has a health check) and its
-      agent state to read running. The document's service name and volume
-      names are node create's; its environment is this agent's id and
-      CAPABILITIES_PROJECT_ID_ROOT; its memory limit is --memory, a size as
-      node create takes it (exit 6 input otherwise), or without it the one
-      the node's container runs with. Before writing, it reads the node's
-      one agent container over SSH (`docker inspect`) and refuses, changing
-      nothing,
-      unless each volume the document mounts is the one mounted at that
-      path (<resource>_<name>) and nothing else is mounted but the image's
-      own anonymous volumes (exit 6 node_volumes_unconfirmed); a path the
-      container mounts nothing at gains the document's volume, new and
-      empty (volumes_added), as on a node created before node create
-      declared it, and what the old container kept at that path outside a
-      volume is gone with it; and unless
-      the container has a memory limit and sets exactly those two keys
-      besides the image's environment, Coolify's own keys and a retired
-      AGENT_NODE_NAME other than the node's id or AGENT_NODE_ID equal to it,
-      which the new document drops (exit 6 node_document_unconfirmed). A node
-      running the tag with no volume to gain and no new memory limit is not
-      written, and is redeployed only when its container is not running, so running the
-      update again finishes one that left the node down; a node with no
-      agent container at all is refused (node_document_unconfirmed) and
-      brought back first with `coolify deploy <uuid>`. Answers {ok, node,
-      label, resource, version, image, previous_image, redeployed, memory,
-      env_dropped, volumes, volumes_added, container, running_image, health,
-      state}. A node built from a
-      repository runs no tag and is refused (exit 6
-      node_built_from_repository; rebuild it with `coolify deploy <uuid>`),
-      as is a resource not running the standard image for this agent (exit
-      6 node_resource_not_own) and a coolify without `service set-compose`
-      (exit 6 provider_not_ready); nothing is changed then. A node that is
-      not back in time exits 5 node_not_raised after printing the answer.
-  deployment node remove <node> --yes [--coolify-stdin]
-      Delete the node's Coolify resource with its volumes and configuration,
-      then its node row. Only the resource the row names is touched; one
-      already gone leaves only the row to remove. A resource whose agent
-      container does not run the standard image - for a node built from a
-      repository, the image Coolify built for that application - for this
-      agent (its CAPABILITIES_PROJECT_ID) is refused (exit 6
-      node_resource_not_own) and nothing is deleted.
-      The host paths a node built from a repository binds are not its
-      volumes: the socket and the directories and what is in them stay.
-  deployment node exec <node> -- <command> [<arg>...]
-      Run one command in the node's container, over SSH to its server and
-      `docker exec -i` into the container enrol reaches, with no terminal:
-      standard input is forwarded, standard output and standard error come
-      back byte for byte as the command writes them (a JSON event stream
-      such as `telegram login --events` or `whatsapp pair --events` reaches
-      this machine line by line), and the exit code is the command's own -
-      255 is SSH's own, when the server cannot be reached.
+      SSH to its server and `docker exec -it` into the container labelled
+      with the project alone - `claude auth login`, `codex login
+      --device-auth`, and `gh auth login` for the GitHub CLI - or with
+      `capabilities node login <node> <tool> --events`.
   deployment node login claude|codex [--target <name>] [--print-command]
       SSH with a terminal into the application's agent container for subscription
       login. --print-command prepares the command without attempting login.
-  deployment node login <node> claude|codex|gh --events
-      Run the tool's own headless sign-in in the node's container (`claude
-      auth login`, `codex login --device-auth`, `gh auth login --web` for
-      github.com), and speak it as JSON lines on stdout:
-      link {url}, the page to open; code {code}, the code to enter there
-      (codex, gh); code_needed, where the tool asks for the code the page
-      gives to be pasted back (claude), answered by one line on stdin;
-      waiting, while the tool waits for the sign-in to finish; then done
-      {result {ok, node, tool}} or error {exit, error {code, message}},
-      message the reason: login_failed with the tool's last words and its
-      exit code, input_closed (exit 6) when stdin closes while code_needed
-      waits, node_unreachable (255). Each event carries node and tool; the
-      tool's own output goes to stderr. SIGTERM, SIGINT or SIGHUP cancels
-      it: the tool on the node is stopped and the stream ends in error
-      cancelled (exit 6). Each node is signed in on its own.
-  deployment node login <node> <capability> [--connection <id>]
-                        [--method <id>] --events
-      Sign a device-bound connection (`connections.device_bound`, as
-      telegram's and whatsapp's are) in on the node as a new device: the
-      capability's own link ceremony from its manifest on the node (the
-      first, or --method's id), run there with --connection as through
-      `node exec`, its events passed on as it speaks them and stdin handed
-      to it line by line. It never replaces a session: a node that already
-      holds a live session for the connection is refused (exit 6
-      already_signed_in) and --recreate is never passed. A connection that
-      binds no account - its `connections` entry names no identity and sets
-      no expected_account_id - while another of the agent's nodes holds a
-      session for it is refused (exit 6 connection_unbound, naming the
-      account to bind), since a first link that failed would take the
-      shared connection out again. Before the ceremony one event devices
-      {node, capability, connection, in_use [{node, label, account, live}],
-      limit}: in_use the agent's other nodes the store reports holding a
-      live session for it (`capabilities node state`), limit how many
-      devices the service links to one account besides the phone (4 for
-      whatsapp), else null. --connection may be left out where the
-      capability has one connection. Cancel as above: the ceremony on the
-      node gets SIGTERM, so a first link takes back what it made.
   deployment node sync [--target <name>]
       Fetch node-<target>, rebase and push; abort conflicts and report diverged.
       Optional target.mirror receives the synced branch. Host-agents compiles
       an interval job (target.sync_interval, default 60 seconds). A target
       whose body_source is GitHub answers state nothing_to_carry, touches no
       remote and gets no interval job: its node syncs with GitHub itself.
-  deployment node list
-      The nodes of this project's agent (`capabilities node list`), each
-      with seen_seconds_ago and live. A node is live when its last_seen_at
-      is within three reconciles (3 x service_policy.reconcile_seconds of
-      deployment/runtime.json, default 60) of now: this is the definition of
-      a node being live, and it holds for a Mac and for a node of the
-      standard image alike, since the node manager's supervisors on either
-      report it each reconcile. A node never seen is not live. Whether a given service runs
-      is not this: an exclusive service's live lease is the proof it runs,
-      and on which node (`deployment services`). Answers {ok, project,
-      agent_id, reconcile_seconds, live_within_seconds, nodes [{...,
-      seen_seconds_ago, live}]}; the manager's refusals pass through.
   deployment node status [--target <name>] [--json]
       JSON host, release, Git sync, harness, store and per-service state.
       Git sync is against the node remote, or the GitHub branch for a target
@@ -545,6 +319,30 @@ USAGE
   deployment next [--target <name>] [--text|--json]
       Human next steps after setup: what to review, what secrets to enter, how
       to create the provider resource, first-login commands, and validation.
+
+  Moved to the capabilities manager
+      The standard agent node, the list of an agent's nodes and the handover
+      of an older deployment's launchd agents are the manager's. These forms
+      run nothing here: each exits 6 moved, naming the manager command that
+      does its work, with its usage as the hint, and under --events (node
+      add, node login) the refusal is the stream's error event.
+        deployment node image            capabilities node image
+        deployment node create           capabilities node create
+          (with no --repository, --branch, --dockerfile, --context,
+          --deploy-key, --github-app, --docker-socket or --host-dir)
+        deployment node enrol            capabilities node enrol
+        deployment node add              capabilities node add
+        deployment node update           capabilities node update <node>
+                                           --version <tag>
+        deployment node remove           capabilities node remove <node> --yes
+        deployment node exec             capabilities node exec
+        deployment node login <node> <tool> | --events | --connection
+          | --method                     capabilities node login <node>
+                                           <tool> --events
+        deployment node list             capabilities node list, and
+                                           capabilities agent state for
+                                           which nodes are live
+        deployment handover              capabilities node install --apply
 
 Contract commands:
   deployment help
@@ -636,7 +434,6 @@ import argparse
 import hashlib
 import json
 import os
-import plistlib
 import re
 import secrets
 import shlex
@@ -685,9 +482,6 @@ RESTART_POLICIES = ("no", "on-failure", "always", "unless-stopped")
 RECONCILE_DEFAULT_SECONDS = 60
 RECONCILE_BOUNDS = (5, 3600)
 LEASE_TTL_RECONCILES = 3
-# Each reconcile a service's supervisor reports its node seen; a node is live while it was
-# seen within this many reconciles, so one missed report never reads as down.
-LIVE_RECONCILES = 3
 SEEN_TIMEOUT_SECONDS = 20
 RUNNER_STOP_GRACE_SECONDS = 20
 # The contract's policy refusal. A service that exits with it is refusing to run
@@ -4637,8 +4431,8 @@ def _handed_over_next_payload(root: Path, runtime: dict, target: dict, target_pa
     apply_steps = [] if installed else [
         f"Install this Mac's node manager ({NODE_MANAGER_AGENT}): `capabilities node "
         "install --apply`, which first hands over any launchd agent an older "
-        "deployment compiled for this project (`deployment handover`) and places "
-        "on this node a service such an agent ran."]
+        "deployment compiled for this project and places on this node a service "
+        "such an agent ran."]
     apply_steps += [
         f"This Mac's node manager runs this project's services, each as a job of its "
         "own, wherever the gate places them on this node: "
@@ -4983,8 +4777,7 @@ def cmd_doctor(args) -> None:
                                    "compiled, is still loaded and runs this service "
                                    "outside this Mac's node manager",
                         "hint": "run `capabilities node install --apply`, which hands it "
-                                "over (`deployment handover`) and runs the service under "
-                                "the node manager"})
+                                "over and runs the service under the node manager"})
         else:
             names = ([_target_name(path) for path in target_paths if path.exists()]
                      if _bundle_layout(compiled) else [None])
@@ -5019,106 +4812,6 @@ def cmd_doctor(args) -> None:
         "findings": findings,
     })
     if errors:
-        sys.exit(6)
-
-
-def _inside(path: object, root: Path) -> bool:
-    """Whether an absolute path an agent names lies inside a folder."""
-    if not isinstance(path, str) or not path.startswith("/"):
-        return False
-    try:
-        Path(path).resolve().relative_to(root.resolve())
-    except (OSError, ValueError):
-        return False
-    return True
-
-
-def _bundles_service(name: str) -> bool:
-    """Whether an installed capability declares a bundled service."""
-    if not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
-        return False
-    manifest, _err = _installed_manifest(name)
-    return isinstance(manifest, dict) and isinstance(manifest.get("service"), dict)
-
-
-def _handover_labels(root: Path, runtime: dict | None) -> list[dict]:
-    """Each launchd agent of this folder that runs a service or watches one:
-    every service agent and the project watchdog an older deployment compiled
-    into its agents folder, not the agents that carry the body to a node; and
-    every other agent in ~/Library/LaunchAgents or that folder whose program
-    or working directory lies inside the project, whatever compiled it, such
-    as one an older compilation left under another label. Such an agent is a
-    service where its label ends in the name of an installed capability that
-    bundles one, the watchdog where it ends in `watchdog`, and otherwise
-    `other`, which is reported and left running. The node manager's own jobs
-    (`capabilities.*`) are never one."""
-    found: dict[str, dict] = {}
-    agents_dir = _host_agents_dir(root, runtime or {})
-    if runtime is not None and str(runtime.get("profile") or "") in HOST_PROFILES:
-        prefix = _host_label_prefix(runtime, root)
-        for path in sorted(agents_dir.glob(f"{prefix}.*.plist")) if agents_dir.is_dir() else []:
-            label = path.stem
-            rest = label[len(prefix) + 1:]
-            if rest.startswith("node-sync-") or not _is_generated(_read_text(path) or ""):
-                continue
-            found[label] = ({"label": label, "kind": "watchdog"} if rest == "watchdog"
-                            else {"label": label, "kind": "service", "service": rest})
-    library = Path.home() / "Library" / "LaunchAgents"
-    for directory in (library, agents_dir):
-        for path in sorted(directory.glob("*.plist")) if directory.is_dir() else []:
-            try:
-                body = plistlib.loads(path.read_bytes())
-            except Exception:  # noqa: BLE001 - a file launchd could not read either
-                continue
-            label = body.get("Label") if isinstance(body, dict) else None
-            if (not isinstance(label, str) or not label or label in found
-                    or label.startswith("capabilities.")):
-                continue
-            name = label.rsplit(".", 1)[-1]
-            if name.startswith("node-sync"):
-                continue
-            argv = body.get("ProgramArguments")
-            program = body.get("Program") or (argv[0] if isinstance(argv, list) and argv
-                                              else None)
-            if not (_inside(program, root) or _inside(body.get("WorkingDirectory"), root)):
-                continue
-            if name == "watchdog":
-                found[label] = {"label": label, "kind": "watchdog"}
-            elif _bundles_service(name):
-                found[label] = {"label": label, "kind": "service", "service": name}
-            else:
-                found[label] = {"label": label, "kind": "other"}
-    return list(found.values())
-
-
-def cmd_handover(args) -> None:
-    """Hand this project's host agents to the node's service manager."""
-    root = _root()
-    dry_run = bool(getattr(args, "dry_run", False))
-    report: dict = {"project": str(root), "profile": None, "dry_run": dry_run,
-                    "agents": []}
-    runtime, err = _read_json(_runtime_path(root))
-    if err or not isinstance(runtime, dict):
-        runtime = None
-    else:
-        report["profile"] = runtime.get("profile")
-    found = _handover_labels(root, runtime)
-    if not found and runtime is None:
-        report["skipped"] = "no deployment/runtime.json here, so nothing of it was compiled"
-        _emit(report)
-        return
-    if not found and str(runtime.get("profile") or "") not in HOST_PROFILES:
-        report["skipped"] = "only the host-agents profile compiles launchd agents"
-        _emit(report)
-        return
-    failed = False
-    for agent in found:
-        entry = _hand_over_agent(agent, _host_agents_dir(root, runtime or {}), dry_run)
-        failed = failed or entry["action"] == "failed"
-        report["agents"].append(entry)
-    report["ok"] = not failed
-    _emit(report)
-    if failed:
         sys.exit(6)
 
 
@@ -7194,18 +6887,6 @@ def cmd_logs(args):
 
 
 def cmd_node_login(args):
-    # With two words the first names the node: `node login <node> <tool>`.
-    if any(getattr(args, key, None) for key in ("tool", "events", "connection", "method")):
-        if getattr(args, "tool", None) is None:
-            raise NodeFailure("input", "node login --events needs the node: "
-                              "node login <node> <tool> --events", 6)
-        if not getattr(args, "events", False):
-            raise NodeFailure("input", "node login <node> speaks its sign-in as events; "
-                              "pass --events", 6)
-        if args.target or args.print_command:
-            raise NodeFailure("input", "node login <node> takes neither --target nor "
-                              "--print-command", 6)
-        _node_forward(args)
     if args.harness not in ("claude", "codex"):
         raise NodeFailure("input", f"node login takes claude or codex, not {args.harness!r}", 6)
     root = _root()
@@ -7344,26 +7025,6 @@ def _node_database(root, host, container):
         "python", "-c", _NODE_DATABASE_PROBE]))
 
 
-def cmd_node_list(args):
-    root = _root()
-    every = _reconcile_seconds(_load_runtime(root) if _runtime_path(root).exists() else {})
-    within = every * LIVE_RECONCILES
-    listed = _manager(root, "node", "list")
-    now = datetime.now(timezone.utc)
-    nodes = []
-    for node in listed.get("nodes") or []:
-        ago = None
-        try:
-            ago = max(0, round((now - datetime.fromisoformat(node["last_seen_at"]))
-                               .total_seconds()))
-        except (KeyError, TypeError, ValueError):
-            pass
-        nodes.append({**node, "seen_seconds_ago": ago,
-                      "live": ago is not None and ago <= within})
-    _emit({"ok": True, "project": str(root), "agent_id": listed.get("agent_id"),
-           "reconcile_seconds": every, "live_within_seconds": within, "nodes": nodes})
-
-
 def cmd_node_status(args):
     root = _root()
     target = _node_target(root, args.target)
@@ -7470,13 +7131,11 @@ def cmd_node_status(args):
 # --- An agent node -----------------------------------------------------------
 # A node of a store-only agent is a Coolify resource running the one standard
 # image, which carries no agent and no secret. The capabilities manager owns
-# that node end to end: `node image`, `create`, `enrol`, `add`, `update`,
-# `remove --yes`, `exec` and `login <node> <tool> --events` hand their parsed
-# arguments to `capabilities node`, after the gates this capability passes them
-# through, and the manager answers them as they have always answered here.
-# deployment keeps the node Coolify builds on its server from a repository
-# (`node create --repository`), which is a Coolify application of the same
-# keys and volumes whose row the manager's verbs then reach as any other.
+# that node end to end (`capabilities node`); its forms here refuse as moved
+# (MOVED). deployment keeps the node Coolify builds on its server from a
+# repository (`node create --repository`), which is a Coolify application of
+# the same keys and volumes whose row the manager's verbs then reach as any
+# other.
 AGENT_NODE_IMAGE = "ghcr.io/agenium-dev/agent-node"
 AGENT_NODE_ROOT = "/app"
 AGENT_NODE_MEMORY = "2g"
@@ -7764,7 +7423,7 @@ def _agent_node_create(root, args):
               "environment": {"project": args.project, "name": args.environment},
               "volumes": [{"name": name, "path": path} for name, path in AGENT_NODE_VOLUMES],
               "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"],
-              "next": f"deployment node enrol {node_id}"}
+              "next": f"capabilities node enrol {node_id}"}
     answer.update({"resource": {"kind": kind, "uuid": resource}, "deployment": deployment,
                    "host_paths": build["mounts"],
                    "wait": f"coolify wait {resource} --deployment {deployment} "
@@ -7772,80 +7431,66 @@ def _agent_node_create(root, args):
     return answer
 
 
-def _node_forwarded(args):
-    """Whether this `node` invocation is one the manager answers: everything
-    about the standard agent node but a sign-in, which `cmd_node_login` hands
-    over once its own shape is settled."""
+# --- Verbs that moved to the capabilities manager -----------------------------
+# The standard agent node, the list of an agent's nodes and the handover of an
+# older deployment's launchd agents are the manager's alone. Each form of them
+# here refuses, exit 6 moved, naming the manager command that does its work, and
+# runs nothing in its place: (that command, how it is used).
+MOVED = {
+    "node image": ("capabilities node image", "capabilities node image [--json]"),
+    "node create": ("capabilities node create",
+                    "capabilities node create <label> --project <uuid> --server <uuid> "
+                    "--environment <name> [--version <tag>] [--memory 2g] "
+                    "[--connection <id> | --coolify-stdin]"),
+    "node enrol": ("capabilities node enrol",
+                   "capabilities node enrol <node> [--services <name,...>] [--wait 300] "
+                   "[--coolify-stdin]"),
+    "node add": ("capabilities node add",
+                 "capabilities node add <label> --server <uuid> [--version <tag>] "
+                 "[--memory 2g] [--services <name,...>] [--project <uuid>] "
+                 "[--environment production] [--connection <id>] [--wait 600] [--events] "
+                 "[--coolify-stdin]"),
+    "node update": ("capabilities node update <node> --version <tag>",
+                    "capabilities node update <node> --version <tag> [--memory <size>] "
+                    "[--wait 600] [--coolify-stdin]"),
+    "node remove": ("capabilities node remove <node> --yes",
+                    "capabilities node remove <node> --yes [--coolify-stdin]"),
+    "node exec": ("capabilities node exec",
+                  "capabilities node exec <node> -- <command> [<arg>...]"),
+    "node login": ("capabilities node login <node> <tool> --events",
+                   "capabilities node login <node> claude|codex|gh|<capability> "
+                   "[--connection <id>] [--method <id>] --events"),
+    "node list": ("capabilities node list",
+                  "capabilities node list lists this agent's nodes, and capabilities agent "
+                  "state <id|slug> says which of them are live"),
+    "handover": ("capabilities node install --apply",
+                 "capabilities node install answers what it would hand over; with --apply "
+                 "it hands this Mac's old agents over and loads the node manager"),
+}
+
+
+def _moved_form(args) -> str | None:
+    """The moved form this invocation is, or None for one answered here: a
+    `node create` of the node built from a repository, `node login claude|codex`
+    with a terminal, and every other verb."""
+    if args.cmd == "handover":
+        return "handover"
     if args.cmd != "node":
-        return False
-    if args.node_cmd in ("image", "enrol", "add", "update", "exec"):
-        return True
+        return None
+    form = f"node {args.node_cmd}"
     if args.node_cmd == "create":
-        return not _agent_node_built(args)
-    return args.node_cmd == "remove" and bool(args.yes)
+        return None if _agent_node_built(args) else form
+    if args.node_cmd == "login":
+        # With two words the first names a node: `node login <node> <tool>`.
+        return form if any(getattr(args, key, None)
+                           for key in ("tool", "events", "connection", "method")) else None
+    return form if form in MOVED else None
 
 
-def _node_forward(args):
-    """Run the manager's `capabilities node` for this invocation in this
-    process's place: its standard input, output, error, exit code and signals
-    are this command's own."""
-    sub = args.node_cmd
-    argv = ["node", sub]
-    def value(flag, given):
-        if given is not None:
-            argv.append(f"{flag}={given}")
-    def flag(name, given):
-        if given:
-            argv.append(name)
-    if sub == "image":
-        flag("--json", args.json)
-    elif sub == "create":
-        for name in ("project", "server", "environment", "version", "memory", "connection"):
-            value("--" + name, getattr(args, name))
-    elif sub == "enrol":
-        value("--services", args.services)
-        value("--wait", args.wait)
-    elif sub == "add":
-        for name in ("server", "version", "memory", "project", "environment", "services",
-                     "connection", "wait"):
-            value("--" + name, getattr(args, name))
-        flag("--events", args.events)
-    elif sub == "update":
-        for name in ("version", "memory", "wait"):
-            value("--" + name, getattr(args, name))
-    elif sub == "remove":
-        flag("--yes", args.yes)
-    elif sub == "login":
-        flag("--events", args.events)
-        value("--connection", args.connection)
-        value("--method", args.method)
-    flag("--coolify-stdin", getattr(args, "coolify_stdin", False))
-    # The node (and a sign-in's tool) after `--`, where no word is an option;
-    # for `node exec` what it runs follows the node and `--`.
-    if sub == "exec":
-        argv += [args.node, "--", *args.argv]
-    elif sub == "login":
-        argv += ["--", args.harness, args.tool]
-    elif sub != "image":
-        argv += ["--", args.node]
-    manager = _manager_executable()
-    if manager is None:
-        raise NodeFailure("node_command_failed", "`capabilities node` could not complete")
-    sys.stdout.flush()
-    sys.stderr.flush()
-    try:
-        os.execv(manager, [manager, *argv])
-    except OSError:
-        raise NodeFailure("node_command_failed", "`capabilities node` could not complete")
-
-
-def cmd_node_remove(args):
-    """`node remove <node>` without --yes: the confirmation it asks for. With
-    --yes the manager removes the node."""
-    _root()
-    _agent_node_name(args.node)
-    raise NodeFailure("confirmation_required", "node remove deletes the node's resource "
-                      "and its volumes; pass --yes", 6)
+def _refuse_moved(form: str) -> NoReturn:
+    command, usage = MOVED[form]
+    _die(6, "moved", f"`deployment {form}` has moved to the capabilities manager: "
+         f"`{command}` does its work", usage)
 
 
 def _memory_attributes(root):
@@ -7997,6 +7642,44 @@ def main(argv: list[str] | None = None) -> None:
         split = argv.index("--")
         argv, node_command = argv[:split], argv[split + 1:]
 
+    # The first pass tells a moved form from a kept one; a `node create` given
+    # a flag of the node built from a repository is parsed again as before.
+    args, extra = _parser(lenient=True).parse_known_args(argv)
+    moved = _moved_form(args)
+    if moved:
+        # A sign-in or an add asked for events hears the refusal as one.
+        if getattr(args, "events", False):
+            _events_begin()
+        _refuse_moved(moved)
+    if args.cmd == "node" and args.node_cmd == "create":
+        args, extra = _parser().parse_known_args(argv)
+    if extra:
+        _die(6, "input", f"unknown arguments: {' '.join(extra)}")
+    args.service_command = service_command
+    args.argv = node_command
+    # A write verb and a runner, whose supervisor starts and stops a service,
+    # change the project or its machine; a preview (--check, --dry-run) only
+    # reads.
+    previews = getattr(args, "check", False) or getattr(args, "dry_run", False)
+    if (args.cmd in WRITE_VERBS or args.cmd == "runner") and not previews:
+        _read_only_gate(f"`{NAME} {args.cmd}`")
+    if args.cmd == "machine" and args.machine_cmd == "handover" and not previews:
+        _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
+    if args.cmd == "node" and args.node_cmd in ("sync", "login", "create"):
+        _read_only_gate(f"`deployment node {args.node_cmd}`")
+    try:
+        if getattr(args, "coolify_stdin", False):
+            _node_lend()
+        args.fn(args)
+    except NodeFailure as e:
+        _die(e.exit_code, e.code, e.message)
+    except StoreError as e:
+        _die(6, e.slug, e.message, e.hint)
+
+
+def _parser(lenient: bool = False) -> argparse.ArgumentParser:
+    """The command line. `lenient` takes `node create` without its required
+    arguments, to tell the node built from a repository from a moved form."""
     parser = argparse.ArgumentParser(prog=NAME, add_help=False)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -8038,9 +7721,7 @@ def main(argv: list[str] | None = None) -> None:
     p_doctor.add_argument("--target")
     p_doctor.set_defaults(fn=cmd_doctor)
 
-    p_handover = sub.add_parser("handover", add_help=False)
-    p_handover.add_argument("--dry-run", action="store_true")
-    p_handover.set_defaults(fn=cmd_handover)
+    sub.add_parser("handover", add_help=False)
 
     p_runner = sub.add_parser("runner", add_help=False)
     p_runner.add_argument("name")
@@ -8084,10 +7765,10 @@ def main(argv: list[str] | None = None) -> None:
         p.set_defaults(fn=fn)
     node = sub.add_parser("node", add_help=False).add_subparsers(dest="node_cmd", required=True)
     p = node.add_parser("create", add_help=False)
-    p.add_argument("node")
-    p.add_argument("--project", required=True)
-    p.add_argument("--server", required=True)
-    p.add_argument("--environment", required=True)
+    p.add_argument("node", nargs="?" if lenient else None)
+    p.add_argument("--project", required=not lenient)
+    p.add_argument("--server", required=not lenient)
+    p.add_argument("--environment", required=not lenient)
     p.add_argument("--version")
     p.add_argument("--repository")
     p.add_argument("--branch")
@@ -8101,44 +7782,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--connection")
     p.add_argument("--coolify-stdin", action="store_true")
     p.set_defaults(fn=cmd_node_create)
-    p = node.add_parser("enrol", add_help=False)
-    p.add_argument("node")
-    p.add_argument("--services", default="")
-    p.add_argument("--wait", type=int, default=300)
-    p.add_argument("--coolify-stdin", action="store_true")
-    p.set_defaults(fn=_node_forward)
-    p = node.add_parser("add", add_help=False)
-    p.add_argument("node")
-    p.add_argument("--server", required=True)
-    p.add_argument("--version")
-    p.add_argument("--memory", default=AGENT_NODE_MEMORY)
-    p.add_argument("--project")
-    p.add_argument("--environment", default="production")
-    p.add_argument("--services", default="")
-    p.add_argument("--connection")
-    p.add_argument("--wait", type=int, default=600)
-    p.add_argument("--events", action="store_true")
-    p.add_argument("--coolify-stdin", action="store_true")
-    p.set_defaults(fn=_node_forward)
-    p = node.add_parser("update", add_help=False)
-    p.add_argument("node")
-    p.add_argument("--version", required=True)
-    p.add_argument("--memory")
-    p.add_argument("--wait", type=int, default=600)
-    p.add_argument("--coolify-stdin", action="store_true")
-    p.set_defaults(fn=_node_forward)
-    p = node.add_parser("remove", add_help=False)
-    p.add_argument("node")
-    p.add_argument("--yes", action="store_true")
-    p.add_argument("--coolify-stdin", action="store_true")
-    p.set_defaults(fn=cmd_node_remove)
-    p = node.add_parser("exec", add_help=False)
-    p.add_argument("node")
-    p.set_defaults(fn=_node_forward)
-    node.add_parser("list", add_help=False).set_defaults(fn=cmd_node_list)
-    p = node.add_parser("image", add_help=False)
-    p.add_argument("--json", action="store_true")
-    p.set_defaults(fn=_node_forward)
+    # The manager's verbs: whatever follows them, they refuse as moved.
+    for verb in ("image", "enrol", "add", "update", "remove", "exec", "list"):
+        p = node.add_parser(verb, add_help=False)
+        p.add_argument("node", nargs="?")
+        if verb == "add":
+            p.add_argument("--events", action="store_true")
     for verb, fn in (("status", cmd_node_status), ("sync", cmd_node_sync), ("login", cmd_node_login)):
         p = node.add_parser(verb, add_help=False)
         p.add_argument("--target")
@@ -8152,38 +7801,7 @@ def main(argv: list[str] | None = None) -> None:
             p.add_argument("--connection")
             p.add_argument("--method")
         p.set_defaults(fn=fn)
-
-    args, extra = parser.parse_known_args(argv)
-    if extra:
-        _die(6, "input", f"unknown arguments: {' '.join(extra)}")
-    args.service_command = service_command
-    args.argv = node_command
-    # A write verb, a handover, which takes launchd agents down, and a runner,
-    # whose supervisor starts and stops a service, change the project or its
-    # machine; a preview (--check, --dry-run) only reads.
-    previews = getattr(args, "check", False) or getattr(args, "dry_run", False)
-    if (args.cmd in WRITE_VERBS or args.cmd in ("handover", "runner")) and not previews:
-        _read_only_gate(f"`{NAME} {args.cmd}`")
-    if args.cmd == "machine" and args.machine_cmd == "handover" and not previews:
-        _read_only_gate(f"`{NAME} machine {args.machine_cmd}`")
-    # A sign-in asked for events speaks them from here on, refusals included.
-    if args.cmd == "node" and args.node_cmd in ("login", "add") and args.events:
-        _events_begin()
-    if args.cmd == "node" and args.node_cmd in ("sync", "login", "add", "create", "enrol",
-                                             "update", "remove", "exec"):
-        _read_only_gate(f"`deployment node {args.node_cmd}`")
-    try:
-        # The standard agent node is the manager's: it reads a lent connection
-        # itself.
-        if _node_forwarded(args):
-            _node_forward(args)
-        if getattr(args, "coolify_stdin", False):
-            _node_lend()
-        args.fn(args)
-    except NodeFailure as e:
-        _die(e.exit_code, e.code, e.message)
-    except StoreError as e:
-        _die(6, e.slug, e.message, e.hint)
+    return parser
 
 
 if __name__ == "__main__":

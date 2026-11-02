@@ -1,8 +1,8 @@
 """A node Coolify builds from a repository: `deployment node create --repository`
 drives coolify for the application and the manager for the node row. The node
 of the standard image, and every verb that reaches a node once it exists, is
-the manager's (`capabilities node`), tested in its own suite; deployment hands
-those forms to it."""
+the manager's (`capabilities node`), tested in its own suite; deployment
+refuses those forms as moved, naming the manager command."""
 from __future__ import annotations
 
 import importlib.machinery
@@ -367,68 +367,84 @@ def test_a_lent_connection_is_a_url_and_a_token_on_stdin(lab, monkeypatch, given
     assert refused.value.code == "input" and "a b" not in refused.value.message
 
 
-FORWARDED = [
-    (["node", "image", "--json"], ["node", "image", "--json"]),
+MOVED = [
+    (["node", "image", "--json"], "capabilities node image"),
     (["node", "create", "box1", "--project", "prj-uuid", "--server", "srv-uuid",
-      "--environment", "test", "--coolify-stdin"],
-     ["node", "create", "--project=prj-uuid", "--server=srv-uuid", "--environment=test",
-      "--memory=2g", "--coolify-stdin", "--", "box1"]),
-    (["node", "enrol", "box1"], ["node", "enrol", "--services=", "--wait=300", "--", "box1"]),
-    (["node", "add", "box1", "--server", "srv-uuid", "--version", "0.0.2", "--events",
-      "--coolify-stdin"],
-     ["node", "add", "--server=srv-uuid", "--version=0.0.2", "--memory=2g",
-      "--environment=production", "--services=", "--wait=600", "--events", "--coolify-stdin",
-      "--", "box1"]),
+      "--environment", "test", "--coolify-stdin"], "capabilities node create"),
+    (["node", "create", "box1"], "capabilities node create"),
+    (["node", "enrol", "box1"], "capabilities node enrol"),
+    (["node", "add", "box1", "--server", "srv-uuid", "--version", "0.0.2", "--coolify-stdin"],
+     "capabilities node add"),
     (["node", "update", "box1", "--version", "0.0.2", "--memory", "4g"],
-     ["node", "update", "--version=0.0.2", "--memory=4g", "--wait=600", "--", "box1"]),
-    (["node", "remove", "box1", "--yes"], ["node", "remove", "--yes", "--", "box1"]),
-    (["node", "exec", "box1", "--", "ls", "--all"], ["node", "exec", "box1", "--", "ls", "--all"]),
-    (["node", "login", "box1", "whatsapp", "--connection", "main", "--events"],
-     ["node", "login", "--events", "--connection=main", "--", "box1", "whatsapp"]),
+     "capabilities node update <node> --version <tag>"),
+    (["node", "update", "box1"], "capabilities node update <node> --version <tag>"),
+    (["node", "remove", "box1", "--yes"], "capabilities node remove <node> --yes"),
+    (["node", "remove", "box1"], "capabilities node remove <node> --yes"),
+    (["node", "exec", "box1", "--", "ls", "--all"], "capabilities node exec"),
+    (["node", "login", "box1", "gh"], "capabilities node login <node> <tool> --events"),
+    (["node", "login", "box1", "gh", "--target", "test"],
+     "capabilities node login <node> <tool> --events"),
+    (["node", "login", "claude", "--connection", "main"],
+     "capabilities node login <node> <tool> --events"),
+    (["node", "list"], "capabilities node list"),
+    (["handover", "--dry-run"], "capabilities node install --apply"),
 ]
 
 
-@pytest.mark.parametrize("given, handed", FORWARDED)
-def test_the_standard_node_is_handed_to_the_manager_with_every_argument_and_stdin(
-        lab, monkeypatch, given, handed):
-    monkeypatch.setattr(lab.m, "_gate", lambda: None)
-    monkeypatch.setattr(lab.m, "_contract", lambda argv: None)
-    monkeypatch.setattr(lab.m, "_manager_executable", lambda: "/manager")
-    monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO('{"url": "https://c.invalid"}'))
-    ran = []
-
-    def execv(path, argv):
-        ran.append(argv)
-        raise SystemExit(0)
-    monkeypatch.setattr(lab.m.os, "execv", execv)
-    try:
-        with pytest.raises(SystemExit):
-            lab.m.main(given)
-    finally:
-        lab.m._EVENTS_ON[0] = False
-    assert ran == [["/manager", *handed]]
-    # A lent connection is the manager's to read.
-    assert lab.m.sys.stdin.read() == '{"url": "https://c.invalid"}'
-    assert not lab.fake.calls
-
-
-@pytest.mark.parametrize("given, code", [
-    (["node", "remove", "box1"], "confirmation_required"),
-    (["node", "create", "box1", "--project", "prj-uuid", "--server", "srv-uuid",
-      "--environment", "test", "--version", "0.0.1", "--docker-socket"], "input"),
-    (["node", "create", "box1", "--project", "prj-uuid", "--server", "srv-uuid",
-      "--environment", "test", "--version", "0.0.1", "--branch", ""], "input"),
-    (["node", "login", "box1", "gh", "--events", "--target", "test"], "input"),
-    (["node", "login", "box1", "gh"], "input"),
-])
-def test_what_stays_here_is_answered_here(lab, monkeypatch, capsys, given, code):
+def _main(lab, monkeypatch, given):
     monkeypatch.setattr(lab.m, "_gate", lambda: None)
     monkeypatch.setattr(lab.m, "_contract", lambda argv: None)
     monkeypatch.setattr(lab.m.os, "execv", lambda path, argv: pytest.fail("handed over"))
     try:
-        with pytest.raises(SystemExit) as refused:
+        with pytest.raises(SystemExit) as stopped:
             lab.m.main(given)
     finally:
         lab.m._EVENTS_ON[0] = False
-    assert refused.value.code == 6
+    return stopped.value.code
+
+
+@pytest.mark.parametrize("given, command", MOVED)
+def test_a_form_the_manager_owns_refuses_as_moved_and_runs_nothing(
+        lab, monkeypatch, capsys, given, command):
+    monkeypatch.setattr(lab.m.sys, "stdin", io.StringIO('{"url": "https://c.invalid"}'))
+    # Under the read-only switch too: it is refused for having moved.
+    monkeypatch.setenv("CAPABILITIES_READ_ONLY", "1")
+    assert _main(lab, monkeypatch, given) == 6
+    out, err = capsys.readouterr()
+    error = json.loads(err.splitlines()[-1])["error"]
+    assert error["code"] == "moved" and f"`{command}`" in error["message"]
+    assert error["hint"].startswith("capabilities ")
+    assert out == ""
+    # Nothing ran and nothing was read: no coolify, ssh or manager, no stdin.
+    assert not lab.fake.calls
+    assert lab.m.sys.stdin.read() == '{"url": "https://c.invalid"}'
+
+
+@pytest.mark.parametrize("given", [
+    ["node", "add", "box1", "--server", "srv-uuid", "--events"],
+    ["node", "login", "box1", "whatsapp", "--connection", "main", "--events"],
+])
+def test_under_events_the_moved_refusal_is_the_streams_error(lab, monkeypatch, capsys, given):
+    assert _main(lab, monkeypatch, given) == 6
+    out, _err = capsys.readouterr()
+    [event] = [json.loads(line) for line in out.splitlines()]
+    assert (event["event"], event["exit"], event["error"]["code"]) == ("error", 6, "moved")
+    assert not lab.fake.calls
+
+
+@pytest.mark.parametrize("given, code", [
+    (["node", "create", "box1", "--project", "prj-uuid", "--server", "srv-uuid",
+      "--environment", "test", "--version", "0.0.1", "--docker-socket"], "input"),
+    (["node", "create", "box1", "--project", "prj-uuid", "--server", "srv-uuid",
+      "--environment", "test", "--version", "0.0.1", "--branch", ""], "input"),
+    (["node", "login", "box1"], "input"),
+])
+def test_what_stays_here_is_answered_here(lab, monkeypatch, capsys, given, code):
+    assert _main(lab, monkeypatch, given) == 6
     assert json.loads(capsys.readouterr().err.splitlines()[-1])["error"]["code"] == code
+
+
+def test_a_repository_node_still_takes_its_required_arguments(lab, monkeypatch, capsys):
+    # Parsed as it always was: argparse names what is missing.
+    assert _main(lab, monkeypatch, ["node", "create", "box1", "--repository", "r"]) == 2
+    assert "--project, --server, --environment" in capsys.readouterr().err

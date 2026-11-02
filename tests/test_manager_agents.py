@@ -1115,12 +1115,10 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
         (bundle / name).write_text("#!/bin/sh\n")
         (bundle / "manifest.json").write_text(json.dumps({"name": name, "service": service}))
     tools = lab.tmp / "tools"
-    _fake_tool(tools, "deployment", "import json, os\nprint(json.dumps({'ok': True, "
-               f"'agent_id': {PROJECT_ID!r}, 'live_within_seconds': 180, 'nodes': ["
-               f"{{'node': {nid('box-one')!r}, 'live': True}}, "
-               f"{{'node': {nid('box-two')!r}, 'live': False}}, "
-               f"{{'node': {nid('mac-one')!r}, 'live': False}}]}}))\n"
-               "open(os.environ['STATE_CALLS'], 'a').write(os.getcwd() + '\\n')\n")
+    # Liveness is the manager's own reading: a deployment on PATH is never run.
+    _fake_tool(tools, "deployment", "import os, sys\n"
+               "open(os.environ['STATE_CALLS'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+               "sys.exit(9)\n")
     _fake_tool(tools, "coolify", "import json, sys\nassert sys.argv[1:] == ['--connection', "
                "'infra', 'servers', 'srv-uuid'], sys.argv\n"
                "print(json.dumps({'uuid': 'srv-uuid', 'ip': '198.51.100.7'}))\n")
@@ -1138,10 +1136,10 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
     before = lab.sql(nodes_now)
     answer = state(PROJECT_ID)
     assert (answer["agent_id"], answer["this_node"]) == (PROJECT_ID, nid("box-one"))
-    assert answer["liveness"] == {"by": "deployment node list",
+    assert answer["liveness"] == {"by": "capabilities agent state",
                                   "folder": str(lab.project.resolve()),
                                   "live_within_seconds": 180, "reason": None}
-    assert calls.read_text().splitlines() == [str(lab.project.resolve())]
+    assert not calls.exists()
     nodes = {n["node"]: n for n in answer["nodes"]}
     assert list(nodes) == [nid("box-one"), nid("box-two"), nid("mac-one")]
     one, two, mac = nodes[nid("box-one")], nodes[nid("box-two")], nodes[nid("mac-one")]
@@ -1175,7 +1173,7 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
          "placed_on": [nid("box-two")], "holders": [nid("box-two")]}]
 
     # By slug, from outside any project, under the read-only switch: the same
-    # read, with no folder of the agent on this node to ask deployment in.
+    # read, with no folder of the agent on this node to read its cadence in.
     elsewhere = lab.tmp / "elsewhere"
     elsewhere.mkdir()
     result = subprocess.run(
@@ -1192,7 +1190,7 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
     assert remote["liveness"]["reason"] == "no_folder_here"
     assert all(n["live"] is None for n in remote["nodes"])
     assert [n["placed"] for n in remote["nodes"]] == [["tasks"], ["tasks", "telegram"], []]
-    assert calls.read_text().splitlines() == [str(lab.project.resolve())]
+    assert not calls.exists()
     assert lab.sql(nodes_now) == before
 
     code, error = lab.refused("agent", "state", "nobody", PATH=path)

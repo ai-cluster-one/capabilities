@@ -1004,11 +1004,17 @@ PROJECT VERBS (run inside a consuming project)
         services [{capability, placement, nodes, placed_on, holders}],
         store}. address is the node's row's, else the ip of the Coolify
         server it was created on (`coolify servers`, through its
-        connection). live is deployment's answer (`deployment node list`
-        in the agent's folder on this machine); where deployment is not
-        installed or the agent has no folder here it is null and
-        liveness.reason says why. A gate is read from the store's policy
-        rows highest first - the agent's row for the node, its row for every
+        connection). live is whether the node was seen within three
+        reconciles of now (liveness.live_within_seconds: 3 x
+        service_policy.reconcile_seconds of deployment/runtime.json in the
+        agent's folder on this machine, default 60): every supervisor of the
+        node manager, on a Mac and on a box alike, reports its node seen each
+        reconcile, and a node never seen is not live. Whether a given service
+        runs is not this: its live lease is. Where the agent has no folder
+        here (no_folder_here) or that runtime.json cannot be read
+        (bad_runtime) live is null and liveness.reason says why. A gate is
+        read from the store's policy rows highest first - the agent's row for
+        the node, its row for every
         node, the global rows likewise (node names the node a row was for),
         this machine's ceiling on this node alone - and is disabled by
         default; it names every capability a row names. placed is the
@@ -1162,7 +1168,7 @@ PROJECT VERBS (run inside a consuming project)
         else its host name), and, where AGENT_NODE_ID is set, overridden_by
         and warnings [{code node_id_in_environment, variable, value, message,
         hint}]: only a node still keyed by its name from before ids needs it.
-        --set <id> writes that file (`deployment node enrol` sets the id a
+        --set <id> writes that file (`node enrol` sets the id a
         server was created with); refused on a Mac (node_id_derived) and
         under the read-only switch. No project is needed.
   node add <id> --label TEXT --kind mac|server [--address HOST]
@@ -1187,7 +1193,7 @@ PROJECT VERBS (run inside a consuming project)
         the resource, all three or none (exit 6
         coolify_incomplete); the token stays in that connection.
         --public-key is the node's X25519 public key, its 32 bytes in base64
-        (`deployment node enrol` records it). An agent has at most one
+        (`node enrol` records it). An agent has at most one
         master: --master while another node is master exits 6 master_exists
         naming it. A node already registered exits 6 node_exists. Answers
         {ok, project, agent_id, node, changed, store}.
@@ -1224,10 +1230,11 @@ PROJECT VERBS (run inside a consuming project)
              [--method <id>] --events
         The standard agent node: a Coolify resource of a store-only agent
         running ghcr.io/agenium-dev/agent-node, which carries no agent and
-        no secret. `deployment node` with the same arguments hands these
-        forms to the manager and answers exactly as they do; it keeps only
-        the node Coolify builds from a repository (`deployment node create
-        --repository`), whose row these verbs reach as any other. Coolify is
+        no secret. These forms are the manager's alone: `deployment node`
+        refuses each of them (exit 6 moved, naming the command here) and
+        keeps only the node Coolify builds from a repository (`deployment
+        node create --repository`), whose row these verbs reach as any
+        other. Coolify is
         reached only through the coolify capability's CLI, with the
         connection the node's row names, the one coolify connection granted
         (or --connection), or --coolify-stdin: a connection lent for this run
@@ -1314,8 +1321,7 @@ PROJECT VERBS (run inside a consuming project)
         Report this node up: set its last_seen_at to the store's now. The
         node is the one this process runs on (`node id`); a node reports
         itself and no other. `node run` and every `node supervise` run it on
-        each reconcile, and `deployment help` says when a node counts as
-        live.
+        each reconcile, and `agent state` says when a node counts as live.
         Answers {ok, project, agent_id, node, last_seen_at, store}. Exit 6
         node_unknown for a node not registered.
   node state
@@ -1602,16 +1608,35 @@ PROJECT VERBS (run inside a consuming project)
         the PATH this shell has, at every login. Before it loads, every
         folder whose services it will run - this agent's and each agent the
         store links to this node whose folder here is bound to it - hands its
-        old host agents over (`deployment handover` there), so no service
-        runs twice. A service a loaded old agent runs that nothing places -
+        old host agents over, so no service runs twice: each loaded launchd
+        agent an older deployment's host-agents compilation left in the
+        folder's compiler.host.agents_dir (deployment/launchd by default) -
+        every service agent and the project watchdog, not the agents that
+        carry the body to a node - and every other agent in
+        ~/Library/LaunchAgents or that folder whose program or working
+        directory lies inside the folder, whatever compiled it, where its
+        label ends in `watchdog` or in the name of an installed capability
+        that bundles a service, is booted out and its entry taken out of
+        ~/Library/LaunchAgents, so a login does not load it again (a link is
+        removed; a file put there by hand is kept beside the agents as
+        <label>.plist.handed-over). Such an agent that runs neither is
+        reported as kind other and left running, the node manager's own
+        agents (capabilities.*) are never touched, and the compiled files
+        stay. Each agent is answered as {label, kind (service | watchdog |
+        other), service?, loaded, installed, action (handed_over,
+        would_hand_over, kept, absent, or failed with step and detail),
+        kept_at?}. A service a loaded old agent runs that nothing places -
         an exclusive one placed on no node, a shared one not on this one - is
         first placed on this node (`capabilities place <name> --node <this
         node>` there), so the migration stops no service that was running;
         where that fails the folder's agents are not handed over. The machine
         services it will run here - placed on this node in mode shared by an
         agent it serves, declaring a machine command - hand their old machine
-        agents over too (`deployment machine handover <name> ...`, once,
-        answered as machine_handover {services, agents, error?}). Before
+        agents over too, once: each loaded capabilities.machine.<name> an
+        older deployment compiled into $XDG_STATE_HOME/deployment/machine/
+        launchd/, and the capabilities.machine.watchdog with them once no
+        other machine service agent stays loaded, answered as
+        machine_handover {services, agents, error?}. Before
         that, every agent it serves that is on a machine service's list here
         (service.machine.projects) and not placed on this node in mode shared
         is placed so (`capabilities place <name> --node <this node> --mode
@@ -5464,7 +5489,7 @@ def _runner_move(staged: Path) -> tuple[dict | None, dict | None]:
     else:
         reason = "this machine's supervisor still runs `deployment runner` programs"
         step = ("only a redeploy onto the agent-node image, whose supervisor runs "
-                "`capabilities node run`, moves it (`deployment node update <node> "
+                "`capabilities node run`, moves it (`capabilities node update <node> "
                 "--version <release>`); then `capabilities update deployment`")
     kept = {"reason": f"{reason}, and the deployment update would remove the runner they "
                       "need, so deployment keeps the payload it has",
@@ -10810,7 +10835,7 @@ def _agent_state(ref: str) -> dict:
             bool(enabled), bool(service))
     names = sorted({name for _own, name, *_rest in policy})
     folder = _agent_folder_here(agent_id, nodes, here)
-    liveness = _deployment_liveness(agent_id, folder)
+    liveness = _node_liveness(folder, ago)
     lease_rows = [{"node": node, "capability": name, "acquired_at": stamp(acquired),
                    "renewed_at": stamp(renewed), "expires_at": stamp(expires)}
                   for node, name, acquired, renewed, expires in leases]
@@ -10873,35 +10898,30 @@ def _agent_folder_here(agent_id: str, nodes: list[dict], here: str) -> Path | No
     return None
 
 
-def _deployment_liveness(agent_id: str, folder: Path | None) -> dict:
-    """Whether each node is live, as deployment defines it (`deployment node
-    list`, read in the agent's folder, whose runtime sets the window). Where it
-    cannot be asked here the answer is null with the reason, never a guess."""
-    out: dict = {"by": "deployment node list", "folder": str(folder) if folder else None,
+# A node is live while it was seen within this many reconciles: every supervisor
+# of the node manager, on a Mac and on a box alike, reports its node seen each
+# reconcile, so one missed report never reads as down.
+LIVE_RECONCILES = 3
+
+
+def _node_liveness(folder: Path | None, ago: dict) -> dict:
+    """Whether each node is live: seen within three reconciles of the agent's
+    folder on this machine, whose deployment/runtime.json sets the cadence
+    (service_policy.reconcile_seconds, default 60). `ago` is each node's
+    seconds since it was last seen, None for one never seen, which is not live.
+    Where the agent has no folder here, or its runtime cannot be read, the
+    answer is null with the reason, never a guess."""
+    out: dict = {"by": "capabilities agent state", "folder": str(folder) if folder else None,
                  "live_within_seconds": None, "reason": None, "nodes": {}}
-    deployment = shutil.which("deployment")
     if folder is None:
         return {**out, "reason": "no_folder_here"}
-    if not deployment:
-        return {**out, "reason": "deployment_unavailable"}
-    try:
-        result = subprocess.run([deployment, "node", "list"], cwd=folder, text=True,
-                                capture_output=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return {**out, "reason": f"deployment could not complete: {exc}"}
-    try:
-        answer = json.loads(result.stdout) if not result.returncode else None
-    except ValueError:
-        answer = None
-    if not isinstance(answer, dict) or answer.get("agent_id") != agent_id:
-        try:
-            reason = json.loads(result.stderr.strip().splitlines()[-1])["error"]["code"]
-        except (ValueError, KeyError, TypeError, IndexError):
-            reason = f"deployment node list exited {result.returncode}"
-        return {**out, "reason": reason}
-    return {**out, "live_within_seconds": answer.get("live_within_seconds"),
-            "nodes": {n.get("node"): n.get("live") for n in answer.get("nodes") or []
-                      if isinstance(n, dict)}}
+    runtime = folder / "deployment" / "runtime.json"
+    if runtime.exists() and not isinstance(_read_json(runtime), dict):
+        return {**out, "reason": "bad_runtime"}
+    within = _supervise_every(folder) * LIVE_RECONCILES
+    return {**out, "live_within_seconds": within,
+            "nodes": {node: seconds is not None and max(0, seconds) <= within
+                      for node, seconds in ago.items()}}
 
 
 def _node_address(row: dict, folder: Path | None) -> dict:
@@ -13843,6 +13863,194 @@ def _node_install_joined(folders: list[tuple[str, Path]], placed: list[tuple], h
     return out, failed
 
 
+# --- Handing an older deployment's launchd agents over -----------------------
+# On a Mac an older deployment compiled launchd agents of its own: in a project
+# of the host-agents profile one per service and a project watchdog, into the
+# folder's compiler.host.agents_dir, and for the services that run once per
+# machine one per service and a machine watchdog, into its state home. `node
+# install` takes them down before the node manager runs those services, so none
+# runs twice; the files they were compiled from stay.
+
+HANDOVER_GENERATED_MARKER = ("Generated by deployment sync "
+                             "(capabilities.deployment.generated.v1)")
+HANDOVER_MACHINE_PREFIX = "capabilities.machine"
+
+
+class _HandoverUnreadable(Exception):
+    """A compiled agent file that exists and cannot be read."""
+
+
+def _handover_inside(path: object, root: Path) -> bool:
+    """Whether an absolute path an agent names lies inside a folder."""
+    if not isinstance(path, str) or not path.startswith("/"):
+        return False
+    try:
+        Path(path).resolve().relative_to(root.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _handover_host(root: Path, runtime: dict) -> tuple[Path, str]:
+    """The folder deployment compiled a project's launchd agents into and the
+    prefix of their labels, as its runtime declares them (compiler.host)."""
+    compiler = runtime.get("compiler")
+    host = compiler.get("host") if isinstance(compiler, dict) else None
+    host = host if isinstance(host, dict) else {}
+    agents_dir = "deployment/launchd"
+    declared = host.get("agents_dir")
+    if (isinstance(declared, str) and declared and "\\" not in declared
+            and not Path(declared).is_absolute() and ".." not in Path(declared).parts
+            and declared != "."):
+        agents_dir = declared
+    prefix = host.get("label_prefix")
+    if not (isinstance(prefix, str) and prefix.strip()):
+        prefix = re.sub(r"[^a-z0-9]+", "-",
+                        str(runtime.get("name") or root.name).lower()).strip("-") or "project"
+    return root / agents_dir, prefix.strip()
+
+
+def _handover_labels(root: Path, runtime: dict | None) -> list[dict]:
+    """Each launchd agent of this folder that runs a service or watches one:
+    every service agent and the project watchdog an older deployment compiled
+    into its agents folder, not the agents that carry the body to a node; and
+    every other agent in ~/Library/LaunchAgents or that folder whose program
+    or working directory lies inside the project, whatever compiled it, such
+    as one an older compilation left under another label. Such an agent is a
+    service where its label ends in the name of an installed capability that
+    bundles one, the watchdog where it ends in `watchdog`, and otherwise
+    `other`, which is reported and left running. The node manager's own jobs
+    (`capabilities.*`) are never one."""
+    import plistlib
+    found: dict[str, dict] = {}
+    agents_dir, prefix = _handover_host(root, runtime or {})
+    if runtime is not None and str(runtime.get("profile") or "") == "host-agents":
+        for path in sorted(agents_dir.glob(f"{prefix}.*.plist")) if agents_dir.is_dir() else []:
+            label = path.stem
+            rest = label[len(prefix) + 1:]
+            try:
+                head = "\n".join(path.read_text().splitlines()[:3])
+            except FileNotFoundError:
+                head = ""
+            except OSError as exc:
+                raise _HandoverUnreadable(f"{path}: {exc}") from None
+            if rest.startswith("node-sync-") or HANDOVER_GENERATED_MARKER not in head:
+                continue
+            found[label] = ({"label": label, "kind": "watchdog"} if rest == "watchdog"
+                            else {"label": label, "kind": "service", "service": rest})
+    for directory in (_launch_agents_dir(), agents_dir):
+        for path in sorted(directory.glob("*.plist")) if directory.is_dir() else []:
+            try:
+                body = plistlib.loads(path.read_bytes())
+            except Exception:  # noqa: BLE001 - a file launchd could not read either
+                continue
+            label = body.get("Label") if isinstance(body, dict) else None
+            if (not isinstance(label, str) or not label or label in found
+                    or label.startswith("capabilities.")):
+                continue
+            name = label.rsplit(".", 1)[-1]
+            if name.startswith("node-sync"):
+                continue
+            argv = body.get("ProgramArguments")
+            program = body.get("Program") or (argv[0] if isinstance(argv, list) and argv
+                                              else None)
+            if not (_handover_inside(program, root)
+                    or _handover_inside(body.get("WorkingDirectory"), root)):
+                continue
+            if name == "watchdog":
+                found[label] = {"label": label, "kind": "watchdog"}
+            elif re.fullmatch(r"[a-z][a-z0-9_-]*", name) and _installed_service(name):
+                found[label] = {"label": label, "kind": "service", "service": name}
+            else:
+                found[label] = {"label": label, "kind": "other"}
+    return list(found.values())
+
+
+def _hand_over_agent(agent: dict, aside_dir: Path, dry_run: bool) -> dict:
+    """Boot one launchd agent out and take its entry out of ~/Library/
+    LaunchAgents, so a login does not load it again; an agent of kind `other`
+    is only reported. A file put there by hand is kept in `aside_dir`."""
+    domain = _launchd_domain()
+    label = agent["label"]
+    installed = _launch_agents_dir() / f"{label}.plist"
+    loaded = _launchctl("print", f"{domain}/{label}")[0] == 0
+    present = installed.is_symlink() or installed.exists()
+    entry = {**agent, "loaded": loaded, "installed": present}
+    if agent["kind"] == "other":
+        # Nothing the node manager runs takes its place, so it keeps running.
+        entry["action"] = "absent" if not loaded and not present else "kept"
+        return entry
+    if not loaded and not present:
+        entry["action"] = "absent"
+        return entry
+    if dry_run:
+        entry["action"] = "would_hand_over"
+        return entry
+    if loaded:
+        code, detail = _launchctl("bootout", f"{domain}/{label}")
+        if code != 0 and _launchctl("print", f"{domain}/{label}")[0] == 0:
+            entry.update(action="failed", step="bootout", detail=detail[:400])
+            return entry
+    if present:
+        try:
+            if installed.is_symlink():
+                installed.unlink()
+            else:
+                # A file someone put there by hand stays, beside the agents,
+                # rather than being lost.
+                aside_dir.mkdir(parents=True, exist_ok=True)
+                aside = aside_dir / f"{label}.plist.handed-over"
+                shutil.move(str(installed), str(aside))
+                entry["kept_at"] = str(aside)
+        except OSError as exc:
+            entry.update(action="failed", step="unlink", detail=str(exc)[:400])
+            return entry
+    entry["action"] = "handed_over"
+    return entry
+
+
+def _handover_failed(agents: list[dict]) -> str | None:
+    """What went wrong handing these agents over, or None where nothing did."""
+    failed = [f"{entry['label']} ({entry.get('step')}: {entry.get('detail')})"
+              for entry in agents if entry.get("action") == "failed"]
+    return ("could not hand over " + ", ".join(failed)) if failed else None
+
+
+def _project_handover(root: Path, dry_run: bool) -> list[dict]:
+    """Hand one folder's old host agents to the node manager; its agents as
+    each was handed over (or would be, with `dry_run`). Raises
+    _HandoverUnreadable where a compiled agent file cannot be read."""
+    runtime = _read_json(root / "deployment" / "runtime.json")
+    runtime = runtime if isinstance(runtime, dict) else None
+    found = _handover_labels(root, runtime)
+    aside = _handover_host(root, runtime or {})[0]
+    return [_hand_over_agent(agent, aside, dry_run) for agent in found]
+
+
+def _machine_handover(names: list[str], dry_run: bool) -> list[dict]:
+    """Hand the named machine services' old launchd agents to the node manager:
+    each capabilities.machine.<name> an older deployment compiled into this
+    machine's state home, and the machine watchdog with the last of them."""
+    state = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+    agents_dir = state / "deployment" / "machine" / "launchd"
+    prefix = f"{HANDOVER_MACHINE_PREFIX}."
+    watchdog = f"{prefix}watchdog"
+    labels = {path.stem for directory in (agents_dir, _launch_agents_dir())
+              if directory.is_dir() for path in directory.glob(f"{prefix}*.plist")}
+    agents = [_hand_over_agent({"label": f"{prefix}{name}", "kind": "service",
+                                "service": name}, agents_dir, dry_run)
+              for name in sorted(set(names))]
+    # The watchdog goes with the last machine service agent it watches.
+    gone = {entry["label"] for entry in agents
+            if entry["action"] in ("handed_over", "would_hand_over", "absent")}
+    staying = [label for label in sorted(labels - gone - {watchdog})
+               if _launchctl("print", f"{_launchd_domain()}/{label}")[0] == 0]
+    if not staying:
+        agents.append(_hand_over_agent({"label": watchdog, "kind": "watchdog"},
+                                       agents_dir, dry_run))
+    return agents
+
+
 def _node_install(args: list[str]) -> None:
     pos, opts = _kernel_options(args, set(), {"--apply", "--json"}, "node install")
     if pos:
@@ -13885,33 +14093,23 @@ def _node_install(args: list[str]) -> None:
                          "reason": "no folder on this node is bound to it"})
             continue
         folders.append((linked, path))
-    deployment = shutil.which("deployment")
     handovers, failed = [], []
     for linked, path in folders:
         entry: dict = {"agent_id": linked, "folder": str(path)}
-        if not deployment:
-            entry["agents"] = []
-            entry["note"] = "deployment is not installed, so no agent of its compiling runs here"
-            handovers.append(entry)
-            continue
 
-        def handover(dry_run: bool) -> dict | None:
-            rc, out, err = _run_script(Path(deployment),
-                                       ["handover", *(["--dry-run"] if dry_run else [])],
-                                       cwd=path, env=_snapshot_env(), timeout=300)
+        def handover(dry_run: bool) -> bool:
             try:
-                answer = json.loads(out) if out.strip() else None
-            except ValueError:
-                answer = None
-            if isinstance(answer, dict):
-                entry["agents"] = answer.get("agents") or []
-            if rc != 0 or not isinstance(answer, dict):
-                entry["error"] = (err or out).strip()[-1000:] or f"exit {rc}"
-                return None
-            return answer
+                entry["agents"] = _project_handover(path, dry_run)
+            except _HandoverUnreadable as exc:
+                entry["agents"] = []
+                entry["error"] = f"an old agent's file cannot be read: {exc}"
+                return False
+            said = _handover_failed(entry["agents"])
+            if said:
+                entry["error"] = said
+            return not said
 
-        answer = handover(True)
-        if answer is not None:
+        if handover(True):
             # A service an old agent runs here, and nothing places, is placed
             # here first, so the node manager runs it once the agent is gone.
             placing, error = _node_install_placements(path, entry["agents"], here, apply)
@@ -13941,20 +14139,12 @@ def _node_install(args: list[str]) -> None:
                       and capability not in joined_failed
                       and _machine_state(capability) != "quarantined"})
     machine_handover: dict | None = None
-    if machine and deployment:
-        machine_handover = {"services": machine}
-        rc, out, err = _run_script(Path(deployment),
-                                   ["machine", "handover", *machine,
-                                    *([] if apply else ["--dry-run"])],
-                                   cwd=root, env=_snapshot_env(), timeout=300)
-        try:
-            answer = json.loads(out) if out.strip() else None
-        except ValueError:
-            answer = None
-        machine_handover["agents"] = (answer.get("agents") or []
-                                      if isinstance(answer, dict) else [])
-        if rc != 0 or not isinstance(answer, dict):
-            machine_handover["error"] = (err or out).strip()[-1000:] or f"exit {rc}"
+    if machine:
+        machine_handover = {"services": machine,
+                            "agents": _machine_handover(machine, not apply)}
+        said = _handover_failed(machine_handover["agents"])
+        if said:
+            machine_handover["error"] = said
     manager = shutil.which("capabilities") or str(Path(sys.argv[0]).resolve())
     logs = _node_launchd_dir()
     plist = _launch_agents_dir() / f"{NODE_AGENT_LABEL}.plist"
@@ -13996,8 +14186,9 @@ def _node_install(args: list[str]) -> None:
         _service_fail("handover_incomplete",
                       "the node manager is loaded, and the old agents of "
                       + ", ".join(e["folder"] for e in failed) + " were not all handed over",
-                      "run `deployment handover` in that folder; until it hands an agent "
-                      "over, the node manager's job for that service waits for it", result)
+                      "settle the error named for each under handover and run `capabilities "
+                      "node install --apply` again; until it hands an agent over, the node "
+                      "manager's job for that service waits for it", result)
     if joined_failed:
         _service_fail("handover_incomplete",
                       "the node manager is loaded, and the agents on the machine lists of "
@@ -14009,9 +14200,9 @@ def _node_install(args: list[str]) -> None:
         _service_fail("handover_incomplete",
                       "the node manager is loaded, and the machine agents of "
                       + ", ".join(machine) + " were not all handed over",
-                      f"run `deployment machine handover {' '.join(machine)}`; until it "
-                      "hands an agent over, the node manager's job for that service "
-                      "waits for it", result)
+                      "settle the error named under machine_handover and run `capabilities "
+                      "node install --apply` again; until it hands an agent over, the node "
+                      "manager's job for that service waits for it", result)
     _emit(result)
 
 
@@ -17424,7 +17615,8 @@ def _agent_node_reach(root, row, write):
     """(target, host, container) for a node created as a Coolify resource."""
     if not row.get("coolify_resource"):
         raise NodeFailure("node_not_coolify", f"node {row.get('node')} is not a Coolify "
-                          "resource made by `deployment node create`", 6)
+                          "resource made by `capabilities node create` or `deployment node "
+                          "create --repository`", 6)
     target = _agent_node_target(row)
     entry = _node_connection(target, write)
     host = _node_server_host(root, target, entry, row["coolify_server"])
@@ -17707,7 +17899,7 @@ def _agent_node_create(root, args):
             "environment": {"project": args.project, "name": args.environment},
             "volumes": [{"name": name, "path": path} for name, path in AGENT_NODE_VOLUMES],
             "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"],
-            "next": f"deployment node enrol {node_id}"}
+            "next": f"capabilities node enrol {node_id}"}
 
 
 def _agent_node_services(value):
@@ -18333,7 +18525,8 @@ def cmd_node_remove(args):
     node = row["node"]
     if not row.get("coolify_resource"):
         raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
-                          "`deployment node create`", 6)
+                          "`capabilities node create` or `deployment node create "
+                          "--repository`", 6)
     target = _agent_node_target(row)
     entry = _node_connection(target, write=True)
     resource = row["coolify_resource"]
@@ -18517,7 +18710,8 @@ def cmd_node_update(args):
     node = row["node"]
     if not row.get("coolify_resource"):
         raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
-                          "`deployment node create`", 6)
+                          "`capabilities node create` or `deployment node create "
+                          "--repository`", 6)
     target = _agent_node_target(row)
     entry = _node_connection(target, write=True)
     resource = row["coolify_resource"]
