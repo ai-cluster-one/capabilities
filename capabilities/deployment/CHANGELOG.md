@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-02 — the standard agent node's verbs are the manager's; deployment hands them over
+
+`deployment node image`, `node create` (the node of the standard image), `node enrol`, `node add`, `node update`, `node remove --yes`, `node exec` and `node login <node> <tool> --events` no longer carry their own implementation: once deployment has parsed them and passed them through its gate, read-only switch and, for `--events`, the start of the event stream, it runs the capabilities manager's `capabilities node` form of the same verb in its place with every argument it parsed, so standard input (a connection lent with `--coolify-stdin`, the line that answers `code_needed`), output, the event stream, exit code and the signals that cancel a sign-in are the manager's. Each answers and refuses byte for byte as before. deployment keeps `node create --repository` (and every other flag of a node Coolify builds from a repository, whose refusals it still gives), `node remove <node>` without `--yes` (its `confirmation_required`), `node login claude|codex [--target] [--print-command]` and the shape refusals of `node login`, `node sync`, `node list` and `node status`. A manager that does not yet carry these forms refuses them; `capabilities self-update` brings it forward.
+
 ## 2026-11-02 — the service lease table's migration is the manager's alone
 
 `deployment_service_leases` is made and migrated only by the capabilities manager's `node supervise`, under the ledger entry `deployment` gave it, with the same two steps, so a store either made reads alike. deployment no longer declares tables: its manifest answers `tables: false`, `deployment migrate [status]` is gone, and installing or updating deployment migrates nothing. The runner an older launcher still starts under a manager too old to take its service makes no table and uses the one the store holds; `deployment services` and `node status` read the lease as before.

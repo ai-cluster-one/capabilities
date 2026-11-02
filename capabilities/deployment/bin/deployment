@@ -6535,30 +6535,6 @@ def _node_lend():
     _NODE_LENT.update(url=url.rstrip("/"), token=token)
 
 
-def _node_lent_address(value):
-    """Whether a node row's coolify connection is the address of a lent one."""
-    return isinstance(value, str) and re.match(r"https?://", value) is not None
-
-
-def _agent_node_target(row):
-    """The target a node is reached through: the connection its row names, or
-    the one lent to this run for the Coolify address the row names instead."""
-    recorded = row["coolify_connection"]
-    if _node_lent_address(recorded):
-        if not _NODE_LENT:
-            raise NodeFailure("coolify_connection_required", f"node {row['node']} was created "
-                              f"through a connection lent for {recorded}; lend it again with "
-                              "--coolify-stdin", 6)
-        if _NODE_LENT["url"] != recorded:
-            raise NodeFailure("lent_connection_mismatch", f"node {row['node']} was created on "
-                              f"{recorded}, not on {_NODE_LENT['url']}", 6)
-        return {"connection": None}
-    if _NODE_LENT:
-        raise NodeFailure("lent_connection_mismatch", f"node {row['node']} was created through "
-                          f"coolify connection {recorded!r}, not a lent one", 6)
-    return {"connection": recorded}
-
-
 def _node_origin(target):
     """What a node row records as the connection it was created through: the
     connection's id, or a lent connection's Coolify address."""
@@ -7226,8 +7202,10 @@ def cmd_node_login(args):
         if not getattr(args, "events", False):
             raise NodeFailure("input", "node login <node> speaks its sign-in as events; "
                               "pass --events", 6)
-        _node_login_events(args)
-        return
+        if args.target or args.print_command:
+            raise NodeFailure("input", "node login <node> takes neither --target nor "
+                              "--print-command", 6)
+        _node_forward(args)
     if args.harness not in ("claude", "codex"):
         raise NodeFailure("input", f"node login takes claude or codex, not {args.harness!r}", 6)
     root = _root()
@@ -7489,17 +7467,18 @@ def cmd_node_status(args):
     _emit(report)
 
 
-# --- An agent node from the standard image -----------------------------------
+# --- An agent node -----------------------------------------------------------
 # A node of a store-only agent is a Coolify resource running the one standard
-# image, which carries no agent and no secret. It is created knowing only the
-# agent's id and its root; enrolment then gives it its node id, a key pair of
-# its own, the store setting and the agent's secrets on its volumes, and the
-# placements that say which services run there. The node's row in the store
-# names the coolify connection, server and resource, so the node is reached and
-# removed through that connection, whose token stays in it.
+# image, which carries no agent and no secret. The capabilities manager owns
+# that node end to end: `node image`, `create`, `enrol`, `add`, `update`,
+# `remove --yes`, `exec` and `login <node> <tool> --events` hand their parsed
+# arguments to `capabilities node`, after the gates this capability passes them
+# through, and the manager answers them as they have always answered here.
+# deployment keeps the node Coolify builds on its server from a repository
+# (`node create --repository`), which is a Coolify application of the same
+# keys and volumes whose row the manager's verbs then reach as any other.
 AGENT_NODE_IMAGE = "ghcr.io/agenium-dev/agent-node"
 AGENT_NODE_ROOT = "/app"
-AGENT_NODE_SERVICE = "agent"
 AGENT_NODE_MEMORY = "2g"
 # The state the image keeps, each on a volume of the node's own: the store
 # setting, the secrets, the node key and the node id (.config), capability
@@ -7511,10 +7490,6 @@ AGENT_NODE_VOLUMES = (("config", "/home/agent/.config"),
                       ("claude", "/home/agent/.claude"),
                       ("codex", "/home/agent/.codex"),
                       ("work", "/home/agent/work"))
-# Under the node user's home, on its config volume.
-AGENT_NODE_KEY = ".config/agent-node/node-key.pem"
-AGENT_NODE_STATE = "/tmp/agent-node.state"
-AGENT_NODE_VERSION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
 # The standard image's current release is the newest version its registry
 # holds: a release publishes ghcr.io/agenium-dev/agent-node:<version> and moves
 # :latest to it, and the tags it pushes first for each architecture carry a
@@ -7522,7 +7497,6 @@ AGENT_NODE_VERSION = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")
 AGENT_NODE_REGISTRY = "https://ghcr.io"
 AGENT_NODE_RELEASE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 AGENT_NODE_MEMORY_LIMIT = re.compile(r"[1-9][0-9]*[bkmgBKMG]?")
-AGENT_NODE_PUBLIC_KEY = re.compile(r"[A-Za-z0-9+/]{43}=")
 COOLIFY_UUID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 # A node built on its server from a Dockerfile in a repository, FROM the
 # standard image, is a Coolify application instead of a Compose service. Only
@@ -7533,89 +7507,6 @@ AGENT_NODE_DOCKER_SOCKET = "/var/run/docker.sock"
 # An absolute path of named segments: no '.' or '..' segment, no ':' or ','.
 AGENT_NODE_PATH = re.compile(r"(?:/(?!\.\.?(?:/|$))[A-Za-z0-9._-]+)+")
 AGENT_NODE_BRANCH = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
-
-# Run in the node: make its X25519 key pair once, keep the private key on its
-# config volume, and print the public key's 32 bytes in base64.
-_AGENT_NODE_KEYGEN = (
-    'set -e; umask 077; key="$HOME/$1"; mkdir -p "$(dirname "$key")"; '
-    '[ -s "$key" ] || openssl genpkey -algorithm X25519 -out "$key" 2>/dev/null; '
-    'openssl pkey -in "$key" -pubout -outform DER | tail -c 32 | base64')
-
-# Run in the node: merge {capability: {KEY: value}} from stdin into each
-# capability's credentials file under the node's config home, mode 0600,
-# printing only how many keys each file took.
-_AGENT_NODE_SECRETS = r"""
-import json, os, re, sys, tempfile
-from pathlib import Path
-home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-written = {}
-for name, keys in json.load(sys.stdin).items():
-    if not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
-        continue
-    path = home / name / "credentials.env"
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    lines = path.read_text().splitlines() if path.is_file() else []
-    kept = [line for line in lines
-            if line.split("=", 1)[0].strip().removeprefix("export ").strip() not in keys]
-    body = "\n".join(kept + [f"{k}={v}" for k, v in sorted(keys.items())]) + "\n"
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".credentials.")
-    with os.fdopen(fd, "w") as f:
-        f.write(body)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
-    written[name] = len(keys)
-print(json.dumps(written))
-"""
-
-
-# Run in the node: set AGENT_ENCRYPTION_KEY, read from stdin, in the machine's
-# shared.env under the node's config home, mode 0600, every other line kept,
-# printing nothing. The node's root is not on a volume; its config home is.
-_AGENT_NODE_KEY = r"""
-import os, sys, tempfile
-from pathlib import Path
-key = sys.stdin.read().strip()
-if not key or "\n" in key:
-    sys.exit("no key came on stdin")
-path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "capabilities" / "shared.env"
-path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-lines = path.read_text().splitlines() if path.is_file() else []
-kept = [line for line in lines
-        if line.split("=", 1)[0].strip().removeprefix("export ").strip() != "AGENT_ENCRYPTION_KEY"]
-fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".shared.")
-with os.fdopen(fd, "w") as f:
-    f.write("\n".join(kept + ["AGENT_ENCRYPTION_KEY=" + key]) + "\n")
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
-"""
-
-
-def _agent_node_vault(root):
-    """(the agent's key as it resolves here, its fingerprint, the names its
-    vault holds that the key opens), or (None, None, set()) for an agent with
-    no key here. A key that is not the one the agent's vault is kept under is
-    refused: the node could read nothing with it."""
-    try:
-        listed = _manager(root, "secrets", "list")
-    except NodeFailure as failure:
-        if failure.code in ("key_missing", "agent_unregistered"):
-            return None, None, set()
-        raise
-    key = listed.get("key") or {}
-    if not key.get("set"):
-        return None, None, set()
-    if key.get("matches") is False:
-        raise NodeFailure("key_mismatch", "the AGENT_ENCRYPTION_KEY here is not the key this "
-                          "agent's vault is kept under, so the node could not read it", 6)
-    from capabilities_contract import vault
-    text, _where = vault.key_source(root)
-    try:
-        vault.parse_key(text or "")
-    except vault.VaultError as exc:
-        raise NodeFailure(exc.slug, exc.message, 6) from None
-    names = {entry["name"] for entry in listed.get("secrets") or []
-             if isinstance(entry, dict) and entry.get("readable")}
-    return text.strip(), key.get("fingerprint"), names
 
 
 def _manager(root, *args, stdin=None):
@@ -7681,211 +7572,6 @@ def _agent_node_environment(project_id):
             "CAPABILITIES_PROJECT_ID_ROOT": AGENT_NODE_ROOT}
 
 
-def _agent_node_compose(project_id, image, memory):
-    """The node's Compose document: the standard image, its memory limit, its
-    volumes and the two keys it is told - nothing else."""
-    environment = _agent_node_environment(project_id)
-    lines = ["services:", f"  {AGENT_NODE_SERVICE}:", f"    image: {json.dumps(image)}",
-             "    restart: unless-stopped", f"    mem_limit: {json.dumps(memory)}",
-             "    environment:"]
-    lines += [f"      {key}: {json.dumps(value)}" for key, value in environment.items()]
-    lines += ["    volumes:"]
-    lines += [f"      - {json.dumps(name + ':' + path)}" for name, path in AGENT_NODE_VOLUMES]
-    lines += ["volumes:"] + [f"  {name}: {{}}" for name, _path in AGENT_NODE_VOLUMES]
-    return "\n".join(lines) + "\n"
-
-
-def _agent_node_reach(root, row, write):
-    """(target, host, container) for a node created as a Coolify resource."""
-    if not row.get("coolify_resource"):
-        raise NodeFailure("node_not_coolify", f"node {row.get('node')} is not a Coolify "
-                          "resource made by `deployment node create`", 6)
-    target = _agent_node_target(row)
-    entry = _node_connection(target, write)
-    host = _node_server_host(root, target, entry, row["coolify_server"])
-    return target, host, _agent_node_container(root, host, row)
-
-
-def _agent_node_container(root, host, row):
-    """The one running container of the node `row` names, on `host`."""
-    owner = "com.docker.compose.project=" + row["coolify_resource"]
-    containers = _node_ssh(root, host, "docker ps --filter " + shlex.quote("label=" + owner)
-                           + " --filter " + shlex.quote(
-                               "label=com.docker.compose.service=" + AGENT_NODE_SERVICE)
-                           + " --format '{{.ID}}'").splitlines()
-    if not containers:
-        # A node built from a repository is a Coolify application, whose one
-        # container is a Compose service named after it rather than `agent`.
-        containers = _node_ssh(root, host, "docker ps --filter " + shlex.quote("label=" + owner)
-                               + " --format '{{.ID}}'").splitlines()
-    if len(containers) != 1 or not re.fullmatch(r"[a-f0-9]+", containers[0]):
-        raise NodeFailure("node_container", "expected one running container for node "
-                          f"{row.get('node')}", 3)
-    return containers[0]
-
-
-def _agent_node_exec(root, host, container, argv, *, stdin=None, timeout=120):
-    flags = ["-i"] if stdin is not None else []
-    return _node_ssh(root, host, shlex.join(["docker", "exec", *flags, container, *argv]),
-                     stdin=stdin, timeout=timeout)
-
-
-def _usable_capabilities(root: Path) -> list[str]:
-    """Every capability the agent can use here: the gate's answer, from the
-    project's row or a global one, is enabled."""
-    del root
-    try:
-        rows = _records().resolve("capabilities", "policy")
-    except StoreError as exc:
-        raise NodeFailure(exc.slug, exc.message, 6) from None
-    return sorted(name for name, row in rows.items()
-                  if isinstance(row.get("value"), dict)
-                  and row["value"].get("enabled") is True)
-
-
-# Words of an environment key that say it holds a credential.
-_SECRET_WORDS = {"TOKEN", "SECRET", "KEY", "PASSWORD", "PASSWD", "PASS", "SESSION", "HASH",
-                 "COOKIE", "CREDENTIAL", "CREDENTIALS", "PRIVATE", "JSON", "DSN", "AUTH"}
-
-
-def _secret_looking(key: str) -> bool:
-    return bool(_SECRET_WORDS & set(key.upper().split("_")))
-
-
-def _reported_env_key(key: object) -> str | None:
-    """The environment key a `connections` row names: the row's key, or the
-    key in parentheses after an option a connection maps to one
-    (`option (ENV_KEY)`)."""
-    if _safe_env_key(key):
-        return key
-    named = re.fullmatch(r"\S+ \(([A-Z_][A-Z0-9_]*)\)", str(key or ""))
-    return named.group(1) if named else None
-
-
-def _agent_node_secrets(root, capabilities, withheld=None):
-    """({capability: {KEY: value}}, skipped, environment_only): every secret
-    key of a connection each of these capabilities resolves for this agent,
-    read where its own `connections` answer says the value is, except the
-    connections `withheld` names per capability; every secret key it does
-    not carry, with the reason; and, per capability, every secret-looking
-    key its service reads from its environment that no connection reports,
-    which it resolves from the process environment alone and so cannot be
-    carried."""
-    withheld = withheld or {}
-    out, skipped, environment_only = {}, [], {}
-    database_keys = _database_keys()
-    for name in capabilities:
-        p = _node_run([name, "connections"], root, check=False, timeout=120)
-        try:
-            listed = json.loads(p.stdout) if p.returncode == 0 else None
-        except ValueError:
-            listed = None
-        if not isinstance(listed, dict):
-            # Its secrets may live in the process environment alone, which
-            # is why it has no connection to report: its service's keys are
-            # still named below, as reported by none.
-            skipped.append({"capability": name, "reason": f"`{name} connections` gave no "
-                            f"report (exit {p.returncode})"})
-            listed = {}
-        keys, reported = {}, set()
-        for cid, connection in (listed.get("connections") or {}).items():
-            for key in (connection or {}).get("keys") or []:
-                if not isinstance(key, dict):
-                    continue
-                env_key = _reported_env_key(key.get("key"))
-                if env_key is None:
-                    continue
-                reported.add(env_key)
-                secret = key.get("secret") is True
-                if key.get("tier") == "connection" or not (secret or _secret_looking(env_key)):
-                    # A connection's own fields travel with the store.
-                    continue
-                row = {"capability": name, "connection": cid, "key": env_key}
-                if cid in withheld.get(name, ()):
-                    skipped.append({**row, "reason": "the connection the node was created "
-                                    "through stays on this machine"})
-                    continue
-                if not key.get("set"):
-                    skipped.append({**row, "reason": "not set on this machine"})
-                    continue
-                if not secret:
-                    skipped.append({**row, "reason": "the capability declares it not secret, "
-                                    "and enrol carries secret keys only"})
-                    continue
-                value = None
-                if key.get("tier") in ("project", "user") and key.get("source"):
-                    value = _parse_env_file(Path(key["source"])).get(env_key)
-                elif key.get("tier") == "env":
-                    value = os.environ.get(env_key)
-                if not value:
-                    skipped.append({**row, "reason": f"no value readable here from its "
-                                    f"{key.get('tier') or 'unknown'} tier"})
-                elif "\n" in value or "\r" in value:
-                    skipped.append({**row, "reason": "its value spans lines, which a "
-                                    "credentials file cannot hold"})
-                else:
-                    keys[env_key] = value
-        if keys:
-            out[name] = keys
-        # The keys its service reads from its environment - what a compiled
-        # target's container environment carries - but the database's, which
-        # the store setting hands the node.
-        manifest, _err = _installed_manifest(name)
-        secret_keys = {entry.get("key") for entry in
-                       (((manifest or {}).get("credentials") or {}).get("keys") or [])
-                       if isinstance(entry, dict) and entry.get("secret") is True}
-        environment = ((((manifest or {}).get("service") or {}).get("deploy") or {})
-                       .get("environment") or {})
-        read = {key for key in [*(environment.get("required") or []),
-                                *[entry.get("key") for entry in environment.get("optional") or []
-                                  if isinstance(entry, dict)]]
-                if _safe_env_key(key)} - set(database_keys)
-        loose = sorted(key for key in read
-                       if key not in reported and (key in secret_keys or _secret_looking(key)))
-        if loose:
-            environment_only[name] = loose
-    return out, skipped, environment_only
-
-
-def _agent_node_store_args(root):
-    """`capabilities store set` arguments for the store this agent resolves
-    here, and its password for standard input."""
-    from capabilities_contract import db
-    try:
-        setting = db.resolve_setting(root)
-    except db.DbError as exc:
-        raise NodeFailure(exc.slug, exc.message, 6) from None
-    if setting.url is not None:
-        from psycopg.conninfo import conninfo_to_dict
-        parsed = conninfo_to_dict(setting.url)
-        values = {"host": parsed.get("host"), "port": parsed.get("port"),
-                  "database": parsed.get("dbname"), "user": parsed.get("user"),
-                  "sslmode": parsed.get("sslmode") or "require",
-                  "sslrootcert": parsed.get("sslrootcert"), "password": parsed.get("password")}
-    else:
-        values = {"host": setting.host, "port": setting.port, "database": setting.database,
-                  "user": setting.user, "sslmode": setting.sslmode,
-                  "sslrootcert": setting.sslrootcert, "password": setting.password}
-    if not (values["host"] and values["database"] and values["user"]):
-        raise NodeFailure("store_setting_incomplete", "the store setting here names no host, "
-                          "database or user to give the node", 6)
-    if not values["password"]:
-        raise NodeFailure("store_password_missing", "the store setting here carries no "
-                          "password to give the node", 6)
-    if values["sslrootcert"] and values["sslrootcert"] != "system":
-        raise NodeFailure("store_setting_not_portable", "the store setting here names a root "
-                          "certificate file on this machine, which the node does not have", 6)
-    args = ["store", "set", "--host", str(values["host"]), "--database", str(values["database"]),
-            "--user", str(values["user"]), "--schema", setting.schema]
-    for flag, value in (("--port", values["port"]), ("--sslmode", values["sslmode"]),
-                        ("--sslrootcert", values["sslrootcert"]),
-                        ("--transaction-host", setting.transaction_host),
-                        ("--transaction-port", setting.transaction_port)):
-        if value:
-            args += [flag, str(value)]
-    return args + ["--password-stdin"], str(values["password"]) + "\n"
-
-
 def _agent_node_release():
     """The standard image's current release, {version, image}, read from its
     registry; image_release_unknown (exit 5) when the registry cannot say."""
@@ -7914,11 +7600,6 @@ def _agent_node_release():
                           "holds no release", 5)
     version = max(releases, key=lambda tag: tuple(int(part) for part in tag.split(".")))
     return {"version": version, "image": f"{AGENT_NODE_IMAGE}:{version}"}
-
-
-def cmd_node_image(args):
-    release = _agent_node_release()
-    _emit({"ok": True, **release} if args.json else release["image"])
 
 
 def _agent_node_build(args):
@@ -8031,6 +7712,16 @@ def cmd_node_create(args):
     _emit(_agent_node_create(_root(), args))
 
 
+def _agent_node_built(args):
+    """Whether `node create` was given a flag of a node built from a
+    repository, which deployment answers itself; the node of the standard
+    image is the manager's."""
+    return (any(value is not None for value in (args.repository, args.branch, args.dockerfile,
+                                                 args.context, args.deploy_key,
+                                                 args.github_app))
+            or bool(args.docker_socket) or bool(args.host_dir))
+
+
 def _agent_node_create(root, args):
     """`node create`'s whole answer, with nothing printed."""
     node = _agent_node_name(args.node)
@@ -8039,9 +7730,9 @@ def _agent_node_create(root, args):
             raise NodeFailure("input", f"{flag} takes a Coolify uuid", 6)
     if args.version is None and args.repository is None:
         args.version = _agent_node_release()["version"]
+    # Given a flag only a repository-built node takes, this is that node or a
+    # refusal; the node of the standard image is the manager's `node create`.
     build = _agent_node_build(args)
-    if build is None and not AGENT_NODE_VERSION.fullmatch(args.version or ""):
-        raise NodeFailure("input", "--version takes the standard image's tag", 6)
     if not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory or ""):
         raise NodeFailure("input", "--memory takes a size such as 2g or 1536m", 6)
     project_id, slug = _agent_node_project(root)
@@ -8058,22 +7749,9 @@ def _agent_node_create(root, args):
         raise NodeFailure("environment_missing", f"the Coolify project has no "
                           f"{args.environment!r} environment; deployment creates none", 3)
     name = _slug(slug) + "-" + _slug(node)
-    if build is None:
-        kind, image, deployment = "service", f"{AGENT_NODE_IMAGE}:{args.version}", None
-        compose = _agent_node_compose(project_id, image, args.memory)
-        created = _node_coolify(root, target, "service", "create", "--compose", "-",
-                                "--project", args.project, "--server", args.server,
-                                "--environment", args.environment,
-                                "--name", name, "--instant-deploy",
-                                stdin=compose)
-        resource = created.get("uuid") or created.get("service_uuid")
-        if not isinstance(resource, str) or not COOLIFY_UUID.fullmatch(resource):
-            raise NodeFailure("provider_output", "service creation returned no uuid")
-    else:
-        kind = "application"
-        image = {key: build[key] for key in ("repository", "branch", "context", "dockerfile")}
-        resource, deployment = _agent_node_application(root, target, args, project_id,
-                                                       name, build)
+    kind = "application"
+    image = {key: build[key] for key in ("repository", "branch", "context", "dockerfile")}
+    resource, deployment = _agent_node_application(root, target, args, project_id, name, build)
     try:
         row = _manager(root, "node", "add", node_id, "--label", node, "--kind", "server",
                        "--coolify-connection", _node_origin(target),
@@ -8087,888 +7765,87 @@ def _agent_node_create(root, args):
               "volumes": [{"name": name, "path": path} for name, path in AGENT_NODE_VOLUMES],
               "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"],
               "next": f"deployment node enrol {node_id}"}
-    if build is not None:
-        answer.update({"resource": {"kind": kind, "uuid": resource}, "deployment": deployment,
-                       "host_paths": build["mounts"],
-                       "wait": f"coolify wait {resource} --deployment {deployment} "
-                               "--timeout 1800"})
+    answer.update({"resource": {"kind": kind, "uuid": resource}, "deployment": deployment,
+                   "host_paths": build["mounts"],
+                   "wait": f"coolify wait {resource} --deployment {deployment} "
+                           "--timeout 1800"})
     return answer
 
 
-def _agent_node_services(value):
-    services = [name for name in (value or "").split(",") if name.strip()]
-    for name in services:
-        if not re.fullmatch(r"[a-z][a-z0-9_-]*", name):
-            raise NodeFailure("input", f"--services names capabilities, not {name!r}", 6)
-    return services
-
-
-def _agent_node_enrol_inputs(root):
-    """What enrolment carries from here, read - and the agent's key refused
-    when it is not the vault's - before anything is written to a node."""
-    store_args, password = _agent_node_store_args(root)
-    return (store_args, password, *_agent_node_vault(root))
-
-
-class _NodeStep:
-    """One step of a node verb spoken as events: `step` started, then done
-    with its check, or failed with its error, which goes on up. Without
-    --events nothing is said."""
-
-    def __init__(self, name, **fields):
-        self.name, self.fields, self.check = name, fields, {}
-
-    def __enter__(self):
-        _event("step", step=self.name, state="started", **self.fields)
-        return self.check
-
-    def __exit__(self, kind, exc, _trace):
-        if exc is None:
-            _event("step", step=self.name, state="done", **self.fields, check=self.check)
-        elif isinstance(exc, (NodeFailure, StoreError)):
-            _event("step", step=self.name, state="failed", **self.fields,
-                   error={"code": getattr(exc, "code", None) or getattr(exc, "slug", None),
-                          "message": exc.message})
+def _node_forwarded(args):
+    """Whether this `node` invocation is one the manager answers: everything
+    about the standard agent node but a sign-in, which `cmd_node_login` hands
+    over once its own shape is settled."""
+    if args.cmd != "node":
         return False
+    if args.node_cmd in ("image", "enrol", "add", "update", "exec"):
+        return True
+    if args.node_cmd == "create":
+        return not _agent_node_built(args)
+    return args.node_cmd == "remove" and bool(args.yes)
 
 
-def cmd_node_enrol(args):
-    root = _root()
-    node = _agent_node_name(args.node)
-    _agent_node_project(root)
-    services = _agent_node_services(args.services)
-    row = _agent_node_row(root, node)
-    if row is None:
-        raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
-    inputs = _agent_node_enrol_inputs(root)
-    reached = _agent_node_reach(root, row, write=True)
+def _node_forward(args):
+    """Run the manager's `capabilities node` for this invocation in this
+    process's place: its standard input, output, error, exit code and signals
+    are this command's own."""
+    sub = args.node_cmd
+    argv = ["node", sub]
+    def value(flag, given):
+        if given is not None:
+            argv.append(f"{flag}={given}")
+    def flag(name, given):
+        if given:
+            argv.append(name)
+    if sub == "image":
+        flag("--json", args.json)
+    elif sub == "create":
+        for name in ("project", "server", "environment", "version", "memory", "connection"):
+            value("--" + name, getattr(args, name))
+    elif sub == "enrol":
+        value("--services", args.services)
+        value("--wait", args.wait)
+    elif sub == "add":
+        for name in ("server", "version", "memory", "project", "environment", "services",
+                     "connection", "wait"):
+            value("--" + name, getattr(args, name))
+        flag("--events", args.events)
+    elif sub == "update":
+        for name in ("version", "memory", "wait"):
+            value("--" + name, getattr(args, name))
+    elif sub == "remove":
+        flag("--yes", args.yes)
+    elif sub == "login":
+        flag("--events", args.events)
+        value("--connection", args.connection)
+        value("--method", args.method)
+    flag("--coolify-stdin", getattr(args, "coolify_stdin", False))
+    # The node (and a sign-in's tool) after `--`, where no word is an option;
+    # for `node exec` what it runs follows the node and `--`.
+    if sub == "exec":
+        argv += [args.node, "--", *args.argv]
+    elif sub == "login":
+        argv += ["--", args.harness, args.tool]
+    elif sub != "image":
+        argv += ["--", args.node]
+    manager = _manager_executable()
+    if manager is None:
+        raise NodeFailure("node_command_failed", "`capabilities node` could not complete")
+    sys.stdout.flush()
+    sys.stderr.flush()
     try:
-        answer = _agent_node_enrol(root, row, services, args.wait, inputs, reached)
-    except NodeFailure as failure:
-        # A node that did not rise still has its answer said, then the refusal.
-        if hasattr(failure, "answer"):
-            _emit(failure.answer)
-        raise
-    _emit(answer)
-
-
-def _agent_node_enrol(root, row, services, wait, inputs, reached):
-    """Enrol the node `row` names, each part a step, and answer what enrol
-    answers; whether the agent rose is the answer's ok."""
-    node = row["node"]
-    store_args, password, key, fingerprint, in_vault = inputs
-    _target, host, container = reached
-    # The node's id goes onto its config volume first, with the node's own
-    # manager: everything after it, the raised agent too, runs as that node.
-    with _NodeStep("id", node=node) as check:
-        _agent_node_exec(root, host, container, ["capabilities", "node", "id", "--set", node])
-        check["node"] = node
-    with _NodeStep("key_pair", node=node) as check:
-        public_key = _agent_node_exec(root, host, container,
-                                      ["sh", "-c", _AGENT_NODE_KEYGEN, "keygen", AGENT_NODE_KEY])
-        if not AGENT_NODE_PUBLIC_KEY.fullmatch(public_key):
-            raise NodeFailure("node_key", "the node did not answer with an X25519 public key", 5)
-        _manager(root, "node", "set", node, "--public-key", public_key)
-        check["public_key"] = public_key
-    # The agent's key and secrets go first and the store setting last: the
-    # setting is what the waiting node raises the agent on, so it finds them
-    # all there. The key opens the agent's vault, so a secret the vault holds
-    # is neither carried nor reported skipped; a secret kept only in a file
-    # here still is carried. The coolify connection the node was created
-    # through stays here: the row names it, and the node does not hold its
-    # token.
-    with _NodeStep("encryption_key", node=node) as check:
-        if key is not None:
-            _agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_KEY],
-                             stdin=key)
-        check.update({"placed": key is not None, "fingerprint": fingerprint})
-    with _NodeStep("secrets", node=node) as check:
-        withheld = ({} if _node_lent_address(row["coolify_connection"])
-                    else {"coolify": {row["coolify_connection"]}})
-        secrets, skipped, environment_only = _agent_node_secrets(
-            root, sorted({*_usable_capabilities(root), *services}), withheld)
-        held = {}
-        for name in list(secrets):
-            held.setdefault(name, set()).update(k for k in secrets[name] if k in in_vault)
-            secrets[name] = {k: v for k, v in secrets[name].items() if k not in in_vault}
-            if not secrets[name]:
-                del secrets[name]
-        kept = []
-        for entry in skipped:
-            if (entry.get("key") in in_vault
-                    and entry.get("connection") not in withheld.get(entry.get("capability"), ())):
-                held.setdefault(entry["capability"], set()).add(entry["key"])
-            else:
-                kept.append(entry)
-        skipped = kept
-        held = {name: sorted(keys) for name, keys in held.items() if keys}
-        written = json.loads(_agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_SECRETS],
-                                              stdin=json.dumps(secrets)) or "{}") if secrets else {}
-        check.update({"written": written, "in_vault": held,
-                      "skipped": [entry.get("key") for entry in skipped]})
-    placed = []
-    unplaced: dict[str, list[str]] = {}
-    for name in services:
-        with _NodeStep("place", node=node, service=name) as check:
-            moved = _manager(root, "place", name, "--node", node)
-            placed.append(name)
-            if moved.get("unplaced_from"):
-                unplaced[name] = moved["unplaced_from"]
-            check.update({"placed_on": moved.get("placed_on"),
-                          "unplaced_from": moved.get("unplaced_from") or []})
-    with _NodeStep("store", node=node) as check:
-        _agent_node_exec(root, host, container, ["capabilities", *store_args], stdin=password)
-        check["written"] = True
-    with _NodeStep("raised", node=node) as check:
-        deadline = time.monotonic() + wait
-        state = ""
-        while True:
-            state = _agent_node_exec(root, host, container, ["cat", AGENT_NODE_STATE],
-                                     timeout=60)
-            if state.startswith("running agent") or time.monotonic() >= deadline:
-                break
-            time.sleep(10)
-        check["state"] = state
-        answer = {"ok": state.startswith("running agent"), "node": node,
-                  "label": row.get("label"), "public_key": public_key,
-                  "key": {"placed": key is not None, "fingerprint": fingerprint},
-                  "secrets": {name: sorted(keys) for name, keys in secrets.items()},
-                  "secrets_in_vault": held,
-                  "secrets_written": written, "secrets_skipped": skipped,
-                  "environment_only": environment_only, "store": "written", "placed": placed,
-                  "unplaced": unplaced, "state": state}
-        if environment_only:
-            answer["environment_only_hint"] = (
-                "each key is read from the process environment alone - a target's container "
-                "environment, say - so no node receives it: keep its value in a connection of "
-                "the capability, then enrol again")
-        if not answer["ok"]:
-            failure = NodeFailure("node_not_raised", f"node {node} did not raise its agent "
-                                  f"within {wait} seconds; its state reads {state!r}", 5)
-            failure.answer = answer
-            raise failure
-    return answer
-
-
-def _agent_node_coolify_project(root, target, given, name):
-    """(uuid, name, created) of the Coolify project a node is added in: the one
-    given, else the one named after the agent, made when there is none."""
-    if given:
-        found = _node_coolify(root, target, "projects", given)
-        return given, found.get("name"), False
-    listed = _node_coolify(root, target, "projects")
-    rows = listed.get("data") if isinstance(listed, dict) else listed
-    named = [row for row in rows or [] if isinstance(row, dict) and row.get("name") == name]
-    if len(named) > 1:
-        raise NodeFailure("project_ambiguous", f"{len(named)} Coolify projects are named "
-                          f"{name}: " + ", ".join(str(row.get("uuid")) for row in named)
-                          + "; name one with --project", 6)
-    if named:
-        return named[0]["uuid"], name, False
-    created = _node_coolify(root, target, "projects", "create", name)
-    uuid = created.get("uuid") or created.get("project_uuid")
-    if not isinstance(uuid, str) or not COOLIFY_UUID.fullmatch(uuid):
-        raise NodeFailure("provider_output", "project creation returned no uuid")
-    return uuid, name, True
-
-
-def _agent_node_up(root, row, wait):
-    """(target, host, container) once the node's one container runs, waiting
-    up to `wait` seconds for it."""
-    deadline = time.monotonic() + wait
-    while True:
-        try:
-            return _agent_node_reach(root, row, write=True)
-        except NodeFailure as failure:
-            if failure.code != "node_container":
-                raise
-            if time.monotonic() >= deadline:
-                raise NodeFailure("node_not_running", f"node {row['node']} has no running "
-                                  f"container after {wait} seconds", 5) from None
-        time.sleep(10)
-
-
-def cmd_node_add(args):
-    """`node add`: the whole path from nothing to a raised node, each part a
-    step. A step that finds its work done keeps it, so the same command again
-    takes up where a failure left off."""
-    root = _root()
-    label = _agent_node_name(args.node)
-    for flag, value in (("--project", args.project), ("--server", args.server)):
-        if value is not None and not COOLIFY_UUID.fullmatch(value):
-            raise NodeFailure("input", f"{flag} takes a Coolify uuid", 6)
-    if args.version is not None and not AGENT_NODE_VERSION.fullmatch(args.version):
-        raise NodeFailure("input", "--version takes the standard image's tag", 6)
-    if not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory or ""):
-        raise NodeFailure("input", "--memory takes a size such as 2g or 1536m", 6)
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.environment or ""):
-        raise NodeFailure("input", "--environment takes an environment's name", 6)
-    services = _agent_node_services(args.services)
-    _project_id, slug = _agent_node_project(root)
-    target = {"connection": args.connection}
-    # Everything that can refuse without writing is read before the first write.
-    _node_connection(target, write=True)
-    inputs = _agent_node_enrol_inputs(root)
-    row = _agent_node_row(root, label)
-    if row is not None and row.get("label") != label:
-        raise NodeFailure("node_exists", f"{label} is the id of this agent's node "
-                          f"{row.get('label')}; a new node takes a label of its own", 6)
-    if row is not None and (row.get("coolify_server") != args.server
-                            or _node_origin(target) != row.get("coolify_connection")):
-        raise NodeFailure("node_exists", f"this agent already has node {label} on server "
-                          f"{row.get('coolify_server')} through connection "
-                          f"{row.get('coolify_connection')}", 6)
-    version = args.version
-    if row is None and version is None:
-        version = _agent_node_release()["version"]
-    with _NodeStep("project") as check:
-        project, project_name, made = _agent_node_coolify_project(root, target, args.project,
-                                                                  _slug(slug))
-        check.update({"uuid": project, "name": project_name, "created": made})
-    with _NodeStep("environment", project=project) as check:
-        environments = _node_coolify(root, target, "projects", project).get("environments") or []
-        made = args.environment not in [entry.get("name") for entry in environments]
-        if made:
-            _node_coolify(root, target, "projects", "environment", "create", project,
-                          args.environment)
-        check.update({"name": args.environment, "created": made})
-    with _NodeStep("create", label=label) as check:
-        created = None
-        if row is None:
-            created = _agent_node_create(root, argparse.Namespace(
-                node=label, project=project, server=args.server, environment=args.environment,
-                version=version, memory=args.memory, connection=target["connection"],
-                repository=None, branch=None, dockerfile=None, context=None, deploy_key=None,
-                github_app=None, docker_socket=False, host_dir=None))
-            row = _agent_node_row(root, created["node"]["node"])
-            if row is None:
-                raise NodeFailure("node_unknown", f"node {label} was registered but the "
-                                  "agent's nodes do not list it", 5)
-        check.update({"node": row["node"], "resource": row.get("coolify_resource"),
-                      "created": created is not None})
-    node = row["node"]
-    with _NodeStep("container", node=node) as check:
-        reached = _agent_node_up(root, row, args.wait)
-        check["container"] = reached[2]
-    answer = _agent_node_enrol(root, row, services, args.wait, inputs, reached)
-    answer.update({"project": {"uuid": project, "name": project_name},
-                   "environment": args.environment, "created": created is not None,
-                   "resource": row.get("coolify_resource")})
-    if created is not None:
-        answer.update({"image": created["image"], "memory": created["memory"]})
-    _emit(answer)
-
-
-def _agent_node_is_own(root, host, resource, project_id, kind="service"):
-    """Whether the Compose project `resource` on `host` - the resource this
-    node's row names - is this agent's node: its agent containers, stopped ones
-    too, run the standard image - for an application, the image Coolify built
-    for it, named after it - for this agent, CAPABILITIES_PROJECT_ID set to its
-    id. Its label is its row's, so it is not read here."""
-    owner = "com.docker.compose.project=" + resource
-    service = ("" if kind == "application" else " --filter " + shlex.quote(
-        "label=com.docker.compose.service=" + AGENT_NODE_SERVICE))
-    ids = _node_ssh(root, host, "docker ps -a --filter " + shlex.quote("label=" + owner)
-                    + service + " --format '{{.ID}}'").split()
-    if not ids or not all(re.fullmatch(r"[a-f0-9]+", i) for i in ids):
-        return False
-    configs = []
-    for line in _node_ssh(root, host, shlex.join(
-            ["docker", "inspect", "--format", "{{json .Config}}", *ids])).splitlines():
-        try:
-            configs.append(json.loads(line))
-        except ValueError:
-            return False
-    named = f"CAPABILITIES_PROJECT_ID={project_id}"
-    image = (resource if kind == "application" else AGENT_NODE_IMAGE) + ":"
-    return len(configs) == len(ids) and all(
-        isinstance(c, dict) and str(c.get("Image") or "").startswith(image)
-        and named in (c.get("Env") or []) for c in configs)
-
-
-def cmd_node_exec(args):
-    root = _root()
-    node = _agent_node_name(args.node)
-    _agent_node_project(root)
-    if not args.argv:
-        raise NodeFailure("input", "node exec needs a command after --", 6)
-    row = _agent_node_row(root, node)
-    if row is None:
-        raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
-    _target, host, container = _agent_node_reach(root, row, write=True)
-    command = _node_ssh_argv(host) + [shlex.join(["docker", "exec", "-i", container, *args.argv])]
-    raise SystemExit(subprocess.call(command, cwd=root))
-
-
-# Each tool's own headless sign-in, as `node login <node> <tool> --events` runs
-# it on the node, and what in its output is the code to enter at the link and
-# the prompt that asks for a code to be pasted back. None of them needs a
-# terminal: gh writes its code and link on stderr, codex its link and code on
-# lines of their own, claude its link and then the paste prompt with no newline.
-NODE_LOGIN_TOOLS = {
-    "claude": {"argv": ["claude", "auth", "login"],
-               "paste": re.compile(r"Paste code here[^>\n]*> ?")},
-    "codex": {"argv": ["codex", "login", "--device-auth"],
-              "code": re.compile(r"one-time code[^\n]*\n\s*([A-Z0-9]{4,}-[A-Z0-9]{4,})\s")},
-    "gh": {"argv": ["gh", "auth", "login", "--hostname", "github.com",
-                    "--git-protocol", "https", "--web", "--skip-ssh-key"],
-           "code": re.compile(r"one-time code: ([A-Z0-9]{4,}-[A-Z0-9]{4,})")},
-}
-NODE_LOGIN_LINK = re.compile(r"https://\S+(?=\s)")
-_NODE_LOGIN_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-# How many devices a service lets one account link besides the phone, where it
-# limits them: WhatsApp links at most four.
-NODE_DEVICE_LIMITS = {"whatsapp": 4}
-
-# Run in the node's container around a sign-in. It hands the command the
-# frames this machine sends - `D<line>` one line of input, `E` the end of it -
-# and when the channel itself closes, as it does when the sign-in is cancelled
-# here or this machine goes away, or the runner is itself sent SIGTERM, SIGINT
-# or SIGHUP, it stops the command with SIGTERM (SIGKILL after 20 seconds), so
-# nothing is left signing in on the node.
-_NODE_LOGIN_RUNNER = """
-import os, signal, subprocess, sys, threading
-child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, start_new_session=True)
-def stop():
-    try:
-        os.killpg(child.pid, signal.SIGTERM)
-        child.wait(20)
-    except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
+        os.execv(manager, [manager, *argv])
     except OSError:
-        pass
-for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-    signal.signal(sig, lambda *_: threading.Thread(target=stop, daemon=True).start())
-def relay():
-    while True:
-        frame = sys.stdin.buffer.readline()
-        if not frame:
-            break
-        try:
-            if frame[:1] == b"D":
-                child.stdin.write(frame[1:])
-                child.stdin.flush()
-            elif frame[:1] == b"E":
-                child.stdin.close()
-        except (OSError, ValueError):
-            pass
-    stop()
-threading.Thread(target=relay, daemon=True).start()
-code = child.wait()
-# Not sys.exit: the relay may still be reading stdin, which shutdown would wait on.
-os._exit(code if code >= 0 else 128 - code)
-"""
-
-
-class _NodeLoginChannel:
-    """One command run in the node's container under the sign-in runner, its
-    standard input carried as the runner's frames. Closing the channel, which
-    a SIGTERM, SIGINT or SIGHUP here does, cancels the command on the node."""
-
-    def __init__(self, root, host, container, argv, *, capture):
-        import threading
-        command = _node_ssh_argv(host) + [shlex.join(
-            ["docker", "exec", "-i", container, "python3", "-c", _NODE_LOGIN_RUNNER, *argv])]
-        self.proc = subprocess.Popen(command, cwd=root, stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE if capture else None,
-                                     stderr=subprocess.STDOUT if capture else None)
-        self.lock = threading.Lock()
-        self.cancelled: str | None = None
-
-    def send(self, frame: bytes) -> None:
-        with self.lock:
-            try:
-                self.proc.stdin.write(frame)
-                self.proc.stdin.flush()
-            except (OSError, ValueError):
-                pass
-
-    def line(self, text: str) -> None:
-        self.send(b"D" + text.rstrip("\r\n").encode() + b"\n")
-
-    def close(self) -> None:
-        try:
-            self.proc.stdin.close()
-        except (OSError, ValueError):
-            pass
-
-    def __enter__(self):
-        import signal
-        def cancel(signum, _frame):
-            self.cancelled = self.cancelled or signal.Signals(signum).name
-            self.close()
-        self.previous = {sig: signal.signal(sig, cancel)
-                         for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)}
-        return self
-
-    def __exit__(self, *exc):
-        import signal
-        for sig, handler in self.previous.items():
-            signal.signal(sig, handler)
-        if exc[0] is not None:
-            self.close()
-            try:
-                self.proc.wait(30)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-        return False
-
-    def forward_stdin(self) -> None:
-        """Hand every line on this process's standard input to the command, and
-        its end as the end of the command's."""
-        import threading
-        def pump():
-            for line in sys.stdin:
-                self.line(line)
-            self.send(b"E")
-        threading.Thread(target=pump, daemon=True).start()
-
-
-def _node_login_json(root, host, container, argv):
-    out = _agent_node_exec(root, host, container, argv)
-    try:
-        answer = json.loads(out)
-    except ValueError:
-        raise NodeFailure("node_command_failed", f"`{shlex.join(argv)}` on the node "
-                          "answered no JSON", 5) from None
-    return answer if isinstance(answer, dict) else {}
-
-
-def _node_login_tool(root, host, container, node, tool):
-    """Run the tool's headless sign-in on the node and speak it as events."""
-    import codecs
-    import threading
-    spec = NODE_LOGIN_TOOLS[tool]
-    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-    seen, said = "", set()
-    input_closed = []
-
-    def answer():
-        line = sys.stdin.readline()
-        if not line:
-            input_closed.append(True)
-            channel.close()
-            return
-        channel.line(line)
-        _event("waiting", node=node, tool=tool)
-
-    with _NodeLoginChannel(root, host, container, spec["argv"], capture=True) as channel:
-        while True:
-            chunk = os.read(channel.proc.stdout.fileno(), 4096)
-            if not chunk:
-                break
-            # The tool's own words stay readable, on stderr, beside the events.
-            sys.stderr.buffer.write(chunk)
-            sys.stderr.flush()
-            seen += _NODE_LOGIN_ANSI.sub("", decoder.decode(chunk))
-            link = NODE_LOGIN_LINK.search(seen)
-            if link and "link" not in said:
-                said.add("link")
-                _event("link", node=node, tool=tool, url=link.group(0))
-            code = spec.get("code") and spec["code"].search(seen)
-            if code and "code" not in said:
-                said.add("code")
-                _event("code", node=node, tool=tool, code=code.group(1))
-            if spec.get("paste") and "link" in said and "paste" not in said \
-                    and spec["paste"].search(seen):
-                said.add("paste")
-                _event("code_needed", node=node, tool=tool)
-                threading.Thread(target=answer, daemon=True).start()
-            if not spec.get("paste") and "waiting" not in said and "link" in said \
-                    and (not spec.get("code") or "code" in said):
-                said.add("waiting")
-                _event("waiting", node=node, tool=tool)
-        rc = channel.proc.wait()
-    if rc == 0:
-        _emit({"ok": True, "node": node, "tool": tool})
-        return
-    if channel.cancelled:
-        raise NodeFailure("cancelled", f"the {tool} sign-in on node {node} was cancelled "
-                          f"({channel.cancelled}) before it completed", 6)
-    if input_closed:
-        raise NodeFailure("input_closed", "standard input closed while code_needed waited "
-                          "for an answer", 6)
-    if rc == 255:
-        raise NodeFailure("node_unreachable", f"node {node} could not be reached over SSH", 255)
-    # The paste prompt ends in no newline, so the tool's last words follow it.
-    if spec.get("paste"):
-        seen = spec["paste"].sub("\n", seen)
-    said_last = next((l.strip() for l in reversed(seen.splitlines()) if l.strip()), "")
-    raise NodeFailure("login_failed", f"the {tool} sign-in on node {node} failed (exit {rc})"
-                      + (f": {said_last[-500:]}" if said_last else ""), rc)
-
-
-def _node_login_device(root, host, container, node, capability, wanted, method_id):
-    """Sign a device-bound connection in on the node as a new device, through
-    the capability's own `--events` ceremony, which this passes on as it
-    speaks it. Before it: refuse a node that already holds a live session for
-    the connection, and a connection that binds no account while another node
-    holds a session for it, since a first link that fails or is cancelled
-    takes the connection out again; then say which of the agent's nodes hold
-    one, and how many the service allows."""
-    manifest = _node_login_json(root, host, container, [capability, "manifest", "--json"])
-    declared = manifest.get("connections")
-    if not isinstance(declared, dict) or declared.get("device_bound") is not True:
-        raise NodeFailure("not_device_bound", f"{capability}'s connections on node {node} "
-                          "are not device-bound; node login signs in claude, codex, gh, or "
-                          "a capability whose connections are", 6)
-    methods = [m for m in declared.get("link") or []
-               if isinstance(m, dict) and isinstance(m.get("argv"), list) and m["argv"]]
-    method = next((m for m in methods if method_id in (None, m.get("id"))), None)
-    if method is None:
-        raise NodeFailure("input", f"{capability} has no link method {method_id!r}; it has "
-                          + (", ".join(str(m.get("id")) for m in methods) or "none"), 6)
-    entries = _node_login_json(root, host, container,
-                               [capability, "connections", "--json"]).get("connections")
-    entries = entries if isinstance(entries, dict) else {}
-    if wanted is None:
-        if len(entries) != 1:
-            raise NodeFailure("connection_required", f"{capability} on node {node} has "
-                              f"{len(entries)} connections; name one with --connection: "
-                              + (", ".join(sorted(entries)) or "none"), 6)
-        wanted = next(iter(entries))
-    entry = entries.get(wanted)
-    if not isinstance(entry, dict):
-        raise NodeFailure("connection_unknown", f"{capability} on node {node} has no "
-                          f"connection {wanted!r}", 6)
-    session = entry.get("session") if isinstance(entry.get("session"), dict) else {}
-    if session.get("live") is True:
-        raise NodeFailure("already_signed_in", f"node {node} already holds a live {capability} "
-                          f"session for {wanted!r}"
-                          + (f" ({session['account']})" if session.get("account") else ""), 6)
-    # A connection is bound when the contract's `identity` beside the entry
-    # names its account, or, for a capability that declares no main
-    # identifier, when its expected_account_id key is set.
-    identity = entry.get("identity") if isinstance(entry.get("identity"), dict) else {}
-    bound = identity.get("id") not in (None, "") or any(
-        isinstance(k, dict) and k.get("key") == "expected_account_id" and k.get("set")
-        for k in entry.get("keys") or [])
-    elsewhere = []
-    for other in _manager(root, "node", "state").get("nodes") or []:
-        if other.get("node") == node:
-            continue
-        for held in other.get("sessions") or []:
-            if (held.get("capability"), held.get("connection")) == (capability, wanted) \
-                    and isinstance(held.get("live"), bool):
-                elsewhere.append({"node": other.get("node"), "label": other.get("label"),
-                                  "account": held.get("account"), "live": held["live"]})
-    if elsewhere and not bound:
-        account = next((d["account"] for d in elsewhere if d["account"]), None)
-        raise NodeFailure("connection_unbound", f"{wanted!r} binds no account and node "
-                          f"{elsewhere[0]['node']} holds a {capability} session for it; a "
-                          "first link here that failed would take the connection out from "
-                          "under it. Bind it first: `" + shlex.join(
-                              [capability, "connection", "add", wanted, "--replace", "--field",
-                               f"expected_account_id={account or '<account>'}"])
-                          + "` at the scope that holds it", 6)
-    _event("devices", node=node, capability=capability, connection=wanted,
-           in_use=[d for d in elsewhere if d["live"]],
-           limit=NODE_DEVICE_LIMITS.get(capability))
-    argv = [*method["argv"], "--connection", wanted]
-    with _NodeLoginChannel(root, host, container, argv, capture=False) as channel:
-        channel.forward_stdin()
-        rc = channel.proc.wait()
-    raise SystemExit(rc)
-
-
-def _node_login_events(args):
-    """`node login <node> <claude|codex|gh|capability> --events`."""
-    if args.target or args.print_command:
-        raise NodeFailure("input", "node login <node> takes neither --target nor "
-                          "--print-command", 6)
-    root = _root()
-    node = _agent_node_name(args.harness)
-    _agent_node_project(root)
-    tool = args.tool
-    if not re.fullmatch(r"[a-z][a-z0-9_-]*", tool or ""):
-        raise NodeFailure("input", f"node login signs in claude, codex, gh or a "
-                          f"device-bound capability, not {tool!r}", 6)
-    if tool in NODE_LOGIN_TOOLS and (args.connection or args.method):
-        raise NodeFailure("input", f"--connection and --method name a device-bound "
-                          f"connection; {tool} has none", 6)
-    row = _agent_node_row(root, node)
-    if row is None:
-        raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
-    _target, host, container = _agent_node_reach(root, row, write=True)
-    if tool in NODE_LOGIN_TOOLS:
-        _node_login_tool(root, host, container, row["node"], tool)
-    else:
-        _node_login_device(root, host, container, row["node"], tool, args.connection,
-                           args.method)
+        raise NodeFailure("node_command_failed", "`capabilities node` could not complete")
 
 
 def cmd_node_remove(args):
-    root = _root()
-    node = _agent_node_name(args.node)
-    if not args.yes:
-        raise NodeFailure("confirmation_required", "node remove deletes the node's resource "
-                          "and its volumes; pass --yes", 6)
-    project_id, _slug = _agent_node_project(root)
-    row = _agent_node_row(root, node)
-    if row is None:
-        raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
-    node = row["node"]
-    if not row.get("coolify_resource"):
-        raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
-                          "`deployment node create`", 6)
-    target = _agent_node_target(row)
-    entry = _node_connection(target, write=True)
-    resource = row["coolify_resource"]
-    # A node of the standard image is a service, one built from a repository
-    # an application; a resource that is neither any more leaves only its row.
-    kind = _agent_node_kind(root, target, resource)
-    deleted = False
-    if kind is not None:
-        host = _node_server_host(root, target, entry, row["coolify_server"])
-        if not _agent_node_is_own(root, host, resource, project_id, kind):
-            raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
-                              f"{AGENT_NODE_IMAGE} for this agent; nothing was deleted", 6)
-        try:
-            _agent_node_delete(root, target, kind, resource)
-            deleted = True
-        except NodeFailure as failure:
-            if failure.exit_code != 3:
-                raise
-    _manager(root, "node", "remove", node)
-    _emit({"ok": True, "node": node, "resource": resource, "resource_deleted": deleted,
-           "volumes_deleted": deleted, "row_removed": True})
-
-
-def _agent_node_kind(root, target, resource):
-    """What the node's Coolify resource is: a service for a node of the
-    standard image, an application for one built from a repository, None
-    for one that is gone."""
-    for found, collection in (("service", "services"), ("application", "applications")):
-        try:
-            _node_coolify(root, target, collection, resource)
-            return found
-        except NodeFailure as failure:
-            if failure.exit_code != 3:
-                raise
-    return None
-
-
-def _agent_node_running(root, host, row):
-    """(container, image, health, state) of the node's running container, or
-    None while none runs: the image it runs, its Docker health ('' without a
-    health check) and what its agent state file reads."""
-    try:
-        container = _agent_node_container(root, host, row)
-        image, _sep, health = _node_ssh(root, host, shlex.join(
-            ["docker", "inspect", "--format",
-             "{{.Config.Image}} {{if .State.Health}}{{.State.Health.Status}}{{end}}",
-             container])).strip().partition(" ")
-        state = _agent_node_exec(root, host, container, ["cat", AGENT_NODE_STATE], timeout=60)
-    except NodeFailure:
-        return None
-    return container, image, health.strip(), state
-
-
-# Keys a node's container may carry that its Compose document did not set:
-# Coolify's own, and the identity a node was handed before it resolved its id
-# from its config volume, which `node create` no longer writes.
-_AGENT_NODE_FOREIGN_ENV = re.compile(r"(?:COOLIFY|SERVICE)_[A-Za-z0-9_]*")
-_AGENT_NODE_RETIRED_ENV = ("AGENT_NODE_NAME", "AGENT_NODE_ID")
-
-
-def _agent_node_retired_env_droppable(key, value, node):
-    """Whether a retired identity key can leave the node's environment: an
-    AGENT_NODE_NAME that is not the node's id (a node still keyed by its name
-    reads it at boot to move to its own id), an AGENT_NODE_ID that is."""
-    return value != node if key == "AGENT_NODE_NAME" else value == node
-
-
-def _agent_node_memory(limit):
-    """A container's memory limit in bytes as Compose takes it: 2147483648 as 2g."""
-    for suffix, size in (("g", 1 << 30), ("m", 1 << 20), ("k", 1 << 10)):
-        if limit % size == 0:
-            return f"{limit // size}{suffix}"
-    return str(limit)
-
-
-def _agent_node_memory_bytes(size):
-    """A Compose memory size in bytes: 2g as 2147483648, a bare number as bytes."""
-    unit = {"b": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}.get(size[-1].lower())
-    return int(size[:-1]) * unit if unit else int(size)
-
-
-def _agent_node_containers(root, host, resource):
-    """The ids of the Compose project `resource`'s agent containers on `host`,
-    stopped ones too."""
-    owner = "com.docker.compose.project=" + resource
-    return _node_ssh(root, host, "docker ps -a --filter " + shlex.quote("label=" + owner)
-                     + " --filter " + shlex.quote("label=com.docker.compose.service="
-                                                  + AGENT_NODE_SERVICE)
-                     + " --format '{{.ID}}'").split()
-
-
-def _agent_node_document(root, host, resource, project_id, node):
-    """What the node's Compose document holds besides its tag, read from its
-    one agent container (`docker inspect` over SSH, no Coolify field) and
-    checked against what `_agent_node_compose` writes for it: {image, memory,
-    env_dropped, volumes_added}. Each volume it would mount at a path the
-    container mounts anything at must be the one mounted there, named <resource>_<name> as Coolify names a Compose
-    volume of the service, and the container mounts nothing else but the
-    image's own anonymous volumes; it must set exactly the two keys the
-    document names, to their values, besides the image's environment,
-    Coolify's own keys and a retired identity key the node no longer needs
-    (`_agent_node_retired_env_droppable`); and it must have a memory
-    limit. Anything that differs or cannot be read refuses before a change."""
-    ids = _agent_node_containers(root, host, resource)
-    if len(ids) != 1 or not re.fullmatch(r"[a-f0-9]+", ids[0]):
-        raise NodeFailure("node_document_unconfirmed", f"expected one agent container of "
-                          f"resource {resource} to read its volumes, memory limit and "
-                          f"environment from, found {len(ids)}; nothing was changed", 6)
-    try:
-        container = json.loads(_node_ssh(root, host, shlex.join(
-            ["docker", "inspect", "--format", "{{json .}}", ids[0]])))
-        built = json.loads(_node_ssh(root, host, shlex.join(
-            ["docker", "image", "inspect", "--format", "{{json .Config}}",
-             str(container["Image"])])))
-        config, mounts = container["Config"], container["Mounts"]
-        limit = int(container["HostConfig"]["Memory"])
-        env = [str(entry) for entry in config.get("Env") or []]
-        image_env = {str(entry) for entry in built.get("Env") or []}
-        image_volumes = set(built.get("Volumes") or {})
-        mounted = {str(m["Destination"]): (str(m.get("Type")), str(m.get("Name") or ""))
-                   for m in mounts}
-    except (ValueError, KeyError, TypeError, NodeFailure):
-        raise NodeFailure("node_document_unconfirmed", f"cannot read the agent container of "
-                          f"resource {resource} (docker inspect); nothing was changed", 6) from None
-    expected = {path: f"{resource}_{name}" for name, path in AGENT_NODE_VOLUMES}
-    # A path the container mounts nothing at holds no data a redeploy keeps,
-    # so the document's volume there is added new, empty, renaming nothing:
-    # a node created before node create declared that volume (work) gains it.
-    added = sorted(name for name, path in AGENT_NODE_VOLUMES if path not in mounted)
-    differ = sorted(
-        [f"{path}: expects volume {name}, mounts {mounted[path][0]} {mounted[path][1]}"
-         for path, name in expected.items()
-         if path in mounted and mounted[path] != ("volume", name)]
-        + [f"{path}: mounts {kind} {name}, which the document would drop"
-           for path, (kind, name) in mounted.items() if path not in expected
-           and not (kind == "volume" and path in image_volumes
-                    and re.fullmatch(r"[a-f0-9]{64}", name))])
-    if differ:
-        raise NodeFailure("node_volumes_unconfirmed", "the volumes node create's document "
-                          "mounts are not the ones the node's container mounts, so a new "
-                          "document could start it without its data: " + "; ".join(differ)
-                          + "; nothing was changed", 6)
-    if limit <= 0:
-        raise NodeFailure("node_document_unconfirmed", f"the agent container of resource "
-                          f"{resource} has no memory limit to keep; nothing was changed", 6)
-    wanted = _agent_node_environment(project_id)
-    keys = {}
-    for entry in env:
-        if entry not in image_env:
-            key, _sep, value = entry.partition("=")
-            keys[key] = value
-    wrong = sorted(key for key, value in wanted.items() if keys.get(key) != value)
-    dropped = sorted(key for key in keys if key in _AGENT_NODE_RETIRED_ENV
-                     and _agent_node_retired_env_droppable(key, keys[key], node))
-    extra = sorted(key for key in keys if key not in wanted and key not in dropped
-                   and not _AGENT_NODE_FOREIGN_ENV.fullmatch(key))
-    if wrong or extra:
-        raise NodeFailure("node_document_unconfirmed", "the node's environment is not the one "
-                          "node create's document sets"
-                          + (": " + ", ".join(wrong) + " differ" if wrong else "")
-                          + (("; " if wrong else ": ") + ", ".join(extra)
-                             + " would be dropped" if extra else "")
-                          + "; nothing was changed", 6)
-    return {"image": str(config.get("Image") or ""), "memory": _agent_node_memory(limit),
-            "env_dropped": dropped, "volumes_added": added}
-
-
-def cmd_node_update(args):
-    root = _root()
-    node = _agent_node_name(args.node)
-    if not AGENT_NODE_VERSION.fullmatch(args.version or ""):
-        raise NodeFailure("input", "--version takes the standard image's tag", 6)
-    if args.wait < 0:
-        raise NodeFailure("input", "--wait takes a number of seconds", 6)
-    if args.memory is not None and not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory):
-        raise NodeFailure("input", "--memory takes a size such as 2g or 1536m", 6)
-    project_id, _slug = _agent_node_project(root)
-    row = _agent_node_row(root, node)
-    if row is None:
-        raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
-    node = row["node"]
-    if not row.get("coolify_resource"):
-        raise NodeFailure("node_not_coolify", f"node {node} is not a Coolify resource made by "
-                          "`deployment node create`", 6)
-    target = _agent_node_target(row)
-    entry = _node_connection(target, write=True)
-    resource = row["coolify_resource"]
-    # `node create` makes a node of the standard image a Compose service and
-    # one built from a repository an application; only the first runs a tag.
-    kind = _agent_node_kind(root, target, resource)
-    if kind == "application":
-        raise NodeFailure("node_built_from_repository", f"node {node} is built on its server "
-                          "from a repository, so it runs no tag of the standard image: "
-                          f"rebuild it with `coolify deploy {resource}`", 6)
-    if kind is None:
-        raise NodeFailure("node_resource_missing", f"node {node}'s Coolify resource {resource} "
-                          "is gone", 3)
-    host = _node_server_host(root, target, entry, row["coolify_server"])
-    if not _agent_node_containers(root, host, resource):
-        # Without a container nothing confirms the volumes a new document
-        # would mount; the stored document still names them, and deploying
-        # it unchanged brings the node back to be updated.
-        raise NodeFailure("node_document_unconfirmed", f"resource {resource} has no agent "
-                          "container to confirm its volumes from: bring it back on its "
-                          f"current document with `coolify deploy {resource}` and run the "
-                          "update again; nothing was changed", 6)
-    if not _agent_node_is_own(root, host, resource, project_id):
-        raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
-                          f"{AGENT_NODE_IMAGE} for this agent; nothing was changed", 6)
-    if "service set-compose" not in _node_run(["coolify", "help"], root).stdout:
-        raise NodeFailure("provider_not_ready", "the coolify capability here has no "
-                          "`service set-compose`; update it (`capabilities update coolify`)", 6)
-    image = f"{AGENT_NODE_IMAGE}:{args.version}"
-    # `node create` wrote the service's Compose document, so the whole of it is
-    # written again rather than read, which a token without read:sensitive
-    # cannot: what the document holds besides the tag is established from the
-    # node's container first, and nothing changes unless it agrees.
-    found = _agent_node_document(root, host, resource, project_id, node)
-    previous = found["image"]
-    # --memory replaces the limit the container runs with; without it that
-    # limit is kept.
-    memory = (found["memory"] if args.memory is None
-              else _agent_node_memory(_agent_node_memory_bytes(args.memory)))
-    # A node not on the tag, one that has a volume to gain, or one whose
-    # memory limit changes has its document written again; one that is not
-    # running the tag (a container on another tag, or one on it that has
-    # stopped) is started again, so an update that left the node down is
-    # finished by running it once more.
-    rewrite = previous != image or bool(found["volumes_added"]) or memory != found["memory"]
-    redeployed = rewrite or _agent_node_running(root, host, row) is None
-    if rewrite:
-        _node_coolify(root, target, "service", "set-compose", resource, "--compose", "-",
-                      stdin=_agent_node_compose(project_id, image, memory))
-    if redeployed:
-        _node_coolify(root, target, "deploy", resource)
-    deadline = time.monotonic() + args.wait
-    while True:
-        running = _agent_node_running(root, host, row)
-        up = (running is not None and running[1] == image and running[2] in ("", "healthy")
-              and running[3].startswith("running agent"))
-        if up or time.monotonic() >= deadline:
-            break
-        time.sleep(10)
-    container, now_image, health, state = running or (None, None, None, "")
-    answer = {"ok": up, "node": node, "label": row.get("label"), "resource": resource,
-              "version": args.version, "image": image,
-              "previous_image": previous, "redeployed": redeployed,
-              "memory": memory, "env_dropped": found["env_dropped"],
-              "volumes": [name for name, _path in AGENT_NODE_VOLUMES],
-              "volumes_added": found["volumes_added"],
-              "container": container, "running_image": now_image, "health": health,
-              "state": state}
-    if not up:
-        _emit(answer)
-        raise NodeFailure("node_not_raised", f"node {node} did not come back on {image} with "
-                          f"its agent running within {args.wait} seconds; its state reads "
-                          f"{state!r}", 5)
-    _emit(answer)
+    """`node remove <node>` without --yes: the confirmation it asks for. With
+    --yes the manager removes the node."""
+    _root()
+    _agent_node_name(args.node)
+    raise NodeFailure("confirmation_required", "node remove deletes the node's resource "
+                      "and its volumes; pass --yes", 6)
 
 
 def _memory_attributes(root):
@@ -9229,7 +8106,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--services", default="")
     p.add_argument("--wait", type=int, default=300)
     p.add_argument("--coolify-stdin", action="store_true")
-    p.set_defaults(fn=cmd_node_enrol)
+    p.set_defaults(fn=_node_forward)
     p = node.add_parser("add", add_help=False)
     p.add_argument("node")
     p.add_argument("--server", required=True)
@@ -9242,14 +8119,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--wait", type=int, default=600)
     p.add_argument("--events", action="store_true")
     p.add_argument("--coolify-stdin", action="store_true")
-    p.set_defaults(fn=cmd_node_add)
+    p.set_defaults(fn=_node_forward)
     p = node.add_parser("update", add_help=False)
     p.add_argument("node")
     p.add_argument("--version", required=True)
     p.add_argument("--memory")
     p.add_argument("--wait", type=int, default=600)
     p.add_argument("--coolify-stdin", action="store_true")
-    p.set_defaults(fn=cmd_node_update)
+    p.set_defaults(fn=_node_forward)
     p = node.add_parser("remove", add_help=False)
     p.add_argument("node")
     p.add_argument("--yes", action="store_true")
@@ -9257,11 +8134,11 @@ def main(argv: list[str] | None = None) -> None:
     p.set_defaults(fn=cmd_node_remove)
     p = node.add_parser("exec", add_help=False)
     p.add_argument("node")
-    p.set_defaults(fn=cmd_node_exec)
+    p.set_defaults(fn=_node_forward)
     node.add_parser("list", add_help=False).set_defaults(fn=cmd_node_list)
     p = node.add_parser("image", add_help=False)
     p.add_argument("--json", action="store_true")
-    p.set_defaults(fn=cmd_node_image)
+    p.set_defaults(fn=_node_forward)
     for verb, fn in (("status", cmd_node_status), ("sync", cmd_node_sync), ("login", cmd_node_login)):
         p = node.add_parser(verb, add_help=False)
         p.add_argument("--target")
@@ -9296,6 +8173,10 @@ def main(argv: list[str] | None = None) -> None:
                                              "update", "remove", "exec"):
         _read_only_gate(f"`deployment node {args.node_cmd}`")
     try:
+        # The standard agent node is the manager's: it reads a lent connection
+        # itself.
+        if _node_forwarded(args):
+            _node_forward(args)
         if getattr(args, "coolify_stdin", False):
             _node_lend()
         args.fn(args)

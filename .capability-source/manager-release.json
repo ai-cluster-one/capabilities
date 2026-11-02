@@ -19,12 +19,12 @@
     "guides/store-connections.md": "6ee909e85f6d46d2b179959a9cec1d27f19691a5869a0320f9543a1210defbc6",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "7e0f0669b8a9531da06e50d6a1328be5ecd0575ba79f6e5ea0bf024f3b0d9ddf",
+    "manager/CHANGELOG.md": "030f8ef4603d503de5ebe99aa00540e33e58e337087d09771603717ff7ddb732",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "8d87f725153180202f2d6787dbcbc0266a09fca272c45e57a251e4891bd12106"
+    "sha256": "a7aab4cc037e04988156857a99999b8fe0d0873cdb6122b2118c8fa604a9c080"
   },
   "schema": "capabilities.manager-release.v1"
 }
