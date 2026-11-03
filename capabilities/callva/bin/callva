@@ -12,8 +12,9 @@ This tool is designed to be invoked by agents. Run `callva help` to load the
 full usage contract on demand — do not rely on memorised knowledge of its
 surface. It is a pure CRUD / I/O adapter over the CallVA External API: voice
 agents, assets (prompts), calls, transcripts, recordings, analytics, custom
-fields, webhook schedules, automations (Windmill scripts), webhook logs,
-variables, settings, projects, phone numbers, and providers.
+fields, webhook schedules, automations (Windmill scripts), webhook logs, record
+actions, saved calls-list views, variables, settings, projects, phone numbers,
+and providers.
 
 `agents config` is the one place callva reaches outside the External API: it
 calls the platform's call-configuration endpoint, POST /config/livekit, on the
@@ -46,20 +47,23 @@ CONNECTIONS
   ("secret_env"); the value resolves through the credential cascade above.
   "api_url" is optional — absent, the
   default base URL applies. "allow_write": false makes the connection
-  read-only: every mutating verb (the create/update/delete/batch/store/
+  read-only: every mutating verb (the create/update/put/delete/batch/store/
   reorder/deploy/run actions on agents, assets, calls, transcripts, fields,
-  field-groups, schedules, automations, and variables, the add/update/remove/
-  toggle trigger actions on automations, the outbound `call`, and `agents
+  field-groups, schedules, automations, actions, ui-views, and variables, the
+  add/update/remove/toggle trigger actions on automations, `recordings purge`,
+  `calls run-action`, `ui-views set-default`, the outbound `call`, and `agents
   config`, which runs the agent's start-of-call automation) exits 4, and no
-  flag lifts the gate.
+  flag lifts the gate. `settings reveal` writes nothing but prints a secret, so
+  a read-only connection refuses it the same way.
 
   Selection: --connection <id> (accepted anywhere on the command line).
   Unflagged, the registry's "default" pointer applies, else the sole entry;
   several entries without a pointer is refused as ambiguous.
 
   Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
+  machine's own connections read-only, unless a grant switched one off. routes
+  is one too, and uses no connection at all. Every other verb that needs a
+  connection is refused there.
 
 Global options (accepted anywhere on the line — before or after the command):
   --full              return the full, unfiltered API response (list endpoints
@@ -76,7 +80,8 @@ Global options (accepted anywhere on the line — before or after the command):
 
 Output is JSON on stdout. List endpoints are slimmed to the fields an agent
 needs; pass --full for the raw API response. `get` / detail commands always
-return the full resource. `recordings stream` writes binary audio.
+return the full resource. `recordings stream` writes binary audio and `settings
+reveal` one raw value.
 
 Commands (`-f key=value` is repeatable for list filters):
 
@@ -88,9 +93,14 @@ Commands (`-f key=value` is repeatable for list filters):
                                       project the key sees — every connection,
                                       or one
   help                                print this contract
+  routes                              JSON map of every API verb: its verb, HTTP
+                                      method, path template, whether it writes
+                                      and whether it prints a secret. Local only
+                                      — no network, no connection.
 
   agents list [--is-active B]
-  agents default
+  agents default                      (reads only: the project's default agent,
+                                       else its oldest; exit 3 when it has none)
   agents get <id>
   agents update <id> [--name N] [--prompt T | --prompt-file F]
                      [--greeting-type prompt|exact|instruction]
@@ -178,6 +188,28 @@ Commands (`-f key=value` is repeatable for list filters):
                         (the prepared view for runs whose args carry the id as a
                          nested call object, {"call":{"id":"<call_id>"}}; for any
                          other args shape use `automations all-runs --args-filter`)
+  calls actions <call_id>             (the actions that apply to this call now)
+  calls run-action <call_id> <action_id> [--inputs JSON | --inputs-file F]
+  calls action-runs <call_id> [--per-page N] [--page N]
+
+  actions list [--entity-type T]
+  actions get <id>
+  actions create (--data JSON | --data-file F)
+  actions update <id> (--data JSON | --data-file F)     (PATCH)
+  actions put <id> (--data JSON | --data-file F)        (PUT)
+  actions delete <id>
+
+  ui-views list
+  ui-views get <id>
+  ui-views create (--data JSON | --data-file F)
+  ui-views update <id> (--data JSON | --data-file F)    (PATCH)
+  ui-views put <id> (--data JSON | --data-file F)       (PUT)
+  ui-views delete <id>
+  ui-views set-default <id>
+
+  ui-views are the project's saved calls-list views. On both resources the API
+  treats PUT and PATCH alike, as a partial update: a field left out keeps its
+  value, so `put` replaces no more than `update` does.
 
   transcripts get <call_id>
   transcripts store <call_id> (--data JSON | --data-file F)
@@ -193,6 +225,9 @@ Commands (`-f key=value` is repeatable for list filters):
 
   recordings stream <call_id> --url URL [--output FILE]   (binary; stdout if no
                                                            --output)
+  recordings purge <call_id>          (drops the platform's cached copy, so the
+                                       next stream fetches it afresh; the
+                                       recording itself stays)
 
   fields list [--entity-type T]
   fields create --data JSON
@@ -280,6 +315,13 @@ Commands (`-f key=value` is repeatable for list filters):
 
   settings list
   settings get <key>
+  settings reveal <definition_id>     (prints one setting's value in the clear,
+                                       raw on stdout with a trailing newline and
+                                       nothing else; exit 3 `not_set` when it
+                                       holds none, exit 4 on a read-only
+                                       connection. definition_id comes from
+                                       `settings get`. The platform logs each
+                                       reveal of a secret.)
 
   projects list [--is-active B] [--per-page N]
   projects get <id>
@@ -297,7 +339,7 @@ Conventions:
   - `stats aggregate` filters dates with `-f created_at_gte=<date>`; `--from` /
     `--to` belong to `stats trends` only.
   - Use file flags (`--content-file`, `--prompt-file`, `--file`, `--data-file`,
-    `--args-file`) for large content; `-` reads stdin.
+    `--args-file`, `--inputs-file`) for large content; `-` reads stdin.
   - `--data` / `--overrides` / `--settings` take a JSON object.
 
 Contract commands (the same on every capability):
@@ -357,6 +399,7 @@ SUMMARY = ("CallVA voice-AI platform CLI over the External API — "
            "they run on and the tools they call, assets (prompts), calls, "
            "transcripts, recordings, call analytics, custom fields, webhook "
            "schedules, automations (Windmill scripts), webhook logs, "
+           "record actions, saved calls-list views, "
            "variables, settings, projects, phone numbers, and providers.")
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
@@ -400,9 +443,131 @@ WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platfor
     "automations add-trigger", "automations update-trigger",
     "automations remove-trigger", "automations toggle-trigger",
     "variables create", "variables update", "variables delete",
+    "recordings purge", "calls run-action",
+    "actions create", "actions update", "actions put", "actions delete",
+    "ui-views create", "ui-views update", "ui-views put", "ui-views delete",
+    "ui-views set-default",
+}
+SECRET_READS = {"settings reveal"}   # write nothing, print a secret: a read-only connection refuses them too
+# The one API route each domain verb calls, which `callva routes` prints and the
+# product's checks compare against its route export. Placeholders carry the name
+# the product's route file gives them. tests/test_routes.py runs every verb and
+# holds this table to the call it actually makes.
+ROUTES = {
+    "agents list": ("GET", "/external/agents"),
+    "agents default": ("GET", "/external/agents/default"),
+    "agents get": ("GET", "/external/agents/{id}"),
+    "agents update": ("PATCH", "/external/agents/{id}"),
+    "agents clone": ("POST", "/external/agents/{id}/clone"),
+    "agents delete": ("DELETE", "/external/agents/{id}"),
+    "agents config": ("POST", "/config/livekit"),
+    "presets catalog": ("GET", "/external/presets"),
+    "presets describe": ("GET", "/external/presets"),
+    "presets list": ("GET", "/external/agents/{id}/presets"),
+    "presets get": ("GET", "/external/agents/{id}/presets/{preset}"),
+    "presets set": ("PUT", "/external/agents/{id}/presets/{preset}"),
+    "presets patch": ("PATCH", "/external/agents/{id}/presets/{preset}"),
+    "presets activate": ("POST", "/external/agents/{id}/presets/{preset}/activate"),
+    "tools list": ("GET", "/external/agents/{id}/tools"),
+    "tools get": ("GET", "/external/agents/{id}/tools/{key}"),
+    "tools set": ("PUT", "/external/agents/{id}/tools/{key}"),
+    "tools patch": ("PATCH", "/external/agents/{id}/tools/{key}"),
+    "tools delete": ("DELETE", "/external/agents/{id}/tools/{key}"),
+    "assets list": ("GET", "/external/assets"),
+    "assets get": ("GET", "/external/assets/{id}"),
+    "assets create": ("POST", "/external/assets"),
+    "assets update": ("PATCH", "/external/assets/{id}"),
+    "assets delete": ("DELETE", "/external/assets/{id}"),
+    "calls list": ("GET", "/external/calls"),
+    "calls get": ("GET", "/external/calls/{call}"),
+    "calls create": ("POST", "/external/calls"),
+    "calls update": ("PATCH", "/external/calls/{call}"),
+    "calls delete": ("DELETE", "/external/calls/{call}"),
+    "calls batch": ("PATCH", "/external/calls/batch"),
+    "calls webhook-logs": ("GET", "/external/calls/{call}/webhook-logs"),
+    "calls automation-runs": ("GET", "/external/calls/{call}/automation-runs"),
+    "calls actions": ("GET", "/external/calls/{call}/actions"),
+    "calls run-action": ("POST", "/external/calls/{call}/actions/{action}"),
+    "calls action-runs": ("GET", "/external/calls/{call}/action-runs"),
+    "actions list": ("GET", "/external/actions"),
+    "actions get": ("GET", "/external/actions/{action}"),
+    "actions create": ("POST", "/external/actions"),
+    "actions update": ("PATCH", "/external/actions/{action}"),
+    "actions put": ("PUT", "/external/actions/{action}"),
+    "actions delete": ("DELETE", "/external/actions/{action}"),
+    "ui-views list": ("GET", "/external/ui-views"),
+    "ui-views get": ("GET", "/external/ui-views/{view}"),
+    "ui-views create": ("POST", "/external/ui-views"),
+    "ui-views update": ("PATCH", "/external/ui-views/{view}"),
+    "ui-views put": ("PUT", "/external/ui-views/{view}"),
+    "ui-views delete": ("DELETE", "/external/ui-views/{view}"),
+    "ui-views set-default": ("POST", "/external/ui-views/{view}/set-default"),
+    "transcripts get": ("GET", "/external/calls/{call}/transcript"),
+    "transcripts store": ("POST", "/external/calls/{call}/transcript"),
+    "transcripts delete": ("DELETE", "/external/calls/{call}/transcript"),
+    "transcripts url": ("GET", "/external/calls/{call}/transcript/url"),
+    "call": ("POST", "/external/call"),
+    "stats aggregate": ("GET", "/external/calls/aggregate"),
+    "stats trends": ("GET", "/external/calls/trends"),
+    "recordings stream": ("GET", "/external/calls/{call}/recording"),
+    "recordings purge": ("DELETE", "/external/calls/{call}/recording"),
+    "fields list": ("GET", "/external/custom-fields"),
+    "fields create": ("POST", "/external/custom-fields"),
+    "fields update": ("PUT", "/external/custom-fields/{custom_field}"),
+    "fields delete": ("DELETE", "/external/custom-fields/{custom_field}"),
+    "fields impact": ("GET", "/external/custom-fields/{custom_field}/delete-impact"),
+    "field-groups list": ("GET", "/external/custom-field-groups"),
+    "field-groups create": ("POST", "/external/custom-field-groups"),
+    "field-groups update": ("PUT", "/external/custom-field-groups/{groupId}"),
+    "field-groups delete": ("DELETE", "/external/custom-field-groups/{groupId}"),
+    "field-groups reorder": ("POST", "/external/custom-field-groups/reorder"),
+    "field-groups add-field": ("POST", "/external/custom-field-groups/{groupId}/fields"),
+    "field-groups remove-field": ("DELETE", "/external/custom-field-groups/{groupId}/fields/{fieldId}"),
+    "field-groups reorder-fields": ("POST", "/external/custom-field-groups/{groupId}/fields/reorder"),
+    "field-groups update-field": ("PATCH", "/external/custom-field-groups/{groupId}/fields/{fieldId}"),
+    "schedules list": ("GET", "/external/webhook-schedule"),
+    "schedules get": ("GET", "/external/webhook-schedule/{id}"),
+    "schedules create": ("POST", "/external/webhook-schedule"),
+    "schedules update": ("PUT", "/external/webhook-schedule/{id}"),
+    "schedules delete": ("DELETE", "/external/webhook-schedule/{id}"),
+    "schedules preview": ("POST", "/external/webhook-schedule/{id}/preview"),
+    "schedules executions": ("GET", "/external/webhook-schedule/{id}/execution"),
+    "automations list": ("GET", "/external/automations"),
+    "automations get": ("GET", "/external/automations/{id}"),
+    "automations create": ("POST", "/external/automations"),
+    "automations update": ("PUT", "/external/automations/{id}"),
+    "automations delete": ("DELETE", "/external/automations/{id}"),
+    "automations code": ("GET", "/external/automations/{id}/code"),
+    "automations deploy": ("PUT", "/external/automations/{id}/code"),
+    "automations run": ("POST", "/external/automations/{id}/run"),
+    "automations runs": ("GET", "/external/automations/{id}/runs"),
+    "automations all-runs": ("GET", "/external/automations/runs"),
+    "automations run-detail": ("GET", "/external/automations/{id}/runs/{jobId}"),
+    "automations runtime-info": ("GET", "/external/automations/runtime-info"),
+    "automations triggers": ("GET", "/external/automations/{id}/triggers"),
+    "automations add-trigger": ("POST", "/external/automations/{id}/triggers"),
+    "automations update-trigger": ("PUT", "/external/automations/{id}/triggers/{path}"),
+    "automations remove-trigger": ("DELETE", "/external/automations/{id}/triggers/{path}"),
+    "automations toggle-trigger": ("POST", "/external/automations/{id}/triggers/{path}/toggle"),
+    "webhook-logs list": ("GET", "/external/webhook-logs"),
+    "webhook-logs get": ("GET", "/external/webhook-logs/{webhookLog}"),
+    "webhook-logs filters": ("GET", "/external/webhook-logs/filters"),
+    "variables list": ("GET", "/external/variables"),
+    "variables create": ("POST", "/external/variables"),
+    "variables update": ("PATCH", "/external/variables/{path}"),
+    "variables delete": ("DELETE", "/external/variables/{path}"),
+    "settings list": ("GET", "/external/settings/project"),
+    "settings get": ("GET", "/external/settings/project"),
+    "settings reveal": ("GET", "/external/settings/project/{definitionId}/reveal"),
+    "projects list": ("GET", "/external/projects"),
+    "projects get": ("GET", "/external/projects/{id}"),
+    "phone-numbers list": ("GET", "/external/phone-numbers"),
+    "phone-numbers get": ("GET", "/external/phone-numbers/{id}"),
+    "providers list": ("GET", "/external/phone-providers"),
+    "providers types": ("GET", "/external/phone-providers/types"),
 }
 WRITE_DEFAULT = True    # writes stay inside a tenant the consumer owns
-MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
+MACHINE_READS = ("connections", "doctor", "routes")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/callva/guides/")
 STATE = False       # True when the capability writes session/cache state
@@ -472,6 +637,28 @@ def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
     base = api_url_flag or entry.get("api_url") or DEFAULT_API_URL
     return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
             "key_env": key_env, "api_key": api_key, "base": base.rstrip("/")}, None
+
+
+def _secret_gate(conn_id: str, allow_write: bool, verb: str) -> None:
+    """A verb that prints a secret answers to the write gate although it writes
+    nothing: a connection held read-only is not one to hand secrets out through."""
+    if verb not in SECRET_READS:
+        return
+    _read_only_gate(f"secret read {verb!r} on connection {conn_id!r}")
+    if not allow_write:
+        _die(4, "read_only",
+             f"connection {conn_id!r} does not allow writes, and {verb!r} prints a secret",
+             "Do not lift the gate yourself — ask the user; granting is "
+             f"`capabilities set {NAME} grant {conn_id} '{{\"allow_write\": true}}'` "
+             "run inside this project.")
+
+
+def _routes_report() -> dict:
+    """The declared map of API verbs. Local only: no connection, no network."""
+    return {"routes": [
+        {"verb": verb, "method": method, "path": path,
+         "writes": verb in WRITE_VERBS, "secret": verb in SECRET_READS}
+        for verb, (method, path) in ROUTES.items()]}
 
 
 def _connections_report() -> dict:
@@ -1251,6 +1438,108 @@ def calls_automation_runs(args):
         "triggered_by", "duration_ms", "started_at", "args"])))
 
 
+def calls_actions(args):
+    result = api("GET", f"/external/calls/{args.call_id}/actions")
+    return _result(result, slim=lambda r: _apply_slim(r, lambda a: _pick(a, [
+        "id", "key", "label", "description", "confirm_text", "inputs"])))
+
+
+def calls_run_action(args):
+    inputs = getattr(args, "inputs", None)
+    r = api("POST", f"/external/calls/{args.call_id}/actions/{args.action_id}",
+            {"inputs": inputs} if inputs is not None else {})
+    return r.get("data", r)
+
+
+def calls_action_runs(args):
+    query = {}
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    if args.page:
+        query["page"] = str(args.page)
+    return api("GET", f"/external/calls/{args.call_id}/action-runs", query=query)
+
+
+# ===================================================================
+# ACTIONS
+# ===================================================================
+
+
+def actions_list(args):
+    query = {}
+    if args.entity_type:
+        query["entity_type"] = args.entity_type
+    result = api("GET", "/external/actions", query=query)
+    return _result(result, slim=lambda r: _apply_slim(r, lambda a: _pick(a, [
+        "id", "entity_type", "key", "label", "style", "sort_order", "is_active"])))
+
+
+def actions_get(args):
+    r = api("GET", f"/external/actions/{args.id}")
+    return r.get("data", r)
+
+
+def actions_create(args):
+    r = api("POST", "/external/actions", _data(args.payload))
+    return r.get("data", r)
+
+
+def actions_update(args):
+    r = api("PATCH", f"/external/actions/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def actions_put(args):
+    r = api("PUT", f"/external/actions/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def actions_delete(args):
+    api("DELETE", f"/external/actions/{args.id}")
+    return {"deleted": args.id}
+
+
+# ===================================================================
+# UI VIEWS
+# ===================================================================
+
+
+def ui_views_list(_args):
+    result = api("GET", "/external/ui-views")
+    return _result(result, slim=lambda r: _apply_slim(r, lambda v: _pick(v, [
+        "id", "entity_type", "name", "scope", "is_default", "sort_order"])))
+
+
+def ui_views_get(args):
+    r = api("GET", f"/external/ui-views/{args.id}")
+    return r.get("data", r)
+
+
+def ui_views_create(args):
+    r = api("POST", "/external/ui-views", _data(args.payload))
+    return r.get("data", r)
+
+
+def ui_views_update(args):
+    r = api("PATCH", f"/external/ui-views/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def ui_views_put(args):
+    r = api("PUT", f"/external/ui-views/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def ui_views_delete(args):
+    api("DELETE", f"/external/ui-views/{args.id}")
+    return {"deleted": args.id}
+
+
+def ui_views_set_default(args):
+    r = api("POST", f"/external/ui-views/{args.id}/set-default")
+    return r.get("data", r)
+
+
 # ===================================================================
 # TRANSCRIPTS
 # ===================================================================
@@ -1327,6 +1616,11 @@ def recordings_stream(args):
     # Returns a dict when saved to --output, None when streamed to stdout.
     return api_download(f"/external/calls/{args.call_id}/recording",
                         args.output, query={"url": args.url})
+
+
+def recordings_purge(args):
+    r = api("DELETE", f"/external/calls/{args.call_id}/recording")
+    return r.get("data", r)
 
 
 # ===================================================================
@@ -1802,6 +2096,20 @@ def settings_get(args):
     return match
 
 
+def settings_reveal(args):
+    """One value in the clear, as SHEBANG.md's "Revealing one value" prints one:
+    raw on stdout with a trailing newline and nothing else. The value is never
+    placed in an error, so a refusal carries nothing of it."""
+    r = api("GET", f"/external/settings/project/{args.definition_id}/reveal")
+    data = r.get("data") if isinstance(r, dict) else None
+    data = data if isinstance(data, dict) else {}
+    value = data.get("effective_value", data.get("value"))
+    if value is None or value == "":
+        _die(3, "not_set", f"setting {args.definition_id} holds no value")
+    text = value if isinstance(value, str) else json.dumps(value)
+    sys.stdout.write(text + "\n")
+
+
 # ===================================================================
 # PROJECTS
 # ===================================================================
@@ -1946,13 +2254,14 @@ def build_parser():
 
     subs.add_parser("help", help="Print the full usage contract")
     subs.add_parser("doctor", help="Authenticated round-trip — prove readiness")
+    subs.add_parser("routes", help="JSON map of every API verb and its route (local, no network)")
 
     # --- agents ---
     ag = subs.add_parser("agents", help="Manage voice agents")
     ag_sub = ag.add_subparsers(dest="action", required=True)
     ag_ls = ag_sub.add_parser("list", help="List all agents")
     ag_ls.add_argument("--is-active", type=parse_bool, default=None, help="Filter by active status")
-    ag_sub.add_parser("default", help="Get or create the default agent")
+    ag_sub.add_parser("default", help="The project's default agent, else its oldest; 404 (exit 3) when it has none")
     ag_get = ag_sub.add_parser("get", help="Get agent by ID")
     ag_get.add_argument("id", help="Agent UUID")
     ag_upd = ag_sub.add_parser("update", help="Update agent")
@@ -2092,6 +2401,57 @@ def build_parser():
                        help="Filter as key=value, e.g. -f status=success -f triggered_by=webhook (repeatable)")
     cl_ar.add_argument("--no-include-args", action="store_true",
                        help="Disable the default include_args=true")
+    cl_act = cl_sub.add_parser("actions", help="The actions that apply to this call now")
+    cl_act.add_argument("call_id", help="Call UUID")
+    cl_ra = cl_sub.add_parser("run-action", help="Press one action on this call")
+    cl_ra.add_argument("call_id", help="Call UUID")
+    cl_ra.add_argument("action_id", help="Action UUID")
+    cl_ra.add_argument("--inputs", dest="inputs", type=parse_json_arg, help="The action's inputs as JSON")
+    cl_ra.add_argument("--inputs-file", dest="inputs", type=parse_json_file,
+                       help="Read the inputs from a JSON file (- for stdin)")
+    cl_arn = cl_sub.add_parser("action-runs", help="The history of actions pressed on this call")
+    cl_arn.add_argument("call_id", help="Call UUID")
+    cl_arn.add_argument("--per-page", type=int, help="Results per page (max 100)")
+    cl_arn.add_argument("--page", type=int, help="Page number")
+
+    # --- actions ---
+    act = subs.add_parser("actions", help="Manage record action definitions")
+    act_sub = act.add_subparsers(dest="action", required=True)
+    act_ls = act_sub.add_parser("list", help="List action definitions")
+    act_ls.add_argument("--entity-type", help="Filter by entity type")
+    act_get = act_sub.add_parser("get", help="Get an action definition")
+    act_get.add_argument("id", help="Action UUID")
+    act_cr = act_sub.add_parser("create", help="Create an action definition")
+    act_cr.add_argument("--data", dest="payload", type=parse_json_arg, help="Definition as JSON (key, label, steps required)")
+    act_cr.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read the definition from a JSON file (- for stdin)")
+    for name, parser_help in (("update", "Change fields of a definition (PATCH)"),
+                              ("put", "Change fields of a definition (PUT, which the API treats as PATCH)")):
+        act_w = act_sub.add_parser(name, help=parser_help)
+        act_w.add_argument("id", help="Action UUID")
+        act_w.add_argument("--data", dest="payload", type=parse_json_arg, help="Fields to change as JSON")
+        act_w.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read the fields from a JSON file (- for stdin)")
+    act_del = act_sub.add_parser("delete", help="Delete an action definition")
+    act_del.add_argument("id", help="Action UUID")
+
+    # --- ui-views ---
+    uiv = subs.add_parser("ui-views", help="Manage the project's saved calls-list views")
+    uiv_sub = uiv.add_subparsers(dest="action", required=True)
+    uiv_sub.add_parser("list", help="List the project's views")
+    uiv_get = uiv_sub.add_parser("get", help="Get a view")
+    uiv_get.add_argument("id", help="View UUID")
+    uiv_cr = uiv_sub.add_parser("create", help="Create a project view")
+    uiv_cr.add_argument("--data", dest="payload", type=parse_json_arg, help="View as JSON (name, preferences required)")
+    uiv_cr.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read the view from a JSON file (- for stdin)")
+    for name, parser_help in (("update", "Change fields of a view (PATCH)"),
+                              ("put", "Change fields of a view (PUT, which the API treats as PATCH)")):
+        uiv_w = uiv_sub.add_parser(name, help=parser_help)
+        uiv_w.add_argument("id", help="View UUID")
+        uiv_w.add_argument("--data", dest="payload", type=parse_json_arg, help="Fields to change as JSON")
+        uiv_w.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read the fields from a JSON file (- for stdin)")
+    uiv_del = uiv_sub.add_parser("delete", help="Delete a view")
+    uiv_del.add_argument("id", help="View UUID")
+    uiv_def = uiv_sub.add_parser("set-default", help="Make a view the project's default")
+    uiv_def.add_argument("id", help="View UUID")
 
     # --- transcripts ---
     tr = subs.add_parser("transcripts", help="Manage call transcripts")
@@ -2136,6 +2496,8 @@ def build_parser():
     rec_dl.add_argument("call_id", help="Call UUID")
     rec_dl.add_argument("--url", required=True, help="Recording URL (from the call's recording_url field)")
     rec_dl.add_argument("--output", help="Output file path (omit for stdout)")
+    rec_pg = rec_sub.add_parser("purge", help="Drop the platform's cached copy; the recording itself stays")
+    rec_pg.add_argument("call_id", help="Call UUID")
 
     # --- fields ---
     fld = subs.add_parser("fields", help="Manage custom field definitions")
@@ -2325,6 +2687,8 @@ def build_parser():
     stg_sub.add_parser("list", help="List all settings")
     stg_get = stg_sub.add_parser("get", help="Get a single setting by key")
     stg_get.add_argument("key", help="Setting key (e.g. timezone, date_format)")
+    stg_rev = stg_sub.add_parser("reveal", help="Print one setting's value in the clear (refused on a read-only connection)")
+    stg_rev.add_argument("definition_id", help="The setting's definition_id, from `settings get`")
 
     # --- projects ---
     proj = subs.add_parser("projects", help="List and inspect projects")
@@ -2383,6 +2747,17 @@ DISPATCH = {
         "list": calls_list, "get": calls_get, "create": calls_create,
         "update": calls_update, "delete": calls_delete, "batch": calls_batch,
         "webhook-logs": calls_webhook_logs, "automation-runs": calls_automation_runs,
+        "actions": calls_actions, "run-action": calls_run_action,
+        "action-runs": calls_action_runs,
+    },
+    "actions": {
+        "list": actions_list, "get": actions_get, "create": actions_create,
+        "update": actions_update, "put": actions_put, "delete": actions_delete,
+    },
+    "ui-views": {
+        "list": ui_views_list, "get": ui_views_get, "create": ui_views_create,
+        "update": ui_views_update, "put": ui_views_put, "delete": ui_views_delete,
+        "set-default": ui_views_set_default,
     },
     "transcripts": {
         "get": transcripts_get, "store": transcripts_store,
@@ -2390,7 +2765,7 @@ DISPATCH = {
     },
     "call": call_initiate,
     "stats": {"aggregate": stats_aggregate, "trends": stats_trends},
-    "recordings": {"stream": recordings_stream},
+    "recordings": {"stream": recordings_stream, "purge": recordings_purge},
     "fields": {
         "list": fields_list, "create": fields_create, "update": fields_update,
         "delete": fields_delete, "impact": fields_impact,
@@ -2426,7 +2801,7 @@ DISPATCH = {
         "list": variables_list, "create": variables_create,
         "update": variables_update, "delete": variables_delete,
     },
-    "settings": {"list": settings_list, "get": settings_get},
+    "settings": {"list": settings_list, "get": settings_get, "reveal": settings_reveal},
     "projects": {"list": projects_list, "get": projects_get},
     "phone-numbers": {"list": phone_numbers_list, "get": phone_numbers_get},
     "providers": {"list": providers_list, "types": providers_types},
@@ -2477,6 +2852,10 @@ def main():
 
     args = build_parser().parse_args(cleaned)
 
+    if args.resource == "routes":
+        _emit(_routes_report())
+        return
+
     reg, _ = _connections_registry()
     if args.resource == "doctor":
         cmd_doctor(reg, wanted_conn, key_env, api_url)
@@ -2490,6 +2869,7 @@ def main():
         _die(problem["exit"], problem["code"], problem["message"],
              problem.get("hint"))
     _write_gate(cid, conn["allow_write"], verb)   # before any client exists
+    _secret_gate(cid, conn["allow_write"], verb)
 
     with _client(conn["api_key"], conn["base"]) as client:
         _STATE["client"] = client

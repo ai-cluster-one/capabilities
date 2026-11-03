@@ -1,5 +1,15 @@
 # callva — change log
 
+## 2026-11-03 — `callva` reaches record actions, saved views and one secret setting, and says which route each verb calls
+
+New verbs: `calls actions`, `calls run-action`, `calls action-runs`, `actions list|get|create|update|put|delete`, `ui-views list|get|create|update|put|delete|set-default`, `recordings purge` and `settings reveal`. Those that change the platform are write-gated. `update` sends PATCH and `put` sends PUT, which the API treats alike as a partial update. `recordings purge` drops the platform's cached copy of a recording, and the recording itself stays.
+
+`settings reveal <definition_id>` prints one setting's value raw on stdout with a trailing newline and nothing else, and exits 3 `not_set` when it holds none. It writes nothing but a read-only connection refuses it with exit 4 `read_only`, and so does the read-only switch.
+
+`callva routes` prints a JSON map of every API verb: `verb`, `method`, `path`, `writes` and `secret`. It is local, uses no connection and runs outside a project too. `tests/test_routes.py` runs every verb and holds the map to the call it makes.
+
+`agents default` is described as what it does: it only reads, answering the project's default agent, else its oldest, and exit 3 when it has none.
+
 ## 2026-10-31 — `callva help` names the agent's vault in the credential cascade
 
 Bare `callva help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.
