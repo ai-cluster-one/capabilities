@@ -21476,11 +21476,18 @@ def _store_upgrade_check(root: Path | None, *, available: dict | None = None) ->
         answer["_"] = {"setting": setting, "survey": survey, "key": key}
         return answer
     # The newest line is fetched while the readers are asked; both only wait.
+    # The fetch holds this process's stderr until it returns, so nothing
+    # leaves here before it has, a failure's own report included.
+    fetched = None
     if not available:
         fetching = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         fetched = fetching.submit(_store_upgrade_available)
         fetching.shutdown(wait=False)
-    readers = _store_upgrade_readers(setting, survey)
+    try:
+        readers = _store_upgrade_readers(setting, survey)
+    finally:
+        if fetched is not None:
+            concurrent.futures.wait([fetched])
     answer["available"] = available = available or fetched.result()
     target = max(available["major"] or STORE_MAJOR, STORE_MAJOR)
     answer["target_major"] = target
