@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-03 — The claude reply gate decides, and a gate run that fails is seen
+
+A claude gate run ended `max_turns: Reached maximum number of turns (1)` whenever the model wrote its decision as text rather than through the schema, because claude then asks for it once more and that request is a second turn; the run left no decision and was recorded as an ordinary `ignore`, so the group heard nothing. `telegram-gate-claude` now sets `max_turns = 2` and the gate's fit asks for 2, so that second request is answered; with no tools a gate run can do nothing else with it. A stored gate profile that still sets 1 is refused, naming why. A gate run that fails is now recorded with `action: "failed"` and an `outcome` saying its batch was not answered, rather than as `ignore`; the daemon keeps each channel whose last gate run failed in its health file under `gate_failures`, which `telegram service status` shows, and `telegram service doctor` reports `ok: false` with `gate_failing` while a running service holds one. The channel's next run that decides clears it.
+
 ## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
 
 The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning in the log; codex is unchanged. Nothing a turn does changes.

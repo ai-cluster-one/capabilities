@@ -5362,6 +5362,12 @@ GATE_RUN_DIR = SERVICE_STATE_DIR / "gate"
 # The environment name that places the gate's codex home elsewhere, for a
 # deployment that keeps logins on a volume of their own.
 GATE_CODEX_HOME_ENV = "TELEGRAM_GATE_CODEX_HOME"
+# Each channel whose last gate run failed, with when, why and the batch it left
+# unanswered, published in the health file as `gate_failures` so `service
+# status` shows it and `service doctor` fails on it; the channel's next run that
+# decides takes it out. A process starts with none.
+GATE_FAILURES = {}
+GATE_FAILED_OUTCOME = "not answered: the gate run failed, so no turn ran and no reaction was set"
 
 
 def gate_codex_home():
@@ -7463,17 +7469,27 @@ async def run_session(client):
                 else:
                     error = (f"{result.failure.kind}: "
                              f"{str(result.failure.message or '')[:300]}")
-        if decision is None:
-            decision = {"action": "ignore", "target_message_id": None, "emoji": None,
-                        "reason": ""}
         latency_ms = round((time.monotonic() - started) * 1000)
-        acted, outcome = await gate_act(key, ent_id, group_policy, settings, decision,
-                                        items)
+        if decision is None:
+            # A run that failed decided nothing, and nothing is acted on: the
+            # batch is left unanswered, as a gate that cannot decide must not
+            # make the assistant speak to every message it was meant to judge.
+            decision = {"action": "failed", "target_message_id": None, "emoji": None,
+                        "reason": ""}
+            acted, outcome = False, GATE_FAILED_OUTCOME
+        else:
+            acted, outcome = await gate_act(key, ent_id, group_policy, settings, decision,
+                                            items)
         record = reply_gate.record(
             channel=key, batch_ids=batch_ids, harness=harness, model=model,
             decision=decision, latency_ms=latency_ms, tokens=tokens,
             mode=settings["mode"], acted=acted, error=error, outcome=outcome)
         log(f"{key}: gate " + json.dumps(record, ensure_ascii=False))
+        if error is not None:
+            GATE_FAILURES[key] = {"at": now(), "error": error, "batch": batch_ids}
+        elif GATE_FAILURES.pop(key, None) is None:
+            return
+        write_health(gate_failures=dict(GATE_FAILURES))
 
     async def gate_act(key, ent_id, group_policy, settings, decision, items):
         """Act on a decision: `(acted, outcome)`. Shadow acts on nothing."""

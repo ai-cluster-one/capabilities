@@ -472,7 +472,7 @@ class Profiles(unittest.TestCase):
         claude = self.bundled("telegram-gate-claude")["knobs"]
         self.assertEqual((claude["tools"], claude["setting_sources"], claude["max_turns"],
                           claude["thinking"], claude["strict_mcp"], claude["mcp_config"]),
-                         ([], [], 1, False, True, {"mcpServers": {}}))
+                         ([], [], 2, False, True, {"mcpServers": {}}))
         # Thinking off reaches Haiku 5.5 only with the CLI's mark taken off
         # it, and a named session makes no session-title request; both reach
         # the CLI as the runner builds its options.
@@ -840,6 +840,38 @@ class GateSession(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((record["action"], record["acted"]), ("ignore", False))
                 self.assertIn("emoji", record["invalid"])
                 self.assertEqual(s.reactions, [])
+
+    async def test_a_failed_run_is_failed_not_ignore_and_held_in_health_until_a_run_decides(self):
+        with tempfile.TemporaryDirectory() as td:
+            service = group_settings(gate_block={"enabled": True, "mode": "live"},
+                                     profile="telegram-claude")
+            answering = Answering({"action": "ignore", "target_message_id": 2,
+                                   "emoji": None, "reason": "banter"})
+            failures = [result("claude", ok=False, kind="max_turns",
+                               message="Reached maximum number of turns (1)")]
+
+            def harness(prompt, profile, cwd, **kwargs):
+                if profile.output_schema is not None and failures:
+                    return failures.pop(0)
+                return answering(prompt, profile, cwd, **kwargs)
+
+            async with Session(self, td, service, answering=harness) as s:
+                await s.send(group_message(1, "can you check the deploy?"))
+                await wait_until(lambda: gate_records(s.daemon))
+                record = gate_records(s.daemon)[0]
+                self.assertEqual((record["action"], record["acted"]), ("failed", False))
+                self.assertIn("max_turns", record["error"])
+                self.assertIn("not answered", record["outcome"])
+                self.assertEqual((s.client.sent, s.reactions, answering.turn_calls),
+                                 ([], [], []))
+                health = json.loads(s.daemon.HEALTH_FILE.read_text())
+                self.assertEqual(list(health["gate_failures"]), [str(GROUP)])
+                self.assertEqual(health["gate_failures"][str(GROUP)]["batch"], [1])
+                await s.send(group_message(2, "lol"))
+                await wait_until(lambda: len(gate_records(s.daemon)) == 2)
+                self.assertEqual(gate_records(s.daemon)[1]["action"], "ignore")
+                health = json.loads(s.daemon.HEALTH_FILE.read_text())
+                self.assertEqual(health["gate_failures"], {})
 
     async def test_one_record_per_run_with_every_field(self):
         with tempfile.TemporaryDirectory() as td:

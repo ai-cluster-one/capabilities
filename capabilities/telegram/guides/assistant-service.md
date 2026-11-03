@@ -687,7 +687,7 @@ The gate reads a document built for it and nothing else: the assistant's display
 
 ### What it decides
 
-The run's answer is held to a JSON schema: `action` (`ignore`, `react` or `reply`), `target_message_id` (a message of the batch), `emoji` (one of the allowed set, required for `react`) and `reason` (one sentence). An answer that does not parse, names a message outside the batch or an emoji outside the set, or a run that fails, is `ignore`, and the record says why.
+The run's answer is held to a JSON schema: `action` (`ignore`, `react` or `reply`), `target_message_id` (a message of the batch), `emoji` (one of the allowed set, required for `react`) and `reason` (one sentence). An answer that does not parse, or names a message outside the batch or an emoji outside the set, is `ignore`, and the record says why in `invalid`. A run that fails - the harness refused it, it timed out, it ended without a decision - decides nothing: its record says `action: "failed"` with the `error`, and its `outcome` says the batch was not answered, since no turn runs and no reaction is set, in `live` as in `shadow`. The failure also stays in the service's health file under `gate_failures`, by channel with when, why and the batch, so `telegram service status` shows it and `telegram service doctor` reports `ok: false` with `gate_failing` until that channel's next run decides; a restart starts with none.
 
 In `live` mode:
 
@@ -701,7 +701,7 @@ Every run writes one line to the service log, `<channel>: gate {...}`, with `cha
 
 ### How the gate runs
 
-The gate runs on the vendor of the channel's resolved profile: a channel on a claude profile gates on `telegram-gate-claude` (`haiku`), one on a codex profile on `telegram-gate-codex` (the `luna` family), and a channel on `stub` gates on a stub decision that runs no harness. Both are bundled profiles at the lowest layer of the same resolution every telegram profile uses (see Harness Profiles); telegram never saves either. Each is one light turn: the gate's own system prompt in place of the coding agent's, the lowest effort, no tools, no settings files, hooks, skills or MCP servers, a single turn, the decision schema, and no session saved, so a run appears in neither harness's session list. The turn's fit refuses both, so `/set profile` never puts a room on one. Each run starts in an empty directory under the service's state, removed after, so no project file is in reach.
+The gate runs on the vendor of the channel's resolved profile: a channel on a claude profile gates on `telegram-gate-claude` (`haiku`), one on a codex profile on `telegram-gate-codex` (the `luna` family), and a channel on `stub` gates on a stub decision that runs no harness. Both are bundled profiles at the lowest layer of the same resolution every telegram profile uses (see Harness Profiles); telegram never saves either. Each is one light turn: the gate's own system prompt in place of the coding agent's, the lowest effort, no tools, no settings files, hooks, skills or MCP servers, the decision schema, and no session saved, so a run appears in neither harness's session list. On claude the run may take two turns and no more: a model that writes its decision as text instead of through the schema is asked for it once more by claude itself, and that request is a turn of its own, so the gate profile must set `max_turns` to 2. The turn's fit refuses both, so `/set profile` never puts a room on one. Each run starts in an empty directory under the service's state, removed after, so no project file is in reach.
 
 A codex gate run reads a codex home of its own instead of the user's, so the user's codex settings, MCP servers, plugins, skills and instructions stay out of it: `$XDG_STATE_HOME/telegram/gate-codex-home` (`~/.local/state/telegram/gate-codex-home` when `XDG_STATE_HOME` is unset), one per machine for every telegram service on it, or the path in `TELEGRAM_GATE_CODEX_HOME`. It has no login until one is made there, once per machine, by the operator:
 
@@ -709,7 +709,7 @@ A codex gate run reads a codex home of its own instead of the user's, so the use
 mkdir -p ~/.local/state/telegram/gate-codex-home && CODEX_HOME=~/.local/state/telegram/gate-codex-home codex login
 ```
 
-Until then every codex gate run fails `not_authenticated`, which its record names, and is read as `ignore`.
+Until then every codex gate run fails `not_authenticated`, which its record names, and leaves its batch unanswered.
 
 A gate run costs latency on every gated reply - a few seconds of harness start and decision before the turn begins - and mechanical triggers never pay it. Runs bill to the account the harness is logged in with; batching is the main control on how many there are.
 

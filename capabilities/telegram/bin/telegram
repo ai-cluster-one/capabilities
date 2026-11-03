@@ -449,10 +449,12 @@ Exit codes:
   5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx, and
      `service doctor` reporting `ok: false` — a running daemon whose update
      sync is not fresh, a profile the settings name that does not resolve
-     or fit or, under `--live`, that its harness did not accept, or a job
-     register the store did not open; after its report it prints the error
-     envelope naming the first of these (`service_unhealthy` with the
-     daemon's last error, `worker_unavailable`, or the store's own code),
+     or fit or, under `--live`, that its harness did not accept, a job
+     register the store did not open, or a running daemon whose last
+     reply-gate run in a channel failed; after its report it prints the
+     error envelope naming the first of these (`service_unhealthy` with the
+     daemon's last error, `worker_unavailable`, the store's own code, or
+     `gate_failing`),
      which a supervisor records as why the service cannot work. A route
      skipped on this node is named under `skipped_settings` beside
      `warnings`, and the doctor stays ok
@@ -5297,7 +5299,8 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None,
     status["session_file_exists"] = session_file.exists()
     workers = _service_worker_preflight(root, settings or {}, live)
     store = _service_store_check(root)
-    report = {"ok": local_ok and workers["ok"] and store["ok"],
+    report = {"ok": (local_ok and workers["ok"] and store["ok"]
+                     and not _service_gate_failures(status)),
               "service": status,
               "workers": workers,
               "store": store,
@@ -5305,7 +5308,9 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None,
               "note": ("`telegram doctor` performs the authenticated Telegram round-trip; "
                        "a running service is healthy only while its update sync stays fresh; "
                        "`workers` is each profile the settings name resolved and fitted; "
-                       "with `--live`, each answering one live turn on its harness")}
+                       "with `--live`, each answering one live turn on its harness; "
+                       "a running service whose last reply-gate run in a channel failed "
+                       "names it under `service.health.gate_failures`")}
     if _SKIPPED_ROUTES:
         report["warnings"] = [f"{entry['path']} -> {entry['project']} is skipped on this "
                               f"node: {entry['reason']}" for entry in _SKIPPED_ROUTES]
@@ -5313,6 +5318,17 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None,
                                        "reason": entry["reason"]}
                                       for entry in _SKIPPED_ROUTES]
     return report
+
+
+def _service_gate_failures(status: dict) -> list[dict]:
+    """Every channel whose last reply-gate run failed in a running service, as
+    the daemon publishes them in its health file, with when, why and the batch
+    that run left unanswered. A stopped service runs no gate."""
+    failures = (status.get("health") or {}).get("gate_failures") if status["running"] else None
+    if not isinstance(failures, dict):
+        return []
+    return [{"channel": channel, **row} for channel, row in sorted(failures.items())
+            if isinstance(row, dict)]
 
 
 def _service_doctor_problem(report: dict) -> tuple[str, str, str | None]:
@@ -5338,6 +5354,16 @@ def _service_doctor_problem(report: dict) -> tuple[str, str, str | None]:
         return (store.get("code") or "store_unavailable",
                 store.get("error") or "the job register does not open in the store",
                 store.get("hint"))
+    failing = _service_gate_failures(status)
+    if failing:
+        row = failing[0]
+        return ("gate_failing",
+                f"the reply gate's last run in channel {row['channel']} failed at "
+                f"{row.get('at')}: {row.get('error')}; its batch {row.get('batch')} was not "
+                f"answered" + (f", and {len(failing) - 1} more channel(s) failed too"
+                               if len(failing) > 1 else ""),
+                f"`telegram service logs --connection {report['connection']}` shows each "
+                "`gate` record; the channel's next run that decides clears this")
     return "service_unhealthy", "the service doctor found it not ok", None
 
 

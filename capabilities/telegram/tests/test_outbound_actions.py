@@ -1457,6 +1457,22 @@ class ServiceDoctorExitTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(code, 0)
 
+    def test_a_fresh_daemon_whose_last_gate_run_failed_fails(self):
+        cli = import_cli()
+        failed = {"at": self._stamp(5), "batch": [7],
+                  "error": "max_turns: Reached maximum number of turns (1)"}
+        with tempfile.TemporaryDirectory() as tmp:
+            code, payload = self._run_doctor(cli, tmp, health={
+                "state": "healthy", "last_sync_at": self._stamp(1),
+                "stale_after_seconds": 600, "gate_failures": {"-200": failed}})
+            problem = cli._service_doctor_problem(payload)
+        self.assertEqual(set(payload), self.PAYLOAD_KEYS)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(code, 5)
+        self.assertEqual(problem[0], "gate_failing")
+        self.assertIn("-200", problem[1])
+        self.assertIn("max_turns", problem[1])
+
     def test_a_stopped_service_passes(self):
         """No daemon is not a failing daemon; the verdict is unchanged."""
         cli = import_cli()

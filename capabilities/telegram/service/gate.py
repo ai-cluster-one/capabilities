@@ -16,7 +16,9 @@ emoji it may use - and never the turn's prompt, the project's context or a
 channel's context file. It runs on the vendor of the channel's resolved
 profile, on one of the two gate profiles telegram ships, from an empty
 directory, with no tools and no session saved. Its answer is held to a JSON
-schema, and an answer outside it is read as ignore.
+schema, and an answer outside it is read as ignore. A run that fails decides
+nothing: its record says `failed`, nothing is acted on, and the service health
+names the channel until its next run decides.
 
 `shadow`, the default once the gate is on, decides and logs and acts on
 nothing; `live` acts. Every run writes one record.
@@ -139,7 +141,8 @@ def fit_problems(knobs: dict) -> list[str]:
     """Why a profile cannot carry a gate run, one sentence per knob; empty when
     it can. A gate run is one light turn: its own system prompt, an answer held
     to a schema, nothing saved, and on claude no tools, no settings files and
-    one turn."""
+    two turns: the answer, and the one claude takes to ask for it again when
+    the model wrote it as text rather than through the schema."""
     problems = []
     harness = knobs.get("harness")
     if harness not in ("claude", "codex"):
@@ -162,8 +165,10 @@ def fit_problems(knobs: dict) -> list[str]:
                             "settings, hooks or plugins")
         if knobs.get("strict_mcp") is not True:
             problems.append("strict_mcp is not true; a gate run reaches no MCP server")
-        if knobs.get("max_turns") != 1:
-            problems.append("max_turns is not 1; a gate run is a single turn")
+        if knobs.get("max_turns") != 2:
+            problems.append("max_turns is not 2; a gate run is one answer, and claude "
+                            "takes a second turn to ask for it again when the model "
+                            "writes it as text rather than through the schema")
     return problems
 
 
