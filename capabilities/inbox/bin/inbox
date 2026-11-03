@@ -24,12 +24,11 @@ there are none: every verb that reads or writes them exits 6
 
 ASKING  (the agent of the folder the command runs in)
   inbox ask "<title>" --text T --yes WORDS --no WORDS --recommend yes|no
-            [--key K] [--on-answer CMD]
+            [--session ID] [--key K] [--on-answer CMD]
       A question for a yes or a no. --yes and --no are the words the person
       reads for each answer, and --recommend the answer the agent would take.
   inbox talk "<title>" --text T [--session ID] [--key K] [--on-answer CMD]
-      A message the person answers in words. --session names the
-      conversation it belongs to, as the asker keeps it; inbox only stores it.
+      A message the person answers in words.
   inbox notify "<title>" --text T [--key K]
       Something the person should know; it takes no answer.
       Each of the three answers {"created", "item"}. The title is one line of
@@ -57,6 +56,26 @@ ASKING  (the agent of the folder the command runs in)
 
   An asker reaches only its own agent's items: an id or key of another
   agent's item is not found (exit 3).
+
+THE SESSION AND THE NODE
+  Every item records the node it was put from, by the id `capabilities node
+  id` answers, and the harness session that put it in, so its answer can
+  return there; show, status and list return both for every kind. The
+  session is the one the harness names in the environment of the commands it
+  runs - CLAUDE_CODE_SESSION_ID for Claude Code, CODEX_THREAD_ID for Codex -
+  and an ask's or a talk's --session ID names another session of the same
+  agent instead. A session is this agent's where the harness's own session
+  store holds it as started in this project's folder, or in a folder inside
+  it that is no project of its own, by the first cwd its file records:
+    Claude Code   ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/<id>.jsonl
+    Codex         ${CODEX_HOME:-~/.codex}/sessions/*/*/*/rollout-*-<id>.jsonl
+  Any other session, the one the environment names included, is refused
+  (exit 6 `foreign_session`): the agent whose session it is puts the item in
+  itself. An ask or a talk with no session is refused (exit 6 `no_session`)
+  unless it gives --on-answer, whose command then takes the answer: a caller
+  that runs in no harness session - a service, an automation, tasks run by
+  none - leaves one. A notify records the session where there is one and
+  needs none.
 
 THE PERSON
   inbox list [--view inbox|archive] [--agent A | --all-agents] [--kind K]
@@ -185,7 +204,8 @@ EXIT CODES
     project may not run here
   5 store - unreachable or busy
   6 input - a malformed argument, no store configured, no project or project
-    identity, an item not in the state the verb needs
+    identity, an item not in the state the verb needs, a question with no
+    session, a session that is not this agent's
   7 already answered, not answered in time, or a delivery that failed
   8 another service process already holds this state root
 """
@@ -272,7 +292,7 @@ def _manifest() -> dict:
 # and its delivery are facts of that row written once each. An item is
 # withdrawn rather than deleted, so its row stays as the record of what was
 # asked; nothing refuses a delete, which no verb makes.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 0
+LEDGER_MAJOR, LEDGER_MINOR = 1, 1
 CHANNEL = "inbox_changed"
 LEDGER_STEPS = [
     ("0001-items", """
@@ -408,6 +428,40 @@ LEDGER_STEPS = [
     CREATE TRIGGER inbox_items_changed AFTER INSERT OR UPDATE ON inbox_items
         FOR EACH ROW EXECUTE FUNCTION inbox_items_changed();
     """),
+    # Every kind carries the session that put it in, and every item the node
+    # it was put from; what an item asks still never changes, its node with it.
+    ("0004-session-node", """
+    ALTER TABLE inbox_items DROP CONSTRAINT inbox_items_session;
+    ALTER TABLE inbox_items ADD COLUMN node text CHECK (node <> '');
+    CREATE OR REPLACE FUNCTION inbox_items_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF (new.agent_id, new.id, new.kind, new.key, new.title, new.text, new.yes_label,
+            new.no_label, new.recommend, new.session, new.on_answer, new.created_at,
+            new.created_by, new.node)
+           IS DISTINCT FROM
+           (old.agent_id, old.id, old.kind, old.key, old.title, old.text, old.yes_label,
+            old.no_label, old.recommend, old.session, old.on_answer, old.created_at,
+            old.created_by, old.node) THEN
+            RAISE EXCEPTION 'what an inbox item asks is never changed: withdraw it and ask again'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF old.answered_at IS NOT NULL
+           AND (new.answered_at, new.answered_by, new.answer, new.reply)
+               IS DISTINCT FROM (old.answered_at, old.answered_by, old.answer, old.reply) THEN
+            RAISE EXCEPTION 'the first answer to an inbox item is final'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF old.withdrawn_at IS NOT NULL AND new.withdrawn_at IS DISTINCT FROM old.withdrawn_at THEN
+            RAISE EXCEPTION 'a withdrawn inbox item stays withdrawn'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+    COMMENT ON COLUMN inbox_items.session IS
+        'The harness session that put the item in, of any kind: the one the putting command ran in, or another session of the same agent it named. NULL where none ran it, for an ask or a talk that left an on-answer command, or a notify.';
+    COMMENT ON COLUMN inbox_items.node IS
+        'The node the item was put from, by the id `capabilities node id` answers; NULL on an item put before inbox recorded it.';
+    """),
 ]
 
 
@@ -532,7 +586,7 @@ def _one(conn, sql: str, params=()) -> dict | None:
 # ── an item ─────────────────────────────────────────────────────────────────
 
 _COLUMNS = ("agent_id, id, kind, key, title, text, yes_label, no_label, recommend, session, "
-            "on_answer, created_at, created_by, read_at, archived_at, withdrawn_at, "
+            "node, on_answer, created_at, created_by, read_at, archived_at, withdrawn_at, "
             "answered_at, answered_by, answer, reply, delivered_at, delivery_attempts, "
             "delivery_error, delivery_due_at, delivery_lease_until")
 
@@ -563,8 +617,7 @@ def _view(row: dict) -> dict:
             "key": row["key"], "title": row["title"], "text": row["text"]}
     if row["kind"] == "ask":
         item.update(yes=row["yes_label"], no=row["no_label"], recommend=row["recommend"])
-    if row["kind"] == "talk":
-        item["session"] = row["session"]
+    item.update(session=row["session"], node=row["node"])
     if row["kind"] != "notify":
         item["on_answer"] = row["on_answer"]
     item.update(created_at=_iso(row["created_at"]), created_by=row["created_by"],
@@ -633,11 +686,104 @@ def _line(value: str, what: str, limit: int | None = None) -> str:
     return value
 
 
+# ── the session ─────────────────────────────────────────────────────────────
+
+# The harnesses whose sessions inbox knows, by the variable each sets in every
+# command it runs to name the session running it.
+SESSION_VARS = ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID")
+_SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def _running_session() -> tuple[str, str] | None:
+    """The variable naming the harness session this command runs in, and the
+    session; None outside any."""
+    for var in SESSION_VARS:
+        value = os.environ.get(var, "").strip()
+        if value:
+            return var, value
+    return None
+
+
+def _first_cwd(path: Path, pick, lines: int | None = None) -> list[Path]:
+    """The folder the first entry `pick` answers for records, of a session file."""
+    with contextlib.suppress(OSError, UnicodeDecodeError):
+        with path.open(encoding="utf-8") as entries:
+            for n, line in enumerate(entries):
+                if lines is not None and n >= lines:
+                    break
+                with contextlib.suppress(ValueError):
+                    entry = json.loads(line)
+                    found = pick(entry) if isinstance(entry, dict) else None
+                    if isinstance(found, str) and found:
+                        return [Path(found)]
+    return []
+
+
+def _session_folders(session: str) -> list[Path]:
+    """The folders the harnesses' own session stores record `session` as
+    started in: Claude Code's transcript by its cwd, Codex's rollout by its
+    session_meta."""
+    if not _SESSION_ID.fullmatch(session):
+        return []
+    home = Path.home()
+    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude") / "projects"
+    codex = Path(os.environ.get("CODEX_HOME") or home / ".codex") / "sessions"
+    folders = []
+    for transcript in claude.glob(f"*/{session}.jsonl"):
+        folders += _first_cwd(transcript, lambda e: e.get("cwd"))
+    for rollout in codex.glob(f"*/*/*/rollout-*-{session}.jsonl"):
+        folders += _first_cwd(rollout, lambda e: (e.get("payload") or {}).get("cwd")
+                              if e.get("type") == "session_meta" else None, lines=1)
+    return folders
+
+
+def _in_project(folder: Path, root: Path) -> bool:
+    """Whether `folder` is the project `root`, or a folder inside it that is no
+    project of its own."""
+    try:
+        here, root = folder.resolve(), root.resolve()
+        here.relative_to(root)
+    except (OSError, ValueError):
+        return False
+    for d in (here, *here.parents):
+        if d == root:
+            return True
+        if _bound_folder(d, None):
+            return False
+    return False
+
+
+def _session(args, kind: str) -> str | None:
+    """The session an item records: the one --session names, else the one the
+    command runs in; proven this agent's by the harness's own session store.
+    An ask or a talk without one must leave an on-answer command."""
+    named = getattr(args, "session", None)
+    running = _running_session()
+    if named is not None:
+        source, session = "--session", _line(named, "--session")
+    elif running is not None:
+        source, session = running
+    else:
+        if kind != "notify" and getattr(args, "on_answer", None) is None:
+            _die(6, "no_session", f"`{NAME} {kind}` carries the session that puts it in, "
+                 "so its answer can return there, and this command runs in no harness session",
+                 "run it in the agent's own session, name one with --session ID, or leave "
+                 "--on-answer CMD to take the answer")
+        return None
+    root = _root()
+    if not any(_in_project(folder, root) for folder in _session_folders(session)):
+        _die(6, "foreign_session", f"session {session!r} ({source}) is not this agent's: no "
+             f"harness session store holds it as started in {root}",
+             "the agent whose session it is puts the item in itself; --session names "
+             "another session of this agent")
+    return session
+
+
 # ── asking ──────────────────────────────────────────────────────────────────
 
 def _put(fields: dict) -> None:
     agent = _agent(write=True)
-    fields = {"agent_id": agent, "created_by": _actor(), **fields}
+    fields = {"agent_id": agent, "created_by": _actor(), "node": node_name(), **fields}
     names = list(fields)
     with _store() as conn:
         with conn.transaction():
@@ -659,6 +805,7 @@ def _common(args, kind: str) -> dict:
         if not args.on_answer.strip():
             _die(6, "input", "--on-answer is empty")
         fields["on_answer"] = args.on_answer
+    fields["session"] = _session(args, kind)
     return fields
 
 
@@ -670,10 +817,7 @@ def cmd_ask(args) -> None:
 
 
 def cmd_talk(args) -> None:
-    fields = _common(args, "talk")
-    if args.session is not None:
-        fields["session"] = _line(args.session, "--session")
-    _put(fields)
+    _put(_common(args, "talk"))
 
 
 def cmd_notify(args) -> None:
@@ -1487,10 +1631,10 @@ def _parser() -> _Parser:
         one.add_argument("--key")
     for one in (ask, talk):
         one.add_argument("--on-answer", dest="on_answer")
+        one.add_argument("--session")
     ask.add_argument("--yes", required=True)
     ask.add_argument("--no", required=True)
     ask.add_argument("--recommend", required=True, choices=("yes", "no"))
-    talk.add_argument("--session")
     for verb in ("withdraw", "status", "wait"):
         one = sub.add_parser(verb)
         one.add_argument("id", nargs="?")

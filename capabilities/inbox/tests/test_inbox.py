@@ -29,7 +29,7 @@ MANAGER = CAPABILITY.parents[1] / "bin" / "capabilities"
 ADMIN = "pgadmin"
 SCHEMA = "box"
 ALPHA, BETA = "prj_" + "a1a1a1a1a1a1", "prj_" + "b2b2b2b2b2b2"
-CLEARED_PREFIXES = ("AGENTKIT_DB_", "CAPABILITIES_", "CLAUDE", "INBOX_")
+CLEARED_PREFIXES = ("AGENTKIT_DB_", "CAPABILITIES_", "CLAUDE", "CODEX", "INBOX_")
 TEST_NODE = "746573742d6e"
 NASTY = "$(touch pwned); rm -rf x; \"' `id`"
 
@@ -108,6 +108,7 @@ class Lab:
         self.alpha = self._project("alpha", ALPHA)
         self.beta = self._project("beta", BETA)
         self.services: list[subprocess.Popen] = []
+        self.sessions: dict[Path, str] = {}
 
     def _project(self, slug: str, ident: str) -> Path:
         root = self.tmp / slug
@@ -120,7 +121,32 @@ class Lab:
             {"capabilities": {"inbox": {"enabled": True}}}))
         return root
 
-    def env(self, **extra: str) -> dict:
+    def session(self, started_in: Path, harness: str = "claude") -> str:
+        """A new session of `harness`, kept in its own session store in the
+        test's home as started in `started_in`."""
+        session = str(uuid.uuid4())
+        home = self.tmp / "home"
+        if harness == "claude":
+            transcript = (home / ".claude" / "projects" / str(started_in).replace("/", "-")
+                          / f"{session}.jsonl")
+            entries = [{"type": "queue-operation", "sessionId": session},
+                       {"type": "user", "cwd": str(started_in), "sessionId": session}]
+        else:
+            transcript = (home / ".codex" / "sessions" / "2026" / "11" / "03"
+                          / f"rollout-2026-11-03T10-00-00-{session}.jsonl")
+            entries = [{"type": "session_meta", "payload": {"id": session,
+                                                             "cwd": str(started_in)}}]
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text("".join(json.dumps(e) + "\n" for e in entries))
+        return session
+
+    def own(self, where: Path) -> str:
+        """The Claude Code session each command in `where` runs in by default."""
+        if where not in self.sessions:
+            self.sessions[where] = self.session(where)
+        return self.sessions[where]
+
+    def env(self, **extra: str | None) -> dict:
         env = {k: v for k, v in os.environ.items() if not k.startswith(CLEARED_PREFIXES)}
         env.update({
             "HOME": str(self.tmp / "home"),
@@ -136,9 +162,10 @@ class Lab:
             "USER": "tester",
             **extra,
         })
-        return env
+        return {k: v for k, v in env.items() if v is not None}
 
-    def run(self, where: Path, *args: str, **extra: str):
+    def run(self, where: Path, *args: str, **extra: str | None):
+        extra = {"CLAUDE_CODE_SESSION_ID": self.own(where), **extra}
         return subprocess.run([sys.executable, str(CLI), *args], cwd=where,
                               env=self.env(**extra), text=True, capture_output=True,
                               timeout=180)
@@ -159,9 +186,9 @@ class Lab:
             cur = conn.execute(query, params)
             return cur.fetchall() if cur.description else None
 
-    def ask(self, where: Path, title: str = "Ship it?", *more: str) -> dict:
+    def ask(self, where: Path, title: str = "Ship it?", *more: str, **extra) -> dict:
         return self.ok(where, "ask", title, "--text", "The release is ready.", "--yes",
-                       "Ship now", "--no", "Hold", "--recommend", "yes", *more)["item"]
+                       "Ship now", "--no", "Hold", "--recommend", "yes", *more, **extra)["item"]
 
     def serve(self, where: Path) -> subprocess.Popen:
         child = subprocess.Popen([sys.executable, str(CLI), "service", "run"], cwd=where,
@@ -229,14 +256,122 @@ def test_the_three_kinds_and_a_key_that_makes_a_repeat_one_item(lab):
     # The key is the agent's own: another agent's same key is another item.
     other = lab.ok(lab.beta, "notify", "Hello", "--text", "t", "--key", "rel-1")
     assert other["created"] and other["item"]["agent"] == BETA
-    talk = lab.ok(lab.alpha, "talk", "Which way?", "--text", "t", "--session", "s-1")["item"]
-    assert talk["kind"] == "talk" and talk["session"] == "s-1" and "yes" not in talk
+    talk = lab.ok(lab.alpha, "talk", "Which way?", "--text", "t")["item"]
+    assert talk["kind"] == "talk" and talk["session"] == lab.own(lab.alpha) and "yes" not in talk
     assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.inbox_items")[0][0] == 3
     code, error = lab.refused(lab.alpha, "ask", "Two\nlines", "--text", "t", "--yes", "a",
                               "--no", "b", "--recommend", "yes")
     assert (code, error["code"]) == (6, "input")
     code, _error = lab.refused(lab.alpha, "notify", "x", "--text", "t", "--on-answer", "true")
     assert code == 6
+
+
+def test_every_kind_records_the_session_it_runs_in_and_its_node(lab):
+    mine = lab.own(lab.alpha)
+    asked = lab.ask(lab.alpha)
+    talked = lab.ok(lab.alpha, "talk", "Which way?", "--text", "t")["item"]
+    noted = lab.ok(lab.alpha, "notify", "FYI", "--text", "t")["item"]
+    for item in (asked, talked, noted):
+        assert (item["session"], item["node"]) == (mine, TEST_NODE)
+        for read in (lab.ok(lab.alpha, "show", item["id"]),
+                     lab.ok(lab.alpha, "status", item["id"])):
+            assert (read["session"], read["node"]) == (mine, TEST_NODE)
+    listed = lab.ok(lab.alpha, "list")["items"]
+    assert {(i["kind"], i["session"], i["node"]) for i in listed} == {
+        (kind, mine, TEST_NODE) for kind in ("ask", "talk", "notify")}
+    # --session names another session of the same agent, on an ask as on a talk;
+    # one started in a folder inside the project is the project's.
+    (lab.alpha / "docs").mkdir()
+    other, inside = lab.session(lab.alpha), lab.session(lab.alpha / "docs")
+    assert lab.ask(lab.alpha, "Other?", "--session", other)["session"] == other
+    assert lab.ok(lab.alpha, "talk", "x", "--text", "t",
+                  "--session", inside)["item"]["session"] == inside
+    # A Codex session is named by CODEX_THREAD_ID and kept in its rollout.
+    codex = lab.session(lab.alpha, harness="codex")
+    item = lab.ask(lab.alpha, "From codex?", CLAUDE_CODE_SESSION_ID=None, CODEX_THREAD_ID=codex)
+    assert (item["session"], item["node"]) == (codex, TEST_NODE)
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.inbox_items WHERE node = %s",
+                   (TEST_NODE,))[0][0] == 6
+
+
+def test_a_session_that_is_not_this_agent_s_is_refused(lab):
+    theirs = lab.own(lab.beta)
+    for args in (("ask", "Ship?", "--text", "t", "--yes", "a", "--no", "b", "--recommend",
+                  "yes", "--session", theirs),
+                 ("talk", "x", "--text", "t", "--session", theirs),
+                 ("talk", "x", "--text", "t", "--session", "no-such-session")):
+        code, error = lab.refused(lab.alpha, *args)
+        assert (code, error["code"]) == (6, "foreign_session"), args
+    # The session the command runs in is held to the same proof, for every kind.
+    for args in (("talk", "x", "--text", "t", "--on-answer", "true"),
+                 ("notify", "x", "--text", "t")):
+        code, error = lab.refused(lab.alpha, *args, CLAUDE_CODE_SESSION_ID=theirs)
+        assert (code, error["code"]) == (6, "foreign_session"), args
+    codex = lab.session(lab.beta, harness="codex")
+    code, error = lab.refused(lab.alpha, "notify", "x", "--text", "t",
+                              CLAUDE_CODE_SESSION_ID=None, CODEX_THREAD_ID=codex)
+    assert (code, error["code"]) == (6, "foreign_session")
+    # A folder inside the project that is a project of its own is that project.
+    nested = lab.alpha / "nested"
+    (nested / "capabilities").mkdir(parents=True)
+    (nested / "capabilities" / "project.json").write_text(json.dumps(
+        {"schema": "capabilities.project.v1", "slug": "nested", "id": "prj_" + "c3" * 6}))
+    code, error = lab.refused(lab.alpha, "talk", "x", "--text", "t",
+                              "--session", lab.session(nested))
+    assert (code, error["code"]) == (6, "foreign_session")
+    assert lab.ok(lab.alpha, "list", "--all-agents")["count"] == 0
+
+
+def test_a_question_outside_any_session_needs_an_on_answer_command(lab):
+    for args in (("ask", "Ship?", "--text", "t", "--yes", "a", "--no", "b", "--recommend", "yes"),
+                 ("talk", "x", "--text", "t")):
+        code, error = lab.refused(lab.alpha, *args, CLAUDE_CODE_SESSION_ID=None)
+        assert (code, error["code"]) == (6, "no_session"), args
+    note = lab.ok(lab.alpha, "notify", "FYI", "--text", "t", CLAUDE_CODE_SESSION_ID=None)["item"]
+    assert (note["session"], note["node"]) == (None, TEST_NODE)
+    # What tasks puts in, run by no session: an ask and a talk that leave its command.
+    tid, key = str(uuid.uuid4()), f"tasks:{uuid.uuid4()}:{uuid.uuid4()}"
+    on_answer = f"tasks answer '{tid}' --key '{key}'"
+    asked = lab.ok(lab.alpha, "ask", "Release it?", "--text", "t", "--yes", "Release",
+                   "--no", "Hold", "--recommend", "yes", "--key", key, "--on-answer", on_answer,
+                   CLAUDE_CODE_SESSION_ID=None)
+    lab.ok(lab.alpha, "withdraw", "--key", key)
+    talked = lab.ok(lab.alpha, "talk", "Release it?", "--text", "t", "--key", key,
+                    "--on-answer", on_answer, CLAUDE_CODE_SESSION_ID=None)
+    for put in (asked, talked):
+        assert put["created"] and put["item"]["on_answer"] == on_answer
+        assert (put["item"]["session"], put["item"]["node"]) == (None, TEST_NODE)
+
+
+def test_a_table_put_in_before_sessions_and_nodes_migrates_and_keeps_its_items(lab):
+    loader = (
+        "import importlib.machinery, importlib.util, sys\n"
+        "loader = importlib.machinery.SourceFileLoader('inbox_cli', sys.argv[1])\n"
+        "mod = importlib.util.module_from_spec(importlib.util.spec_from_loader('inbox_cli', loader))\n"
+        "loader.exec_module(mod)\n"
+        "db = mod._db()\n"
+        "conn = db.connect(application_name='inbox', transaction=True,\n"
+        "                  setting=db.resolve_setting(mod._project_root()))\n"
+        "db.migrate(conn, 'inbox', mod.LEDGER_STEPS[:3], major=1, minor=0)\n"
+        "conn.commit()\n")
+    made = subprocess.run([sys.executable, "-c", loader, str(CLI)], cwd=lab.alpha,
+                          env=lab.env(), text=True, capture_output=True, timeout=180)
+    assert made.returncode == 0, made.stderr
+    old = lab.sql(f"INSERT INTO {SCHEMA}.inbox_items (agent_id, kind, title, session, created_by) "
+                  "VALUES (%s, 'talk', 'Old talk', 'old-session', 'tester@old') RETURNING id",
+                  (ALPHA,))[0][0]
+    has_node = ("SELECT count(*) FROM information_schema.columns WHERE table_schema = %s "
+                "AND table_name = 'inbox_items' AND column_name = 'node'")
+    assert lab.sql(has_node, (SCHEMA,))[0][0] == 0
+    lab.ok(lab.alpha, "migrate")
+    assert lab.sql(has_node, (SCHEMA,))[0][0] == 1
+    kept = lab.ok(lab.alpha, "show", str(old))
+    assert (kept["session"], kept["node"]) == ("old-session", None)
+    assert lab.ok(lab.alpha, "read", str(old))["items"][0]["changed"] is True
+    assert lab.ask(lab.alpha)["node"] == TEST_NODE
+    import psycopg
+    with pytest.raises(psycopg.errors.CheckViolation, match="never changed"):
+        lab.sql(f"UPDATE {SCHEMA}.inbox_items SET node = 'x' WHERE id = %s", (old,))
 
 
 def test_withdraw_takes_the_question_back_frees_its_key_and_spares_an_answer(lab):
