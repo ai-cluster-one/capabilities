@@ -1,5 +1,9 @@
 # callva — change log
 
+## 2026-11-03 — `CALLVA_HEADLESS=read-write` lets the credential's own scopes bound writes, and no headless mode touches a local path
+
+`CALLVA_HEADLESS=read-write` is `read-only` plus the verbs `callva routes` marks `writes`, which the platform bounds by the credential's scopes and `CAPABILITIES_READ_ONLY` still closes. Everything else stays refused: verbs marked `secret`, connection flags, anything undeclared, and the same `headless_refused` wherever a project, the machine's capability configuration or a store resolves. In both modes `--prompt-file`, `--config-file`, `--content-file`, `--inputs-file`, `--data-file`, `--file`, `--args-file` and `--output` now exit 4 `headless_refused`, so `recordings stream --output`, the one of them `read-only` used to run, is refused there too and a recording goes to stdout. Without the variable nothing changes. `deviations.md` records why.
+
 ## 2026-11-03 — `CALLVA_HEADLESS=read-only` serves a process holding one credential and nothing else
 
 With `CALLVA_HEADLESS=read-only` and `CALLVA_API_KEY` (optionally `CALLVA_API_URL`) in its environment, a process with no project, store or manager runs every verb `callva routes` marks neither `writes` nor `secret`, plus `help`, `stub`, `manifest`, `routes` and `doctor`. Every other verb exits 4, `--connection`, `--key-env` and `--api-url` are refused, and the mode exits 4 `headless_refused` wherever a project, the machine's capability configuration or a store resolves. Without the variable nothing changes. `deviations.md` records why.

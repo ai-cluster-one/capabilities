@@ -67,15 +67,21 @@ CONNECTIONS
 
 HEADLESS (one credential, no project, no store, no manager)
   A process handed exactly one credential runs with:
-    CALLVA_HEADLESS=read-only
+    CALLVA_HEADLESS=read-only | read-write
     CALLVA_API_KEY=<the credential>
     CALLVA_API_URL=<base URL>              optional; the default above applies
-  Only the process environment is read: no policy, registry, vault or file. The
-  mode serves help, stub, manifest, routes, doctor and every verb `routes` marks
-  neither `writes` nor `secret`. Every other verb exits 4, no flag or env value
-  lifts that, and --connection, --key-env and --api-url are refused. The mode
-  exits 4 headless_refused wherever a project, a machine's capability
-  configuration or a store resolves, and for any other value of CALLVA_HEADLESS.
+  Only the process environment is read: no policy, registry, vault or file.
+  read-only serves help, stub, manifest, routes, doctor and every verb `routes`
+  marks neither `writes` nor `secret`. read-write serves those and the verbs
+  marked `writes`: the credential's own scopes bound them, the platform refuses
+  what it does not allow, and CAPABILITIES_READ_ONLY still closes them. Every
+  other verb exits 4, no flag or env value lifts that, and --connection,
+  --key-env and --api-url are refused. So is every flag naming a local path
+  (--prompt-file, --config-file, --content-file, --inputs-file, --data-file,
+  --file, --args-file, --output): content travels inline, and a recording goes
+  to stdout. The mode exits 4 headless_refused wherever a project, a machine's
+  capability configuration or a store resolves, and for any other value of
+  CALLVA_HEADLESS.
 
 Global options (accepted anywhere on the line — before or after the command):
   --full              return the full, unfiltered API response (list endpoints
@@ -2857,12 +2863,14 @@ def _extract_globals(argv):
 # ===================================================================
 
 HEADLESS_ENV = "CALLVA_HEADLESS"
-HEADLESS_READ_ONLY = "read-only"    # the value names the allowance; there is one
+HEADLESS_READ_ONLY = "read-only"    # each value names its allowance
+HEADLESS_READ_WRITE = "read-write"
+HEADLESS_MODES = (HEADLESS_READ_ONLY, HEADLESS_READ_WRITE)
 
 
 def _headless_refused(message: str) -> NoReturn:
     _die(4, "headless_refused", message,
-         f"{HEADLESS_ENV}={HEADLESS_READ_ONLY} serves a process holding one credential "
+         f"{HEADLESS_ENV} serves a process holding one credential "
          "and nothing else; elsewhere unset it and use a connection a project grants")
 
 
@@ -2883,30 +2891,47 @@ def _headless_managed_here() -> str | None:
     return "a store resolves here"
 
 
-def _headless_verb_gate(verb: str) -> None:
+def _headless_verb_gate(verb: str, mode: str) -> None:
     if verb in WRITE_VERBS:
-        _die(4, "read_only", f"{verb!r} writes, and {HEADLESS_ENV} is read-only",
-             "Do not lift the gate yourself — ask the user; no flag or env value lifts it.")
+        if mode != HEADLESS_READ_WRITE:
+            _die(4, "read_only", f"{verb!r} writes, and {HEADLESS_ENV} is read-only",
+                 "Do not lift the gate yourself — ask the user; no flag or env value lifts it.")
+        _read_only_gate(f"write verb {verb!r}")
     if verb in SECRET_READS:
         _die(4, "secret_refused", f"{verb!r} prints a secret, and {HEADLESS_ENV} hands none out",
              "Do not lift the gate yourself — ask the user; no flag or env value lifts it.")
 
 
-def _headless_conn() -> dict:
+def _headless_close_local_paths(parser: argparse.ArgumentParser) -> None:
+    """Refuse a flag naming a local path as argparse consumes it, which is its own
+    matching (abbreviations, `--flag=value`) and comes before a JSON file flag opens
+    its file. A caller of this process has no business with the disk it runs on."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in action.choices.values():
+                _headless_close_local_paths(sub)
+        elif any(flag.endswith("-file") or flag in ("--file", "--output")
+                 for flag in action.option_strings):
+            flag = action.option_strings[0]
+            action.type = lambda _value, flag=flag: _headless_refused(
+                f"{flag} names a local path and is refused: pass the content inline")
+
+
+def _headless_conn(mode: str) -> dict:
     """The one connection: this process's own environment and nothing else."""
     api_key = os.environ.get("CALLVA_API_KEY")
     if not api_key:
         _die(2, "missing_api_key", f"{HEADLESS_ENV} needs CALLVA_API_KEY in the process environment")
     base = os.environ.get("CALLVA_API_URL") or DEFAULT_API_URL
-    return {"id": "headless", "allow_write": False, "key_env": "CALLVA_API_KEY",
-            "api_key": api_key, "base": base.rstrip("/")}
+    return {"id": "headless", "allow_write": mode == HEADLESS_READ_WRITE,
+            "key_env": "CALLVA_API_KEY", "api_key": api_key, "base": base.rstrip("/")}
 
 
 def _headless_main(mode: str) -> None:
     global FULL
     _auth_gate()
-    if mode != HEADLESS_READ_ONLY:
-        _headless_refused(f"{HEADLESS_ENV}={mode!r} is not a mode; the mode is {HEADLESS_READ_ONLY!r}")
+    if mode not in HEADLESS_MODES:
+        _headless_refused(f"{HEADLESS_ENV}={mode!r} is not a mode; the modes are {HEADLESS_MODES}")
     managed = _headless_managed_here()
     if managed:
         _headless_refused(f"{HEADLESS_ENV} does not run here: {managed}")
@@ -2922,15 +2947,17 @@ def _headless_main(mode: str) -> None:
     if first not in {"routes", "doctor", *(verb.split()[0] for verb in ROUTES)}:
         _headless_refused(f"{first!r} does not run under {HEADLESS_ENV}")
     # Named before parsing, so a write with bad arguments still answers as a write.
-    _headless_verb_gate(first)
-    _headless_verb_gate(" ".join(cleaned[:2]))
+    _headless_verb_gate(first, mode)
+    _headless_verb_gate(" ".join(cleaned[:2]), mode)
 
-    args = build_parser().parse_args(cleaned)
+    parser = build_parser()
+    _headless_close_local_paths(parser)
+    args = parser.parse_args(cleaned)
     if args.resource == "routes":
         _emit(_routes_report())
         return
     if args.resource == "doctor":
-        res = _check_connection(_headless_conn())
+        res = _check_connection(_headless_conn(mode))
         fail_exit = 0 if res.get("ok") else (res.pop("category", None) or 5)
         _emit({"ok": not fail_exit, "connections": {"headless": res}})
         if fail_exit:
@@ -2938,10 +2965,10 @@ def _headless_main(mode: str) -> None:
         return
     verb = (f"{args.resource} {args.action}"
             if getattr(args, "action", None) else args.resource)
-    _headless_verb_gate(verb)
+    _headless_verb_gate(verb, mode)
     if verb not in ROUTES:
         _headless_refused(f"{verb!r} does not run under {HEADLESS_ENV}")
-    _run_verb(_headless_conn(), args)
+    _run_verb(_headless_conn(mode), args)
 
 
 def main():
