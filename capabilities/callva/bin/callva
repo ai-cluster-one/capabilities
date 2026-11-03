@@ -65,6 +65,18 @@ CONNECTIONS
   is one too, and uses no connection at all. Every other verb that needs a
   connection is refused there.
 
+HEADLESS (one credential, no project, no store, no manager)
+  A process handed exactly one credential runs with:
+    CALLVA_HEADLESS=read-only
+    CALLVA_API_KEY=<the credential>
+    CALLVA_API_URL=<base URL>              optional; the default above applies
+  Only the process environment is read: no policy, registry, vault or file. The
+  mode serves help, stub, manifest, routes, doctor and every verb `routes` marks
+  neither `writes` nor `secret`. Every other verb exits 4, no flag or env value
+  lifts that, and --connection, --key-env and --api-url are refused. The mode
+  exits 4 headless_refused wherever a project, a machine's capability
+  configuration or a store resolves, and for any other value of CALLVA_HEADLESS.
+
 Global options (accepted anywhere on the line — before or after the command):
   --full              return the full, unfiltered API response (list endpoints
                       are slimmed to the agent-useful fields by default)
@@ -2840,8 +2852,104 @@ def _extract_globals(argv):
     return cleaned, full, key_env, api_url, connection
 
 
+# ===================================================================
+# Headless (deviations.md: one credential, no project, no store, no manager)
+# ===================================================================
+
+HEADLESS_ENV = "CALLVA_HEADLESS"
+HEADLESS_READ_ONLY = "read-only"    # the value names the allowance; there is one
+
+
+def _headless_refused(message: str) -> NoReturn:
+    _die(4, "headless_refused", message,
+         f"{HEADLESS_ENV}={HEADLESS_READ_ONLY} serves a process holding one credential "
+         "and nothing else; elsewhere unset it and use a connection a project grants")
+
+
+def _headless_managed_here() -> str | None:
+    """What says this process stands where policy or a registry could speak."""
+    root = _project_root()
+    if root is not None:
+        return f"project {root} resolves here"
+    for path in (_CONFIG_HOME / "capabilities", CONFIG_DIR, Path.home() / ".capabilities"):
+        if path.exists():
+            return f"{path} exists"
+    from capabilities_contract.db import DbError, resolve_setting
+    try:
+        resolve_setting(None, config_home=_CONFIG_HOME)
+    except DbError as e:
+        if e.slug == "store_not_configured":
+            return None
+    return "a store resolves here"
+
+
+def _headless_verb_gate(verb: str) -> None:
+    if verb in WRITE_VERBS:
+        _die(4, "read_only", f"{verb!r} writes, and {HEADLESS_ENV} is read-only",
+             "Do not lift the gate yourself — ask the user; no flag or env value lifts it.")
+    if verb in SECRET_READS:
+        _die(4, "secret_refused", f"{verb!r} prints a secret, and {HEADLESS_ENV} hands none out",
+             "Do not lift the gate yourself — ask the user; no flag or env value lifts it.")
+
+
+def _headless_conn() -> dict:
+    """The one connection: this process's own environment and nothing else."""
+    api_key = os.environ.get("CALLVA_API_KEY")
+    if not api_key:
+        _die(2, "missing_api_key", f"{HEADLESS_ENV} needs CALLVA_API_KEY in the process environment")
+    base = os.environ.get("CALLVA_API_URL") or DEFAULT_API_URL
+    return {"id": "headless", "allow_write": False, "key_env": "CALLVA_API_KEY",
+            "api_key": api_key, "base": base.rstrip("/")}
+
+
+def _headless_main(mode: str) -> None:
+    global FULL
+    _auth_gate()
+    if mode != HEADLESS_READ_ONLY:
+        _headless_refused(f"{HEADLESS_ENV}={mode!r} is not a mode; the mode is {HEADLESS_READ_ONLY!r}")
+    managed = _headless_managed_here()
+    if managed:
+        _headless_refused(f"{HEADLESS_ENV} does not run here: {managed}")
+    cleaned, FULL, key_env, api_url, wanted_conn = _extract_globals(sys.argv[1:])
+    if key_env or api_url or wanted_conn:
+        _headless_refused("--connection, --key-env and --api-url are refused: the connection is the environment's")
+    first = cleaned[0] if cleaned else "help"
+    if first == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+    if first in ("stub", "manifest"):
+        _contract(cleaned)
+    if first not in {"routes", "doctor", *(verb.split()[0] for verb in ROUTES)}:
+        _headless_refused(f"{first!r} does not run under {HEADLESS_ENV}")
+    # Named before parsing, so a write with bad arguments still answers as a write.
+    _headless_verb_gate(first)
+    _headless_verb_gate(" ".join(cleaned[:2]))
+
+    args = build_parser().parse_args(cleaned)
+    if args.resource == "routes":
+        _emit(_routes_report())
+        return
+    if args.resource == "doctor":
+        res = _check_connection(_headless_conn())
+        fail_exit = 0 if res.get("ok") else (res.pop("category", None) or 5)
+        _emit({"ok": not fail_exit, "connections": {"headless": res}})
+        if fail_exit:
+            sys.exit(fail_exit)
+        return
+    verb = (f"{args.resource} {args.action}"
+            if getattr(args, "action", None) else args.resource)
+    _headless_verb_gate(verb)
+    if verb not in ROUTES:
+        _headless_refused(f"{verb!r} does not run under {HEADLESS_ENV}")
+    _run_verb(_headless_conn(), args)
+
+
 def main():
     global FULL
+    headless = os.environ.get(HEADLESS_ENV)
+    if headless:
+        _headless_main(headless)
+        return
     _gate()                      # every verb passes the effective policy gate first
     _contract(sys.argv[1:])      # contract verbs; domain verbs fall through
     cleaned, FULL, key_env, api_url, wanted_conn = _extract_globals(sys.argv[1:])
@@ -2870,7 +2978,10 @@ def main():
              problem.get("hint"))
     _write_gate(cid, conn["allow_write"], verb)   # before any client exists
     _secret_gate(cid, conn["allow_write"], verb)
+    _run_verb(conn, args)
 
+
+def _run_verb(conn: dict, args) -> None:
     with _client(conn["api_key"], conn["base"]) as client:
         _STATE["client"] = client
         _STATE["base"] = conn["base"]

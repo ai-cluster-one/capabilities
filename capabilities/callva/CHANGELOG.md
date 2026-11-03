@@ -1,5 +1,9 @@
 # callva — change log
 
+## 2026-11-03 — `CALLVA_HEADLESS=read-only` serves a process holding one credential and nothing else
+
+With `CALLVA_HEADLESS=read-only` and `CALLVA_API_KEY` (optionally `CALLVA_API_URL`) in its environment, a process with no project, store or manager runs every verb `callva routes` marks neither `writes` nor `secret`, plus `help`, `stub`, `manifest`, `routes` and `doctor`. Every other verb exits 4, `--connection`, `--key-env` and `--api-url` are refused, and the mode exits 4 `headless_refused` wherever a project, the machine's capability configuration or a store resolves. Without the variable nothing changes. `deviations.md` records why.
+
 ## 2026-11-03 — `callva` reaches record actions, saved views and one secret setting, and says which route each verb calls
 
 New verbs: `calls actions`, `calls run-action`, `calls action-runs`, `actions list|get|create|update|put|delete`, `ui-views list|get|create|update|put|delete|set-default`, `recordings purge` and `settings reveal`. Those that change the platform are write-gated. `update` sends PATCH and `put` sends PUT, which the API treats alike as a partial update. `recordings purge` drops the platform's cached copy of a recording, and the recording itself stays.
