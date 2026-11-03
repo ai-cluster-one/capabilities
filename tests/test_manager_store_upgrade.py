@@ -294,6 +294,10 @@ def machine(tmp_path, cluster):
 def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) -> None:
     machine.ok("node", "add", NODE_OLD, "--label", "old-node", "--kind", "server")
     machine.probe()
+    # The check remembers what the readers answered; the second release moves
+    # what that answer was made of, so the check below asks them again.
+    assert machine.ok("store", "upgrade", "--check")["state"] == "current"
+    assert list((machine.tmp / "cache" / "capabilities" / "store-upgrade-readers").glob("*"))
     updated = machine.ok("update", "probe")["updated"][0]
     # The second release arrives, and its migration refuses to cross alone,
     # naming the upgrade.

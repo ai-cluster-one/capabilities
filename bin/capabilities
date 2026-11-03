@@ -20980,27 +20980,39 @@ def _store_major_since(conn, schema: str) -> tuple[int | None, object]:
         return None, None
     rows = conn.execute(sql.SQL("SELECT owner, major, updated_at FROM {}.schema_version")
                         .format(sql.Identifier(schema))).fetchall()
-    if not rows:
-        return None, None
     core = next((row for row in rows if row[0] == "core"), None)
-    if core is None:
-        return 1, None
-    major = int(core[1])
-    try:
-        from capabilities_contract.db import _migrate as migrate_module
-        steps = [step.id for step in getattr(migrate_module, "CORE_STEPS", ())
-                 if getattr(step, "major", None) is not None]
-    except ImportError:
-        steps = []
+    steps = _core_major_steps()
     since = None
-    if steps and conn.execute("SELECT to_regclass(%s)",
-                              (f'"{schema}".schema_ledger',)).fetchone()[0] is not None:
+    if core is not None and steps and conn.execute(
+            "SELECT to_regclass(%s)", (f'"{schema}".schema_ledger',)).fetchone()[0] is not None:
         since = conn.execute(sql.SQL(
             "SELECT max(applied_at) FROM {}.schema_ledger WHERE owner = 'core' "
             "AND step = ANY (%s)").format(sql.Identifier(schema)), (steps,)).fetchone()[0]
-    if since is None and major > 1:
-        since = core[2]
-    return major, since
+    return _major_since(bool(rows), core and (core[1], core[2]), since)
+
+
+def _core_major_steps() -> list[str]:
+    """The ids of the core steps the library knows that raise its major."""
+    try:
+        from capabilities_contract.db import _migrate as migrate_module
+    except ImportError:
+        return []
+    return [step.id for step in getattr(migrate_module, "CORE_STEPS", ())
+            if getattr(step, "major", None) is not None]
+
+
+def _major_since(held: bool, core, applied) -> tuple[int | None, object]:
+    """`_store_major_since` from what was read: whether the store records any
+    owner (`held`), the core's (major, updated_at) or None, and when its latest
+    major step was applied (`applied`)."""
+    if not held:
+        return None, None
+    if core is None:
+        return 1, None
+    major = int(core[0])
+    if applied is None and major > 1:
+        applied = core[1]
+    return major, applied
 
 
 def _node_reads_store(major: int | None, since, seen) -> bool:
@@ -21180,63 +21192,83 @@ def _pg_tool(name: str) -> dict | None:
 
 def _store_survey(setting) -> dict:
     """What the store holds, read in one transaction, changing nothing: its
-    major and since when, each owner's version, the tables of its schema and
-    their size, the server's major, its now, and every node it holds with what
-    it last said it runs."""
+    major and since when, each owner's version, a digest of the steps its
+    ledger holds, the tables of its schema and their size, the server's major,
+    its now, and every node it holds with what it last said it runs. Each read
+    is one round trip, so the store far away answers in a few."""
     db = _db_module()
     store = _store_module()
     from psycopg import sql
     conn = db.connect(application_name=store.STORE_OWNER, setting=setting, transaction=True)
     schema = setting.schema
-
-    def exists(table: str) -> bool:
-        return conn.execute("SELECT to_regclass(%s)",
-                            (f'"{schema}".{table}',)).fetchone()[0] is not None
+    ident = sql.Identifier(schema)
+    books = ("schema_version", "schema_ledger", "capabilities_nodes",
+             "capabilities_node_states", "capabilities_node_updates")
     try:
         with conn.transaction():
-            server = int(conn.execute("SHOW server_version_num").fetchone()[0])
-            now = conn.execute("SELECT now()").fetchone()[0]
-            major, since = _store_major_since(conn, schema)
-            owners = {}
-            if exists("schema_version"):
-                owners = {owner: {"major": owner_major, "minor": owner_minor}
-                          for owner, owner_major, owner_minor in conn.execute(
-                              sql.SQL("SELECT owner, major, minor FROM {}.schema_version "
-                                      "ORDER BY owner").format(sql.Identifier(schema)))}
-            tables = [row[0] for row in conn.execute(
-                "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = %s AND c.relkind = 'r' ORDER BY c.relname", (schema,))]
-            size = int(conn.execute(
-                "SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) FROM pg_class c "
+            server, now, *found, tables, size = conn.execute(
+                "SELECT current_setting('server_version_num')::int, now(), "
+                + "".join("to_regclass(%s), " for _ in books)
+                + "ARRAY(SELECT c.relname FROM pg_class c JOIN pg_namespace n "
+                "ON n.oid = c.relnamespace WHERE n.nspname = %s AND c.relkind = 'r' "
+                "ORDER BY c.relname), "
+                "(SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = %s "
-                "AND c.relkind IN ('r', 'm')", (schema,)).fetchone()[0])
+                "AND c.relkind IN ('r', 'm'))",
+                (*(f'"{schema}".{table}' for table in books), schema, schema)).fetchone()
+            exists = {table: at is not None for table, at in zip(books, found)}
+            owners, ledger, versions, applied = {}, None, [], None
+            if exists["schema_version"]:
+                steps = _core_major_steps()
+                kept = exists["schema_ledger"]
+                versions = conn.execute(sql.SQL(
+                    "SELECT owner, major, minor, updated_at, {applied}, {ledger} "
+                    "FROM {schema}.schema_version ORDER BY owner").format(
+                        schema=ident,
+                        applied=sql.SQL("(SELECT max(applied_at) FROM {}.schema_ledger "
+                                        "WHERE owner = 'core' AND step = ANY (%s))")
+                        .format(ident) if kept and steps else sql.SQL("NULL"),
+                        ledger=sql.SQL("(SELECT md5(string_agg(concat_ws(E'\\t', owner, "
+                                       "step, checksum), E'\\n' ORDER BY owner, step)) "
+                                       "FROM {}.schema_ledger)").format(ident)
+                        if kept else sql.SQL("NULL")),
+                    (steps,) if kept and steps else None).fetchall()
+                owners = {row[0]: {"major": row[1], "minor": row[2]} for row in versions}
+                if versions:
+                    applied, ledger = versions[0][4], versions[0][5]
+            core = next(((row[1], row[3]) for row in versions if row[0] == "core"), None)
+            major, since = _major_since(bool(versions), core, applied)
             nodes = []
-            if exists("capabilities_nodes"):
-                states = runs = {}
-                if exists("capabilities_node_states"):
-                    states = {row[0]: row[1:] for row in conn.execute(sql.SQL(
-                        "SELECT node, image_version, boot_line, reported_at, "
-                        "fresh_until > now() FROM {}.capabilities_node_states").format(
-                            sql.Identifier(schema)))}
-                if exists("capabilities_node_updates"):
-                    runs = {row[0]: row[1] or row[2] for row in conn.execute(sql.SQL(
-                        "SELECT DISTINCT ON (node) node, versions_after, versions_before "
-                        "FROM {}.capabilities_node_updates ORDER BY node, requested_at DESC, "
-                        "id").format(sql.Identifier(schema)))}
-                for node, label, kind, last_seen, disabled, resource in conn.execute(sql.SQL(
-                        "SELECT id, label, kind, last_seen_at, disabled_at, coolify_resource "
-                        "FROM {}.capabilities_nodes ORDER BY label, id").format(
-                            sql.Identifier(schema))):
-                    image, boot, reported, fresh = states.get(node, (None, None, None, False))
+            if exists["capabilities_nodes"]:
+                state = (sql.SQL("s.image_version, s.boot_line, s.reported_at, "
+                                 "s.fresh_until > now()")
+                         if exists["capabilities_node_states"] else sql.SQL("NULL, NULL, NULL, NULL"))
+                run = (sql.SQL("u.versions_after, u.versions_before")
+                       if exists["capabilities_node_updates"] else sql.SQL("NULL, NULL"))
+                joins = sql.SQL(" ").join(
+                    ([sql.SQL("LEFT JOIN {}.capabilities_node_states s ON s.node = n.id")
+                      .format(ident)] if exists["capabilities_node_states"] else [])
+                    + ([sql.SQL("LEFT JOIN (SELECT DISTINCT ON (node) node, versions_after, "
+                                "versions_before FROM {}.capabilities_node_updates ORDER BY "
+                                "node, requested_at DESC, id) u ON u.node = n.id").format(ident)]
+                       if exists["capabilities_node_updates"] else []))
+                for (node, label, kind, last_seen, disabled, resource, image, boot, reported,
+                     fresh, after, before) in conn.execute(sql.SQL(
+                        "SELECT n.id, n.label, n.kind, n.last_seen_at, n.disabled_at, "
+                        "n.coolify_resource, {state}, {run} FROM {schema}.capabilities_nodes n "
+                        "{joins} ORDER BY n.label, n.id").format(
+                            state=state, run=run, schema=ident, joins=joins)):
                     nodes.append({"node": node, "label": label, "kind": kind,
                                   "last_seen_at": last_seen, "reported_at": reported,
                                   "disabled_at": disabled, "coolify_resource": resource,
                                   "reachable": bool(fresh), "image_version": image,
-                                  "boot_line": boot, "versions": runs.get(node)})
+                                  "boot_line": boot, "versions": after or before})
     finally:
         conn.close()
     return {"server_major": server // 10000, "now": now, "major": major, "since": since,
-            "owners": owners, "tables": tables, "size": size, "nodes": nodes}
+            "owners": owners, "tables": list(tables), "size": int(size), "nodes": nodes,
+            "books": {table: exists[table] for table in ("schema_version", "schema_ledger")},
+            "ledger": ledger}
 
 
 def _store_nodes_answer(survey: dict, crossed_at=None) -> list[dict]:
@@ -21269,7 +21301,18 @@ def _store_nodes_answer(survey: dict, crossed_at=None) -> list[dict]:
     return out
 
 
-def _store_upgrade_readers(setting, survey: dict) -> list[dict]:
+def _store_upgrade_asked() -> list[tuple[str, dict, bool]]:
+    """(name, manifest, quarantined) of every installed capability that keeps
+    tables, the ones the upgrade asks."""
+    asked = []
+    for name in sorted(_installed()):
+        manifest = _read_json(_registry_dir(name) / "manifest.json") or {}
+        if manifest.get("tables") is True:
+            asked.append((name, manifest, _machine_state(name) == "quarantined"))
+    return asked
+
+
+def _store_upgrade_readers(setting, survey: dict, asked: list | None = None) -> list[dict]:
     """What the installed releases read of each owner, as `migrate status`
     answers it without the upgrade's flag - the manager's own owners asked
     here, each installed capability that keeps tables asked through its own
@@ -21280,11 +21323,7 @@ def _store_upgrade_readers(setting, survey: dict) -> list[dict]:
     the store over its own connection."""
     db = _db_module()
     store = _store_module()
-    asked = []
-    for name in sorted(_installed()):
-        manifest = _read_json(_registry_dir(name) / "manifest.json") or {}
-        if manifest.get("tables") is True:
-            asked.append((name, manifest, _machine_state(name) == "quarantined"))
+    asked = _store_upgrade_asked() if asked is None else asked
 
     # Made here, since the manager's own owners move this process's
     # environment while the capabilities are asked.
@@ -21388,6 +21427,102 @@ def _store_upgrade_readers(setting, survey: dict) -> list[dict]:
     return out
 
 
+# What the readers answered, kept per store under STORE_READERS_CACHE_ROOT with
+# the digest of everything the answer is made of: what the store's books hold,
+# the manager's own steps and library, and each capability's script, manifest
+# and the environment uv runs it in. `--check` answers from it while that
+# digest holds, and asks every reader again the moment any part moves or
+# cannot be read.
+STORE_READERS_CACHE_ROOT = _CACHE_HOME / "capabilities" / "store-upgrade-readers"
+
+
+def _script_environment(script: Path) -> str | None:
+    """A digest of the environment uv runs `script` in - its interpreter and
+    every distribution installed in it - or None where uv names none."""
+    uv = shutil.which("uv")
+    if uv is None:
+        return None
+    try:
+        proc = subprocess.run(
+            [uv, "python", "find", "--offline", "--no-python-downloads", "--script",
+             str(script)], capture_output=True, text=True, env=_snapshot_env(), timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    prefix = Path(proc.stdout.strip()).parent.parent
+    digest = hashlib.sha256()
+    try:
+        digest.update((prefix / "pyvenv.cfg").read_bytes())
+        records = sorted([*prefix.glob("lib/python*/site-packages/*.dist-info/RECORD"),
+                          *prefix.glob("Lib/site-packages/*.dist-info/RECORD")])
+        for record in records:
+            digest.update(str(record.relative_to(prefix)).encode() + b"\0"
+                          + hashlib.sha256(record.read_bytes()).digest())
+    except OSError:
+        return None
+    return digest.hexdigest() if records else None
+
+
+def _store_reader_identity(row: tuple) -> dict | None:
+    """What one capability's `migrate status` answer is made of on this
+    machine, or None where any part of it cannot be read."""
+    name, _, quarantined = row
+    environment = _script_environment(_script_path(name))
+    if environment is None:
+        return None
+    try:
+        return {"script": _sha256(_script_path(name)),
+                "manifest": _sha256(_registry_dir(name) / "manifest.json"),
+                "quarantined": quarantined, "environment": environment}
+    except OSError:
+        return None
+
+
+def _store_readers_key(setting, survey: dict, asked: list, identities: list) -> str | None:
+    """The digest of everything the readers' answer is made of, or None where
+    a capability's part of it cannot be read."""
+    if survey.get("books") is None or any(found is None for found in identities):
+        return None
+    from importlib.metadata import PackageNotFoundError, version
+    db = _db_module()
+    store = _store_module()
+    try:
+        library = version(CONTRACT_LIBRARY)
+    except PackageNotFoundError:
+        library = None
+    made = {"store": _store_upgrade_key(setting), "user": _store_params(setting).get("user"),
+            "major": survey["major"], "owners": survey["owners"], "books": survey["books"],
+            "ledger": survey["ledger"],
+            "manager": {"library": library, "store_major": db.STORE_MAJOR,
+                        "steps": repr((store.STORE_OWNER, store.record_table_steps()
+                                       + PLACEMENT_STEPS, store.STORE_TABLES_VERSION,
+                                       SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS,
+                                       SUPERVISE_LEASE_VERSION))},
+            "capabilities": {name: found for (name, _, _), found in zip(asked, identities)}}
+    return hashlib.sha256(json.dumps(made, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _store_readers_remembered(setting, survey: dict, asked: list,
+                              identities: list) -> list[dict]:
+    """The readers, as last answered for exactly this store and these
+    releases, else asked again and kept when every one of them answered."""
+    digest = _store_readers_key(setting, survey, asked, identities)
+    path = STORE_READERS_CACHE_ROOT / f"{_store_upgrade_key(setting)}.json"
+    kept = _read_json(path) if digest is not None else None
+    if isinstance(kept, dict) and kept.get("digest") == digest \
+            and isinstance(kept.get("readers"), list):
+        return kept["readers"]
+    readers = _store_upgrade_readers(setting, survey, asked)
+    if digest is not None and not _store_module().read_only_switch() and not any(
+            entry["state"] == "unknown" or "error" in entry for entry in readers):
+        try:
+            _write_json(path, {"digest": digest, "readers": readers})
+        except OSError:
+            pass
+    return readers
+
+
 def _script_error(stderr: str, rc: int) -> dict:
     """The error envelope a capability printed last, else its last words."""
     for line in reversed((stderr or "").strip().splitlines()):
@@ -21427,9 +21562,12 @@ def _store_upgrade_state_path(key: str) -> Path:
     return STORE_UPGRADE_DIR / f"{key}.json"
 
 
-def _store_upgrade_check(root: Path | None, *, available: dict | None = None) -> dict:
+def _store_upgrade_check(root: Path | None, *, available: dict | None = None,
+                         remembered: bool = False) -> dict:
     """What `store upgrade --check` answers, changing nothing; the setting,
-    the survey and the readers ride along under `_` for the procedure."""
+    the survey and the readers ride along under `_` for the procedure. With
+    `remembered`, the readers' last answer stands while nothing it was made of
+    has moved."""
     db = _db_module()
     store = _store_module()
     lib_major = db.STORE_MAJOR
@@ -21450,6 +21588,34 @@ def _store_upgrade_check(root: Path | None, *, available: dict | None = None) ->
     answer["store"] = {"key": key, "level": setting.level, "schema": setting.schema,
                        "host": params.get("host"), "port": params.get("port"),
                        "database": params.get("dbname"), "reachable": False}
+    # The newest line is fetched, and what each reader's answer is made of
+    # read, while the store is read; all of them only wait. The fetch holds
+    # this process's stderr until it returns, so nothing leaves here before it
+    # has, a failure's own report included.
+    fetched = None
+    if not available:
+        fetching = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fetched = fetching.submit(_store_upgrade_available)
+        fetching.shutdown(wait=False)
+    try:
+        return _store_upgrade_judge(answer, setting, key, available, fetched, remembered)
+    finally:
+        if fetched is not None:
+            concurrent.futures.wait([fetched])
+
+
+def _store_upgrade_judge(answer: dict, setting, key: str, available: dict | None,
+                         fetched, remembered: bool) -> dict:
+    """`_store_upgrade_check` from the store's survey on."""
+    db = _db_module()
+    store = _store_module()
+    lib_major = db.STORE_MAJOR
+    asked = _store_upgrade_asked()
+    identities = None
+    if remembered:
+        identifying = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(asked)))
+        identities = [identifying.submit(_store_reader_identity, row) for row in asked]
+        identifying.shutdown(wait=False)
     try:
         survey = _store_survey(setting)
     except Exception as exc:  # DbError, psycopg.Error: the store did not answer
@@ -21475,19 +21641,11 @@ def _store_upgrade_check(root: Path | None, *, available: dict | None = None) ->
                              "first migration of each owner takes its newest steps")
         answer["_"] = {"setting": setting, "survey": survey, "key": key}
         return answer
-    # The newest line is fetched while the readers are asked; both only wait.
-    # The fetch holds this process's stderr until it returns, so nothing
-    # leaves here before it has, a failure's own report included.
-    fetched = None
-    if not available:
-        fetching = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        fetched = fetching.submit(_store_upgrade_available)
-        fetching.shutdown(wait=False)
-    try:
-        readers = _store_upgrade_readers(setting, survey)
-    finally:
-        if fetched is not None:
-            concurrent.futures.wait([fetched])
+    if identities is not None:
+        readers = _store_readers_remembered(setting, survey, asked,
+                                            [found.result() for found in identities])
+    else:
+        readers = _store_upgrade_readers(setting, survey, asked)
     answer["available"] = available = available or fetched.result()
     target = max(available["major"] or STORE_MAJOR, STORE_MAJOR)
     answer["target_major"] = target
@@ -21581,7 +21739,7 @@ def _store_upgrade_check(root: Path | None, *, available: dict | None = None) ->
 
 def cmd_store_upgrade_check() -> None:
     os.environ.pop(_db_module().UPGRADE_ENV, None)
-    answer = _store_upgrade_check(_project_root())
+    answer = _store_upgrade_check(_project_root(), remembered=True)
     code = answer.pop("_exit", 0)
     answer.pop("_", None)
     _emit(answer)
