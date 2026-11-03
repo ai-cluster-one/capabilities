@@ -133,6 +133,13 @@
       "store_major": 1,
       "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk."
     },
+    "inbox": {
+      "icon": false,
+      "path": "capabilities/inbox",
+      "payload_sha256": "22cc6e26f1b7e35aab0d79f2aebe2d462abff00cc2e7e1d8e5f93a2b37f39912",
+      "store_major": 1,
+      "summary": "A go-between to the person - an agent puts in a question to answer yes or no, a message to answer in words, or something to know, and leaves the command that takes the answer; the person lists, reads, answers and archives them, and the answer runs the asker's command in the asker's own folder."
+    },
     "instagram": {
       "icon": true,
       "path": "capabilities/instagram",

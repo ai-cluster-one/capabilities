@@ -20,12 +20,12 @@
     "guides/store-upgrade.md": "3bf70888436054cf52b221329b15dd676fc4769c37e0950aee3af078270a5b50",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "b26e8c5ffb6f67b3739ef788552eb1c024a40baf0f612360baa3932967880d4b",
+    "manager/CHANGELOG.md": "cbdbbcd27842fce03c445fa80c321e353c6fd87335972058fe76773041072bf9",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "71142a35edbedd47ae87621fac2edc4def25e1ef82d276997c096cd2de2867ec"
+    "sha256": "fc0a111b1ab37c905d63987bf18660acc0f9eb7ca29ecf490ab6beb4abfa02fb"
   },
   "schema": "capabilities.manager-release.v1",
   "store_major": 1

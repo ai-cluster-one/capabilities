@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-03 — `inbox` is a core capability
+
+`inbox` joins the catalogue's core tier beside `agenttemplates`, `askproject`, `assets`, `automations`, `context`, `deployment`, `memory`, `routine` and `tasks`: `capabilities list` shows it as `tier` "core", and its first install from the official catalogue on a machine arrives allowed and enabled at global scope, where that scope holds no entry for it yet. A machine that already has it installed keeps its quarantine, allowance and gates as they are; after arrival it is gated, enabled and granted as before, and its bundled service still needs an explicit project enable.
+
 ## 2026-11-02 — `node add` and `node enrol` say what the node is doing while it rises, and `node login` ends once the node's sign-in row says signed in
 
 Inside the `raised` step, `node add --events` and `node enrol --events` read the line the node writes of what it is doing (`/tmp/agent-node.state`) every 5 seconds instead of every 10, and say it each time it changes, as `progress {step, node, state, doing}`: `state` is the line as it reads and `doing` what the node is doing now. Where the line ends in a count, `<doing>: <done> of <total> (<item>)`, as the standard image's boot path from agent-node 0.0.15 writes it while it brings the agent's capabilities to its catalogue, the event also carries `done`, `total` and `item`. The node is still the only writer of that line, and nothing else in the step or its answer changed.

@@ -1,0 +1,1564 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "capabilities-contract>=0.42,<1",
+#     "psycopg[binary]>=3.2",
+# ]
+# ///
+"""inbox — a go-between to the person, in the project's store.
+
+Anyone puts a question in and leaves the command that takes the answer. An
+item is one thing put before the person: a question to answer yes or no
+(ask), a message to answer in words (talk), or something to know (notify).
+The agent that puts it in is the project the command runs in, by the
+project's declared id; it is never an argument. inbox asks no one anything,
+knows no other capability, holds no list of people, and writes no table but
+its own: the person reads the items and answers them, and the answer reaches
+the asking agent through the command the asker left with the question.
+Agent-invoked: every answer is JSON on stdout.
+
+Items live in the PostgreSQL the project resolves (STORE). Without a store
+there are none: every verb that reads or writes them exits 6
+`store_not_configured`.
+
+ASKING  (the agent of the folder the command runs in)
+  inbox ask "<title>" --text T --yes WORDS --no WORDS --recommend yes|no
+            [--key K] [--on-answer CMD]
+      A question for a yes or a no. --yes and --no are the words the person
+      reads for each answer, and --recommend the answer the agent would take.
+  inbox talk "<title>" --text T [--session ID] [--key K] [--on-answer CMD]
+      A message the person answers in words. --session names the
+      conversation it belongs to, as the asker keeps it; inbox only stores it.
+  inbox notify "<title>" --text T [--key K]
+      Something the person should know; it takes no answer.
+      Each of the three answers {"created", "item"}. The title is one line of
+      at most 200 characters. --key K makes the same question one item: a
+      repeat with the same key by the same agent, while the item it names is
+      not withdrawn, creates nothing and answers that item with
+      "created": false, whatever else the repeat says. Without --key every
+      call puts a new item in.
+  inbox withdraw <id> | --key K
+      The question no longer stands: the item leaves every list, and its key
+      is free again. An answered item is not withdrawn (exit 6
+      `already_answered`). Repeating it by id answers "changed": false; by
+      key the withdrawn item is no longer found (exit 3).
+  inbox status <id> | --key K
+      This agent's item, with its answer and its delivery.
+  inbox wait <id> | --key K [--timeout S]
+      Wait until the item is answered and answer it as `status` does. S is
+      seconds, default 300; 0 looks once. Not answered in time exits 7
+      `not_answered`; a withdrawn item exits 6 `withdrawn`; a notify takes
+      no answer and exits 6 `not_answerable`.
+  inbox deliver
+      Run this agent's due on-answer commands (ON ANSWER) and record each
+      outcome. Answers {"agent", "delivered", "failed", "next_due_at"}; exits
+      7 `delivery_failed` after the answer when any command failed.
+
+  An asker reaches only its own agent's items: an id or key of another
+  agent's item is not found (exit 3).
+
+THE PERSON
+  inbox list [--view inbox|archive] [--agent A | --all-agents] [--kind K]
+             [--since WHEN] [--before CURSOR] [--limit N]
+      Items newest first, in pages. The inbox view holds the items neither
+      archived nor withdrawn; the archive view the archived ones not
+      withdrawn; a withdrawn item is in neither. Bare, the folder's agent's
+      items; --agent A another agent's by its id, --all-agents every agent's.
+      --kind ask|talk|notify. --limit 1-500, default 50. Answers {"view",
+      "agent", "count", "items", "next"}: `next` is null on the last page,
+      else the CURSOR that --before takes for the page after it.
+  inbox show <id>
+      One item whole.
+  inbox count [--agent A | --all-agents]
+      For the same agents as list: `inbox` (items in the inbox view),
+      `unread` and `unanswered` (asks and talks without an answer) among
+      them, `archive`, and `undelivered` (answers whose on-answer command has
+      not run to success).
+  inbox answer <id> yes|no [--reply TEXT]      for an ask
+  inbox answer <id> --reply TEXT               for a talk
+      Record the answer and mark the item read. The first answer is final: a
+      second is refused (exit 7 `already_answered`), and the store refuses
+      any change to an answer once it is given. A notify takes none (exit 6
+      `not_answerable`), nor does a withdrawn item (exit 6 `withdrawn`).
+      Answering runs no command: it records the answer, and the asking
+      agent's own process runs its command (ON ANSWER).
+  inbox read <id>... | inbox unread <id>...
+  inbox archive <id>... | inbox unarchive <id>...
+      Mark items read or unread, archived or back in the inbox. Each item's
+      outcome is reported, "changed": false where it already was so; safe to
+      repeat.
+
+  The person reaches every agent's items by id. WHEN is a date
+  (2026-10-01), a moment (2026-10-01T12:00:00Z) or an age (30m, 12h, 7d,
+  2w). An id is the whole id or its first six or more characters.
+
+ON ANSWER
+  --on-answer CMD is a command line the asker writes. Once the item is
+  answered it runs as the agent that asked: in that agent's folder, as a
+  child of `inbox deliver` run there, with that agent's own environment and
+  rights - never in the answering person's process. It runs as written,
+  through `sh -c`, its text unchanged; the answer reaches it only in the
+  environment, never in the command's text, so no reply becomes part of a
+  shell line:
+    INBOX_ITEM_ID       the item's id
+    INBOX_KEY           its key, empty where none
+    INBOX_KIND          ask or talk
+    INBOX_ANSWER        yes or no for an ask, empty for a talk
+    INBOX_REPLY         the reply, empty where none
+    INBOX_ANSWERED_BY   who answered, user@node
+    INBOX_ANSWERED_AT   when, as 2026-10-01T12:00:00.000000Z
+  Its stdin is empty; it is ended after 600 seconds. Exit 0 is delivered.
+  Any other outcome leaves the answer recorded and the item undelivered,
+  with the attempts, the error and the next attempt, which waits 30 seconds
+  after the first failure and doubles after each, up to an hour. Where the
+  agent's folder is on several machines, each delivery is claimed under a
+  lease, so it runs once. With nothing serving the agent the answer stays
+  recorded and visibly undelivered until `inbox deliver` runs in its folder.
+
+SERVICE  (inbox service run|status|doctor [--machine])
+  Its only work is to start `inbox deliver` as a child in a served agent's
+  folder, with that agent's .env and .env.local over the machine's
+  environment, when the store announces an answer for that agent and when a
+  failed delivery falls due; one child per agent at a time. It follows the
+  channel inbox_changed in the store's change versions about once a second,
+  and where the store names its transaction address apart it also listens,
+  so an answer wakes it at once.
+
+  inbox service run [--machine]      the service in the foreground, for a
+                                     supervisor
+  inbox service status [--machine]   whether it runs, and each agent it serves
+  inbox service doctor [--machine]   the process, the stores, each agent
+
+  `run` needs inbox enabled for the project itself (`capabilities enable
+  inbox --project`), not only globally, and the read-only switch refuses it.
+  Project mode serves the project it runs in from
+  $XDG_STATE_HOME/capabilities/projects/<slug>/inbox (daemon.pid,
+  daemon.json, daemon.log, daemon.lock, deliver.log). Machine mode serves
+  every project on $XDG_CONFIG_HOME/inbox/service/projects.json, keyed by
+  project id, from $XDG_STATE_HOME/capabilities/machine/inbox; it loads no
+  project's environment itself, checks before every action that the project
+  is still listed and enables inbox for itself, and holds each project's
+  daemon.lock, so one process serves a project at a time: a joined project's
+  own `run` exits 4 `joined_to_machine_service`. A project it cannot serve
+  is reported `refused` or `error` with the reason, and the others are
+  served. The node manager writes the list (`capabilities node supervise
+  inbox --machine`) from the agents placed on this node in mode shared;
+  inbox only reads it. A project is placed so with `capabilities service
+  start inbox`, and taken off with `capabilities service stop inbox`.
+  Every log line reads `<moment> inbox service [<slug>]: <what happened>`.
+  Nothing the service holds is reloaded: it reads no declaration.
+
+STORE
+  The table is inbox_items in the schema the project's store setting names,
+  migrated under the `inbox` ledger: the AGENTKIT_DB_* keys in the project's
+  .env.local and .env, then the same keys in the environment, then the
+  machine's store setting that `capabilities store set` writes. A key is
+  unique per agent among items not withdrawn; the store refuses any change
+  to what an item asks, any change to an answer once given, and taking a
+  withdrawal back. Every change raises the agent's version of the channel
+  `inbox_changed` in the store's change versions (schema_channel, scope the
+  agent id) in the writer's own transaction, and notifies `inbox_changed`
+  with {"schema", "agent_id", "id"} - ids only, never text.
+
+CONTRACT VERBS
+  inbox help                  this text
+  inbox doctor                the store, the table, and this project's identity
+  inbox connections           none: inbox reaches no system of its own
+  inbox stub                  the one-line awareness text
+  inbox manifest --json       the declaration, with the service
+  inbox guide [<topic>]       how-to guides (none ship)
+  inbox ids list|get|set|rm   this project's identifiers
+  inbox refs                  this project's references
+  inbox inventory [--network] the service's state on this machine; the
+                              items are the store's (`inbox list`)
+  inbox migrate [status]      bring the table up to this version / report
+
+I/O
+  Success is JSON on stdout; failure is {"error": {"code", "message",
+  "hint"?}} on stderr.
+
+EXIT CODES
+  0 success
+  3 not found - no item of that id or key
+  4 policy - inbox not enabled, the read-only switch, a service verb this
+    project may not run here
+  5 store - unreachable or busy
+  6 input - a malformed argument, no store configured, no project or project
+    identity, an item not in the state the verb needs
+  7 already answered, not answered in time, or a delivery that failed
+  8 another service process already holds this state root
+"""
+
+import argparse
+import base64
+import contextlib
+import datetime as dt
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import NoReturn
+
+NAME = "inbox"
+SUMMARY = ("A go-between to the person - an agent puts in a question to answer yes or no, a "
+           "message to answer in words, or something to know, and leaves the command that "
+           "takes the answer; the person lists, reads, answers and archives them, and the "
+           "answer runs the asker's command in the asker's own folder.")
+SCOPE = "project"
+CRED_KEYS: list = []
+# Every verb that changes the store's items; each is refused under the
+# read-only switch. `deliver` writes each delivery's outcome.
+WRITE_VERBS = {"ask", "talk", "notify", "withdraw", "answer", "read", "unread", "archive",
+               "unarchive", "deliver"}
+WRITE_DEFAULT = True
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/inbox/guides/")
+STATE = True        # the service's pid, status and logs on this machine
+TABLES = True       # inbox_items in the project's store, built by _tables()
+INVENTORY = {"network": "none"}   # the service's state here; the items are the store's
+POST_INSTALL: list[dict] = []
+SERVICE = {
+    # Each delivery is claimed under a lease in the store, so any node the
+    # service is placed on may run it beside the others.
+    "placement": "shared",
+    "name": "inbox",
+    "summary": ("Starts `inbox deliver` in a served agent's folder when the store announces "
+                "an answer for it and when a failed delivery falls due; once per machine for "
+                "the projects that join it, or in one project."),
+    "verbs": ["run", "status", "doctor"],
+    "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/inbox",
+    "machine": {
+        "schema": "capabilities.service.machine.v1",
+        "command": ["inbox", "service", "run", "--machine"],
+        "doctor": ["inbox", "service", "doctor", "--machine"],
+        "projects": "$XDG_CONFIG_HOME/inbox/service/projects.json",
+        "state": "$XDG_STATE_HOME/capabilities/machine/inbox",
+    },
+}
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# The shared capability code is the capabilities-contract library's, bound here
+# into this script's namespace (SHEBANG.md, "The contract verbs").
+from capabilities_contract.capability import bind as _contract_bind
+
+_contract_bind(globals(), "core")
+
+_contract_bind(globals(), "store")
+
+
+def _cmd_connections() -> None:
+    """inbox reaches no system of its own: the store is the project's, resolved
+    through the shared library, so there is nothing to resolve here."""
+    _emit({"default": None, "connections": {}})
+
+
+def _manifest() -> dict:
+    """The contract's manifest, with the service this capability bundles."""
+    return {**_manifest_core(), "service": SERVICE}
+
+
+# ── the table ───────────────────────────────────────────────────────────────
+
+# One table: an item is one row with its own id and lifecycle, and the answer
+# and its delivery are facts of that row written once each. An item is
+# withdrawn rather than deleted, so its row stays as the record of what was
+# asked; nothing refuses a delete, which no verb makes.
+LEDGER_MAJOR, LEDGER_MINOR = 1, 0
+CHANNEL = "inbox_changed"
+LEDGER_STEPS = [
+    ("0001-items", """
+    CREATE TABLE inbox_items (
+        agent_id              text NOT NULL CHECK (agent_id <> ''),
+        id                    uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        kind                  text NOT NULL CHECK (kind IN ('ask', 'talk', 'notify')),
+        key                   text CHECK (key <> ''),
+        title                 text NOT NULL CHECK (title <> ''),
+        text                  text,
+        yes_label             text CHECK (yes_label <> ''),
+        no_label              text CHECK (no_label <> ''),
+        recommend             text CHECK (recommend IN ('yes', 'no')),
+        session               text CHECK (session <> ''),
+        on_answer             text CHECK (on_answer <> ''),
+        created_at            timestamptz NOT NULL DEFAULT now(),
+        created_by            text NOT NULL CHECK (created_by <> ''),
+        read_at               timestamptz,
+        archived_at           timestamptz,
+        withdrawn_at          timestamptz,
+        answered_at           timestamptz,
+        answered_by           text CHECK (answered_by <> ''),
+        answer                text CHECK (answer IN ('yes', 'no')),
+        reply                 text CHECK (reply <> ''),
+        delivered_at          timestamptz,
+        delivery_attempts     integer NOT NULL DEFAULT 0 CHECK (delivery_attempts >= 0),
+        delivery_error        text,
+        delivery_due_at       timestamptz,
+        delivery_lease_until  timestamptz,
+        CONSTRAINT inbox_items_ask CHECK (
+            (kind = 'ask') = (yes_label IS NOT NULL)
+            AND (kind = 'ask') = (no_label IS NOT NULL)
+            AND (kind = 'ask') = (recommend IS NOT NULL)),
+        CONSTRAINT inbox_items_session CHECK (session IS NULL OR kind = 'talk'),
+        CONSTRAINT inbox_items_on_answer CHECK (on_answer IS NULL OR kind IN ('ask', 'talk')),
+        CONSTRAINT inbox_items_answered CHECK (
+            (answered_at IS NULL AND answered_by IS NULL AND answer IS NULL AND reply IS NULL)
+            OR (answered_at IS NOT NULL AND answered_by IS NOT NULL
+                AND ((kind = 'ask' AND answer IS NOT NULL)
+                     OR (kind = 'talk' AND answer IS NULL AND reply IS NOT NULL)))),
+        CONSTRAINT inbox_items_delivered CHECK (
+            (delivered_at IS NULL AND delivery_due_at IS NULL AND delivery_lease_until IS NULL
+             AND delivery_attempts = 0 AND delivery_error IS NULL)
+            OR (answered_at IS NOT NULL AND on_answer IS NOT NULL))
+    );
+    CREATE UNIQUE INDEX inbox_items_key ON inbox_items (agent_id, key)
+        WHERE key IS NOT NULL AND withdrawn_at IS NULL;
+    CREATE INDEX inbox_items_newest ON inbox_items (created_at DESC, id DESC);
+    CREATE INDEX inbox_items_agent_newest ON inbox_items (agent_id, created_at DESC, id DESC);
+    CREATE INDEX inbox_items_undelivered ON inbox_items (agent_id, delivery_due_at)
+        WHERE answered_at IS NOT NULL AND on_answer IS NOT NULL AND delivered_at IS NULL;
+    COMMENT ON TABLE inbox_items IS
+        'One item put before the person by an agent: a question for yes or no (ask), a message to answer in words (talk), or something to know (notify); with its answer, written once, and the delivery of that answer to the asker''s on-answer command.';
+    COMMENT ON COLUMN inbox_items.agent_id IS
+        'The declared id of the agent that put the item in: the project the asking command ran in.';
+    COMMENT ON COLUMN inbox_items.key IS
+        'The asker''s own name for the question: a repeat with the same key by the same agent returns this item while it is not withdrawn.';
+    COMMENT ON COLUMN inbox_items.yes_label IS
+        'For an ask, the words the person reads for the answer yes.';
+    COMMENT ON COLUMN inbox_items.no_label IS
+        'For an ask, the words the person reads for the answer no.';
+    COMMENT ON COLUMN inbox_items.recommend IS
+        'For an ask, the answer the asking agent would take: yes or no.';
+    COMMENT ON COLUMN inbox_items.session IS
+        'For a talk, the conversation it belongs to, as the asker names it; inbox only stores it.';
+    COMMENT ON COLUMN inbox_items.on_answer IS
+        'For an ask or a talk, the command line the asker left: run as written through sh -c in the asking agent''s folder once answered, the answer reaching it only in INBOX_* environment variables.';
+    COMMENT ON COLUMN inbox_items.created_by IS
+        'Who put the item in: user@node.';
+    COMMENT ON COLUMN inbox_items.withdrawn_at IS
+        'When the asker withdrew the item: it leaves every view and frees its key; never taken back.';
+    COMMENT ON COLUMN inbox_items.answered_by IS
+        'Who answered: user@node. The answer columns are written once; a guard refuses any change to them after.';
+    COMMENT ON COLUMN inbox_items.answer IS
+        'For an ask, yes or no; NULL for a talk, whose answer is the reply.';
+    COMMENT ON COLUMN inbox_items.delivered_at IS
+        'When the on-answer command ran to success; NULL while the answer is undelivered.';
+    COMMENT ON COLUMN inbox_items.delivery_attempts IS
+        'How many times the on-answer command was run.';
+    COMMENT ON COLUMN inbox_items.delivery_error IS
+        'What the last failed run said: its exit and the end of its output.';
+    COMMENT ON COLUMN inbox_items.delivery_due_at IS
+        'When the next run of the on-answer command falls due: the answer''s moment, then a doubling wait after each failure.';
+    COMMENT ON COLUMN inbox_items.delivery_lease_until IS
+        'While a deliver process runs the command, the moment its claim lapses; no other process claims the item before it.';
+    """),
+    ("0002-guard", """
+    CREATE FUNCTION inbox_items_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF (new.agent_id, new.id, new.kind, new.key, new.title, new.text, new.yes_label,
+            new.no_label, new.recommend, new.session, new.on_answer, new.created_at,
+            new.created_by)
+           IS DISTINCT FROM
+           (old.agent_id, old.id, old.kind, old.key, old.title, old.text, old.yes_label,
+            old.no_label, old.recommend, old.session, old.on_answer, old.created_at,
+            old.created_by) THEN
+            RAISE EXCEPTION 'what an inbox item asks is never changed: withdraw it and ask again'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF old.answered_at IS NOT NULL
+           AND (new.answered_at, new.answered_by, new.answer, new.reply)
+               IS DISTINCT FROM (old.answered_at, old.answered_by, old.answer, old.reply) THEN
+            RAISE EXCEPTION 'the first answer to an inbox item is final'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF old.withdrawn_at IS NOT NULL AND new.withdrawn_at IS DISTINCT FROM old.withdrawn_at THEN
+            RAISE EXCEPTION 'a withdrawn inbox item stays withdrawn'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+    CREATE TRIGGER inbox_items_guard BEFORE UPDATE ON inbox_items
+        FOR EACH ROW EXECUTE FUNCTION inbox_items_guard();
+    """),
+    # Every change raises the agent's version of inbox_changed in the store's
+    # change versions, in the writer's own transaction, so whatever writes a
+    # row moves the version the service follows; the notification beside it
+    # only wakes a listener sooner.
+    ("0003-changed", """
+    CREATE FUNCTION inbox_items_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN
+            EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                           'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                           'DO UPDATE SET version = c.version + 1',
+                           tg_table_schema, 'inbox_changed')
+                USING new.agent_id;
+        END IF;
+        PERFORM pg_notify('inbox_changed', json_build_object(
+            'schema', tg_table_schema, 'agent_id', new.agent_id, 'id', new.id)::text);
+        RETURN NULL;
+    END $$;
+    CREATE TRIGGER inbox_items_changed AFTER INSERT OR UPDATE ON inbox_items
+        FOR EACH ROW EXECUTE FUNCTION inbox_items_changed();
+    """),
+]
+
+
+def _tables():
+    """The steps and version of inbox's table, for the contract's `migrate`."""
+    return LEDGER_STEPS, LEDGER_MAJOR, LEDGER_MINOR
+
+
+# ── the project, the store ──────────────────────────────────────────────────
+
+_PROJECT_POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID",
+                     "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
+                     "CAPABILITIES_PROJECT_ENVELOPE_ROOT")
+_SETTING_SLUGS = frozenset({
+    "store_not_configured", "store_not_postgres", "store_setting_unreadable",
+    "store_setting_too_new", "bad_store_setting", "sslmode_too_weak",
+    "bad_schema_name", "driver_missing", "transaction_pooler"})
+_STORE_HINT = ("set AGENTKIT_DB_URL (or AGENTKIT_DB_HOST, AGENTKIT_DB_NAME, AGENTKIT_DB_USER, "
+               "AGENTKIT_DB_PASSWORD) in the project's .env.local or the environment, or run "
+               "`capabilities store set`")
+TITLE_MAX = 200
+COMMAND_TIMEOUT_SECONDS = 600
+LEASE_SECONDS = COMMAND_TIMEOUT_SECONDS + 60
+RETRY_FIRST_SECONDS = 30
+RETRY_LONGEST_SECONDS = 3600
+ERROR_TAIL = 1000
+
+
+def _root() -> Path:
+    root = _project_root()
+    if root is None:
+        _die(6, "no_project", f"{NAME} puts items in for the project it runs in; run it "
+             "inside a project", "cd into the project, or set CLAUDE_PROJECT_DIR")
+    return root
+
+
+def _agent(write: bool) -> str:
+    """The agent this command stands for: the folder's declared project id,
+    verified for a write."""
+    _root()
+    project = _project_id(write=write)
+    if not project:
+        _die(6, "no_project_identity", "this project has no durable id",
+             "run `capabilities init` in the project")
+    return str(project)
+
+
+def _actor() -> str:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if not user:
+        with contextlib.suppress(Exception):
+            import pwd
+            user = pwd.getpwuid(os.getuid()).pw_name
+    return f"{user or 'unknown'}@{node_name()}"
+
+
+def _db():
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        _die(6, "driver_missing",
+             "the shared database library capabilities-contract is not installed",
+             f"run {NAME} through its own script header, which pins it")
+    return db
+
+
+def _db_refused(exc) -> NoReturn:
+    if exc.slug == "store_not_configured":
+        _die(6, "store_not_configured",
+             f"{NAME} keeps its items in a store, and none is configured here", _STORE_HINT)
+    _die(6 if exc.slug in _SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+
+
+def _open():
+    """The working connection to the store this folder resolves, the table
+    migrated."""
+    db = _db()
+    conn = None
+    try:
+        setting = db.resolve_setting(_project_root())
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+        db.migrate(conn, NAME, LEDGER_STEPS, major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+        conn.autocommit = True
+    except db.DbError as exc:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+        _db_refused(exc)
+    return conn
+
+
+@contextlib.contextmanager
+def _store():
+    """A connection for one command; a lost store or a store refusal becomes
+    the error envelope."""
+    import psycopg
+    conn = _open()
+    try:
+        yield conn
+    except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+        _die(5, "store_unreachable", f"the store stopped answering: {exc}",
+             f"`{NAME} doctor` proves the store")
+    except psycopg.errors.CheckViolation as exc:
+        _die(6, "refused_by_store", str(exc).splitlines()[0])
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+def _rows(conn, sql: str, params=()) -> list[dict]:
+    from psycopg.rows import dict_row
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return list(cur.fetchall()) if cur.description else []
+
+
+def _one(conn, sql: str, params=()) -> dict | None:
+    rows = _rows(conn, sql, params)
+    return rows[0] if rows else None
+
+
+# ── an item ─────────────────────────────────────────────────────────────────
+
+_COLUMNS = ("agent_id, id, kind, key, title, text, yes_label, no_label, recommend, session, "
+            "on_answer, created_at, created_by, read_at, archived_at, withdrawn_at, "
+            "answered_at, answered_by, answer, reply, delivered_at, delivery_attempts, "
+            "delivery_error, delivery_due_at, delivery_lease_until")
+
+
+def _iso(moment) -> str | None:
+    if moment is None:
+        return None
+    return moment.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _delivery(row: dict) -> dict | None:
+    """Where the answer's on-answer command stands: None with no command,
+    `waiting_for_answer`, `delivered`, or `undelivered` with its attempts."""
+    if row["on_answer"] is None:
+        return None
+    if row["answered_at"] is None:
+        return {"state": "waiting_for_answer"}
+    if row["delivered_at"] is not None:
+        return {"state": "delivered", "delivered_at": _iso(row["delivered_at"]),
+                "attempts": row["delivery_attempts"]}
+    return {"state": "undelivered", "attempts": row["delivery_attempts"],
+            "error": row["delivery_error"], "next_attempt_at": _iso(row["delivery_due_at"]),
+            "claimed_until": _iso(row["delivery_lease_until"])}
+
+
+def _view(row: dict) -> dict:
+    item = {"id": str(row["id"]), "agent": row["agent_id"], "kind": row["kind"],
+            "key": row["key"], "title": row["title"], "text": row["text"]}
+    if row["kind"] == "ask":
+        item.update(yes=row["yes_label"], no=row["no_label"], recommend=row["recommend"])
+    if row["kind"] == "talk":
+        item["session"] = row["session"]
+    if row["kind"] != "notify":
+        item["on_answer"] = row["on_answer"]
+    item.update(created_at=_iso(row["created_at"]), created_by=row["created_by"],
+                read=row["read_at"] is not None, read_at=_iso(row["read_at"]),
+                archived_at=_iso(row["archived_at"]), withdrawn_at=_iso(row["withdrawn_at"]))
+    if row["kind"] != "notify":
+        item.update(answered=row["answered_at"] is not None,
+                    answered_at=_iso(row["answered_at"]), answered_by=row["answered_by"],
+                    answer=row["answer"], reply=row["reply"], delivery=_delivery(row))
+    return item
+
+
+def _check_ref(ref: str) -> str:
+    ref = ref.strip().lower()
+    if len(ref) < 6 or not re.fullmatch(r"[0-9a-f-]+", ref):
+        _die(6, "input", f"{ref!r} names no item",
+             "an item id is its whole id or its first six or more characters")
+    return ref
+
+
+def _find(conn, ref: str, agent: str | None = None, lock: bool = False) -> dict:
+    """One item by its whole id or a prefix; within `agent`'s items when one
+    is named."""
+    ref = _check_ref(ref)
+    where, params = "id::text LIKE %s", [ref + "%"]
+    if agent is not None:
+        where += " AND agent_id = %s"
+        params.append(agent)
+    found = _rows(conn, f"SELECT {_COLUMNS} FROM inbox_items WHERE {where} "
+                  "ORDER BY created_at LIMIT 2" + (" FOR UPDATE" if lock else ""), params)
+    if not found:
+        _die(3, "not_found", f"no item {ref!r}" + (" of this agent" if agent else ""),
+             f"`{NAME} list` shows the items")
+    if len(found) > 1:
+        _die(6, "ambiguous_id", f"{ref!r} names more than one item", "give more of the id")
+    return found[0]
+
+
+def _by_key(conn, agent: str, key: str, lock: bool = False) -> dict:
+    found = _one(conn, f"SELECT {_COLUMNS} FROM inbox_items WHERE agent_id = %s AND key = %s "
+                 "AND withdrawn_at IS NULL" + (" FOR UPDATE" if lock else ""), (agent, key))
+    if found is None:
+        _die(3, "not_found", f"this agent has no item of key {key!r} that is not withdrawn",
+             f"`{NAME} list` shows the items")
+    return found
+
+
+def _own(conn, args, lock: bool = False) -> dict:
+    """The asker's item its verb names, by id or by --key."""
+    agent = _agent(write=False)
+    if (args.id is None) == (args.key is None):
+        _die(6, "input", f"`{NAME} {args.cmd}` takes an item id or --key K, one of them")
+    if args.key is not None:
+        return _by_key(conn, agent, _line(args.key, "--key"), lock)
+    return _find(conn, args.id, agent, lock)
+
+
+def _line(value: str, what: str, limit: int | None = None) -> str:
+    value = value.strip()
+    if not value:
+        _die(6, "input", f"{what} is empty")
+    if "\n" in value or "\r" in value:
+        _die(6, "input", f"{what} is one line")
+    if limit and len(value) > limit:
+        _die(6, "input", f"{what} is {len(value)} characters; at most {limit}")
+    return value
+
+
+# ── asking ──────────────────────────────────────────────────────────────────
+
+def _put(fields: dict) -> None:
+    agent = _agent(write=True)
+    fields = {"agent_id": agent, "created_by": _actor(), **fields}
+    names = list(fields)
+    with _store() as conn:
+        with conn.transaction():
+            row = _one(conn, f"INSERT INTO inbox_items ({', '.join(names)}) "
+                       f"VALUES ({', '.join(['%s'] * len(names))}) "
+                       "ON CONFLICT (agent_id, key) WHERE key IS NOT NULL AND withdrawn_at IS NULL "
+                       f"DO NOTHING RETURNING {_COLUMNS}", [fields[n] for n in names])
+            created = row is not None
+            if not created:
+                row = _by_key(conn, agent, fields["key"])
+    _emit({"created": created, "item": _view(row)})
+
+
+def _common(args, kind: str) -> dict:
+    fields = {"kind": kind, "title": _line(args.title, "the title", TITLE_MAX),
+              "text": args.text if args.text and args.text.strip() else None,
+              "key": _line(args.key, "--key") if args.key is not None else None}
+    if getattr(args, "on_answer", None) is not None:
+        if not args.on_answer.strip():
+            _die(6, "input", "--on-answer is empty")
+        fields["on_answer"] = args.on_answer
+    return fields
+
+
+def cmd_ask(args) -> None:
+    fields = _common(args, "ask")
+    fields.update(yes_label=_line(args.yes, "--yes"), no_label=_line(args.no, "--no"),
+                  recommend=args.recommend)
+    _put(fields)
+
+
+def cmd_talk(args) -> None:
+    fields = _common(args, "talk")
+    if args.session is not None:
+        fields["session"] = _line(args.session, "--session")
+    _put(fields)
+
+
+def cmd_notify(args) -> None:
+    _put(_common(args, "notify"))
+
+
+def cmd_withdraw(args) -> None:
+    with _store() as conn:
+        with conn.transaction():
+            row = _own(conn, args, lock=True)
+            if row["answered_at"] is not None:
+                _die(6, "already_answered", f"item {row['id']} was answered at "
+                     f"{_iso(row['answered_at'])}; an answered item is not withdrawn",
+                     f"`{NAME} status {row['id']}` reads the answer")
+            changed = row["withdrawn_at"] is None
+            if changed:
+                row = _one(conn, "UPDATE inbox_items SET withdrawn_at = now() WHERE id = %s "
+                           f"RETURNING {_COLUMNS}", (row["id"],))
+    _emit({"changed": changed, "item": _view(row)})
+
+
+def cmd_status(args) -> None:
+    with _store() as conn:
+        row = _own(conn, args)
+    _emit(_view(row))
+
+
+def cmd_wait(args) -> None:
+    if args.timeout < 0:
+        _die(6, "input", "--timeout is a number of seconds, 0 or more")
+    deadline = time.monotonic() + args.timeout
+    follower = None
+    try:
+        while True:
+            with _store() as conn:
+                row = _own(conn, args)
+            if row["kind"] == "notify":
+                _die(6, "not_answerable", f"item {row['id']} is a notify, which takes no answer")
+            if row["answered_at"] is not None:
+                _emit(_view(row))
+                return
+            if row["withdrawn_at"] is not None:
+                _die(6, "withdrawn", f"item {row['id']} was withdrawn at "
+                     f"{_iso(row['withdrawn_at'])}; it will not be answered")
+            left = deadline - time.monotonic()
+            if left <= 0:
+                _die(7, "not_answered", f"item {row['id']} was not answered within "
+                     f"{args.timeout:g} seconds",
+                     f"`{NAME} wait {row['id']}` waits again; `{NAME} status {row['id']}` "
+                     "looks once")
+            if follower is None:
+                with contextlib.suppress(Exception):
+                    follower = _db().Follower([(CHANNEL, row["agent_id"])],
+                                              application_name=NAME,
+                                              project_root=_project_root())
+            if follower is not None:
+                follower.wait(min(left, 1.0))
+            else:
+                time.sleep(min(left, 1.0))
+    finally:
+        if follower is not None:
+            follower.close()
+
+
+# ── delivering ──────────────────────────────────────────────────────────────
+
+def _retry_after(attempts: int) -> int:
+    """The wait before the next run after `attempts` runs that failed."""
+    return min(RETRY_FIRST_SECONDS * 2 ** max(0, attempts - 1), RETRY_LONGEST_SECONDS)
+
+
+def _claim(conn, agent: str, done: list) -> dict | None:
+    """Claim this agent's next due delivery under a lease, one transaction, a
+    row another process holds passed over."""
+    with conn.transaction():
+        row = _one(conn, f"SELECT {_COLUMNS} FROM inbox_items WHERE agent_id = %s "
+                   "AND answered_at IS NOT NULL AND on_answer IS NOT NULL "
+                   "AND delivered_at IS NULL AND NOT (id = ANY(%s::uuid[])) "
+                   "AND coalesce(delivery_due_at, answered_at) <= now() "
+                   "AND (delivery_lease_until IS NULL OR delivery_lease_until <= now()) "
+                   "ORDER BY coalesce(delivery_due_at, answered_at), id LIMIT 1 "
+                   "FOR UPDATE SKIP LOCKED", (agent, done))
+        if row is None:
+            return None
+        return _one(conn, "UPDATE inbox_items SET delivery_lease_until = now() + "
+                    f"make_interval(secs => %s) WHERE id = %s RETURNING {_COLUMNS}",
+                    (LEASE_SECONDS, row["id"]))
+
+
+def _command_env(row: dict) -> dict:
+    """The asker's own environment, and the answer beside it in a fixed form."""
+    env = dict(os.environ)
+    env.update({
+        "INBOX_ITEM_ID": str(row["id"]),
+        "INBOX_KEY": row["key"] or "",
+        "INBOX_KIND": row["kind"],
+        "INBOX_ANSWER": row["answer"] or "",
+        "INBOX_REPLY": row["reply"] or "",
+        "INBOX_ANSWERED_BY": row["answered_by"] or "",
+        "INBOX_ANSWERED_AT": _iso(row["answered_at"]) or "",
+    })
+    return env
+
+
+def _run_command(row: dict, root: Path) -> str | None:
+    """Run the item's on-answer command as written; None when it succeeded,
+    else what went wrong."""
+    try:
+        child = subprocess.Popen(["sh", "-c", row["on_answer"]], cwd=str(root),
+                                 env=_command_env(row), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
+    except OSError as exc:
+        return f"it did not start: {exc}"
+    try:
+        out, _ = child.communicate(timeout=COMMAND_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(child.pid, signal.SIGKILL)
+        out, _ = child.communicate()
+        said = (out or b"").decode("utf-8", "replace").strip()[-ERROR_TAIL:]
+        return f"ended after {COMMAND_TIMEOUT_SECONDS} seconds" + (f": {said}" if said else "")
+    if child.returncode == 0:
+        return None
+    said = (out or b"").decode("utf-8", "replace").strip()[-ERROR_TAIL:]
+    return f"exit {child.returncode}" + (f": {said}" if said else "")
+
+
+def cmd_deliver(_args) -> None:
+    agent = _agent(write=True)
+    root = _root()
+    delivered, failed, done = [], [], []
+    with _store() as conn:
+        while True:
+            row = _claim(conn, agent, done)
+            if row is None:
+                break
+            done.append(str(row["id"]))
+            error = _run_command(row, root)
+            attempts = row["delivery_attempts"] + 1
+            if error is None:
+                _rows(conn, "UPDATE inbox_items SET delivered_at = now(), "
+                      "delivery_attempts = %s, delivery_error = NULL, delivery_due_at = NULL, "
+                      "delivery_lease_until = NULL WHERE id = %s", (attempts, row["id"]))
+                delivered.append({"id": str(row["id"]), "attempts": attempts})
+            else:
+                after = _retry_after(attempts)
+                due = _one(conn, "UPDATE inbox_items SET delivery_attempts = %s, "
+                           "delivery_error = %s, delivery_due_at = now() + "
+                           "make_interval(secs => %s), delivery_lease_until = NULL "
+                           "WHERE id = %s RETURNING delivery_due_at",
+                           (attempts, error, after, row["id"]))
+                failed.append({"id": str(row["id"]), "attempts": attempts, "error": error,
+                               "next_attempt_at": _iso(due["delivery_due_at"])})
+        upcoming = _one(conn, "SELECT min(coalesce(delivery_due_at, answered_at)) AS at "
+                        "FROM inbox_items WHERE agent_id = %s AND answered_at IS NOT NULL "
+                        "AND on_answer IS NOT NULL AND delivered_at IS NULL", (agent,))
+    _emit({"agent": agent, "delivered": delivered, "failed": failed,
+           "next_due_at": _iso(upcoming["at"])})
+    if failed:
+        _die(7, "delivery_failed", f"{len(failed)} on-answer command(s) failed; each answer "
+             "stays recorded and is run again when it falls due",
+             f"`{NAME} status <id>` shows each item's delivery")
+
+
+# ── the person ──────────────────────────────────────────────────────────────
+
+_AGE = re.compile(r"(\d+)\s*([mhdw])")
+
+
+def _when(value: str | None):
+    if value is None:
+        return None
+    text = value.strip()
+    age = _AGE.fullmatch(text)
+    if age:
+        unit = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[age.group(2)]
+        return dt.datetime.now(dt.timezone.utc) - dt.timedelta(**{unit: int(age.group(1))})
+    try:
+        moment = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        _die(6, "input", f"--since {value!r} is no date, moment or age",
+             "a date (2026-10-01), a moment (2026-10-01T12:00:00Z) or an age (30m, 12h, 7d, 2w)")
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.timezone.utc)
+    return moment
+
+
+def _agents(args) -> tuple[str | None, str, list]:
+    """Whose items a person's read covers, as (the agent or None for every
+    agent, the SQL condition, its parameters)."""
+    if args.agent is not None and args.all_agents:
+        _die(6, "input", "--agent and --all-agents are two answers to one question; give one")
+    if args.all_agents:
+        return None, "TRUE", []
+    agent = _line(args.agent, "--agent") if args.agent is not None else _agent(write=False)
+    return agent, "agent_id = %s", [agent]
+
+
+def _cursor(row: dict) -> str:
+    text = f"{row['created_at'].astimezone(dt.timezone.utc).isoformat()}|{row['id']}"
+    return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
+
+
+def _uncursor(value: str) -> tuple:
+    try:
+        text = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
+        moment, ident = text.split("|")
+        return dt.datetime.fromisoformat(moment), str(uuid.UUID(ident))
+    except Exception:
+        _die(6, "input", f"--before {value!r} is no cursor",
+             f"take the `next` of the page before it from `{NAME} list`")
+
+
+def cmd_list(args) -> None:
+    agent, where, params = _agents(args)
+    where += (" AND archived_at IS NULL" if args.view == "inbox"
+              else " AND archived_at IS NOT NULL") + " AND withdrawn_at IS NULL"
+    if args.kind:
+        where += " AND kind = %s"
+        params.append(args.kind)
+    since = _when(args.since)
+    if since is not None:
+        where += " AND created_at >= %s"
+        params.append(since)
+    if args.before is not None:
+        where += " AND (created_at, id) < (%s, %s::uuid)"
+        params.extend(_uncursor(args.before))
+    with _store() as conn:
+        rows = _rows(conn, f"SELECT {_COLUMNS} FROM inbox_items WHERE {where} "
+                     "ORDER BY created_at DESC, id DESC LIMIT %s", [*params, args.limit + 1])
+    more = len(rows) > args.limit
+    rows = rows[:args.limit]
+    _emit({"view": args.view, "agent": agent if agent is not None else "all",
+           "count": len(rows), "items": [_view(r) for r in rows],
+           "next": _cursor(rows[-1]) if more else None})
+
+
+def cmd_show(args) -> None:
+    with _store() as conn:
+        row = _find(conn, args.id)
+    _emit(_view(row))
+
+
+def cmd_count(args) -> None:
+    agent, where, params = _agents(args)
+    with _store() as conn:
+        counts = _one(conn, "SELECT "
+                      "count(*) FILTER (WHERE archived_at IS NULL) AS inbox, "
+                      "count(*) FILTER (WHERE archived_at IS NULL AND read_at IS NULL) AS unread, "
+                      "count(*) FILTER (WHERE archived_at IS NULL AND kind <> 'notify' "
+                      "AND answered_at IS NULL) AS unanswered, "
+                      "count(*) FILTER (WHERE archived_at IS NOT NULL) AS archive, "
+                      "count(*) FILTER (WHERE answered_at IS NOT NULL AND on_answer IS NOT NULL "
+                      "AND delivered_at IS NULL) AS undelivered "
+                      f"FROM inbox_items WHERE withdrawn_at IS NULL AND {where}", params)
+    _emit({"agent": agent if agent is not None else "all", **counts})
+
+
+def cmd_answer(args) -> None:
+    reply = args.reply
+    if reply is not None and not reply.strip():
+        _die(6, "input", "--reply is empty")
+    with _store() as conn:
+        with conn.transaction():
+            row = _find(conn, args.id, lock=True)
+            if row["kind"] == "notify":
+                _die(6, "not_answerable", f"item {row['id']} is a notify, which takes no answer")
+            if row["withdrawn_at"] is not None:
+                _die(6, "withdrawn", f"item {row['id']} was withdrawn at "
+                     f"{_iso(row['withdrawn_at'])}; the question no longer stands")
+            if row["answered_at"] is not None:
+                _die(7, "already_answered", f"item {row['id']} was answered at "
+                     f"{_iso(row['answered_at'])} by {row['answered_by']}; the first answer "
+                     "is final", f"`{NAME} show {row['id']}` reads it")
+            if row["kind"] == "ask" and args.answer is None:
+                _die(6, "input", f"item {row['id']} is an ask: answer it yes or no "
+                     f"(yes: {row['yes_label']}; no: {row['no_label']})",
+                     f"`{NAME} answer {row['id']} yes|no [--reply TEXT]`")
+            if row["kind"] == "talk" and args.answer is not None:
+                _die(6, "input", f"item {row['id']} is a talk: it is answered in words, "
+                     "not yes or no", f"`{NAME} answer {row['id']} --reply TEXT`")
+            if row["kind"] == "talk" and reply is None:
+                _die(6, "input", f"item {row['id']} is a talk: --reply carries the answer",
+                     f"`{NAME} answer {row['id']} --reply TEXT`")
+            row = _one(conn, "UPDATE inbox_items SET answered_at = now(), answered_by = %s, "
+                       "answer = %s, reply = %s, read_at = coalesce(read_at, now()), "
+                       "delivery_due_at = CASE WHEN on_answer IS NULL THEN NULL ELSE now() END "
+                       f"WHERE id = %s RETURNING {_COLUMNS}",
+                       (_actor(), args.answer, reply, row["id"]))
+    _emit(_view(row))
+
+
+def _mark(args, column: str, on: bool) -> None:
+    outcomes = []
+    with _store() as conn:
+        with conn.transaction():
+            rows = list({row["id"]: row for row in (_find(conn, ref, lock=True)
+                                                    for ref in args.ids)}.values())
+            for row in rows:
+                if (row[column] is not None) == on:
+                    outcomes.append({"id": str(row["id"]), "changed": False})
+                    continue
+                _rows(conn, f"UPDATE inbox_items SET {column} = "
+                      f"{'now()' if on else 'NULL'} WHERE id = %s", (row["id"],))
+                outcomes.append({"id": str(row["id"]), "changed": True})
+    _emit({"items": outcomes})
+
+
+# ── doctor and inventory ────────────────────────────────────────────────────
+
+def cmd_doctor() -> None:
+    db = _db()
+    report: dict = {"ok": False}
+    root = _project_root()
+    project = None
+    if root is not None:
+        state = _project_id_state()
+        project = state.get("id") if state else None
+    report["project"] = {"root": str(root) if root else None, "id": project}
+    conn = None
+    try:
+        setting = db.resolve_setting(root)
+        report["store"] = {"level": setting.level, "schema": setting.schema}
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+        found = db.status(conn, NAME, LEDGER_STEPS, major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+        report["tables"] = {"state": found.state, "pending": found.pending,
+                            "changed": found.changed, "warnings": found.warnings}
+        if found.state == "current" and project:
+            conn.autocommit = True
+            report["items"] = _one(conn, "SELECT count(*) FILTER (WHERE withdrawn_at IS NULL "
+                                   "AND archived_at IS NULL) AS inbox, "
+                                   "count(*) FILTER (WHERE answered_at IS NOT NULL "
+                                   "AND on_answer IS NOT NULL AND delivered_at IS NULL) "
+                                   "AS undelivered FROM inbox_items WHERE agent_id = %s",
+                                   (str(project),))
+    except db.DbError as exc:
+        report["store"] = {**report.get("store", {}), "error": {"code": exc.slug,
+                                                                "message": exc.message}}
+        _emit(report)
+        sys.exit(6 if exc.slug in _SETTING_SLUGS else 5)
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+    state = report["tables"]["state"]
+    report["ok"] = state in ("current", "pending")
+    if state == "pending":
+        report["hint"] = f"`{NAME} migrate` brings the table to this version; any call does too"
+    elif state != "current":
+        report["hint"] = (f"the store's {NAME} table does not match this version ({state}); "
+                          f"`{NAME} migrate status` says how")
+    if report["ok"] and (report.get("items") or {}).get("undelivered"):
+        report["service"] = _service_here()
+    _emit(report)
+    if not report["ok"]:
+        sys.exit(7)
+
+
+def _inventory(_network: bool) -> dict:
+    """Local only, and nothing more than the service: the items are the
+    store's, and reading them is `inbox list`."""
+    here = _service_here()
+    service = {"state": "running" if here.get("running") else "stopped"}
+    if here.get("running"):
+        service["detail"] = f"pid {here['pid']}" + (" (machine service)"
+                                                     if here.get("joined") else "")
+        project = here.get("project") or {}
+        if project.get("state") not in (None, "served"):
+            service.update(ok=False, problem=f"{project.get('state')}: {project.get('reason')}")
+        elif project.get("state") == "served":
+            service["ok"] = True
+    return {"service": service}
+
+
+# ── the service ─────────────────────────────────────────────────────────────
+
+def _bundle_dir() -> Path:
+    here = Path(__file__).resolve()
+    return here.parent.parent if here.parent.name == "bin" else here.parent
+
+
+_ENGINE = None
+
+
+def _engine():
+    """The bundled service engine, loaded once from the installed bundle."""
+    global _ENGINE
+    if _ENGINE is None:
+        import importlib.util
+        path = _bundle_dir() / "service" / "engine.py"
+        spec = importlib.util.spec_from_file_location("inbox_engine", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["inbox_engine"] = module
+        spec.loader.exec_module(module)
+        _ENGINE = module
+    return _ENGINE
+
+
+def _machine_projects_path() -> Path:
+    return _CONFIG_HOME / NAME / "service" / "projects.json"
+
+
+def _machine_state_dir() -> Path:
+    return _STATE_HOME / "capabilities" / "machine" / NAME
+
+
+def _project_state_dir(slug: str) -> Path:
+    return _STATE_HOME / "capabilities" / "projects" / slug / NAME
+
+
+class _Refusal(Exception):
+    def __init__(self, exit_code: int, code: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.exit_code, self.code, self.message, self.hint = exit_code, code, message, hint
+
+
+def _read_projects() -> dict:
+    """The opt-in list, every project on it by its id. No file is an empty
+    list."""
+    path = _machine_projects_path()
+
+    def refuse(sentence: str) -> NoReturn:
+        raise _Refusal(6, "projects_invalid", f"{path}: {sentence}",
+                       "the node manager writes it (`capabilities node supervise "
+                       f"{NAME} --machine`) from the agents placed on this node in mode "
+                       "shared; remove it and the node manager writes it again")
+
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        refuse(f"it does not read as JSON: {exc}")
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        refuse('it is {"version": 1, "projects": {...}}')
+    projects = raw.get("projects") or {}
+    if not isinstance(projects, dict):
+        refuse("its `projects` maps project ids to entries")
+    listed = {}
+    for project, entry in projects.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("root"), str) \
+                or not Path(entry["root"]).is_absolute() or not entry.get("slug"):
+            refuse(f"its entry {project!r} is {{root, slug, joined_at, joined_by}}")
+        listed[str(project)] = {k: entry.get(k) for k in ("root", "slug", "joined_at",
+                                                          "joined_by")}
+    return listed
+
+
+@contextlib.contextmanager
+def _project_scope(root: Path):
+    """Stand in one project for the length of a block: the environment points
+    at that project alone and its records adapter is opened afresh; both are
+    put back on the way out."""
+    global _RECORDS
+    saved_env, saved_records = dict(os.environ), _RECORDS
+    for key in _PROJECT_POINTERS:
+        os.environ.pop(key, None)
+    os.environ["CLAUDE_PROJECT_DIR"] = str(root)
+    _RECORDS = None
+    try:
+        yield
+    finally:
+        if _RECORDS is not None and _RECORDS is not saved_records:
+            with contextlib.suppress(Exception):
+                _RECORDS.close()
+        os.environ.clear()
+        os.environ.update(saved_env)
+        _RECORDS = saved_records
+
+
+def _ask_in_project(root: Path, question):
+    """Answer `question` inside the project's scope; a refusal it would have
+    exited with is raised as a _Refusal, so one project never ends the
+    process."""
+    import io
+    said = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(said), _project_scope(root):
+            return question()
+    except SystemExit as stop:
+        error: dict = {}
+        for line in reversed(said.getvalue().strip().splitlines()):
+            with contextlib.suppress(ValueError, AttributeError):
+                error = json.loads(line).get("error") or {}
+                break
+        raise _Refusal(stop.code if isinstance(stop.code, int) else 6,
+                       error.get("code") or "refused",
+                       error.get("message") or "the check exited without saying why",
+                       error.get("hint")) from None
+
+
+def _identity_here() -> tuple[str, str]:
+    """This project's id and slug, or the refusal that says why it has none."""
+    root = _root()
+    project = _project_id(write=True, refuse=False)
+    if not project:
+        raise _Refusal(6, "no_project_identity",
+                       f"{root} is bound to no durable id (CAPABILITIES_PROJECT_ID)",
+                       "run `capabilities init` in the project")
+    try:
+        slug = _project_slug(root)
+    except StoreError as exc:
+        raise _Refusal(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6,
+                       exc.slug, exc.message, exc.hint) from None
+    return str(project), str(slug or project)
+
+
+def _joined_here() -> dict | None:
+    if _project_root() is None:
+        return None
+    try:
+        project, _slug = _identity_here()
+        entry = _read_projects().get(project)
+    except _Refusal:
+        return None
+    return {**entry, "id": project} if entry else None
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_pid(state: Path) -> int | None:
+    try:
+        return int((state / _engine().PID_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_status(state: Path) -> dict:
+    try:
+        found = json.loads((state / _engine().STATUS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def _admission(project_id: str, machine: bool) -> tuple[str, str] | None:
+    """Why this process may not act for the project it stands in now, or
+    None. Asked inside the project's scope."""
+    if _machine_state() == "quarantined":
+        return ("refused", f"{NAME} is quarantined on this machine")
+    if not _project_enabled_explicitly():
+        return ("refused", f"{NAME} is not enabled explicitly for this project; "
+                f"`capabilities enable {NAME} --project` there")
+    project, _slug = _identity_here()
+    if project != project_id:
+        return ("refused", f"the project's id is now {project}, not the {project_id} it "
+                "joined with; the node manager writes the new one on its next reconcile")
+    if machine and project_id not in _read_projects():
+        return ("refused", "the project left the machine service")
+    return None
+
+
+class _Host:
+    """What the engine asks of this executable, every project question
+    answered inside that project's own resolution."""
+
+    name = NAME
+    channel = CHANNEL
+
+    def __init__(self, mode: str, entry: dict | None = None):
+        self.mode = mode
+        self.entry = entry
+
+    def db(self):
+        return _db()
+
+    def ledger(self):
+        return _tables()
+
+    def node(self) -> str:
+        return node_name()
+
+    def entries(self) -> dict:
+        if self.mode == "project":
+            return {self.entry["id"]: self.entry}
+        return _read_projects()
+
+    def list_witness(self):
+        if self.mode == "project":
+            return "project"
+        try:
+            seen = os.stat(_machine_projects_path())
+        except OSError:
+            return None
+        return (seen.st_mtime_ns, seen.st_size, seen.st_ino)
+
+    def lock_path(self, slug: str) -> Path:
+        return _project_state_dir(slug) / _engine().LOCK_FILE
+
+    def admit(self, agent_id: str, root: Path, machine: bool):
+        """(why the process may not serve the agent now, or None; the store
+        setting its folder resolves where it may)."""
+        def question():
+            found = _admission(agent_id, machine)
+            return found, (None if found else _db().resolve_setting(root))
+        try:
+            return _ask_in_project(root, question)
+        except _Refusal as exc:
+            return ("refused" if exc.exit_code == 4 else "error",
+                    f"{exc.code}: {exc.message}"), None
+        except Exception as exc:
+            return ("error", getattr(exc, "message", None)
+                    or f"{type(exc).__name__}: {exc}"), None
+
+    def deliver_command(self, root: Path) -> tuple[list[str], dict]:
+        """`inbox deliver` as the agent would run it: this executable on its
+        own interpreter, in the agent's folder, with its .env and .env.local
+        over the machine's environment."""
+        env = {k: v for k, v in os.environ.items() if k not in _PROJECT_POINTERS}
+        env.update(_parse_env_file(root / ".env"))
+        env.update(_parse_env_file(root / ".env.local"))
+        env["CLAUDE_PROJECT_DIR"] = str(root)
+        return [sys.executable, str(Path(__file__).resolve()), "deliver"], env
+
+
+def _refused(exc: _Refusal) -> NoReturn:
+    _die(exc.exit_code, exc.code, exc.message, exc.hint)
+
+
+def _project_entry_here() -> dict:
+    root = _root()
+    try:
+        project, slug = _identity_here()
+    except _Refusal as exc:
+        _refused(exc)
+    return {"id": project, "root": str(root), "slug": slug}
+
+
+def cmd_service_run(machine: bool) -> None:
+    engine = _engine()
+    if machine:
+        runner = engine.Service(_Host("machine"), mode="machine", state_dir=_machine_state_dir())
+    else:
+        root = _root()
+        if _joined_here():
+            _die(4, "joined_to_machine_service",
+                 f"this project is joined to the machine {NAME} service, which serves it",
+                 f"`capabilities service stop {NAME}` takes it back to project mode first")
+        entry = _project_entry_here()
+        try:
+            _db().resolve_setting(root)
+        except _db().DbError as exc:
+            _db_refused(exc)
+        runner = engine.Service(_Host("project", entry), mode="project",
+                                state_dir=_project_state_dir(entry["slug"]), tag=entry["slug"])
+    try:
+        runner.run()
+    except engine.Busy as exc:
+        _die(8, "service_running", f"another {NAME} service process holds {exc}",
+             f"`{NAME} service status{' --machine' if machine else ''}` names it")
+
+
+def _service_target(machine: bool) -> tuple[Path, dict | None, bool]:
+    if machine:
+        return _machine_state_dir(), None, True
+    entry = _project_entry_here()
+    joined = _joined_here()
+    return (_machine_state_dir() if joined else _project_state_dir(entry["slug"])), entry, \
+        bool(joined)
+
+
+def _status_view(machine: bool) -> dict:
+    state, entry, by_machine = _service_target(machine)
+    pid = _read_pid(state)
+    running = _pid_alive(pid)
+    status = _read_status(state) if running else {}
+    if machine:
+        try:
+            listed, list_error = _read_projects(), None
+        except _Refusal as exc:
+            listed, list_error = {}, exc.message
+        rows = {p.get("project_id"): p for p in status.get("projects") or []}
+        projects = []
+        for project, joined in sorted(listed.items(), key=lambda kv: kv[1].get("slug") or ""):
+            row = {"project": joined.get("slug"), "project_id": project,
+                   "root": joined.get("root"), "joined_at": joined.get("joined_at"),
+                   "joined_by": joined.get("joined_by"),
+                   "present": Path(joined["root"]).is_dir()}
+            row.update(rows.get(project) or {
+                "state": None, "reason": "the machine service is not running"
+                if not running else "not yet taken up"})
+            projects.append(row)
+        return {"mode": "machine", "running": running, "pid": pid if running else None,
+                "state_dir": str(state), "started_at": status.get("started_at"),
+                "published_at": status.get("published_at"), "stores": status.get("stores"),
+                "list": {"path": str(_machine_projects_path()), "joined": len(listed),
+                         **({"error": list_error} if list_error else {})},
+                "projects": projects, "log": str(state / _engine().LOG_FILE)}
+    row = next((p for p in status.get("projects") or []
+                if p.get("project_id") == entry["id"]), None)
+    return {"mode": "machine" if by_machine else "project", "joined": by_machine,
+            "running": running, "pid": pid if running else None, "state_dir": str(state),
+            "stores": status.get("stores"), "log": str(state / _engine().LOG_FILE),
+            "project": row or {"state": None, "reason": "no process serves this project"
+                               if not running else "not yet taken up"}}
+
+
+def _service_here() -> dict:
+    """This project's service as this machine's files say."""
+    try:
+        view = _status_view(False)
+    except SystemExit:
+        return {"running": None, "reason": "the project has no durable id and slug"}
+    return {"mode": view["mode"], "joined": view["joined"], "running": view["running"],
+            "pid": view["pid"], "project": view["project"],
+            **({} if view["running"] else {
+                "hint": f"nothing on this machine delivers this agent's answers; `{NAME} "
+                        f"deliver` delivers them by hand, `capabilities service start {NAME}` "
+                        "places the service"})}
+
+
+def cmd_service_doctor(machine: bool) -> None:
+    findings: dict = {}
+    fail = 0
+
+    def note(key: str, row: dict) -> None:
+        nonlocal fail
+        findings[key] = row
+        if not row.get("ok") and not fail:
+            fail = row.get("category") or 6
+        row.pop("category", None)
+
+    view = _status_view(machine)
+    if not machine:
+        root = _root()
+        db = _db()
+        try:
+            setting = db.resolve_setting(root)
+            with contextlib.closing(db.connect(application_name=NAME, setting=setting,
+                                               transaction=True)) as conn:
+                found = db.status(conn, NAME, LEDGER_STEPS, major=LEDGER_MAJOR,
+                                  minor=LEDGER_MINOR)
+            note("store", {"ok": found.state in ("current", "pending"), "category": 7,
+                           "schema": setting.schema, "tables": found.state})
+        except db.DbError as exc:
+            note("store", {"ok": False, "category": 6 if exc.slug in _SETTING_SLUGS else 5,
+                           "code": exc.slug, "error": exc.message})
+    if not view["running"]:
+        note("process", {"ok": False, "category": 7,
+                         "error": ("the machine service is not running" if machine
+                                   else "no process serves this project"),
+                         "hint": (f"its supervisor runs `{NAME} service run --machine`" if machine
+                                  else f"`capabilities service start {NAME}` places it on this "
+                                       f"node for the machine service; `{NAME} service run` "
+                                       "serves this project in the foreground")})
+    else:
+        stores = view.get("stores") or []
+        broken = [s for s in stores if not s.get("connected")]
+        if machine:
+            note("process", {"ok": not (stores and len(broken) == len(stores)), "category": 5,
+                             "pid": view["pid"], "stores": stores})
+            findings["projects"] = view["projects"]
+        else:
+            project = view["project"] or {}
+            note("process", {"ok": project.get("state") == "served" and not broken,
+                             "category": 7, "pid": view["pid"], "mode": view["mode"],
+                             "state": project.get("state"), "reason": project.get("reason"),
+                             "stores": stores})
+    _emit({"ok": fail == 0, **findings})
+    if fail:
+        sys.exit(fail)
+
+
+# ── the command line ────────────────────────────────────────────────────────
+
+class _Parser(argparse.ArgumentParser):
+    """Usage errors leave through the envelope at exit 6."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        kwargs.setdefault("add_help", False)
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> NoReturn:
+        _die(6, "input", f"{self.prog}: {message}", f"`{NAME} help` shows every verb")
+
+
+def _limit(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a whole number")
+    if not 1 <= n <= 500:
+        raise argparse.ArgumentTypeError(f"{value!r} is not between 1 and 500")
+    return n
+
+
+def _parser() -> _Parser:
+    parser = _Parser(prog=NAME)
+    sub = parser.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
+    sub.add_parser("help").add_argument("topic", nargs="*")
+    sub.add_parser("doctor")
+
+    ask = sub.add_parser("ask")
+    talk = sub.add_parser("talk")
+    notify = sub.add_parser("notify")
+    for one in (ask, talk, notify):
+        one.add_argument("title")
+        one.add_argument("--text", required=True)
+        one.add_argument("--key")
+    for one in (ask, talk):
+        one.add_argument("--on-answer", dest="on_answer")
+    ask.add_argument("--yes", required=True)
+    ask.add_argument("--no", required=True)
+    ask.add_argument("--recommend", required=True, choices=("yes", "no"))
+    talk.add_argument("--session")
+    for verb in ("withdraw", "status", "wait"):
+        one = sub.add_parser(verb)
+        one.add_argument("id", nargs="?")
+        one.add_argument("--key")
+        if verb == "wait":
+            one.add_argument("--timeout", type=float, default=300.0)
+    sub.add_parser("deliver")
+
+    listed = sub.add_parser("list")
+    listed.add_argument("--view", choices=("inbox", "archive"), default="inbox")
+    listed.add_argument("--kind", choices=("ask", "talk", "notify"))
+    listed.add_argument("--since")
+    listed.add_argument("--before")
+    listed.add_argument("--limit", type=_limit, default=50)
+    count = sub.add_parser("count")
+    for one in (listed, count):
+        one.add_argument("--agent")
+        one.add_argument("--all-agents", dest="all_agents", action="store_true")
+    sub.add_parser("show").add_argument("id")
+    answer = sub.add_parser("answer")
+    answer.add_argument("id")
+    answer.add_argument("answer", nargs="?", choices=("yes", "no"))
+    answer.add_argument("--reply")
+    for verb in ("read", "unread", "archive", "unarchive"):
+        sub.add_parser(verb).add_argument("ids", nargs="+")
+
+    service = sub.add_parser("service")
+    ssub = service.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    for verb in ("run", "status", "doctor"):
+        ssub.add_parser(verb).add_argument("--machine", action="store_true")
+    return parser
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    if argv[:1] == ["manifest"]:
+        _emit(_manifest())
+        return
+    _contract(argv)
+    if not argv:
+        _cmd_help()
+        return
+    args = _parser().parse_args(argv)
+    cmd = args.cmd
+    if cmd == "help":
+        _cmd_help()
+        return
+    if cmd in WRITE_VERBS:
+        _read_only_gate(f"`{NAME} {cmd}`")
+    if cmd == "doctor":
+        cmd_doctor()
+    elif cmd == "service":
+        if args.action == "run":
+            cmd_service_run(args.machine)
+        elif args.action == "status":
+            _emit(_status_view(args.machine))
+        else:
+            cmd_service_doctor(args.machine)
+    else:
+        {"ask": cmd_ask, "talk": cmd_talk, "notify": cmd_notify, "withdraw": cmd_withdraw,
+         "status": cmd_status, "wait": cmd_wait, "deliver": cmd_deliver, "list": cmd_list,
+         "show": cmd_show, "count": cmd_count, "answer": cmd_answer,
+         "read": lambda a: _mark(a, "read_at", True),
+         "unread": lambda a: _mark(a, "read_at", False),
+         "archive": lambda a: _mark(a, "archived_at", True),
+         "unarchive": lambda a: _mark(a, "archived_at", False)}[cmd](args)
+
+
+if __name__ == "__main__":
+    main()
