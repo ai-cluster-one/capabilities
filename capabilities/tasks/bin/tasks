@@ -4571,7 +4571,7 @@ def cmd_answer(entry, args: list[str]) -> None:
     key = opts["key"].strip()
     actor = _actor(opts.get("actor"))
     with _connect(entry) as conn, conn.cursor() as cur:
-        tid = _task_id(cur, opts["_loose"][0], writing=True, answering=True)
+        tid = _task_id(cur, opts["_loose"][0], writing=True)
         move = key[len(f"tasks:{tid}:"):] if key.startswith(f"tasks:{tid}:") else ""
         if not move:
             _die(6, "input", f"{key!r} is no Inbox key of task {tid}",

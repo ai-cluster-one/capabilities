@@ -216,6 +216,27 @@ def test_the_owners_own_handback_follows_the_ordinary_rules(assigned, capsys,
     assert "handed_back" not in answer and answer["task"]["status"] == "waiting"
 
 
+
+@needs_store
+def test_an_inbox_answer_from_the_assigned_project_is_refused(assigned, capsys,
+                                                              monkeypatch):
+    entry, _schema, conn, tid = assigned
+    monkeypatch.setattr(mod, "_inbox_after", lambda: None)
+    _as(monkeypatch, OWNER)
+    mod.cmd_set(entry, [tid, "--status", "draft"])
+    mod.cmd_set(entry, [tid, "--status", "waiting"])
+    capsys.readouterr()
+    from psycopg.rows import dict_row
+    with conn.cursor(row_factory=dict_row) as cur:
+        key = mod._wait_key(cur, tid)
+    before = _show(entry, capsys, tid, monkeypatch)["task"]
+    _as(monkeypatch, AGENT)
+    monkeypatch.setenv("INBOX_ITEM_ID", "forged")
+    monkeypatch.setenv("INBOX_KIND", "talk")
+    error = _refused(capsys, mod.cmd_answer, entry, [tid, "--key", key])
+    assert error["exit"] == 4 and error["code"] == "policy"
+    assert _show(entry, capsys, tid, monkeypatch)["task"] == before
+
 WRITES = {
     "status": (lambda e, t: mod.cmd_set(e, [t, "--status", "complete"])),
     "title": (lambda e, t: mod.cmd_set(e, [t, "--title", "mine now"])),
