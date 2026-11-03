@@ -258,7 +258,8 @@ def test_the_shipped_supervisor_is_there_switched_off(project):
     assert row["description"].startswith("Acts on behalf of this project's owner")
     assert row["takes"] == [{"status": ["waiting"], "assignee": ["supervisor"]}]
     assert row["writes"] == {
-        "held": {"status": ["todo", "waiting", "complete", "closed"], "assignee": "*"},
+        "held": {"status": ["todo", "waiting", "complete", "closed"], "assignee": "*",
+                 "metadata": ["question"]},
         "other": {"status": ["todo", "waiting"], "assignee": "*", "metadata": ["blocked_by"]},
         "new": {"status": ["todo", "waiting"], "type": ["defect", "change"],
                 "assignee": "*"},

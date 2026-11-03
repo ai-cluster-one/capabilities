@@ -99,6 +99,17 @@ WRITING  (needs allow_write on a selected connection; exit 4 otherwise)
   tasks meta rm <task> <key> [key...]           remove keys by name
   tasks activity <task> "what happened"          record real work done,
                                                  written in Markdown
+  tasks set <task> --status waiting --assignee <person> --question TEXT
+            --yes WORDS --no WORDS --recommend yes|no
+                                                hand it to a person with one
+                                                question to answer yes or no;
+                                                see THE INBOX
+  tasks answer <task> --key KEY                 take an Inbox answer back onto
+                                                the task: the command its item
+                                                runs once answered. See THE INBOX
+  tasks inbox                                   put every task of this project
+                                                waiting on a person into the
+                                                Inbox, once. See THE INBOX
   tasks workers save <name> <file|-> [--base ID]  save a worker's new version;
                                                 see WORKERS
   tasks workers remove <name> [--base ID]       take a worker out of the project
@@ -1745,6 +1756,55 @@ ACTIVITY
   `show` always returns a task together with its whole activity trail, oldest
   first, so what was done is read in the same breath as what is to be done.
 
+THE INBOX
+  A task waiting on a person is put before that person in the Inbox, by
+  running the `inbox` command in the project's folder once the move that put it
+  there has committed. A name is a person when it is no worker of the task's
+  project, no project of this store, and nothing the manager answers for as an
+  agent (`capabilities agent list`) or a capability (`capabilities list
+  --json`, `capabilities search`); a name the manager cannot answer for is no
+  person, and nothing is put for it.
+
+  Every move of a task's status or assignee - by `set`, `release`, the claim's
+  return of a wait that is over, or an escalation - that lands it waiting on a
+  person puts an item keyed `tasks:<task id>:<move id>`, the move's status
+  row in `history`, else its assignee row: a talk carrying the task's latest
+  trail entry, or its objective, or - when that move gave `--question` - an
+  ask. Any later move out of that wait withdraws the item, so a move from one
+  person to another withdraws one item and puts another, and a wait begun again
+  is a new item.
+
+  --question TEXT --yes WORDS --no WORDS --recommend yes|no
+                        on `set`, all four together and only on a call that
+                        moves the task into waiting on a person, else exit 6:
+                        the question, the words the person reads for each
+                        answer, and the answer recommended. They are kept in
+                        the task's metadata under `question`, stamped with
+                        the move, and a worker writes that key as it writes any
+                        metadata key (WORKER SCOPE).
+
+  `answer <task> --key KEY` is the item's on-answer command, run by the Inbox
+  in this project's folder with the answer in its environment (INBOX_ITEM_ID,
+  INBOX_KIND, INBOX_ANSWER, INBOX_REPLY, INBOX_ANSWERED_BY,
+  INBOX_ANSWERED_AT), never in its text. It records the answer on the trail.
+  While the task still waits under that key it returns it to where that move
+  found it - the status and assignee the move changed, an `in_progress` it
+  found landing as `todo` - judged as `set` judges a move; a return that is
+  refused says why on the trail. A task that has moved on gets only an entry
+  saying the answer came after it did. It exits 0 for each of these, so the
+  Inbox does not run it again; it answers {task, key, item, returned, moved?,
+  refused?, moved_on?, activity}.
+
+  `inbox` puts every task of this project waiting on a person now, keyed by
+  the move that began its wait (`tasks:<task id>:created` where none is
+  recorded), and answers {project, put [{task, task_id, assignee, key, kind,
+  item, created}], left}. The Inbox keeps one item per key, so a second run
+  puts nothing new. Exit 6 `inbox_unavailable` without `inbox` on PATH.
+
+  The Inbox is asked once, for at most 10 seconds, and never again. Without
+  `inbox` on PATH, gated off, failing or not answering, a move commits and
+  answers exactly as it would without it.
+
 RUNS
   tasks runs <task>
   tasks runs --run SYSTEM:REF [--run SYSTEM:REF ...] [--since WHEN]
@@ -2084,7 +2144,8 @@ SETTINGS = {'homes': [{'scope': 'project',
            'scope': 'machine',
            'apply': 'next_call'}]}
 WRITE_VERBS = {"add", "set", "tag", "untag", "meta", "activity", "claim",
-               "release", "run", "workers", "profiles", "hooks", "lines"}
+               "release", "run", "workers", "profiles", "hooks", "lines", "answer",
+               "inbox"}
 WRITE_DEFAULT = False
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/tasks/guides/")
@@ -3776,6 +3837,212 @@ def _created_on_line(lookup, given: str | None, named: str | None) -> str | None
     return named
 
 
+# --- The Inbox ---------------------------------------------------------------
+
+# A move that leaves a task waiting on a person puts it before that person in
+# the Inbox, by running the `inbox` command, and a later move away takes it back
+# out; the answer returns through `answer`. Moves are noted here as they are
+# recorded and told to the Inbox once their transaction has committed, never
+# inside it, so nothing the Inbox does or fails to do can fail or undo a move.
+# Without `inbox` on PATH none of it runs.
+_INBOX_MOVES: list[dict] = []
+_INBOX_SECONDS = 10
+_QUESTION = "question"
+_QUESTION_FLAGS = ("question", "yes", "no", "recommend")
+
+
+def _then_inbox(verb):
+    """`verb`, and then the Inbox told of the moves it committed - also when it
+    ends by refusing, since a claim may commit an escalation and then refuse the
+    task it was asked for. A move that was rolled back is not told."""
+    import functools
+
+    @functools.wraps(verb)
+    def told(*args, **kwargs):
+        try:
+            return verb(*args, **kwargs)
+        finally:
+            _inbox_after()
+    return told
+
+
+def _inbox_root() -> str | None:
+    """The folder `inbox` runs in, which is what tells it whose item it is: the
+    project the command resolved, else where it stands."""
+    root = _project_root()
+    return str(root) if root is not None else None
+
+
+def _command(argv: list[str], seconds: int = _INBOX_SECONDS) -> dict | None:
+    """Run another command in the project's folder, ended with everything it
+    started once `seconds` pass: its JSON answer, `{}` for an answer that is
+    no JSON, or None when it could not start, failed or did not answer in time.
+    Asked once, never again."""
+    import signal
+    import subprocess
+    try:
+        child = subprocess.Popen(argv, cwd=_inbox_root(), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, start_new_session=True)
+    except (OSError, ValueError):
+        return None
+    try:
+        out, _err = child.communicate(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        try:
+            child.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return None
+    if child.returncode != 0:
+        return None
+    try:
+        answer = json.loads(out)
+    except ValueError:
+        return {}
+    return answer if isinstance(answer, dict) else {}
+
+
+def _manager_names(name: str, seen: dict) -> bool | None:
+    """Whether the manager answers `name` as an agent - an id, slug or name in
+    `capabilities agent list` - or as a capability, installed or in its
+    catalogue; None when it cannot answer. Asked lazily and once per name set in
+    `seen`, never read from the manager's tables."""
+    manager = os.environ.get("CAPABILITIES_MANAGER_BIN", "").strip() or "capabilities"
+    asks = (("agents", ["agent", "list"],
+             lambda a: [one.get(k) for one in a.get("agents") or [] for k in ("id", "slug", "name")]),
+            ("installed", ["list", "--json"],
+             lambda a: [one.get("name") for one in a.get("installed") or []]),
+            ("catalogue", ["search"],
+             lambda a: [one.get("name") for one in a.get("matches") or []]))
+    for label, argv, names in asks:
+        if label not in seen:
+            answer = _command([manager, *argv])
+            try:
+                seen[label] = (None if answer is None else
+                               {str(one).strip() for one in names(answer) if one})
+            except (AttributeError, TypeError):
+                seen[label] = None
+        if seen[label] is None:
+            return None
+        if name in seen[label]:
+            return True
+    return False
+
+
+def _no_person_here(cur, project: str | None, name: str) -> bool:
+    """Whether the store answers `name` as nobody's person: a worker of the
+    task's project - shipped, or kept in the store - or a project of this
+    store."""
+    shipped = _shipped_workers_dir()
+    if shipped.is_dir() and (shipped / f"{name}.md").is_file():
+        return True
+    cur.execute(f"""select exists (select 1 from {SCHEMA}.tasks_workers
+                                    where project_id = %s and name = %s and active)
+                           as worker""", (project, name))
+    return bool(_rows(cur)[0]["worker"]) or _is_project(cur, name)
+
+
+def _a_person(cur, project: str | None, name, seen: dict) -> bool:
+    """Whether a task of `project` assigned to `name` waits on a person: a name
+    that is no worker of that project, no agent and no capability. A name the
+    manager cannot answer for is not judged one."""
+    name = (name or "").strip()
+    if not name or _no_person_here(cur, project, name):
+        return False
+    return _manager_names(name, seen) is False
+
+
+def _wait_key(cur, tid: str, before=None) -> str:
+    """The Inbox key of the wait a task stands in: the move that began it - the
+    latest move of its status or assignee, by its status row where it moved
+    into `waiting`, else its assignee row - or, where no move is recorded, the
+    task's creation. `before` asks it of the wait the task stood in before that
+    moment."""
+    cur.execute(f"""select id from {SCHEMA}.tasks_changes
+                     where task_id = %s and field in ('status', 'assignee')
+                       and (%s::timestamptz is null or changed_at < %s::timestamptz)
+                     order by changed_at desc,
+                              (field = 'status' and new_value = 'waiting') desc,
+                              (field = 'assignee') desc
+                     limit 1""", (tid, before, before))
+    found = _rows(cur)
+    return f"tasks:{tid}:{found[0]['id'] if found else 'created'}"
+
+
+def _put_argv(cur, task: dict, key: str) -> list[str]:
+    """The `inbox` call that puts this wait before its person: a question to
+    answer yes or no where the move that began it carried one, else the task's
+    latest trail entry - or its objective - to answer in words. The answer comes
+    back through `answer`, whose task and key are quoted for the shell inbox
+    runs it in, always, whatever they hold."""
+    tid = str(task["id"])
+    title = " ".join(str(task.get("title") or tid).split())[:200]
+
+    def quoted(value: str) -> str:
+        return "'" + value.replace("'", "'\"'\"'") + "'"
+
+    on_answer = f"{NAME} answer {quoted(tid)} --key {quoted(key)}"
+    question = (task.get("metadata") or {}).get(_QUESTION)
+    if (isinstance(question, dict)
+            and f"tasks:{tid}:{question.get('move')}" == key):
+        return ["inbox", "ask", title, "--text", str(question.get("text")),
+                "--yes", str(question.get("yes")), "--no", str(question.get("no")),
+                "--recommend", str(question.get("recommend")),
+                "--key", key, "--on-answer", on_answer]
+    cur.execute(f"""select description from {SCHEMA}.tasks_activities
+                     where task_id = %s order by created_at desc limit 1""", (tid,))
+    latest = _rows(cur)
+    text = (latest[0]["description"] if latest else None) or task.get("objective") or title
+    return ["inbox", "talk", title, "--text", text, "--key", key, "--on-answer", on_answer]
+
+
+def _inbox_after() -> list[dict]:
+    """Tell the Inbox of the moves noted since it was last told, as far as each
+    committed: a move out of a wait on a person withdraws that wait's item, and
+    a move into one puts a new item, keyed by that move. The store is read in
+    one transaction and the commands run after it ends. Nothing here refuses,
+    retries or reaches the move; answers what was run."""
+    import shutil
+    moves, _INBOX_MOVES[:] = list(_INBOX_MOVES), []
+    if not moves or shutil.which("inbox") is None:
+        return []
+    planned = []
+    try:
+        with _connect(None, raising=True, waiting=False,
+                      migrating=False) as conn, conn.cursor() as cur:
+            cur.execute(f"""select id::text as id, changed_at from {SCHEMA}.tasks_changes
+                             where id::text = any(%s)""", ([one["move"] for one in moves],))
+            committed = {row["id"]: row["changed_at"] for row in _rows(cur)}
+            for one in moves:
+                if one["move"] not in committed:
+                    continue
+                tid, was, now = one["task"], one["before"], one["after"]
+                if was["status"] == "waiting" and not _no_person_here(
+                        cur, one["project"], (was["assignee"] or "").strip()):
+                    key = _wait_key(cur, tid, committed[one["move"]])
+                    planned.append((was["assignee"], ["inbox", "withdraw", "--key", key]))
+                if now["status"] == "waiting" and not _no_person_here(
+                        cur, one["project"], (now["assignee"] or "").strip()):
+                    task = _task_row(cur, tid)
+                    planned.append((now["assignee"],
+                                    _put_argv(cur, task, f"tasks:{tid}:{one['move']}")))
+            conn.commit()
+    except Exception:
+        return []
+    seen: dict = {}
+    ran = []
+    for name, argv in planned:
+        name = (name or "").strip()
+        if name and _manager_names(name, seen) is False:
+            ran.append({"argv": argv, "answer": _command(argv)})
+    return ran
+
+
 def cmd_add(entry, args: list[str]) -> None:
     """Create one task. `--key` makes it re-runnable: a key this project already
     holds creates nothing, changes nothing, and reports the task that holds it. A
@@ -3860,6 +4127,7 @@ def cmd_add(entry, args: list[str]) -> None:
         _emit(_accepted(answer, judged))
 
 
+@_then_inbox
 def cmd_set(entry, args: list[str]) -> None:
     """Edit scalar fields. A field not named is left alone; `--clear` is the only
     thing that empties one. Tags and metadata are not editable here on purpose -
@@ -3875,11 +4143,22 @@ def cmd_set(entry, args: list[str]) -> None:
     A call that names the assignee and nothing else is one of the two writes the
     project a task is assigned to may make on another project's task. Handing a
     waiting task back or on from there returns it to `todo` at once, so the
-    project that raised it picks it up."""
-    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor", "blocked-by", "line"),
-                  multi=("clear",), takes=1)
+    project that raised it picks it up.
+
+    `--question`, `--yes`, `--no` and `--recommend` go together, on a call that
+    moves the task into waiting on a person: they are kept in its metadata under
+    `question`, stamped with that move, so the Inbox asks them (THE INBOX)."""
+    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor", "blocked-by", "line")
+                  + _QUESTION_FLAGS, multi=("clear",), takes=1)
     if not opts["_loose"]:
         _die(6, "input", "set needs a task", f"{NAME} set <uuid|unique_key> [fields]")
+    asked = {flag: opts.pop(flag) for flag in _QUESTION_FLAGS if flag in opts}
+    if asked and (len(asked) < len(_QUESTION_FLAGS)
+                  or not all(str(value).strip() for value in asked.values())):
+        _die(6, "input", "--question, --yes, --no and --recommend go together, none empty",
+             "--question TEXT --yes WORDS --no WORDS --recommend yes|no")
+    if asked:
+        _one_of(asked["recommend"], ("yes", "no"), "--recommend")
     tz = _zone(entry)
     values = _scalar_updates(opts, tz)
     if "blocked-by" in opts:
@@ -3941,6 +4220,21 @@ def cmd_set(entry, args: list[str]) -> None:
         _wait_has_a_name(values.get("status", before.get("status")),
                          values["assignee"] if "assignee" in values
                          else before.get("assignee"))
+        if asked:
+            # A question is asked of the person a wait begins on, so it rides only
+            # on the move that begins one; it lands in the metadata, gated as any
+            # key a worker writes there.
+            lands = values.get("status", before["status"])
+            named = values["assignee"] if "assignee" in values else before.get("assignee")
+            if not (lands == "waiting"
+                    and (lands != before["status"]
+                         or (named or "") != (before.get("assignee") or ""))
+                    and _a_person(cur, before["project_id"], named, {})):
+                _die(6, "input", "--question goes with a move into waiting on a person",
+                     "move it there in the same call: --status waiting --assignee <person>")
+            _worker_gate(f"meta-overwrite:{_QUESTION}"
+                         if _QUESTION in (before.get("metadata") or {}) else "meta-set",
+                         tid, lookup)
         # Only a call that names the status is a transition into the wait, and
         # naming `--pickup` - or clearing it - is what says the moment was chosen
         # for this wait rather than inherited from whatever held the task before.
@@ -3969,9 +4263,21 @@ def cmd_set(entry, args: list[str]) -> None:
                      _acceptance_hint(row["assignee"].strip()))
         # The move is recorded here, under the verb that made it, rather than by
         # whoever remembered to write it down afterwards.
+        ids: dict = {}
         moved = _record_moves(cur, tid, before, row,
                               execution_id=(_open_execution(cur, tid) or {}).get("id"),
-                              actor=_actor(opts.get("actor")))
+                              actor=_actor(opts.get("actor")), ids=ids)
+        if asked:
+            # Stamped with the move it belongs to, so a later wait does not ask it.
+            cur.execute(f"""update {SCHEMA}.tasks_tasks
+                               set metadata = metadata || jsonb_build_object(%s::text, %s::jsonb)
+                             where id = %s returning *""",
+                        (_QUESTION, json.dumps({"text": asked["question"], "yes": asked["yes"],
+                                                "no": asked["no"],
+                                                "recommend": asked["recommend"],
+                                                "move": ids.get("status") or ids.get("assignee")},
+                                               ensure_ascii=False), tid))
+            row = _rows(cur)[0]
         conn.commit()
         answer = {"updated": row["id"], "fields": cols, "moved": moved, "task": row}
         if handed_back:
@@ -4184,6 +4490,165 @@ def cmd_activity(entry, args: list[str]) -> None:
         _emit({"task": tid, "activity": row["id"], "created_at": row["created_at"]})
 
 
+def _returned_from(cur, task: dict, move: str, lookup) -> tuple[dict | None, str | None]:
+    """Put a task back where the move `move` found it, inside the caller's
+    transaction: the old value of that move's status row and of its assignee
+    row, an old `in_progress` landing as `todo`; a field the move did not change
+    stays. Judged as `set` judges a move, and a move refused - or a wait that
+    began at creation, which no move found anywhere - is undone and answered by
+    the sentence saying why, so the caller still records the answer."""
+    tid = str(task["id"])
+    cur.execute(f"""select field, old_value, changed_at from {SCHEMA}.tasks_changes
+                     where id::text = %s and task_id = %s""", (move, tid))
+    found = _rows(cur)
+    if not found:
+        return None, ("the wait began when the task was created, so no earlier place "
+                      "is recorded to return it to")
+    values: dict = {}
+    if found[0]["field"] == "status":
+        old = found[0]["old_value"]
+        values["status"] = "todo" if old == "in_progress" else old
+        cur.execute(f"""select old_value from {SCHEMA}.tasks_changes
+                         where task_id = %s and field = 'assignee' and changed_at = %s
+                         limit 1""", (tid, found[0]["changed_at"]))
+        assignee = _rows(cur)
+        if assignee:
+            values["assignee"] = assignee[0]["old_value"]
+    else:
+        values["assignee"] = found[0]["old_value"]
+    lands = values.get("status", task["status"])
+    named = values["assignee"] if "assignee" in values else task.get("assignee")
+    if lands == "waiting" and not (named or "").strip():
+        return None, "a task that waits on nobody is a stall with a name missing"
+    execution = _worker_execution()
+    if execution:
+        writes = _bound_writes(lookup(execution))
+        for op in ([f"status:{values['status']}"] if "status" in values else []) + (
+                [f"assignee:{values['assignee'] or ''}"] if "assignee" in values else []):
+            refused = _worker_refusal(op, tid, lookup, writes=writes)
+            if refused:
+                return None, refused
+    cur.execute("savepoint tasks_answer")
+    cols = list(values)
+    cur.execute(f"""update {SCHEMA}.tasks_tasks
+                       set {', '.join(f'{c} = %s' for c in cols)}, updated_at = now()
+                     where id = %s returning *""", [values[c] for c in cols] + [tid])
+    after = _rows(cur)[0]
+    refused = _landing_refusal(after)
+    if not refused:
+        judged = _acceptance(cur, after)
+        refused = judged.get("refused") if judged else None
+    if refused:
+        cur.execute("rollback to savepoint tasks_answer")
+        return None, refused
+    cur.execute("release savepoint tasks_answer")
+    return after, None
+
+
+def _where_it_stands(task: dict) -> str:
+    return f"{task['status']} on {(task.get('assignee') or '').strip() or 'nobody'}"
+
+
+@_then_inbox
+def cmd_answer(entry, args: list[str]) -> None:
+    """Take an Inbox answer back onto the task its item was put in for: the
+    command an item `tasks` put in runs once it is answered, with the answer in
+    its environment (THE INBOX). The answer always lands on the trail; while the
+    task still waits under that key it is also returned to where the move that
+    began the wait found it. Every outcome but a call that cannot be read exits
+    0, so the Inbox does not deliver it again."""
+    opts = _flags(args, ("key", "actor"), takes=1)
+    if not opts["_loose"] or not (opts.get("key") or "").strip():
+        _die(6, "input", "answer needs a task and the key of its Inbox item",
+             f"{NAME} answer <task> --key <key>")
+    given = {name: (os.environ.get(f"INBOX_{name.upper()}") or "").strip()
+             for name in ("item_id", "kind", "answer", "reply", "answered_by",
+                          "answered_at")}
+    if not given["item_id"] or given["kind"] not in ("ask", "talk"):
+        _die(6, "input", "answer reads its answer from the environment the Inbox gives "
+             "an on-answer command, and INBOX_ITEM_ID or INBOX_KIND is missing",
+             "the Inbox runs it once the item is answered; answer it there")
+    key = opts["key"].strip()
+    actor = _actor(opts.get("actor"))
+    with _connect(entry) as conn, conn.cursor() as cur:
+        tid = _task_id(cur, opts["_loose"][0], writing=True, answering=True)
+        move = key[len(f"tasks:{tid}:"):] if key.startswith(f"tasks:{tid}:") else ""
+        if not move:
+            _die(6, "input", f"{key!r} is no Inbox key of task {tid}",
+                 f"its keys read tasks:{tid}:<move>")
+        cur.execute(f"select * from {SCHEMA}.tasks_tasks where id = %s for update", (tid,))
+        task = _rows(cur)[0]
+        question = (task.get("metadata") or {}).get(_QUESTION)
+        words = (question.get(given["answer"]) if isinstance(question, dict)
+                 and f"tasks:{tid}:{question.get('move')}" == key else None)
+        said = (f"Answered in the Inbox by {given['answered_by'] or 'the person'}"
+                + (f" at {given['answered_at']}" if given["answered_at"] else "") + ": "
+                + (given["answer"] + (f" ({words})" if words else "")
+                   + (f". Reply: {given['reply']}" if given["reply"] else "")
+                   if given["kind"] == "ask" else given["reply"] or "(no reply)"))
+        answer = {"task": tid, "key": key, "item": given["item_id"], "returned": None}
+        if task["status"] == "waiting" and _wait_key(cur, tid) == key:
+            after, refused = _returned_from(cur, task, move, _execution_lookup(cur))
+            if after is not None:
+                answer["moved"] = _record_moves(cur, tid, task, after, actor=actor)
+                answer["returned"] = {"status": after["status"],
+                                      "assignee": after.get("assignee")}
+                said += (f"\n\nReturned to {_where_it_stands(after)}, where the move that "
+                         "put it before them found it.")
+            else:
+                answer["refused"] = refused
+                said += (f"\n\nIt could not be returned to where it was: {refused}. It "
+                         f"stays {_where_it_stands(task)}.")
+        else:
+            answer["moved_on"] = True
+            said += (f"\n\nThe answer came after the task moved on: it is "
+                     f"{_where_it_stands(task)} now, so nothing was moved.")
+        answer["activity"] = _add_activity(cur, tid, said, actor)["id"]
+        conn.commit()
+    _emit(answer)
+
+
+def cmd_inbox(entry, args: list[str]) -> None:
+    """Put every task of this project that waits on a person now into the
+    Inbox, each keyed by the move that began its wait, so a project whose waits
+    began before tasks put them there has them too. A key the Inbox already
+    holds puts nothing new, so running it again changes nothing."""
+    import shutil
+    _flags(args, ())
+    project = _writing_project()
+    if shutil.which("inbox") is None:
+        _die(6, "inbox_unavailable", "the inbox command is not on PATH, so nothing can be "
+             "put in the Inbox", "install inbox and run this again")
+    planned = []
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""select * from {SCHEMA}.tasks_tasks
+                         where project_id = %s and status = 'waiting'
+                         order by created_at""", (project,))
+        for task in _rows(cur):
+            name = (task.get("assignee") or "").strip()
+            if not name or _no_person_here(cur, project, name):
+                continue
+            key = _wait_key(cur, str(task["id"]))
+            planned.append((task, name, key, _put_argv(cur, task, key)))
+        conn.commit()
+    seen: dict = {}
+    put, left = [], []
+    for task, name, key, argv in planned:
+        if _manager_names(name, seen) is not False:
+            left.append({"task": _address(task), "task_id": str(task["id"]), "assignee": name,
+                         "why": "the manager names it an agent or a capability, or "
+                                "cannot say"})
+            continue
+        answer = _command(argv)
+        item = (answer or {}).get("item") or {}
+        put.append({"task": _address(task), "task_id": str(task["id"]), "assignee": name,
+                    "key": key, "kind": argv[1], "item": item.get("id"),
+                    "created": (answer or {}).get("created"),
+                    **({} if answer else {"error": "inbox refused it, failed or did not "
+                                                   "answer in time"})})
+    _emit({"project": project, "put": put, "left": left})
+
+
 # --- Execution ---------------------------------------------------------------
 
 class Refusal(Exception):
@@ -4225,21 +4690,23 @@ def _duration(text: str) -> int:
 
 def _record_change(cur, tid: str, field: str, old, new,
                    execution_id: str | None = None, actor: str | None = None,
-                   origin: str | None = None) -> bool:
-    """One row per move that actually moved. Writing a row for a save that
-    changed nothing would make the count of moves useless, and counting moves is
+                   origin: str | None = None) -> str | None:
+    """One row per move that actually moved, answered by its id - empty where
+    the store hands none back; None for a save that changed nothing. Writing a
+    row for one would make the count of moves useless, and counting moves is
     what this table exists for."""
     before = None if old is None else str(old)
     after = None if new is None else str(new)
     if before == after:
-        return False
+        return None
     cur.execute(f"""insert into {SCHEMA}.tasks_changes
                       (task_id, field, old_value, new_value, execution_id, actor,
                        origin_project)
-                    values (%s, %s, %s, %s, %s, %s, %s)""",
+                    values (%s, %s, %s, %s, %s, %s, %s) returning id""",
                 (tid, field, before, after, execution_id, actor,
                  origin or _writing_project()))
-    return True
+    found = _rows(cur)
+    return str(found[0]["id"]) if found else ""
 
 
 _TRACKED = (("status", "status"), ("pickup", "pickup_at"),
@@ -4248,15 +4715,30 @@ _TRACKED = (("status", "status"), ("pickup", "pickup_at"),
 
 def _record_moves(cur, tid: str, before: dict, after: dict,
                   execution_id: str | None = None, actor: str | None = None,
-                  origin: str | None = None) -> list[str]:
+                  origin: str | None = None, ids: dict | None = None) -> list[str]:
     """Every tracked field that moved, one row each, stamped with the project
     that moved it: the one the command runs in, unless the caller already
-    holds that answer and names it."""
-    moved = []
+    holds that answer and names it. `ids`, when given, is filled with each
+    row's id by its field.
+
+    A move of the status or the assignee is also noted for the Inbox, which
+    is told of it once its transaction has committed (THE INBOX)."""
+    moved, rows = [], {}
     for field, column in _TRACKED:
-        if _record_change(cur, tid, field, before.get(column), after.get(column),
-                          execution_id, actor, origin):
+        made = _record_change(cur, tid, field, before.get(column), after.get(column),
+                              execution_id, actor, origin)
+        if made is not None:
             moved.append(field)
+            rows[field] = made
+    if ids is not None:
+        ids.update(rows)
+    move = rows.get("status") or rows.get("assignee")
+    if move:
+        _INBOX_MOVES.append({
+            "task": tid, "move": move,
+            "project": after.get("project_id") or before.get("project_id"),
+            "before": {"status": before.get("status"), "assignee": before.get("assignee")},
+            "after": {"status": after.get("status"), "assignee": after.get("assignee")}})
     return moved
 
 
@@ -4699,6 +5181,7 @@ def _type_refusal(task: dict, opts: dict) -> str | None:
     return None
 
 
+@_then_inbox
 def _claim(entry, opts: dict) -> dict:
     """The claim itself, answered rather than printed, so `run` takes a task the
     same way a caller of the verb does and there is one transaction either way.
@@ -4972,6 +5455,7 @@ def cmd_release(entry, args: list[str]) -> None:
     _emit(answer)
 
 
+@_then_inbox
 def _release(entry, ref: str, outcome: str, status: str | None, detail: str | None,
              run_system: str | None, run_ref: str | None, metrics: str,
              judged: bool = False, assignee: str | None = None) -> dict:
@@ -5585,6 +6069,7 @@ def _escalation_answer(task: dict, target: str, why: str, facts: dict) -> dict:
             "raises_in_place": int(facts["raises_in_place"])}
 
 
+@_then_inbox
 def _attempts_first(entry, escalation: dict, task: dict, *, write: bool) -> dict | None:
     """Escalate a task whose raises in place have reached the worker's attempts,
     before its `before` hook is asked about it: a hook that holds it would
@@ -5604,6 +6089,7 @@ def _attempts_first(entry, escalation: dict, task: dict, *, write: bool) -> dict
     return moved
 
 
+@_then_inbox
 def _escalate_asked(entry, escalation: dict, task: dict, why: str, *,
                     write: bool) -> dict | None:
     """Escalate a task a handler answered `escalate` for, at once, with the
@@ -5643,6 +6129,7 @@ def _lane_moving(cur, task: dict, escalation: dict) -> bool:
     return bool(_rows(cur)[0]["moving"])
 
 
+@_then_inbox
 def _held_back(entry, escalation: dict, task: dict, said: str | None, how: str, *,
                write: bool) -> dict | None:
     """Count a hold of a task by its own taker's `before` hook against
@@ -9285,6 +9772,7 @@ def _key_candidate(entry, worker: dict, key: str) -> dict | None:
     return row if refused is None else None
 
 
+@_then_inbox
 def _sweep(entry, worker: dict | None = None,
            key: str | None = None) -> tuple[list, list, dict]:
     """The two sweeps a claim runs before it selects, and then the scan for dead
@@ -9910,6 +10398,7 @@ def _later(one, other) -> bool:
         return False
 
 
+@_then_inbox
 def _escalate_after(entry, escalation: dict, task: dict, why: str) -> dict | None:
     """Escalate a task the `after` hook answered escalate for, while it stands
     where the raise left it: same status and assignee, no raise open on it."""
@@ -15107,7 +15596,7 @@ def main() -> None:
         "runs": cmd_runs, "history": cmd_history,
         "watch": cmd_watch, "workers": cmd_workers, "profiles": cmd_profiles,
         "hooks": cmd_hooks, "lines": cmd_lines,
-        "accepts": cmd_accepts,
+        "accepts": cmd_accepts, "answer": cmd_answer, "inbox": cmd_inbox,
     }
     handler = handlers.get(verb)
     if not handler and verb not in ("tag", "untag"):
