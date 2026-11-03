@@ -21275,9 +21275,40 @@ def _store_upgrade_readers(setting, survey: dict) -> list[dict]:
     here, each installed capability that keeps tables asked through its own
     `migrate status`, a quarantined one under the flag, which alone lets it
     answer - against what the store holds: {owner, by, capability?,
-    quarantined?, store, reads, state, crosses, error?}."""
+    quarantined?, store, reads, state, crosses, error?}. The capabilities are
+    asked all at once, while the manager asks its own, since each waits on
+    the store over its own connection."""
     db = _db_module()
     store = _store_module()
+    asked = []
+    for name in sorted(_installed()):
+        manifest = _read_json(_registry_dir(name) / "manifest.json") or {}
+        if manifest.get("tables") is True:
+            asked.append((name, manifest, _machine_state(name) == "quarantined"))
+
+    # Made here, since the manager's own owners move this process's
+    # environment while the capabilities are asked.
+    envs = {flag: _store_upgrade_env(setting, upgrading=flag) for flag in (False, True)}
+
+    def ask(row):
+        name, _, flagged = row
+        rc, stdout, stderr = _run_script(
+            _script_path(name), ["migrate", "status"], env=envs[flagged],
+            timeout=MIGRATE_TIMEOUT_SECONDS)
+        if rc != 0 and not flagged \
+                and _script_error(stderr, rc).get("code") in STORE_MAJOR_SLUGS:
+            # A release whose library refuses a store at another major
+            # answers only under the upgrade's flag, which `status` reads as
+            # the upgrade would.
+            flagged = True
+            rc, stdout, stderr = _run_script(
+                _script_path(name), ["migrate", "status"], env=envs[True],
+                timeout=MIGRATE_TIMEOUT_SECONDS)
+        return flagged, rc, stdout, stderr
+
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(asked)))
+    pending = [pool.submit(ask, row) for row in asked]
+    pool.shutdown(wait=False)
     out = []
     lib_major = db.STORE_MAJOR
     core_store = survey["owners"].get("core")
@@ -21311,26 +21342,8 @@ def _store_upgrade_readers(setting, survey: dict) -> list[dict]:
                 conn.close()
         entry["crosses"] = entry["state"] == "upgrade_needed"
         out.append(entry)
-    for name in sorted(_installed()):
-        manifest = _read_json(_registry_dir(name) / "manifest.json") or {}
-        if manifest.get("tables") is not True:
-            continue
-        quarantined = _machine_state(name) == "quarantined"
-        flagged = quarantined
-        rc, stdout, stderr = _run_script(
-            _script_path(name), ["migrate", "status"],
-            env=_store_upgrade_env(setting, upgrading=flagged),
-            timeout=MIGRATE_TIMEOUT_SECONDS)
-        if rc != 0 and not flagged \
-                and _script_error(stderr, rc).get("code") in STORE_MAJOR_SLUGS:
-            # A release whose library refuses a store at another major
-            # answers only under the upgrade's flag, which `status` reads as
-            # the upgrade would.
-            flagged = True
-            rc, stdout, stderr = _run_script(
-                _script_path(name), ["migrate", "status"],
-                env=_store_upgrade_env(setting, upgrading=True),
-                timeout=MIGRATE_TIMEOUT_SECONDS)
+    for (name, manifest, quarantined), future in zip(asked, pending):
+        flagged, rc, stdout, stderr = future.result()
         base = {"by": "capability", "capability": name, "quarantined": quarantined,
                 "release_store_major": _release_store_major(manifest.get("store_major"))}
         # The owners it migrates, further ones first and its own last, as its
@@ -21462,10 +21475,15 @@ def _store_upgrade_check(root: Path | None, *, available: dict | None = None) ->
                              "first migration of each owner takes its newest steps")
         answer["_"] = {"setting": setting, "survey": survey, "key": key}
         return answer
-    answer["available"] = available = available or _store_upgrade_available()
+    # The newest line is fetched while the readers are asked; both only wait.
+    if not available:
+        fetching = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        fetched = fetching.submit(_store_upgrade_available)
+        fetching.shutdown(wait=False)
+    readers = _store_upgrade_readers(setting, survey)
+    answer["available"] = available = available or fetched.result()
     target = max(available["major"] or STORE_MAJOR, STORE_MAJOR)
     answer["target_major"] = target
-    readers = _store_upgrade_readers(setting, survey)
     answer["owners"] = readers
     answer["_"] = {"setting": setting, "survey": survey, "key": key, "readers": readers}
     if survey["major"] > STORE_MAJOR or survey["major"] > lib_major or any(
