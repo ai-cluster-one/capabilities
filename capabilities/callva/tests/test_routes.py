@@ -51,6 +51,7 @@ ARGV = {
     "agents list": ["agents", "list"],
     "agents default": ["agents", "default"],
     "agents get": ["agents", "get", "{id}"],
+    "agents create": ["agents", "create"],
     "agents update": ["agents", "update", "{id}", "--name", "N"],
     "agents clone": ["agents", "clone", "{id}"],
     "agents delete": ["agents", "delete", "{id}"],
@@ -96,6 +97,18 @@ ARGV = {
     "ui-views put": ["ui-views", "put", "{view}", *DATA],
     "ui-views delete": ["ui-views", "delete", "{view}"],
     "ui-views set-default": ["ui-views", "set-default", "{view}"],
+    "issues list": ["issues", "list"],
+    "issues get": ["issues", "get", "{issue}"],
+    "issues create": ["issues", "create", *DATA],
+    "issues update": ["issues", "update", "{issue}", *DATA],
+    "issues put": ["issues", "put", "{issue}", *DATA],
+    "issues delete": ["issues", "delete", "{issue}"],
+    "knowledge list": ["knowledge", "list"],
+    "knowledge get": ["knowledge", "get", "{knowledgeItem}"],
+    "knowledge create": ["knowledge", "create", *DATA],
+    "knowledge update": ["knowledge", "update", "{knowledgeItem}", *DATA],
+    "knowledge put": ["knowledge", "put", "{knowledgeItem}", *DATA],
+    "knowledge delete": ["knowledge", "delete", "{knowledgeItem}"],
     "transcripts get": ["transcripts", "get", "{call}"],
     "transcripts store": ["transcripts", "store", "{call}", *DATA],
     "transcripts delete": ["transcripts", "delete", "{call}"],
@@ -110,6 +123,7 @@ ARGV = {
     "fields update": ["fields", "update", "{custom_field}", *DATA],
     "fields delete": ["fields", "delete", "{custom_field}"],
     "fields impact": ["fields", "impact", "{custom_field}"],
+    "fields extraction-schema": ["fields", "extraction-schema"],
     "field-groups list": ["field-groups", "list"],
     "field-groups create": ["field-groups", "create", *DATA],
     "field-groups update": ["field-groups", "update", "{groupId}", *DATA],
@@ -155,8 +169,16 @@ ARGV = {
     "settings reveal": ["settings", "reveal", "{definitionId}"],
     "projects list": ["projects", "list"],
     "projects get": ["projects", "get", "{id}"],
+    "projects create": ["projects", "create", "--name", "N"],
+    "projects update": ["projects", "update", "{id}", "--name", "N"],
+    "projects put": ["projects", "put", "{id}", "--name", "N"],
+    "projects delete": ["projects", "delete", "{id}"],
     "phone-numbers list": ["phone-numbers", "list"],
     "phone-numbers get": ["phone-numbers", "get", "{id}"],
+    "phone-numbers create": ["phone-numbers", "create", "--phone-number", "+15550000000", "--number-type", "manual"],
+    "phone-numbers update": ["phone-numbers", "update", "{id}", "--label", "L"],
+    "phone-numbers delete": ["phone-numbers", "delete", "{id}"],
+    "phone-numbers bind": ["phone-numbers", "bind", "{id}", "AG"],
     "providers list": ["providers", "list"],
     "providers types": ["providers", "types"],
 }
@@ -299,6 +321,19 @@ class WriteGateTest(unittest.TestCase):
                 self.assertEqual(json.loads(err)["error"]["code"], "read_only")
                 self.assertEqual(main.requests, [])
 
+    def test_provisioning_verbs_refuse_on_a_read_only_connection(self):
+        new = [verb for verb in callva.WRITE_VERBS
+               if verb.split(" ")[0] in ("issues", "knowledge", "projects", "phone-numbers")
+               or verb == "agents create"]
+        self.assertEqual(len(new), 17)
+        for verb in new:
+            with self.subTest(verb=verb):
+                main = _Main(allow_write=False)
+                code, out, err = main.run(*_fill(ARGV[verb]))
+                self.assertEqual(code, 4)
+                self.assertEqual(json.loads(err)["error"]["code"], "read_only")
+                self.assertEqual(main.requests, [])
+
 
 class RevealTest(unittest.TestCase):
     PATH = "/api/v1/external/settings/project/D1/reveal"
@@ -371,6 +406,60 @@ class PayloadTest(unittest.TestCase):
                 code, _out, err = main.run(*argv)
                 self.assertEqual(code, 6)
                 self.assertEqual(main.requests, [])
+
+    def test_agent_create_sends_no_fields(self):
+        self.assertEqual(self._sent("agents", "create"), ("POST", None))
+
+    def test_custom_webhook_events_replaces_the_list_and_empty_forwards_nothing(self):
+        self.assertEqual(self._sent("agents", "update", "A", "--custom-webhook-events", "call.ended, call.started"),
+                         ("PATCH", {"custom_webhook_events": ["call.ended", "call.started"]}))
+        self.assertEqual(self._sent("agents", "update", "A", "--custom-webhook-events", ""),
+                         ("PATCH", {"custom_webhook_events": []}))
+        self.assertEqual(self._sent("agents", "update", "A", "--data", '{"custom_webhook_events": ["call.ended"]}'),
+                         ("PATCH", {"custom_webhook_events": ["call.ended"]}))
+
+    def test_project_and_phone_flags_write_over_data(self):
+        self.assertEqual(self._sent("projects", "create", "--name", "N", "--description", "D", "--is-active", "false"),
+                         ("POST", {"name": "N", "description": "D", "is_active": False}))
+        self.assertEqual(self._sent("projects", "put", "X", "--data", '{"name": "A", "description": "D"}', "--name", "B"),
+                         ("PUT", {"name": "B", "description": "D"}))
+        self.assertEqual(self._sent("phone-numbers", "create", "--phone-number", "+15550000000",
+                                    "--number-type", "provider", "--provider-credential-id", "C",
+                                    "--provider-phone-id", "P"),
+                         ("POST", {"phone_number": "+15550000000", "number_type": "provider",
+                                   "provider_credential_id": "C", "provider_phone_id": "P"}))
+        self.assertEqual(self._sent("phone-numbers", "update", "X", "--label", "L", "--is-active", "true", "--status", "active"),
+                         ("PATCH", {"label": "L", "is_active": True, "status": "active"}))
+
+    def test_bind_names_the_agent_or_unbinds_out_loud(self):
+        self.assertEqual(self._sent("phone-numbers", "bind", "X", "AG"), ("PUT", {"agent_id": "AG"}))
+        self.assertEqual(self._sent("phone-numbers", "bind", "X", "--unbind"), ("PUT", {"agent_id": None}))
+        for argv in (("phone-numbers", "bind", "X"), ("phone-numbers", "bind", "X", "AG", "--unbind")):
+            with self.subTest(argv=argv):
+                main = _Main()
+                code, _out, err = main.run(*argv)
+                self.assertEqual(code, 6)
+                self.assertEqual(json.loads(err)["error"]["code"], "bind_target")
+                self.assertEqual(main.requests, [])
+
+    def test_journal_list_filters_and_writes_need_a_payload(self):
+        main = _Main(respond=lambda r: httpx.Response(200, json={"data": []}))
+        code, _out, err = main.run("issues", "list", "-f", "status=open", "--per-page", "5")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(dict(main.requests[0].url.params), {"status": "open", "per_page": "5"})
+        for argv in (("issues", "create"), ("knowledge", "update", "X"), ("projects", "create"),
+                     ("phone-numbers", "update", "X")):
+            with self.subTest(argv=argv):
+                main = _Main()
+                code, _out, _err = main.run(*argv)
+                self.assertEqual(code, 6)
+                self.assertEqual(main.requests, [])
+
+    def test_extraction_schema_passes_the_entity_type(self):
+        main = _Main()
+        code, _out, err = main.run("fields", "extraction-schema", "--entity-type", "lead")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(dict(main.requests[0].url.params), {"entity_type": "lead"})
 
 
 if __name__ == "__main__":

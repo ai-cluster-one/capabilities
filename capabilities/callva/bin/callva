@@ -49,10 +49,11 @@ CONNECTIONS
   default base URL applies. "allow_write": false makes the connection
   read-only: every mutating verb (the create/update/put/delete/batch/store/
   reorder/deploy/run actions on agents, assets, calls, transcripts, fields,
-  field-groups, schedules, automations, actions, ui-views, and variables, the
-  add/update/remove/toggle trigger actions on automations, `recordings purge`,
-  `calls run-action`, `ui-views set-default`, the outbound `call`, and `agents
-  config`, which runs the agent's start-of-call automation) exits 4, and no
+  field-groups, schedules, automations, actions, ui-views, issues, knowledge,
+  projects, phone-numbers, and variables, the add/update/remove/toggle trigger
+  actions on automations, `recordings purge`, `calls run-action`, `ui-views
+  set-default`, `phone-numbers bind`, the outbound `call`, and `agents config`,
+  which runs the agent's start-of-call automation) exits 4, and no
   flag lifts the gate. `settings reveal` writes nothing but prints a secret, so
   a read-only connection refuses it the same way.
 
@@ -120,10 +121,18 @@ Commands (`-f key=value` is repeatable for list filters):
   agents default                      (reads only: the project's default agent,
                                        else its oldest; exit 3 when it has none)
   agents get <id>
+  agents create                       (takes no fields: an active agent named
+                                       "Untitled agent" in the project; set the
+                                       rest with `agents update`)
   agents update <id> [--name N] [--prompt T | --prompt-file F]
                      [--greeting-type prompt|exact|instruction]
                      [--greeting-exact T] [--greeting-instruction T]
-                     [--agent-speaks-first B] [--config JSON] [--data JSON]
+                     [--agent-speaks-first B]
+                     [--custom-webhook-events E1,E2] [--config JSON] [--data JSON]
+                     (--custom-webhook-events replaces the event types the
+                      custom webhook forwards; "" forwards nothing. The API
+                      names them call.dialing, call.started, call.ended and
+                      call.recording.)
   agents clone <id> [--name N]
   agents delete <id>
   agents config <id> [--direction inbound|outbound]
@@ -229,6 +238,32 @@ Commands (`-f key=value` is repeatable for list filters):
   treats PUT and PATCH alike, as a partial update: a field left out keeps its
   value, so `put` replaces no more than `update` does.
 
+  issues list [-f k=v ...] [--per-page N] [--page N]
+  issues get <id>
+  issues create (--data JSON | --data-file F)
+  issues update <id> (--data JSON | --data-file F)      (PATCH)
+  issues put <id> (--data JSON | --data-file F)         (PUT)
+  issues delete <id>
+
+  Issues are the project's journal of what works and what does not on calls.
+  create requires kind (defect|limitation), title and problem; status
+  (open|fixed|closed), solution, implemented_at, proven_by, agent_id and call_id
+  are optional. list filters: status, kind, agent_id, call_id, search, sort.
+
+  knowledge list [-f k=v ...] [--per-page N] [--page N]
+  knowledge get <id>
+  knowledge create (--data JSON | --data-file F)
+  knowledge update <id> (--data JSON | --data-file F)   (PATCH)
+  knowledge put <id> (--data JSON | --data-file F)      (PUT)
+  knowledge delete <id>
+
+  Knowledge is what the project holds true or must not do. create requires
+  content; kind (fact|restriction), status (draft|active|outdated|wrong),
+  agent_id, source and source_call_id are optional. list filters: status (comma
+  separated), kind, agent_id, search, sort.
+
+  On both resources the API treats PUT and PATCH alike, as a partial update.
+
   transcripts get <call_id>
   transcripts store <call_id> (--data JSON | --data-file F)
   transcripts delete <call_id>
@@ -252,6 +287,8 @@ Commands (`-f key=value` is repeatable for list filters):
   fields update <id> --data JSON
   fields delete <id>
   fields impact <id>
+  fields extraction-schema [--entity-type T]   (JSON Schema of the project's
+                                                extraction fields; default call)
 
   field-groups list
   field-groups create --data JSON
@@ -343,9 +380,25 @@ Commands (`-f key=value` is repeatable for list filters):
 
   projects list [--is-active B] [--per-page N]
   projects get <id>
+  projects create [--name N] [--description T] [--is-active B] [--data JSON]
+  projects update <id> [--name N] [--description T] [--is-active B] [--data JSON]   (PATCH)
+  projects put <id> [--name N] [--description T] [--is-active B] [--data JSON]      (PUT)
+  projects delete <id>                (deletes everything in the project; the
+                                       default project is refused)
+
+  create, update, put and delete need a tenant-wide key: a key bound to one
+  project is refused. The API treats PUT and PATCH alike, as a partial update.
 
   phone-numbers list [--is-active B] [--per-page N]
   phone-numbers get <id>
+  phone-numbers create [--phone-number E164] [--number-type provider|personal|manual]
+                       [--provider-credential-id ID] [--provider-phone-id ID] [--data JSON]
+  phone-numbers update <id> [--label T] [--is-active B] [--status S] [--data JSON]
+  phone-numbers delete <id>           (an assigned number is refused; unbind it first)
+  phone-numbers bind <id> (<agent_id> | --unbind)
+
+  create needs a tenant-wide key; --provider-credential-id is required for
+  --number-type provider. --status is pending|active|suspended|error.
 
   providers list [--is-active B] [--provider-type T] [--per-page N]
   providers types
@@ -417,7 +470,7 @@ SUMMARY = ("CallVA voice-AI platform CLI over the External API — "
            "they run on and the tools they call, assets (prompts), calls, "
            "transcripts, recordings, call analytics, custom fields, webhook "
            "schedules, automations (Windmill scripts), webhook logs, "
-           "record actions, saved calls-list views, "
+           "record actions, saved calls-list views, issues, knowledge, "
            "variables, settings, projects, phone numbers, and providers.")
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
@@ -443,7 +496,7 @@ CONN_FIELDS = [{'key': 'api_url',
   'required': True,
   'env': 'CALLVA_{ID}_API_KEY'}]
 WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platform
-    "agents update", "agents delete", "agents clone",
+    "agents create", "agents update", "agents delete", "agents clone",
     "agents config",    # runs the agent's custom_config_url automation
     "presets set", "presets patch", "presets activate",
     "tools set", "tools patch", "tools delete",
@@ -465,6 +518,11 @@ WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platfor
     "actions create", "actions update", "actions put", "actions delete",
     "ui-views create", "ui-views update", "ui-views put", "ui-views delete",
     "ui-views set-default",
+    "issues create", "issues update", "issues put", "issues delete",
+    "knowledge create", "knowledge update", "knowledge put", "knowledge delete",
+    "projects create", "projects update", "projects put", "projects delete",
+    "phone-numbers create", "phone-numbers update", "phone-numbers delete",
+    "phone-numbers bind",
 }
 SECRET_READS = {"settings reveal"}   # write nothing, print a secret: a read-only connection refuses them too
 # The one API route each domain verb calls, which `callva routes` prints and the
@@ -475,6 +533,7 @@ ROUTES = {
     "agents list": ("GET", "/external/agents"),
     "agents default": ("GET", "/external/agents/default"),
     "agents get": ("GET", "/external/agents/{id}"),
+    "agents create": ("POST", "/external/agents"),
     "agents update": ("PATCH", "/external/agents/{id}"),
     "agents clone": ("POST", "/external/agents/{id}/clone"),
     "agents delete": ("DELETE", "/external/agents/{id}"),
@@ -520,6 +579,18 @@ ROUTES = {
     "ui-views put": ("PUT", "/external/ui-views/{view}"),
     "ui-views delete": ("DELETE", "/external/ui-views/{view}"),
     "ui-views set-default": ("POST", "/external/ui-views/{view}/set-default"),
+    "issues list": ("GET", "/external/issues"),
+    "issues get": ("GET", "/external/issues/{issue}"),
+    "issues create": ("POST", "/external/issues"),
+    "issues update": ("PATCH", "/external/issues/{issue}"),
+    "issues put": ("PUT", "/external/issues/{issue}"),
+    "issues delete": ("DELETE", "/external/issues/{issue}"),
+    "knowledge list": ("GET", "/external/knowledge"),
+    "knowledge get": ("GET", "/external/knowledge/{knowledgeItem}"),
+    "knowledge create": ("POST", "/external/knowledge"),
+    "knowledge update": ("PATCH", "/external/knowledge/{knowledgeItem}"),
+    "knowledge put": ("PUT", "/external/knowledge/{knowledgeItem}"),
+    "knowledge delete": ("DELETE", "/external/knowledge/{knowledgeItem}"),
     "transcripts get": ("GET", "/external/calls/{call}/transcript"),
     "transcripts store": ("POST", "/external/calls/{call}/transcript"),
     "transcripts delete": ("DELETE", "/external/calls/{call}/transcript"),
@@ -534,6 +605,7 @@ ROUTES = {
     "fields update": ("PUT", "/external/custom-fields/{custom_field}"),
     "fields delete": ("DELETE", "/external/custom-fields/{custom_field}"),
     "fields impact": ("GET", "/external/custom-fields/{custom_field}/delete-impact"),
+    "fields extraction-schema": ("GET", "/external/custom-fields/extraction-schema"),
     "field-groups list": ("GET", "/external/custom-field-groups"),
     "field-groups create": ("POST", "/external/custom-field-groups"),
     "field-groups update": ("PUT", "/external/custom-field-groups/{groupId}"),
@@ -579,8 +651,16 @@ ROUTES = {
     "settings reveal": ("GET", "/external/settings/project/{definitionId}/reveal"),
     "projects list": ("GET", "/external/projects"),
     "projects get": ("GET", "/external/projects/{id}"),
+    "projects create": ("POST", "/external/projects"),
+    "projects update": ("PATCH", "/external/projects/{id}"),
+    "projects put": ("PUT", "/external/projects/{id}"),
+    "projects delete": ("DELETE", "/external/projects/{id}"),
     "phone-numbers list": ("GET", "/external/phone-numbers"),
     "phone-numbers get": ("GET", "/external/phone-numbers/{id}"),
+    "phone-numbers create": ("POST", "/external/phone-numbers"),
+    "phone-numbers update": ("PATCH", "/external/phone-numbers/{id}"),
+    "phone-numbers delete": ("DELETE", "/external/phone-numbers/{id}"),
+    "phone-numbers bind": ("PUT", "/external/phone-numbers/{id}/agent"),
     "providers list": ("GET", "/external/phone-providers"),
     "providers types": ("GET", "/external/phone-providers/types"),
 }
@@ -958,6 +1038,11 @@ def parse_json_file(value):
         return json.load(f)
 
 
+def parse_csv(value):
+    """A comma-separated list; the empty string is the empty list."""
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def _data(value):
     """A non-empty --data/--payload object, or die with a validation error."""
     if not value:
@@ -1003,6 +1088,12 @@ def agents_get(args):
     return r.get("data", r)
 
 
+def agents_create(_args):
+    """The API takes no fields here: it names the agent and makes it active."""
+    r = api("POST", "/external/agents")
+    return r.get("data", r)
+
+
 def agents_update(args):
     # Voice is a property of the speech stack, not of the agent, and where it
     # sits inside that stack differs per preset. Translating it here would mean
@@ -1033,6 +1124,8 @@ def agents_update(args):
         fields["greeting_instruction"] = args.greeting_instruction
     if args.agent_speaks_first is not None:
         fields["agent_speaks_first"] = args.agent_speaks_first
+    if args.custom_webhook_events is not None:
+        fields["custom_webhook_events"] = args.custom_webhook_events
     if args.config_json is not None:
         fields["config"] = args.config_json
     data = _merge_update(args.payload, fields)
@@ -1518,6 +1611,86 @@ def actions_delete(args):
 
 
 # ===================================================================
+# ISSUES AND KNOWLEDGE
+# ===================================================================
+
+
+def _journal_query(args):
+    query = {}
+    if args.per_page:
+        query["per_page"] = str(args.per_page)
+    if args.page:
+        query["page"] = str(args.page)
+    for filt in args.filter or []:
+        key, _, value = filt.partition("=")
+        if value:
+            query[key] = value
+    return query
+
+
+def issues_list(args):
+    result = api("GET", "/external/issues", query=_journal_query(args))
+    return _result(result, slim=lambda r: _apply_slim(r, lambda i: _pick(i, [
+        "id", "kind", "status", "title", "agent_id", "call_id", "created_at"])))
+
+
+def issues_get(args):
+    r = api("GET", f"/external/issues/{args.id}")
+    return r.get("data", r)
+
+
+def issues_create(args):
+    r = api("POST", "/external/issues", _data(args.payload))
+    return r.get("data", r)
+
+
+def issues_update(args):
+    r = api("PATCH", f"/external/issues/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def issues_put(args):
+    r = api("PUT", f"/external/issues/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def issues_delete(args):
+    api("DELETE", f"/external/issues/{args.id}")
+    return {"deleted": args.id}
+
+
+def knowledge_list(args):
+    result = api("GET", "/external/knowledge", query=_journal_query(args))
+    return _result(result, slim=lambda r: _apply_slim(r, lambda k: _pick(k, [
+        "id", "kind", "status", "content", "agent_id", "created_at"])))
+
+
+def knowledge_get(args):
+    r = api("GET", f"/external/knowledge/{args.id}")
+    return r.get("data", r)
+
+
+def knowledge_create(args):
+    r = api("POST", "/external/knowledge", _data(args.payload))
+    return r.get("data", r)
+
+
+def knowledge_update(args):
+    r = api("PATCH", f"/external/knowledge/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def knowledge_put(args):
+    r = api("PUT", f"/external/knowledge/{args.id}", _data(args.payload))
+    return r.get("data", r)
+
+
+def knowledge_delete(args):
+    api("DELETE", f"/external/knowledge/{args.id}")
+    return {"deleted": args.id}
+
+
+# ===================================================================
 # UI VIEWS
 # ===================================================================
 
@@ -1676,6 +1849,12 @@ def fields_update(args):
 def fields_delete(args):
     api("DELETE", f"/external/custom-fields/{args.id}")
     return {"deleted": args.id}
+
+
+def fields_extraction_schema(args):
+    query = {"entity_type": args.entity_type} if args.entity_type else {}
+    r = api("GET", "/external/custom-fields/extraction-schema", query=query)
+    return r.get("data", r)
 
 
 def fields_impact(args):
@@ -2150,6 +2329,37 @@ def projects_get(args):
     return r.get("data", r)
 
 
+def _project_body(args):
+    fields = {}
+    if args.name is not None:
+        fields["name"] = args.name
+    if args.description is not None:
+        fields["description"] = args.description
+    if args.is_active is not None:
+        fields["is_active"] = args.is_active
+    return _data(_merge_update(args.payload, fields))
+
+
+def projects_create(args):
+    r = api("POST", "/external/projects", _project_body(args))
+    return r.get("data", r)
+
+
+def projects_update(args):
+    r = api("PATCH", f"/external/projects/{args.id}", _project_body(args))
+    return r.get("data", r)
+
+
+def projects_put(args):
+    r = api("PUT", f"/external/projects/{args.id}", _project_body(args))
+    return r.get("data", r)
+
+
+def projects_delete(args):
+    api("DELETE", f"/external/projects/{args.id}")
+    return {"deleted": args.id}
+
+
 # ===================================================================
 # PHONE NUMBERS
 # ===================================================================
@@ -2171,6 +2381,46 @@ def phone_numbers_list(args):
 
 def phone_numbers_get(args):
     r = api("GET", f"/external/phone-numbers/{args.id}")
+    return r.get("data", r)
+
+
+def phone_numbers_create(args):
+    fields = {}
+    if args.phone_number is not None:
+        fields["phone_number"] = args.phone_number
+    if args.number_type is not None:
+        fields["number_type"] = args.number_type
+    if args.provider_credential_id is not None:
+        fields["provider_credential_id"] = args.provider_credential_id
+    if args.provider_phone_id is not None:
+        fields["provider_phone_id"] = args.provider_phone_id
+    r = api("POST", "/external/phone-numbers", _data(_merge_update(args.payload, fields)))
+    return r.get("data", r)
+
+
+def phone_numbers_update(args):
+    fields = {}
+    if args.label is not None:
+        fields["label"] = args.label
+    if args.is_active is not None:
+        fields["is_active"] = args.is_active
+    if args.status is not None:
+        fields["status"] = args.status
+    r = api("PATCH", f"/external/phone-numbers/{args.id}", _data(_merge_update(args.payload, fields)))
+    return r.get("data", r)
+
+
+def phone_numbers_delete(args):
+    api("DELETE", f"/external/phone-numbers/{args.id}")
+    return {"deleted": args.id}
+
+
+def phone_numbers_bind(args):
+    # The API reads a missing agent_id as null, which unbinds, so a command naming
+    # neither side must not reach it: unbinding is said out loud or it does not happen.
+    if (args.agent_id is None) == (not args.unbind):
+        _die(6, "bind_target", "name the agent to bind, or pass --unbind; not both and not neither")
+    r = api("PUT", f"/external/phone-numbers/{args.id}/agent", {"agent_id": args.agent_id})
     return r.get("data", r)
 
 
@@ -2282,6 +2532,7 @@ def build_parser():
     ag_sub.add_parser("default", help="The project's default agent, else its oldest; 404 (exit 3) when it has none")
     ag_get = ag_sub.add_parser("get", help="Get agent by ID")
     ag_get.add_argument("id", help="Agent UUID")
+    ag_sub.add_parser("create", help="Create an active agent named \"Untitled agent\"; the API takes no fields, so set them with `agents update`")
     ag_upd = ag_sub.add_parser("update", help="Update agent")
     ag_upd.add_argument("id", help="Agent UUID")
     ag_upd.add_argument("--name", help="Agent name")
@@ -2294,6 +2545,8 @@ def build_parser():
     ag_upd.add_argument("--greeting-exact", help="Exact greeting text")
     ag_upd.add_argument("--greeting-instruction", help="Greeting instruction")
     ag_upd.add_argument("--agent-speaks-first", type=parse_bool, default=None)
+    ag_upd.add_argument("--custom-webhook-events", type=parse_csv,
+                        help="Comma-separated event types the custom webhook forwards, replacing the list; \"\" forwards nothing")
     ag_upd.add_argument("--config", dest="config_json", type=parse_json_arg, help="Config JSON (partial merge); beats a `config` key in --data")
     ag_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Base update payload as JSON; the flags above write over it")
     ag_cl = ag_sub.add_parser("clone", help="Copy an agent with every preset row it holds")
@@ -2451,6 +2704,32 @@ def build_parser():
     act_del = act_sub.add_parser("delete", help="Delete an action definition")
     act_del.add_argument("id", help="Action UUID")
 
+    # --- issues and knowledge ---
+    for resource, resource_help, create_help in (
+            ("issues", "The project's journal of what works and what does not on calls",
+             "kind, title, problem required"),
+            ("knowledge", "What the project holds true or must not do",
+             "content required")):
+        jr = subs.add_parser(resource, help=resource_help)
+        jr_sub = jr.add_subparsers(dest="action", required=True)
+        jr_ls = jr_sub.add_parser("list", help=f"List {resource}")
+        jr_ls.add_argument("--filter", "-f", action="append", help="Filter as key=value (repeatable)")
+        jr_ls.add_argument("--per-page", type=int, help="Results per page")
+        jr_ls.add_argument("--page", type=int, help="Page number")
+        jr_get = jr_sub.add_parser("get", help="Get one by ID")
+        jr_get.add_argument("id", help="UUID")
+        jr_cr = jr_sub.add_parser("create", help="Create one")
+        jr_cr.add_argument("--data", dest="payload", type=parse_json_arg, help=f"Fields as JSON ({create_help})")
+        jr_cr.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read the fields from a JSON file (- for stdin)")
+        for name, parser_help in (("update", "Change fields (PATCH)"),
+                                  ("put", "Change fields (PUT, which the API treats as PATCH)")):
+            jr_w = jr_sub.add_parser(name, help=parser_help)
+            jr_w.add_argument("id", help="UUID")
+            jr_w.add_argument("--data", dest="payload", type=parse_json_arg, help="Fields to change as JSON")
+            jr_w.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read the fields from a JSON file (- for stdin)")
+        jr_del = jr_sub.add_parser("delete", help="Delete one")
+        jr_del.add_argument("id", help="UUID")
+
     # --- ui-views ---
     uiv = subs.add_parser("ui-views", help="Manage the project's saved calls-list views")
     uiv_sub = uiv.add_subparsers(dest="action", required=True)
@@ -2529,6 +2808,8 @@ def build_parser():
     fld_upd.add_argument("--data", dest="payload", type=parse_json_arg, required=True, help="Fields to update as JSON")
     fld_del = fld_sub.add_parser("delete", help="Delete custom field")
     fld_del.add_argument("id", help="Field UUID")
+    fld_sch = fld_sub.add_parser("extraction-schema", help="JSON Schema of the project's extraction fields")
+    fld_sch.add_argument("--entity-type", help="Entity type (default call)")
     fld_imp = fld_sub.add_parser("impact", help="Preview deletion impact")
     fld_imp.add_argument("id", help="Field UUID")
 
@@ -2709,22 +2990,52 @@ def build_parser():
     stg_rev.add_argument("definition_id", help="The setting's definition_id, from `settings get`")
 
     # --- projects ---
-    proj = subs.add_parser("projects", help="List and inspect projects")
+    proj = subs.add_parser("projects", help="Manage projects")
     proj_sub = proj.add_subparsers(dest="action", required=True)
     proj_ls = proj_sub.add_parser("list", help="List projects")
     proj_ls.add_argument("--is-active", type=parse_bool, default=None, help="Filter by active status")
     proj_ls.add_argument("--per-page", type=int, help="Results per page")
     proj_get = proj_sub.add_parser("get", help="Get project details")
     proj_get.add_argument("id", help="Project UUID")
+    for name, parser_help, takes_id in (("create", "Create a project (name required; tenant-wide key)", False),
+                                        ("update", "Change a project (PATCH; tenant-wide key)", True),
+                                        ("put", "Change a project (PUT, which the API treats as PATCH; tenant-wide key)", True)):
+        proj_w = proj_sub.add_parser(name, help=parser_help)
+        if takes_id:
+            proj_w.add_argument("id", help="Project UUID")
+        proj_w.add_argument("--name", help="Project name, unique in the tenant")
+        proj_w.add_argument("--description", help="Description")
+        proj_w.add_argument("--is-active", type=parse_bool, default=None)
+        proj_w.add_argument("--data", dest="payload", type=parse_json_arg, help="Base payload as JSON; the flags above write over it")
+    proj_del = proj_sub.add_parser("delete", help="Delete a project and everything in it (tenant-wide key; the default project is refused)")
+    proj_del.add_argument("id", help="Project UUID")
 
     # --- phone-numbers ---
-    pn = subs.add_parser("phone-numbers", help="List and inspect phone numbers")
+    pn = subs.add_parser("phone-numbers", help="Manage phone numbers")
     pn_sub = pn.add_subparsers(dest="action", required=True)
     pn_ls = pn_sub.add_parser("list", help="List phone numbers")
     pn_ls.add_argument("--is-active", type=parse_bool, default=None, help="Filter by active status")
     pn_ls.add_argument("--per-page", type=int, help="Results per page")
     pn_get = pn_sub.add_parser("get", help="Get phone number details")
     pn_get.add_argument("id", help="Phone number UUID")
+    pn_cr = pn_sub.add_parser("create", help="Add a phone number (tenant-wide key)")
+    pn_cr.add_argument("--phone-number", help="The number")
+    pn_cr.add_argument("--number-type", choices=["provider", "personal", "manual"])
+    pn_cr.add_argument("--provider-credential-id", help="Required for --number-type provider")
+    pn_cr.add_argument("--provider-phone-id", help="The provider's id for the number")
+    pn_cr.add_argument("--data", dest="payload", type=parse_json_arg, help="Base payload as JSON; the flags above write over it")
+    pn_upd = pn_sub.add_parser("update", help="Change a phone number's label, active flag or status")
+    pn_upd.add_argument("id", help="Phone number UUID")
+    pn_upd.add_argument("--label", help="Label")
+    pn_upd.add_argument("--is-active", type=parse_bool, default=None)
+    pn_upd.add_argument("--status", choices=["pending", "active", "suspended", "error"])
+    pn_upd.add_argument("--data", dest="payload", type=parse_json_arg, help="Base payload as JSON; the flags above write over it")
+    pn_del = pn_sub.add_parser("delete", help="Delete a phone number (an assigned one is refused; unbind it first)")
+    pn_del.add_argument("id", help="Phone number UUID")
+    pn_bd = pn_sub.add_parser("bind", help="Bind a phone number to an agent, or --unbind it")
+    pn_bd.add_argument("id", help="Phone number UUID")
+    pn_bd.add_argument("agent_id", nargs="?", help="Agent UUID")
+    pn_bd.add_argument("--unbind", action="store_true", help="Leave the number bound to no agent")
 
     # --- providers ---
     prov = subs.add_parser("providers", help="List phone providers and types")
@@ -2745,7 +3056,7 @@ def build_parser():
 DISPATCH = {
     "agents": {
         "list": agents_list, "default": agents_default, "get": agents_get,
-        "update": agents_update, "clone": agents_clone, "delete": agents_delete,
+        "create": agents_create, "update": agents_update, "clone": agents_clone, "delete": agents_delete,
         "config": agents_config,
     },
     "presets": {
@@ -2777,6 +3088,14 @@ DISPATCH = {
         "update": ui_views_update, "put": ui_views_put, "delete": ui_views_delete,
         "set-default": ui_views_set_default,
     },
+    "issues": {
+        "list": issues_list, "get": issues_get, "create": issues_create,
+        "update": issues_update, "put": issues_put, "delete": issues_delete,
+    },
+    "knowledge": {
+        "list": knowledge_list, "get": knowledge_get, "create": knowledge_create,
+        "update": knowledge_update, "put": knowledge_put, "delete": knowledge_delete,
+    },
     "transcripts": {
         "get": transcripts_get, "store": transcripts_store,
         "delete": transcripts_delete, "url": transcripts_url,
@@ -2787,6 +3106,7 @@ DISPATCH = {
     "fields": {
         "list": fields_list, "create": fields_create, "update": fields_update,
         "delete": fields_delete, "impact": fields_impact,
+        "extraction-schema": fields_extraction_schema,
     },
     "field-groups": {
         "list": field_groups_list, "create": field_groups_create,
@@ -2820,8 +3140,15 @@ DISPATCH = {
         "update": variables_update, "delete": variables_delete,
     },
     "settings": {"list": settings_list, "get": settings_get, "reveal": settings_reveal},
-    "projects": {"list": projects_list, "get": projects_get},
-    "phone-numbers": {"list": phone_numbers_list, "get": phone_numbers_get},
+    "projects": {
+        "list": projects_list, "get": projects_get, "create": projects_create,
+        "update": projects_update, "put": projects_put, "delete": projects_delete,
+    },
+    "phone-numbers": {
+        "list": phone_numbers_list, "get": phone_numbers_get,
+        "create": phone_numbers_create, "update": phone_numbers_update,
+        "delete": phone_numbers_delete, "bind": phone_numbers_bind,
+    },
     "providers": {"list": providers_list, "types": providers_types},
 }
 

@@ -53,7 +53,7 @@ def _agent_args(**overrides):
     args = dict(
         id="AG", name=None, voice=None, prompt=None, prompt_file=None,
         greeting_type=None, greeting_exact=None, greeting_instruction=None,
-        agent_speaks_first=None, config_json=None, payload=None)
+        agent_speaks_first=None, custom_webhook_events=None, config_json=None, payload=None)
     args.update(overrides)
     return types.SimpleNamespace(**args)
 

@@ -1,5 +1,9 @@
 # callva — change log
 
+## 2026-11-04 — `callva` creates agents, projects and phone numbers, binds a number to an agent, and reaches issues, knowledge and the extraction schema
+
+New verbs: `agents create`, `projects create|update|put|delete`, `phone-numbers create|update|delete|bind`, `issues list|get|create|update|put|delete`, `knowledge list|get|create|update|put|delete` and `fields extraction-schema`. Those that change the platform are write-gated and `callva routes` declares them. `agents update` takes `--custom-webhook-events`, a comma-separated list that replaces the event types the agent's custom webhook forwards, where `""` forwards nothing. `phone-numbers bind <id>` takes the agent or `--unbind` and refuses neither, because the API reads a missing agent as an unbind.
+
 ## 2026-11-03 — `CALLVA_HEADLESS=read-write` lets the credential's own scopes bound writes, and no headless mode touches a local path
 
 `CALLVA_HEADLESS=read-write` is `read-only` plus the verbs `callva routes` marks `writes`, which the platform bounds by the credential's scopes and `CAPABILITIES_READ_ONLY` still closes. Everything else stays refused: verbs marked `secret`, connection flags, anything undeclared, and the same `headless_refused` wherever a project, the machine's capability configuration or a store resolves. In both modes `--prompt-file`, `--config-file`, `--content-file`, `--inputs-file`, `--data-file`, `--file`, `--args-file` and `--output` now exit 4 `headless_refused`, so `recordings stream --output`, the one of them `read-only` used to run, is refused there too and a recording goes to stdout. Without the variable nothing changes. `deviations.md` records why.
