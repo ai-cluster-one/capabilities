@@ -165,6 +165,8 @@ from settings_schema import (
     old_environment,
     old_names_sentence,
     old_register_fields,
+    retired_labels,
+    retired_sentence,
     routes_skipped_here,
     validate_settings,
     without_routes,
@@ -584,8 +586,7 @@ def _query_prompt(key):
             _PROMPT_STORE = None
         if _PROMPT_STORE is None:
             _PROMPT_STORE, register = jobs.open_register(
-                PROJECT_CAPABILITIES_DIR, globals().get("ENVIRONMENT") or "development",
-                setting=STORE_SETTING,
+                PROJECT_CAPABILITIES_DIR, setting=STORE_SETTING,
                 project_id=jobs.handed_project_id(PROJECT_ROOT) or None,
                 profile_tables=False)
             _PROMPT_PROJECT = register.project_id
@@ -648,7 +649,7 @@ def job_register():
         if STORE_REFUSAL is not None:
             raise STORE_REFUSAL
         _JOB_STORE, _JOB_REGISTER = jobs.open_register(
-            PROJECT_CAPABILITIES_DIR, ENVIRONMENT, setting=STORE_SETTING,
+            PROJECT_CAPABILITIES_DIR, setting=STORE_SETTING,
             project_id=jobs.bound_project_id(PROJECT_ROOT) or None)
     return _JOB_REGISTER
 
@@ -825,15 +826,6 @@ def _runtime_settings(settings, project_layout=None, skipped=()):
             return float(default)
 
     sync_interval = positive_seconds("sync_interval", 20)
-    # Which half of the machine this daemon is. It reaches the job queue as a
-    # filter, so a development daemon can never take a production job off the
-    # shared store, and the process environment wins because a daemon and a
-    # doctor started under one must not disagree about which they are.
-    environment = str(os.environ.get("TELEGRAM_ENVIRONMENT")
-                      or settings.get("environment") or "development").strip()
-    if not jobs.ENVIRONMENT_RE.fullmatch(environment):
-        raise SettingsError(
-            f"settings.environment must match {jobs.ENVIRONMENT_RE.pattern}")
     aliases = defaults.get("group_aliases")
     if aliases is None:
         group_aliases = (assistant_name,)
@@ -869,7 +861,6 @@ def _runtime_settings(settings, project_layout=None, skipped=()):
         "SYNC_STALE_AFTER": max(
             sync_interval * 2, positive_seconds("sync_stale_after", 60)),
         "PROJECT_LAYOUT": project_layout if project_layout is not None else PROJECT_LAYOUT,
-        "ENVIRONMENT": environment,
         # The job class is a property of the daemon, not of one conversation:
         # the queue it drains is shared by every channel this service serves.
         "MAX_PARALLEL_JOBS": max(1, int(defaults.get("max_parallel_jobs", 1) or 1)),
@@ -3249,7 +3240,7 @@ def _delivery_description(reply_to, is_direct):
 
 # --- register (dynamic state: watermark + per-channel /set overrides) ---------
 # The register is one row per channel in `telegram_channels` (`channels.py`),
-# for this project, environment and connection, written through the job
+# for this project and connection, written through the job
 # register's connection, which belongs to the event loop as every caller here
 # does. `register.json` under the service state dir held it before; a node
 # carries that file into the store once and never writes it again.
@@ -3268,7 +3259,7 @@ def _register_text(row):
 
 def _register_scope():
     register = job_register()
-    return (register.project_id, register.environment, CONNECTION)
+    return (register.project_id, CONNECTION)
 
 
 def read_register_file():
@@ -3302,9 +3293,9 @@ def _import_register_file(conn, scope):
 
 
 def load_register():
-    """The register the store holds for this project, environment and
-    connection, after carrying in a `register.json` not yet imported. Where a
-    save could not reach the store, the register it could not write is served
+    """The register the store holds for this project and connection, after
+    carrying in a `register.json` not yet imported. Where a save could not
+    reach the store, the register it could not write is served
     instead: this daemon holds the service, so its copy is the newer one."""
     global _REGISTER_STORED
     if _REGISTER_UNSAVED is not None:
@@ -8150,7 +8141,7 @@ async def run_session(client):
 
     async def job_runner():
         """Watch the register and, while there is a free slot, take the oldest
-        queued job of this project and environment.
+        queued job of this project.
 
         No estimation, no priority, no classes of size: order is arrival order,
         and preemption is something the operator asks for explicitly.
@@ -10471,6 +10462,10 @@ async def run_session(client):
             client, interrupted_recordings, rejoin_conference,
             call_in_progress))
 
+    retired = retired_labels(SETTINGS, os.environ)
+    if retired:
+        log(f"warning: {retired_sentence(retired)}")
+
     # Reconcile attempts owned by a daemon that is gone. A local orphan is
     # terminated before its slot can be reused; a foreign-host attempt cannot
     # be proved dead here and is stopped for inspection rather than duplicated.
@@ -10487,8 +10482,7 @@ async def run_session(client):
             log(f"jobs: {len(interrupted)} interrupted "
                 f"under fenced recovery; only locally-owned checkpointed work was continued")
         counts = register.counts()
-        log(f"jobs: register ready — environment={ENVIRONMENT} "
-            f"slots={MAX_PARALLEL_JOBS} {counts or 'empty'}")
+        log(f"jobs: register ready — slots={MAX_PARALLEL_JOBS} {counts or 'empty'}")
     except Exception as exc:
         log(f"jobs: register unavailable, the job class is off this session: "
             f"{_short_error(exc)}")

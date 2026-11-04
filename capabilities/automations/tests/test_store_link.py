@@ -192,3 +192,64 @@ def test_a_saved_definition_cuts_the_schedulers_sleep_short(runtime):
                 time.sleep(0.1)
             admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
     assert listening == (0,)
+
+
+@needs_store
+def test_runs_from_before_the_label_left_the_table_keep_every_other_field(runtime):
+    """`0008-runs-environment-retired` leaves the label's column to earlier
+    releases: every run recorded before it is still listed with every field as
+    it was, and a run recorded after it leaves the column null."""
+    import psycopg
+    from psycopg.rows import dict_row
+    from capabilities_contract import db
+    schema = "automations_label_" + uuid.uuid4().hex[:8]
+    setting = _setting(schema)
+    earlier = [step for step in runtime.LEDGER_STEPS if step[0] != "0008-runs-environment-retired"]
+    assert len(earlier) == len(runtime.LEDGER_STEPS) - 1
+    conn = db.connect(application_name=runtime.LEDGER_OWNER, setting=setting, transaction=True)
+    try:
+        db.migrate(conn, runtime.LEDGER_OWNER, earlier, major=1, minor=4)
+        conn.commit()
+    finally:
+        conn.close()
+    columns = "SELECT is_nullable FROM information_schema.columns WHERE table_schema = %s " \
+              "AND table_name = 'automations_runs' AND column_name = 'environment'"
+    try:
+        with psycopg.connect(DSN, autocommit=True, row_factory=dict_row) as writer:
+            writer.execute(f'SET search_path TO "{schema}"')
+            assert writer.execute(columns, (schema,)).fetchall() == [{"is_nullable": "NO"}]
+            # What a release before the step wrote: the label beside the node.
+            for run_id, status, label, result in (("r-done", "succeeded", "production", "kept"),
+                                                  ("r-queued", "pending", "node-a", None)):
+                writer.execute(
+                    "INSERT INTO automations_runs (id, project_id, automation_slug, "
+                    "environment, trigger, scheduled_for, dedupe_key, status, attempt, "
+                    "queued_at, started_at, finished_at, pid, exit_code, summary, log_path, "
+                    "host, node, result) VALUES (%s, 'prj_a', 'nightly', %s, 'schedule', "
+                    "'2026-08-23T03:00:00+00:00', %s, %s, 2, '2026-08-23T03:00:01+00:00', "
+                    "'2026-08-23T03:00:02+00:00', '2026-08-23T03:00:03+00:00', 41, 0, "
+                    "'done', '/tmp/r.log', 'host-a', 'node-a', %s)",
+                    (run_id, label, f"nightly:{run_id}", status, result))
+            before = {row["id"]: row for row in writer.execute(
+                "SELECT * FROM automations_runs ORDER BY id").fetchall()}
+
+        # A minor step: the next open applies it, with no upgrade.
+        link = runtime.StoreLink(setting).open()
+        try:
+            ledger = runtime.RunLedger("prj_a", link=link)
+            listed = ledger.list()
+            fresh = ledger.claim("nightly", Path("/tmp"), trigger="manual")
+        finally:
+            link.close()
+        assert sorted(row["id"] for row in listed) == sorted(before)
+
+        with psycopg.connect(DSN, autocommit=True, row_factory=dict_row) as reader:
+            reader.execute(f'SET search_path TO "{schema}"')
+            assert reader.execute(columns, (schema,)).fetchall() == [{"is_nullable": "YES"}]
+            after = {row["id"]: row for row in reader.execute(
+                "SELECT * FROM automations_runs ORDER BY id").fetchall()}
+        assert after.pop(fresh["id"])["environment"] is None
+        assert after == before
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

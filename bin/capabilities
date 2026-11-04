@@ -12756,6 +12756,7 @@ NODE_REFERENCES = (
     ("memory_entries", "node", "whole"),
     ("memory_events", "node", "whole"),
     ("tasks_executions", "node", "whole"),
+    ("tasks_tasks", "node", "whole"),
 )
 # The tables that keep a lease - a node and an expiry - and the column naming
 # what holds it: a live one names a service that runs on the node.

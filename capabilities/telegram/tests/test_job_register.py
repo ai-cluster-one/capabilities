@@ -35,6 +35,7 @@ def _module(name: str, path: Path):
 
 
 jobs = _module("telegram_service_jobs_test", SERVICE_DIR / "jobs.py")
+channels = _module("telegram_service_channels_test", SERVICE_DIR / "channels.py")
 
 
 def project_id() -> str:
@@ -76,7 +77,7 @@ class RegisterCase(unittest.TestCase):
 
     def open(self, envelope=None, **kwargs):
         """Another connection to the same store, as another process opens it."""
-        return jobs.open_register(envelope or self.envelope, "development",
+        return jobs.open_register(envelope or self.envelope,
                                   setting=self.setting, **kwargs)
 
     def register(self, reg=None, submit=True, **overrides):
@@ -118,7 +119,7 @@ class RegisterCase(unittest.TestCase):
         with tempfile.TemporaryDirectory() as config:
             with mock.patch.dict(os.environ, no_db_env(config), clear=True):
                 with self.assertRaises(jobs.JobError) as caught:
-                    jobs.open_register(self.envelope, "development",
+                    jobs.open_register(self.envelope,
                                        project_root=self.envelope.parent)
         self.assertEqual(caught.exception.slug, "store_not_configured")
 
@@ -147,7 +148,7 @@ class RegisterCase(unittest.TestCase):
         registered without one keeps none, and a store at the earlier version
         takes the step without losing a row."""
         self.assertEqual([step for step, _sql in jobs.STORE_STEPS][3], "0004-job-profile")
-        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (1, 3))
+        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (2, 0))
         with_profile = self.register(engine="claude", profile="telegram-fast")
         without = self.register(engine="codex", model="gpt-5.5")
         self.assertEqual(self.reg.get(with_profile["id"])["profile"], "telegram-fast")
@@ -167,11 +168,127 @@ class RegisterCase(unittest.TestCase):
                         "'2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')",
                         (self.project_id,))
         conn.commit()
-        old_store, old_reg = jobs.open_register(self.envelope, "development", setting=older)
+        # The later steps cross to major 2, which only the store upgrade applies.
+        with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
+            old_store, old_reg = jobs.open_register(self.envelope, setting=older)
         self.addCleanup(old_store.close)
         row = old_reg.get("old-1")
         self.assertEqual((row["description"], row["engine"], row["profile"]),
                          ("from before", "codex", None))
+
+    def test_one_register_keeps_every_labelled_row_and_merges_collisions(self):
+        """A store whose rows were kept apart by the retired environment label,
+        some of them colliding once it is gone, is brought to one register by
+        the store upgrade: every job, amendment, slot and channel is visible to
+        a register opened after it, and nothing is deleted but a channel row
+        merged into the one with the highest watermark."""
+        from capabilities_contract.db import connect, migrate
+        older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_labels")
+        conn = connect(application_name="telegram", setting=older)
+        self.addCleanup(conn.close)
+        migrate(conn, jobs.STORE_OWNER, jobs.STORE_STEPS[:6], major=1, minor=3)
+        pid = self.project_id
+        lease = "2026-11-04T00:10:00+00:00"
+
+        def job(job_id, env, created, state="waiting", origin=None):
+            conn.execute(
+                "INSERT INTO telegram_jobs (id, project_id, environment, surface, "
+                "channel_key, requested_by, origin_message_id, description, engine, "
+                "state, created_at, updated_at) VALUES (%s, %s, %s, 'telegram', "
+                "'-100:7', '42', %s, %s, 'codex', %s, %s, %s)",
+                (job_id, pid, env, origin, f"{job_id} under {env}", state, created,
+                 created))
+
+        def slot(env, number, job_id):
+            conn.execute(
+                "INSERT INTO telegram_job_slots (project_id, environment, surface, slot, "
+                "job_id, owner_id, attempt_token, lease_expires_at) VALUES (%s, %s, "
+                "'telegram', %s, %s, 'daemon', 'token', %s)", (pid, env, number, job_id, lease))
+
+        def channel(env, key, watermark, settings, state, updated):
+            conn.execute(
+                "INSERT INTO telegram_channels (project_id, environment, connection, "
+                "channel_key, last_processed_message_id, settings, voice_echo_senders, "
+                "state, updated_at) VALUES (%s, %s, 'main', %s, %s, %s::jsonb, "
+                "%s::jsonb, %s::jsonb, %s)",
+                (pid, env, key, watermark, json.dumps(settings),
+                 json.dumps({f"{env}-echo": env}), json.dumps(state), updated))
+
+        # One Telegram update registered under both labels; the later job loses
+        # only its claim on the update.
+        job("dev-origin", "development", "2026-11-01T00:00:00+00:00", origin="91")
+        job("prod-origin", "production", "2026-11-02T00:00:00+00:00", origin="91")
+        job("prod-waiting", "production", "2026-11-03T00:00:00+00:00")
+        # Slot 0, and the first slot below zero, each held under both labels.
+        for env in ("development", "production"):
+            job(f"{env}-run", env, "2026-11-01T01:00:00+00:00", state="running")
+            job(f"{env}-direct", env, "2026-11-01T02:00:00+00:00", state="running")
+            slot(env, 0, f"{env}-run")
+            slot(env, -1, f"{env}-direct")
+        for env, job_id in (("development", "dev-origin"), ("production", "prod-origin")):
+            conn.execute(
+                "INSERT INTO telegram_job_amendments (id, project_id, environment, "
+                "surface, job_id, text, state, created_at) VALUES (%s, %s, %s, "
+                "'telegram', %s, %s, 'pending', '2026-11-03T00:00:00+00:00')",
+                (f"amend-{env}", pid, env, job_id, f"also {env}"))
+        # One channel held under both labels; production's watermark is higher.
+        channel("development", "-100:7", 50,
+                {"tail_size": 10, "dev_only": True},
+                {"jobs": {"40": {"status": "queued"}}, "last_seen_message_id": 50},
+                "2026-11-01T00:00:00+00:00")
+        channel("production", "-100:7", 80,
+                {"tail_size": 20, "prod_only": True},
+                {"jobs": {"70": {"status": "queued"}}, "last_seen_message_id": 80},
+                "2026-11-02T00:00:00+00:00")
+        channel("production", "-100:8", 5, {}, {}, "2026-11-02T00:00:00+00:00")
+        conn.commit()
+
+        # The step drops what older releases read, so only the upgrade takes it.
+        with self.assertRaises(jobs.JobError) as refused:
+            jobs.open_register(self.envelope, setting=older)
+        self.assertEqual(refused.exception.slug, "store_upgrade_needed")
+        with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
+            store, reg = jobs.open_register(self.envelope, setting=older)
+        self.addCleanup(store.close)
+
+        rows = {row["id"]: row for row in reg.list(limit=100)}
+        self.assertEqual(set(rows), {
+            "dev-origin", "prod-origin", "prod-waiting", "development-run",
+            "production-run", "development-direct", "production-direct"})
+        self.assertEqual(rows["dev-origin"]["origin_message_id"], "91")
+        self.assertIsNone(rows["prod-origin"]["origin_message_id"])
+        self.assertEqual(reg.next_waiting()["id"], "dev-origin")
+        self.assertEqual(reg.register(channel_key="-100:7", requested_by="42",
+                                      description="again", engine="codex",
+                                      origin_message_id="91")["id"], "dev-origin")
+        self.assertEqual(reg.pending_amendment("dev-origin"), ["also development"])
+        self.assertEqual(reg.pending_amendment("prod-origin"), ["also production"])
+
+        slots = dict(store._execute(
+            "SELECT job_id, slot FROM telegram_job_slots WHERE project_id = ?",
+            (pid,)).fetchall())
+        self.assertEqual(set(slots), {"development-run", "production-run",
+                                      "development-direct", "production-direct"})
+        self.assertEqual(sorted([slots["development-run"], slots["production-run"]]), [0, 1])
+        self.assertEqual(sorted([slots["development-direct"], slots["production-direct"]]),
+                         [-2, -1])
+
+        held = channels.rows(store.conn, (pid, "main"))
+        self.assertEqual(set(held), {"-100:7", "-100:8"})
+        merged = held["-100:7"]
+        self.assertEqual(merged["last_processed_message_id"], 80)
+        self.assertEqual(merged["settings"],
+                         {"tail_size": 20, "dev_only": True, "prod_only": True})
+        self.assertEqual(merged["voice_echo_senders"],
+                         {"development-echo": "development",
+                          "production-echo": "production"})
+        self.assertEqual(set(merged["jobs"]), {"40", "70"})
+        self.assertEqual(merged["last_seen_message_id"], 80)
+
+        labelled = store._execute(
+            "SELECT table_name FROM information_schema.columns WHERE "
+            "table_schema = current_schema() AND column_name = 'environment'").fetchall()
+        self.assertEqual(labelled, [])
 
     def test_reopening_applies_nothing_twice(self):
         again_store, again = self.open()
@@ -225,32 +342,19 @@ class RegisterCase(unittest.TestCase):
 
     # -- identity and isolation ----------------------------------------------
 
-    def test_environment_isolates_the_queue(self):
-        """The same machine runs development and production; a dev job must not
-        be eligible for a production runner."""
-        self.register()
-        production = jobs.JobRegister(self.store, self.reg.project_id, "production")
-        self.assertIsNone(production.next_waiting())
-        self.assertIsNotNone(self.reg.next_waiting())
-
     def test_project_isolates_the_queue(self):
-        other = jobs.JobRegister(self.store, project_id(), "development")
+        other = jobs.JobRegister(self.store, project_id())
         self.register()
         self.assertIsNone(other.next_waiting())
 
     def test_surface_isolates_the_queue(self):
         self.register()
-        elsewhere = jobs.JobRegister(self.store, self.reg.project_id, "development",
-                                     surface="slack")
+        elsewhere = jobs.JobRegister(self.store, self.reg.project_id, surface="slack")
         self.assertIsNone(elsewhere.next_waiting())
 
     def test_a_register_without_a_project_is_refused(self):
         with self.assertRaises(jobs.JobError):
-            jobs.JobRegister(self.store, None, "development")
-
-    def test_an_unaddressable_environment_is_refused(self):
-        with self.assertRaises(jobs.JobError):
-            jobs.JobRegister(self.store, self.reg.project_id, "dev/prod")
+            jobs.JobRegister(self.store, None)
 
     # -- registration ---------------------------------------------------------
 
@@ -294,15 +398,6 @@ class RegisterCase(unittest.TestCase):
         self.assertIsNone(self.reg.stage_amendment(
             other["id"], "take it over", actor_id="42"))
         self.assertEqual(self.reg.get(other["id"])["requested_by"], "99")
-
-    def test_primary_key_reads_and_writes_do_not_cross_environment(self):
-        row = self.register()
-        production = jobs.JobRegister(self.store, self.reg.project_id, "production")
-        self.assertIsNone(production.get(row["id"]))
-        self.assertIsNone(production.update(row["id"], description="crossed"))
-        self.assertIsNone(production.request_stop(row["id"]))
-        self.assertEqual(self.reg.get(row["id"])["description"],
-                         "reconcile the ledger")
 
     # -- arrival order --------------------------------------------------------
 

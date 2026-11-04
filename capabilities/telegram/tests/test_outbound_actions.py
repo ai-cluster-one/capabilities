@@ -1379,7 +1379,7 @@ class ServiceDoctorExitTests(unittest.TestCase):
     STORE_OK = {"ok": True, "level": "environment", "sources": ["AGENTKIT_DB_URL"],
                 "schema": "agentkit"}
 
-    def _run_doctor(self, cli, tmp, health, store=None):
+    def _run_doctor(self, cli, tmp, health, store=None, settings=None):
         """Drive the real dispatch for one runtime-health shape and return
         (exit_code, payload). The verdict is computed by the real
         `cmd_service_doctor` over the real `_service_runtime_health`; only the
@@ -1403,7 +1403,8 @@ class ServiceDoctorExitTests(unittest.TestCase):
                 mock.patch.object(cli, "_contract", lambda argv: None), \
                 mock.patch.object(cli, "_service_project_root", lambda: Path(tmp)), \
                 mock.patch.object(cli, "_require_service_initialized", lambda root: None), \
-                mock.patch.object(cli, "_validate_service_settings", lambda root: None), \
+                mock.patch.object(cli, "_validate_service_settings",
+                                  lambda root: settings), \
                 mock.patch.object(cli, "_service_wanted_connection",
                                   lambda root, flag: "probe"), \
                 mock.patch.object(cli, "_load_config", lambda *a, **k: cfg), \
@@ -1424,6 +1425,21 @@ class ServiceDoctorExitTests(unittest.TestCase):
     def _stamp(age_seconds):
         moment = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
         return moment.isoformat().replace("+00:00", "Z")
+
+    def test_a_retired_environment_label_is_named_and_fails_nothing(self):
+        """A settings file and a process still carrying the environment label
+        from before the register was one per project: the doctor stays ok and
+        names both as retired, so the operator can remove them."""
+        cli = import_cli()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"TELEGRAM_ENVIRONMENT": "production"}):
+            code, payload = self._run_doctor(cli, tmp, health=None,
+                                             settings={"environment": "development"})
+        self.assertTrue(payload["ok"])
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["retired"], ["settings.environment", "TELEGRAM_ENVIRONMENT"])
+        self.assertIn("settings.environment, TELEGRAM_ENVIRONMENT: retired",
+                      payload["warnings"][0])
 
     def test_a_live_daemon_with_no_health_record_fails(self):
         """`health.json` absent under a live pid is state `unknown` — the

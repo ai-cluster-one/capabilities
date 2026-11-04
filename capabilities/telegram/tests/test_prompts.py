@@ -54,7 +54,7 @@ class PromptStoreCase(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             setting = jobs.store_setting(self.root)
         setting = dataclasses.replace(setting, schema=f"tgtest_{uuid.uuid4().hex}")
-        self.store, _register = jobs.open_register(envelope, "development",
+        self.store, _register = jobs.open_register(envelope,
                                                    setting=setting, profile_tables=False)
         self.addCleanup(self.store.close)
         self.conn = self.store.conn

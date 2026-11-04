@@ -9,5 +9,5 @@ print(json.dumps({
     "ok": True,
     "automation": os.environ["AUTOMATION_ID"],
     "run_id": os.environ["AUTOMATION_RUN_ID"],
-    "environment": os.environ["AUTOMATION_ENVIRONMENT"],
+    "node": os.environ["AUTOMATION_NODE"],
 }))

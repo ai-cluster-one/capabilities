@@ -1,17 +1,21 @@
 """Strict, dependency-free validation for Telegram assistant settings."""
 
-import re
 from pathlib import Path
 
 
 TOP_LEVEL = {
-    "connection", "environment", "assistant_name", "direct_messages",
+    "connection", "assistant_name", "direct_messages",
     "allowed_users", "allowed_groups", "control", "authority", "defaults",
 }
-# Which half of the machine this daemon is. The same box runs development and
-# production, and the job queue is filtered by this: without it a development
-# job is eligible for a production runner.
-ENVIRONMENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.IGNORECASE)
+# What settings and the process environment once carried and no longer mean
+# anything. The service's register was partitioned by a label read from
+# `environment` (or TELEGRAM_ENVIRONMENT over it); it is one register per
+# project now, and which node runs the service is decided by where it is
+# placed. A file or a process still carrying the label is not refused, since
+# that would stop a service on upgrade over a value it no longer reads: it has
+# no effect, and the doctor names it so the operator can remove it.
+RETIRED_KEYS = ("environment",)
+RETIRED_ENVIRONMENT = ("TELEGRAM_ENVIRONMENT",)
 # What the media stack may be read at. A call under investigation is read at
 # debug; anything a normal call needs is at info.
 MEDIA_LOG_LEVELS = {"debug", "info", "warning", "error", "critical"}
@@ -141,10 +145,9 @@ DEFAULTS_NUMBERS = {
     "max_attempts": (1, 20, True),
 }
 # The top-level keys a running service cannot take on `service reload`. The
-# connection owns the Telethon session and state directories, and the job
-# register is opened once with the environment as its filter; every other key
+# connection owns the Telethon session and state directories; every other key
 # is adopted by a reload.
-RESTART_KEYS = ("connection", "environment")
+RESTART_KEYS = ("connection",)
 
 
 def _fail(path, message):
@@ -774,6 +777,21 @@ def old_register_fields(register):
     return found
 
 
+def retired_labels(settings, environ):
+    """Every place that still carries a retired label: a settings path for a
+    key, the name for a process environment variable."""
+    places = [f"settings.{key}" for key in RETIRED_KEYS if key in _mapping(settings)]
+    return places + [name for name in RETIRED_ENVIRONMENT
+                     if str(environ.get(name) or "").strip()]
+
+
+def retired_sentence(places):
+    """What the doctor says of the places `retired_labels` found."""
+    return (f"{', '.join(places)}: retired and without effect - the service keeps one "
+            "register per project, and the node that runs it is the one it is "
+            "placed on; remove it")
+
+
 def old_environment(environ):
     """The environment names of the default worker that are set."""
     return [name for name in OLD_ENVIRONMENT if str(environ.get(name) or "").strip()]
@@ -796,14 +814,9 @@ def validate_settings(settings, project_root, service_dir):
     """Validate the complete public settings surface; return the same object."""
     settings = _object(settings, "settings")
     refuse_old_worker_settings(settings)
-    _unknown(settings, TOP_LEVEL, "settings")
+    _unknown(settings, TOP_LEVEL | set(RETIRED_KEYS), "settings")
     if "connection" in settings:
         _string(settings["connection"], "settings.connection", nullable=True, nonempty=True)
-    if "environment" in settings:
-        _string(settings["environment"], "settings.environment", nonempty=True)
-        if not ENVIRONMENT_RE.fullmatch(settings["environment"]):
-            _fail("settings.environment",
-                  f"must match {ENVIRONMENT_RE.pattern}")
     if "assistant_name" in settings:
         _string(settings["assistant_name"], "settings.assistant_name", nonempty=True)
     if "direct_messages" in settings:
@@ -927,14 +940,6 @@ def _js_map(value, keyed_by, *, pattern=None, label=None, **extra):
 
 def _ref(name):
     return {"$ref": f"#/$defs/{name}"}
-
-
-def _ecma_pattern(compiled):
-    """A Python pattern as JSON Schema writes it: anchored, case spelled out."""
-    pattern = compiled.pattern
-    if compiled.flags & re.IGNORECASE:
-        pattern = pattern.replace("a-z", "A-Za-z")
-    return f"^{pattern}$"
 
 
 def json_schema():
@@ -1141,9 +1146,6 @@ def json_schema():
     properties = {
         "connection": _js_text(nonempty=True, nullable=True,
                                description="the connection the service runs on"),
-        "environment": _js_text(nonempty=True, pattern=_ecma_pattern(ENVIRONMENT_RE),
-                                description="which half of the machine this service is; "
-                                "jobs are filtered by it"),
         "assistant_name": _js_text(nonempty=True, **{"x-inherits": [
             "defaults.assistant_name", "<Assistant>"]}),
         "direct_messages": _js_object(DIRECT_MESSAGE_KEYS, {
@@ -1164,6 +1166,9 @@ def json_schema():
                "the group's own entries"}),
         "defaults": defaults,
     }
+    for key in RETIRED_KEYS:
+        properties[key] = {"deprecated": True,
+                           "description": "retired: has no effect; remove it"}
     for key, node in properties.items():
         node["x-apply"] = "restart" if key in RESTART_KEYS else "reload"
     return {
@@ -1171,7 +1176,7 @@ def json_schema():
         "title": "Telegram assistant service settings",
         "type": "object",
         "additionalProperties": False,
-        "properties": {key: properties[key] for key in sorted(TOP_LEVEL)},
+        "properties": {key: properties[key] for key in sorted(properties)},
         "$defs": defs,
         "x-documents": [{"key": key, "read": read} for key, read in
                         SERVICE_DOCUMENTS.items()]

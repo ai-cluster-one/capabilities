@@ -38,7 +38,7 @@
     "automations": {
       "icon": true,
       "path": "capabilities/automations",
-      "payload_sha256": "f9b9c79b6fc1a6452c667bc1bbd708defa854026e287d500c174fe5c96278c6c",
+      "payload_sha256": "979f832afb7cb8381cbfc4ca2a1f4e18008496731096f84c25d3a6e6721cc7bb",
       "store_major": 1,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },
@@ -94,7 +94,7 @@
     "deployment": {
       "icon": true,
       "path": "capabilities/deployment",
-      "payload_sha256": "e15818479c0fd6e5f8d3d4eb779dfb98b29f3e055365d4268e8e0dc612cdcce4",
+      "payload_sha256": "2cd877df4d349ca47c10073355c95e9c440172f64413a72a86454f8d912204ae",
       "store_major": 1,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to."
     },
@@ -255,14 +255,14 @@
     "tasks": {
       "icon": true,
       "path": "capabilities/tasks",
-      "payload_sha256": "cbda61a5b01a60a01e7ab6eb90594ebaf19624f00f5b752032c70f947377fe38",
+      "payload_sha256": "7b2a580a59bfeb12be9316ea6f06eb5f8fdeb4fe06b47a1d0f51d5d22f704e5d",
       "store_major": 1,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
     "telegram": {
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "e031bd0efc0b43f73e40a8f4aa957a00498e5dbea5083cd64c5bc0f39ba0dfe8",
+      "payload_sha256": "40bb8c3f1ab69fbf2c44c490780cd62cd1c24cbb9f45b9e75ee21a8785ce4187",
       "store_major": 1,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },

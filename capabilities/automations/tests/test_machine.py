@@ -348,7 +348,7 @@ def test_the_machine_process_reads_no_project_environment(bare, monkeypatch):
     action read its selectors and the names its env files set, and never a
     value of the rest; the process environment is left as it was."""
     root = bare.project("quiet", env_text="PROJECT_SECRET=never-read\n"
-                                          "AUTOMATIONS_ENVIRONMENT=staging\n"
+                                          "AUTOMATIONS_NAMESPACE=staging\n"
                                           "AGENTKIT_DB_URL=postgresql://quiet@127.0.0.1:1/"
                                           "quiet?sslmode=disable\n")
     cli = load_cli()
@@ -368,7 +368,7 @@ def test_the_machine_process_reads_no_project_environment(bare, monkeypatch):
     assert (host.setting.level, host.setting.database) == ("project", None)
     assert host.setting.url.startswith("postgresql://quiet@")
     config = host.load()
-    assert config["engine"]["environment"] == "staging"
+    assert config["engine"]["namespace"] == "staging"
     assert host.check() is None
     assert not [path for path in read if path.parent == root]
     assert dict(os.environ) == before

@@ -68,8 +68,10 @@ Scripts:
   capabilities_contract.bodies), kept for every run of that body, and runs
   through its #! line. Either runs in the project root, inherits the daemon
   environment and receives AUTOMATION_ID, AUTOMATION_RUN_ID,
-  AUTOMATION_ATTEMPT, AUTOMATION_TRIGGER, AUTOMATION_ENVIRONMENT,
-  AUTOMATION_NAMESPACE, AUTOMATION_PROJECT_ROOT, and AUTOMATION_STATE_DIR.
+  AUTOMATION_ATTEMPT, AUTOMATION_TRIGGER, AUTOMATION_NODE (the node it runs
+  on), AUTOMATION_NAMESPACE, AUTOMATION_PROJECT_ROOT, and
+  AUTOMATION_STATE_DIR. Work between an agent's nodes is told apart by the
+  node alone: a script that branches on where it runs reads AUTOMATION_NODE.
 
   AUTOMATION_STATE_DIR is a folder on the node that runs the job. State a
   later run needs on any node is recorded with `automations result`: each run
@@ -91,6 +93,9 @@ Commands:
       reading as healthy; `node_idle.placed_on` is where the service is
       placed, null where the store records no placement. `daemon_node` is the node that daemon
       published, null when it published none; `node` is this invocation's.
+      `retired` names each retired selector still set (AUTOMATIONS_ENVIRONMENT)
+      with `key`, `set_in` (the process environment, or the project's .env or
+      .env.local), `message` and `hint`; it has no effect and fails nothing.
       Exits 6 `store_not_configured` when the machine has no store to keep
       the definitions and runs in, and 5 when the store cannot be reached.
       `--repair` is accepted and repairs nothing: the tables are created whole
@@ -130,23 +135,24 @@ Commands:
   automations history <automation>
       Every version of the automation, oldest first, each whole with
       `version`, `active`, `created_at` and `created_by`.
-  automations import [--apply] [--node ENVIRONMENT=NODE ...]
+  automations import [--apply] [--node LABEL=NODE ...]
       Move config.toml's [[automations]] into the store, all or none, each as
       a definition whose script stays the file it was. `id` becomes the slug,
       `name` and `description` the description, `every_seconds` the cron that
       fires at that rate (a whole number of minutes under an hour, of hours
       under a day, or one day; anything else is refused), [engine] timezone
-      the definition's timezone, and `environments` the one node: the
-      environment in force here (AUTOMATIONS_ENVIRONMENT, else
-      engine.environment, else development) is this machine's node, and
-      --node maps another; an empty node leaves it on none. An enabled
-      automation whose environments reach no node, or two, refuses the import
+      the definition's timezone, and the old `environments` labels the one
+      node: the file's own label (its engine.environment, else development)
+      is this machine's node, and --node maps another; an empty node leaves
+      it on none. An enabled automation whose labels reach no node, or two,
+      refuses the import
       (exit 6 `definitions_not_importable`), as does an automation the store
       already holds differently (`definition_differs`). `max_parallel`,
       `max_pending` and `overlap` are dropped: one run at a time is fixed. With
       --apply the definitions are saved and the [[automations]] tables and
       engine.timezone are removed from the file, every other byte kept; without
-      it nothing is written. Answers {"applied", "node", "environment",
+      it nothing is written. Answers {"applied", "node", "environment" (the
+      file's own label),
       "config", "automations": [{"automation", "outcome", "node", "schedule",
       "script", "version"?}], "config_rewritten"?}. --apply is gated as `set`
       is.
@@ -323,7 +329,7 @@ Machine mode:
   `project_id`, `root`, `joined_at`, `joined_by`,
   `present`, `enabled_explicitly`, `state` (`served`, `paused`, `refused`,
   `error`, or null with no machine process) and `reason`, and while it is held
-  its `node`, `environment`, `fingerprint`, `reload_error`, `automations`,
+  its `node`, `fingerprint`, `reload_error`, `automations`,
   `running` and `pause`. `service status` in a joined project answers `mode` "machine"
   and the machine's word on it under `machine`. `doctor --machine` exits 0
   while the process holds its lock, published its status within twice its
@@ -355,9 +361,6 @@ Environment:
   AGENT_NODE_ID            The node this machine schedules for, overriding the id
                            it resolves for itself (`capabilities node id`),
                            matched against each definition's node.
-  AUTOMATIONS_ENVIRONMENT  Handed to every job as AUTOMATION_ENVIRONMENT, and the
-                           environment `import` maps to this node (default:
-                           development).
   AUTOMATIONS_NAMESPACE    Handed to every job as AUTOMATION_NAMESPACE (default:
                            project directory name).
   AUTOMATIONS_CONFIG       Optional config path override; ignored, with a
@@ -369,10 +372,12 @@ Environment:
   AUTOMATIONS_BIN          Absolute path of this CLI, exported into every job so
                            a script can call `automations agent` without
                            resolving anything itself.
-  AUTOMATIONS_ENVIRONMENT, AUTOMATIONS_NAMESPACE, AUTOMATIONS_CONFIG and
-  AUTOMATIONS_STATE_DIR are read from the process environment first and then from
-  the project's .env and .env.local (.local wins), so a project declares one for
-  every invocation made in it, `service status` included, without a shell export.
+  AUTOMATIONS_NAMESPACE, AUTOMATIONS_CONFIG and AUTOMATIONS_STATE_DIR are read
+  from the process environment first and then from the project's .env and
+  .env.local (.local wins), so a project declares one for every invocation made
+  in it, `service status` included, without a shell export.
+  AUTOMATIONS_ENVIRONMENT is retired: nothing reads it, and `doctor` names it
+  under `retired` wherever it is still set, so it can be removed.
 
 Run ledger:
   Definitions live in the table automations_definitions, and runs, the queue
@@ -564,7 +569,6 @@ SERVICE = {
         "environment": {
             "required": [],
             "optional": [
-                {"key": "AUTOMATIONS_ENVIRONMENT", "default": "production"},
                 {"key": "AUTOMATIONS_NAMESPACE"},
                 # The database is the server's own environment level
                 # (SHEBANG.md, "The store setting").
@@ -807,8 +811,10 @@ def _service_dir(root: Path) -> Path:
 # .env.local, and only these keys are read from those files, so resolving a
 # project - as the machine service does for every project it serves - holds
 # none of the project's other values.
-_SELECTOR_KEYS = ("AUTOMATIONS_ENVIRONMENT", "AUTOMATIONS_NAMESPACE",
-                  "AUTOMATIONS_CONFIG", "AUTOMATIONS_STATE_DIR")
+_SELECTOR_KEYS = ("AUTOMATIONS_NAMESPACE", "AUTOMATIONS_CONFIG",
+                  "AUTOMATIONS_STATE_DIR")
+# Selectors nothing reads any more, which `doctor` names where they are still set.
+_RETIRED_KEYS = ("AUTOMATIONS_ENVIRONMENT",)
 
 
 def _env_file_entries(path: Path, keep: tuple[str, ...] = ()) -> dict:
@@ -1379,11 +1385,6 @@ def _load_config(runtime, root: Path) -> dict[str, Any]:
     else:
         config = runtime.load_effective_config(root, _config_path(root), _state_path(root))
     selectors = _project_selectors()
-    config["engine"]["environment"] = (
-        os.environ.get("AUTOMATIONS_ENVIRONMENT")
-        or selectors.get("AUTOMATIONS_ENVIRONMENT")
-        or config["engine"]["environment"]
-    )
     config["engine"]["namespace"] = (
         os.environ.get("AUTOMATIONS_NAMESPACE")
         or selectors.get("AUTOMATIONS_NAMESPACE")
@@ -1559,17 +1560,10 @@ def service_status(root: Path) -> dict[str, Any]:
         **({"machine": _machine_view(runtime, joined)} if joined else {}),
         "paused": runtime.read_pause(state),
         "project": str(root),
-        "environment": os.environ.get("AUTOMATIONS_ENVIRONMENT")
-        or _project_selectors().get("AUTOMATIONS_ENVIRONMENT")
-        or "development",
-        # The environment above is this invocation's, and a supervisor's is not
-        # visible from a terminal opened later, so the two are ordinarily
-        # different and a payload carrying only one lets a reader take it for
-        # both. This is the daemon's own answer, published by the daemon; `null`
-        # says there is no daemon, or that it is one too old to have published it.
-        "daemon_environment": runtime.read_daemon_environment(state) if running else None,
         # The node this invocation runs as, and the one the running daemon
-        # published, which decides what it schedules.
+        # published, which decides what it schedules. A supervisor's process is
+        # not visible from a terminal opened later, so the two may differ; `null`
+        # says there is no daemon, or that it is one too old to have published it.
         "node": node_name(),
         "daemon_node": runtime.read_daemon_node(state) if running else None,
         "config": _config_where(root),
@@ -1674,6 +1668,29 @@ def _service_findings(runtime, config: dict, state: Path, running: bool,
             "config_stale": config_stale, "node_idle": node_idle}
 
 
+def _retired_selectors() -> list[dict[str, Any]]:
+    """Each retired selector still set for this project, with where it is set:
+    the process environment, or the project's .env / .env.local. It has no
+    effect and fails nothing; it is named so the operator can remove it. No
+    value is read."""
+    root = _project_root()
+    out: list[dict[str, Any]] = []
+    for key in _RETIRED_KEYS:
+        where = ["process environment"] if key in os.environ else []
+        if root is not None:
+            where += [str(root / name) for name in (".env", ".env.local")
+                      if key in _env_file_entries(root / name)]
+        if where:
+            out.append({
+                "key": key, "set_in": where,
+                "message": (f"{key} is retired and has no effect: work between an "
+                            "agent's nodes is told apart by the node alone, and a job "
+                            "reads the node it runs on as AUTOMATION_NODE"),
+                "hint": f"remove {key} from {', '.join(where)}",
+            })
+    return out
+
+
 def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     root = _root_required()
     runtime, config = _load(root)
@@ -1696,7 +1713,6 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
         # This invocation's node is the one above; this is the running
         # daemon's, and only it decides what is actually being scheduled.
         "daemon_node": daemon_node,
-        "environment": config["engine"]["environment"],
         "namespace": config["engine"]["namespace"],
         "automations": len(config["automations"]),
         "missing_scripts": found["missing_scripts"],
@@ -1705,6 +1721,9 @@ def cmd_doctor(repair: bool = False) -> dict[str, Any]:
     for code in ("invalid_definitions", "config_stale", "node_idle"):
         if found[code]:
             result[code] = found[code]
+    retired = _retired_selectors()
+    if retired:
+        result["retired"] = retired
     if repair:
         result["repaired"] = {
             "repaired": False,
@@ -2185,12 +2204,12 @@ def _write_atomically(runtime, root: Path, target: Path, data: bytes) -> None:
 def _parse_node_map(values: list[str]) -> dict[str, str | None]:
     out: dict[str, str | None] = {}
     for value in values:
-        environment, eq, node = value.partition("=")
-        if not eq or not environment.strip():
-            _die(6, "input", f"--node takes <environment>=<node>, not {value!r}",
-                 "an empty node, as `production=`, leaves that environment's "
-                 "automations on no node")
-        out[environment.strip()] = node.strip() or None
+        label, eq, node = value.partition("=")
+        if not eq or not label.strip():
+            _die(6, "input", f"--node takes <label>=<node>, not {value!r}",
+                 "an empty node, as `production=`, leaves the automations of that "
+                 "label of the old file on no node")
+        out[label.strip()] = node.strip() or None
     return out
 
 
@@ -2213,10 +2232,9 @@ def cmd_import(apply: bool, nodes: list[str]) -> dict[str, Any]:
              "run `automations service init`")
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         _die(6, "invalid_config", f"cannot read config {config_path}: {exc}")
-    selectors = _project_selectors()
-    environment = (os.environ.get("AUTOMATIONS_ENVIRONMENT")
-                   or selectors.get("AUTOMATIONS_ENVIRONMENT")
-                   or str((document.get("engine") or {}).get("environment") or "development"))
+    # The old file's `environments` are labels it alone still carries: its own
+    # engine.environment, else development, is the one that maps to this node.
+    environment = str((document.get("engine") or {}).get("environment") or "development")
     here = node_name()
     definitions, refused = runtime.legacy_definitions(
         root, document, environment, here, _parse_node_map(nodes))
@@ -2224,7 +2242,7 @@ def cmd_import(apply: bool, nodes: list[str]) -> dict[str, Any]:
         _die(6, "definitions_not_importable",
              f"{len(refused)} automation(s) cannot be imported, so none is: "
              + "; ".join(refused),
-             "repair config.toml, or name the node with --node <environment>=<node>, "
+             "repair config.toml, or name the node with --node <label>=<node>, "
              "then import again")
     plan: list[dict[str, Any]] = []
     ledger = _write_ledger(runtime, root)
@@ -2380,10 +2398,11 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
     leaving the file to the manager, which writes the rest of it as this
     project's settings rows and removes it once everything is verified.
 
-    Which node an automation runs on is a question when its environments do
-    not say it: the environment in force here is this node, the master; the
-    person answers `environments.<environment>` with a node of the agent, or
-    `automations.<slug>` for one automation whose environments reach two. A
+    Which node an automation runs on is a question when the old file's
+    `environments` labels do not say it: the file's own label (its
+    engine.environment, else development) is this node, the master; the
+    person answers `environments.<label>` with a node of the agent, or
+    `automations.<slug>` for one automation whose labels reach two. A
     definition the store already holds differently is a question too:
     `differs.<slug>` is `store` (keep the stored one) or `files` (save the
     file's as a new version). Nothing is written while a question is open.
@@ -2422,9 +2441,7 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
         _die(6, "invalid_config", f"{config_path}: automations must be an array of tables")
     runtime = _runtime_module()
     engine = document.get("engine") if isinstance(document.get("engine"), dict) else {}
-    environment = (os.environ.get("AUTOMATIONS_ENVIRONMENT")
-                   or _project_selectors().get("AUTOMATIONS_ENVIRONMENT")
-                   or str(engine.get("environment") or "development"))
+    environment = str(engine.get("environment") or "development")
     known = set(answers.get("_nodes") or [here])
     by_env = mine.get("environments") if isinstance(mine.get("environments"), dict) else {}
     by_slug = mine.get("automations") if isinstance(mine.get("automations"), dict) else {}
@@ -2471,9 +2488,9 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
             if unmapped and (enabled or reached):
                 for env in unmapped:
                     ask(f"environments.{env}",
-                        f"which node runs environment {env!r}? automation {slug!r} "
-                        f"runs under {', '.join(envs)}, and the environment in force "
-                        f"here is {environment!r} on {here}", sorted(known))
+                        f"which node runs label {env!r}? automation {slug!r} "
+                        f"runs under {', '.join(envs)}, and the file's own label "
+                        f"is {environment!r} on {here}", sorted(known))
             if len(reached) > 1 or (unmapped and len(envs) > 1 and (enabled or reached)):
                 ask(f"automations.{slug}",
                     f"automation {slug!r} runs under {', '.join(envs)}, and an "
@@ -2851,7 +2868,8 @@ def cmd_service_run() -> NoReturn:
 # a scope it opens for a project points at that project alone.
 _PROJECT_POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID",
                      "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
-                     "CAPABILITIES_PROJECT_ENVELOPE_ROOT", *_SELECTOR_KEYS)
+                     "CAPABILITIES_PROJECT_ENVELOPE_ROOT", *_SELECTOR_KEYS,
+                     *_RETIRED_KEYS)
 _PROJECT_ENTRY_KEYS = ("root", "slug", "joined_at", "joined_by")
 _MACHINE_KEYS = ("version", "max_parallel")
 _NOT_ENABLED = (f"project_enable_required: {NAME} is not enabled explicitly for this "

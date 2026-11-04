@@ -38,7 +38,6 @@ def rich_settings():
     forum topics, roles, defaults and their voice block."""
     return {
         "connection": "main",
-        "environment": "production",
         "assistant_name": "Helper",
         "direct_messages": {"mode": "allowed_users", "default_role": "direct_user"},
         "allowed_users": {
@@ -116,7 +115,8 @@ class SchemaTest(unittest.TestCase):
     def test_each_object_offers_exactly_the_keys_the_validator_accepts(self):
         document = schema.json_schema()
         defs = document["$defs"]
-        self.assertEqual(set(document["properties"]), schema.TOP_LEVEL)
+        self.assertEqual(set(document["properties"]),
+                         schema.TOP_LEVEL | set(schema.RETIRED_KEYS))
         self.assertEqual(set(defs["group"]["properties"]), schema.GROUP_KEYS)
         self.assertEqual(set(defs["topic"]["properties"]), schema.TOPIC_KEYS)
         self.assertEqual(set(defs["user"]["properties"]),
@@ -152,8 +152,27 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual({k for k, v in applies.items() if v == "restart"},
                          set(schema.RESTART_KEYS))
         self.assertEqual({k for k, v in applies.items() if v == "reload"},
-                         schema.TOP_LEVEL - set(schema.RESTART_KEYS))
+                         (schema.TOP_LEVEL | set(schema.RETIRED_KEYS))
+                         - set(schema.RESTART_KEYS))
         self.assertIn("context", [d["key"] for d in document["x-documents"]])
+
+    def test_a_retired_environment_label_validates_and_is_named(self):
+        """Settings from before the register was one per project still carry
+        `environment`, in any spelling it was given; they validate, the JSON
+        Schema accepts them, and the label is named as retired, with the
+        process variable that used to override it."""
+        import jsonschema
+        checker = jsonschema.Draft202012Validator(schema.json_schema())
+        for label in ("production", "development", "dev/prod"):
+            settings = {**rich_settings(), "environment": label}
+            self.validates(settings)
+            self.assertEqual(list(checker.iter_errors(settings)), [])
+            self.assertEqual(schema.retired_labels(settings, {}), ["settings.environment"])
+        self.assertEqual(schema.retired_labels(rich_settings(),
+                                               {"TELEGRAM_ENVIRONMENT": "production"}),
+                         ["TELEGRAM_ENVIRONMENT"])
+        self.assertEqual(schema.retired_labels(rich_settings(), {}), [])
+        self.assertTrue(schema.json_schema()["properties"]["environment"]["deprecated"])
 
     def test_the_manifest_declarations_agree_with_the_restart_rule(self):
         cli = import_cli()

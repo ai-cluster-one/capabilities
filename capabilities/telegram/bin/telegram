@@ -255,11 +255,11 @@ Commands:
                                                Accepted, it prints the top-level
                                                keys that change, `apply`
                                                (reload, or restart when
-                                               connection or environment
-                                               changes) and each prompt file the
-                                               settings name with its document
-                                               key: `telegram context show|edit|
-                                               put <key>` reads and writes it.
+                                               connection changes) and each
+                                               prompt file the settings name
+                                               with its document key: `telegram
+                                               context show|edit|put <key>`
+                                               reads and writes it.
   telegram service harness [--json]            The harness tools (claude, codex)
                                                of every profile a turn is
                                                configured to run on now - each
@@ -324,7 +324,14 @@ Commands:
                                                time is not ok.
                                                `doctor` exits 5 when its own
                                                verdict is `ok: false`, so a
-                                               script can gate on it.
+                                               script can gate on it. A
+                                               settings `environment` key or a
+                                               TELEGRAM_ENVIRONMENT variable is
+                                               retired and has no effect: the
+                                               service keeps one register per
+                                               project, and `doctor` names
+                                               either under `retired` and
+                                               `warnings` for its removal.
                                                The job register lives in the
                                                project's Postgres database, in
                                                telegram_* tables migrated on
@@ -627,13 +634,6 @@ SETTINGS = {'homes': [{'scope': 'project',
            'help': 'The connection the service runs on.',
            'type': 'string',
            'required': False,
-           'scope': 'project',
-           'apply': 'restart'},
-          {'key': 'environment',
-           'label': 'Environment',
-           'help': 'Which half of the machine this service is; jobs are filtered by '
-                   'it.',
-           'type': 'string',
            'scope': 'project',
            'apply': 'restart'},
           {'key': 'assistant_name',
@@ -3204,22 +3204,22 @@ _SIGN_IN_HARNESSES = ("claude", "codex")
 # daemon resumes on its own (jobs.SELF_RESUMING).
 _HARNESS_OPEN_JOBS = """
     SELECT id, profile, engine FROM telegram_jobs
-     WHERE project_id = %s AND surface = 'telegram' AND environment = %s
+     WHERE project_id = %s AND surface = 'telegram'
        AND (state IN ('draft', 'waiting', 'running')
             OR (state = 'stopped' AND outcome IN ('quota', 'interrupted')))
      ORDER BY created_at, id"""
 _HARNESS_CHAT_PROFILES = """
     SELECT channel_key, settings->>'profile' FROM telegram_channels
-     WHERE project_id = %s AND environment = %s AND settings->>'profile' IS NOT NULL
+     WHERE project_id = %s AND settings->>'profile' IS NOT NULL
      ORDER BY channel_key"""
 
 
-def _configured_in_store(setting, project_id: str, environment: str) -> tuple[list, list]:
-    """Every chat's `/set profile` and every open job of this project and
-    environment, as (channel key, profile) and (job id, profile) rows, read on
-    one read-only connection. A job registered before profiles names none and
-    runs on `telegram-<engine>`, as the daemon runs it. A table the store does
-    not hold yet holds none. Writes nothing and migrates nothing."""
+def _configured_in_store(setting, project_id: str) -> tuple[list, list]:
+    """Every chat's `/set profile` and every open job of this project, as
+    (channel key, profile) and (job id, profile) rows, read on one read-only
+    connection. A job registered before profiles names none and runs on
+    `telegram-<engine>`, as the daemon runs it. A table the store does not hold
+    yet holds none. Writes nothing and migrates nothing."""
     from capabilities_contract.db import DbError, connect
     try:
         conn = connect(application_name=NAME, setting=setting, transaction=True)
@@ -3231,7 +3231,7 @@ def _configured_in_store(setting, project_id: str, environment: str) -> tuple[li
         conn.read_only = True
         for sql in (_HARNESS_CHAT_PROFILES, _HARNESS_OPEN_JOBS):
             try:
-                found.append(conn.execute(sql, (project_id, environment)).fetchall())
+                found.append(conn.execute(sql, (project_id,)).fetchall())
             except Exception as exc:
                 if type(exc).__name__ != "UndefinedTable":
                     raise
@@ -3280,7 +3280,7 @@ def cmd_service_harness() -> dict:
 
     for entry in _declared_profiles(settings):
         name(entry["profile"])["settings"] = entry["declared_at"]
-    chats, jobs = _configured_in_store(setting, str(project_id), _job_environment(root))
+    chats, jobs = _configured_in_store(setting, str(project_id))
     for key, profile in chats:
         name(profile)["chats"].append(key)
     for job_id, profile in jobs:
@@ -3455,24 +3455,6 @@ def _tables():
     return module.STORE_STEPS, module.STORE_SCHEMA_MAJOR, module.STORE_SCHEMA_MINOR
 
 
-def _job_environment(root: Path) -> str:
-    """Which half of the machine this queue belongs to.
-
-    Read the same way the daemon reads it, from the same settings, so a person
-    asking about the queue and the daemon draining it are never looking at two
-    different ones.
-    """
-    value = os.environ.get("TELEGRAM_ENVIRONMENT")
-    if not value:
-        try:
-            value = (_service_settings(root) or {}).get("environment")
-        except SystemExit:
-            raise
-        except Exception:
-            value = None
-    return str(value or "development").strip()
-
-
 def _open_job_register(root: Path, write: bool = True):
     """The job register, in the project's database. A write is keyed by the
     project id verified for this invocation; a read takes the id in every
@@ -3481,8 +3463,8 @@ def _open_job_register(root: Path, write: bool = True):
     project_id = _project_id(write=True) if write else _project_id()
     try:
         _store, register = module.open_register(
-            _project_capabilities_dir(root), _job_environment(root),
-            project_id=project_id, project_root=root, profile_tables=False)
+            _project_capabilities_dir(root), project_id=project_id, project_root=root,
+            profile_tables=False)
         return module, register
     except module.JobError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
@@ -3507,8 +3489,8 @@ def _service_store_check(root: Path) -> dict:
     try:
         setting = module.store_setting(root)
         store, _register = module.open_register(
-            _project_capabilities_dir(root), _job_environment(root),
-            project_id=_project_id(), setting=setting, profile_tables=False)
+            _project_capabilities_dir(root), project_id=_project_id(), setting=setting,
+            profile_tables=False)
     except module.JobError as exc:
         return {"ok": False, "code": exc.slug, "error": exc.message,
                 "hint": exc.hint}
@@ -3715,8 +3697,8 @@ def _open_prompts(root: Path, write: bool):
     project_id = _project_id(write=True) if write else _project_id()
     try:
         store, register = module.open_register(
-            _project_capabilities_dir(root), _job_environment(root),
-            project_id=project_id, project_root=root, profile_tables=False)
+            _project_capabilities_dir(root), project_id=project_id, project_root=root,
+            profile_tables=False)
     except module.JobError as exc:
         _die(6 if exc.slug in _STORE_SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
     return store, register.project_id
@@ -3729,8 +3711,8 @@ def _stored_prompt_keys(root: Path) -> set:
     module = _jobs_module()
     try:
         store, register = module.open_register(
-            _project_capabilities_dir(root), _job_environment(root),
-            project_id=_project_id(), project_root=root, profile_tables=False)
+            _project_capabilities_dir(root), project_id=_project_id(), project_root=root,
+            profile_tables=False)
     except module.JobError:
         return set()
     try:
@@ -3927,8 +3909,7 @@ def cmd_jobs_list(chat: str | None, topic_id: str | None, state: str | None,
         else:
             rows = register.list(limit=limit, state=state, outcome=outcome,
                                  channel_key=key, actor_id=actor_id)
-        return {"environment": register.environment,
-                "channel_key": key,
+        return {"channel_key": key,
                 "counts": register.counts(actor_id=actor_id),
                 "slots_in_use": register.running(actor_id=actor_id),
                 "jobs": [_job_row(row) for row in rows]}
@@ -5317,6 +5298,13 @@ def cmd_service_doctor(connection_flag: str | None, session_flag: str | None,
         report["skipped_settings"] = [{"setting": entry["path"], "project": entry["project"],
                                        "reason": entry["reason"]}
                                       for entry in _SKIPPED_ROUTES]
+    # A label the service no longer reads is no reason to fail: it is named so
+    # the operator can remove it.
+    schema = _settings_schema_module()
+    retired = schema.retired_labels(settings or {}, os.environ)
+    if retired:
+        report["retired"] = retired
+        report.setdefault("warnings", []).append(schema.retired_sentence(retired))
     return report
 
 
