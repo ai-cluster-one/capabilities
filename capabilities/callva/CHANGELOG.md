@@ -1,5 +1,9 @@
 # callva — change log
 
+## 2026-11-04 — `callva issues` carries the optional `stack` field
+
+`issues create`, `update` and `put` send `stack` in their payload like any other field, `issues list -f stack=<value>` filters by it, and the list summary shows it where the platform returns it. The help for these verbs describes the standard: a plain string `preset/model/speech/worker`. No route changes.
+
 ## 2026-11-04 — `callva` creates agents, projects and phone numbers, binds a number to an agent, and reaches issues, knowledge and the extraction schema
 
 New verbs: `agents create`, `projects create|update|put|delete`, `phone-numbers create|update|delete|bind`, `issues list|get|create|update|put|delete`, `knowledge list|get|create|update|put|delete` and `fields extraction-schema`. Those that change the platform are write-gated and `callva routes` declares them. `agents update` takes `--custom-webhook-events`, a comma-separated list that replaces the event types the agent's custom webhook forwards, where `""` forwards nothing. `phone-numbers bind <id>` takes the agent or `--unbind` and refuses neither, because the API reads a missing agent as an unbind.

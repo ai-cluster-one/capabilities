@@ -455,6 +455,29 @@ class PayloadTest(unittest.TestCase):
                 self.assertEqual(code, 6)
                 self.assertEqual(main.requests, [])
 
+    def test_issue_stack_is_written_filtered_and_summarised(self):
+        stack = "pipeline/gpt-5.4-mini/azure-azure/callva-worker"
+        for argv in (("issues", "create"), ("issues", "update", "X"), ("issues", "put", "X")):
+            with self.subTest(argv=argv):
+                main = _Main()
+                code, _out, err = main.run(*argv, "--data", json.dumps({"stack": stack}))
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(main.requests[0].content)["stack"], stack)
+        main = _Main(respond=lambda r: httpx.Response(200, json={"data": [
+            {"id": "I", "stack": stack, "problem": "left out of the summary"}]}))
+        code, out, err = main.run("issues", "list", "-f", f"stack={stack}")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(dict(main.requests[0].url.params), {"stack": stack})
+        self.assertEqual(json.loads(out)["data"], [{"id": "I", "stack": stack}])
+        self.assertIn(stack, callva.__doc__)
+        self.assertIn("gpt_live/gpt-5.6-terra/callva-worker", callva.__doc__)
+        self.assertIn("preset/model/speech/worker", callva.__doc__)
+        for argv in (("issues", "list"), ("issues", "create"), ("issues", "update"), ("issues", "put")):
+            with self.subTest(help=argv):
+                code, out, _err = main.run(*argv, "--help")
+                self.assertEqual(code, 0)
+                self.assertIn("preset/model/speech/worker", " ".join(out.split()))
+
     def test_extraction_schema_passes_the_entity_type(self):
         main = _Main()
         code, _out, err = main.run("fields", "extraction-schema", "--entity-type", "lead")

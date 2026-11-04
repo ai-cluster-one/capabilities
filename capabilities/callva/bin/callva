@@ -247,8 +247,10 @@ Commands (`-f key=value` is repeatable for list filters):
 
   Issues are the project's journal of what works and what does not on calls.
   create requires kind (defect|limitation), title and problem; status
-  (open|fixed|closed), solution, implemented_at, proven_by, agent_id and call_id
-  are optional. list filters: status, kind, agent_id, call_id, search, sort.
+  (open|fixed|closed), solution, implemented_at, proven_by, agent_id, call_id
+  and stack are optional. list filters: status, kind, agent_id, call_id, stack,
+  search, sort, and the list summary shows stack.
+  stack is a plain string: preset/model/speech/worker, for example gpt_live/gpt-5.6-terra/callva-worker and pipeline/gpt-5.4-mini/azure-azure/callva-worker.
 
   knowledge list [-f k=v ...] [--per-page N] [--page N]
   knowledge get <id>
@@ -1631,7 +1633,7 @@ def _journal_query(args):
 def issues_list(args):
     result = api("GET", "/external/issues", query=_journal_query(args))
     return _result(result, slim=lambda r: _apply_slim(r, lambda i: _pick(i, [
-        "id", "kind", "status", "title", "agent_id", "call_id", "created_at"])))
+        "id", "kind", "status", "title", "agent_id", "call_id", "stack", "created_at"])))
 
 
 def issues_get(args):
@@ -2705,27 +2707,28 @@ def build_parser():
     act_del.add_argument("id", help="Action UUID")
 
     # --- issues and knowledge ---
-    for resource, resource_help, create_help in (
+    for resource, resource_help, create_help, field_note in (
             ("issues", "The project's journal of what works and what does not on calls",
-             "kind, title, problem required"),
+             "kind, title, problem required",
+             "; stack is a plain string preset/model/speech/worker, examples in `callva help`"),
             ("knowledge", "What the project holds true or must not do",
-             "content required")):
+             "content required", "")):
         jr = subs.add_parser(resource, help=resource_help)
         jr_sub = jr.add_subparsers(dest="action", required=True)
         jr_ls = jr_sub.add_parser("list", help=f"List {resource}")
-        jr_ls.add_argument("--filter", "-f", action="append", help="Filter as key=value (repeatable)")
+        jr_ls.add_argument("--filter", "-f", action="append", help=f"Filter as key=value (repeatable){field_note}")
         jr_ls.add_argument("--per-page", type=int, help="Results per page")
         jr_ls.add_argument("--page", type=int, help="Page number")
         jr_get = jr_sub.add_parser("get", help="Get one by ID")
         jr_get.add_argument("id", help="UUID")
         jr_cr = jr_sub.add_parser("create", help="Create one")
-        jr_cr.add_argument("--data", dest="payload", type=parse_json_arg, help=f"Fields as JSON ({create_help})")
+        jr_cr.add_argument("--data", dest="payload", type=parse_json_arg, help=f"Fields as JSON ({create_help}{field_note})")
         jr_cr.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read the fields from a JSON file (- for stdin)")
         for name, parser_help in (("update", "Change fields (PATCH)"),
                                   ("put", "Change fields (PUT, which the API treats as PATCH)")):
             jr_w = jr_sub.add_parser(name, help=parser_help)
             jr_w.add_argument("id", help="UUID")
-            jr_w.add_argument("--data", dest="payload", type=parse_json_arg, help="Fields to change as JSON")
+            jr_w.add_argument("--data", dest="payload", type=parse_json_arg, help=f"Fields to change as JSON{field_note}")
             jr_w.add_argument("--data-file", dest="payload", type=parse_json_file, help="Read the fields from a JSON file (- for stdin)")
         jr_del = jr_sub.add_parser("delete", help="Delete one")
         jr_del.add_argument("id", help="UUID")
