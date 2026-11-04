@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-04 — `node rekey` moves the node a task names
+
+`node rekey` moves `tasks_tasks.node`, the node a task names as the one that claims it, with every other column that names a node, so a task bound to a node is still that node's after its id changes. A store whose `tasks` tables predate the column has nothing there to move.
+
 ## 2026-11-05 — `store upgrade` is not stopped by an owner whose tables are gone
 
 `capabilities store upgrade --check` no longer reports `owner_not_installed` for an owner the store records in `schema_version` but whose tables are all gone, as a retired tool's whose tables were dropped: it has nothing to move, so it no longer stops the upgrade, and a store that holds such a row can be crossed from this line.

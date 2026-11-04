@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-04 — A compiled bundle carries no automations environment label
+
+The automations service no longer declares `AUTOMATIONS_ENVIRONMENT`, so `deployment sync` and `setup` export it into no Compose file and no `.env.example`: work between an agent's nodes is told apart by the node alone. A server that still sets it keeps running; `automations doctor` names it as retired.
+
 ## 2026-11-02 — the verbs the manager owns refuse as moved; deployment hands nothing over
 
 `deployment node image`, `node create` without a flag of the node built from a repository, `node enrol`, `node add`, `node update`, `node remove` (with or without `--yes`), `node exec`, `node login <node> <tool>` (and any `node login` given `--events`, `--connection` or `--method`), `node list` and `handover` run nothing: each exits 6 `moved`, naming the manager command that does its work (`capabilities node image|create|enrol|add|exec`, `capabilities node update <node> --version <tag>`, `capabilities node remove <node> --yes`, `capabilities node login <node> <tool> --events`, `capabilities node list` with `capabilities agent state` for which nodes are live, `capabilities node install --apply`), with its usage as the hint, before the read-only switch and without reading standard input; under `--events` the refusal is the stream's `error` event. Nothing is forwarded to the manager any more, and the code only those verbs used is gone. `node create --repository` answers and refuses as before, its `next` now naming `capabilities node enrol <id>`; `node login claude|codex [--target] [--print-command]`, `node sync`, `node status`, `services`, `machine handover`, `runner` and every other verb are unchanged, and `next` and `doctor` on a host profile name `capabilities node install --apply` alone for the handover.

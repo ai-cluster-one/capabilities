@@ -12,8 +12,7 @@ The project's database is the home, not a private one beside it: the
 capability owns its `telegram_*` tables there and migrates them itself, through
 the shared database library and under its own ledger, and nothing else knows
 these columns. The reason it is a table rather than a JSON blob is that the
-runner filters on `project_id`, `environment`, `surface` and `state` on every
-tick.
+runner filters on `project_id`, `surface` and `state` on every tick.
 
 WHAT THE REGISTER HOLDS, AND WHAT IT REFUSES TO HOLD
 ===================================================
@@ -42,7 +41,7 @@ there is no `parent_id`: an amendment has no lineage to record.
 
 ISOLATION IS A CORRECTNESS CONDITION
 ====================================
-Every queue read is filtered by `project_id` and `environment`. The store is
+Every queue read is filtered by `project_id` and `surface`. The store is
 shared — by two projects on one machine, and by two machines on one project —
 so a query that forgets whose work it is asking about answers with somebody
 else's. It cannot therefore be a `WHERE` clause each caller is trusted to
@@ -53,7 +52,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -139,8 +137,8 @@ def job_label(description: Any) -> str:
 # always kept: a timestamp is TEXT holding an ISO instant and a flag is INTEGER,
 # so every comparison and every reader below sees the values it always saw.
 STORE_OWNER = "telegram"
-STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 3
+STORE_SCHEMA_MAJOR = 2
+STORE_SCHEMA_MINOR = 0
 STORE_STEPS = (
     ("0001-jobs", """
     CREATE TABLE telegram_jobs (
@@ -341,6 +339,124 @@ STORE_STEPS = (
     COMMENT ON COLUMN telegram_channels.state IS
         'The rest of the row as the daemon keeps it: reserved dialogue jobs, last seen message, last usage, agent dialogue turns.';
     """),
+    # One register per project. The rows were partitioned by a label the
+    # service read from its settings, so a node that came up under another
+    # label saw none of the work the node before it left; which node runs the
+    # service is decided by where it is placed, and nothing else tells the work
+    # of an agent's nodes apart. Every row is kept. Rows the label alone kept
+    # apart are merged: a channel keeps one row, the one with the highest
+    # watermark, with the others' overrides, voice echoes, state and reserved
+    # dialogue jobs beneath its own; a slot number two attempts shared is given
+    # to one of them and the other is renumbered past the ones in use; and of
+    # two jobs registered from one Telegram update, the later one no longer
+    # claims that update, so both stay. The column drops what older code reads,
+    # so the step raises the register's tables to schema major 2.
+    ("0007-one-register", """
+    DO $$
+    DECLARE
+        taken record;
+        free integer;
+    BEGIN
+        FOR taken IN
+            SELECT project_id, environment, surface, slot, job_id FROM (
+                SELECT project_id, environment, surface, slot, job_id,
+                       row_number() OVER (PARTITION BY project_id, surface, slot
+                                          ORDER BY environment, job_id) AS n
+                  FROM telegram_job_slots) ranked
+             WHERE n > 1
+             ORDER BY project_id, surface, slot, environment, job_id
+        LOOP
+            IF taken.slot >= 0 THEN
+                SELECT max(slot) + 1 INTO free FROM telegram_job_slots
+                 WHERE project_id = taken.project_id AND surface = taken.surface;
+            ELSE
+                SELECT min(slot) - 1 INTO free FROM telegram_job_slots
+                 WHERE project_id = taken.project_id AND surface = taken.surface;
+            END IF;
+            UPDATE telegram_job_slots SET slot = free
+             WHERE project_id = taken.project_id AND environment = taken.environment
+               AND surface = taken.surface AND job_id = taken.job_id;
+        END LOOP;
+    END $$;
+    ALTER TABLE telegram_job_slots DROP CONSTRAINT telegram_job_slots_pkey;
+    ALTER TABLE telegram_job_slots DROP CONSTRAINT telegram_job_slots_job_key;
+    ALTER TABLE telegram_job_slots DROP COLUMN environment;
+    ALTER TABLE telegram_job_slots
+        ADD CONSTRAINT telegram_job_slots_pkey PRIMARY KEY (project_id, surface, slot),
+        ADD CONSTRAINT telegram_job_slots_job_key UNIQUE (project_id, surface, job_id);
+
+    UPDATE telegram_jobs SET origin_message_id = NULL
+      FROM (SELECT id, row_number() OVER (
+                       PARTITION BY project_id, surface, channel_key, origin_message_id
+                       ORDER BY created_at, id) AS n
+              FROM telegram_jobs WHERE origin_message_id IS NOT NULL) ranked
+     WHERE telegram_jobs.id = ranked.id AND ranked.n > 1;
+    DROP INDEX telegram_jobs_queue_idx;
+    DROP INDEX telegram_jobs_origin_idx;
+    ALTER TABLE telegram_jobs DROP COLUMN environment;
+    CREATE INDEX telegram_jobs_queue_idx
+        ON telegram_jobs (project_id, surface, state);
+    CREATE UNIQUE INDEX telegram_jobs_origin_idx
+        ON telegram_jobs (project_id, surface, channel_key, origin_message_id)
+        WHERE origin_message_id IS NOT NULL;
+
+    DROP INDEX telegram_job_amendments_pending_idx;
+    ALTER TABLE telegram_job_amendments DROP COLUMN environment;
+    CREATE INDEX telegram_job_amendments_pending_idx
+        ON telegram_job_amendments (project_id, surface, job_id, state, created_at);
+
+    DO $$
+    DECLARE
+        channel record;
+        held record;
+        kept text;
+        merged_settings jsonb;
+        merged_echoes jsonb;
+        merged_state jsonb;
+        reserved jsonb;
+        touched timestamptz;
+    BEGIN
+        FOR channel IN
+            SELECT project_id, connection, channel_key FROM telegram_channels
+             GROUP BY project_id, connection, channel_key HAVING count(*) > 1
+        LOOP
+            merged_settings := '{}'; merged_echoes := '{}'; merged_state := '{}';
+            reserved := '{}'; touched := NULL;
+            -- Lowest watermark first, so the row with the highest one is
+            -- folded in last, is the one kept, and wins every key they share.
+            FOR held IN
+                SELECT * FROM telegram_channels
+                 WHERE project_id = channel.project_id AND connection = channel.connection
+                   AND channel_key = channel.channel_key
+                 ORDER BY last_processed_message_id, updated_at, environment
+            LOOP
+                merged_settings := merged_settings || held.settings;
+                merged_echoes := merged_echoes || held.voice_echo_senders;
+                merged_state := merged_state || held.state;
+                IF jsonb_typeof(held.state -> 'jobs') = 'object' THEN
+                    reserved := reserved || (held.state -> 'jobs');
+                END IF;
+                touched := greatest(touched, held.updated_at);
+                kept := held.environment;
+            END LOOP;
+            IF reserved <> '{}' THEN
+                merged_state := merged_state || jsonb_build_object('jobs', reserved);
+            END IF;
+            DELETE FROM telegram_channels
+             WHERE project_id = channel.project_id AND connection = channel.connection
+               AND channel_key = channel.channel_key AND environment <> kept;
+            UPDATE telegram_channels
+               SET settings = merged_settings, voice_echo_senders = merged_echoes,
+                   state = merged_state, updated_at = touched
+             WHERE project_id = channel.project_id AND connection = channel.connection
+               AND channel_key = channel.channel_key;
+        END LOOP;
+    END $$;
+    ALTER TABLE telegram_channels DROP CONSTRAINT telegram_channels_pkey;
+    ALTER TABLE telegram_channels DROP COLUMN environment;
+    ALTER TABLE telegram_channels
+        ADD CONSTRAINT telegram_channels_pkey PRIMARY KEY (project_id, connection, channel_key);
+    """),
 )
 
 # The harness runner's profile table lives in the same store, under the
@@ -433,12 +549,6 @@ OUTCOMES = (SUCCEEDED, FAILED, CANCELLED, INTERRUPTED, QUOTA, MODEL_REFUSED)
 SELF_RESUMING = (QUOTA, INTERRUPTED)
 
 ENGINES = ("codex", "claude", "stub")
-
-# An environment is a label a person types into settings, and it lands in a
-# query that decides whose work a runner may take. Anything ambiguous to
-# address stays out.
-ENVIRONMENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}", re.IGNORECASE)
-
 
 class JobError(Exception):
     """Every failure this module reports, carrying a slug the caller maps onto
@@ -542,7 +652,7 @@ class JobStore:
         return bool(self.conn.closed or self.conn.broken)
 
 
-def open_register(envelope: Path, environment: str, surface: str = "telegram",
+def open_register(envelope: Path, surface: str = "telegram",
                   project_id: str | None = None, setting=None,
                   project_root: Path | None = None, profile_tables: bool = True):
     """The store this project's jobs live in, and the register onto it.
@@ -590,7 +700,7 @@ def open_register(envelope: Path, environment: str, surface: str = "telegram",
         conn.close()
         raise
     store = JobStore(conn)
-    return store, JobRegister(store, str(project_id), environment, surface)
+    return store, JobRegister(store, str(project_id), surface)
 
 
 class JobRegister:
@@ -601,18 +711,12 @@ class JobRegister:
     how many of them there are.
     """
 
-    def __init__(self, store, project_id: str, environment: str,
-                 surface: str = "telegram"):
+    def __init__(self, store, project_id: str, surface: str = "telegram"):
         if not project_id:
             raise JobError("no_project_scope",
                            "the job register requires a registered project")
-        if not ENVIRONMENT_RE.fullmatch(str(environment or "")):
-            raise JobError("bad_environment",
-                           f"environment {environment!r} must match "
-                           f"{ENVIRONMENT_RE.pattern}")
         self.store = store
         self.project_id = project_id
-        self.environment = str(environment)
         self.surface = str(surface)
 
     # -- the scope, applied once ----------------------------------------------
@@ -620,14 +724,11 @@ class JobRegister:
     def _where(self, *predicates: str) -> tuple[str, list]:
         """The isolation clause every read and every write carries.
 
-        Environment is part of every ordinary lookup, including primary-key
-        reads. Cross-environment inspection belongs to an explicit operator
-        surface, never to the register workers use.
+        The project and surface are part of every ordinary lookup, including
+        primary-key reads.
         """
         parts = ["project_id = ?", "surface = ?"]
         params: list = [self.project_id, self.surface]
-        parts.append("environment = ?")
-        params.append(self.environment)
         parts.extend(predicates)
         return " WHERE " + " AND ".join(parts), params
 
@@ -697,7 +798,7 @@ class JobRegister:
         return self._rows(" AND ".join(predicates), params, order="created_at, id")
 
     def next_waiting(self) -> dict[str, Any] | None:
-        """The oldest job waiting for a slot in this project and environment.
+        """The oldest job waiting for a slot in this project.
         Arrival order, with no estimation, priority or classes of size."""
         rows = self._rows("state = ?", (WAITING,), order="created_at, id", limit=1)
         return rows[0] if rows else None
@@ -766,9 +867,9 @@ class JobRegister:
     def quota_until(self) -> str | None:
         row = self.store._execute(
             "SELECT MAX(resume_at) FROM telegram_jobs WHERE project_id = ? AND "
-            "environment = ? AND surface = ? AND state = ? AND outcome = ? "
+            "surface = ? AND state = ? AND outcome = ? "
             "AND resume_at > ?",
-            (self.project_id, self.environment, self.surface, STOPPED, QUOTA, iso())).fetchone()
+            (self.project_id, self.surface, STOPPED, QUOTA, iso())).fetchone()
         return row[0] if row else None
 
     def pending_deliveries(self, limit: int = 50) -> list[dict[str, Any]]:
@@ -785,10 +886,10 @@ class JobRegister:
         claimed: list[str] = []
         with self.store.transaction():
             rows = self.store._execute(
-                "SELECT id FROM telegram_jobs WHERE project_id = ? AND environment = ? "
+                "SELECT id FROM telegram_jobs WHERE project_id = ? "
                 "AND surface = ? AND (delivery_state = ? OR (delivery_state = ? "
                 "AND delivery_lease_expires_at <= ?)) ORDER BY execution_finished_at, id LIMIT ?",
-                (self.project_id, self.environment, self.surface, "pending",
+                (self.project_id, self.surface, "pending",
                  "delivering", now, max(1, int(limit)))).fetchall()
             for (job_id,) in rows:
                 token = str(uuid4())
@@ -836,12 +937,12 @@ class JobRegister:
         try:
             with self.store.transaction():
                 self.store._execute(
-                    "INSERT INTO telegram_jobs (id, project_id, environment, surface, "
+                    "INSERT INTO telegram_jobs (id, project_id, surface, "
                     "channel_key, requested_by, origin_message_id, description, engine, "
                     "model, profile, state, attempt, amendments, stop_requested, "
                     "created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)",
-                    (job_id, self.project_id, self.environment, self.surface,
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, ?, ?)",
+                    (job_id, self.project_id, self.surface,
                      str(channel_key), str(requested_by), origin,
                      description, engine, model, profile, DRAFT, now, now))
         except Exception:
@@ -937,14 +1038,14 @@ class JobRegister:
                         return None
                     lowest = self.store._execute(
                         "SELECT MIN(slot) FROM telegram_job_slots WHERE project_id = ? "
-                        "AND environment = ? AND surface = ?",
-                        (self.project_id, self.environment, self.surface)).fetchone()[0]
+                        "AND surface = ?",
+                        (self.project_id, self.surface)).fetchone()[0]
                     slot = min(-1, int(lowest) - 1) if lowest is not None else -1
                     self.store._execute(
-                        "INSERT INTO telegram_job_slots (project_id, environment, surface, "
+                        "INSERT INTO telegram_job_slots (project_id, surface, "
                         "slot, job_id, owner_id, attempt_token, lease_expires_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (self.project_id, self.environment, self.surface, slot, job_id,
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (self.project_id, self.surface, slot, job_id,
                          owner_id, token, lease_until))
             except Exception as exc:
                 # Two direct attempts picking the same number at once is the
@@ -974,23 +1075,23 @@ class JobRegister:
             with self.store.transaction():
                 used = {int(r[0]) for r in self.store._execute(
                     "SELECT slot FROM telegram_job_slots WHERE project_id = ? AND "
-                    "environment = ? AND surface = ?",
-                    (self.project_id, self.environment, self.surface)).fetchall()}
+                    "surface = ?",
+                    (self.project_id, self.surface)).fetchall()}
                 slot = next((n for n in range(max_parallel) if n not in used), None)
                 if slot is None:
                     return None
                 candidate = self.store._execute(
                     "SELECT id FROM telegram_jobs WHERE project_id = ? AND surface = ? "
-                    "AND environment = ? AND state = ? ORDER BY created_at, id LIMIT ?",
-                    (self.project_id, self.surface, self.environment, WAITING, 1)).fetchone()
+                    "AND state = ? ORDER BY created_at, id LIMIT ?",
+                    (self.project_id, self.surface, WAITING, 1)).fetchone()
                 if not candidate:
                     return None
                 job_id = candidate[0]
                 self.store._execute(
-                    "INSERT INTO telegram_job_slots (project_id, environment, surface, "
+                    "INSERT INTO telegram_job_slots (project_id, surface, "
                     "slot, job_id, owner_id, attempt_token, lease_expires_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (self.project_id, self.environment, self.surface, slot, job_id,
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (self.project_id, self.surface, slot, job_id,
                      owner_id, token, lease_until))
                 clause, params = self._where("id = ?", "state = ?")
                 cur = self.store._execute(
@@ -1054,9 +1155,9 @@ class JobRegister:
                     raise JobError("lease_lost", f"job {job_id} no longer owns its attempt")
                 slot = self.store._execute(
                     "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE project_id = ? "
-                    "AND environment = ? AND surface = ? AND job_id = ? AND owner_id = ? "
+                    "AND surface = ? AND job_id = ? AND owner_id = ? "
                     "AND attempt_token = ?",
-                    (until, self.project_id, self.environment, self.surface, job_id,
+                    (until, self.project_id, self.surface, job_id,
                      owner_id, attempt_token))
                 if slot.rowcount != 1:
                     raise JobError("lease_lost", f"job {job_id} no longer owns its slot")
@@ -1109,18 +1210,18 @@ class JobRegister:
             if before_release is not None:
                 before_release()
             slot = self.store._execute(
-                "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+                "DELETE FROM telegram_job_slots WHERE project_id = ? "
                 "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ? "
                 "AND lease_expires_at = ?",
-                (self.project_id, self.environment, self.surface, job_id,
+                (self.project_id, self.surface, job_id,
                  owner, token, observed))
             if slot.rowcount != 1:
                 raise JobError("slot_mismatch", f"job {job_id} expired without its exact slot")
             self.store._execute(
                 "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
-                "claimed_at = NULL WHERE project_id = ? AND environment = ? AND surface = ? "
+                "claimed_at = NULL WHERE project_id = ? AND surface = ? "
                 "AND job_id = ? AND state = ? AND claim_token = ?",
-                ("pending", self.project_id, self.environment, self.surface,
+                ("pending", self.project_id, self.surface,
                  job_id, "claimed", token))
         return self.get(job_id)
 
@@ -1130,10 +1231,10 @@ class JobRegister:
         marks = self._marks(states)
         cur = self.store._execute(
             "SELECT id, text, state, claim_token, created_at FROM "
-            "telegram_job_amendments WHERE project_id = ? AND environment = ? "
+            "telegram_job_amendments WHERE project_id = ? "
             f"AND surface = ? AND job_id = ? AND state IN ({marks}) "
             "ORDER BY created_at, id",
-            (self.project_id, self.environment, self.surface, job_id, *states))
+            (self.project_id, self.surface, job_id, *states))
         return [{"id": r[0], "text": r[1], "state": r[2],
                  "claim_token": r[3], "created_at": r[4]}
                 for r in cur.fetchall()]
@@ -1155,9 +1256,9 @@ class JobRegister:
         clause, params = self._where(*predicates)
         with self.store.transaction():
             self.store._execute(
-                "INSERT INTO telegram_job_amendments (id, project_id, environment, "
-                "surface, job_id, text, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (amendment_id, self.project_id, self.environment, self.surface,
+                "INSERT INTO telegram_job_amendments (id, project_id, "
+                "surface, job_id, text, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (amendment_id, self.project_id, self.surface,
                  job_id, text, "pending", now))
             cur = self.store._execute(
                 "UPDATE telegram_jobs SET amendments = amendments + 1, updated_at = ?"
@@ -1179,17 +1280,17 @@ class JobRegister:
     def _lock_attempt(self, job_id: str, attempt_token: str, owner_id: str) -> bool:
         """Lock one exact attempt and its slot in the common row-then-slot order."""
         job = self.store._execute(
-            "SELECT 1 FROM telegram_jobs WHERE project_id = ? AND environment = ? "
+            "SELECT 1 FROM telegram_jobs WHERE project_id = ? "
             "AND surface = ? AND id = ? AND state = ? AND attempt_token = ? "
             "AND lease_owner = ? FOR UPDATE",
-            (self.project_id, self.environment, self.surface, job_id, RUNNING,
+            (self.project_id, self.surface, job_id, RUNNING,
              attempt_token, owner_id)).fetchone()
         if not job:
             return False
         slot = self.store._execute(
-            "SELECT 1 FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+            "SELECT 1 FROM telegram_job_slots WHERE project_id = ? "
             "AND surface = ? AND job_id = ? AND attempt_token = ? AND owner_id = ? FOR UPDATE",
-            (self.project_id, self.environment, self.surface, job_id,
+            (self.project_id, self.surface, job_id,
              attempt_token, owner_id)).fetchone()
         return bool(slot)
 
@@ -1207,9 +1308,9 @@ class JobRegister:
                 return []
             self.store._execute(
                 "UPDATE telegram_job_amendments SET state = ?, claim_token = ?, "
-                "claimed_at = ? WHERE project_id = ? AND environment = ? AND surface = ? "
+                "claimed_at = ? WHERE project_id = ? AND surface = ? "
                 "AND job_id = ? AND state = ?",
-                ("claimed", attempt_token, now, self.project_id, self.environment,
+                ("claimed", attempt_token, now, self.project_id,
                  self.surface, job_id, "pending"))
         return [row for row in self._amendment_rows(job_id, ("claimed",))
                 if row["claim_token"] == attempt_token]
@@ -1221,9 +1322,9 @@ class JobRegister:
                 return 0
             cur = self.store._execute(
                 "UPDATE telegram_job_amendments SET state = ?, acked_at = ? WHERE "
-                "project_id = ? AND environment = ? AND surface = ? AND job_id = ? "
+                "project_id = ? AND surface = ? AND job_id = ? "
                 "AND state = ? AND claim_token = ?",
-                ("acked", iso(), self.project_id, self.environment, self.surface,
+                ("acked", iso(), self.project_id, self.surface,
                  job_id, "claimed", attempt_token))
         return int(cur.rowcount or 0)
 
@@ -1316,17 +1417,17 @@ class JobRegister:
             if cur.rowcount != 1:
                 return None
             slot = self.store._execute(
-                "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+                "DELETE FROM telegram_job_slots WHERE project_id = ? "
                 "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ?",
-                (self.project_id, self.environment, self.surface, job_id,
+                (self.project_id, self.surface, job_id,
                  owner_id, attempt_token))
             if slot.rowcount != 1:
                 raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
             self.store._execute(
                 "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
-                "claimed_at = NULL WHERE project_id = ? AND environment = ? AND surface = ? "
+                "claimed_at = NULL WHERE project_id = ? AND surface = ? "
                 "AND job_id = ? AND state = ? AND claim_token = ?",
-                ("pending", self.project_id, self.environment, self.surface,
+                ("pending", self.project_id, self.surface,
                  job_id, "claimed", attempt_token))
         return self.get(job_id)
 
@@ -1456,9 +1557,9 @@ class JobRegister:
                 tuple(list(columns.values()) + params + values))
             if cur.rowcount:
                 slot_sql = (
-                    "DELETE FROM telegram_job_slots WHERE project_id = ? AND environment = ? "
+                    "DELETE FROM telegram_job_slots WHERE project_id = ? "
                     "AND surface = ? AND job_id = ?")
-                slot_params: list[Any] = [self.project_id, self.environment,
+                slot_params: list[Any] = [self.project_id,
                                           self.surface, job_id]
                 if attempt_token is not None:
                     slot_sql += " AND attempt_token = ? AND owner_id = ?"
@@ -1469,9 +1570,9 @@ class JobRegister:
                 if attempt_token is not None:
                     self.store._execute(
                         "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
-                        "claimed_at = NULL WHERE project_id = ? AND environment = ? "
+                        "claimed_at = NULL WHERE project_id = ? "
                         "AND surface = ? AND job_id = ? AND state = ? AND claim_token = ?",
-                        ("pending", self.project_id, self.environment, self.surface,
+                        ("pending", self.project_id, self.surface,
                          job_id, "claimed", attempt_token))
         return self.get(job_id) if cur.rowcount else None
 

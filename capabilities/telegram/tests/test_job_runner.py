@@ -65,9 +65,7 @@ def end_children(children):
 
 
 def job_settings(**overrides):
-    base = settings(job_poll_interval=0.05, **overrides)
-    base["environment"] = "development"
-    return base
+    return settings(job_poll_interval=0.05, **overrides)
 
 
 
@@ -98,8 +96,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         is exactly why the surface is a CLI over a table rather than a call.
         """
         return daemon.jobs.open_register(
-            daemon.PROJECT_CAPABILITIES_DIR, daemon.ENVIRONMENT,
-            setting=daemon.STORE_SETTING)
+            daemon.PROJECT_CAPABILITIES_DIR, setting=daemon.STORE_SETTING)
 
     def daemon_with_store(self, td, **overrides):
         daemon = import_daemon(Path(td), job_settings(**overrides), store=True)
@@ -164,12 +161,11 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                          engine="stub")
             self.assertEqual(row["description"], "on the project's database")
 
-    async def test_the_daemon_opens_its_register_scoped_to_its_environment(self):
+    async def test_the_daemon_opens_its_projects_register(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             register = daemon.job_register()
             self.addCleanup(daemon.close_job_register)
-            self.assertEqual(register.environment, "development")
             self.assertEqual(register.surface, "telegram")
             self.assertIsNotNone(register.project_id)
 
@@ -293,8 +289,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                          if key.startswith("TELEGRAM_AUTHORIZED_")
                          or key == "TELEGRAM_DAEMON_CHILD"}
                 child.update({"CLAUDE_PROJECT_DIR": str(daemon.PROJECT_ROOT),
-                              "AGENTKIT_DB_URL": daemon.STORE_SETTING.url,
-                              "TELEGRAM_ENVIRONMENT": daemon.ENVIRONMENT})
+                              "AGENTKIT_DB_URL": daemon.STORE_SETTING.url})
                 # The CLI reads the same store, bound to this case's schema.
                 with mock.patch.dict(os.environ, child, clear=False), \
                         mock.patch.object(cli._jobs_module(), "store_setting",
@@ -350,7 +345,6 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rows[0]["description"], "reconcile the ledger")
             self.assertEqual(rows[0]["requested_by"], "777")
             self.assertEqual(rows[0]["origin_message_id"], "60")
-            self.assertEqual(rows[0]["environment"], "development")
             self.assertEqual(dispatched[0]["description"], "reconcile the ledger")
             await self.stop_session(client, task)
 

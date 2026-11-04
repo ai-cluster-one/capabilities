@@ -181,6 +181,12 @@ EXECUTION  (also needs allow_write)
   and `why` with until when its lease runs - and so do `run` and the service's
   log line. `--key` naming one is refused, exit 6 `conflict`, naming the raise.
 
+  A task that names a node (FIELDS) is taken only on that node: a claim on any
+  other node, the service's turns and `run` included, selects it never, and
+  `--key` naming it there is refused, exit 6 `conflict`, saying which node it
+  belongs to. This node is the value its raises record as their `node`. A task
+  naming no node is taken on any node.
+
   The outcome scores the raise and moves nothing: closed `failed` or
   `handback`, the task stays exactly where it stands - where it rested, unless
   the work moved it. `--status` and `--assignee` move it, judged as `set`
@@ -1424,6 +1430,18 @@ FIELDS  (add and set take the same set)
                         --line`, or its `add` on another line, is refused unless
                         its `writes` grants `line` (WORKER SCOPE). Refused with
                         exit 3 for a name that is no line here.
+  --node NODE           the one node that may claim the task: the node's id, the
+                        value a raise records as its `node` for the machine that
+                        claimed it (`capabilities node id` answers this
+                        machine's), or `any`, which a task naming none is on.
+                        Unsaid, and after `set --node any`, any node takes it,
+                        as every task was taken before. A claim on another node
+                        passes the task over, and `--key` naming it there is
+                        refused, exit 6 `conflict`, naming the node it belongs
+                        to (EXECUTION). A worker's `set --node`, or its `add
+                        --node` naming a node, is refused unless its `writes`
+                        grants `node` (WORKER SCOPE). Refused with exit 6 for a
+                        value that is no node id.
   --clear FIELD         empty a field outright; repeatable. Clearable: objective,
                         description, assignee, pickup, unique-key, blocked-by.
                         Type, title and status cannot be cleared. A field not
@@ -1573,17 +1591,18 @@ WORKER SCOPE
                 among them answers for the task's `blocked_by` field
     tags        the tags it may remove
     line        the lines it may put a task on: `default` or a line's name
+    node        the nodes it may bind a task to: `any` or a node's id
 
-  `new` names status, type, assignee, pickup and line only. Two rules read it, and
-  only two: a field a scope does not list may not be written in that scope,
-  and `"*"` - alone or in the list - means any value, emptying a field
-  included. Adding is never configured and always allowed, on every task: an
+  `new` names status, type, assignee, pickup, line and node only. Two rules
+  read it, and only two: a field a scope does not list may not be written in
+  that scope, and `"*"` - alone or in the list - means any value, emptying a
+  field included. Adding is never configured and always allowed, on every task: an
   activity, a tag, a metadata key not already there, blockers on a task that
   lists none. A field `writes` does not name - title, objective, description,
   the key, and a bare save - is written on the task the raise holds and on no
   other. `add` lands a status `new` does not allow in draft rather than
   refusing it, and the answer reports the coercion under `coerced`; it refuses
-  a type, assignee or pickup `new` does not allow.
+  a type, assignee, pickup or node `new` does not allow.
 
   A worker with no `writes` is held to this, which is the fence every worker
   had before a file could say otherwise:
@@ -1690,9 +1709,10 @@ PAGING  (list, ready, search)
 COLLECTIONS
   A scan and a read want different answers, so they give different ones.
 
-  `list` and `search` scan: identity, state, tags, moments, plus
-  `activities_count` and `last_activity_at` - enough to choose which task to look
-  at, and cheap enough to ask for often. `objective` and `description` are the
+  `list` and `search` scan: identity, state, tags, moments, the `node` a task is
+  bound to (null where any node takes it), plus `activities_count` and
+  `last_activity_at` - enough to choose which task to look at, and cheap enough
+  to ask for often. `objective` and `description` are the
   expensive half of a task and stay out until asked for.
 
   Every row any reading verb prints - `show`, `list`, `search`, `ready`, a
@@ -3041,7 +3061,7 @@ _LIST_FLAGS = (("project", "type", "status", "tag", "assignee", "per-page",
 # are the expensive half of a task and stay out until asked for: a list is read
 # to pick one row, not to read every row's reasoning.
 _LEAN = ("id, project_id, type, unique_key, title, status, assignee, tags, "
-         "pickup_at, blocked_by, created_at, updated_at")
+         "pickup_at, blocked_by, node, created_at, updated_at")
 _LIST_BOOLS = ("pickup-set", "pickup-unset", "full", "assigned-here")
 # `ready` is the queue one project's worker consumes, so the whole store is a
 # question only the two scans answer.
@@ -3575,8 +3595,9 @@ _WORKER_HINT = ("a worker records what it found on the task - an activity, a tag
 # worker scope answers for in each. `add` creates, so it removes nothing, and
 # names no tags or metadata to take away.
 _WRITE_SCOPES = ("held", "other", "new")
-_WRITE_FIELDS = ("status", "type", "assignee", "pickup", "metadata", "tags", "line")
-_NEW_FIELDS = ("status", "type", "assignee", "pickup", "line")
+_WRITE_FIELDS = ("status", "type", "assignee", "pickup", "metadata", "tags", "line",
+                 "node")
+_NEW_FIELDS = ("status", "type", "assignee", "pickup", "line", "node")
 ANY = "*"
 
 # The fence a worker whose file declares no `writes` is held to, in the language
@@ -3603,11 +3624,17 @@ _CLAIMED_FROM = "claimed_from"
 # save - and those stay the holder's alone whatever a file declares.
 _OP_FIELDS = {"status": "status", "type": "type", "assignee": "assignee",
               "pickup": "pickup", "untag": "tags", "meta-rm": "metadata",
-              "meta-overwrite": "metadata", "line": "line", "set": None}
+              "meta-overwrite": "metadata", "line": "line", "node": "node",
+              "set": None}
 
 _WORKER_LINE_REFUSAL = ("a worker may not move a task to another line, or create one "
                         "on a line other than its own, unless its `writes` grants "
                         "`line`; which line work runs on is a person's or the "
+                        "supervisor's decision")
+
+_WORKER_NODE_REFUSAL = ("a worker may not bind a task to a node, or let any node "
+                        "take one bound to a node, unless its `writes` grants "
+                        "`node`; which machine work runs on is a person's or the "
                         "supervisor's decision")
 
 
@@ -3658,6 +3685,8 @@ def _default_refusal(kind: str, scope: str, value: str | None) -> str:
         return _WORKER_TYPE_REFUSAL
     if kind == "line":
         return _WORKER_LINE_REFUSAL
+    if kind == "node":
+        return _WORKER_NODE_REFUSAL
     return _WORKER_HELD_ONLY["set" if kind in ("assignee", "pickup") else kind]
 
 
@@ -3679,6 +3708,8 @@ def _declared_refusal(kind: str, scope: str, value: str | None, allowed) -> str:
         "meta-overwrite": (f"write over the metadata key {value} on {where}" if value
                            else f"write over metadata on {where}"),
         "line": f"put {where} on line {value or DEFAULT_LINE}",
+        "node": (f"let any node take {where}" if value in (None, "any")
+                 else f"bind {where} to node {value}"),
     }[kind]
     rule = (f"its worker's `writes.{scope}.{field}` allows only "
             f"{', '.join(allowed)}" if isinstance(allowed, list) and allowed
@@ -3758,8 +3789,8 @@ def _worker_new(values: dict, lookup) -> dict:
     A status the scope does not allow is not refused - refusing would lose the
     task the worker was writing down - it lands in draft instead, and the answer
     says so. A raise that is over allows no status but draft, so a lapse never
-    widens what a worker creates. A type, assignee or pickup the scope does not
-    allow is refused, because nothing a task could be created as instead means
+    widens what a worker creates. A type, assignee, pickup or node the scope
+    does not allow is refused, because nothing a task could be created as instead means
     what was asked."""
     execution = _worker_execution()
     if not execution:
@@ -3768,7 +3799,7 @@ def _worker_new(values: dict, lookup) -> dict:
     writes = _bound_writes(row)
     scope = _write_scope(DEFAULT_WRITES if writes is None else writes, "new")
     for field, column in (("type", "type"), ("assignee", "assignee"),
-                          ("pickup", "pickup_at")):
+                          ("pickup", "pickup_at"), ("node", "node")):
         given = values.get(column)
         if given is None or given == "":
             continue
@@ -3820,6 +3851,27 @@ def _line_named(cur, project: str, given: str) -> str | None:
         _die(3, "not_found", f"no line named {given!r} in this project",
              f"`{NAME} lines list` shows this project's lines; `{DEFAULT_LINE}` is the "
              "line of every worker no line names")
+    return given
+
+
+# A node as a task names it: the id a raise records as its `node` - twelve
+# lowercase hex characters, or the name a node registered before ids is keyed by
+# - or `any`, which is no node and stores null, as `default` is no line.
+_NODE_GIVEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,252}")
+ANY_NODE = "any"
+
+
+def _node_given(given: str) -> str | None:
+    """The node `--node` names, as the task's `node` stores it: None for `any`.
+    Exits on a value that is no node id."""
+    given = given.strip()
+    if given == ANY_NODE:
+        return None
+    if not _NODE_GIVEN.fullmatch(given):
+        _die(6, "input", f"{given!r} is not a node id: twelve lowercase hex characters, "
+             "or the name a node registered before ids is keyed by",
+             f"`capabilities node id` answers this machine's; `--node {ANY_NODE}` lets "
+             "any node take the task")
     return given
 
 
@@ -4057,7 +4109,7 @@ def cmd_add(entry, args: list[str]) -> None:
     holds creates nothing, changes nothing, and reports the task that holds it. A
     key is unique within a project, so another project holding it is no reason
     to refuse."""
-    opts = _flags(args, _SCALARS + ("key", "actor", "blocked-by", "line"))
+    opts = _flags(args, _SCALARS + ("key", "actor", "blocked-by", "line", "node"))
     if not opts.get("type") or not opts.get("title"):
         _die(6, "input", "add needs --type and --title",
              "the goal belongs in --objective, the reasoning in --description")
@@ -4066,6 +4118,9 @@ def cmd_add(entry, args: list[str]) -> None:
         opts["unique-key"] = opts.pop("key")
     values = _scalar_updates(opts, tz)
     values.setdefault("status", "draft")
+    if "node" in opts:
+        # The one node that may claim it; a worker's `new` scope must grant it.
+        values["node"] = _node_given(opts["node"])
     coerced: dict = {}
     worker = bool(_worker_execution())
     if not worker:
@@ -4131,6 +4186,8 @@ def cmd_add(entry, args: list[str]) -> None:
         answer = {"created": row["id"], **{k: row[k] for k in ("type", "title", "status")}}
         if values.get("line"):
             answer["line"] = values["line"]
+        if values.get("node"):
+            answer["node"] = values["node"]
         if coerced:
             answer["coerced"] = coerced
         _emit(_accepted(answer, judged))
@@ -4157,8 +4214,8 @@ def cmd_set(entry, args: list[str]) -> None:
     `--question`, `--yes`, `--no` and `--recommend` go together, on a call that
     moves the task into waiting on a person: they are kept in its metadata under
     `question`, stamped with that move, so the Inbox asks them (THE INBOX)."""
-    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor", "blocked-by", "line")
-                  + _QUESTION_FLAGS, multi=("clear",), takes=1)
+    opts = _flags(args, _SCALARS + ("unique-key", "clear", "actor", "blocked-by", "line",
+                                    "node") + _QUESTION_FLAGS, multi=("clear",), takes=1)
     if not opts["_loose"]:
         _die(6, "input", "set needs a task", f"{NAME} set <uuid|unique_key> [fields]")
     asked = {flag: opts.pop(flag) for flag in _QUESTION_FLAGS if flag in opts}
@@ -4172,6 +4229,8 @@ def cmd_set(entry, args: list[str]) -> None:
     values = _scalar_updates(opts, tz)
     if "blocked-by" in opts:
         values["blocked_by"] = _blocked_by_flag(opts["blocked-by"])
+    if "node" in opts:
+        values["node"] = _node_given(opts["node"])
     for field in opts.get("clear", []):
         if field not in _CLEARABLE:
             _die(6, "input", f"cannot clear {field!r}",
@@ -4197,6 +4256,9 @@ def cmd_set(entry, args: list[str]) -> None:
             # a worker does it only where its `writes` grants `line`.
             _worker_gate(f"line:{opts['line'].strip()}", tid, lookup)
             values["line"] = _line_named(cur, _writing_project(), opts["line"])
+        if "node" in opts:
+            # Which node work runs on is a person's or the supervisor's too.
+            _worker_gate(f"node:{values['node'] or ANY_NODE}", tid, lookup)
         if values.get("blocked_by") == []:
             # Emptying the blockers removes them whatever the task carries, so
             # it is judged before the task is read; giving blockers is judged
@@ -4207,7 +4269,7 @@ def cmd_set(entry, args: list[str]) -> None:
         # one answers for the rest of the verb rather than leaving a field
         # nobody asked about open on somebody else's task.
         if not values or set(values) - {"status", "type", "assignee", "pickup_at",
-                                        "blocked_by", "line"}:
+                                        "blocked_by", "line", "node"}:
             _worker_gate("set", tid, lookup)
         # Only a claim puts a task in progress, because only a claim opens the
         # raise that holds it there; a worker's own fence already refuses it.
@@ -4996,6 +5058,11 @@ def _selection(opts: dict, project: str, tz, held: bool = False) -> tuple[str, l
         # default line's; a claim by hand names no worker and reads no line.
         clauses.append("line is not distinct from %s")
         params = [*params, opts["line"]]
+    if opts.get("on_node"):
+        # A claim takes a task naming a node only on that node, and one naming
+        # none on any: `on_node` is this node, as the raise records it.
+        clauses.append("(node is null or node = %s)")
+        params = [*params, opts["on_node"]]
     if opts.get("only_id"):
         # The one task a worker's `before` hook let through: the claim takes it
         # only while every other condition of the ask still holds.
@@ -5142,6 +5209,11 @@ def _key_refusal(task: dict, due: bool, opts: dict,
                 f"{opts.get('worker')!r} is on line {opts['line'] or DEFAULT_LINE}",
                 f"a worker takes only its own line's tasks; `{NAME} set {key} --line "
                 "<line>` moves the task, or run a worker of its line")
+    if task.get("node") and task["node"] != node_name():
+        return (f"{key} belongs to node {task['node']}, and this is node {node_name()}",
+                f"it is claimed only on node {task['node']}; `{NAME} set {key} --node "
+                f"<node>` moves it, or `{NAME} set {key} --node {ANY_NODE}` lets any node "
+                "take it")
     statuses = (sorted({one for entry in accept for one in entry["status"]})
                 if accept else ["todo"])
     if task["status"] not in statuses:
@@ -5213,6 +5285,9 @@ def _claim(entry, opts: dict) -> dict:
     if opts.get("beat"):
         lease = min(lease, int(opts["beat"]))
     project = _writing_project()
+    # The node the raise will record, so the claim selects only what this node
+    # may take.
+    opts = {**opts, "on_node": node_name()}
     where, params = _selection(opts, project, _zone(entry))
     # What a worker's claim escalates by, when its project sets a chain; a claim
     # by hand, or in a project without one, escalates nothing.
@@ -9439,7 +9514,7 @@ A task you create carries only what `writes.new` allows: {new}. A status it does
 
 _SCOPE_LABELS = {"status": "status", "type": "type", "assignee": "assignee",
                  "pickup": "pickup", "metadata": "writing over or removing the metadata keys",
-                 "tags": "removing the tags", "line": "line"}
+                 "tags": "removing the tags", "line": "line", "node": "node"}
 
 
 def _scope_words(entries: dict) -> str:
@@ -9755,7 +9830,8 @@ def _next_candidate(cur, worker: dict, project: str, tz,
     """The ask that would yield and the task it would take, asked in the order a
     claim asks in and writing nothing, or two Nones when nothing is there."""
     for ask in _asks(worker):
-        where, params = _selection({**ask, "not_ids": list(exclude)}, project, tz)
+        where, params = _selection({**ask, "not_ids": list(exclude),
+                                    "on_node": node_name()}, project, tz)
         cur.execute(f"""select * from {SCHEMA}.tasks_tasks{where}
                         order by pickup_at asc nulls last, created_at asc
                         limit 1""", params)
@@ -14427,7 +14503,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 1
-STORE_MINOR = 9
+STORE_MINOR = 10
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -15320,6 +15396,17 @@ comment on column tasks_tasks.line is
   'takes a task of this project only for a worker of the same line.';
 """
 
+# A task may name the one node that claims it: the value a raise records as
+# its `node`, so "this node" means one thing on both sides of a claim. Null is
+# any node, which every task written before the column is.
+_TASK_NODE = r"""
+alter table tasks_tasks add column node text
+  constraint tasks_tasks_node_check check (node <> '');
+comment on column tasks_tasks.node is
+  'The one node that may claim the task, by the value a raise records as its node; '
+  'null is any node. A claim on another node never takes it.';
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
@@ -15332,6 +15419,7 @@ STORE_STEPS = [
     ("0009-change-versions", _CHANGE_VERSIONS),
     ("0010-service-presence", _SERVICE_PRESENCE),
     ("0011-lines", _LINES),
+    ("0012-task-node", _TASK_NODE),
 ]
 
 

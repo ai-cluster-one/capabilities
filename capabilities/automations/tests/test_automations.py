@@ -95,7 +95,6 @@ class AutomationsTests(unittest.TestCase):
         self.env.update(
             {
                 "CLAUDE_PROJECT_DIR": str(self.root),
-                "AUTOMATIONS_ENVIRONMENT": "test",
                 "XDG_STATE_HOME": str(Path(self.tmp.name) / "xdg-state"),
             }
         )
@@ -702,8 +701,12 @@ environments = ["production"]
     @needs_store
     def test_import_moves_every_automation_as_a_path_and_empties_the_file(self) -> None:
         config_path = self.legacy_config()
-        # `production` names no node here, so nothing is imported until one does.
+        # `production` names no node here, so nothing is imported until one does:
+        # the file's own label (`test`) is this node, and the retired selector
+        # that names `production` is read by nothing.
+        self.env["AUTOMATIONS_ENVIRONMENT"] = "production"
         refused = self.cli("import", check=False)
+        del self.env["AUTOMATIONS_ENVIRONMENT"]
         self.assertEqual(refused.returncode, 6)
         error = json.loads(refused.stderr)["error"]
         self.assertEqual(error["code"], "definitions_not_importable")
@@ -947,17 +950,17 @@ environments = ["production"]
         # The daemon and whatever asks it for a health answer need not share an
         # environment, and if the fingerprint moved with one they would disagree
         # permanently: a stale verdict no restart could ever clear.
-        before = os.environ.get("AUTOMATIONS_ENVIRONMENT")
+        before = os.environ.get("AUTOMATIONS_NAMESPACE")
         try:
-            os.environ["AUTOMATIONS_ENVIRONMENT"] = "production"
+            os.environ["AUTOMATIONS_NAMESPACE"] = "production"
             production = RUNTIME.config_fingerprint(self.loaded())
-            os.environ["AUTOMATIONS_ENVIRONMENT"] = "development"
+            os.environ["AUTOMATIONS_NAMESPACE"] = "development"
             development = RUNTIME.config_fingerprint(self.loaded())
         finally:
             if before is None:
-                os.environ.pop("AUTOMATIONS_ENVIRONMENT", None)
+                os.environ.pop("AUTOMATIONS_NAMESPACE", None)
             else:
-                os.environ["AUTOMATIONS_ENVIRONMENT"] = before
+                os.environ["AUTOMATIONS_NAMESPACE"] = before
         self.assertEqual(production, development)
         # A definition saved in the store moves it, from whichever machine.
         self.define("added", script_path="capabilities/automations/scripts/job.py")
@@ -1374,13 +1377,13 @@ environments = ["production"]
         conn = RUNTIME._database().connect(application_name="automations-test")
         try:
             row = conn.execute(
-                "SELECT node, host, environment FROM automations_runs WHERE id = %s",
+                "SELECT node, host FROM automations_runs WHERE id = %s",
                 [run["id"]]).fetchone()
             other = conn.execute(
                 "SELECT node FROM automations_runs WHERE id = %s", [placed["id"]]).fetchone()
         finally:
             conn.close()
-        self.assertEqual(row, (LAB_NODE, socket.gethostname(), LAB_NODE))
+        self.assertEqual(row, (LAB_NODE, socket.gethostname()))
         self.assertEqual(other, (self.node,))
 
     @needs_store
@@ -1597,19 +1600,28 @@ environments = ["production"]
         # The body is written to a file of its own for the one run, run through
         # its #! line in the project with the same variables; the file is the
         # shared contract's, named by the body's digest, and kept for its next run.
-        self.define("bodied", script_body="#!/bin/sh\n"
-                    "echo \"$AUTOMATION_ID $1 $AUTOMATION_ENVIRONMENT $(pwd)\"\n",
-                    arguments=["first"], node=self.node)
+        # The job is handed the node it runs on and no environment label, though
+        # the retired selector is still set: it stops nothing and does nothing.
+        self.env["AUTOMATIONS_ENVIRONMENT"] = "production"
+        (self.root / ".env").write_text("AUTOMATIONS_ENVIRONMENT=staging\n")
+        script = ("#!/bin/sh\necho \"$AUTOMATION_ID $1 $AUTOMATION_NODE "
+                  "${AUTOMATION_ENVIRONMENT-none} $(pwd)\"\n")
+        self.define("bodied", script_body=script, arguments=["first"], node=self.node)
         started = json.loads(self.cli("service", "start").stdout)
         run = json.loads(self.cli("run", "bodied").stdout)["run"]
         row = self.wait_status(run["id"], {"succeeded", "failed"})
         self.assertEqual(row["status"], "succeeded", row)
-        self.assertEqual(row["summary"], f"bodied first test {self.root.resolve()}")
+        self.assertEqual(row["summary"], f"bodied first {self.node} none {self.root.resolve()}")
+        doctor = json.loads(self.cli("doctor").stdout)
+        self.assertTrue(doctor["ok"], doctor)
+        self.assertNotIn("environment", doctor)
+        self.assertEqual([(r["key"], r["set_in"]) for r in doctor["retired"]],
+                         [("AUTOMATIONS_ENVIRONMENT",
+                           ["process environment", str(self.root / ".env")])])
         self.assertEqual(row["definition_id"],
                          json.loads(self.cli("history", "bodied").stdout)["versions"][-1]["version"])
-        body = "#!/bin/sh\necho \"$AUTOMATION_ID $1 $AUTOMATION_ENVIRONMENT $(pwd)\"\n"
         self.assertEqual([p.name for p in (Path(started["state_dir"]) / "bodies").iterdir()],
-                         [hashlib.sha256(body.encode()).hexdigest()])
+                         [hashlib.sha256(script.encode()).hexdigest()])
 
     @needs_store
     def test_a_run_receives_the_result_the_last_run_recorded(self) -> None:
@@ -1837,9 +1849,9 @@ def test_a_run_inserted_without_a_node_is_refused_rather_than_recorded_under_its
     led = ledger_env()
     with pytest.raises(psycopg.errors.NotNullViolation):
         led._execute(
-            "INSERT INTO automations_runs (id, project_id, automation_slug, environment, "
+            "INSERT INTO automations_runs (id, project_id, automation_slug, "
             "trigger, status, queued_at, log_path, host) VALUES "
-            "(%s, %s, 'nightly', 'production', 'manual', 'pending', %s, '/tmp/x.log', 'old-node')",
+            "(%s, %s, 'nightly', 'manual', 'pending', %s, '/tmp/x.log', 'old-node')",
             [uuid.uuid4().hex, led.project_id, RUNTIME.iso()])
     assert led.list() == []
 
@@ -1918,7 +1930,7 @@ def test_the_ledger_refuses_without_a_store(tmp_path, monkeypatch):
         {"schema": "capabilities.project.v2", "slug": "nostore"}))
     (root / ".env.local").write_text("CAPABILITIES_PROJECT_ID=prj_nostore00000\n")
     with pytest.raises(RUNTIME.StoreUnavailable) as caught:
-        RUNTIME.open_ledger(root, {"engine": {"environment": "development"}})
+        RUNTIME.open_ledger(root, {"engine": {}})
     assert caught.value.slug == "store_not_configured"
     assert "capabilities store set" in caught.value.hint
     assert not (tmp_path / "store.db").exists()
@@ -1959,12 +1971,12 @@ def test_a_read_with_no_id_to_read_under_reads_as_empty(tmp_path, ledger_env, mo
         {"schema": "capabilities.project.v1", "slug": "unstamped"}))
     monkeypatch.setattr(RUNTIME, "PROJECT_ID_FOR_WRITE", lambda strict=True: None)
     monkeypatch.delenv("CAPABILITIES_PROJECT_ID", raising=False)
-    with RUNTIME.open_ledger(root, {"engine": {"environment": "development"}},
+    with RUNTIME.open_ledger(root, {"engine": {}},
                              strict=False) as ledger:
         assert ledger.project_id == ""
         assert ledger.list(limit=10) == []
     with pytest.raises(RUNTIME.ConfigError):
-        RUNTIME.open_ledger(root, {"engine": {"environment": "development"}})
+        RUNTIME.open_ledger(root, {"engine": {}})
 
 
 def test_an_automation_follows_the_service_unless_pinned_where_it_is_placed() -> None:
@@ -2006,7 +2018,7 @@ class _StoreGone(Exception):
 class DownLedger:
     """A ledger whose store is gone: every statement raises."""
 
-    environment = "test"
+    node = "node-a"
     warnings: list[str] = []
 
     def lost(self) -> bool:
@@ -2027,7 +2039,6 @@ class DownLedger:
 class UpLedger:
     """A ledger whose store answers: it keeps the columns written per run."""
 
-    environment = "test"
     warnings: list[str] = []
     node = "node-a"
     host = "host-a"
@@ -2059,7 +2070,7 @@ def _scheduler(tmp_path, *, grace=0.5, timeout=60):
     root = tmp_path / "project"
     (root / "jobs").mkdir(parents=True)
     declared = "version = 1\n[engine]\nmax_parallel = 8\n" \
-               f"shutdown_grace_seconds = {grace}\nenvironment = \"test\"\n"
+               f"shutdown_grace_seconds = {grace}\n"
     rows = []
     for slug, body in (("job", "exec sleep 60"), ("stubborn", STUBBORN)):
         job = root / "jobs" / f"{slug}.sh"
@@ -2109,7 +2120,7 @@ def _start(daemon, run_id, slug="job"):
     """Start a run of `slug`; a `stubborn` one is returned once its trap is set."""
     log_path = daemon.state_dir / "runs" / f"{run_id}.log"
     row = {"id": run_id, "automation_slug": slug, "attempt": 1, "trigger": "manual",
-           "environment": "test", "log_path": str(log_path)}
+           "log_path": str(log_path)}
     with contextlib.suppress(_StoreGone):
         daemon._start(row)
     until = time.monotonic() + 10
@@ -2146,7 +2157,7 @@ def test_a_job_started_as_the_store_drops_is_still_the_daemons(tmp_path, reaped)
     daemon, _ = _scheduler(tmp_path)
     with pytest.raises(_StoreGone):
         daemon._start({"id": "r1", "automation_slug": "job", "attempt": 1,
-                       "trigger": "manual", "environment": "test",
+                       "trigger": "manual",
                        "log_path": str(daemon.state_dir / "runs" / "r1.log")})
     child = daemon.children["r1"]
     reaped.append(child.process)

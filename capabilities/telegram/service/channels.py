@@ -4,12 +4,12 @@ The register is what decides whether a message is answered: per channel - a
 chat, or one forum topic in it - the watermark (`last_processed_message_id`),
 the channel's `/set` overrides, which outgoing voice echoes speak for whom, and
 the dialogue jobs reserved and not yet finished. It is a row of
-`telegram_channels`, keyed by project, environment, connection and channel, so
+`telegram_channels`, keyed by project, connection and channel, so
 whichever node runs the service next reads the register the last one left,
 rather than one of its own on that machine's disk.
 
 The table is this capability's own, created by step `0006-channels` of the
-register's ledger (`jobs.STORE_STEPS`). The daemon holds the register as one
+register's ledger (`jobs.STORE_STEPS`) and keyed as it is by `0007-one-register`. The daemon holds the register as one
 dict of rows, as it always has, and every write is `write`: the rows that
 changed since the store last held them, in one transaction, so a job leaving
 its row and the watermark passing it are one commit. The watermark is written
@@ -22,7 +22,7 @@ a tie, since it is the one in use.
 
 Every function takes an autocommit psycopg connection bound to the store's
 schema - the register's own, `JobStore.conn` - and the scope
-`(project_id, environment, connection)`.
+`(project_id, connection)`.
 """
 
 from __future__ import annotations
@@ -73,21 +73,21 @@ def _values(row: dict) -> tuple:
             json.dumps(state, ensure_ascii=False))
 
 
-def rows(conn, scope: tuple[str, str, str]) -> dict:
+def rows(conn, scope: tuple[str, str]) -> dict:
     """The whole register for the scope, by channel key."""
     found = conn.execute(
         f"SELECT channel_key, {WATERMARK}, settings, voice_echo_senders, state "
-        f"FROM {TABLE} WHERE project_id = %s AND environment = %s AND connection = %s",
+        f"FROM {TABLE} WHERE project_id = %s AND connection = %s",
         tuple(scope)).fetchall()
     return {key: _row(watermark, settings, echoes, state)
             for key, watermark, settings, echoes, state in found}
 
 
 _UPSERT = f"""
-    INSERT INTO {TABLE} AS t (project_id, environment, connection, channel_key,
+    INSERT INTO {TABLE} AS t (project_id, connection, channel_key,
                               {WATERMARK}, settings, voice_echo_senders, state)
-    VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
-    ON CONFLICT (project_id, environment, connection, channel_key) DO UPDATE SET
+    VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
+    ON CONFLICT (project_id, connection, channel_key) DO UPDATE SET
         {WATERMARK} = GREATEST(t.{WATERMARK}, EXCLUDED.{WATERMARK}),
         settings = EXCLUDED.settings,
         voice_echo_senders = EXCLUDED.voice_echo_senders,
@@ -95,7 +95,7 @@ _UPSERT = f"""
         updated_at = now()"""
 
 
-def write(conn, scope: tuple[str, str, str], changed: dict,
+def write(conn, scope: tuple[str, str], changed: dict,
           removed: Iterable[str] = ()) -> None:
     """Write the changed rows and drop the removed ones, in one transaction."""
     with conn.transaction():
@@ -103,11 +103,11 @@ def write(conn, scope: tuple[str, str, str], changed: dict,
             conn.execute(_UPSERT, (*scope, str(key), *_values(row)))
         for key in removed:
             conn.execute(
-                f"DELETE FROM {TABLE} WHERE project_id = %s AND environment = %s "
+                f"DELETE FROM {TABLE} WHERE project_id = %s "
                 "AND connection = %s AND channel_key = %s", (*scope, str(key)))
 
 
-def import_file(conn, scope: tuple[str, str, str], register: dict) -> list[str]:
+def import_file(conn, scope: tuple[str, str], register: dict) -> list[str]:
     """Carry an older `register.json` into the store, in one transaction: each
     channel whose file row is newer than the stored one, or that the store does
     not hold, is written whole. The channel keys taken from the file."""
@@ -118,7 +118,7 @@ def import_file(conn, scope: tuple[str, str, str], register: dict) -> list[str]:
                 continue
             stored = conn.execute(
                 f"SELECT {WATERMARK} FROM {TABLE} WHERE project_id = %s "
-                "AND environment = %s AND connection = %s AND channel_key = %s "
+                "AND connection = %s AND channel_key = %s "
                 "FOR UPDATE", (*scope, str(key))).fetchone()
             if stored is not None and _watermark(row) <= int(stored[0] or 0):
                 continue
