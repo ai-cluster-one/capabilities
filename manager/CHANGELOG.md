@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-04 — `node rekey` moves the node a task names
+
+`node rekey` moves `tasks_tasks.node`, the node a task names as the one that claims it, with every other column that names a node, so a task bound to a node is still that node's after its id changes. A store whose `tasks` tables predate the column has nothing there to move.
+
 ## 2026-11-03 — `inbox` is a core capability
 
 `inbox` joins the catalogue's core tier beside `agenttemplates`, `askproject`, `assets`, `automations`, `context`, `deployment`, `memory`, `routine` and `tasks`: `capabilities list` shows it as `tier` "core", and its first install from the official catalogue on a machine arrives allowed and enabled at global scope, where that scope holds no entry for it yet. A machine that already has it installed keeps its quarantine, allowance and gates as they are; after arrival it is gated, enabled and granted as before, and its bundled service still needs an explicit project enable.

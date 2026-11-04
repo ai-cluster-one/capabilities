@@ -1209,8 +1209,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             if state["current_request"]["kind"] == "registered job":
                 return successful_result("count complete")
             store, register = daemon.jobs.open_register(
-                daemon.PROJECT_CAPABILITIES_DIR, daemon.ENVIRONMENT,
-                setting=daemon.STORE_SETTING)
+                daemon.PROJECT_CAPABILITIES_DIR, setting=daemon.STORE_SETTING)
             try:
                 row = register.register(
                     channel_key=state["channel_key"],
@@ -1310,8 +1309,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 if state["current_request"]["kind"] == "registered job":
                     return successful_result("count complete")
                 store, register = daemon.jobs.open_register(
-                    daemon.PROJECT_CAPABILITIES_DIR, daemon.ENVIRONMENT,
-                    setting=daemon.STORE_SETTING)
+                    daemon.PROJECT_CAPABILITIES_DIR, setting=daemon.STORE_SETTING)
                 try:
                     row = register.register(
                         channel_key=state["channel_key"],

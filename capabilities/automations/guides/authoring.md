@@ -10,7 +10,7 @@ A script is either a file in the project, named by its path relative to the proj
 
 A project whose `config.toml` still declares `[[automations]]` is moved with `automations import --apply`, which saves each as a definition whose script stays the path it was and takes them out of the file; until then the commands that read the declaration refuse and name the import.
 
-Scripts inherit the service environment, including values loaded from the project's `.env` and `.env.local`, so credentials remain in environment variables rather than in a definition. A script receives its run identity and project paths through the `AUTOMATION_*` variables listed by `automations help`. Exit zero for success and non-zero for failure; stdout and stderr are captured into the run log.
+Scripts inherit the service environment, including values loaded from the project's `.env` and `.env.local`, so credentials remain in environment variables rather than in a definition. A script receives its run identity and project paths through the `AUTOMATION_*` variables listed by `automations help`. Work between an agent's nodes is told apart by the node alone: a script that must behave differently on one node reads `AUTOMATION_NODE`, the node it runs on, and no environment label is handed to it. Exit zero for success and non-zero for failure; stdout and stderr are captured into the run log.
 
 One run of an automation is active at a time across every node: a scheduled firing that finds one running or queued is recorded `skipped`, so polling and reconciliation work never piles up behind a slow run.
 

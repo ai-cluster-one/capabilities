@@ -264,14 +264,13 @@ DAEMON_FINGERPRINT_FILE = "daemon.fingerprint"
 def config_fingerprint(config: dict[str, Any]) -> str:
     """Twelve hex characters standing for everything a person declared.
 
-    `environment` and `namespace` are excluded deliberately: both are taken
-    from the process environment, so a daemon started under one and a doctor
-    invoked under another would disagree about them permanently, and every
-    comparison would report a change that no restart could ever settle. What
-    remains is the declaration itself, which is what a restart actually
-    reloads."""
+    `namespace` is excluded deliberately: it is taken from the process
+    environment, so a daemon started under one and a doctor invoked under
+    another would disagree about it permanently, and every comparison would
+    report a change that no restart could ever settle. What remains is the
+    declaration itself, which is what a restart actually reloads."""
     engine = {key: value for key, value in config["engine"].items()
-              if key not in {"environment", "namespace"}}
+              if key != "namespace"}
     # The automations are the definition rows read from the store, so a change
     # to one, from any machine, moves the fingerprint of every daemon that
     # reads the project.
@@ -286,18 +285,17 @@ def config_fingerprint(config: dict[str, Any]) -> str:
 def daemon_record(config: dict[str, Any]) -> str:
     """Everything the running daemon publishes about what it loaded.
 
-    The fingerprint answers *which declaration*; the environment answers *which
-    of it is in force*, and the second is taken from the daemon's own process
-    environment, which nothing outside that process can see. A supervisor that
-    exports one environment and a terminal opened later that carries none are
-    the ordinary case, so the loaded value is written down rather than
-    re-derived by whoever asks. It rides in the file the daemon already writes
-    beside its pid and behind the same lock, because a second file answering
-    for the same process is a second thing to disagree with.
+    The fingerprint answers *which declaration*; the node answers *where it
+    schedules*, and the second is taken from the daemon's own process, which
+    nothing outside that process can see. A supervisor that hands the daemon a
+    node and a terminal opened later that carries none are the ordinary case,
+    so the loaded value is written down rather than re-derived by whoever
+    asks. It rides in the file the daemon already writes beside its pid and
+    behind the same lock, because a second file answering for the same
+    process is a second thing to disagree with.
     """
     return json.dumps({
         "config": config_fingerprint(config),
-        "environment": config["engine"]["environment"],
         "node": NODE_NAME(),
     }, sort_keys=True) + "\n"
 
@@ -306,7 +304,7 @@ def read_daemon_record(state_dir: Path) -> dict[str, Any]:
     """What the running daemon published, as far as it published anything.
 
     A daemon started by an older payload wrote the bare fingerprint and no
-    environment, and it keeps running across an upgrade, so that form is read
+    node, and it keeps running across an upgrade, so that form is read
     as what it is rather than as a damaged record."""
     try:
         text = (state_dir / DAEMON_FINGERPRINT_FILE).read_text().strip()
@@ -326,12 +324,6 @@ def read_daemon_record(state_dir: Path) -> dict[str, Any]:
 def read_config_fingerprint(state_dir: Path) -> str | None:
     """What the running daemon recorded, or None if it recorded nothing."""
     value = read_daemon_record(state_dir).get("config")
-    return value if isinstance(value, str) and value else None
-
-
-def read_daemon_environment(state_dir: Path) -> str | None:
-    """The environment the running daemon loaded, or None if it published none."""
-    value = read_daemon_record(state_dir).get("environment")
     return value if isinstance(value, str) and value else None
 
 
@@ -455,9 +447,6 @@ def normalise_config(root: Path, raw: dict[str, Any],
             engine.get("shutdown_grace_seconds", 15.0),
             "engine.shutdown_grace_seconds",
             0.0,
-        ),
-        "environment": os.environ.get("AUTOMATIONS_ENVIRONMENT") or str(
-            engine.get("environment") or "development"
         ),
         "namespace": os.environ.get("AUTOMATIONS_NAMESPACE") or str(
             engine.get("namespace") or root.name
@@ -657,10 +646,11 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
     """The `[[automations]]` entries of a config.toml as store definitions, for
     `import`: (definitions, refusals). Each definition is
     {"slug", "fields", "from"}; a refusal names the entry and why it cannot be
-    imported. `environments` becomes the one node: the environment in force here
-    is this node, `nodes` maps the others, and an enabled automation whose
-    environments reach no node, or reach two, is refused rather than imported
-    to stop."""
+    imported. The old file's `environments` labels become the one node: the
+    label the file itself ran under here (`here_environment`, its own
+    engine.environment, else development) is this node, `nodes` maps the
+    others, and an enabled automation whose labels reach no node, or reach two,
+    is refused rather than imported to stop."""
     entries = raw.get("automations") or []
     if not isinstance(entries, list):
         return [], ["automations must be an array of tables"]
@@ -706,9 +696,9 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
                                   "automation is scheduled on one node")
             if not reached and enabled:
                 raise ConfigError(f"none of its environments ({', '.join(environments)}) "
-                                  "names a node: the one in force here is "
-                                  f"{here_environment!r}, node {here_node!r}; pass "
-                                  "--node <environment>=<node> for the one it runs under")
+                                  "names a node: the file's own label, "
+                                  f"{here_environment!r}, is node {here_node!r}; pass "
+                                  "--node <label>=<node> for the one it runs under")
             timeout = _number(item.get("timeout_seconds", 300), "timeout_seconds", 1)
             fields = {
                 "description": text,
@@ -742,7 +732,7 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
 # than across the table, because one database serves every project on every
 # machine, and two projects living in directories of the same name would
 # otherwise take each other's firings. (Rows written before the definitions
-# moved into the store carry namespace and environment in front of it.)
+# moved into the store carry the namespace and the retired label in front of it.)
 #
 # `node` names the node a run belongs to: the one that schedules it, or for a
 # manual run the definition's node, else the machine that asked. Recovery,
@@ -768,9 +758,16 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
 # Every run is inserted with its node, so the trigger that filled a missing
 # node from the host is dropped (`0007-runs-node-written`): a host is a machine
 # name, never a node id, and an insert without a node is refused.
+#
+# Work between an agent's nodes is told apart by the node alone, so the column
+# that held the label a run was queued under, and since the definitions moved
+# into the store a copy of its node, is written and read by nothing
+# (`0008-runs-environment-retired`). It is made nullable rather than dropped:
+# every earlier release still inserts it, and a machine on the store that has
+# not updated yet keeps queueing runs, so no store upgrade is needed.
 LEDGER_OWNER = "automations"
 LEDGER_MAJOR = 1
-LEDGER_MINOR = 4
+LEDGER_MINOR = 5
 # The most a run may record: it is handed to the next run as one environment
 # variable, which the kernel caps at 128 KiB.
 RESULT_MAX_BYTES = 65536
@@ -947,6 +944,12 @@ LEDGER_STEPS = [
     ("0007-runs-node-written", """
     DROP TRIGGER automations_runs_node_from_host ON automations_runs;
     DROP FUNCTION automations_runs_node_from_host();
+    """),
+    ("0008-runs-environment-retired", """
+    ALTER TABLE automations_runs ALTER COLUMN environment DROP NOT NULL;
+    COMMENT ON COLUMN automations_runs.environment IS
+        'The retired environment label of earlier releases, which still write it; '
+        'no longer written, and null on every run recorded since.';
     """),
 ]
 
@@ -1396,11 +1399,11 @@ class RunLedger:
         with self.transaction():
             inserted = self._execute(
                 "INSERT INTO automations_runs (id, project_id, automation_slug, "
-                "environment, trigger, scheduled_for, dedupe_key, status, attempt, "
+                "trigger, scheduled_for, dedupe_key, status, attempt, "
                 "parent_run_id, queued_at, log_path, host, node, definition_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s) "
+                "VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (project_id, dedupe_key) DO NOTHING",
-                (run_id, self.project_id, slug, node, trigger,
+                (run_id, self.project_id, slug, trigger,
                  scheduled_for, dedupe_key, attempt, parent_run_id, iso(),
                  str(log_path), self.host, node, definition_id)).rowcount
         if not inserted:
@@ -2080,9 +2083,9 @@ class Daemon:
             "AUTOMATION_RUN_ID": row["id"],
             "AUTOMATION_ATTEMPT": str(row["attempt"]),
             "AUTOMATION_TRIGGER": row["trigger"],
-            # What a script reads stays what it read before definitions moved
-            # into the store, though the run row now records the node here.
-            "AUTOMATION_ENVIRONMENT": self.config["engine"]["environment"],
+            # The node the job runs on, which is how a script tells one node's
+            # work from another's.
+            "AUTOMATION_NODE": self.node,
             "AUTOMATION_NAMESPACE": self.config["engine"]["namespace"],
             "AUTOMATION_PROJECT_ROOT": str(self.root),
             "AUTOMATION_STATE_DIR": str(self.state_dir),
@@ -2336,7 +2339,7 @@ class Daemon:
         pid_path.write_text(f"{os.getpid()}\n")
         # Written behind the lock and beside the pid, because it answers for the
         # same process: which configuration the daemon still running loaded, and
-        # which environment it loaded it under.
+        # which node it schedules for.
         fingerprint_path.write_text(daemon_record(self.config))
         self.recover()
 
@@ -2476,7 +2479,7 @@ class ProjectSlot:
         here = sum(1 for item in daemon.config["automations"]
                    if scheduled_here(item, daemon.node, daemon.config.get("placed_on")))
         self.log(f"served: {len(daemon.by_id)} automations declared, {here} scheduled on "
-                 f"node {daemon.node}, environment {daemon.config['engine']['environment']}")
+                 f"node {daemon.node}")
         return True
 
     def tick_seconds(self) -> float:
@@ -2560,7 +2563,6 @@ class ProjectSlot:
         if self.daemon is not None:
             row.update({
                 "node": self.daemon.node,
-                "environment": self.daemon.config["engine"]["environment"],
                 "fingerprint": config_fingerprint(self.daemon.config),
                 "reload_error": self.daemon.reload_error,
                 "automations": len(self.daemon.by_id),

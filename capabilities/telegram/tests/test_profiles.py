@@ -559,13 +559,11 @@ class Tables(unittest.TestCase):
             (Path(tmp) / ".env.local").write_text(f"CAPABILITIES_PROJECT_ID={project_id()}\n")
             with mock.patch.object(db, "migrate", recording), \
                     mock.patch.object(jobs, "_PROFILE_STORE_STEPS", steps):
-                store, _reg = jobs.open_register(envelope, "development",
-                                                 setting=store_setting())
+                store, _reg = jobs.open_register(envelope, setting=store_setting())
                 store.close()
                 order_daemon = list(order)
                 order.clear()
-                store, _reg = jobs.open_register(envelope, "development",
-                                                 setting=store_setting(),
+                store, _reg = jobs.open_register(envelope, setting=store_setting(),
                                                  profile_tables=False)
                 store.close()
         self.assertEqual(order_daemon, ["harness", jobs.STORE_OWNER])
@@ -686,7 +684,7 @@ class MigrateProfiles(unittest.TestCase):
         self.cli = import_cli()
         self.jobs = self.cli._jobs_module()
         self.store, self.reg = self.jobs.open_register(
-            self.envelope, "production", project_id=self.project, setting=self.setting,
+            self.envelope, project_id=self.project, setting=self.setting,
             profile_tables=False)
         self.addCleanup(self.store.close)
         self.conn = connect(application_name="telegram", setting=self.setting)
@@ -727,7 +725,7 @@ class MigrateProfiles(unittest.TestCase):
 
         def open_register(root, write=True):
             return self.jobs, self.jobs.open_register(
-                self.envelope, "production", project_id=self.project,
+                self.envelope, project_id=self.project,
                 setting=self.setting, profile_tables=False)[1]
 
         clean = {k: v for k, v in os.environ.items()
@@ -1024,15 +1022,15 @@ class ServiceHarness(unittest.TestCase):
         root = Path(tmp.name)
         (root / "capabilities").mkdir()
         jobs_module = cli._jobs_module()
-        store, reg = jobs_module.open_register(root / "capabilities", "production",
+        store, reg = jobs_module.open_register(root / "capabilities",
                                                project_id=project, setting=setting)
         self.addCleanup(store.close)
         conn = connect(application_name="telegram", setting=setting)
         self.addCleanup(conn.close)
         lib.save_profile(conn, "telegram-fast", CODEX, scope="project",
                          schema=setting.schema, scope_id=project)
-        conn.execute("INSERT INTO telegram_channels (project_id, environment, connection, "
-                     "channel_key, settings) VALUES (%s, 'production', 'probe', '11', "
+        conn.execute("INSERT INTO telegram_channels (project_id, connection, "
+                     "channel_key, settings) VALUES (%s, 'probe', '11', "
                      "'{\"profile\": \"telegram-fast\"}'::jsonb)", (project,))
         conn.commit()
         legacy = reg.submit(reg.register(channel_key="11", requested_by="11",
@@ -1055,10 +1053,9 @@ class ServiceHarness(unittest.TestCase):
             return code, json.loads(out.getvalue() if code == 0
                                     else err.getvalue().splitlines()[-1])
 
-        settings = {"environment": "production",
-                    "defaults": {"profile": "telegram-claude"}}
+        settings = {"defaults": {"profile": "telegram-claude"}}
         env = {k: v for k, v in os.environ.items()
-               if k not in ("TELEGRAM_SERVICE_PROFILE", "TELEGRAM_ENVIRONMENT")}
+               if k not in ("TELEGRAM_SERVICE_PROFILE",)}
         with mock.patch.dict(os.environ, env, clear=True), \
                 mock.patch.object(cli, "_service_project_root", lambda: root), \
                 mock.patch.object(cli, "_jobs_module", return_value=mock.Mock(

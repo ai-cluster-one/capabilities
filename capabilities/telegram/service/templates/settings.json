@@ -1,6 +1,5 @@
 {
   "connection": null,
-  "environment": "production",
   "assistant_name": "Assistant",
   "direct_messages": {
     "mode": "allowed_users",
