@@ -1,0 +1,2027 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "capabilities-contract>=0.42,<1",
+#     "psycopg[binary]>=3.2",
+#     "httpx>=0.27",
+#     "telethon==1.45.0",
+#     "callva-harness-runner==0.10.2",
+# ]
+# ///
+"""telegrambot — an agent's own Telegram channel, through a bot.
+
+Agent-invoked. One connection is one bot, made with BotFather. New messages
+arrive and every write leaves through the HTTP Bot API; history is read back
+from Telegram by message number through a separate MTProto session the bot's
+own token signs in (no account, no login ceremony). Nothing keeps a copy of the
+conversation: Telegram is its only home. Run `telegrambot doctor` first.
+
+It refuses: reading chats the bot is not in, searching history, jumping to a
+date, listing chats (Telegram gives a bot none of these; `seen` lists what the
+bot itself has seen), reading history in a group where the bot does not see
+every message (privacy mode on and not an admin), calls, and a second account.
+
+CONNECTIONS
+  One connection is one bot and holds everything that bot needs, so it is whole
+  by itself on any machine. Where this project keeps it, `telegrambot
+  connections` says:
+
+    {"default": "<id>",
+     "connections": {"<id>": {
+        "secret_env":   "TELEGRAMBOT_<ID>_BOT_TOKEN",
+        "api_id_env":   "TELEGRAMBOT_<ID>_API_ID",
+        "api_hash_env": "TELEGRAMBOT_<ID>_API_HASH",
+        "deepgram_env": "TELEGRAMBOT_<ID>_DEEPGRAM_KEY"}}}
+
+  secret_env    the bot token from BotFather. Required.
+  api_id_env    the App api_id from my.telegram.org/apps. With api_hash_env it
+                lets the bot read history; without the two the bot runs with
+                no history and says so in doctor and in every turn.
+  api_hash_env  the App api_hash paired with that api_id.
+  deepgram_env  the Deepgram key voice messages are transcribed with. Without
+                it voice messages reach a turn as a voice attachment only.
+
+  Each field names an env key; its value resolves through the credential
+  cascade (`Where a secret resolves`, at the end of this help), the agent's
+  vault first. Give a value and it is sealed into the vault under the
+  connection's own key; name a key the vault (or any tier) already holds and
+  the connection refers to it instead:
+
+    telegrambot connection add <id> --stdin \
+        <<< '{"secret_env": "<token>", "api_id_env": "<api_id>",
+              "api_hash_env": "<api_hash>"}'
+    telegrambot connection add <id> --env secret_env=<KEY> \
+        --env api_id_env=<KEY> --env api_hash_env=<KEY> \
+        --env deepgram_env=DEEPGRAM_API_KEY
+
+  A new connection that names no Deepgram key is given a reference to the
+  machine's shared one (DEEPGRAM_API_KEY, `telegrambot setup`) where the
+  machine holds one, sealed into the vault and named in the answer's
+  `prefilled`. That is the only default: a connection that names no key has
+  none, and no machine value stands in for it at run time.
+
+  Writes are refused by default: send and react need `allow_write: true`
+  granted on the connection. Selection: --connection <id> anywhere on the
+  line, else the "default" pointer, else the sole entry.
+
+  One token is polled by one process. A bot another product also polls (an
+  app's notification channel, a webhook) cannot be served here: doctor names
+  the webhook, and a poll that collides fails `poll_conflict`.
+
+COMMANDS
+  Readiness
+    doctor [--connection <id>]
+        Per connection, from Telegram: the bot (getMe: id, username, name);
+        privacy mode (on means a group delivers only commands, replies and
+        mentions, unless the bot is an admin there); whether a webhook is set
+        (then nothing may poll the bot); history readiness (api_id and
+        api_hash resolve and the MTProto session signs in with the token);
+        voice readiness (the Deepgram key resolves and Deepgram accepts it).
+        Bot-to-Bot mode is not readable: it is reported unknown. ok is the
+        token's verdict; what the bot lacks is listed under `missing` and in
+        each part's `reason`. Exit 2 token missing or rejected, 5 unreachable.
+    connections
+        Where every value of every connection resolves from, secrets masked.
+        Local only.
+
+  Who the bot has seen
+    seen [--kind chat|topic|person]
+        The chats, forum topics and people the bot has seen, from the store:
+        Telegram id, title or name, username, chat type, whether a person is
+        a bot, the bot's own membership in a chat, first and last seen. No
+        text. A bot cannot list its chats or find a person by @username, so
+        this is how a chat or a person is found to be allowed. Decide by id:
+        a name can be anyone's. Local to the store: no Telegram call.
+
+  History (needs api_id and api_hash on the connection)
+    history <chat> [--topic N] [--before ID] [--limit N]
+        Messages of one chat (and one forum topic) numbered below ID, oldest
+        first: steps back from ID through the bot's message numbers, keeping
+        only this chat's, at most 5 requests of 100 numbers (about 0.1 s
+        each). --limit 1-100 (default 40). Without --before, from the newest
+        message the service recorded in that chat. In a private chat the
+        numbers are shared with every other private chat of the bot, so a
+        busy bot reaches back less far for the same --limit. The answer says
+        how many it read of how many it wanted and why it stopped short
+        (`complete`, `reason`); an empty answer is a read that found nothing,
+        never a refusal. Refused (exit 4 group_not_visible) in a group where
+        the bot does not see every message. Exit 7 history_unavailable when
+        the connection names no api_id and api_hash.
+    download <chat> <message> [--out PATH]
+        Fetch the file a message carries (any size) to PATH, default
+        <state>/<connection>/files/<chat>-<message>-<name>. {path, bytes}.
+
+  Writes (allow_write on the connection)
+    send <chat> <text|-> [--topic N] [--reply-to ID] [--file PATH]
+        Send text (- reads it from stdin), cut into messages of at most 4096
+        characters; with --file, the file as a document (at most 50 MB) with
+        the text as its caption. {message_ids}. Not idempotent: Telegram has
+        no dedup key. A send whose outcome is unknown (a timeout after it
+        left) exits 5 delivery_unknown: read the chat before sending again.
+    react <chat> <message> [<emoji>]
+        Set the bot's one reaction on a message; without an emoji, clear it.
+        Repeating it is safe. The emoji must be one the chat allows.
+
+  Prompts (the agent's own text over the standard the bundle ships)
+    prompts list
+    prompts show <key>
+    prompts put <key> [--base ID] [--note TEXT]     (body on stdin)
+    prompts history <key>
+    prompts retire <key>
+        Keys: bot (the agent's one prompt, read every turn after the
+        standard; empty is the standard alone), delegation (replaces the
+        standard text about handing work to a background job), and
+        context.<name> (a chat's or a topic's own context, which the service
+        settings name). Every save is a new version; the one it replaces
+        stays in history. --base names the version you read (its id or six
+        or more of its first characters) and refuses the save (exit 6
+        base_mismatch) when another was saved since. retire leaves no active
+        version and deletes nothing. show answers {key, body, version,
+        source}: store, bundle (delegation's standard text) or none.
+
+  Profiles (how a turn runs: harness, model, effort, rights)
+    profiles list | profiles show <name>
+    profiles save <name> <file|-> [--base VERSION]
+        Every telegrambot profile this project reaches: the project's version
+        in the store, the global one, then the bundled telegrambot-claude,
+        -codex, -job-claude, -job-codex and the reply gate's -gate-claude and
+        -gate-codex. A name always starts telegrambot-. save writes a new
+        version at this project's scope (exit 6 conflict when --base is not
+        the active one); inside a turn only for a requester whose role may
+        /set. list and show never print an env_set value or a settings object.
+
+  Jobs (work a turn hands off; needs `delegation: allowed`)
+    jobs help | list | active | show | register | amend | submit | stop |
+    resume | discard
+        `telegrambot jobs help` prints the whole surface. Inside a turn the
+        worker wrapper fixes the chat, topic, requester, origin message and
+        profile, and this CLI takes them from the turn again.
+
+  Service
+    service run [--machine]        foreground; the supervisor's command
+    service stop|reload [--machine] [--timeout S]
+    service status|logs|doctor [--machine]   (logs: --tail N)
+    service harness [--json]       the harnesses this project's turns run on
+
+SERVICE
+  One process per machine serves every bot of every project that joined it
+  (`service run --machine`); `service run` in a project not joined serves
+  that project alone with the same code. A project joins by being placed on
+  the node in mode shared (`capabilities service start telegrambot`, or
+  `capabilities place telegrambot --node <node> --mode shared`); the node
+  manager writes the list, ~/.config/telegrambot/service/projects.json, and
+  this CLI never does. One lock per project decides which process serves it.
+  The service needs the project's store (store_not_configured without one),
+  serves every connection the project grants with allow_write (checked again
+  every 30 s), and one getUpdates poll per bot: a bot with a webhook, or one
+  another process polls, is not served (webhook_set, poll_conflict).
+
+  A message is answered in this order; the first stop wins: the chat is
+  allowed (a private chat by direct_messages.mode and allowed_users, a group
+  by allowed_groups) -> /start is never a turn -> a last line #noreply ->
+  the sender may address it (may_address) -> other bots: at most
+  agent_dialogue.max_turns turns in a row (default 4; a person's message
+  starts the count again; Telegram's own is_bot says who is a bot) -> a
+  service command -> in a group, addressed: @username, an alias, a reply to
+  the bot (`triggers` switches each off; require_reference false admits
+  every message), else the reply gate, else an ambient voice message in an
+  `auto` chat. A stranger is ignored silently and recorded in `seen`.
+
+  An admitted message is reserved in the store before anything is done, the
+  chat shows the bot typing at once, and one person's messages within the
+  channel's debounce become one turn. A channel is a chat or one forum topic
+  (General is topic 1); one turn runs per channel at a time. A turn reads the
+  conversation back by message number (tail_size, at most history_requests
+  reads), climbs the reply chain of the first message, and runs in a fresh
+  harness session on the channel's profile; its answer, cut at
+  `=== REPLY ===`, is sent in parts of 4096, as a reply to the request in a
+  group. An empty answer is silence. A request ending in #external has
+  everything sent for it end in #noreply. In a group where the bot does not
+  see every message (privacy on, not an admin) no history is read and the
+  bot answers only when addressed; with no api_id and api_hash on the
+  connection no history is read anywhere. Each turn's channel state says
+  which, and how far its read reached.
+
+  The prompt, top down: the bundle's mechanics (read every turn, never cut),
+  the bundle's behaviour (`prompt_mode: replace` drops it), the agent's own
+  prompt (`prompts put bot`), the delegation text where the chat may hand
+  off work, the group's or direct sender's context, the topic's context,
+  then the channel state, the request and the conversation. context_mode
+  exclusive on a group cuts the behaviour and the agent's prompt; on a topic
+  it cuts the group's context too. A job reads the job mechanics, the job
+  behaviour, the agent's prompt, its state, its brief and the conversation.
+
+  Voice: an addressed voice message (every one in a voice_transcription
+  `auto` chat) is fetched, transcribed with the connection's Deepgram key,
+  kept on disk under the connection's state, and echoed into the chat as a
+  quote when voice_echo is on; an ambient one is answered only when its
+  words name the bot. The turn reads it as `[voice] <text>`.
+
+  Commands in a chat, each gated by control.roles: /status (settings,
+  profile, history, the replies in flight numbered, open jobs), /stop
+  (everything in flight here) and /stop N (one of the last /status list),
+  /profiles, /reload, /set tail|debounce|worker-timeout|profile|
+  voice-transcription|voice-echo <value|default>, /help. A command with
+  another bot's @suffix is not read at all. The bot's command menu is set at
+  start. Roles come from allowed_users.<id>.role, a group member's role,
+  member_role, direct_messages.default_role; authority.roles hands each turn
+  its CAPABILITIES_AUTH_CONTEXT.
+
+  The reply gate (allowed_groups.<id>.gate {enabled, mode shadow|live,
+  brief, context_messages, context_chars, max_batch, model, effort}): in a
+  group the bot sees whole, unaddressed messages of people collect per
+  channel and, after the debounce, one light run on telegrambot-gate-<the
+  channel's harness> decides ignore, react with one emoji, or reply. shadow
+  logs only; live acts. A failing run is named by service doctor
+  (gate_failing).
+
+  Inside a turn or a job the worker wrapper (service/worker-bin) is first on
+  PATH: `telegrambot progress <text>`, `send current <text> [--file PATH]`,
+  `history`, `download <message>`, `react <message> [<emoji>]` and `jobs`
+  act on this chat only; the channel state names each command.
+
+SETTINGS
+  `telegrambot settings` reads and writes them (service/settings.json at the
+  project's scope over the global one; an agent in the store keeps them as
+  rows). The surface is closed: an unknown key is refused with its path.
+    assistant_name, prompt_mode (extend|replace)
+    direct_messages {mode: allowed_users|anyone|off, default_role}
+    allowed_users {<user id>: {name, role, may_address, profile,
+      worker_timeout, context, context_prompt, context_mode, project,
+      voice_transcription, voice_echo, delegation}}
+    allowed_groups {<chat id>: {name, member_role, members {<user id>:
+      {name, role, may_address}}, may_address (anyone|members), aliases,
+      require_reference, triggers, gate, profile, worker_timeout,
+      voice_transcription, voice_echo, context, context_prompt,
+      context_mode, project, delegation, agent_dialogue {max_turns},
+      topics {<topic id>: {name, profile, context, context_prompt,
+      context_mode, project}}}}
+    agent_dialogue {max_turns}, control {roles {<role>: {commands}}},
+    authority {default, roles {<role>: {allowed_capabilities}}}
+    defaults {tail_size 40, history_requests 5, debounce 2, worker_timeout
+      120, progress_after 15, progress_from_stream false, max_parallel_jobs
+      1, job_recovery requeue|inspect, profile, job_profile,
+      voice_transcription addressed, voice_echo true, delegation disabled}
+  context is inline text; context_prompt names the prompt key
+  context.<name>. project runs that chat's (or topic's, or person's) turns
+  in another project folder. A profile left unset is telegrambot-claude
+  where claude is on PATH, else telegrambot-codex. Settings, connections and
+  profiles take `service reload`; prompts are read every turn.
+
+CHATS AND TOPICS
+  A chat is its Bot API id: a person's id for a private chat, -<id> for a
+  basic group, -100<id> for a supergroup. A forum topic is its number (the
+  message that opened it); General is 1. `seen` lists both.
+
+CONTRACT VERBS
+  telegrambot help | stub | manifest --json | guide [<topic>]
+  telegrambot connection add|remove|seal ... | setup [set|unset]
+  telegrambot settings [get|set|unset|put|export|edit] ...
+  telegrambot ids list|get <l>|set <l> <v> [--note <t>]|rm <l>
+  telegrambot refs | inventory | migrate [status]
+
+I/O
+  Success is JSON on stdout; failure is {"error": {"code", "message", "hint"?,
+  "status"?}} on stderr.
+
+EXIT CODES
+  0 success · 2 auth (token missing or rejected, api_id/api_hash rejected) ·
+  3 not found (unknown chat or message) · 4 policy (the project gate, a write
+  on a connection without a write grant, the read-only switch, history in a
+  group the bot does not fully see - ask the user, never lift a gate
+  yourself) · 5 server/network (timeout, 5xx, 429 after retries, a flood
+  wait, delivery_unknown, poll_conflict) · 6 input (bad arguments, a request
+  Telegram refused) · 7 history_unavailable (the connection names no api_id
+  and api_hash), or service doctor found the service unable to serve, not
+  running or not current · 8 another process already runs the service here.
+"""
+
+import argparse
+import contextlib
+import importlib.util
+import json
+import os
+import re
+import signal
+import sys
+import time
+from pathlib import Path
+from typing import NoReturn
+
+NAME = "telegrambot"
+SUMMARY = ("An agent's own Telegram channel through a bot - new messages and every "
+           "write over the HTTP Bot API, history read back from Telegram by message "
+           "number through an MTProto session the bot's token signs in, the chats and "
+           "people the bot has seen, and the agent's prompts over the shipped standard; "
+           "nothing keeps a copy of the conversation.")
+SCOPE = "project"   # each bot is one agent's own
+CRED_KEYS: list[dict] = []   # every value is the connection's own (CONN_FIELDS)
+
+# What a person is asked for (SHEBANG.md, "What a person is asked for"):
+# a connection entry's own fields, which `connection add` writes. Every value a
+# bot needs is the connection's, so one connection is whole on any machine.
+CONN_FIELDS = [
+    {"key": "secret_env", "label": "Bot token",
+     "help": "The bot's token from BotFather (/newbot, or /token for an existing bot).",
+     "type": "string", "secret": True, "required": True,
+     "env": "TELEGRAMBOT_{ID}_BOT_TOKEN"},
+    {"key": "api_id_env", "label": "App api_id",
+     "help": "The numeric App api_id from my.telegram.org/apps; with the api_hash it lets "
+             "the bot read history. Without both the bot runs with no history.",
+     "type": "string", "secret": True, "required": False,
+     "env": "TELEGRAMBOT_{ID}_API_ID"},
+    {"key": "api_hash_env", "label": "App api_hash",
+     "help": "The App api_hash paired with that api_id, from my.telegram.org/apps.",
+     "type": "string", "secret": True, "required": False,
+     "env": "TELEGRAMBOT_{ID}_API_HASH"},
+    {"key": "deepgram_env", "label": "Transcription key",
+     "help": "The Deepgram key voice messages are transcribed with; a new connection "
+             "refers to the machine's shared DEEPGRAM_API_KEY where there is one.",
+     "type": "string", "secret": True, "required": False,
+     "env": "TELEGRAMBOT_{ID}_DEEPGRAM_KEY"},
+]
+# What the machine is given once: the shared Deepgram key a connection may refer to.
+SETUP_FIELDS = [
+    {"key": "DEEPGRAM_API_KEY", "label": "Transcription key",
+     "help": "The machine's shared Deepgram key; a connection uses it only where it "
+             "names it (deepgram_env).",
+     "type": "string", "secret": True, "required": False, "shared": "DEEPGRAM_API_KEY"},
+]
+WRITE_VERBS = {"send", "react"}
+WRITE_DEFAULT = False   # a send or a reaction reaches people outside the system
+MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/telegrambot/guides/")
+STATE = True        # the MTProto session (an auth key, no text) and fetched files
+TABLES = True       # telegrambot_* tables in the project's store (service/store.py)
+INVENTORY = {"network": "none"}
+POST_INSTALL: list[dict] = []
+# Where this capability's settings live, and the keys a control panel shows;
+# `settings` reads and writes them, `service/settings_schema.py` is the whole surface.
+SETTINGS = {
+    "homes": [{"scope": "project", "path": "service/settings.json", "format": "json",
+               "inherits": "global"},
+              {"scope": "global", "path": "service/settings.json", "format": "json"}],
+    "keys": [
+        {"key": "assistant_name", "label": "Assistant name",
+         "help": "The name the bot answers to in a group, and goes by in its prompt.",
+         "type": "string", "scope": "project", "apply": "reload"},
+        {"key": "prompt_mode", "label": "Prompt mode",
+         "help": "extend puts the agent's prompt after the standard behaviour; replace puts "
+                 "it in its place.", "type": "enum", "choices": ["extend", "replace"],
+         "default": "extend", "scope": "project", "apply": "next_call"},
+        {"key": "direct_messages.mode", "label": "Direct messages",
+         "help": "Who may write to the bot directly.", "type": "enum",
+         "choices": ["allowed_users", "anyone", "off"], "default": "allowed_users",
+         "scope": "project", "apply": "reload"},
+        {"key": "defaults.profile", "label": "Profile",
+         "help": "The harness profile a turn runs on; the signed-in harness's when empty.",
+         "type": "string", "scope": "project", "apply": "reload"},
+        {"key": "defaults.debounce", "label": "Debounce",
+         "help": "Seconds of quiet before one person's messages become one turn.",
+         "type": "number", "default": 2, "minimum": 0, "maximum": 300, "scope": "project",
+         "apply": "reload"},
+        {"key": "defaults.tail_size", "label": "History",
+         "help": "Messages a turn reads back from Telegram.", "type": "integer",
+         "default": 40, "minimum": 1, "maximum": 100, "scope": "project", "apply": "reload"},
+        {"key": "defaults.voice_transcription", "label": "Voice transcription",
+         "help": "Which voice messages are transcribed.", "type": "enum",
+         "choices": ["off", "addressed", "auto"], "default": "addressed",
+         "scope": "project", "apply": "reload"},
+        {"key": "defaults.voice_echo", "label": "Voice echo",
+         "help": "Whether a transcribed voice message is echoed into its chat.",
+         "type": "boolean", "default": True, "scope": "project", "apply": "reload"},
+        {"key": "defaults.delegation", "label": "Background jobs",
+         "help": "Whether turns may hand work to a background job.", "type": "enum",
+         "choices": ["allowed", "disabled"], "default": "disabled", "scope": "project",
+         "apply": "reload"},
+        {"key": "agent_dialogue.max_turns", "label": "Bot turns in a row",
+         "help": "Turns other bots may start in a chat before a person writes; 0 is no "
+                 "limit.", "type": "integer", "default": 4, "minimum": 0, "maximum": 100,
+         "scope": "project", "apply": "reload"},
+    ]}
+SERVICE = {
+    # One poll per bot token: one node at a time (service.placement).
+    "placement": "exclusive",
+    "name": "bots",
+    "summary": ("Serves every bot of every project that joined it, one getUpdates poll "
+                "per bot: admits each message by the project's settings, batches one "
+                "person's messages within the debounce into one turn, reads the "
+                "conversation back from Telegram by message number, answers through a fresh "
+                "harness session on the chat's profile, runs the jobs turns hand over, "
+                "transcribes voice messages, and judges unaddressed group messages with "
+                "the reply gate; once per machine for the projects that join it, or in one "
+                "project."),
+    "verbs": ["doctor", "run", "reload", "stop", "status", "logs", "harness"],
+    "sign_ins": {"harness": ["telegrambot", "service", "harness", "--json"]},
+    "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/telegrambot",
+    "machine": {
+        "schema": "capabilities.service.machine.v1",
+        "command": ["telegrambot", "service", "run", "--machine"],
+        "doctor": ["telegrambot", "service", "doctor", "--machine"],
+        "projects": "$XDG_CONFIG_HOME/telegrambot/service/projects.json",
+        "state": "$XDG_STATE_HOME/capabilities/machine/telegrambot",
+    },
+}
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# The shared capability code is the capabilities-contract library's, bound here
+# into this script's namespace (SHEBANG.md, "The contract verbs").
+from capabilities_contract.capability import bind as _contract_bind
+
+_contract_bind(globals(), "core")
+_contract_bind(globals(), "store")
+_contract_bind(globals(), "connections")
+
+
+# ── the bundle ───────────────────────────────────────────────────────────────
+
+
+def _bundle_dir() -> Path:
+    here = Path(__file__).resolve()
+    return here.parent.parent if here.parent.name == "bin" else here.parent
+
+
+_MODULES: dict = {}
+_MODULES_LOCK = __import__("threading").RLock()
+
+
+def _module(name: str):
+    """A bundled service module, loaded once from the installed bundle; the
+    service's threads ask for them too, so loading one is done under a lock."""
+    with _MODULES_LOCK:
+        if name not in _MODULES:
+            path = _bundle_dir() / "service" / f"{name}.py"
+            spec = importlib.util.spec_from_file_location(f"telegrambot_{name}", path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[f"telegrambot_{name}"] = module
+            spec.loader.exec_module(module)
+            _MODULES[name] = module
+        return _MODULES[name]
+
+
+def _transport():
+    return _module("transport")
+
+
+def _store_module():
+    return _module("store")
+
+
+def _tables():
+    """The steps and version of the telegrambot_* tables, for the contract's `migrate`."""
+    store = _store_module()
+    return store.steps(), store.MAJOR, store.MINOR
+
+
+def _fail(exc) -> NoReturn:
+    _die(exc.exit_code, exc.code, exc.message, getattr(exc, "hint", None),
+         status=getattr(exc, "status", None))
+
+
+# ── connections ──────────────────────────────────────────────────────────────
+
+_FIELD = {f["key"]: f for f in CONN_FIELDS}
+_OPTIONAL_FIELDS = ("api_id_env", "api_hash_env", "deepgram_env")
+
+
+def _connection_prefill(cid: str, entry: dict) -> dict:
+    """What a new connection naming no Deepgram key of its own is given: a
+    reference to the machine's shared DEEPGRAM_API_KEY, where the machine holds
+    one (the contract seals its value into the vault). Nothing else is filled in:
+    api_id and api_hash are the connection's own or absent."""
+    if entry.get("deepgram_env") or not _resolve_env_key("DEEPGRAM_API_KEY")[0]:
+        return {}
+    return {"fields": {"deepgram_env": "DEEPGRAM_API_KEY"}}
+
+
+def _field_report(entry: dict, key: str) -> dict:
+    """One connection field as the report shows it: the env key it names and where
+    that resolves, or the field itself unset."""
+    field = _FIELD[key]
+    env_key = entry.get(key)
+    if isinstance(env_key, str) and env_key:
+        value, tier, source = _resolve_env_key(env_key)
+        row = _key_report(env_key, True, bool(field.get("required")), value, tier, source)
+    else:
+        row = _key_report(key, True, bool(field.get("required")), None, None, None)
+    row["field"] = key
+    return row
+
+
+def _readiness(entry: dict) -> dict:
+    """What a connection can do, from resolution alone (no network)."""
+    have = {key: bool(entry.get(key) and _resolve_env_key(entry[key])[0])
+            for key in CONN_FIELDS_KEYS}
+    missing = [key for key in CONN_FIELDS_KEYS if not have[key]]
+    history = have["api_id_env"] and have["api_hash_env"]
+    return {"history": history, "voice": have["deepgram_env"], "missing": missing}
+
+
+CONN_FIELDS_KEYS = tuple(f["key"] for f in CONN_FIELDS)
+
+
+def _connections_report() -> dict:
+    """Where every value of every connection resolves from, secrets masked.
+    Local only: no network."""
+    reg, _ = _connections_registry()
+    conns = reg["connections"]
+    report: dict = {"default": reg.get("default") or (next(iter(conns)) if len(conns) == 1
+                                                      else None),
+                    "connections": {}}
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        ready = _readiness(entry)
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "keys": [_field_report(entry, key) for key in CONN_FIELDS_KEYS],
+            "history": "ready" if ready["history"] else
+            "off: the connection names no api_id and api_hash that resolve",
+            "voice": "ready" if ready["voice"] else
+            "off: the connection names no Deepgram key that resolves",
+            "identity": _connection_identity(entry)}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
+    """One connection, materialized; or its problem as an error dict."""
+    entry = entry if isinstance(entry, dict) else {}
+    token_env = entry.get("secret_env")
+    token = _resolve_env_key(token_env)[0] if token_env else None
+    if not token:
+        named = token_env or _connection_env_name(_FIELD["secret_env"], cid)
+        return None, {"exit": 2, "code": "missing_secret",
+                      "message": f"connection {cid!r} has no bot token ({named} resolves "
+                                 "nowhere)",
+                      "hint": f"`{NAME} connection add {cid} --replace --stdin` with "
+                              '{"secret_env": "<token>"}'}
+    t = _transport()
+    if t.bot_id_of(token) is None:
+        return None, {"exit": 2, "code": "token_malformed",
+                      "message": f"connection {cid!r}: {token_env} does not hold a bot token "
+                                 "(<digits>:<secret>)"}
+    cfg = {"id": cid, "token": token, "bot_id": t.bot_id_of(token),
+           "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+           "api_id": None, "api_hash": None, "deepgram": None, "history_off": None,
+           "voice_off": None}
+    api_id = _resolve_env_key(entry["api_id_env"])[0] if entry.get("api_id_env") else None
+    api_hash = _resolve_env_key(entry["api_hash_env"])[0] if entry.get("api_hash_env") else None
+    if api_id and api_hash:
+        try:
+            cfg["api_id"], cfg["api_hash"] = int(str(api_id).strip()), api_hash.strip()
+        except ValueError:
+            cfg["history_off"] = f"{entry['api_id_env']} is not a numeric api_id"
+    else:
+        lacking = [k for k, v in (("api_id", api_id), ("api_hash", api_hash)) if not v]
+        cfg["history_off"] = (f"the connection names no {' and no '.join(lacking)} that "
+                              "resolves, so the bot reads no history")
+    key = _resolve_env_key(entry["deepgram_env"])[0] if entry.get("deepgram_env") else None
+    if key:
+        cfg["deepgram"] = key
+    else:
+        cfg["voice_off"] = ("the connection names no Deepgram key that resolves, so voice "
+                            "messages are not transcribed")
+    return cfg, None
+
+
+def _cfg(wanted: str | None, verb: str) -> dict:
+    """Select, gate, then resolve: the write gate refuses before a secret is read."""
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    _write_gate(cid, bool((entry or {}).get("allow_write", WRITE_DEFAULT)), verb)
+    cfg, problem = _build_cfg(cid, entry)
+    if problem:
+        _die(problem["exit"], problem["code"], problem["message"], problem.get("hint"))
+    return cfg
+
+
+def _bot(cfg: dict):
+    return _transport().BotAPI(cfg["token"])
+
+
+def _conn_state(cfg: dict) -> Path:
+    path = _state_dir() / cfg["id"]
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+# ── doctor ───────────────────────────────────────────────────────────────────
+
+
+def _history_check(cfg: dict) -> dict:
+    """Whether the MTProto session signs in with the token: the history door."""
+    if cfg["history_off"]:
+        return {"ready": False, "reason": cfg["history_off"]}
+    t = _transport()
+
+    async def probe():
+        reader = t.HistoryReader(cfg["token"], cfg["api_id"], cfg["api_hash"],
+                                 _conn_state(cfg))
+        try:
+            await reader.open()
+            return str(reader.path)
+        except t.TelegramError:
+            raise
+        except Exception as exc:
+            raise t.mtproto_failure(exc) from None
+        finally:
+            await reader.close()
+
+    started = time.monotonic()
+    try:
+        path = t.run_read(probe, deadline=30.0)
+    except t.TelegramError as exc:
+        return {"ready": False, "reason": f"{exc.code}: {exc.message}"}
+    return {"ready": True, "session": path,
+            "signed_in_ms": int((time.monotonic() - started) * 1000)}
+
+
+def _check_connection(cfg: dict) -> dict:
+    t = _transport()
+    try:
+        with _bot(cfg) as bot:
+            me = bot.get_me()
+            hook = bot.webhook_info()
+    except t.TelegramError as exc:
+        return {"ok": False, "category": exc.exit_code, "error": f"{exc.code}: {exc.message}",
+                **({"hint": exc.hint} if exc.hint else {})}
+    username = me.get("username")
+    with contextlib.suppress(Exception):
+        _record_identity(cfg["id"], str(me.get("id")), f"@{username}" if username else None)
+    privacy_on = not me.get("can_read_all_group_messages")
+    url = hook.get("url") or ""
+    row = {"ok": True,
+           "bot": {"id": me.get("id"), "username": username,
+                   "name": me.get("first_name"), "can_join_groups": me.get("can_join_groups")},
+           "privacy": {"mode": "on" if privacy_on else "off",
+                       "meaning": "in a group the bot sees only commands, replies to it and "
+                                  "mentions, unless it is an admin there; it reads no history "
+                                  "in such a group" if privacy_on else
+                                  "the bot sees every message in the groups it was added to "
+                                  "after privacy was turned off"},
+           "webhook": {"set": bool(url),
+                       **({"host": re.sub(r"^https?://([^/]+).*$", r"\1", url),
+                           "pending_update_count": hook.get("pending_update_count"),
+                           "last_error": hook.get("last_error_message")} if url else {})},
+           "bot_to_bot": "unknown: Telegram says it only to a real send to another bot",
+           "history": _history_check(cfg),
+           "allow_write": cfg["allow_write"]}
+    if cfg["voice_off"]:
+        row["voice"] = {"ready": False, "reason": cfg["voice_off"]}
+    else:
+        found = t.deepgram_check(cfg["deepgram"])
+        row["voice"] = {"ready": bool(found.get("ok")),
+                        **({"reason": found["error"]} if not found.get("ok") else {})}
+    missing = []
+    if not row["history"]["ready"]:
+        missing.append("history")
+    if not row["voice"]["ready"]:
+        missing.append("voice")
+    if url:
+        missing.append("polling: a webhook is set, so the service cannot poll this bot")
+    row["missing"] = missing
+    return row
+
+
+_FIELD_WORDS = {"secret_env": "a bot token", "api_id_env": "an api_id",
+                "api_hash_env": "an api_hash", "deepgram_env": "a Deepgram key"}
+
+
+def _lacking_sentence(cid: str, row: dict) -> str:
+    """What one connection lacks, in words: the required token, and what goes off
+    without the rest."""
+    unset = [k for k in row["keys"] if not k["set"]]
+    words = ", ".join(_FIELD_WORDS[k["field"]] + (f" ({k['key']} resolves nowhere)"
+                                                  if k["key"] != k["field"] else "")
+                      for k in unset)
+    off = [part for part in ("history", "voice") if row[part] != "ready"]
+    return (f"connection {cid!r} lacks {words}" + (f"; without them {' and '.join(off)} "
+                                                   "would be off" if off else ""))
+
+
+def cmd_doctor(wanted: str | None) -> None:
+    report = _connections_report()
+    conns = report["connections"]
+    targets = [wanted] if wanted in conns else list(conns)
+    lacking = {cid: conns[cid] for cid in targets if _missing_required(conns[cid]["keys"])}
+    if lacking:
+        # The contract's readiness gate gives this same verdict from the same rows;
+        # here it names everything each connection lacks, not only the token.
+        _die(2, "credentials_missing",
+             "; ".join(_lacking_sentence(cid, row) for cid, row in sorted(lacking.items())),
+             f"`{NAME} connection add <id> --replace --stdin` with "
+             '{"secret_env": "<token>", "api_id_env": "<api_id>", "api_hash_env": '
+             '"<api_hash>", "deepgram_env": "<key>"}, or --env <field>=<KEY> for a key the '
+             f"vault already holds; `{NAME} connections` shows where each resolves")
+    _doctor_gate(report, wanted)
+    reg, _ = _connections_registry()
+    targets = [_select_connection(reg, wanted)] if wanted else list(reg["connections"].items())
+    out: dict = {}
+    fail = 0
+    for cid, entry in targets:
+        cfg, problem = _build_cfg(cid, entry)
+        if problem:
+            row = {"ok": False, "category": problem["exit"], "error": problem["message"],
+                   **({"hint": problem["hint"]} if problem.get("hint") else {})}
+        else:
+            row = _check_connection(cfg)
+        if not row.get("ok") and not fail:
+            fail = row.get("category") or 5
+        row.pop("category", None)
+        out[cid] = row
+    _emit({"ok": fail == 0, "connections": out})
+    if fail:
+        sys.exit(fail)
+
+
+# ── the store ────────────────────────────────────────────────────────────────
+
+
+def _store_refusal(exc) -> NoReturn:
+    transient = exc.slug in ("store_unreachable", "store_busy")
+    _die(5 if transient else 6, exc.slug, exc.message, exc.hint)
+
+
+def _agent_id() -> str:
+    project = _project_id(write=False, refuse=False)
+    if not project:
+        _die(6, "no_project_identity", "this project is bound to no durable id "
+             "(CAPABILITIES_PROJECT_ID)", "run `capabilities init` in the project")
+    return str(project)
+
+
+def _open_store():
+    s = _store_module()
+    try:
+        return s.Store(s.resolve_store(_project_root())).open()
+    except s.StoreUnavailable as exc:
+        _store_refusal(exc)
+
+
+@contextlib.contextmanager
+def _store():
+    s = _store_module()
+    store = _open_store()
+    try:
+        yield store
+    except s.StoreUnavailable as exc:
+        _store_refusal(exc)
+    finally:
+        store.close()
+
+
+def _iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def cmd_seen(cfg: dict, kind: str | None) -> dict:
+    with _store() as store:
+        rows = store.seen(_agent_id(), cfg["id"], kind)
+    return {"connection": cfg["id"], "count": len(rows),
+            "seen": [{k: _iso(v) for k, v in row.items()} for row in rows]}
+
+
+# ── history and files ────────────────────────────────────────────────────────
+
+
+def _require_history(cfg: dict) -> None:
+    if cfg["history_off"]:
+        _die(7, "history_unavailable", f"connection {cfg['id']!r}: {cfg['history_off']}",
+             f"`{NAME} connection add {cfg['id']} --replace --stdin` with "
+             '{"api_id_env": "<api_id>", "api_hash_env": "<api_hash>"} from '
+             "my.telegram.org/apps")
+
+
+def _chat_info(cfg: dict, chat_id: int) -> dict:
+    """What a read needs to know of a chat: whether it is a forum, and whether the
+    bot sees every message there (a private chat always)."""
+    t = _transport()
+    kind = t.chat_kind(chat_id)
+    if kind == "private":
+        return {"kind": kind, "is_forum": False, "visible": True}
+    try:
+        with _bot(cfg) as bot:
+            chat = bot.get_chat(chat_id)
+            me = bot.get_me()
+            member = bot.member(chat_id, cfg["bot_id"])
+    except t.TelegramError as exc:
+        _fail(exc)
+    admin = member.get("status") in ("administrator", "creator")
+    sees_all = bool(me.get("can_read_all_group_messages")) or admin
+    return {"kind": kind, "is_forum": bool(chat.get("is_forum")), "visible": sees_all,
+            "title": chat.get("title")}
+
+
+def _anchor(cfg: dict, chat_id: int, topic_id: int | None, before: int | None) -> int:
+    if before:
+        return before
+    with _store() as store:
+        row = store.channel(_agent_id(), cfg["id"], chat_id, topic_id or 0)
+    top = max([row.get("last_message_id") or 0, *(row.get("reserved") or [])])
+    if not top:
+        _die(6, "anchor_unknown", f"no message of chat {chat_id} is recorded to read back "
+             "from", "pass --before <message id>: the newest number to read below")
+    return top + 1
+
+
+def cmd_history(cfg: dict, chat_raw: str, topic_id: int | None, before: int | None,
+                limit: int) -> dict:
+    t = _transport()
+    _require_history(cfg)
+    try:
+        chat_id = t.parse_chat_id(chat_raw)
+    except t.TelegramError as exc:
+        _fail(exc)
+    info = _chat_info(cfg, chat_id)
+    if not info["visible"]:
+        _die(4, "group_not_visible", f"the bot does not see every message of chat {chat_id} "
+             "(privacy mode on, not an admin), so it reads no history there",
+             "turn privacy off with BotFather (/setprivacy) and add the bot again, or make "
+             "it an admin of the group")
+    anchor = _anchor(cfg, chat_id, topic_id, before)
+    if info["is_forum"] and topic_id is None:
+        topic_id = t.GENERAL_TOPIC
+    try:
+        reading = t.run_read(lambda: t.read_history(
+            cfg["token"], cfg["api_id"], cfg["api_hash"], _conn_state(cfg), chat_id, anchor,
+            limit=limit, topic_id=topic_id, is_forum=info["is_forum"]))
+    except t.TelegramError as exc:
+        _fail(exc)
+    return {"connection": cfg["id"], "chat": chat_id, "topic": topic_id, "before": anchor,
+            **reading.as_dict()}
+
+
+def cmd_download(cfg: dict, chat_raw: str, message_id: int, out: str | None) -> dict:
+    t = _transport()
+    _require_history(cfg)
+    try:
+        chat_id = t.parse_chat_id(chat_raw)
+    except t.TelegramError as exc:
+        _fail(exc)
+    dest = Path(out).expanduser() if out else \
+        _conn_state(cfg) / "files" / f"{chat_id}-{message_id}"
+
+    async def fetch():
+        reader = t.HistoryReader(cfg["token"], cfg["api_id"], cfg["api_hash"],
+                                 _conn_state(cfg))
+        try:
+            await reader.open()
+            return await reader.download(chat_id, message_id, dest)
+        except t.TelegramError:
+            raise
+        except Exception as exc:
+            raise t.mtproto_failure(exc) from None
+        finally:
+            await reader.close()
+
+    try:
+        path = t.run_read(fetch, deadline=600.0)
+    except t.TelegramError as exc:
+        _fail(exc)
+    return {"path": str(path), "bytes": path.stat().st_size}
+
+
+# ── writes ───────────────────────────────────────────────────────────────────
+
+
+def _text_arg(text: str) -> str:
+    return sys.stdin.read() if text == "-" else text
+
+
+def cmd_send(cfg: dict, chat_raw: str, text: str, topic_id: int | None,
+             reply_to: int | None, file: str | None) -> dict:
+    t = _transport()
+    try:
+        chat_id = t.parse_chat_id(chat_raw)
+        body = _text_arg(text).strip()
+        with _bot(cfg) as bot:
+            if file:
+                path = Path(file).expanduser()
+                if not path.is_file():
+                    _die(6, "file_missing", f"{path} is not a file")
+                sent = [bot.send_file(chat_id, path, caption=body or None, topic_id=topic_id,
+                                      reply_to=reply_to)]
+            else:
+                if not body:
+                    _die(6, "empty_text", "the text to send is empty")
+                sent = bot.send_text(chat_id, body, topic_id=topic_id, reply_to=reply_to)
+    except t.TelegramError as exc:
+        _fail(exc)
+    return {"connection": cfg["id"], "chat": chat_id, "topic": topic_id,
+            "message_ids": sent}
+
+
+def cmd_react(cfg: dict, chat_raw: str, message_id: int, emoji: str | None) -> dict:
+    t = _transport()
+    try:
+        chat_id = t.parse_chat_id(chat_raw)
+        with _bot(cfg) as bot:
+            bot.react(chat_id, message_id, emoji)
+    except t.TelegramError as exc:
+        _fail(exc)
+    return {"chat": chat_id, "message_id": message_id, "reaction": emoji}
+
+
+# ── prompts ──────────────────────────────────────────────────────────────────
+
+PROMPT_KEY = re.compile(r"(bot|delegation|context\.[a-z0-9][a-z0-9_-]{0,63})")
+
+
+def _prompt_key(key: str) -> str:
+    if not PROMPT_KEY.fullmatch(key or ""):
+        _die(6, "bad_prompt_key", f"{key!r} is not a prompt key",
+             "keys: bot, delegation, context.<name> (lowercase letters, digits, _ and -)")
+    return key
+
+
+def _shipped_prompt(key: str) -> str | None:
+    """The standard text a key replaces, where the bundle ships one."""
+    if key == "delegation":
+        path = _bundle_dir() / "service" / "templates" / "delegation.md"
+        with contextlib.suppress(OSError):
+            return path.read_text()
+    return None
+
+
+def _actor() -> str:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+    return f"{user}@{node_name()}"
+
+
+def cmd_prompts(args) -> dict:
+    action = args.action
+    s = _store_module()
+    if action in ("put", "retire"):
+        _read_only_gate(f"`{NAME} prompts {action}`")
+    if action != "list":
+        _prompt_key(args.key)
+    agent = _agent_id()
+    with _store() as store:
+        if action == "list":
+            rows = store.prompts(agent)
+            return {"prompts": [{k: _iso(v) for k, v in row.items()} for row in rows]}
+        key = _prompt_key(args.key)
+        if action == "show":
+            row = store.prompt(agent, key)
+            if row:
+                return {"key": key, "body": row["body"], "version": row["id"],
+                        "source": "store", "created_at": _iso(row["created_at"]),
+                        "created_by": row["created_by"]}
+            shipped = _shipped_prompt(key)
+            return {"key": key, "body": shipped or "", "version": None,
+                    "source": "bundle" if shipped is not None else "none"}
+        if action == "history":
+            rows = store.prompt_history(agent, key)
+            return {"key": key, "versions": [{k: _iso(v) for k, v in r.items()} for r in rows]}
+        if action == "retire":
+            gone = store.retire_prompt(agent, key)
+            return {"key": key, "retired": gone}
+        body = sys.stdin.read()
+        if not body.strip():
+            _die(6, "empty_prompt", "the prompt on stdin is empty",
+                 f"`{NAME} prompts retire {key}` leaves the key with no active version")
+        try:
+            saved = store.save_prompt(agent, key, body, _actor(), base=args.base,
+                                      note=args.note)
+        except s.PromptConflict as exc:
+            _die(6, "base_mismatch", f"the active version of {key!r} is {exc.current}, not "
+                 f"{args.base!r}", f"`{NAME} prompts show {key}` reads the active version")
+        return {**saved, "created_at": _iso(saved["created_at"])}
+
+
+# ── the service's settings ───────────────────────────────────────────────────
+
+
+def _schema():
+    return _module("settings_schema")
+
+
+def _profiles_module():
+    return _module("profiles")
+
+
+def _service_settings() -> dict:
+    """This project's settings document, the global one beneath it, unvalidated."""
+    try:
+        rows = _records().resolve(NAME, "setting")
+    except StoreError as exc:
+        _die(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6, exc.slug, exc.message, exc.hint)
+    return {key: row["value"] for key, row in rows.items() if key != "connection.default"}
+
+
+def _checked_settings() -> dict:
+    data = _service_settings()
+    try:
+        return _schema().validate_settings(data)
+    except ValueError as exc:
+        _die(6, "service_settings_invalid", str(exc),
+             f"fix it with `{NAME} settings set <key> <value>`; a key the service does not "
+             "read is refused, never ignored")
+
+
+def _settings_check(scope: str, document) -> list:
+    """What the service's schema finds wrong once `document` is written at `scope`
+    (the contract's `settings` verb asks before it writes)."""
+    if scope not in ("project", "global") or _project_root() is None:
+        return []
+    other = "global" if scope == "project" else "project"
+    try:
+        held = {key: row["value"] for key, row in
+                _records().resolve_scope(NAME, "setting", other).items()
+                if key != "connection.default"}
+    except StoreError as exc:
+        return [exc.message]
+    merged = {**held, **(document or {})} if scope == "project" else {**(document or {}), **held}
+    try:
+        _schema().validate_settings(merged)
+    except ValueError as exc:
+        return [str(exc)]
+    return []
+
+
+def _owner_tables():
+    """The harness runner's profile table, which telegrambot reads and `profiles
+    save` writes; migrated before telegrambot's own."""
+    from callva import harness_runner as lib
+    return [(lib.PROFILE_STORE_OWNER, lib.PROFILE_STORE_STEPS, lib.PROFILE_STORE_MAJOR,
+             lib.PROFILE_STORE_MINOR)]
+
+
+# ── profiles ─────────────────────────────────────────────────────────────────
+
+
+def _stored_profiles(store, project: str) -> list:
+    with store._operation() as conn:
+        return _profiles_module().stored(conn, project)
+
+
+def cmd_profiles(args) -> dict:
+    prof = _profiles_module()
+    agent = _agent_id()
+    with _store() as store:
+        active = _stored_profiles(store, agent)
+        if args.action == "list":
+            settings = _service_settings()
+            reached = _schema().profile_names(settings)
+            return {"default": prof.default_profile(), "default_job": prof.default_job_profile(),
+                    "profiles": [{**row, "positions": reached.get(row["name"], [])}
+                                 for row in prof.listing(active, agent)]}
+        if args.action == "show":
+            try:
+                knobs, origin = prof.knobs_of(args.name, active, agent)
+            except ValueError as exc:
+                _die(3, "profile_not_found", str(exc))
+            shown = {k: v for k, v in knobs.items() if k not in ("env_set", "settings")}
+            return {**origin, "knobs": shown, "fit": prof.fit_problems(knobs)}
+        _read_only_gate(f"`{NAME} profiles save`")
+        if os.environ.get("TELEGRAMBOT_TURN"):
+            role = os.environ.get("TELEGRAMBOT_AUTHORIZED_REQUESTER_ROLE", "")
+            policy = _module("dialogue").Policy(_service_settings(), default_profile="",
+                                                default_job_profile="")
+            if not role or not policy.control_allowed(role, "set"):
+                _die(4, "policy", f"a profile is saved inside a turn only for a requester whose "
+                     f"role may /set; this one is {role or 'not stated'}")
+        if not args.name.startswith(prof.PREFIX) or args.name in prof.BUNDLED:
+            _die(6, "bad_profile_name", f"{args.name!r}: a project's profile is named "
+                 f"{prof.PREFIX}<name> and is none of the bundled ones",
+                 f"bundled: {', '.join(prof.BUNDLED)}")
+        text = sys.stdin.read() if args.file == "-" else Path(args.file).read_text()
+        lib = prof.runner()
+        try:
+            knobs = lib.ProfileFile(args.name, "given", args.file, text).knobs()
+            spec = lib.check_spec(knobs, f"profile {args.name!r}")
+            with store.transaction() as cur:
+                version, created = lib.save_profile(
+                    cur.connection, args.name, spec, scope="project", scope_id=agent,
+                    base=args.base, created_by=(f"telegrambot:{os.environ.get('TELEGRAMBOT_AUTHORIZED_REQUESTER')}"
+                                                if os.environ.get("TELEGRAMBOT_TURN") else _actor()))
+        except lib.ProfileConflict as exc:
+            _die(6, "conflict", str(exc), f"`{NAME} profiles show {args.name}` reads the active one")
+        except (lib.ProfileError, ValueError, TypeError, KeyError) as exc:
+            _die(6, "profile_invalid", str(exc))
+        return {"name": args.name, "version": version.id, "created": created,
+                "fit": prof.fit_problems(spec)}
+
+
+# ── jobs ─────────────────────────────────────────────────────────────────────
+
+JOBS_HELP = """telegrambot jobs - the register of work that outlives a conversation
+
+  jobs list [--state S] [--outcome O] [--chat C] [--topic T] [--limit N]
+  jobs active [--chat C] [--topic T]         waiting and running work, oldest first
+  jobs show <id>
+  jobs register "<one line>" --chat C [--topic T] --requested-by U
+                [--origin-message-id M] [--profile P] [--external]
+                                             a draft: no runner takes it yet
+  jobs amend <id> "<what changed>"           continues the job's session with it
+  jobs submit <id> --confirm-active-jobs-checked
+                                             hands the draft over; check `active` first
+  jobs stop <id> | jobs resume <id>          asks; both are safe to repeat
+  jobs discard <id>                          drops a draft that never started
+
+An id is the whole id or six or more of its first characters. --actor U limits
+every read and write to jobs requested by U. Inside a turn the worker wrapper
+puts the chat, topic, requester, origin message and profile in for you, and
+this CLI takes them from the turn again: a job reports into the chat it came
+from. --connection picks the bot; else the default. Answers are JSON rows; a
+draft, a stop and a resume are asks the bot's runner acts on within seconds.
+"""
+
+
+def _job_view(row: dict) -> dict:
+    out = {k: _iso(v) for k, v in row.items() if k not in ("attempt_token", "lease_owner")}
+    out["stopping"] = bool(row.get("stop_requested")) and row.get("state") != "stopped"
+    return out
+
+
+def cmd_jobs(args, wanted: str | None):
+    if args.action == "help":
+        return JOBS_HELP
+    jobs = _module("jobs")
+    reg_conns, _ = _connections_registry()
+    cid, _entry = _select_connection(reg_conns, wanted)
+    agent = _agent_id()
+    turn = bool(os.environ.get("TELEGRAMBOT_TURN"))
+    if turn:
+        # The turn's scope again, whatever the call carried.
+        env = os.environ
+        args.chat = int(env.get("TELEGRAMBOT_AUTHORIZED_CHAT_ID") or 0) or None
+        args.topic = int(env.get("TELEGRAMBOT_AUTHORIZED_TOPIC_ID") or 0) or None
+        args.actor = env.get("TELEGRAMBOT_AUTHORIZED_REQUESTER") or "unknown"
+        if args.action == "register":
+            args.requested_by = args.actor
+            args.origin = int(env.get("TELEGRAMBOT_AUTHORIZED_ORIGIN_MESSAGE_ID") or 0) or None
+            args.profile = env.get("TELEGRAMBOT_AUTHORIZED_JOB_PROFILE") or None
+            args.external = bool(env.get("TELEGRAMBOT_AUTHORIZED_EXTERNAL"))
+    actor = getattr(args, "actor", None)
+    with _store() as store:
+        reg = jobs.JobRegister(jobs.Db(store), agent, cid)
+        try:
+            if args.action == "list":
+                rows = reg.list(limit=args.limit, state=args.state, outcome=args.outcome,
+                                chat_id=args.chat, topic_id=args.topic, actor_id=actor)
+                return {"connection": cid, "count": len(rows), "jobs": [_job_view(r) for r in rows]}
+            if args.action == "active":
+                rows = reg.open_jobs(args.chat, args.topic, actor_id=actor)
+                return {"connection": cid, "count": len(rows), "jobs": [_job_view(r) for r in rows]}
+            if args.action == "register":
+                prof = _profiles_module()
+                profile = args.profile or (_service_settings().get("defaults") or {}).get(
+                    "job_profile") or prof.default_job_profile()
+                try:
+                    _p, origin, _k = prof.resolve(profile, _stored_profiles(store, agent), agent)
+                except ValueError as exc:
+                    _die(6, "profile_refused", str(exc))
+                row = reg.register(chat_id=args.chat, topic_id=args.topic or 0,
+                                   requested_by=args.requested_by, description=args.description,
+                                   origin_message_id=args.origin, profile=profile,
+                                   engine=origin.get("harness"), external=args.external)
+                return {**_job_view(row), "next": f"`{NAME} jobs submit {row['id'][:8]} "
+                        "--confirm-active-jobs-checked` hands it over"}
+            row = reg.find(args.id, actor_id=actor)
+            if row is None or (args.chat is not None and int(row["chat_id"]) != args.chat):
+                _die(3, "job_not_found", f"no job {args.id!r} here",
+                     f"`{NAME} jobs list` shows the jobs this scope reaches")
+            job_id = row["id"]
+            if args.action == "show":
+                return {**_job_view(row), "pending_amendments": reg.pending_amendment(job_id)}
+            if args.action == "submit":
+                if not args.confirmed:
+                    _die(6, "confirm_required", "submit takes --confirm-active-jobs-checked",
+                         f"read `{NAME} jobs active` first: a new outcome joins the work "
+                         "already in flight")
+                return _job_view(reg.submit(job_id, actor_id=actor) or row)
+            if args.action == "discard":
+                gone = reg.discard(job_id, actor_id=actor)
+                if gone is None:
+                    _die(6, "job_not_draft", f"job {job_id} has started; stop it instead",
+                         f"`{NAME} jobs stop {job_id[:8]}`")
+                return {"discarded": job_id}
+            if args.action == "stop":
+                return _job_view(reg.request_stop(job_id, actor_id=actor) or row)
+            if args.action == "resume":
+                return _job_view(reg.resume(job_id, actor_id=actor) or row)
+            if args.action == "amend":
+                staged = reg.stage_amendment(job_id, args.text, actor_id=actor)
+                if staged is None:
+                    _die(6, "empty_amendment", "the amendment is empty")
+                return {**_job_view(reg.amend(job_id, actor_id=actor) or row),
+                        "amendment": staged}
+        except jobs.JobError as exc:
+            _die(6, exc.slug, exc.message, exc.hint)
+
+
+# ── the service: one process, a slot per project ─────────────────────────────
+
+_PROJECT_POINTERS = ("CLAUDE_PROJECT_DIR", "CAPABILITIES_PROJECT_ID",
+                     "CAPABILITIES_PROJECT_ID_ROOT", "CAPABILITIES_PROJECT_ENVELOPE",
+                     "CAPABILITIES_PROJECT_ENVELOPE_ROOT")
+_PROJECT_ENTRY_KEYS = ("root", "slug", "joined_at", "joined_by")
+
+
+class _Refusal(Exception):
+    def __init__(self, exit_code: int, code: str, message: str, hint: str | None = None):
+        super().__init__(message)
+        self.exit_code, self.code, self.message, self.hint = exit_code, code, message, hint
+
+
+def _refused(exc: _Refusal) -> NoReturn:
+    _die(exc.exit_code, exc.code, exc.message, exc.hint)
+
+
+def _machine_projects_path() -> Path:
+    return _CONFIG_HOME / NAME / "service" / "projects.json"
+
+
+def _machine_state_dir() -> Path:
+    return _STATE_HOME / "capabilities" / "machine" / NAME
+
+
+def _project_state_dir(slug: str) -> Path:
+    return _STATE_HOME / "capabilities" / "projects" / slug / NAME
+
+
+def _read_projects() -> dict:
+    """The opt-in list the node manager writes; no file is an empty list."""
+    path = _machine_projects_path()
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise _Refusal(6, "projects_invalid", f"{path}: it does not read as JSON: {exc}",
+                       f"the node manager writes it (`capabilities node supervise {NAME} "
+                       "--machine`); remove it and it is written again")
+    projects = raw.get("projects") if isinstance(raw, dict) and raw.get("version") == 1 else None
+    if not isinstance(projects, dict):
+        raise _Refusal(6, "projects_invalid", f"{path}: it is {{\"version\": 1, \"projects\": "
+                       "{...}}")
+    listed = {}
+    for project, entry in projects.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("root"), str) or \
+                not Path(entry["root"]).is_absolute() or not entry.get("slug"):
+            raise _Refusal(6, "projects_invalid", f"{path}: entry {project!r} is "
+                           "{root, slug, joined_at, joined_by}")
+        listed[str(project)] = {k: entry.get(k) for k in _PROJECT_ENTRY_KEYS}
+    return listed
+
+
+@contextlib.contextmanager
+def _project_scope(root: Path):
+    """Stand in one project for a block: the environment points at it alone and
+    its records adapter is opened afresh; both are put back after."""
+    global _RECORDS
+    saved_env, saved_records = dict(os.environ), _RECORDS
+    for key in _PROJECT_POINTERS:
+        os.environ.pop(key, None)
+    os.environ["CLAUDE_PROJECT_DIR"] = str(root)
+    _RECORDS = None
+    try:
+        yield
+    finally:
+        if _RECORDS is not None and _RECORDS is not saved_records:
+            with contextlib.suppress(Exception):
+                _RECORDS.close()
+        os.environ.clear()
+        os.environ.update(saved_env)
+        _RECORDS = saved_records
+
+
+def _ask_in_project(root: Path, question):
+    """Answer `question` inside the project's scope; an exit it would have made is
+    raised as a _Refusal, so one project never ends the process."""
+    import io
+    said = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(said), _project_scope(root):
+            return question()
+    except SystemExit as stop:
+        error: dict = {}
+        for line in reversed(said.getvalue().strip().splitlines()):
+            with contextlib.suppress(ValueError, AttributeError):
+                error = json.loads(line).get("error") or {}
+                break
+        raise _Refusal(stop.code if isinstance(stop.code, int) else 6,
+                       error.get("code") or "refused",
+                       error.get("message") or "the check exited without saying why",
+                       error.get("hint")) from None
+
+
+def _identity_here() -> tuple[str, str]:
+    project = _project_id(write=True, refuse=False)
+    if not project:
+        raise _Refusal(6, "no_project_identity", f"{_project_root()} is bound to no durable id",
+                       "run `capabilities init` in the project")
+    try:
+        slug = _project_slug(_project_root())
+    except StoreError as exc:
+        raise _Refusal(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6, exc.slug, exc.message,
+                       exc.hint) from None
+    return str(project), str(slug or project)
+
+
+def _joined_here() -> dict | None:
+    if _project_root() is None:
+        return None
+    try:
+        project, _slug = _identity_here()
+        entry = _read_projects().get(project)
+    except _Refusal:
+        return None
+    return {**entry, "id": project} if entry else None
+
+
+def _bot_refusal(cid: str, reg: dict) -> tuple | None:
+    """Why the service may not serve this bot in the project now, or None."""
+    if cid in (reg.get("withheld") or {}):
+        return ("refused", f"connection {cid!r} is not granted in this project")
+    entry = (reg.get("connections") or {}).get(cid)
+    if entry is None:
+        return ("refused", f"connection {cid!r} is not declared in this project")
+    if read_only_switch():
+        return ("refused", f"{READ_ONLY_ENV} is set, so no answer may be sent")
+    if not entry.get("allow_write", WRITE_DEFAULT):
+        return ("refused", f"connection {cid!r} has no write grant, and the service answers "
+                           "by sending; ask the user to grant allow_write")
+    return None
+
+
+def _plan_here(root: Path, expected_id: str | None) -> dict:
+    """Everything the process needs to serve this project, asked inside it."""
+    if _project_root() is None or _project_root().resolve() != root.resolve():
+        raise _Refusal(6, "not_a_project_root", f"{root} does not resolve as a project root")
+    project, slug = _identity_here()
+    if expected_id is not None and project != expected_id:
+        raise _Refusal(6, "project_id_changed", f"the project now declares id {project} and "
+                       f"joined as {expected_id}")
+    if _machine_state() == "quarantined":
+        raise _Refusal(4, "quarantined", f"{NAME} is quarantined on this machine")
+    if not _project_enabled_explicitly():
+        raise _Refusal(4, "project_enable_required", f"{NAME} is not enabled explicitly for "
+                       "this project", f"`capabilities enable {NAME} --project`")
+    s = _store_module()
+    try:
+        setting = s.resolve_store(root)
+    except s.StoreUnavailable as exc:
+        raise _Refusal(6, exc.slug, exc.message, exc.hint) from None
+    settings = _service_settings()
+    try:
+        _schema().validate_settings(settings)
+    except ValueError as exc:
+        raise _Refusal(6, "service_settings_invalid", str(exc)) from None
+    declared = _inventory_connections().get("connections") or {}
+    if not declared:
+        raise _Refusal(6, "no_bot_served", f"this project declares no {NAME} connection",
+                       f"`{NAME} connection add <id> --stdin` declares one")
+    reg = _connections_composed()
+    bots, skipped = {}, {}
+    for cid in sorted(declared):
+        refusal = _bot_refusal(cid, reg)
+        if refusal:
+            skipped[cid] = refusal[1]
+            continue
+        cfg, problem = _build_cfg(cid, reg["connections"][cid])
+        if problem:
+            skipped[cid] = problem["message"]
+            continue
+        state = _state_dir() / cid
+        state.mkdir(parents=True, exist_ok=True)
+        prints = "|".join(str(v) for v in (cfg["token"], cfg["api_id"], cfg["api_hash"],
+                                            cfg["deepgram"]))
+        bots[cid] = {"connection": cid, "token": cfg["token"], "bot_id": cfg["bot_id"],
+                     "api_id": cfg["api_id"], "api_hash": cfg["api_hash"],
+                     "deepgram": cfg["deepgram"], "history_off": cfg["history_off"],
+                     "voice_off": cfg["voice_off"], "state_dir": state,
+                     "identity": (cfg["bot_id"], _engine_module().fingerprint_of(
+                         prints.encode()))}
+    if not bots:
+        detail = "; ".join(f"{c}: {r}" for c, r in sorted(skipped.items()))
+        raise _Refusal(4, "no_bot_served", f"no bot can be served: {detail}")
+    print_ = _engine_module().fingerprint_of(
+        json.dumps(sorted((c, b["identity"][1]) for c, b in bots.items())).encode(),
+        json.dumps(settings, sort_keys=True, default=str).encode())
+    return {"project_id": project, "slug": slug, "setting": setting, "bots": bots,
+            "skipped": skipped, "settings": settings, "fingerprint": print_}
+
+
+def _engine_module():
+    return _module("engine")
+
+
+class _Host:
+    """What the engine asks of this executable, every project question answered
+    inside that project's own resolution, one at a time."""
+
+    def __init__(self, mode: str, entry: dict | None = None):
+        self.mode, self.entry = mode, entry
+        import threading
+        self.lock = threading.RLock()
+
+    def node(self) -> str:
+        return node_name()
+
+    def tag(self) -> str:
+        return (self.entry or {}).get("slug") or "machine"
+
+    def entries(self) -> dict:
+        if self.mode == "project":
+            return {self.entry["id"]: self.entry}
+        with self.lock:
+            return {pid: {**e, "id": pid} for pid, e in _read_projects().items()}
+
+    def list_witness(self):
+        if self.mode == "project":
+            return "project"
+        try:
+            seen = os.stat(_machine_projects_path())
+        except OSError:
+            return None
+        return (seen.st_mtime_ns, seen.st_size, seen.st_ino)
+
+    def fingerprint(self) -> str:
+        try:
+            listed = _machine_projects_path().read_bytes() if self.mode == "machine" else b""
+        except OSError:
+            listed = b""
+        return _engine_module().fingerprint_of(b"machine", listed)
+
+    def admit(self, project_id: str, entry: dict):
+        root = Path(entry["root"])
+        if not root.is_dir():
+            return None, ("error", f"the project folder {root} is gone")
+        with self.lock:
+            try:
+                return _ask_in_project(root, lambda: _plan_here(root, project_id)), None
+            except _Refusal as exc:
+                return None, ("refused", f"{exc.code}: {exc.message}")
+            except Exception as exc:
+                return None, ("error", f"{type(exc).__name__}: {exc}")
+
+    def check(self, entry: dict, cid: str):
+        root = Path(entry["root"])
+        if not root.is_dir():
+            return ("error", f"the project folder {root} is gone")
+
+        def question():
+            if _machine_state() == "quarantined":
+                return ("refused", f"{NAME} is quarantined on this machine")
+            if not _project_enabled_explicitly():
+                return ("refused", f"{NAME} is not enabled explicitly for this project")
+            if self.mode == "machine":
+                project, _slug = _identity_here()
+                if project not in _read_projects():
+                    return ("refused", "the project left the machine service")
+            return _bot_refusal(cid, _connections_composed())
+
+        with self.lock:
+            try:
+                return _ask_in_project(root, question)
+            except _Refusal as exc:
+                return ("refused", f"{exc.code}: {exc.message}")
+            except Exception as exc:
+                return ("error", f"{type(exc).__name__}: {exc}")
+
+    def serve_lock(self, entry: dict) -> Path:
+        return _project_state_dir(entry["slug"]) / _engine_module().SERVE_LOCK
+
+    def open_store(self, setting):
+        return _store_module().Store(setting).open()
+
+    def bot_api(self, token: str):
+        return _transport().BotAPI(token)
+
+    def cli_path(self) -> str:
+        return str(Path(__file__).resolve())
+
+    def turn_env(self, entry: dict) -> dict:
+        env = {k: v for k, v in os.environ.items() if k not in _PROJECT_POINTERS}
+        env["CLAUDE_PROJECT_DIR"] = str(entry["root"])
+        if entry.get("id"):
+            env["CAPABILITIES_PROJECT_ID"] = str(entry["id"])
+            env["CAPABILITIES_PROJECT_ID_ROOT"] = str(entry["root"])
+        return env
+
+    def run_override(self):
+        return None
+
+
+def _project_entry_here() -> dict:
+    try:
+        project, slug = _identity_here()
+    except _Refusal as exc:
+        _refused(exc)
+    return {"id": project, "root": str(_project_root()), "slug": slug}
+
+
+def _pid_alive(pid) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_pid(state: Path):
+    try:
+        return int((state / "daemon.pid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_status(state: Path) -> dict:
+    try:
+        found = json.loads((state / "daemon.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def _service_target(machine: bool) -> tuple[Path, dict | None, bool]:
+    """(state root, this project's entry or None, whether the machine serves it)."""
+    if machine:
+        return _machine_state_dir(), None, True
+    entry = _project_entry_here()
+    joined = _joined_here()
+    return ((_machine_state_dir(), entry, True) if joined
+            else (_project_state_dir(entry["slug"]), entry, False))
+
+
+def _engine_for(host, mode: str, state: Path):
+    names = ("dialogue", "jobs", "profiles", "gate", "store", "settings_schema")
+    modules = {name: _module(name) for name in names}
+    return _engine_module().Engine(host, mode=mode, state_dir=state, modules=modules,
+                                   transport=_transport())
+
+
+def cmd_service_run(machine: bool) -> None:
+    s = _store_module()
+    if machine:
+        host, state = _Host("machine"), _machine_state_dir()
+    else:
+        if _joined_here():
+            _die(4, "joined_to_machine_service", f"this project is joined to the machine {NAME} "
+                 "service, which serves it", f"`capabilities service stop {NAME}` takes it back "
+                 "to project mode first")
+        entry = _project_entry_here()
+        try:
+            s.resolve_store(_project_root())
+        except s.StoreUnavailable as exc:
+            _store_refusal(exc)
+        host, state = _Host("project", entry), _project_state_dir(entry["slug"])
+    engine = _engine_for(host, "machine" if machine else "project", state)
+    try:
+        engine.run()
+    except RuntimeError as exc:
+        if str(exc) == "busy":
+            _die(8, "service_running", f"another {NAME} service process holds {state}",
+                 f"`{NAME} service status{' --machine' if machine else ''}` names it")
+        raise
+
+
+def cmd_service_stop(machine: bool, timeout: float) -> dict:
+    state, _entry, by_machine = _service_target(machine)
+    if by_machine and not machine:
+        _die(4, "joined_to_machine_service", "the machine service serves this project",
+             f"`capabilities service stop {NAME}` stops serving this project; `{NAME} service "
+             "stop --machine` stops the machine process")
+    pid = _read_pid(state)
+    if not _pid_alive(pid):
+        return {"stopped": False, "reason": "not running", "state_dir": str(state)}
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and _pid_alive(pid):
+        time.sleep(0.2)
+    if _pid_alive(pid):
+        _die(5, "stop_timeout", f"pid {pid} did not stop within {timeout:g}s",
+             "a turn may still be ending; ask again, or wait")
+    return {"stopped": True, "pid": pid}
+
+
+def cmd_service_reload(machine: bool, timeout: float) -> dict:
+    """Validate this project's declaration, signal the process (SIGHUP to it alone)
+    and wait until it publishes the new fingerprint."""
+    state, entry, by_machine = _service_target(machine)
+    if machine:
+        expected = _Host("machine").fingerprint()
+        read = lambda status: status.get("fingerprint")  # noqa: E731
+        error = lambda status: None  # noqa: E731
+    else:
+        try:
+            plan = _plan_here(Path(entry["root"]), None)
+        except _Refusal as exc:
+            _refused(exc)
+        expected = plan["fingerprint"]
+
+        def row(status):
+            return next((p for p in status.get("projects") or []
+                         if p.get("project_id") == entry["id"]), {})
+        read = lambda status: row(status).get("fingerprint")  # noqa: E731
+        error = lambda status: row(status).get("reload_error")  # noqa: E731
+    pid = _read_pid(state)
+    if not _pid_alive(pid):
+        _die(3, "not_running", f"no {NAME} service process serves this here",
+             f"start it with `{NAME} service run{' --machine' if by_machine else ''}`")
+    if read(_read_status(state)) == expected:
+        return {"reloaded": False, "reason": "the running process already holds this "
+                "declaration", "fingerprint": expected, "pid": pid}
+    os.kill(pid, signal.SIGHUP)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = _read_status(state)
+        if read(status) == expected:
+            return {"reloaded": True, "fingerprint": expected, "pid": pid}
+        if error(status):
+            _die(6, "reload_rejected", f"the running process kept its declaration: "
+                 f"{error(status)}")
+        time.sleep(0.3)
+    _die(5, "reload_timeout", f"pid {pid} did not publish fingerprint {expected} within "
+         f"{timeout:g}s", f"`{NAME} service logs` shows what it did")
+
+
+def _status_view(machine: bool) -> dict:
+    state, entry, by_machine = _service_target(machine)
+    pid = _read_pid(state)
+    running = _pid_alive(pid)
+    status = _read_status(state) if running else {}
+    if machine:
+        try:
+            listed, list_error = _read_projects(), None
+        except _Refusal as exc:
+            listed, list_error = {}, exc.message
+        rows = {p.get("project_id"): p for p in status.get("projects") or []}
+        projects = []
+        for project, joined in sorted(listed.items(), key=lambda kv: kv[1].get("slug") or ""):
+            row = {"project": joined.get("slug"), "project_id": project,
+                   "root": joined.get("root"), "present": Path(joined["root"]).is_dir()}
+            row.update(rows.get(project) or {"state": None, "reason": "the machine service is "
+                                             "not running" if not running else "not yet taken up"})
+            projects.append(row)
+        return {"mode": "machine", "running": running, "pid": pid if running else None,
+                "state_dir": str(state), "fingerprint": status.get("fingerprint"),
+                "list": {"path": str(_machine_projects_path()), "joined": len(listed),
+                         **({"error": list_error} if list_error else {})},
+                "projects": projects}
+    row = next((p for p in status.get("projects") or []
+                if p.get("project_id") == entry["id"]), None)
+    current = None
+    if running and row:
+        with contextlib.suppress(_Refusal):
+            current = row.get("fingerprint") == _plan_here(Path(entry["root"]),
+                                                           None)["fingerprint"]
+    return {"mode": "machine" if by_machine else "project", "joined": by_machine,
+            "running": running, "pid": pid if running else None, "state_dir": str(state),
+            "current": current,
+            "project": row or {"state": None, "reason": "no process serves this project"
+                               if not running else "not yet taken up"}}
+
+
+def cmd_service_logs(machine: bool, tail: int) -> dict:
+    state, entry, by_machine = _service_target(machine)
+    path = state / "daemon.log"
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    if entry is not None and by_machine:
+        lines = [line for line in lines if f"[{entry['slug']}]" in line]
+    return {"log": str(path), "lines": lines[-tail:] if tail > 0 else lines}
+
+
+def cmd_service_harness() -> dict:
+    """The harness tools of every profile a turn or job of this project could run
+    on, for the sign-ins a node needs. Starts nothing, changes nothing."""
+    prof = _profiles_module()
+    settings = _service_settings()
+    names = set(_schema().profile_names(settings))
+    defaults = settings.get("defaults") or {}
+    names.add(defaults.get("profile") or prof.default_profile())
+    names.add(defaults.get("job_profile") or prof.default_job_profile())
+    agent = _agent_id()
+    harness, unresolved = set(), []
+    with _store() as store:
+        active = _stored_profiles(store, agent)
+    for name in sorted(names):
+        try:
+            knobs, _origin = prof.knobs_of(name, active, agent)
+            if knobs.get("harness") in ("claude", "codex"):
+                harness.add(knobs["harness"])
+        except ValueError as exc:
+            unresolved.append({"name": name, "error": str(exc)})
+    return {"harness": sorted(harness), "profiles": sorted(names), "unresolved": unresolved}
+
+
+def cmd_service_doctor(machine: bool) -> None:
+    """Whether the service can serve here, and whether it does: the store, the
+    settings, every profile they reach, each bot's token and webhook, and whether
+    the running process is current. Exit 7 when it cannot serve or does not."""
+    if machine:
+        view = _status_view(True)
+        problems = [] if view["running"] else ["the machine service is not running"]
+        problems += [f"{p['project']}: {p.get('state')}: {p.get('reason')}"
+                     for p in view["projects"] if p.get("state") not in ("served",)]
+        _emit({"ok": not problems, "problems": problems, **view})
+        if problems:
+            sys.exit(7)
+        return
+    problems: list[str] = []
+    out: dict = {}
+    root = _project_root()
+    s = _store_module()
+    try:
+        setting = s.resolve_store(root)
+        store = s.Store(setting).open()
+        store.close()
+        out["store"] = {"ok": True, "level": getattr(setting, "level", None),
+                        "schema": setting.schema}
+    except s.StoreUnavailable as exc:
+        out["store"] = {"ok": False, "error": f"{exc.slug}: {exc.message}"}
+        problems.append(f"store: {exc.slug}")
+        _emit({"ok": False, "problems": problems, **out})
+        sys.exit(7)
+    try:
+        plan = _plan_here(root, None)
+        out["skipped"] = plan["skipped"]
+    except _Refusal as exc:
+        plan = None
+        problems.append(f"{exc.code}: {exc.message}")
+    try:
+        out["profiles"] = cmd_service_harness()
+        for row in out["profiles"]["unresolved"]:
+            problems.append(f"profile {row['name']}: {row['error']}")
+    except SystemExit:
+        problems.append("the profiles could not be read")
+    bots = {}
+    if plan is not None:
+        t = _transport()
+        for cid, bot in plan["bots"].items():
+            row = {"history": "on" if bot["api_id"] else f"off: {bot['history_off']}",
+                   "voice": "on" if bot["deepgram"] else f"off: {bot['voice_off']}"}
+            try:
+                with t.BotAPI(bot["token"]) as api:
+                    me = api.get_me()
+                    hook = api.webhook_info()
+                row["bot"] = me.get("username")
+                if hook.get("url"):
+                    problems.append(f"{cid}: a webhook is set, so the service cannot poll it")
+                    row["webhook"] = True
+            except t.TelegramError as exc:
+                problems.append(f"{cid}: {exc.code}: {exc.message}")
+                row["error"] = exc.message
+            bots[cid] = row
+    out["bots"] = bots
+    view = _status_view(False)
+    out["service"] = view
+    if not view["running"]:
+        problems.append("the service is not running")
+    elif view.get("current") is False:
+        problems.append("the running process holds another declaration; `service reload`")
+    for bot in (view.get("project") or {}).get("bots") or []:
+        for channel, failure in ((bot.get("dialogue") or {}).get("gate_failures") or {}).items():
+            problems.append(f"{bot['connection']}: gate_failing in {channel}: {failure['error']}")
+    _emit({"ok": not problems, "problems": problems, **out})
+    if problems:
+        sys.exit(7)
+
+
+def _service(args) -> None:
+    machine = bool(getattr(args, "machine", False))
+    try:
+        if args.action == "run":
+            cmd_service_run(machine)
+        elif args.action == "stop":
+            _emit(cmd_service_stop(machine, args.timeout))
+        elif args.action == "reload":
+            _emit(cmd_service_reload(machine, args.timeout))
+        elif args.action == "status":
+            _emit(_status_view(machine))
+        elif args.action == "logs":
+            _emit(cmd_service_logs(machine, args.tail))
+        elif args.action == "doctor":
+            cmd_service_doctor(machine)
+        elif args.action == "harness":
+            _emit(cmd_service_harness())
+    except _Refusal as exc:
+        _refused(exc)
+
+
+# ── inventory ────────────────────────────────────────────────────────────────
+
+
+def _inventory(_network: bool) -> dict:
+    conns = (_inventory_connections().get("connections") or {})
+    items = []
+    for cid, entry in sorted(conns.items()):
+        ready = _readiness(entry)
+        items.append({"group": "bots", "name": cid,
+                      "state": "granted" if entry.get("granted") else "withheld",
+                      "detail": ", ".join(f"{part} {'on' if ready[part] else 'off'}"
+                                          for part in ("history", "voice"))})
+    service = {"state": "stopped"}
+    try:
+        # Local only, and never a refusal: a project without an identity has no
+        # service state to read.
+        _project, slug = _identity_here()
+        by_machine = _joined_here() is not None
+        state = _machine_state_dir() if by_machine else _project_state_dir(slug)
+        pid = _read_pid(state)
+        if _pid_alive(pid):
+            service = {"state": "running", "detail": f"pid {pid}"
+                       + (" (the machine service)" if by_machine else "")}
+    except (_Refusal, StoreError, OSError):
+        pass
+    return {"metrics": [{"label": "bots", "value": len(conns)}], "items": items,
+            "service": service}
+
+
+# ── the command line ─────────────────────────────────────────────────────────
+
+
+class _Parser(argparse.ArgumentParser):
+    """Usage errors leave through the envelope at exit 6."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        kwargs.setdefault("add_help", False)
+        super().__init__(*args, **kwargs)
+
+    def error(self, message: str) -> NoReturn:
+        _die(6, "invalid_arguments", f"{self.prog}: {message}", f"run `{NAME} help`")
+
+
+def _bounded(low: int, high: int):
+    def parse(value: str) -> int:
+        try:
+            n = int(value)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"{value!r} is not a whole number")
+        if not low <= n <= high:
+            raise argparse.ArgumentTypeError(f"{value!r} is not between {low} and {high}")
+        return n
+    return parse
+
+
+_positive = _bounded(1, 2 ** 53)
+
+
+def _parser() -> _Parser:
+    root = _Parser(prog=NAME)
+    sub = root.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
+    sub.add_parser("help")
+    sub.add_parser("doctor")
+    p = sub.add_parser("seen")
+    p.add_argument("--kind", choices=["chat", "topic", "person"])
+    p = sub.add_parser("history")
+    p.add_argument("chat")
+    p.add_argument("--topic", type=_positive)
+    p.add_argument("--before", type=_positive)
+    p.add_argument("--limit", type=_bounded(1, 100), default=40)
+    p = sub.add_parser("download")
+    p.add_argument("chat")
+    p.add_argument("message", type=_positive)
+    p.add_argument("--out")
+    p = sub.add_parser("send")
+    p.add_argument("chat")
+    p.add_argument("text")
+    p.add_argument("--topic", type=_positive)
+    p.add_argument("--reply-to", dest="reply_to", type=_positive)
+    p.add_argument("--file")
+    p = sub.add_parser("react")
+    p.add_argument("chat")
+    p.add_argument("message", type=_positive)
+    p.add_argument("emoji", nargs="?")
+    p = sub.add_parser("prompts")
+    psub = p.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    psub.add_parser("list")
+    for action in ("show", "history", "retire"):
+        psub.add_parser(action).add_argument("key")
+    put = psub.add_parser("put")
+    put.add_argument("key")
+    put.add_argument("--base")
+    put.add_argument("--note")
+    p = sub.add_parser("profiles")
+    rsub = p.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    rsub.add_parser("list")
+    rsub.add_parser("show").add_argument("name")
+    save = rsub.add_parser("save")
+    save.add_argument("name")
+    save.add_argument("file")
+    save.add_argument("--base")
+    p = sub.add_parser("jobs")
+    jsub = p.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    jsub.add_parser("help")
+    for action in ("list", "active"):
+        q = jsub.add_parser(action)
+        q.add_argument("--chat", type=int)
+        q.add_argument("--topic", type=int)
+        q.add_argument("--actor")
+        if action == "list":
+            q.add_argument("--state", choices=["draft", "waiting", "running", "stopped"])
+            q.add_argument("--outcome")
+            q.add_argument("--limit", type=_bounded(1, 500), default=20)
+    for action in ("show", "stop", "resume", "discard", "submit", "amend"):
+        q = jsub.add_parser(action)
+        q.add_argument("id")
+        if action == "amend":
+            q.add_argument("text")
+        if action == "submit":
+            q.add_argument("--confirm-active-jobs-checked", dest="confirmed",
+                           action="store_true")
+        q.add_argument("--chat", type=int)
+        q.add_argument("--topic", type=int)
+        q.add_argument("--actor")
+    q = jsub.add_parser("register")
+    q.add_argument("description")
+    q.add_argument("--chat", type=int, required=True)
+    q.add_argument("--topic", type=int)
+    q.add_argument("--requested-by", dest="requested_by", required=True)
+    q.add_argument("--origin-message-id", dest="origin", type=_positive)
+    q.add_argument("--profile")
+    q.add_argument("--external", action="store_true")
+    q.add_argument("--actor")
+    p = sub.add_parser("service")
+    ssub = p.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    for action in ("run", "stop", "reload", "status", "logs", "doctor", "harness"):
+        q = ssub.add_parser(action)
+        if action != "harness":
+            q.add_argument("--machine", action="store_true")
+        if action in ("stop", "reload"):
+            q.add_argument("--timeout", type=float, default=30.0)
+        if action == "logs":
+            q.add_argument("--tail", type=_bounded(0, 10000), default=100)
+        if action == "harness":
+            q.add_argument("--json", action="store_true")
+    return root
+
+
+def _manifest() -> dict:
+    return {**_manifest_core(), "service": SERVICE}
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    if argv[:1] == ["manifest"]:
+        _emit(_manifest())
+        return
+    _contract(argv)
+    wanted = None
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--connection" and i + 1 < len(argv):
+            wanted = argv[i + 1]
+            i += 2
+            continue
+        if argv[i].startswith("--connection="):
+            wanted = argv[i].split("=", 1)[1]
+            i += 1
+            continue
+        cleaned.append(argv[i])
+        i += 1
+    args = _parser().parse_args(cleaned)
+    cmd = args.cmd
+    if cmd == "help":
+        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        return
+    if cmd == "doctor":
+        cmd_doctor(wanted)
+        return
+    if cmd == "prompts":
+        _emit(cmd_prompts(args))
+        return
+    if cmd == "service":
+        _service(args)
+        return
+    if cmd == "jobs":
+        _emit(cmd_jobs(args, wanted))
+        return
+    if cmd == "profiles":
+        _emit(cmd_profiles(args))
+        return
+    cfg = _cfg(wanted, cmd)
+    if cmd == "seen":
+        _emit(cmd_seen(cfg, args.kind))
+    elif cmd == "history":
+        _emit(cmd_history(cfg, args.chat, args.topic, args.before, args.limit))
+    elif cmd == "download":
+        _emit(cmd_download(cfg, args.chat, args.message, args.out))
+    elif cmd == "send":
+        _emit(cmd_send(cfg, args.chat, args.text, args.topic, args.reply_to, args.file))
+    elif cmd == "react":
+        _emit(cmd_react(cfg, args.chat, args.message, args.emoji))
+
+
+if __name__ == "__main__":
+    main()

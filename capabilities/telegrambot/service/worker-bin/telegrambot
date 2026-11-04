@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""The `telegrambot` a turn or a job of the telegrambot service finds first on its PATH.
+
+The service puts this directory ahead of everything else for each turn and job.
+What the work may touch is fixed by the turn, never by the model: the chat, the
+topic, the connection, the message the work answers, the person whose
+authority it carries and the job profile come from the environment the service
+set, and a call naming any of them itself is refused.
+
+  progress <text>                 a line about the work; the service relays it
+                                  (the first at once, later ones at most one per
+                                  progress_after seconds)
+  send <chat|current> <text|-> [--file PATH]
+                                  a message for the person, sent by the service
+                                  at once into this chat
+  history [--before ID] [--limit N]
+  download <message> [--out PATH]
+  react <message> [<emoji>]       this chat only
+  jobs <verb> ...                 the register, scoped to this chat and requester
+
+Everything else passes to the real CLI unchanged, which applies its own gates.
+This is a supported-path fence, not an operating-system sandbox.
+"""
+
+import json
+import os
+import sys
+import time
+
+SCOPE_FLAGS = ("--connection", "--chat", "--topic", "--requested-by", "--origin-message-id",
+               "--actor", "--profile", "--external")
+
+
+def fail(code, message, hint=None, exit_code=4):
+    error = {"code": code, "message": message}
+    if hint:
+        error["hint"] = hint
+    sys.stderr.write(json.dumps({"error": error}, ensure_ascii=False) + "\n")
+    raise SystemExit(exit_code)
+
+
+def scope():
+    env = os.environ
+    chat = env.get("TELEGRAMBOT_AUTHORIZED_CHAT_ID", "").strip()
+    if not chat:
+        fail("worker_authority_missing", "the service did not hand this worker the chat it "
+             "acts for", "these verbs exist only inside a turn the telegrambot service started")
+    return {"chat": chat, "topic": env.get("TELEGRAMBOT_AUTHORIZED_TOPIC_ID", "").strip(),
+            "connection": env.get("TELEGRAMBOT_AUTHORIZED_CONNECTION", "").strip(),
+            "origin": env.get("TELEGRAMBOT_AUTHORIZED_ORIGIN_MESSAGE_ID", "").strip(),
+            "requester": env.get("TELEGRAMBOT_AUTHORIZED_REQUESTER", "").strip(),
+            "profile": env.get("TELEGRAMBOT_AUTHORIZED_JOB_PROFILE", "").strip(),
+            "external": env.get("TELEGRAMBOT_AUTHORIZED_EXTERNAL", "").strip()}
+
+
+def refuse_scope_flags(args):
+    for item in args:
+        name = item.split("=", 1)[0]
+        if name in SCOPE_FLAGS:
+            fail("worker_scope_denied", f"{name} cannot be set inside a telegrambot worker; "
+                 "the turn fixes it", "leave it out: the work reports into this chat")
+
+
+def outbox(kind, text, file=None):
+    path = os.environ.get("TELEGRAMBOT_PROGRESS_OUTBOX", "").strip()
+    if not path:
+        fail("worker_progress_unavailable", f"telegrambot {kind} is a worker verb and this run "
+             "has no outbox", "it exists only inside a turn the telegrambot service started")
+    text = sys.stdin.read().strip() if text == "-" else str(text or "").strip()
+    if not text and not file:
+        fail("worker_send_invalid", "the text is empty", exit_code=6)
+    if kind == "progress" and text in ("-", ".", "..."):
+        fail("worker_send_invalid", "a progress line says something useful", exit_code=6)
+    if file and not os.path.isfile(file):
+        fail("worker_send_invalid", f"{file} is not a file", exit_code=6)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"time": time.time(), "kind": kind, "text": text,
+                                 "file": os.path.abspath(file) if file else None},
+                                ensure_ascii=False) + "\n")
+    print(json.dumps({"ok": True, "queued": kind}))
+    raise SystemExit(0)
+
+
+def real(args):
+    cli = os.environ.get("TELEGRAMBOT_REAL_CLI", "").strip()
+    if not cli:
+        fail("worker_cli_missing", "the service did not name the CLI this worker runs",
+             exit_code=5)
+    env = dict(os.environ)
+    project = env.get("TELEGRAMBOT_SERVICE_PROJECT", "").strip()
+    if project:
+        # The chat, its history and the register are the service's project's,
+        # even on a turn routed to another project.
+        env["CLAUDE_PROJECT_DIR"] = project
+        for name in ("CAPABILITIES_PROJECT_ENVELOPE", "CAPABILITIES_PROJECT_ENVELOPE_ROOT"):
+            env.pop(name, None)
+    os.execvpe(cli, [cli] + args, env)
+
+
+def main():
+    args = list(sys.argv[1:])
+    verb = args[0] if args else ""
+    if verb in ("progress", "send", "history", "download", "react", "jobs"):
+        if verb == "jobs" and (args[1:2] in (["help"], []) or "--help" in args):
+            real(args)
+        refuse_scope_flags(args[1:])
+        s = scope()
+        pinned = ["--connection", s["connection"]] if s["connection"] else []
+    if verb == "progress":
+        if len(args) != 2:
+            fail("worker_progress_invalid", "worker progress syntax is: telegrambot progress "
+                 "<one text argument>", exit_code=6)
+        outbox("progress", args[1])
+    if verb == "send":
+        rest = args[1:]
+        file = None
+        if "--file" in rest:
+            at = rest.index("--file")
+            if at + 1 >= len(rest):
+                fail("worker_send_invalid", "--file takes a path", exit_code=6)
+            file = rest[at + 1]
+            rest = rest[:at] + rest[at + 2:]
+        if len(rest) not in (1, 2) or any(r.startswith("--") for r in rest):
+            fail("worker_send_invalid", "worker send syntax is: telegrambot send "
+                 "<chat|current> <text|-> [--file PATH]", exit_code=6)
+        chat = rest[0]
+        if chat not in ("current", "$current", s["chat"]):
+            fail("chat_scope_denied", "a worker sends into the chat it acts for only",
+                 f"requested={chat}; authorized_chat_id={s['chat']}")
+        outbox("message", rest[1] if len(rest) == 2 else "", file)
+    if verb == "history":
+        topic = ["--topic", s["topic"]] if s["topic"] else []
+        real(pinned + ["history", s["chat"]] + topic + args[1:])
+    if verb == "download":
+        real(pinned + ["download", s["chat"]] + args[1:])
+    if verb == "react":
+        real(pinned + ["react", s["chat"]] + args[1:])
+    if verb == "jobs":
+        sub = args[1]
+        extra = ["--chat", s["chat"], "--actor", s["requester"] or "unknown"]
+        if s["topic"]:
+            extra += ["--topic", s["topic"]]
+        if sub == "register":
+            extra += ["--requested-by", s["requester"] or "unknown"]
+            if s["origin"]:
+                extra += ["--origin-message-id", s["origin"]]
+            if s["profile"]:
+                extra += ["--profile", s["profile"]]
+            if s["external"]:
+                extra += ["--external"]
+        real(pinned + ["jobs", sub] + extra + args[2:])
+    real(args)
+
+
+if __name__ == "__main__":
+    main()
