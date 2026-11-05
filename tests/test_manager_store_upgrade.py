@@ -334,8 +334,12 @@ def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) ->
     assert set(node) >= {"label", "kind", "last_seen_at", "reachable", "runs", "command"}
     assert not (machine.data / "capabilities" / "backups").exists()
 
-    # What stops it is in the answer with what to do, and the upgrade refuses.
+    # An owner the store still records whose tables are gone, as a retired
+    # tool's, has nothing to move and stops nothing.
     machine.sql("INSERT INTO schema_version (owner, major, minor) VALUES ('ghost', 1, 0)")
+    assert machine.ok("store", "upgrade", "--check")["blockers"] == []
+    # What stops it is in the answer with what to do, and the upgrade refuses.
+    machine.sql("CREATE TABLE ghost_items (id int)")
     tools = {Path(shutil.which(t)).parent for t in ("pg_dump", "pg_restore")}
     path = os.pathsep.join(p for p in machine.base["PATH"].split(os.pathsep)
                            if Path(p) not in tools)

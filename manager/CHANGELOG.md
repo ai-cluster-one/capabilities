@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-05 — `store upgrade` is not stopped by an owner whose tables are gone
+
+`capabilities store upgrade --check` no longer reports `owner_not_installed` for an owner the store records in `schema_version` but whose tables are all gone, as a retired tool's whose tables were dropped: it has nothing to move, so it no longer stops the upgrade, and a store that holds such a row can be crossed from this line.
+
 ## 2026-11-05 — `store-major-1` is the release line of store schema major 1
 
 This branch keeps the last release of store major 1 after `main` moved to major 2. Its manager names `STORE_LIBRARY` `>=0.42,<0.43`, which `source index` stamps as `library` into the release manifest and the catalogue, so `self-update` and `update` on a machine whose store is still at major 1 take this line and hold the manager and every capability on capabilities-contract 0.42, the last library that reads major 1. It takes only fixes and what major 1 needs to reach `capabilities store upgrade`.
