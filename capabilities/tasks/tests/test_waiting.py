@@ -316,7 +316,7 @@ class ReleaseCursor:
         text = " ".join(sql.split())
         if "tasks_executions where id::text" in text:
             self.answer = [dict(EXECUTION)]
-        elif text.startswith("select project_id from"):
+        elif text.startswith("select agent_id from"):
             self.answer = [{"project_id": HERE}]
         elif text.startswith("update") and "tasks_executions" in text:
             self.answer = [{**EXECUTION, "status": params[0], "ended_at": "now"}]

@@ -108,9 +108,9 @@ def test_workers_are_versions_and_history_is_never_edited(store):
     assert store.worker("other", "w") is None
     assert [v["active"] for v in store.worker_history("p", "w")] == [False, True]
     with pytest.raises(Exception, match="never edited or deleted"):
-        store.execute("UPDATE agentrooms_workers SET body = 'x' WHERE id = %s", (first["id"],))
+        store.execute("UPDATE agentrooms_worker_versions SET body = 'x' WHERE id = %s", (first["id"],))
     with pytest.raises(Exception, match="never edited or deleted"):
-        store.execute("DELETE FROM agentrooms_workers WHERE id = %s", (first["id"],))
+        store.execute("DELETE FROM agentrooms_worker_versions WHERE id = %s", (first["id"],))
     assert store.remove_worker("p", "w", base=None) == second["id"]
     assert store.worker("p", "w") is None and store.remove_worker("p", "w", base=None) is None
     assert store.workers("p") == []
@@ -215,7 +215,7 @@ def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
         "WHERE channel = %s AND scope = %s",
         (engine.HELD_CHANNEL, engine.held_scope("p", "alpha"))).fetchone()
     listener.close()
-    assert said and all(n == {"schema": store.setting.schema, "project": "p", "agent": "alpha",
+    assert said and all(n == {"schema": store.setting.schema, "agent_id": "p", "agent": "alpha",
                               "room": "!r"} for n in said)
     assert version == (10,) and len(said) <= 10
 
@@ -238,13 +238,13 @@ def test_a_sync_releasing_a_room_and_a_dismiss_of_it_both_commit(store):
     sync, operator = psycopg.connect(dsn), psycopg.connect(dsn)
     out = {}
     try:
-        sync.execute("INSERT INTO agentrooms_wakes (project_id, agent, room_id, wake_key, kind, "
+        sync.execute("INSERT INTO agentrooms_wakes (agent_id, agent, room_id, wake_key, kind, "
                      "event_id, sender, held_at) VALUES ('p', 'alpha', '!q', '$2', 'mention', "
                      "'$2', '@t:x', now())")
 
         def dismiss():
             try:
-                operator.execute("DELETE FROM agentrooms_wakes WHERE project_id = 'p' "
+                operator.execute("DELETE FROM agentrooms_wakes WHERE agent_id = 'p' "
                                  "AND agent = 'alpha' AND room_id = '!r' AND held_at IS NOT NULL")
                 operator.commit()
                 out["operator"] = "committed"
@@ -256,7 +256,7 @@ def test_a_sync_releasing_a_room_and_a_dismiss_of_it_both_commit(store):
         thread.start()
         thread.join(0.5)
         try:
-            sync.execute("UPDATE agentrooms_wakes SET held_at = NULL WHERE project_id = 'p' "
+            sync.execute("UPDATE agentrooms_wakes SET held_at = NULL WHERE agent_id = 'p' "
                          "AND agent = 'alpha' AND room_id = '!r' AND held_at IS NOT NULL")
             sync.commit()
             out["sync"] = "committed"
@@ -335,3 +335,95 @@ def test_the_store_keeps_one_working_connection_between_operations(store):
     with psycopg.connect(DSN, autocommit=True) as admin:
         assert admin.execute("SELECT state FROM pg_stat_activity WHERE pid = %s",
                              (inside,)).fetchone() == ("idle",)
+
+
+def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(monkeypatch):
+    """A store whose agentrooms tables are at 1.5, with a row in every table, is
+    refused outside the store upgrade and migrated in place when the service
+    opens it inside it: every row stays under
+    `agent_id` and `agentrooms_worker_versions`, nothing in the tables is still
+    named for the old table or for project_id, and the recreated triggers still
+    refuse an edit and announce a held wake by agent_id."""
+    import json
+
+    import psycopg
+    from capabilities_contract import db
+    from psycopg.conninfo import conninfo_to_dict
+
+    info = conninfo_to_dict(DSN)
+    schema = f"ar_m1_{uuid.uuid4().hex[:8]}"
+    setting = db.Setting(schema=schema, level="machine", sources=("AGENTROOMS_TEST_DSN",),
+                         host=info.get("host") or "127.0.0.1", port=int(info.get("port") or 5432),
+                         database=info.get("dbname"), user=info.get("user"),
+                         password=info.get("password"), sslmode=info.get("sslmode") or "disable")
+    conn = db.connect(application_name="agentrooms-test", setting=setting, transaction=True)
+    try:
+        db.migrate(conn, engine.LEDGER_OWNER, engine.LEDGER_STEPS[:11], major=1, minor=5)
+        with conn.transaction():
+            for sql in (
+                "INSERT INTO agentrooms_sync (project_id, agent, user_id, next_batch) "
+                "VALUES ('p', 'alpha', '@alpha:x', 'b1')",
+                "INSERT INTO agentrooms_wakes (project_id, agent, room_id, wake_key, kind, "
+                "sender, held_at) VALUES ('p', 'alpha', '!r', '$1', 'mention', '@b:x', now())",
+                "INSERT INTO agentrooms_sessions (project_id, agent, room_id, harness, session_id, "
+                "node, turns) VALUES ('p', 'alpha', '!r', 'claude', 's1', 'n1', 2)",
+                "INSERT INTO agentrooms_leases (project_id, agent, holder, node, pid, acquired_at, "
+                "expires_at) VALUES ('p', 'alpha', 'h1', 'n1', 1, now(), now() - interval '1 h')",
+                "INSERT INTO agentrooms_pauses (project_id, paused_at, paused_by, reason) "
+                "VALUES ('p', now(), 'u@n1', 'why')",
+                "INSERT INTO agentrooms_workers (id, project_id, name, spec, body, active) VALUES "
+                "('00000000-0000-0000-0000-00000000000a', 'p', 'lab', '{}', 'old', false), "
+                "('00000000-0000-0000-0000-00000000000b', 'p', 'lab', '{}', 'new', true)",
+                "INSERT INTO agentrooms_turns (id, project_id, agent, room_id, worker, outcome) "
+                "VALUES ('t1', 'p', 'alpha', '!r', 'lab', 'answered')"):
+                conn.execute(sql)
+    finally:
+        conn.close()
+    monkeypatch.delenv(db.UPGRADE_ENV, raising=False)
+    with pytest.raises(engine.StoreUnavailable) as refused:
+        engine.Store(setting).open()
+    assert refused.value.slug == "store_upgrade_needed"
+    monkeypatch.setenv(db.UPGRADE_ENV, "1")
+    store = engine.Store(setting).open()
+    monkeypatch.delenv(db.UPGRADE_ENV)
+    try:
+        assert store.next_batch("p", "alpha", "@alpha:x") == "b1"
+        assert [w["sender"] for w in store.held("p", "alpha")] == ["@b:x"]
+        assert store.session("p", "alpha", "!r")["session_id"] == "s1"
+        assert store.pause_of("p")["reason"] == "why"
+        assert [w["body"] for w in store.worker_history("p", "lab")] == ["old", "new"]
+        assert store.worker("p", "lab")["body"] == "new"
+        assert store.acquire("p", "alpha", "h2", "n2", 2) is None  # the old lease ran out
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            admin.execute(f'SET search_path TO "{schema}"')
+            assert admin.execute("SELECT major, minor FROM schema_version "
+                                 "WHERE owner = 'agentrooms'").fetchone() == (2, 0)
+            assert admin.execute("SELECT agent_id, worker, outcome FROM agentrooms_turns"
+                                 ).fetchall() == [("p", "lab", "answered")]
+            names = [r[0] for r in admin.execute(
+                "SELECT relname::text FROM pg_class WHERE relnamespace = %s::regnamespace "
+                "UNION ALL SELECT conname::text FROM pg_constraint "
+                "WHERE connamespace = %s::regnamespace "
+                "UNION ALL SELECT tgname::text FROM pg_trigger t JOIN pg_class c "
+                "ON c.oid = t.tgrelid WHERE c.relnamespace = %s::regnamespace "
+                "UNION ALL SELECT proname::text FROM pg_proc WHERE pronamespace = %s::regnamespace "
+                "UNION ALL SELECT attname::text FROM pg_attribute a JOIN pg_class c "
+                "ON c.oid = a.attrelid WHERE c.relnamespace = %s::regnamespace "
+                "AND c.relname LIKE 'agentrooms\\_%%' AND c.relkind = 'r' AND a.attnum > 0",
+                [schema] * 5).fetchall()]
+            assert not [n for n in names if "agentrooms_workers" in n or "project_id" in n], names
+            said = [r[0] for r in admin.execute(
+                "SELECT pg_get_functiondef(p.oid) FROM pg_proc p "
+                "WHERE pronamespace = %s::regnamespace AND proname LIKE 'agentrooms\\_%%'",
+                [schema]).fetchall()]
+            assert said and not [text for text in said if "project" in text], said
+            with pytest.raises(psycopg.errors.RestrictViolation,
+                               match="agentrooms_worker_versions"):
+                admin.execute("UPDATE agentrooms_worker_versions SET body = 'x'")
+            admin.execute("LISTEN agentrooms_held")
+            admin.execute("UPDATE agentrooms_wakes SET held_at = NULL WHERE agent_id = 'p'")
+            said = [json.loads(n.payload) for n in admin.notifies(timeout=2, stop_after=1)]
+        assert said == [{"schema": schema, "agent_id": "p", "agent": "alpha", "room": "!r"}]
+    finally:
+        store.execute(f"DROP SCHEMA {schema} CASCADE")
+        store.close()

@@ -93,7 +93,7 @@ def store(monkeypatch):
 
 def _task(conn, schema, project, key) -> str:
     return str(conn.execute(
-        f"""insert into {schema}.tasks_tasks (project_id, type, unique_key, title, status)
+        f"""insert into {schema}.tasks_tasks (agent_id, type, unique_key, title, status)
             values (%s, 'change', %s, %s, 'todo') returning id""",
         (project, key, f"title of {key}")).fetchone()[0])
 

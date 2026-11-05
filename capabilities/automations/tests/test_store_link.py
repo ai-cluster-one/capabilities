@@ -102,14 +102,14 @@ def test_no_link_listens_and_the_schedulers_follows_saved_definitions(runtime):
             earlier.execute("LISTEN automations_changed")
             with psycopg.connect(DSN) as writer:
                 writer.execute(f'SET search_path TO "{schema}"')
-                writer.execute("INSERT INTO automations_definitions (project_id, slug, "
+                writer.execute("INSERT INTO automations_definition_versions (agent_id, slug, "
                                "script_path) VALUES ('prj_a', 'kept', 'job.py')")
                 writer.commit()
-                writer.execute("INSERT INTO automations_definitions (project_id, slug, "
+                writer.execute("INSERT INTO automations_definition_versions (agent_id, slug, "
                                "script_path) VALUES ('prj_b', 'undone', 'job.py')")
                 writer.rollback()
             said = [json.loads(n.payload) for n in earlier.notifies(timeout=1, stop_after=1)]
-        assert said == [{"schema": schema, "project": "prj_a", "slug": "kept"}]
+        assert said == [{"schema": schema, "agent_id": "prj_a", "slug": "kept"}]
 
         scheduler._polled_at = None
         assert scheduler.take_changed("prj_a") is True
@@ -167,7 +167,7 @@ def test_a_saved_definition_cuts_the_schedulers_sleep_short(runtime):
             time.sleep(0.5)
             with psycopg.connect(DSN, autocommit=True) as writer:
                 writer.execute(f'SET search_path TO "{schema}"')
-                writer.execute("INSERT INTO automations_definitions (project_id, slug, "
+                writer.execute("INSERT INTO automations_definition_versions (agent_id, slug, "
                                "script_path) VALUES ('prj_a', 'kept', 'job.py')")
 
         writer = threading.Thread(target=save)
@@ -195,7 +195,7 @@ def test_a_saved_definition_cuts_the_schedulers_sleep_short(runtime):
 
 
 @needs_store
-def test_runs_from_before_the_label_left_the_table_keep_every_other_field(runtime):
+def test_runs_from_before_the_label_left_the_table_keep_every_other_field(runtime, monkeypatch):
     """`0008-runs-environment-retired` leaves the label's column to earlier
     releases: every run recorded before it is still listed with every field as
     it was, and a run recorded after it leaves the column null."""
@@ -204,8 +204,9 @@ def test_runs_from_before_the_label_left_the_table_keep_every_other_field(runtim
     from capabilities_contract import db
     schema = "automations_label_" + uuid.uuid4().hex[:8]
     setting = _setting(schema)
-    earlier = [step for step in runtime.LEDGER_STEPS if step[0] != "0008-runs-environment-retired"]
-    assert len(earlier) == len(runtime.LEDGER_STEPS) - 1
+    earlier = [step for step in runtime.LEDGER_STEPS
+               if step[0] not in ("0008-runs-environment-retired", "0009-agent-names")]
+    assert len(earlier) == len(runtime.LEDGER_STEPS) - 2
     conn = db.connect(application_name=runtime.LEDGER_OWNER, setting=setting, transaction=True)
     try:
         db.migrate(conn, runtime.LEDGER_OWNER, earlier, major=1, minor=4)
@@ -233,8 +234,11 @@ def test_runs_from_before_the_label_left_the_table_keep_every_other_field(runtim
             before = {row["id"]: row for row in writer.execute(
                 "SELECT * FROM automations_runs ORDER BY id").fetchall()}
 
-        # A minor step: the next open applies it, with no upgrade.
+        # A minor step, applied with 0009-agent-names, which crosses to 2.0: so here
+        # only the store upgrade takes them.
+        monkeypatch.setenv(db.UPGRADE_ENV, "1")
         link = runtime.StoreLink(setting).open()
+        monkeypatch.delenv(db.UPGRADE_ENV)
         try:
             ledger = runtime.RunLedger("prj_a", link=link)
             listed = ledger.list()
@@ -249,7 +253,99 @@ def test_runs_from_before_the_label_left_the_table_keep_every_other_field(runtim
             after = {row["id"]: row for row in reader.execute(
                 "SELECT * FROM automations_runs ORDER BY id").fetchall()}
         assert after.pop(fresh["id"])["environment"] is None
-        assert after == before
+        # The same rows, the agent under the name 0009-agent-names gives it.
+        assert after == {run_id: {("agent_id" if key == "project_id" else key): value
+                                  for key, value in row.items()}
+                         for run_id, row in before.items()}
     finally:
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+@needs_store
+def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(runtime, monkeypatch):
+    """A store whose automations tables are at 1.4, with runs and definition
+    versions in them, is migrated in place when a link opens: every row stays
+    under `agent_id` and `automations_definition_versions`, nothing in the
+    tables is still named for the old table or for project_id, and the
+    recreated triggers still refuse an edit and announce a save by agent_id."""
+    import psycopg
+    from capabilities_contract import db
+    schema = "automations_m1_" + uuid.uuid4().hex[:8]
+    setting = _setting(schema)
+    conn = db.connect(application_name="automations-test", setting=setting, transaction=True)
+    try:
+        db.migrate(conn, runtime.LEDGER_OWNER, runtime.LEDGER_STEPS[:7], major=1, minor=4)
+        with conn.transaction():
+            conn.execute("INSERT INTO automations_definitions (id, project_id, slug, script_path, "
+                         "active, created_by) VALUES "
+                         "('00000000-0000-0000-0000-00000000000a', 'prj_a', 'job', 'a.py', "
+                         "false, 'u@n'), "
+                         "('00000000-0000-0000-0000-00000000000b', 'prj_a', 'job', 'b.py', "
+                         "true, 'u@n')")
+            conn.execute("INSERT INTO automations_runs (id, project_id, automation_slug, "
+                         "environment, trigger, dedupe_key, status, queued_at, log_path, host, "
+                         "node, definition_id) VALUES ('r1', 'prj_a', 'job', 'n1', 'manual', "
+                         "'d1', 'succeeded', now(), '/tmp/r1.log', 'h', 'n1', "
+                         "'00000000-0000-0000-0000-00000000000b')")
+    finally:
+        conn.close()
+    # Outside the store upgrade the major is not crossed; inside it, it is.
+    monkeypatch.delenv(db.UPGRADE_ENV, raising=False)
+    with pytest.raises(runtime.StoreUnavailable) as held:
+        runtime.StoreLink(setting).open()
+    assert held.value.slug == "store_upgrade_needed"
+    monkeypatch.setenv(db.UPGRADE_ENV, "1")
+    link = runtime.StoreLink(setting).open()
+    monkeypatch.delenv(db.UPGRADE_ENV)
+    try:
+        ledger = runtime.RunLedger("prj_a", link=link)
+        assert [(row["id"], row["project_id"], row["definition_id"])
+                for row in ledger._rows()] == [
+            ("r1", "prj_a", "00000000-0000-0000-0000-00000000000b")]
+        assert [(row["script_path"], row["active"], row["project_id"])
+                for row in ledger.definition_history("job")] == [
+            ("a.py", False, "prj_a"), ("b.py", True, "prj_a")]
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            admin.execute(f'SET search_path TO "{schema}"')
+            assert admin.execute("SELECT major, minor FROM schema_version "
+                                 "WHERE owner = 'automations'").fetchone() == (2, 0)
+            assert admin.execute("SELECT to_regclass('automations_definitions')").fetchone() == (
+                None,)
+            names = [r[0] for r in admin.execute(
+                "SELECT relname::text FROM pg_class WHERE relnamespace = %s::regnamespace "
+                "UNION ALL SELECT conname::text FROM pg_constraint "
+                "WHERE connamespace = %s::regnamespace "
+                "UNION ALL SELECT tgname::text FROM pg_trigger t JOIN pg_class c "
+                "ON c.oid = t.tgrelid WHERE c.relnamespace = %s::regnamespace "
+                "UNION ALL SELECT proname::text FROM pg_proc WHERE pronamespace = %s::regnamespace "
+                "UNION ALL SELECT attname::text FROM pg_attribute a JOIN pg_class c "
+                "ON c.oid = a.attrelid WHERE c.relnamespace = %s::regnamespace "
+                "AND c.relname LIKE 'automations\\_%%' AND NOT c.relname LIKE '%%premig%%' "
+                "AND c.relkind = 'r' AND a.attnum > 0", [schema] * 5).fetchall()]
+            assert not [n for n in names if "automations_definitions" in n
+                        or "project_id" in n], names
+            said = [r[0] for r in admin.execute(
+                "SELECT coalesce(obj_description(p.oid, 'pg_proc'), '') || "
+                "pg_get_functiondef(p.oid) FROM pg_proc p "
+                "WHERE pronamespace = %s::regnamespace AND proname LIKE 'automations\\_%%'",
+                [schema]).fetchall()]
+            said += [r[0] for r in admin.execute(
+                "SELECT description FROM pg_description d JOIN pg_class c ON c.oid = d.objoid "
+                "WHERE c.relnamespace = %s::regnamespace AND c.relname LIKE 'automations\\_%%' "
+                "AND NOT c.relname LIKE '%%premig%%'", [schema]).fetchall()]
+            assert not [text for text in said if "project" in text], said
+            with pytest.raises(psycopg.errors.RestrictViolation,
+                               match="automations_definition_versions"):
+                admin.execute("UPDATE automations_definition_versions SET slug = 'other'")
+            admin.execute("LISTEN automations_changed")
+            ledger.save_definition("job", {**ledger.definition("job"), "script_path": "c.py"},
+                                   by="u@n")
+            said = [json.loads(n.payload) for n in admin.notifies(timeout=2, stop_after=2)]
+        assert {"schema": schema, "agent_id": "prj_a", "slug": "job"} in said
+        assert [row["script_path"] for row in ledger.definition_history("job")] == [
+            "a.py", "b.py", "c.py"]
+    finally:
+        link.close()
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

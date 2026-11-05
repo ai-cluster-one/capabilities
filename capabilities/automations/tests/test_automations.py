@@ -162,10 +162,10 @@ environment = "test"
             db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
                        major=major, minor=minor)
             with conn.transaction():
-                conn.execute("DELETE FROM capabilities_policy WHERE agent_id = %s "
+                conn.execute("DELETE FROM policies WHERE agent_id = %s "
                              "AND capability = 'automations'", (self.project_id,))
                 for node in nodes:
-                    conn.execute("INSERT INTO capabilities_policy (agent_id, capability, "
+                    conn.execute("INSERT INTO policies (agent_id, capability, "
                                  "node, enabled, service) VALUES (%s, 'automations', %s, "
                                  "true, true)", (self.project_id, node))
 
@@ -1357,7 +1357,7 @@ environments = ["production"]
         conn = RUNTIME._database().connect(application_name="automations-test")
         try:
             row = conn.execute(
-                "SELECT project_id, automation_slug, trigger, host "
+                "SELECT agent_id, automation_slug, trigger, host "
                 "FROM automations_runs WHERE id = %s", [run["id"]]).fetchone()
         finally:
             conn.close()
@@ -1849,7 +1849,7 @@ def test_a_run_inserted_without_a_node_is_refused_rather_than_recorded_under_its
     led = ledger_env()
     with pytest.raises(psycopg.errors.NotNullViolation):
         led._execute(
-            "INSERT INTO automations_runs (id, project_id, automation_slug, "
+            "INSERT INTO automations_runs (id, agent_id, automation_slug, "
             "trigger, status, queued_at, log_path, host) VALUES "
             "(%s, %s, 'nightly', 'manual', 'pending', %s, '/tmp/x.log', 'old-node')",
             [uuid.uuid4().hex, led.project_id, RUNTIME.iso()])

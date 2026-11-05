@@ -32,11 +32,11 @@ DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_
 CANONICAL = "agentkit"
 LANE = "dev_telegram_test"
 TABLE = """CREATE TABLE {schema}.telegram_channels (
-    project_id text NOT NULL, environment text NOT NULL, connection text NOT NULL,
+    agent_id text NOT NULL, environment text NOT NULL, connection text NOT NULL,
     channel_key text NOT NULL, last_processed_message_id bigint NOT NULL DEFAULT 0,
     settings jsonb NOT NULL DEFAULT '{{}}'::jsonb, state jsonb NOT NULL DEFAULT '{{}}'::jsonb,
     {extra}
-    PRIMARY KEY (project_id, environment, connection, channel_key))"""
+    PRIMARY KEY (agent_id, environment, connection, channel_key))"""
 
 
 def _free_port() -> int:
@@ -134,14 +134,14 @@ def store(cluster, monkeypatch):
 
 def _rows(conn, schema: str) -> list[tuple]:
     return conn.execute(
-        f"SELECT project_id, connection, channel_key, last_processed_message_id, settings "
+        f"SELECT agent_id, connection, channel_key, last_processed_message_id, settings "
         f"FROM {schema}.telegram_channels ORDER BY 1, 2, 3").fetchall()
 
 
 def _put(conn, schema: str, project: str, connection: str, channel: str, mark: int,
          settings: str = "{}") -> None:
     conn.execute(
-        f"INSERT INTO {schema}.telegram_channels (project_id, environment, connection, "
+        f"INSERT INTO {schema}.telegram_channels (agent_id, environment, connection, "
         "channel_key, last_processed_message_id, settings) VALUES (%s, 'production', %s, "
         "%s, %s, %s::jsonb)", (project, connection, channel, mark, settings))
 

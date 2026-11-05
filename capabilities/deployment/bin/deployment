@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.43,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -5065,9 +5065,9 @@ class _Lease(_StoreTurns):
         def work(conn):
             row = conn.execute(
                 "INSERT INTO deployment_service_leases AS l "
-                "(project, capability, node, expires_at) "
+                "(agent_id, capability, node, expires_at) "
                 "VALUES (%s, %s, %s, now() + %s * interval '1 second') "
-                "ON CONFLICT (project, capability) DO UPDATE "
+                "ON CONFLICT (agent_id, capability) DO UPDATE "
                 "SET node = EXCLUDED.node, expires_at = EXCLUDED.expires_at, "
                 "renewed_at = now(), acquired_at = CASE WHEN l.node = EXCLUDED.node "
                 "THEN l.acquired_at ELSE now() END, "
@@ -5083,7 +5083,7 @@ class _Lease(_StoreTurns):
                 row = conn.execute(
                     "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
                     "last_exit, last_error, last_error_at "
-                    "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                    "FROM deployment_service_leases WHERE agent_id = %s AND capability = %s",
                     (self.project, capability)).fetchone()
             return self._holding(row, self.node)
         found = self._run(work)
@@ -5102,12 +5102,12 @@ class _Lease(_StoreTurns):
         def work(conn):
             gone = conn.execute(
                 "DELETE FROM deployment_service_leases "
-                "WHERE project = %s AND capability = %s AND node = %s",
+                "WHERE agent_id = %s AND capability = %s AND node = %s",
                 (self.project, capability, self.node)).rowcount
             row = conn.execute(
                 "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
                 "last_exit, last_error, last_error_at "
-                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                "FROM deployment_service_leases WHERE agent_id = %s AND capability = %s",
                 (self.project, capability)).fetchone()
             found = self._holding(row, self.node)
             found["released"] = bool(gone)
@@ -5132,7 +5132,7 @@ class _Lease(_StoreTurns):
             done = conn.execute(
                 "UPDATE deployment_service_leases SET last_exit = %s, last_error = %s, "
                 "last_error_at = now() "
-                "WHERE project = %s AND capability = %s AND node = %s",
+                "WHERE agent_id = %s AND capability = %s AND node = %s",
                 (code, error[-LEASE_ERROR_CHARS:], self.project, capability,
                  self.node)).rowcount
             return {"recorded": bool(done)}
@@ -5143,7 +5143,7 @@ class _Lease(_StoreTurns):
             row = conn.execute(
                 "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
                 "last_exit, last_error, last_error_at "
-                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                "FROM deployment_service_leases WHERE agent_id = %s AND capability = %s",
                 (self.project, capability)).fetchone()
             return self._holding(row, self.node)
         return self._run(work)
@@ -5155,7 +5155,7 @@ class _Lease(_StoreTurns):
 
 class _Instance(_StoreTurns):
     """This node's row of what it runs of one service, in the store's
-    `capabilities_service_instances`, which the contract's ledger owns:
+    `service_instances`, which the contract's ledger owns:
     written on every start, reconcile and exit, and deleted once the runner
     no longer supervises the service here. `maybe_written` is whether a row
     may stand: unknown at first, since a runner killed before it could delete
@@ -5231,7 +5231,7 @@ def _lease_read(root: Path, project: str, node: str, capability: str) -> dict:
             row = conn.execute(
                 "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
                 "last_exit, last_error_at "
-                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                "FROM deployment_service_leases WHERE agent_id = %s AND capability = %s",
                 (project, capability)).fetchone()
     except Exception as exc:  # psycopg.Error, or a connection that went away
         return {"state": "unreachable", "error": {

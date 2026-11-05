@@ -789,7 +789,7 @@ def test_two_projects_on_two_stores_each_keep_their_runs_in_their_own(farm):
         with psycopg.connect(DSN, autocommit=True) as conn:
             def ids(schema):
                 return {row[0] for row in conn.execute(
-                    f"select distinct project_id from {schema}.automations_runs")}
+                    f"select distinct agent_id from {schema}.automations_runs")}
             assert farm.projects["beta"]["id"] in ids(own)
             assert farm.projects["alpha"]["id"] not in ids(own)
             assert farm.projects["beta"]["id"] not in ids("agentkit")

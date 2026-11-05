@@ -113,7 +113,7 @@ class Schema(StoreCase):
             "SELECT major, minor FROM schema_version WHERE owner = 'whatsapp'"
         ).fetchone()
         self.assertEqual((version["major"], version["minor"]),
-                         (1, wa.STORE_SCHEMA_MINOR))
+                         (wa.STORE_SCHEMA_MAJOR, wa.STORE_SCHEMA_MINOR))
 
     def test_a_captured_message_reads_back_as_before(self):
         self.captured("m1")

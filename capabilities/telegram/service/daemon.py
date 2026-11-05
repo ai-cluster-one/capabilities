@@ -8,8 +8,8 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.42,<1",
-#     "callva-harness-runner==0.10.2",
+#     "capabilities-contract>=0.43,<1",
+#     "callva-harness-runner==0.11.0",
 # ]
 # ///
 # callva-harness-runner launches every worker turn - dialogue, durable job,
@@ -529,7 +529,7 @@ def _read_document(key):
     """A document's text, or None where neither the store nor a scope's file
     keeps one by that key.
 
-    A prompt's home is the store: its active version in `telegram_prompts` is
+    A prompt's home is the store: its active version in `telegram_prompt_versions` is
     what is read, and its file only while the store holds no version of the
     key, which is what a project that has not run `telegram prompts import`
     still runs on. A store that is configured and cannot answer leaves the

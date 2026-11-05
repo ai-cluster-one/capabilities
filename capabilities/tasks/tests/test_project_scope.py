@@ -234,7 +234,7 @@ def test_a_write_outside_a_project_is_refused_and_names_what_settles_it(
 def test_the_project_clause_is_on_every_question_the_store_is_asked(monkeypatch):
     monkeypatch.setattr(mod, "PROJECT", HERE)
     where, params = mod._where({})
-    assert where.startswith(" where project_id = %s") and params == [HERE]
+    assert where.startswith(" where agent_id = %s") and params == [HERE]
     where, params = mod._where({"project": THERE, "status": "todo"})
     assert params == [THERE, "todo"]
 
@@ -375,7 +375,7 @@ def test_all_projects_drops_the_project_clause_and_nothing_else(monkeypatch):
     where, params = mod._where({"all-projects": True})
     assert where == "" and params == []
     where, params = mod._where({"all-projects": True, "status": "todo"})
-    assert "project_id" not in where and params == ["todo"]
+    assert "agent_id" not in where and params == ["todo"]
 
 
 # --- The tables ---------------------------------------------------------------
@@ -439,7 +439,7 @@ def seed(monkeypatch, entry, capsys, project: str, key: str, **fields) -> None:
 def task_uuid(conn, schema: str, project: str, key: str) -> str:
     """A task's uuid, which names it wherever it is; a key names it only in its
     own project."""
-    row = conn.execute(f"select id from {schema}.tasks_tasks where project_id = %s "
+    row = conn.execute(f"select id from {schema}.tasks_tasks where agent_id = %s "
                        f"and unique_key = %s", (project, key)).fetchone()
     return str(row[0])
 
@@ -794,7 +794,7 @@ def test_outside_a_project_a_read_names_one_and_a_write_is_refused(
     # Nothing was written, and above all no row belonging to nobody.
     with _conn.cursor() as cur:
         cur.execute(f"select count(*) from {_schema}.tasks_tasks "
-                    f"where project_id is null or project_id = ''")
+                    f"where agent_id is null or agent_id = ''")
         assert cur.fetchone()[0] == 0
         cur.execute(f"select count(*) from {_schema}.tasks_tasks")
         assert cur.fetchone()[0] == 3

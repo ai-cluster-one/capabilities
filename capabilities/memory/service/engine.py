@@ -39,8 +39,8 @@ from typing import Any, Callable, Iterable
 # ── the tables ───────────────────────────────────────────────────────────────
 
 LEDGER_OWNER = "memory"
-LEDGER_MAJOR = 1
-LEDGER_MINOR = 2
+LEDGER_MAJOR = 2
+LEDGER_MINOR = 0
 CHANNEL = "memory_changed"
 
 LEDGER_STEPS = [
@@ -184,6 +184,76 @@ LEDGER_STEPS = [
     COMMENT ON COLUMN memory_groom_leases.expires_at IS
         'When the lease lapses unless removed first: the pass''s deadline, so a pass that '
         'was killed leaves nothing that outlasts it.';
+    """),
+    # The store names an agent where it named a project: the column that holds
+    # one in each table, every index and constraint named for it, the guard and
+    # the notification that read it, and the comment that says it. The rows
+    # stay where they are; this is major 2, so a release that still reads the
+    # old names refuses the store instead of failing on a missing column.
+    ("0007-agent-names", """
+    ALTER TABLE memory_entries RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE memory_events RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE memory_groom_leases RENAME COLUMN project_id TO agent_id;
+    ALTER INDEX memory_entries_project RENAME TO memory_entries_agent;
+    ALTER INDEX memory_events_project RENAME TO memory_events_agent;
+    DO $$
+    DECLARE r record;
+    BEGIN
+        FOR r IN SELECT c.conrelid::regclass AS tab, c.conname
+                   FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+                  WHERE t.relnamespace = current_schema()::regnamespace
+                    AND t.relname IN ('memory_entries', 'memory_events', 'memory_groom_leases')
+                    AND c.conname LIKE '%project%'
+        LOOP
+            EXECUTE format('ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+                           r.tab, r.conname, replace(r.conname, 'project', 'agent'));
+        END LOOP;
+    END $$;
+
+    CREATE OR REPLACE FUNCTION memory_entries_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF tg_op = 'DELETE' THEN
+            IF current_setting('memory.purge', true) IS DISTINCT FROM old.id::text THEN
+                RAISE EXCEPTION 'memory entries are never deleted: `memory drop --purge` is the one hard delete'
+                    USING ERRCODE = 'check_violation';
+            END IF;
+            RETURN old;
+        END IF;
+        IF new.id <> old.id OR new.seq <> old.seq OR new.agent_id <> old.agent_id
+                OR new.scope IS DISTINCT FROM old.scope OR new.title <> old.title
+                OR new.body <> old.body OR new.created_at <> old.created_at
+                OR new.created_by <> old.created_by OR new.node <> old.node
+                OR new.origin <> old.origin OR new.body_hash <> old.body_hash THEN
+            RAISE EXCEPTION 'a memory entry''s text is immutable: supersede it with a new entry'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.status <> old.status AND NOT (
+                (old.status = 'active' AND new.status IN ('superseded', 'dropped'))
+                OR (old.status IN ('superseded', 'dropped') AND new.status = 'active')) THEN
+            RAISE EXCEPTION 'a memory entry does not move from % to %', old.status, new.status
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+
+    CREATE OR REPLACE FUNCTION memory_notify() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        PERFORM pg_notify('memory_changed', json_build_object(
+            'schema', tg_table_schema, 'agent_id', new.agent_id, 'kind', new.kind,
+            'entry', new.entry_id, 'event', new.seq)::text);
+        IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN
+            EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                           'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                           'DO UPDATE SET version = c.version + 1',
+                           tg_table_schema, 'memory_changed')
+                USING new.agent_id;
+        END IF;
+        RETURN NULL;
+    END $$;
+
+    COMMENT ON TABLE memory_groom_leases IS
+        'The grooming pass that holds an agent''s memory: one row while it runs, taken only '
+        'when none is held or the one held has expired, and removed when the pass ends.';
     """),
 ]
 
@@ -386,13 +456,13 @@ def store_label(setting) -> str:
     return f"{setting.level} store setting, schema {setting.schema}"
 
 
-ENTRY_COLUMNS = ("id, seq, project_id, scope, title, body, pinned, status, superseded_by, "
+ENTRY_COLUMNS = ("id, seq, agent_id, scope, title, body, pinned, status, superseded_by, "
                  "destination, created_at, created_by, node, origin, body_hash")
 
 
 def entry_out(row: dict, *, with_body: bool = True) -> dict:
     out = {"id": str(row["id"]), "short": short(row["id"]), "seq": row["seq"],
-           "project_id": row["project_id"], "scope": row["scope"], "title": row["title"],
+           "project_id": row["agent_id"], "scope": row["scope"], "title": row["title"],
            "pinned": row["pinned"], "status": row["status"],
            "superseded_by": str(row["superseded_by"]) if row["superseded_by"] else None,
            "destination": row["destination"], "created_at": iso(row["created_at"]),
@@ -500,7 +570,7 @@ class Store:
     def _insert(cur, project: str, title: str, body: str, *, scope: str | None, pinned: bool,
                 origin: str, actor: str, node: str, created_at=None) -> dict:
         cur.execute(
-            f"INSERT INTO memory_entries (project_id, scope, title, body, pinned, origin, "
+            f"INSERT INTO memory_entries (agent_id, scope, title, body, pinned, origin, "
             f"created_by, node, body_hash, created_at) "
             f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, coalesce(%s::timestamptz, now())) "
             f"RETURNING {ENTRY_COLUMNS}",
@@ -512,7 +582,7 @@ class Store:
     def _event(cur, project: str, kind: str, *, actor: str, node: str, entry_id=None,
                reason: str | None = None, pass_id=None, detail: dict | None = None) -> int:
         from psycopg.types.json import Jsonb
-        cur.execute("INSERT INTO memory_events (project_id, entry_id, kind, actor, node, "
+        cur.execute("INSERT INTO memory_events (agent_id, entry_id, kind, actor, node, "
                     "reason, pass_id, detail) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
                     "RETURNING seq",
                     (project, entry_id, kind, actor, node, reason, pass_id,
@@ -530,7 +600,7 @@ class Store:
         """A new entry, or the active one already holding this title and text in
         this scope: repeating an add records nothing twice."""
         with self.writing(project) as cur:
-            cur.execute(f"SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE project_id = %s "
+            cur.execute(f"SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE agent_id = %s "
                         "AND status = 'active' AND title = %s AND body_hash = %s "
                         "AND scope IS NOT DISTINCT FROM %s", (project, title, body_hash(body),
                                                                scope))
@@ -558,7 +628,7 @@ class Store:
                               "`memory list --status all` lists this project's entries")
             return row
         prefix = ref.replace("-", "")
-        found = self.rows(f"SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE project_id = %s "
+        found = self.rows(f"SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE agent_id = %s "
                           "AND replace(id::text, '-', '') LIKE %s ORDER BY seq LIMIT 3",
                           (project, prefix + "%"))
         if not found:
@@ -572,9 +642,9 @@ class Store:
 
     @staticmethod
     def _own(row: dict, project: str, action: str) -> None:
-        if row["project_id"] != project:
+        if row["agent_id"] != project:
             raise Refusal(4, "foreign_project",
-                          f"entry {short(row['id'])} belongs to project {row['project_id']}, "
+                          f"entry {short(row['id'])} belongs to project {row['agent_id']}, "
                           f"and {action} writes only this project's memory",
                           "run it from the project that owns the entry; reading it from "
                           "here stays open")
@@ -669,7 +739,7 @@ class Store:
         """One entry carried in from a memory folder, once per key per project
         whichever machine carries it."""
         with self.writing(project) as cur:
-            cur.execute("SELECT entry_id FROM memory_events WHERE project_id = %s AND kind = 'add' "
+            cur.execute("SELECT entry_id FROM memory_events WHERE agent_id = %s AND kind = 'add' "
                         "AND detail ? 'adopt_key' AND detail->>'adopt_key' = %s", (project, key))
             found = cur.fetchone()
             if found:
@@ -694,7 +764,7 @@ class Store:
 
     def listing(self, project: str, *, status: str, pinned: bool | None, scope: str | None,
                 since, limit: int) -> tuple[list[dict], int]:
-        where, params = ["project_id = %s"], [project]
+        where, params = ["agent_id = %s"], [project]
         if status != "all":
             where.append("status = %s")
             params.append(status)
@@ -722,7 +792,7 @@ class Store:
     def search(self, project: str, query: str, *, everything: bool, limit: int
                ) -> tuple[list[dict], int]:
         like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-        clause = ("project_id = %(project)s AND (status = 'active' OR %(all)s) AND ("
+        clause = ("agent_id = %(project)s AND (status = 'active' OR %(all)s) AND ("
                   "to_tsvector('simple', title || ' ' || body) @@ "
                   "websearch_to_tsquery('simple', %(query)s) "
                   "OR title ILIKE %(like)s OR body ILIKE %(like)s)")
@@ -736,7 +806,7 @@ class Store:
         return self._with_merged(rows), total
 
     def log(self, project: str, *, since, limit: int) -> tuple[list[dict], int]:
-        where, params = "e.project_id = %s", [project]
+        where, params = "e.agent_id = %s", [project]
         if since is not None:
             where += " AND e.at >= %s"
             params.append(since)
@@ -757,16 +827,16 @@ class Store:
             "count(*) FILTER (WHERE status = 'dropped') AS dropped, "
             "count(*) FILTER (WHERE status = 'active' AND scope IS NOT NULL) AS scoped, "
             "count(*) FILTER (WHERE status = 'active' AND origin = 'groom') AS merged "
-            "FROM memory_entries WHERE project_id = %s", (project,))
+            "FROM memory_entries WHERE agent_id = %s", (project,))
         writes = self.one(
             "SELECT count(*) FILTER (WHERE at >= now() - interval '7 days') AS last_7_days, "
             "count(*) FILTER (WHERE at >= now() - interval '30 days') AS last_30_days, "
-            "max(at) AS last_write FROM memory_events WHERE project_id = %s AND kind = 'add' "
+            "max(at) AS last_write FROM memory_events WHERE agent_id = %s AND kind = 'add' "
             "AND pass_id IS NULL AND NOT (detail ? 'adopt_key')", (project,))
         passes = self.one(
             "SELECT count(*) AS passes, max(at) AS last_pass FROM memory_events "
-            "WHERE project_id = %s AND kind = 'groom'", (project,))
-        last = self.one("SELECT max(seq) AS seq FROM memory_events WHERE project_id = %s",
+            "WHERE agent_id = %s AND kind = 'groom'", (project,))
+        last = self.one("SELECT max(seq) AS seq FROM memory_events WHERE agent_id = %s",
                         (project,))
         return {"entries": {k: row[k] for k in ("active", "pinned", "superseded", "dropped",
                                                 "scoped", "merged")},
@@ -777,17 +847,17 @@ class Store:
                 "last_event": last["seq"]}
 
     def last_event(self, project: str) -> int | None:
-        return self.one("SELECT max(seq) AS seq FROM memory_events WHERE project_id = %s",
+        return self.one("SELECT max(seq) AS seq FROM memory_events WHERE agent_id = %s",
                         (project,))["seq"]
 
     def last_write_at(self, project: str):
         """When anyone but a grooming pass last changed this project's memory."""
-        return self.one("SELECT max(at) AS at FROM memory_events WHERE project_id = %s "
+        return self.one("SELECT max(at) AS at FROM memory_events WHERE agent_id = %s "
                         "AND pass_id IS NULL AND kind IN ('add', 'supersede', 'drop', 'pin', "
                         "'unpin', 'purge')", (project,))["at"]
 
     def last_pass_at(self, project: str):
-        return self.one("SELECT max(at) AS at FROM memory_events WHERE project_id = %s "
+        return self.one("SELECT max(at) AS at FROM memory_events WHERE agent_id = %s "
                         "AND kind = 'groom'", (project,))["at"]
 
     def _with_merged(self, rows: list[dict]) -> list[dict]:
@@ -808,16 +878,16 @@ class Store:
     def render_rows(self, project: str) -> list[dict]:
         """Every active project-wide entry, newest first."""
         return self._with_merged(self.rows(
-            f"SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE project_id = %s "
+            f"SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE agent_id = %s "
             "AND status = 'active' AND scope IS NULL ORDER BY created_at DESC, seq DESC",
             (project,)))
 
     def export(self, project: str) -> dict:
         entries = self._with_merged(self.rows(
-            f"SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE project_id = %s ORDER BY seq",
+            f"SELECT {ENTRY_COLUMNS} FROM memory_entries WHERE agent_id = %s ORDER BY seq",
             (project,)))
         events = self.rows("SELECT seq, kind, entry_id, actor, node, at, reason, pass_id, detail "
-                           "FROM memory_events WHERE project_id = %s ORDER BY seq", (project,))
+                           "FROM memory_events WHERE agent_id = %s ORDER BY seq", (project,))
         return {"entries": [entry_out(e) for e in entries],
                 "events": [event_out(e) for e in events]}
 
@@ -856,10 +926,10 @@ class Store:
         holder = uuid.uuid4()
         try:
             row = self.one(
-                "INSERT INTO memory_groom_leases AS l (project_id, holder, node, lock_pid, "
+                "INSERT INTO memory_groom_leases AS l (agent_id, holder, node, lock_pid, "
                 "expires_at) VALUES (%s, %s, %s, CASE WHEN %s THEN pg_backend_pid() END, "
                 "now() + make_interval(secs => %s)) "
-                "ON CONFLICT (project_id) DO UPDATE SET holder = excluded.holder, "
+                "ON CONFLICT (agent_id) DO UPDATE SET holder = excluded.holder, "
                 "node = excluded.node, lock_pid = excluded.lock_pid, taken_at = now(), "
                 "expires_at = excluded.expires_at WHERE l.expires_at <= now() "
                 "RETURNING holder", (project, holder, node, self.setting.has_session_address,
@@ -880,7 +950,7 @@ class Store:
         self._groom_holder = None
         with contextlib.suppress(Exception):
             if holder is not None:
-                self.one("DELETE FROM memory_groom_leases WHERE project_id = %s "
+                self.one("DELETE FROM memory_groom_leases WHERE agent_id = %s "
                          "AND holder = %s RETURNING holder", (project, holder))
         self._groom_unlock_session(project)
 
@@ -901,7 +971,7 @@ class Store:
         return self.rows(
             "SELECT l.pid, (l.objid = hashtext(%s)::oid) AS this_project, "
             "a.client_hostname, host(a.client_addr) AS client_addr, a.application_name, "
-            "a.backend_start, a.usename, g.project_id AS lease_project, g.node AS lease_node "
+            "a.backend_start, a.usename, g.agent_id AS lease_project, g.node AS lease_node "
             "FROM pg_locks l LEFT JOIN pg_stat_activity a ON a.pid = l.pid "
             "LEFT JOIN memory_groom_leases g ON g.lock_pid = l.pid "
             "WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 "
@@ -923,7 +993,7 @@ class Store:
                 rows = [self._locked(cur, sid) for sid in merge["sources"]]
                 stale = [sid for sid, row in zip(merge["sources"], rows)
                          if row is None or row["status"] != "active" or row["pinned"]
-                         or row["project_id"] != project]
+                         or row["agent_id"] != project]
                 if stale:
                     applied["skipped"].append({"merge": merge["title"],
                                                "why": "its sources changed since the plan was "
@@ -954,7 +1024,7 @@ class Store:
             for drop in plan["drops"]:
                 row = self._locked(cur, drop["id"])
                 if row is None or row["status"] != "active" or row["pinned"] \
-                        or row["project_id"] != project:
+                        or row["agent_id"] != project:
                     applied["skipped"].append({"drop": short(drop["id"]),
                                                "why": "it changed since the plan was read"})
                     continue
@@ -983,7 +1053,7 @@ class Store:
         if not REF_RE.fullmatch(ref):
             raise Refusal(6, "input", f"{ref!r} is no pass id",
                           "`memory log` names each pass by its id")
-        rows = self.rows("SELECT DISTINCT pass_id FROM memory_events WHERE project_id = %s "
+        rows = self.rows("SELECT DISTINCT pass_id FROM memory_events WHERE agent_id = %s "
                          "AND kind = 'groom' AND replace(pass_id::text, '-', '') LIKE %s",
                          (project, ref.replace("-", "") + "%"))
         if not rows:
@@ -998,12 +1068,12 @@ class Store:
         """Reactivate what a pass superseded or dropped, and drop what it made."""
         with self.writing(project) as cur:
             pass_id = self.resolve_pass(project, ref)
-            cur.execute("SELECT 1 FROM memory_events WHERE project_id = %s AND kind = 'groom_undo' "
+            cur.execute("SELECT 1 FROM memory_events WHERE agent_id = %s AND kind = 'groom_undo' "
                         "AND detail->>'undoes' = %s", (project, str(pass_id)))
             if cur.fetchone():
                 raise Refusal(6, "already_undone", f"pass {pass_id} is already undone")
             cur.execute("SELECT kind, entry_id FROM memory_events WHERE pass_id = %s "
-                        "AND project_id = %s AND kind IN ('add', 'supersede', 'drop') "
+                        "AND agent_id = %s AND kind IN ('add', 'supersede', 'drop') "
                         "ORDER BY seq", (pass_id, project))
             events = cur.fetchall()
             made = [e["entry_id"] for e in events if e["kind"] == "add"]

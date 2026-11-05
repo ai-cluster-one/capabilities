@@ -341,9 +341,9 @@ class Store(unittest.TestCase):
 
     def test_a_refused_version_is_an_error_and_the_search_stops_there(self):
         with self.conn.cursor() as cur:
-            cur.execute(f'insert into "{self.setting.schema}".harness_profiles '
-                        "(scope, scope_id, name, spec, active) values "
-                        "('project', %s, 'telegram-claude', %s::jsonb, true) returning id",
+            cur.execute(f'insert into "{self.setting.schema}".harness_profile_versions '
+                        "(agent_id, name, spec, active) values "
+                        "(%s, 'telegram-claude', %s::jsonb, true) returning id",
                         (self.project, json.dumps({**CLAUDE, "not_a_knob": 1})))
             version = str(cur.fetchone()[0])
         self.conn.commit()
@@ -1029,7 +1029,7 @@ class ServiceHarness(unittest.TestCase):
         self.addCleanup(conn.close)
         lib.save_profile(conn, "telegram-fast", CODEX, scope="project",
                          schema=setting.schema, scope_id=project)
-        conn.execute("INSERT INTO telegram_channels (project_id, connection, "
+        conn.execute("INSERT INTO telegram_channels (agent_id, connection, "
                      "channel_key, settings) VALUES (%s, 'probe', '11', "
                      "'{\"profile\": \"telegram-fast\"}'::jsonb)", (project,))
         conn.commit()

@@ -234,11 +234,11 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'routine' ORDER BY step")]
     assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
-                     "0005-enablements", "0006-disabled"]
+                     "0005-enablements", "0006-disabled", "0007-agent-names"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["routine_versions_active"]
-    assert ("(COALESCE(project_id, ''::text), name) WHERE (retired_at IS NULL)"
+    assert ("(COALESCE(agent_id, ''::text), name) WHERE (retired_at IS NULL)"
             in indexes["routine_documents_name"])
     for table in ("routine_documents", "routine_versions", "routine_enablements"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
@@ -251,6 +251,88 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
         "SELECT column_name, is_nullable FROM information_schema.columns "
         "WHERE table_schema = %s AND table_name = 'routine_versions'", (SCHEMA,)))
     assert (nullable["title"], nullable["description"]) == ("YES", "NO")
+
+
+# Every name and comment in an owner's tables that still says project, where the
+# store now says agent: table columns, relations, constraints, triggers, comments, and
+# the bodies of the owner's functions.
+_SAYS_PROJECT = """
+SELECT 'column ' || c.relname || '.' || a.attname FROM pg_attribute a
+  JOIN pg_class c ON c.oid = a.attrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+   AND a.attname ~* 'project'
+UNION ALL SELECT 'relation ' || c.relname FROM pg_class c
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relname ~* 'project'
+UNION ALL SELECT 'constraint ' || o.conname FROM pg_constraint o
+  JOIN pg_class c ON c.oid = o.conrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND o.conname ~* 'project'
+UNION ALL SELECT 'trigger ' || g.tgname FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND g.tgname ~* 'project'
+UNION ALL SELECT 'comment on ' || c.relname || coalesce('.' || a.attname, '')
+  FROM pg_description d JOIN pg_class c ON c.oid = d.objoid AND d.classoid = 'pg_class'::regclass
+  LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid AND d.objsubid > 0
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND d.description ~* 'project'
+UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
+ WHERE p.pronamespace = %(schema)s::regnamespace AND p.proname LIKE %(like)s
+   AND p.prosrc ~* 'project'
+"""
+
+
+def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypatch):
+    import psycopg
+    from capabilities_contract import db
+    cli = load_module()
+    old = [step for step in cli.LEDGER_STEPS if step[0] != "0007-agent-names"]
+    with psycopg.connect(lab.cluster.url(lab.database), autocommit=True) as conn:
+        db.migrate(conn, "routine", old, major=1, minor=2, schema=SCHEMA)
+        conn.execute(f"SET search_path TO {SCHEMA}")
+        insert = ("INSERT INTO routine_documents (project_id, name, created_by, author_project_id) "
+                  "VALUES (%s, %s, 'u@n', %s) RETURNING id")
+        own = conn.execute(insert, (PROJECT_ID, "own-routine", None)).fetchone()[0]
+        shared = conn.execute(insert, (None, "shared-routine", OTHER_ID)).fetchone()[0]
+        for document in (own, shared):
+            conn.execute("INSERT INTO routine_versions (document_id, description, body, "
+                         "created_by) VALUES (%s, 'Run it.', 'kept', 'u@n')", (document,))
+        conn.execute("INSERT INTO routine_enablements (project_id, document_id, enabled_by) "
+                     "VALUES (%s, %s, 'u@n')", (PROJECT_ID, shared))
+
+        # Outside the store upgrade the major is not crossed; inside it, it is.
+        monkeypatch.delenv(db.UPGRADE_ENV, raising=False)
+        with pytest.raises(db.DbError) as held:
+            db.migrate(conn, "routine", cli.LEDGER_STEPS, major=cli.LEDGER_MAJOR,
+                       minor=cli.LEDGER_MINOR, schema=SCHEMA)
+        assert held.value.slug == "store_upgrade_needed"
+        monkeypatch.setenv(db.UPGRADE_ENV, "1")
+        result = db.migrate(conn, "routine", cli.LEDGER_STEPS, major=cli.LEDGER_MAJOR,
+                            minor=cli.LEDGER_MINOR, schema=SCHEMA)
+        monkeypatch.delenv(db.UPGRADE_ENV)
+        assert result.applied == ["0007-agent-names"]
+        assert (result.major, result.minor) == (2, 0)
+        conn.execute(f"SET search_path TO {SCHEMA}")
+        assert conn.execute("SELECT name, agent_id, author_agent_id FROM routine_documents "
+                            "ORDER BY name").fetchall() == [
+            ("own-routine", PROJECT_ID, None), ("shared-routine", None, OTHER_ID)]
+        assert conn.execute("SELECT agent_id, document_id FROM routine_enablements"
+                            ).fetchall() == [(PROJECT_ID, shared)]
+        assert conn.execute(_SAYS_PROJECT, {"schema": SCHEMA, "like": "routine\\_%"}
+                            ).fetchall() == []
+        with pytest.raises(psycopg.errors.CheckViolation):
+            conn.execute("UPDATE routine_documents SET author_agent_id = 'x' WHERE id = %s",
+                         (own,))
+        # A release that knows only major 1 refuses the store rather than misreading it.
+        with pytest.raises(db.DbError) as refused:
+            db.migrate(conn, "routine", old, major=1, minor=2, schema=SCHEMA)
+        assert refused.value.slug == "schema_too_new"
+
+    listed = lab.ok("list", "--store", "--json")["routines"]
+    assert [(r["name"], r["global"]) for r in listed] == [
+        ("own-routine", False), ("shared-routine", True)]
+    assert listed[1]["author"] == OTHER_ID
 
 
 def test_the_store_keeps_versions_immutable_but_for_clearing_active(lab):
@@ -445,7 +527,7 @@ def test_a_system_agent_s_routines_are_not_written(lab):
     shown = subprocess.run([sys.executable, str(MANAGER), "agent", "show"], cwd=lab.project,
                            env=lab.env(), text=True, capture_output=True, timeout=180)
     assert shown.returncode == 0, shown.stderr
-    lab.sql(f"INSERT INTO {SCHEMA}.capabilities_agents (id, kind) VALUES (%s, 'system') "
+    lab.sql(f"INSERT INTO {SCHEMA}.agents (id, kind) VALUES (%s, 'system') "
             "ON CONFLICT (id) DO UPDATE SET kind = 'system'", (PROJECT_ID,))
     for args in (("save", "pitstop", "--from", "-"), ("retire", "pitstop"), ("import",),
                  ("title", "pitstop", "Pit stop"), ("disable", "pitstop")):
@@ -562,7 +644,7 @@ def test_a_global_routine_reaches_a_project_only_once_it_is_enabled(lab):
     assert (enabled["changed"], enabled["author"]) == (True, OTHER_ID)
     assert lab.ok("enable", "shared")["changed"] is False
     [(by,)] = lab.sql(f"SELECT enabled_by FROM {SCHEMA}.routine_enablements "
-                      "WHERE project_id = %s", (PROJECT_ID,))
+                      "WHERE agent_id = %s", (PROJECT_ID,))
     assert by == f"tester@{TEST_NODE}"
     [listed] = lab.ok("list", "--store", "--json")["routines"]
     assert (listed["name"], listed["global"], listed["author"]) == ("shared", True, OTHER_ID)

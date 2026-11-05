@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-11-05 — The store names the agent: whatsapp's tables go to schema major 2
+
+`whatsapp`'s tables name an agent where they named a project: `project_id` is `agent_id` in `whatsapp_register`, `whatsapp_jobs`, `whatsapp_job_amendments` and `whatsapp_job_slots`, and every constraint named for the column moves with it. Step `0023-agent-names` renames them in place with every row kept and takes the ledger to 2.0. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of whatsapp 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first whatsapp call makes them at 2.0. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. It pins `callva-harness-runner` 0.11.0, whose profiles are kept in `harness_profile_versions`, so the profiles the service reads and saves are the store's under their new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
 
 The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning; codex is unchanged. Nothing a turn does changes.

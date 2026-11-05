@@ -76,6 +76,36 @@ def _bound(root: Path) -> str | None:
     return found[-1] if found else None
 
 
+def legacy_store(conn, schema: str, count: int, major: int, minor: int) -> None:
+    """The store as a release before the core left it: the first `count` steps
+    owner `capabilities` had, recorded under that owner at `major.minor`. They
+    are run as that release ran them, since any migrate now brings the core
+    first."""
+    import hashlib
+    from capabilities_contract.db import _legacy
+    conn.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+    conn.execute(f'SET search_path TO "{schema}"')
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_ledger (owner text NOT NULL, "
+                 "step text NOT NULL, checksum text NOT NULL, applied_at timestamptz "
+                 "NOT NULL DEFAULT now(), library_version text NOT NULL, "
+                 "PRIMARY KEY (owner, step))")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (owner text PRIMARY KEY, "
+                 "major integer NOT NULL, minor integer NOT NULL, updated_at timestamptz "
+                 "NOT NULL DEFAULT now())")
+    done = {row[0] for row in conn.execute(
+        "SELECT step FROM schema_ledger WHERE owner = %s", (_legacy.LEGACY_OWNER,))}
+    for step, sql in _legacy.LEGACY_STEPS[:count]:
+        if step not in done:
+            conn.execute(sql)
+            conn.execute("INSERT INTO schema_ledger (owner, step, checksum, library_version) "
+                         "VALUES (%s, %s, %s, '0.41.0')",
+                         (_legacy.LEGACY_OWNER, step, hashlib.sha256(sql.encode()).hexdigest()))
+    conn.execute("INSERT INTO schema_version (owner, major, minor) VALUES (%s, %s, %s) "
+                 "ON CONFLICT (owner) DO UPDATE SET major = EXCLUDED.major, "
+                 "minor = EXCLUDED.minor", (_legacy.LEGACY_OWNER, major, minor))
+    conn.commit()
+
+
 def _say(name: str, value) -> None:
     """Keep what a step answered, where the run was asked to keep it."""
     if EVIDENCE:
@@ -527,7 +557,7 @@ def build_agents(w: World) -> None:
         assert result.returncode == 0, (name, result.stderr)
     # A core capability's arrival enable, as install writes it: in the store
     # only, so the config home's gate does not name it.
-    w.sql("INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+    w.sql("INSERT INTO policies (agent_id, capability, node, enabled) "
           "VALUES (NULL, 'deployment', NULL, true)")
     # A launchd agent of relay's, loaded.
     plist = w.home / "Library" / "LaunchAgents" / "test.relay.telegram.plist"
@@ -653,16 +683,16 @@ def test_global_apply_writes_the_rows_once(world):
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply"))
     _say("global-apply", applied)
     assert applied["state"] == "migrated" and applied["global_migrated_at"]
-    assert world.sql("SELECT enabled FROM capabilities_policy WHERE agent_id IS NULL "
+    assert world.sql("SELECT enabled FROM policies WHERE agent_id IS NULL "
                      "AND capability = 'agentrooms'") == [(True,)]
     # The arrival enable the config home does not name stays.
-    assert world.sql("SELECT enabled FROM capabilities_policy WHERE agent_id IS NULL "
+    assert world.sql("SELECT enabled FROM policies WHERE agent_id IS NULL "
                      "AND capability = 'deployment' AND node IS NULL") == [(True,)]
     # A config-home allow_write is a global grant's allow_write only, never enabled.
     assert world.sql("SELECT enabled, allow_write, is_default FROM "
-                     "capabilities_connection_grants WHERE agent_id IS NULL") == [
+                     "grants WHERE agent_id IS NULL") == [
         (None, True, True)]
-    assert world.sql("SELECT path, value FROM capabilities_settings WHERE agent_id IS NULL") \
+    assert world.sql("SELECT path, value FROM settings WHERE agent_id IS NULL") \
         == [(["max_entries"], 500)]
     before = world.everything()
     again = world.answer(world.manager(root, "migrate", "--global", "--apply"))
@@ -830,10 +860,10 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
         # that holds a dot.
         assert after_switch["settings"]["agentrooms"]["document"] == {
             "version": 1, "binding.bot": {"worker": "bot"}}
-        assert world.sql("SELECT path FROM capabilities_settings WHERE agent_id = %s AND "
+        assert world.sql("SELECT path FROM settings WHERE agent_id = %s AND "
                          "capability = 'agentrooms' ORDER BY path", (IDS[name],)) == [
             (["binding.bot", "worker"],), (["version"],)]
-        assert world.sql("SELECT name FROM agentrooms_workers WHERE project_id = %s",
+        assert world.sql("SELECT name FROM agentrooms_worker_versions WHERE agent_id = %s",
                          (IDS[name],)) == [("bot",)]
         before_switch["settings"]["agentrooms"]["document"].pop("agents")
         after_switch["settings"]["agentrooms"] = before_switch["settings"]["agentrooms"]
@@ -855,29 +885,29 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
     assert applied["removed"], "nothing was removed"
     for path in applied["archive"]["files"]:
         assert os.stat(path).st_mode & 0o777 == 0o600
-    state = world.sql("SELECT migrating_since, migrated_at FROM capabilities_agents "
+    state = world.sql("SELECT migrating_since, migrated_at FROM agents "
                       "WHERE id = %s", (IDS[name],))
     assert state[0][0] is None and state[0][1] is not None
     if name == "relay":
-        nodes = dict(world.sql("SELECT l.node, n.address FROM capabilities_agent_nodes l "
-                               "JOIN capabilities_nodes n ON n.id = l.node "
+        nodes = dict(world.sql("SELECT l.node, n.address FROM agent_nodes l "
+                               "JOIN nodes n ON n.id = l.node "
                                "WHERE l.agent_id = %s", (IDS[name],)))
         assert nodes == {nid(MASTER): None, "srv-relay": "203.0.113.10"}
-        placed = world.sql("SELECT capability FROM capabilities_policy WHERE agent_id = %s "
+        placed = world.sql("SELECT capability FROM policies WHERE agent_id = %s "
                            "AND node = 'srv-relay'", (IDS[name],))
         assert ("telegram",) in placed
         log = world.launchctl_log.read_text()
         assert "bootout gui/" in log and "bootstrap gui/" in log
         assert applied["services"]["launchd"] == ["test.relay.telegram"]
     if name == "books":
-        profiles = world.sql("SELECT name, spec, created_by FROM harness_profiles WHERE "
-                             "scope_id = %s AND active", (IDS[name],))
+        profiles = world.sql("SELECT name, spec, created_by FROM harness_profile_versions WHERE "
+                             "agent_id = %s AND active", (IDS[name],))
         assert profiles == [("automations-books", {
             "harness": "claude", "model": "sonnet", "timeout_seconds": 600.0, "permission_mode": "plan",
             "tools": ["Read", "Glob", "Grep"], "allowed_tools": ["Read", "Glob", "Grep"]},
             f"migrate@{nid(MASTER)}")]
         rows = world.sql("SELECT slug, node, schedule, timezone, created_by FROM "
-                         "automations_definitions WHERE project_id = %s AND active "
+                         "automations_definition_versions WHERE agent_id = %s AND active "
                          "ORDER BY slug", (IDS[name],))
         assert rows == [("by-hand", nid(MASTER), None, "Europe/Tallinn", f"migrate@{nid(MASTER)}"),
                         ("daily-books", "srv-books", "0 6 * * *", "Europe/Tallinn",
@@ -885,7 +915,7 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
                         ("watch", "srv-books", "*/5 * * * *", "Europe/Tallinn",
                          f"migrate@{nid(MASTER)}")]
     if name == "clinic":
-        rows = world.sql("SELECT name FROM harness_profiles WHERE scope_id = %s AND active "
+        rows = world.sql("SELECT name FROM harness_profile_versions WHERE agent_id = %s AND active "
                          "ORDER BY name", (IDS[name],))
         assert rows == [("clinic-claude",), ("clinic-night",)]
         [archived] = applied["archive"]["files"]
@@ -895,20 +925,20 @@ def test_apply_moves_everything_and_reads_the_same_through_the_switch(world, nam
         assert archived.endswith("capabilities/telegram/service/settings.json")
         assert "worker" in json.loads(Path(archived).read_text())["defaults"]
     if name == "admin":
-        rows = world.sql("SELECT name FROM tasks_workers WHERE project_id = %s AND active "
+        rows = world.sql("SELECT name FROM tasks_worker_versions WHERE agent_id = %s AND active "
                          "ORDER BY name", (IDS[name],))
         assert rows == [("builder",), ("reviewer",)]
-        conveyor = world.sql("SELECT path, value FROM capabilities_settings WHERE "
+        conveyor = world.sql("SELECT path, value FROM settings WHERE "
                              "agent_id = %s AND capability = 'tasks' AND path[1] = "
                              "'escalation' ORDER BY path", (IDS[name],))
         assert conveyor == [(["escalation", "escalate_to"], ["reviewer", "Owner"]),
                             (["escalation", "stall_after"], "6h")]
-        trail = world.sql("SELECT DISTINCT changed_by FROM capabilities_settings_changes "
+        trail = world.sql("SELECT DISTINCT changed_by FROM settings_changes "
                           "WHERE agent_id = %s", (IDS[name],))
         assert trail == [(f"migrate@{nid(MASTER)}",)]
     if name == "body":
         assert not (root / "agent" / "capabilities" / "slack" / "policy.json").exists()
-        assert world.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
+        assert world.sql("SELECT value FROM settings WHERE agent_id = %s AND "
                          "capability = 'slack' AND path = '{allowed_users}'",
                          (IDS[name],)) == [(["U01"],)]
     # A second apply changes nothing.
@@ -938,13 +968,13 @@ def test_an_old_prj_form_id_moves_into_the_agent_the_store_holds_without_it(worl
     # The store holds the agent under the twelve hex characters alone, and the
     # folder's binding still carries prj_ before them.
     held = "99999999abc1"
-    world.sql("INSERT INTO capabilities_agents (id, name) VALUES (%s, 'Held')", (held,))
+    world.sql("INSERT INTO agents (id, name) VALUES (%s, 'Held')", (held,))
     root = world.agent("old-form", None, {"{env}/settings.json": gate("memory")},
                        bound_id=f"prj_{held}")
     applied = world.answer(world.manager(root, "migrate", "--apply"))
     assert applied["agent_id"] == held and applied["state"] == "migrated"
     assert _bound(root) == held
-    assert world.sql("SELECT id, name, migrated_at IS NOT NULL FROM capabilities_agents "
+    assert world.sql("SELECT id, name, migrated_at IS NOT NULL FROM agents "
                      "WHERE id LIKE %s", (f"%{held}",)) == [(held, "Held", True)]
 
 
@@ -952,7 +982,7 @@ def test_a_linked_worktree_of_an_old_prj_form_checkout_stays_a_second_checkout(w
     # The main checkout still carries prj_ before the twelve hex characters the
     # store holds the agent under; its linked worktree only verifies.
     held = "99999999ac01"
-    world.sql("INSERT INTO capabilities_agents (id, name) VALUES (%s, 'Held')", (held,))
+    world.sql("INSERT INTO agents (id, name) VALUES (%s, 'Held')", (held,))
     main = world.agent("old-form-main", None, {"{env}/settings.json": gate("memory")},
                        bound_id=f"prj_{held}")
     copy = world.tmp / "agents" / "old-form-copy"
@@ -963,7 +993,7 @@ def test_a_linked_worktree_of_an_old_prj_form_checkout_stays_a_second_checkout(w
     error = world.error(world.manager(copy, "migrate", "--apply"))
     assert error["code"] == "second_checkout"
     assert (copy / "capabilities" / "settings.json").is_file()
-    assert world.sql("SELECT migrated_at IS NULL FROM capabilities_agents WHERE id = %s",
+    assert world.sql("SELECT migrated_at IS NULL FROM agents WHERE id = %s",
                      (held,)) == [(True,)]
     # Neither checkout stays on this machine for the tests after this one.
     for name in ("old-form-copy", "old-form-main"):
@@ -991,9 +1021,9 @@ def test_store_mode_with_no_rows_in_this_store_asks_which_is_the_truth(world):
     applied = world.answer(world.manager(root, "migrate", "--apply", "--answers", answers))
     _say("apply-foreign", applied)
     assert applied["state"] == "migrated" and not applied["verify"]["differences"]
-    assert world.sql("SELECT value FROM capabilities_identifiers WHERE agent_id = %s",
+    assert world.sql("SELECT value FROM identifiers WHERE agent_id = %s",
                      ("prj_99999999fff1",)) == [("foreign-app",)]
-    assert world.sql("SELECT enabled FROM capabilities_policy WHERE agent_id = %s AND "
+    assert world.sql("SELECT enabled FROM policies WHERE agent_id = %s AND "
                      "capability = 'coolify'", ("prj_99999999fff1",)) == [(True,)]
 
 
@@ -1023,7 +1053,7 @@ def test_a_run_killed_between_write_and_finalize_resumes(world):
     flag.write_text("1")
     killed = world.manager(root, "migrate", "--apply", CAPABILITIES_HOME=str(registry))
     assert killed.returncode != 0
-    [(since, moved)] = world.sql("SELECT migrating_since, migrated_at FROM capabilities_agents "
+    [(since, moved)] = world.sql("SELECT migrating_since, migrated_at FROM agents "
                                  "WHERE id = %s", (IDS["frozen"],))
     assert since is not None and moved is None
     journal = json.loads((world.state / "capabilities" / "migrate" / IDS["frozen"] /
@@ -1044,7 +1074,7 @@ def test_a_run_killed_between_write_and_finalize_resumes(world):
                                          CAPABILITIES_HOME=str(registry)))
     _say("interrupted-resumed", resumed)
     assert resumed["state"] == "migrated" and not resumed["verify"]["differences"]
-    assert world.sql("SELECT value FROM capabilities_identifiers WHERE agent_id = %s",
+    assert world.sql("SELECT value FROM identifiers WHERE agent_id = %s",
                      (IDS["frozen"],)) == [("frozen-app",)]
     before = world.everything()
     again = world.answer(world.manager(root, "migrate", "--apply",
@@ -1059,7 +1089,7 @@ def test_finalize_waits_for_every_target_node(world):
     error = world.error(world.manager(root, "migrate", "--apply", "--answers", answers))
     _say("refusal-target-node-unregistered", error)
     assert error["code"] == "target_node_unregistered" and error["detail"]["nodes"] == ["srv-later"]
-    [(since, moved)] = world.sql("SELECT migrating_since, migrated_at FROM capabilities_agents "
+    [(since, moved)] = world.sql("SELECT migrating_since, migrated_at FROM agents "
                                  "WHERE id = %s", (IDS["later"],))
     assert since is not None and moved is None
     assert (root / "capabilities" / "settings.json").exists()
@@ -1075,7 +1105,7 @@ def test_finalize_waits_for_every_target_node(world):
                                "--target", "production"))
     done = world.answer(world.manager(root, "migrate", "--apply", "--answers", answers))
     assert done["state"] == "migrated"
-    assert world.sql("SELECT capability FROM capabilities_policy WHERE agent_id = %s AND "
+    assert world.sql("SELECT capability FROM policies WHERE agent_id = %s AND "
                      "node = 'srv-later'", (IDS["later"],)) == [("memory",)]
 
 

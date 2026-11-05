@@ -1,7 +1,7 @@
 """The profiles a telegrambot turn, job or reply-gate run may run on.
 
 A profile is a callva-harness-runner profile kept in the store, in the
-`harness_profiles` table the runner owns. Every telegrambot profile is named
+`harness_profile_versions` table the runner owns. Every telegrambot profile is named
 `telegrambot-<something>`; a name resolves to the project's active version, then
 the global one, then the ones this bundle ships in `service/profiles/`:
 `telegrambot-claude` and `telegrambot-codex` for dialogue turns,

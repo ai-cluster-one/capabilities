@@ -54,9 +54,9 @@ def _stored(lab) -> list[tuple]:
     import psycopg
     with psycopg.connect(STORE_DSN) as conn:
         return conn.execute(
-            "SELECT project_id, host, target_path, engine, last_session_id, "
+            "SELECT agent_id, host, target_path, engine, last_session_id, "
             "last_mode, last_profile, interactions, last_used_at, last_attempt "
-            "FROM agentkit.askproject_sessions WHERE project_id = %s",
+            "FROM agentkit.askproject_sessions WHERE agent_id = %s",
             (f"path:{lab.caller.resolve()}",)).fetchall()
 
 
@@ -278,3 +278,65 @@ def test_timeout_without_session_id_does_not_fall_back_to_older_session(lab):
     assert resumed.returncode == 1
     assert "timed out before its session id was observed" in result["error"]
     assert "without -c" in result["error"]
+
+
+def test_a_store_at_major_1_keeps_its_sessions_under_agent_id(lab, monkeypatch):
+    """A store whose askproject tables are at 1.0, with sessions in them, is
+    refused outside the store upgrade and migrated in place by the next call
+    inside it: every row stays, the caller's column is
+    agent_id, nothing is named for project_id, and the caller's own session is
+    still found."""
+    import secrets
+
+    import psycopg
+    from capabilities_contract import db
+
+    store_env(lab.env)
+    schema = "askproject_m1_" + secrets.token_hex(4)
+    caller, node = f"path:{lab.caller.resolve()}", "6c61622d6e6f"
+    for key in [k for k in os.environ if k.startswith("AGENTKIT_DB_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("AGENTKIT_DB_URL", STORE_DSN)
+    monkeypatch.setenv("AGENTKIT_DB_SCHEMA", schema)
+    conn = db.connect(application_name="test", setting=db.resolve_setting(None))
+    try:
+        db.migrate(conn, "askproject", CLI.SESSIONS_STEPS[:1], major=1, minor=0)
+        conn.execute(
+            "INSERT INTO askproject_sessions (project_id, host, target_path, engine, "
+            "last_session_id, interactions) VALUES (%s, %s, %s, 'codex', 's-1', 3), "
+            "('prj_000000000002', 'elsewhere', '/t/other', 'claude', 's-2', 1)",
+            (caller, node, str(lab.target)))
+        conn.commit()
+    finally:
+        conn.close()
+    try:
+        refused = lab.run("targets", "--json",
+                          env={"AGENTKIT_DB_SCHEMA": schema, "AGENT_NODE_ID": node})
+        assert refused.returncode != 0 and "store_upgrade_needed" in refused.stderr, refused
+        listed = lab.run("targets", "--json",
+                         env={"AGENTKIT_DB_SCHEMA": schema, "AGENT_NODE_ID": node,
+                              db.UPGRADE_ENV: "1"})
+        assert listed.returncode == 0, listed.stderr
+        [entry] = json.loads(listed.stdout)["targets"]
+        assert (entry["target"], entry["last_session_id"], entry["interactions"]) == (
+            str(lab.target), "s-1", 3)
+        with psycopg.connect(STORE_DSN) as conn:
+            conn.execute(f'SET search_path TO "{schema}"')
+            assert conn.execute(
+                "SELECT agent_id, host, target_path, last_session_id, interactions "
+                "FROM askproject_sessions ORDER BY last_session_id").fetchall() == [
+                (caller, node, str(lab.target), "s-1", 3),
+                ("prj_000000000002", "elsewhere", "/t/other", "s-2", 1)]
+            assert conn.execute("SELECT major, minor FROM schema_version "
+                                "WHERE owner = 'askproject'").fetchone() == (2, 0)
+            names = [r[0] for r in conn.execute(
+                "SELECT attname::text FROM pg_attribute WHERE attrelid = "
+                "'askproject_sessions'::regclass AND attnum > 0 UNION ALL "
+                "SELECT conname::text FROM pg_constraint WHERE conrelid = "
+                "'askproject_sessions'::regclass UNION ALL "
+                "SELECT indexname::text FROM pg_indexes WHERE schemaname = current_schema()"
+            ).fetchall()]
+            assert "agent_id" in names and not [n for n in names if "project_id" in n], names
+    finally:
+        with psycopg.connect(STORE_DSN, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')

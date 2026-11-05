@@ -196,7 +196,7 @@ def test_doctor_warns_of_an_earlier_release_grooming_against_the_store(world):
         assert holder["client_addr"] and holder["backend_start"]
         assert "memory-earlier" in warned["warning"] and "2027-01-05" in warned["warning"]
         earlier.execute(f'INSERT INTO "{world.schema}".memory_groom_leases '
-                        "(project_id, holder, lock_pid, expires_at) "
+                        "(agent_id, holder, lock_pid, expires_at) "
                         "VALUES (%s, gen_random_uuid(), pg_backend_pid(), "
                         "now() + interval '1 hour')", (project,))
         assert "earlier_release" not in world.ok(root, "doctor")

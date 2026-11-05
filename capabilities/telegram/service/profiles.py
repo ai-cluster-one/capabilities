@@ -2,15 +2,15 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "callva-harness-runner==0.10.2",
-#     "capabilities-contract>=0.42,<1",
+#     "callva-harness-runner==0.11.0",
+#     "capabilities-contract>=0.43,<1",
 # ]
 # ///
 """The harness profiles a telegram worker may run on, where each comes from,
 and whether one fits.
 
 A profile says how the model runs; it is a callva-harness-runner profile kept
-in the store, in the `harness_profiles` table the runner owns. Every name
+in the store, in the `harness_profile_versions` table the runner owns. Every name
 telegram reaches starts with `telegram-`: the prefix is the capability's scope,
 so a room never runs another capability's profile and the runner's own shipped
 profiles are out of reach. A name resolves to the project's active version,
@@ -57,7 +57,7 @@ import tempfile
 import time
 from pathlib import Path
 
-RUNNER_PIN = "callva-harness-runner==0.10.2"
+RUNNER_PIN = "callva-harness-runner==0.11.0"
 PREFIX = "telegram-"
 BUNDLED = ("telegram-claude", "telegram-codex")
 # The reply gate's profiles, bundled beside the turn's at the same lowest layer.
