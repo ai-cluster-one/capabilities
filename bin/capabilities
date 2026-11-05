@@ -622,7 +622,8 @@ STORE VERBS
         is true where the newest line reads a newer major than the store's,
         or an installed release crosses an owner's major. A blocker is each
         thing that stops it: owner_not_installed (the store holds tables of an
-        owner no release here declares), owner_unreadable, pg_dump_missing,
+        owner no release here declares; an owner it records with no tables
+        left has nothing to move and stops nothing), owner_unreadable, pg_dump_missing,
         pg_dump_too_old (older than the server), pg_restore_missing,
         pg_restore_too_old, no_room_for_dump (the schema's size against the
         free space where the dump goes), read_only_switch, and
@@ -21674,8 +21675,12 @@ def _store_upgrade_judge(answer: dict, setting, key: str, available: dict | None
                          "hint": "Do not lift the switch yourself - ask the user; the upgrade "
                                  f"runs in a process without {store.READ_ONLY_ENV}."})
     known = {entry["owner"] for entry in readers}
+    # An owner the store still records but whose tables are gone, as a retired
+    # tool's that were dropped, has nothing to move, so nothing waits on it.
+    held = set(survey["tables"])
     for owner in sorted(survey["owners"]):
-        if owner not in known:
+        if owner not in known and any(table == owner or table.startswith(owner + "_")
+                                      for table in held):
             blockers.append({"code": "owner_not_installed", "owner": owner,
                              "message": f"the store holds the {owner} tables and no release "
                                         f"installed here migrates them",
