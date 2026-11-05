@@ -1772,7 +1772,9 @@ THE INBOX
   trail entry, or its objective, or - when that move gave `--question` - an
   ask. Any later move out of that wait withdraws the item, so a move from one
   person to another withdraws one item and puts another, and a wait begun again
-  is a new item.
+  is a new item. What the item carries - the task's title, that trail entry or
+  objective, and the --question - is read by the person deciding, so it is
+  written as `inbox stub` says, the inbox's line in every session's context.
 
   --question TEXT --yes WORDS --no WORDS --recommend yes|no
                         on `set`, all four together and only on a call that

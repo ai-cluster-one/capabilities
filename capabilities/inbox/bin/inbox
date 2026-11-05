@@ -32,8 +32,9 @@ ASKING  (the agent of the folder the command runs in)
   inbox notify "<title>" --text T [--key K]
       Something the person should know; it takes no answer.
       Each of the three answers {"created", "item"}. The title is one line of
-      at most 200 characters. --key K makes the same question one item: a
-      repeat with the same key by the same agent, while the item it names is
+      at most 200 characters. Write the title and the text as `inbox stub`
+      says, for the person deciding. --key K makes the same question one item:
+      a repeat with the same key by the same agent, while the item it names is
       not withdrawn, creates nothing and answers that item with
       "created": false, whatever else the repeat says. Without --key every
       call puts a new item in.
@@ -229,7 +230,12 @@ NAME = "inbox"
 SUMMARY = ("A go-between to the person - an agent puts in a question to answer yes or no, a "
            "message to answer in words, or something to know, and leaves the command that "
            "takes the answer; the person lists, reads, answers and archives them, and the "
-           "answer runs the asker's command in the asker's own folder.")
+           "answer runs the asker's command in the asker's own folder. Whatever an agent puts "
+           "before a person in the Inbox, itself or through another tool, is written for someone "
+           "deciding, not someone reading code: say what this is, why it comes up now, what is "
+           "needed from the person, and which answer you recommend and why, in plain language "
+           "with no code, file paths, line numbers, commit or task ids, or internal names, under "
+           "a title that says the matter itself.")
 SCOPE = "project"
 CRED_KEYS: list = []
 # Every verb that changes the store's items; each is refused under the

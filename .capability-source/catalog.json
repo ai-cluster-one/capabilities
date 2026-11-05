@@ -136,9 +136,9 @@
     "inbox": {
       "icon": false,
       "path": "capabilities/inbox",
-      "payload_sha256": "467f7e1a71a07bfa727d2dfc6f7d4079037f21b8c30084023c97b833ca746952",
+      "payload_sha256": "010c72f80f11ce9028d6d6625e52421643cadc190e7db65d7abe80ba10de9295",
       "store_major": 1,
-      "summary": "A go-between to the person - an agent puts in a question to answer yes or no, a message to answer in words, or something to know, and leaves the command that takes the answer; the person lists, reads, answers and archives them, and the answer runs the asker's command in the asker's own folder."
+      "summary": "A go-between to the person - an agent puts in a question to answer yes or no, a message to answer in words, or something to know, and leaves the command that takes the answer; the person lists, reads, answers and archives them, and the answer runs the asker's command in the asker's own folder. Whatever an agent puts before a person in the Inbox, itself or through another tool, is written for someone deciding, not someone reading code: say what this is, why it comes up now, what is needed from the person, and which answer you recommend and why, in plain language with no code, file paths, line numbers, commit or task ids, or internal names, under a title that says the matter itself."
     },
     "instagram": {
       "icon": true,
@@ -255,7 +255,7 @@
     "tasks": {
       "icon": true,
       "path": "capabilities/tasks",
-      "payload_sha256": "cbda61a5b01a60a01e7ab6eb90594ebaf19624f00f5b752032c70f947377fe38",
+      "payload_sha256": "5a8ce633f8a4ef1a0b310e8f6f113a0976135448d6445f64b4e10d3155749565",
       "store_major": 1,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
