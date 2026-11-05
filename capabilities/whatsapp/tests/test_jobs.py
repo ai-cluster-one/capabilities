@@ -807,5 +807,28 @@ class ServiceHarness(td.DialogueCase):
                                            "allowed_groups": {}}):
             self.assertEqual(wa._cmd_service_harness()["harness"], [])
 
+
+class ChatNamesTheJob(unittest.TestCase):
+    """A notice in the chat names the job by a short label, never by the whole
+    brief its worker was handed."""
+
+    BRIEF = ("Summarise the last quarter's invoices for the board, grouped by "
+             "client and month, with totals in euros\n\nRead every invoice in the "
+             "shared folder, check each against the ledger, and flag mismatches.")
+
+    def test_the_stop_and_interrupt_notices_carry_a_short_label(self):
+        for notice in (jobs.stopped_notice({"description": self.BRIEF}),
+                       jobs.interrupted_notice({"description": self.BRIEF})):
+            label = notice.split("«", 1)[1].split("»", 1)[0]
+            self.assertLessEqual(len(label), jobs.JOB_LABEL_LIMIT + 1, notice)
+            self.assertTrue(label.startswith("Summarise the last quarter's invoices"), notice)
+            self.assertTrue(label.endswith("…"), notice)
+            self.assertNotIn("ledger", notice)
+
+    def test_a_short_description_is_named_as_it_is(self):
+        self.assertEqual(jobs.stopped_notice({"description": "count the files"}),
+                         "Stopped: «count the files». It keeps its place and can be continued.")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -262,7 +262,7 @@
     "telegram": {
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "e031bd0efc0b43f73e40a8f4aa957a00498e5dbea5083cd64c5bc0f39ba0dfe8",
+      "payload_sha256": "200cbc40dd1e1c824dee7150264cd48fc10913924edbfad9d0e0f712e0ad9363",
       "store_major": 1,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
@@ -283,7 +283,7 @@
     "whatsapp": {
       "icon": true,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "c2408708adc8e6ccc476b330fd959fbc8674fbf2216cd1686a6ae57aaec92b02",
+      "payload_sha256": "63269535336d92c6759476fdc63f7a60070f367fd751a0ce0ed74b04653e4593",
       "store_major": 1,
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },

@@ -113,6 +113,25 @@ def holds_slot(owner_id: Any) -> bool:
     """Whether an attempt owned by this id holds one of the runner's slots."""
     return not str(owner_id or "").endswith(DIRECT_OWNER_MARKER)
 
+
+# The words a chat message uses to name a job. A job's description is the
+# whole brief its worker reads, often paragraphs long; a person told that a job
+# stopped, failed or was cut off needs to recognise it, not to read it again.
+JOB_LABEL_LIMIT = 80
+
+
+def job_label(description: Any) -> str:
+    """A job's description cut to its first line and to a length a chat line
+    carries, on a word boundary where there is one."""
+    lines = [line.strip() for line in str(description or "").splitlines()]
+    first = " ".join(next((line for line in lines if line), "").split())
+    if len(first) <= JOB_LABEL_LIMIT and sum(1 for line in lines if line) <= 1:
+        return first
+    cut = first[:JOB_LABEL_LIMIT]
+    if len(first) > JOB_LABEL_LIMIT and " " in cut:
+        cut = cut[:cut.rindex(" ")]
+    return cut.rstrip(" ,;:.-") + "…"
+
 # The register's tables, owned by this capability in the project's database and
 # migrated through the shared database library under the owner `telegram`: each
 # step is applied once and recorded in that owner's ledger, and never edited once

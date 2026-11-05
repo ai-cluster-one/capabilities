@@ -7688,7 +7688,7 @@ async def run_session(client):
         by the service going down. Nothing continues it by itself: the call it
         was answering is over, and running it again through the queue would make
         it chat work nobody asked for."""
-        return (f"Interrupted: «{row['description']}» did not finish because the "
+        return (f"Interrupted: «{jobs.job_label(row['description'])}» did not finish because the "
                 "service restarted. It keeps its place and can be continued.")
 
     # -- the asks the register carries ----------------------------------------
@@ -7701,7 +7701,7 @@ async def run_session(client):
 
     async def honour_asks(register):
         for row in register.stop_pending():
-            message = f"Stopped: «{row['description']}». It keeps its place and can be continued."
+            message = f"Stopped: «{jobs.job_label(row['description'])}». It keeps its place and can be continued."
             if row["state"] == jobs.WAITING:
                 stopped = register.cancel_waiting(
                     row["id"], error="stopped by request", result_text=message)
@@ -8024,7 +8024,7 @@ async def run_session(client):
                     job_id, jobs.CANCELLED, attempt_token=attempt_token,
                     owner_id=JOB_OWNER_ID, require_stop_requested=True,
                     error="stopped by request",
-                    result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
+                    result_text=f"Stopped: «{jobs.job_label(row['description'])}». It keeps its place and can be continued.")
                 return
             future = worker_turn(loop, s["worker"], key, tail, state, procs)
             job_futures[job_id] = future
@@ -8039,7 +8039,7 @@ async def run_session(client):
                     job_id, jobs.CANCELLED, attempt_token=attempt_token,
                     owner_id=JOB_OWNER_ID,
                     error="stopped by request",
-                    result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
+                    result_text=f"Stopped: «{jobs.job_label(row['description'])}». It keeps its place and can be continued.")
                 return
             if register.has_pending_amendment(job_id):
                 register.finish_amendment(job_id, attempt_token, JOB_OWNER_ID)
@@ -8087,7 +8087,7 @@ async def run_session(client):
                         job_id, jobs.CANCELLED, attempt_token=attempt_token,
                         owner_id=JOB_OWNER_ID, require_stop_requested=True,
                         error="stopped by request",
-                        result_text=f"Stopped: «{row['description']}». It keeps its place and can be continued.")
+                        result_text=f"Stopped: «{jobs.job_label(row['description'])}». It keeps its place and can be continued.")
                 log(f"{key}: job {job_id} stopped; `jobs resume` continues it")
             elif job_id in amending or (current is not None
                                         and current["state"] == jobs.WAITING) \
@@ -8119,10 +8119,10 @@ async def run_session(client):
                 # that is worth trying again.
                 refused = isinstance(exc, WorkerModelRefused)
                 detail = worker_diagnosis(exc, reason)
-                failure_text = (f"Job failed: «{row['description']}»\n{detail}"
+                failure_text = (f"Job failed: «{jobs.job_label(row['description'])}»\n{detail}"
                                 if any(p.get("role") == "supervisor"
                                        for p in participants)
-                                else f"«{row['description']}» could not be completed. "
+                                else f"«{jobs.job_label(row['description'])}» could not be completed. "
                                      "Please tell an administrator.")
                 register.stop(job_id,
                               jobs.MODEL_REFUSED if refused else jobs.FAILED,

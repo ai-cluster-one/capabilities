@@ -1076,8 +1076,8 @@ class JobRunner:
     def _fail(self, job: LiveJob, outcome: str, detail: str, *, session_id=None) -> None:
         row = job.row
         role = self.dialogue.job_role(row)
-        text = (f"Job failed: «{row['description']}»\n{detail}" if role == "supervisor"
-                else f"«{row['description']}» could not be completed. Please tell an "
+        text = (f"Job failed: «{job_label(row['description'])}»\n{detail}" if role == "supervisor"
+                else f"«{job_label(row['description'])}» could not be completed. Please tell an "
                      "administrator.")
         self.register.finish(row["id"], row["attempt_token"], self.owner_id, outcome,
                              error=detail, session_id=session_id, result_text=text)
@@ -1120,12 +1120,31 @@ class JobRunner:
             self.log(f"jobs: {row['id']} stopped by request")
 
 
+# The words a chat message uses to name a job. A job's description is the
+# whole brief its worker reads, often paragraphs long; a person told that a job
+# stopped, failed or was cut off needs to recognise it, not to read it again.
+JOB_LABEL_LIMIT = 80
+
+
+def job_label(description) -> str:
+    """A job's description cut to its first line and to a length a chat line
+    carries, on a word boundary where there is one."""
+    lines = [line.strip() for line in str(description or "").splitlines()]
+    first = " ".join(next((line for line in lines if line), "").split())
+    if len(first) <= JOB_LABEL_LIMIT and sum(1 for line in lines if line) <= 1:
+        return first
+    cut = first[:JOB_LABEL_LIMIT]
+    if len(first) > JOB_LABEL_LIMIT and " " in cut:
+        cut = cut[:cut.rindex(" ")]
+    return cut.rstrip(" ,;:.-") + "…"
+
+
 def stopped_notice(row: dict) -> str:
-    return f"Stopped: «{row['description']}». It keeps its place and can be continued."
+    return f"Stopped: «{job_label(row['description'])}». It keeps its place and can be continued."
 
 
 def interrupted_notice(row: dict) -> str:
-    return (f"Interrupted: «{row['description']}» did not finish because the service "
+    return (f"Interrupted: «{job_label(row['description'])}» did not finish because the service "
             "restarted. It keeps its place and can be continued.")
 
 

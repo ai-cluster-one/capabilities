@@ -961,6 +961,35 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             hold.set()
             await self.stop_session(client, task)
 
+    async def test_a_stopped_job_is_named_by_a_short_label_in_the_chat(self):
+        """The chat is told which job stopped, not handed its whole brief."""
+        brief = ("Summarise the last quarter's invoices for the board, grouped by "
+                 "client and month, with totals in euros\n\nRead every invoice in "
+                 "the shared folder, check each against the ledger, and flag mismatches.")
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            victim = queued(register, channel_key="123", requested_by="777",
+                            description=brief, engine="stub")
+            store, cli = self.as_cli(daemon)
+            try:
+                cli.request_stop(victim["id"])
+            finally:
+                store.close()
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(
+                lambda: register.get(victim["id"])["outcome"] == daemon.jobs.CANCELLED,
+                timeout=8)
+            text = register.get(victim["id"])["result_text"]
+            await self.stop_session(client, task)
+            label = text.split("«", 1)[1].split("»", 1)[0]
+            self.assertTrue(text.startswith("Stopped: «Summarise the last quarter's"), text)
+            self.assertLessEqual(len(label), daemon.jobs.JOB_LABEL_LIMIT + 1, text)
+            self.assertNotIn("ledger", text)
+
     async def test_a_stopped_job_is_continued_where_it_stopped(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
