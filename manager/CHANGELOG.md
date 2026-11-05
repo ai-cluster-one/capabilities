@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-05 — `store-major-1` is the release line of store schema major 1
+
+This branch keeps the last release of store major 1 after `main` moved to major 2. Its manager names `STORE_LIBRARY` `>=0.42,<0.43`, which `source index` stamps as `library` into the release manifest and the catalogue, so `self-update` and `update` on a machine whose store is still at major 1 take this line and hold the manager and every capability on capabilities-contract 0.42, the last library that reads major 1. It takes only fixes and what major 1 needs to reach `capabilities store upgrade`.
+
 ## 2026-11-03 — `inbox` is a core capability
 
 `inbox` joins the catalogue's core tier beside `agenttemplates`, `askproject`, `assets`, `automations`, `context`, `deployment`, `memory`, `routine` and `tasks`: `capabilities list` shows it as `tier` "core", and its first install from the official catalogue on a machine arrives allowed and enabled at global scope, where that scope holds no entry for it yet. A machine that already has it installed keeps its quarantine, allowance and gates as they are; after arrival it is gated, enabled and granted as before, and its bundled service still needs an explicit project enable.
