@@ -148,3 +148,30 @@ def test_the_reply_chain_climbs_past_the_tail(monkeypatch):
     reading = run(t.read_history(TOKEN, 1, "h", "/x", ann, 300, limit=1,
                                  reply_chain_of=150, include_anchor=True))
     assert [m.message_id for m in reading.messages] == [1, 150, 299]
+
+
+def test_a_supergroup_read_carries_the_access_hash_getchannels_gives():
+    from telethon.tl import types
+
+    class Channel:
+        def __init__(self, id, access_hash):
+            self.id, self.access_hash = id, access_hash
+
+    class Client:
+        def __init__(self):
+            self.requests = []
+
+        async def __call__(self, request):
+            self.requests.append(request)
+            if type(request).__name__ == "GetChannelsRequest":
+                return types.messages.Chats(chats=[Channel(request.id[0].channel_id, 987)])
+            return types.messages.Chats(chats=[])
+
+    found = t.HistoryReader(TOKEN, 1, "hash", "/nonexistent")
+    found.client = Client()
+    run(found.fetch(-1001234567890, [1, 2]))
+    run(found.fetch(-1001234567890, [3]))
+    names = [type(r).__name__ for r in found.client.requests]
+    assert names == ["GetChannelsRequest", "GetMessagesRequest", "GetMessagesRequest"]
+    channel = found.client.requests[1].channel
+    assert (channel.channel_id, channel.access_hash) == (1234567890, 987)

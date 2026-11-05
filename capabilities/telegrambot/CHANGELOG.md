@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-05 — History reads a supergroup the bot is in
+
+`history`, and a turn's read back, refused every supergroup with `chat_unreachable (ChannelInvalidError)`: the read named the channel with access hash 0, which `channels.getMessages` does not accept. The reader now asks `channels.getChannels` for the channel first, which accepts hash 0 from a bot that is a member, takes the access hash Telegram answers with, and keeps it for as long as the reader lives, so a long-running service asks once per supergroup. A supergroup the bot is not in is still refused as `chat_unreachable`; private chats and basic groups read as before.
+
 ## 2026-11-04 — An agent's own Telegram channel through a bot
 
 New capability. One connection is one bot and holds everything that bot needs - the BotFather token, the App api_id and api_hash that let it read history, and the Deepgram key for voice - each as a value sealed into the agent's vault or a reference to a key held there, so a connection is whole on any machine. A new connection refers to the machine's shared `DEEPGRAM_API_KEY` where the machine holds one; nothing else stands in for a key the connection does not name.

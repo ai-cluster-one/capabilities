@@ -638,6 +638,7 @@ class HistoryReader:
         self.bot_id = bot_id_of(token)
         self.path = session_path(state_dir, self.bot_id or 0)
         self.client = None
+        self.channels: dict[int, object] = {}
 
     async def open(self):
         from telethon import TelegramClient
@@ -681,6 +682,23 @@ class HistoryReader:
             await self.client.disconnect()
             self.client = None
 
+    async def input_channel(self, chat_id: int):
+        """A supergroup as MTProto names it, with the access hash Telegram gave
+        this bot. getMessages refuses a channel without it; getChannels accepts
+        hash 0 from a bot that is a member and answers with the real one."""
+        from telethon.tl import functions, types
+        channel_id = channel_of(chat_id)
+        if channel_id not in self.channels:
+            result = await self.client(functions.channels.GetChannelsRequest(
+                id=[types.InputChannel(channel_id, 0)]))
+            found = next((c for c in getattr(result, "chats", None) or []
+                          if getattr(c, "id", None) == channel_id), None)
+            if found is None or getattr(found, "access_hash", None) is None:
+                raise TelegramError(3, "chat_unreachable",
+                                    "the bot cannot read this chat (ChannelInvalidError)")
+            self.channels[channel_id] = types.InputChannel(channel_id, found.access_hash)
+        return self.channels[channel_id]
+
     async def fetch(self, chat_id: int, ids: list[int]) -> tuple[list, dict]:
         """The raw messages for `ids` in this chat and the users they name."""
         from telethon.tl import functions, types
@@ -689,7 +707,7 @@ class HistoryReader:
             return [], {}
         if chat_kind(chat_id) == "supergroup":
             request = functions.channels.GetMessagesRequest(
-                channel=types.InputChannel(channel_of(chat_id), 0), id=wanted)
+                channel=await self.input_channel(chat_id), id=wanted)
         else:
             request = functions.messages.GetMessagesRequest(id=wanted)
         result = await self.client(request)

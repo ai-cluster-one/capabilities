@@ -269,7 +269,7 @@
     "telegrambot": {
       "icon": false,
       "path": "capabilities/telegrambot",
-      "payload_sha256": "2a3156277a164667d4363bdb9128147c2bf1ab3b5fa10991d5ed770af6aefaf2",
+      "payload_sha256": "bf6f31c47a76b26a091184a2ebcb4f5672b523ef938fa66a5765148b1787aea6",
       "store_major": 1,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation."
     },
