@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-05 — The service runner reads the lease by `agent_id`, on a store at schema major 2
+
+The service runner's lease turns and `deployment services` read and write `deployment_service_leases` by `agent_id`, the column that was `project`. The rename is the capabilities manager's: its `node supervise` migrates the lease table under the ledger entry deployment gave it, and the move crosses, with every other owner's, only through `capabilities store upgrade`. The rows of what a node runs are the store's `service_instances`, written through the library. deployment declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-11-04 — A compiled bundle carries no automations environment label
 
 The automations service no longer declares `AUTOMATIONS_ENVIRONMENT`, so `deployment sync` and `setup` export it into no Compose file and no `.env.example`: work between an agent's nodes is told apart by the node alone. A server that still sets it keeps running; `automations doctor` names it as retired.

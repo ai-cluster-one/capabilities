@@ -1,5 +1,9 @@
 # context — change log
 
+## 2026-11-05 — The store names the agent: context's tables go to schema major 2
+
+`context`'s tables name an agent where they named a project: `context_documents.project_id` is `agent_id`, `context_documents.author_project_id` is `author_agent_id` and `context_enablements.project_id` is `agent_id`, and every constraint and comment named for them moves with them. Step `0006-agent-names` renames them in place with every row kept and takes the ledger to 2.0. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of context 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first context call makes them at 2.0. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-10-31 — `context` carries its own icon
 
 The bundle holds its icon as `icon.png`, an open book: Lucide's `book-open` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon context` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

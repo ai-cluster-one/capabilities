@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-05 — The harness profiles are `harness_profile_versions`, behind the store upgrade
+
+telegrambot migrates the harness runner's profile table before its own, so it now pins `callva-harness-runner` 0.11.0, whose step takes that table to schema major 2 as `harness_profile_versions` with the agent in `agent_id`, and declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. The move crosses only through `capabilities store upgrade`, which migrates the harness owner through telegrambot as its further owner; outside it, telegrambot refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command. telegrambot's own tables, which already name the agent `agent_id`, stay at 1.0, and `telegrambot_prompts` keeps its name. Profiles resolve and save as before. No verb, flag, environment variable or output key changes.
+
 ## 2026-11-05 — History reads a supergroup the bot is in
 
 `history`, and a turn's read back, refused every supergroup with `chat_unreachable (ChannelInvalidError)`: the read named the channel with access hash 0, which `channels.getMessages` does not accept. The reader now asks `channels.getChannels` for the channel first, which accepts hash 0 from a bot that is a member, takes the access hash Telegram answers with, and keeps it for as long as the reader lives, so a long-running service asks once per supergroup. A supergroup the bot is not in is still refused as `chat_unreachable`; private chats and basic groups read as before.

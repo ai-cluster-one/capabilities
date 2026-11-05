@@ -12,7 +12,7 @@ The project's database is the home, not a private one beside it: the
 capability owns its `telegram_*` tables there and migrates them itself, through
 the shared database library and under its own ledger, and nothing else knows
 these columns. The reason it is a table rather than a JSON blob is that the
-runner filters on `project_id`, `surface` and `state` on every tick.
+runner filters on `agent_id`, `surface` and `state` on every tick.
 
 WHAT THE REGISTER HOLDS, AND WHAT IT REFUSES TO HOLD
 ===================================================
@@ -41,7 +41,7 @@ there is no `parent_id`: an amendment has no lineage to record.
 
 ISOLATION IS A CORRECTNESS CONDITION
 ====================================
-Every queue read is filtered by `project_id` and `surface`. The store is
+Every queue read is filtered by `agent_id` and `surface`. The store is
 shared — by two projects on one machine, and by two machines on one project —
 so a query that forgets whose work it is asking about answers with somebody
 else's. It cannot therefore be a `WHERE` clause each caller is trusted to
@@ -457,6 +457,53 @@ STORE_STEPS = (
     ALTER TABLE telegram_channels
         ADD CONSTRAINT telegram_channels_pkey PRIMARY KEY (project_id, connection, channel_key);
     """),
+    # The store names an agent where it named a project: the column that holds
+    # one in each table, every constraint named for it, and every comment that
+    # says it. The prompts are a versioned family, so their table takes the
+    # `_versions` name, and every object named for the table moves with it,
+    # leaving the old name free. The rows stay where they are; this is major
+    # 2, so a release that still reads the old names refuses the store
+    # instead of failing on a missing table.
+    ("0008-agent-names", r"""
+    ALTER TABLE telegram_prompts RENAME TO telegram_prompt_versions;
+    ALTER TABLE telegram_jobs RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE telegram_job_amendments RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE telegram_job_slots RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE telegram_prompt_versions RENAME COLUMN project_id TO agent_id;
+    ALTER TABLE telegram_channels RENAME COLUMN project_id TO agent_id;
+    DO $$
+    DECLARE r record;
+    BEGIN
+        FOR r IN SELECT c.conrelid::regclass AS tab, c.conname
+                   FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+                  WHERE t.relnamespace = current_schema()::regnamespace
+                    AND t.relname IN ('telegram_jobs', 'telegram_job_amendments',
+                                      'telegram_job_slots', 'telegram_prompt_versions',
+                                      'telegram_channels')
+                    AND (c.conname LIKE '%project%' OR c.conname LIKE 'telegram\_prompts\_%')
+        LOOP
+            EXECUTE format('ALTER TABLE %s RENAME CONSTRAINT %I TO %I', r.tab, r.conname,
+                           replace(regexp_replace(r.conname, '^telegram_prompts_',
+                                                  'telegram_prompt_versions_'),
+                                   'project', 'agent'));
+        END LOOP;
+    END $$;
+    ALTER INDEX telegram_prompts_active RENAME TO telegram_prompt_versions_active;
+    ALTER INDEX telegram_prompts_key RENAME TO telegram_prompt_versions_key;
+    ALTER TRIGGER telegram_prompts_guard ON telegram_prompt_versions
+        RENAME TO telegram_prompt_versions_guard;
+    ALTER TRIGGER telegram_prompts_truncate ON telegram_prompt_versions
+        RENAME TO telegram_prompt_versions_truncate;
+    ALTER FUNCTION telegram_prompts_guard() RENAME TO telegram_prompt_versions_guard;
+    COMMENT ON COLUMN telegram_prompt_versions.agent_id IS
+        'The agent''s declared id.';
+    COMMENT ON COLUMN telegram_prompt_versions.active IS
+        'The version the service reads; at most one per agent and key.';
+    COMMENT ON COLUMN telegram_channels.agent_id IS
+        'The agent''s declared id.';
+    COMMENT ON COLUMN telegram_channels.settings IS
+        'The channel''s /set overrides, over the agent''s settings.';
+    """),
 )
 
 # The harness runner's profile table lives in the same store, under the
@@ -727,7 +774,7 @@ class JobRegister:
         The project and surface are part of every ordinary lookup, including
         primary-key reads.
         """
-        parts = ["project_id = ?", "surface = ?"]
+        parts = ["agent_id = ?", "surface = ?"]
         params: list = [self.project_id, self.surface]
         parts.extend(predicates)
         return " WHERE " + " AND ".join(parts), params
@@ -866,7 +913,7 @@ class JobRegister:
 
     def quota_until(self) -> str | None:
         row = self.store._execute(
-            "SELECT MAX(resume_at) FROM telegram_jobs WHERE project_id = ? AND "
+            "SELECT MAX(resume_at) FROM telegram_jobs WHERE agent_id = ? AND "
             "surface = ? AND state = ? AND outcome = ? "
             "AND resume_at > ?",
             (self.project_id, self.surface, STOPPED, QUOTA, iso())).fetchone()
@@ -886,7 +933,7 @@ class JobRegister:
         claimed: list[str] = []
         with self.store.transaction():
             rows = self.store._execute(
-                "SELECT id FROM telegram_jobs WHERE project_id = ? "
+                "SELECT id FROM telegram_jobs WHERE agent_id = ? "
                 "AND surface = ? AND (delivery_state = ? OR (delivery_state = ? "
                 "AND delivery_lease_expires_at <= ?)) ORDER BY execution_finished_at, id LIMIT ?",
                 (self.project_id, self.surface, "pending",
@@ -937,7 +984,7 @@ class JobRegister:
         try:
             with self.store.transaction():
                 self.store._execute(
-                    "INSERT INTO telegram_jobs (id, project_id, surface, "
+                    "INSERT INTO telegram_jobs (id, agent_id, surface, "
                     "channel_key, requested_by, origin_message_id, description, engine, "
                     "model, profile, state, attempt, amendments, stop_requested, "
                     "created_at, updated_at) "
@@ -1037,12 +1084,12 @@ class JobRegister:
                     if not cur.rowcount:
                         return None
                     lowest = self.store._execute(
-                        "SELECT MIN(slot) FROM telegram_job_slots WHERE project_id = ? "
+                        "SELECT MIN(slot) FROM telegram_job_slots WHERE agent_id = ? "
                         "AND surface = ?",
                         (self.project_id, self.surface)).fetchone()[0]
                     slot = min(-1, int(lowest) - 1) if lowest is not None else -1
                     self.store._execute(
-                        "INSERT INTO telegram_job_slots (project_id, surface, "
+                        "INSERT INTO telegram_job_slots (agent_id, surface, "
                         "slot, job_id, owner_id, attempt_token, lease_expires_at) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (self.project_id, self.surface, slot, job_id,
@@ -1074,21 +1121,21 @@ class JobRegister:
         try:
             with self.store.transaction():
                 used = {int(r[0]) for r in self.store._execute(
-                    "SELECT slot FROM telegram_job_slots WHERE project_id = ? AND "
+                    "SELECT slot FROM telegram_job_slots WHERE agent_id = ? AND "
                     "surface = ?",
                     (self.project_id, self.surface)).fetchall()}
                 slot = next((n for n in range(max_parallel) if n not in used), None)
                 if slot is None:
                     return None
                 candidate = self.store._execute(
-                    "SELECT id FROM telegram_jobs WHERE project_id = ? AND surface = ? "
+                    "SELECT id FROM telegram_jobs WHERE agent_id = ? AND surface = ? "
                     "AND state = ? ORDER BY created_at, id LIMIT ?",
                     (self.project_id, self.surface, WAITING, 1)).fetchone()
                 if not candidate:
                     return None
                 job_id = candidate[0]
                 self.store._execute(
-                    "INSERT INTO telegram_job_slots (project_id, surface, "
+                    "INSERT INTO telegram_job_slots (agent_id, surface, "
                     "slot, job_id, owner_id, attempt_token, lease_expires_at) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (self.project_id, self.surface, slot, job_id,
@@ -1154,7 +1201,7 @@ class JobRegister:
                 if cur.rowcount != 1:
                     raise JobError("lease_lost", f"job {job_id} no longer owns its attempt")
                 slot = self.store._execute(
-                    "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE project_id = ? "
+                    "UPDATE telegram_job_slots SET lease_expires_at = ? WHERE agent_id = ? "
                     "AND surface = ? AND job_id = ? AND owner_id = ? "
                     "AND attempt_token = ?",
                     (until, self.project_id, self.surface, job_id,
@@ -1210,7 +1257,7 @@ class JobRegister:
             if before_release is not None:
                 before_release()
             slot = self.store._execute(
-                "DELETE FROM telegram_job_slots WHERE project_id = ? "
+                "DELETE FROM telegram_job_slots WHERE agent_id = ? "
                 "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ? "
                 "AND lease_expires_at = ?",
                 (self.project_id, self.surface, job_id,
@@ -1219,7 +1266,7 @@ class JobRegister:
                 raise JobError("slot_mismatch", f"job {job_id} expired without its exact slot")
             self.store._execute(
                 "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
-                "claimed_at = NULL WHERE project_id = ? AND surface = ? "
+                "claimed_at = NULL WHERE agent_id = ? AND surface = ? "
                 "AND job_id = ? AND state = ? AND claim_token = ?",
                 ("pending", self.project_id, self.surface,
                  job_id, "claimed", token))
@@ -1231,7 +1278,7 @@ class JobRegister:
         marks = self._marks(states)
         cur = self.store._execute(
             "SELECT id, text, state, claim_token, created_at FROM "
-            "telegram_job_amendments WHERE project_id = ? "
+            "telegram_job_amendments WHERE agent_id = ? "
             f"AND surface = ? AND job_id = ? AND state IN ({marks}) "
             "ORDER BY created_at, id",
             (self.project_id, self.surface, job_id, *states))
@@ -1256,7 +1303,7 @@ class JobRegister:
         clause, params = self._where(*predicates)
         with self.store.transaction():
             self.store._execute(
-                "INSERT INTO telegram_job_amendments (id, project_id, "
+                "INSERT INTO telegram_job_amendments (id, agent_id, "
                 "surface, job_id, text, state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (amendment_id, self.project_id, self.surface,
                  job_id, text, "pending", now))
@@ -1280,7 +1327,7 @@ class JobRegister:
     def _lock_attempt(self, job_id: str, attempt_token: str, owner_id: str) -> bool:
         """Lock one exact attempt and its slot in the common row-then-slot order."""
         job = self.store._execute(
-            "SELECT 1 FROM telegram_jobs WHERE project_id = ? "
+            "SELECT 1 FROM telegram_jobs WHERE agent_id = ? "
             "AND surface = ? AND id = ? AND state = ? AND attempt_token = ? "
             "AND lease_owner = ? FOR UPDATE",
             (self.project_id, self.surface, job_id, RUNNING,
@@ -1288,7 +1335,7 @@ class JobRegister:
         if not job:
             return False
         slot = self.store._execute(
-            "SELECT 1 FROM telegram_job_slots WHERE project_id = ? "
+            "SELECT 1 FROM telegram_job_slots WHERE agent_id = ? "
             "AND surface = ? AND job_id = ? AND attempt_token = ? AND owner_id = ? FOR UPDATE",
             (self.project_id, self.surface, job_id,
              attempt_token, owner_id)).fetchone()
@@ -1308,7 +1355,7 @@ class JobRegister:
                 return []
             self.store._execute(
                 "UPDATE telegram_job_amendments SET state = ?, claim_token = ?, "
-                "claimed_at = ? WHERE project_id = ? AND surface = ? "
+                "claimed_at = ? WHERE agent_id = ? AND surface = ? "
                 "AND job_id = ? AND state = ?",
                 ("claimed", attempt_token, now, self.project_id,
                  self.surface, job_id, "pending"))
@@ -1322,7 +1369,7 @@ class JobRegister:
                 return 0
             cur = self.store._execute(
                 "UPDATE telegram_job_amendments SET state = ?, acked_at = ? WHERE "
-                "project_id = ? AND surface = ? AND job_id = ? "
+                "agent_id = ? AND surface = ? AND job_id = ? "
                 "AND state = ? AND claim_token = ?",
                 ("acked", iso(), self.project_id, self.surface,
                  job_id, "claimed", attempt_token))
@@ -1417,7 +1464,7 @@ class JobRegister:
             if cur.rowcount != 1:
                 return None
             slot = self.store._execute(
-                "DELETE FROM telegram_job_slots WHERE project_id = ? "
+                "DELETE FROM telegram_job_slots WHERE agent_id = ? "
                 "AND surface = ? AND job_id = ? AND owner_id = ? AND attempt_token = ?",
                 (self.project_id, self.surface, job_id,
                  owner_id, attempt_token))
@@ -1425,7 +1472,7 @@ class JobRegister:
                 raise JobError("slot_mismatch", f"job {job_id} lost its owned slot")
             self.store._execute(
                 "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
-                "claimed_at = NULL WHERE project_id = ? AND surface = ? "
+                "claimed_at = NULL WHERE agent_id = ? AND surface = ? "
                 "AND job_id = ? AND state = ? AND claim_token = ?",
                 ("pending", self.project_id, self.surface,
                  job_id, "claimed", attempt_token))
@@ -1557,7 +1604,7 @@ class JobRegister:
                 tuple(list(columns.values()) + params + values))
             if cur.rowcount:
                 slot_sql = (
-                    "DELETE FROM telegram_job_slots WHERE project_id = ? "
+                    "DELETE FROM telegram_job_slots WHERE agent_id = ? "
                     "AND surface = ? AND job_id = ?")
                 slot_params: list[Any] = [self.project_id,
                                           self.surface, job_id]
@@ -1570,7 +1617,7 @@ class JobRegister:
                 if attempt_token is not None:
                     self.store._execute(
                         "UPDATE telegram_job_amendments SET state = ?, claim_token = NULL, "
-                        "claimed_at = NULL WHERE project_id = ? "
+                        "claimed_at = NULL WHERE agent_id = ? "
                         "AND surface = ? AND job_id = ? AND state = ? AND claim_token = ?",
                         ("pending", self.project_id, self.surface,
                          job_id, "claimed", attempt_token))

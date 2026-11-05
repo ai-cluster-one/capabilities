@@ -1,4 +1,4 @@
-"""A project's references in the store: `capabilities_references`.
+"""A project's references in the store: `reference_versions`.
 
 Every capability's references for a project are one versioned table of the
 contract's: the manager imports `capabilities/<name>/reference/*.md` into it
@@ -207,7 +207,7 @@ def test_a_folder_imported_and_exported_is_the_same_bytes(lab):
         == [("coolify", "account-map", "added"), ("other", "Reply_Tone", "added"),
             ("other", "marked", "added")]
     assert done["skipped"] == [str(accounts.parent / "notes.txt")]
-    assert lab.sql("SELECT count(*) FROM capabilities_references WHERE active") == [(3,)]
+    assert lab.sql("SELECT count(*) FROM reference_versions WHERE active") == [(3,)]
     again = lab.ok(MANAGER, "references", "import")
     assert {r["outcome"] for r in again["imported"]} == {"unchanged"}
 
@@ -229,8 +229,8 @@ def test_an_import_with_a_file_it_cannot_read_writes_nothing(lab):
     code, error = lab.refused(MANAGER, "references", "import")
     assert (code, error["code"]) == (6, "import_refused")
     assert "broken.md" in error["message"]
-    if lab.sql("SELECT to_regclass('capabilities_references')") != [(None,)]:
-        assert lab.sql("SELECT count(*) FROM capabilities_references") == [(0,)]
+    if lab.sql("SELECT to_regclass('reference_versions')") != [(None,)]:
+        assert lab.sql("SELECT count(*) FROM reference_versions") == [(0,)]
 
 
 def test_a_save_adds_a_version_under_its_base_and_history_shows_both(lab):
@@ -263,13 +263,13 @@ def test_the_store_keeps_history_immutable(lab):
     import psycopg
     lab.reference("coolify", "account-map", ACCOUNTS)
     lab.ok(MANAGER, "references", "import")
-    for statement in ("UPDATE capabilities_references SET body = 'x'",
-                      "DELETE FROM capabilities_references",
-                      "TRUNCATE capabilities_references"):
+    for statement in ("UPDATE reference_versions SET body = 'x'",
+                      "DELETE FROM reference_versions",
+                      "TRUNCATE reference_versions"):
         with pytest.raises(psycopg.errors.CheckViolation):
             lab.sql(statement)
     with pytest.raises(psycopg.errors.UniqueViolation):
-        lab.sql("INSERT INTO capabilities_references (project_id, capability, name, body, "
+        lab.sql("INSERT INTO reference_versions (agent_id, capability, name, body, "
                 "created_by) VALUES (%s, 'coolify', 'Account_Map', 'x', 't@n')", (PROJECT_ID,))
 
 

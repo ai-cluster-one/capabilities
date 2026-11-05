@@ -157,7 +157,7 @@ class JobRegister:
     # -- the scope, applied once ------------------------------------------------
 
     def _where(self, *predicates: str) -> tuple[str, list]:
-        parts = ["project_id = %s", "environment = %s", "account = %s", *predicates]
+        parts = ["agent_id = %s", "environment = %s", "account = %s", *predicates]
         return " WHERE " + " AND ".join(parts), [self.project_id, self.environment,
                                                  self.account]
 
@@ -238,7 +238,7 @@ class JobRegister:
 
     def slots_in_use(self) -> int:
         return int(self.db.execute(
-            "SELECT count(*) AS n FROM whatsapp_job_slots WHERE project_id = %s"
+            "SELECT count(*) AS n FROM whatsapp_job_slots WHERE agent_id = %s"
             " AND environment = %s AND account = %s", self._scope()).fetchone()["n"])
 
     def running(self) -> list[dict]:
@@ -252,7 +252,7 @@ class JobRegister:
         the request to stop and continue."""
         return self._rows(
             "state = %s AND EXISTS (SELECT 1 FROM whatsapp_job_amendments a"
-            " WHERE a.project_id = whatsapp_jobs.project_id"
+            " WHERE a.agent_id = whatsapp_jobs.agent_id"
             " AND a.environment = whatsapp_jobs.environment"
             " AND a.account = whatsapp_jobs.account AND a.job_id = whatsapp_jobs.id"
             " AND a.state = 'pending')", [RUNNING], order="started_at, id")
@@ -302,7 +302,7 @@ class JobRegister:
         with self.cli._writing(self.db):
             row = self.db.execute(
                 """INSERT INTO whatsapp_jobs
-                       (id, project_id, environment, account, chat_id, surface,
+                       (id, agent_id, environment, account, chat_id, surface,
                         requested_by, origin_message_id, description, profile, engine,
                         model, state, created_at, updated_at)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
@@ -344,7 +344,7 @@ class JobRegister:
 
     def _amendment_rows(self, job_id: str, states) -> list[dict]:
         return [_dict(r) for r in self.db.execute(
-            "SELECT * FROM whatsapp_job_amendments WHERE project_id = %s"
+            "SELECT * FROM whatsapp_job_amendments WHERE agent_id = %s"
             " AND environment = %s AND account = %s AND job_id = %s"
             " AND state = ANY(%s) ORDER BY created_at, id",
             self._scope() + [job_id, list(states)]).fetchall()]
@@ -367,7 +367,7 @@ class JobRegister:
         with self.cli._writing(self.db):
             self.db.execute(
                 """INSERT INTO whatsapp_job_amendments
-                       (id, project_id, environment, account, job_id, text, state,
+                       (id, agent_id, environment, account, job_id, text, state,
                         created_at)
                    VALUES (%s, %s, %s, %s, %s, %s, 'pending', clock_timestamp())""",
                 (amendment_id, *self._scope(), job_id, text))
@@ -393,7 +393,7 @@ class JobRegister:
                 return []
             self.db.execute(
                 "UPDATE whatsapp_job_amendments SET state = 'claimed', claim_token = %s,"
-                " claimed_at = now() WHERE project_id = %s AND environment = %s"
+                " claimed_at = now() WHERE agent_id = %s AND environment = %s"
                 " AND account = %s AND job_id = %s AND state = 'pending'",
                 [token] + self._scope() + [job_id])
         return [r for r in self._amendment_rows(job_id, ("claimed",))
@@ -405,7 +405,7 @@ class JobRegister:
                 return 0
             done = self.db.execute(
                 "UPDATE whatsapp_job_amendments SET state = 'acked', acked_at = now()"
-                " WHERE project_id = %s AND environment = %s AND account = %s"
+                " WHERE agent_id = %s AND environment = %s AND account = %s"
                 " AND job_id = %s AND state = 'claimed' AND claim_token = %s"
                 " RETURNING id", self._scope() + [job_id, token]).fetchall()
         return len(done)
@@ -413,7 +413,7 @@ class JobRegister:
     def _release_amendments(self, job_id: str, token: str) -> None:
         self.db.execute(
             "UPDATE whatsapp_job_amendments SET state = 'pending', claim_token = NULL,"
-            " claimed_at = NULL WHERE project_id = %s AND environment = %s"
+            " claimed_at = NULL WHERE agent_id = %s AND environment = %s"
             " AND account = %s AND job_id = %s AND state = 'claimed'"
             " AND claim_token = %s", self._scope() + [job_id, token])
 
@@ -426,7 +426,7 @@ class JobRegister:
         if not job:
             return False
         slot = self.db.execute(
-            "SELECT 1 FROM whatsapp_job_slots WHERE project_id = %s AND environment = %s"
+            "SELECT 1 FROM whatsapp_job_slots WHERE agent_id = %s AND environment = %s"
             " AND account = %s AND job_id = %s AND attempt_token = %s AND owner_id = %s"
             " FOR UPDATE", self._scope() + [job_id, token, owner]).fetchone()
         return bool(slot)
@@ -488,7 +488,7 @@ class JobRegister:
             if row is None:
                 return None
             self.db.execute(
-                "DELETE FROM whatsapp_job_slots WHERE project_id = %s AND environment = %s"
+                "DELETE FROM whatsapp_job_slots WHERE agent_id = %s AND environment = %s"
                 " AND account = %s AND job_id = %s AND attempt_token = %s AND owner_id = %s",
                 self._scope() + [job_id, token, owner])
             self._release_amendments(job_id, token)
@@ -537,7 +537,7 @@ class JobRegister:
         try:
             with self.cli._writing(self.db):
                 used = {int(r["slot"]) for r in self.db.execute(
-                    "SELECT slot FROM whatsapp_job_slots WHERE project_id = %s"
+                    "SELECT slot FROM whatsapp_job_slots WHERE agent_id = %s"
                     " AND environment = %s AND account = %s", self._scope()).fetchall()}
                 slot = next((n for n in range(max_parallel) if n not in used), None)
                 if slot is None:
@@ -552,7 +552,7 @@ class JobRegister:
                 job_id = candidate["id"]
                 taken = self.db.execute(
                     """INSERT INTO whatsapp_job_slots
-                           (project_id, environment, account, slot, job_id, owner_id,
+                           (agent_id, environment, account, slot, job_id, owner_id,
                             attempt_token, lease_expires_at)
                        VALUES (%s, %s, %s, %s, %s, %s, %s,
                                now() + make_interval(secs => %s))
@@ -600,7 +600,7 @@ class JobRegister:
             if row is None:
                 return False
             self.db.execute(
-                "UPDATE whatsapp_job_slots SET lease_expires_at = %s WHERE project_id = %s"
+                "UPDATE whatsapp_job_slots SET lease_expires_at = %s WHERE agent_id = %s"
                 " AND environment = %s AND account = %s AND job_id = %s"
                 " AND attempt_token = %s AND owner_id = %s",
                 [until] + self._scope() + [job_id, token, owner])
@@ -640,7 +640,7 @@ class JobRegister:
             if before_release is not None:
                 before_release()
             self.db.execute(
-                "DELETE FROM whatsapp_job_slots WHERE project_id = %s AND environment = %s"
+                "DELETE FROM whatsapp_job_slots WHERE agent_id = %s AND environment = %s"
                 " AND account = %s AND job_id = %s AND attempt_token = %s AND owner_id = %s",
                 self._scope() + [row["id"], token, owner])
             self._release_amendments(row["id"], token)

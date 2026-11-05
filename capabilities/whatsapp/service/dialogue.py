@@ -419,7 +419,7 @@ class Register:
 
     def _row(self, chat_id, *, lock=False):
         return self.db.execute(
-            "SELECT * FROM whatsapp_register WHERE project_id = %s AND environment = %s"
+            "SELECT * FROM whatsapp_register WHERE agent_id = %s AND environment = %s"
             " AND account = %s AND chat_id = %s" + (" FOR UPDATE" if lock else ""),
             (*self.key, chat_id)).fetchone()
 
@@ -465,7 +465,7 @@ class Register:
         with self.cli._writing(self.db):
             self.db.execute(
                 f"""INSERT INTO whatsapp_register
-                       (project_id, environment, account, chat_id, first_ts, watermark,
+                       (agent_id, environment, account, chat_id, first_ts, watermark,
                         processed, overrides, counters, created_at, updated_at)
                     VALUES (%s, %s, %s, %s, {self.cli._TS_PARAM}, {self.cli._TS_PARAM},
                             '{{}}'::jsonb, '{{}}'::jsonb, '{{}}'::jsonb, now(), now())
@@ -483,7 +483,7 @@ class Register:
                 f"""UPDATE whatsapp_register
                        SET processed = %s::jsonb, watermark = {self.cli._TS_PARAM},
                            updated_at = now()
-                     WHERE project_id = %s AND environment = %s AND account = %s
+                     WHERE agent_id = %s AND environment = %s AND account = %s
                        AND chat_id = %s""",
                 (json.dumps(processed), watermark, *self.key, chat_id))
         return True
@@ -508,7 +508,7 @@ class Register:
                 overrides[key] = value
             self.db.execute(
                 "UPDATE whatsapp_register SET overrides = %s::jsonb, updated_at = now()"
-                " WHERE project_id = %s AND environment = %s AND account = %s"
+                " WHERE agent_id = %s AND environment = %s AND account = %s"
                 " AND chat_id = %s", (json.dumps(overrides), *self.key, chat_id))
 
     def echoes(self, chat_id) -> set:
@@ -526,7 +526,7 @@ class Register:
             counters["voice_echoes"] = echoes[-VOICE_ECHOES_KEPT:]
             self.db.execute(
                 "UPDATE whatsapp_register SET counters = %s::jsonb, updated_at = now()"
-                " WHERE project_id = %s AND environment = %s AND account = %s"
+                " WHERE agent_id = %s AND environment = %s AND account = %s"
                 " AND chat_id = %s", (json.dumps(counters), *self.key, chat_id))
 
     def bump(self, chat_id, **changes) -> None:
@@ -543,7 +543,7 @@ class Register:
                     counters[key] = value
             self.db.execute(
                 "UPDATE whatsapp_register SET counters = %s::jsonb, updated_at = now()"
-                " WHERE project_id = %s AND environment = %s AND account = %s"
+                " WHERE agent_id = %s AND environment = %s AND account = %s"
                 " AND chat_id = %s", (json.dumps(counters), *self.key, chat_id))
 
 

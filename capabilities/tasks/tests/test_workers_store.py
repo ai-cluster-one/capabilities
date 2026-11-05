@@ -159,7 +159,7 @@ def refused(proc: subprocess.CompletedProcess, exit_code: int) -> dict:
 def rows(lab, name: str) -> list[tuple]:
     import psycopg
     with psycopg.connect(DSN) as conn:
-        return conn.execute(f"""select project_id, active, id::text from {lab['schema']}.tasks_workers
+        return conn.execute(f"""select agent_id, active, id::text from {lab['schema']}.tasks_worker_versions
                                  where name = %s order by created_at, id""", (name,)).fetchall()
 
 
@@ -204,7 +204,7 @@ def test_a_save_over_a_version_already_replaced_is_refused(lab):
 def test_the_store_refuses_any_writer_editing_deleting_or_truncating_a_version(lab):
     import psycopg
     first = ok(save(lab, "alpha", ALPHA))
-    table = f"{lab['schema']}.tasks_workers"
+    table = f"{lab['schema']}.tasks_worker_versions"
 
     def refusal(sql: str, *params) -> psycopg.Error:
         with psycopg.connect(DSN) as conn:
@@ -220,7 +220,7 @@ def test_the_store_refuses_any_writer_editing_deleting_or_truncating_a_version(l
                         # A plain truncate is already refused by the raises' foreign key.
                         (f"truncate {table} cascade", ())):
         error = refusal(sql, *params)
-        assert error.sqlstate == "23001" and error.diag.constraint_name == "tasks_workers_history"
+        assert error.sqlstate == "23001" and error.diag.constraint_name == "tasks_worker_versions_history"
         assert "never edited or deleted" in str(error)
     shown = ok(cli(lab, "workers", "show", "alpha"))
     assert shown["version"] == version and shown["body"] == "Do the alpha work."
@@ -477,7 +477,7 @@ def test_doctor_warns_while_an_earlier_release_serves_by_the_presence_lock_alone
         assert ("relies on a session lock retired on 2027-01-05; update tasks there before "
                 "then") in warning
         # The row a service of this release writes names the session holding it.
-        held.execute(f"""insert into {rows_} (project_id, holder, node, lock_pid, expires_at)
+        held.execute(f"""insert into {rows_} (agent_id, holder, node, lock_pid, expires_at)
                          values (%s, gen_random_uuid(), 'node-a', %s,
                                  now() + interval '3 minutes')""", (here, pid))
         assert "earlier tasks release" not in ok(cli(lab, "doctor")).get("warning", "")
@@ -485,11 +485,11 @@ def test_doctor_warns_while_an_earlier_release_serves_by_the_presence_lock_alone
         # not stand for the holder, and the node running a tasks service for the
         # project that no live row names is the machine.
         held.execute(f"update {rows_} set lock_pid = null")
-        held.execute(f"""create table {schema}.capabilities_service_instances
-                             (project_id text, capability text, node text, host text)""")
-        held.execute(f"""insert into {schema}.capabilities_service_instances
-                         values (%s, 'tasks', 'node-a', null), (%s, 'tasks', 'node-b', 'box-b'),
-                                (%s, 'memory', 'node-c', null)""", (here, here, here))
+        held.execute(f"""insert into {schema}.service_instances
+                             (agent_id, capability, node, host, state)
+                         values (%s, 'tasks', 'node-a', null, 'ready'),
+                                (%s, 'tasks', 'node-b', 'box-b', 'ready'),
+                                (%s, 'memory', 'node-c', null, 'ready')""", (here, here, here))
         warning = ok(cli(lab, "doctor"))["warning"]
         assert (f"an earlier tasks release still serves project {here} against this store, "
                 "on node node-b (host box-b): it holds the presence advisory lock") in warning

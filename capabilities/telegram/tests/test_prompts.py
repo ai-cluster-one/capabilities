@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The service's prompts as versions in `telegram_prompts`: a save is a new
+"""The service's prompts as versions in `telegram_prompt_versions`: a save is a new
 version and the earlier stays readable, the store keeps history immutable, and
 the service directory's files are imported and exported by key.
 
@@ -84,8 +84,8 @@ class PromptStoreCase(unittest.TestCase):
 
     def test_the_store_keeps_every_version_as_it_was_saved(self):
         row, _ = prompts.save(self.conn, self.project_id, "context", "kept", "a@n")
-        for sql in ("UPDATE telegram_prompts SET body = 'changed' WHERE id = %s::uuid",
-                    "DELETE FROM telegram_prompts WHERE id = %s::uuid"):
+        for sql in ("UPDATE telegram_prompt_versions SET body = 'changed' WHERE id = %s::uuid",
+                    "DELETE FROM telegram_prompt_versions WHERE id = %s::uuid"):
             with self.assertRaises(Exception):
                 self.conn.execute(sql, (row["id"],))
         self.assertEqual(prompts.active(self.conn, self.project_id, "context")["body"], "kept")

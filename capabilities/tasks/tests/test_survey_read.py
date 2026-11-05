@@ -469,7 +469,7 @@ def four_orders(seeded):
     for key, pickup in pickups.items():
         conn.execute(f"update {schema}.tasks_tasks set pickup_at = %s::timestamptz "
                      f"where unique_key = %s", (pickup, key))
-    conn.execute(f"update {schema}.tasks_tasks set pickup_at = null where project_id = %s",
+    conn.execute(f"update {schema}.tasks_tasks set pickup_at = null where agent_id = %s",
                  (THERE,))
     conn.execute(f"alter table {schema}.tasks_tasks enable trigger tasks_touch_updated_at")
     ids = {r[0]: str(r[1]) for r in conn.execute(

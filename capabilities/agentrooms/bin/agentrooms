@@ -2,10 +2,10 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.43,<1",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
-#     "callva-harness-runner==0.10.2",
+#     "callva-harness-runner==0.11.0",
 #     "pyyaml>=6",
 # ]
 # ///
@@ -622,7 +622,7 @@ SERVICE
   Each agent has one harness session per room, resumed on every turn through
   callva-harness-runner on the worker's profile. A profile name resolves to
   the project's version in the store, then the global one (the
-  harness_profiles table the harness library owns, which `tasks profiles`
+  harness_profile_versions table the harness library owns, which `tasks profiles`
   writes), then the library's shipped profiles, then the two this capability
   ships: agentrooms-claude (the default) and agentrooms-codex. A profile must
   fit a turn: free text out, claude's permission_mode bypassPermissions or

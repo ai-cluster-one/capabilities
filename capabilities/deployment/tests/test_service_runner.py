@@ -622,7 +622,7 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
 
     def seen() -> dict:
         return dict(rows("SELECT id, last_seen_at > now() - interval '1 minute' "
-                         "FROM capabilities_nodes WHERE last_seen_at IS NOT NULL"))
+                         "FROM nodes WHERE last_seen_at IS NOT NULL"))
 
     def until_seen(want: dict) -> None:
         deadline = time.monotonic() + 40
@@ -643,7 +643,7 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
         for node, root in roots.items():
             runners[node] = Runner(root, env, node, tmp_path / f"{node}.log")
         until_seen({"6d61632d6100": True, "626f782d6200": True})
-        rows("UPDATE capabilities_nodes SET last_seen_at = now() - interval '1 hour' "
+        rows("UPDATE nodes SET last_seen_at = now() - interval '1 hour' "
              "WHERE last_seen_at IS NOT NULL RETURNING id")
         until_seen({"6d61632d6100": True, "626f782d6200": True})
         for runner in runners.values():
@@ -658,7 +658,7 @@ def test_each_reconcile_reports_the_node_seen_and_a_node_seen_within_three_is_li
 
         # box-b falls silent: past three reconciles it no longer reads live.
         runners.pop("626f782d6200").stop()
-        rows("UPDATE capabilities_nodes SET last_seen_at = now() - interval '16 seconds' "
+        rows("UPDATE nodes SET last_seen_at = now() - interval '16 seconds' "
              "WHERE id = '626f782d6200' RETURNING id")
         nodes = {n["node"]: n for n in listed()["nodes"]}
         assert (nodes["626f782d6200"]["live"], nodes["6d61632d6100"]["live"]) == (False, True)
@@ -699,7 +699,7 @@ def _installed_fixture(env: dict[str, str], placement: str) -> None:
 
 INSTANCES = ("SELECT node, state, ready, problem, problem_code, pid, host, payload_sha256, "
              "last_exit_code, last_error, skipped_settings "
-             "FROM capabilities_service_instances WHERE project_id = '" + PROJECT_ID
+             "FROM service_instances WHERE agent_id = '" + PROJECT_ID
              + "' AND capability = 'fixture' ORDER BY node")
 
 

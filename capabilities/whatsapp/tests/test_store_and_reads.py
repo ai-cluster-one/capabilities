@@ -251,10 +251,13 @@ class StoreSchema(StoreCase):
                  JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname = current_schema()""").fetchall()
         # The profile table is the harness library's, made under its own ledger
-        # by `profiles import`, and shared by every capability that reads it.
+        # by `profiles import`, and shared by every capability that reads it;
+        # the store's core tables are the library's, migrated before any owner.
+        from capabilities_contract.db import _migrate
         platform = ("schema_ledger", "schema_version", "schema_channel", "harness_")
         names = sorted(r["relname"] for r in rows
-                       if not r["relname"].startswith(platform))
+                       if not r["relname"].startswith(platform)
+                       and not _migrate._core_name(r["relname"]))
         self.assertEqual([n for n in names if not n.startswith("whatsapp_")], [])
         self.assertTrue({"whatsapp_chats", "whatsapp_messages",
                          "whatsapp_identities", "whatsapp_meta",

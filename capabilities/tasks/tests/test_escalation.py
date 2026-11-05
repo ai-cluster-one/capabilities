@@ -384,7 +384,7 @@ def test_a_hold_under_the_ceiling_holds_and_writes_nothing(project, store, turns
     # The hold row joins its worker by id, as a raise does.
     [(hold, version)] = conn.execute(
         f"""select e.worker_id, w.id from {schema}.tasks_executions e
-              join {schema}.tasks_workers w on w.name = e.worker and w.active
+              join {schema}.tasks_worker_versions w on w.name = e.worker and w.active
              where e.metrics ? 'hold'""").fetchall()
     assert hold is not None and hold == version
 

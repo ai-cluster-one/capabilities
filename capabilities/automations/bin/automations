@@ -2,8 +2,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
-#     "callva-harness-runner==0.10.2",
+#     "capabilities-contract>=0.43,<1",
+#     "callva-harness-runner==0.11.0",
 # ]
 # ///
 """automations — project-local scheduler and subprocess runner.
@@ -20,10 +20,10 @@ Configuration:
   no file holds them: the [engine] settings and agents.default are rows of
   its `automations` settings document (`automations settings`), and each
   profile of [agents.workers] is a harness profile `automations-<name>` in
-  harness_profiles, at the agent's scope.
+  harness_profile_versions, at the agent's scope.
 
 Definitions:
-  An automation is a row of automations_definitions in the store the project
+  An automation is a row of automations_definition_versions in the store the project
   resolves (Run ledger), kept as versions: a change saves a new version and
   the old one stays as history, so a run names the exact version it ran and
   the version names who saved it. Its fields are: the slug that names it; a
@@ -380,7 +380,7 @@ Environment:
   under `retired` wherever it is still set, so it can be removed.
 
 Run ledger:
-  Definitions live in the table automations_definitions, and runs, the queue
+  Definitions live in the table automations_definition_versions, and runs, the queue
   and their history in automations_runs, of the PostgreSQL the shared
   capabilities-contract library resolves for the project: the AGENTKIT_DB_*
   keys in its .env.local / .env, then the same keys in the process
@@ -865,7 +865,7 @@ def _config_path(root: Path) -> Path:
 # --- the declaration of an agent whose settings are rows ----------------------
 # An agent whose records moved into the store keeps the scheduler's settings as
 # rows of its `automations` settings document and its agent profiles as harness
-# profiles named `automations-<name>` in `harness_profiles`, beside the ones
+# profiles named `automations-<name>` in `harness_profile_versions`, beside the ones
 # tasks and telegram keep there. `agents.default` stays a key of the settings
 # document: a profile row has no place for which profile is the default. No
 # file is read for either.
@@ -2297,7 +2297,7 @@ _MOVED_BY_MOVER = [["automations"], ["engine", "timezone"], ["agents", "workers"
 def _migrate_agent_profiles(action: str, root: Path, document: dict, differs: dict,
                             here: str) -> tuple[list, dict, list]:
     """`capabilities migrate`'s move of config.toml's `[agents.workers]` into
-    `harness_profiles`, one profile `automations-<name>` per declared worker at
+    `harness_profile_versions`, one profile `automations-<name>` per declared worker at
     the project's scope, each as the scheduler resolves it (a shipped profile's
     fields under a declared one of its name). A version the store holds
     differently is a question: `profiles.<name>` is `store` or `files`.

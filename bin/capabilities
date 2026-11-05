@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.43,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -131,7 +131,7 @@ THE PROJECT ENVELOPE
   capabilities` inside it (`.capabilities` names the legacy project-root
   envelope). Without that binding the envelope is
   <root>/<body_root>/capabilities, the body root the agent's row names
-  (capabilities_agents.body_root), and <root>/capabilities where it names
+  (agents.body_root), and <root>/capabilities where it names
   none, the project has no id or no store is configured for it. The row is
   read when the manager's envelope record holds no standing answer for the
   root; while the store does not answer, the last answer recorded for the
@@ -696,9 +696,9 @@ STORE VERBS
 VAULT VERBS
   Each agent has one encryption key, AGENT_ENCRYPTION_KEY (see ENVIRONMENT),
   and a vault of named secrets in its store that only that key opens: each a
-  row of capabilities_vault, sealed with XChaCha20-Poly1305, the agent id and
+  row of secrets, sealed with XChaCha20-Poly1305, the agent id and
   the name bound to it. The store keeps the fingerprint of the agent's key on
-  its row of capabilities_agents, never the key, and beside it the agent's
+  its row of agents, never the key, and beside it the agent's
   public sealing key (vault_public_key), the X25519 public key the key gives,
   so another writer seals a value only the agent's key opens - a shared
   connection's secret for each agent granted it - without holding the key;
@@ -862,7 +862,7 @@ POLICY VERBS
         active records backend. Files mode maps those scopes to
         capabilities/settings.json and $XDG_CONFIG_HOME/capabilities/settings.json;
         store mode to this project's row, stamped with its verified id, and the
-        global row of capabilities_policy, which applies to every project
+        global row of policies, which applies to every project
         reading that store, each for every node, or with --node for that one
         node (its id, as `node id` answers it on that machine). Outside any
         project --global writes that global row, not the
@@ -965,7 +965,7 @@ POLICY VERBS
         stderr too, that it placed nothing, naming the agent's nodes. It also
         answers modes {node: mode}, each placed node's mode, and served_by
         [{node, mode, acquired_at, renewed_at, expires_at, live}]: the
-        service lease of each node, capabilities_service_leases, naming which
+        service lease of each node, service_leases, naming which
         mode's service serves the agent there. Every service that serves an
         agent on a node - its own service, or the node's machine service -
         takes and renews that lease every reconcile, for three reconciles,
@@ -1019,7 +1019,7 @@ PROJECT VERBS (run inside a consuming project)
         input, project_id_exists); a refusal writes nothing. Run once in
         each clone of a repository: the id is not committed. When a
         database resolves for the project, its agent row is registered in
-        capabilities_agents (the result's `agent`: registered, store_not_configured, or the store's
+        agents (the result's `agent`: registered, store_not_configured, or the store's
         error, which never fails init), and the row of this node (its id,
         `node id`) among its nodes is given the folder as its
         `folder` where it records none and no other agent's row holds that
@@ -1073,7 +1073,7 @@ PROJECT VERBS (run inside a consuming project)
   init --system [--name <name>] [--claude] [--codex] [--with-layers]
         Init, with the agent made a system agent: one an app keeps on this
         machine for itself, whose identity and doctrine the app fixes
-        (capabilities_agents.kind `system`). A new folder is a new agent made
+        (agents.kind `system`). A new folder is a new agent made
         one; a folder bound to an existing agent has that agent marked one in
         place, its id, grants, settings and slug kept - one way: a system
         agent stays one. It lives on this node alone, linked as its master
@@ -1119,7 +1119,7 @@ PROJECT VERBS (run inside a consuming project)
         git, init, hooks, build}.
   relabel <slug>
         Give this project a new slug, keeping its id: the slug is its agent's
-        row in the store (capabilities_agents.slug, unique there: exit 6
+        row in the store (agents.slug, unique there: exit 6
         slug_taken), registered first where it is not, and an older
         capabilities/project.json that still names one is kept saying the
         same. Without a database the slug is written to that project.json,
@@ -1129,7 +1129,7 @@ PROJECT VERBS (run inside a consuming project)
         Answers {ok, project, id, slug, previous_slug, identity (where it was
         written), unchanged}. Idempotent.
   agent show [--icon-out PATH]
-        This project's row in the agent registry (capabilities_agents in the
+        This project's row in the agent registry (agents in the
         project's store, keyed by the project id): {ok, project,
         agent_id, registered, agent, store {level, schema}}, where agent is
         null until the agent is registered, else {id, slug, kind (agent or
@@ -1311,10 +1311,10 @@ PROJECT VERBS (run inside a consuming project)
         [{node, label, kind, address, is_master, may_write, target,
         last_seen_at, coolify_connection, coolify_server, coolify_resource,
         public_key, folder, disabled_at}], store}. A node is a row of the node
-        registry (capabilities_nodes): node is its id, the key every store
+        registry (nodes): node is its id, the key every store
         row naming the node holds, and label the name it is shown by.
         is_master, may_write and folder belong to the agent's link to it
-        (capabilities_agent_nodes): folder is the folder the agent lives in
+        (agent_nodes): folder is the folder the agent lives in
         on that node, null where it is not recorded. disabled_at is when the
         node was disabled (`node disable`), null for a node in service.
   node id [--set <id>]
@@ -1508,9 +1508,9 @@ PROJECT VERBS (run inside a consuming project)
         library's hint, and node run says so once in its log.
   node state
         What each of this agent's nodes last said of itself, as its row of
-        capabilities_node_states holds it, one row per machine shared by
+        node_states holds it, one row per machine shared by
         every agent on it, with this agent's own sign-ins there from
-        capabilities_node_logins: {ok, project, agent_id, nodes [{node,
+        node_logins: {ok, project, agent_id, nodes [{node,
         label, disabled_at, reachable, cannot_read_store, load_1, load_5, load_15, cpu_count,
         memory_used_bytes, memory_limit_bytes, disk_used_bytes,
         disk_total_bytes, booted_at, uptime_seconds, boot_line,
@@ -1581,11 +1581,11 @@ PROJECT VERBS (run inside a consuming project)
         updates (`node update --check`), null until it has: available, when
         (checked_at) and offer {components [{kind, name, installed,
         available, entries}], errors}; last_run is its latest update run
-        (capabilities_node_updates) {id, node, state, requested_at,
+        (node_updates) {id, node, state, requested_at,
         requested_by, started_at, finished_at, reason, versions_before,
         versions_after, doctors}, null where it has none. logs is what this
         agent's processes on that node last printed
-        (capabilities_node_logs), one entry per source: manager, the node's
+        (node_logs), one entry per source: manager, the node's
         manager (`node run`) where this agent's folder runs it, and each
         service the agent places there, its supervisor's lines with what
         the service wrote to stderr; lines are oldest first, each with the
@@ -1603,12 +1603,12 @@ PROJECT VERBS (run inside a consuming project)
         contract_library), name, installed, available, entries}, entries
         the change-log entries newer than installed (`changelog`); a source
         that cannot be asked is listed under errors. It writes that onto
-        this node's row of capabilities_node_states (update_available,
+        this node's row of node_states (update_available,
         update_offer, update_checked_at), which its regular state write
         leaves alone, and updates nothing: {ok, project, agent_id, node,
         update_available, offer {components, errors}, checked_at, store}.
         --node <node>, one of this agent's nodes by id or label: asks that
-        node to update, a requested row of capabilities_node_updates its
+        node to update, a requested row of node_updates its
         `node run` takes up within seconds: {ok, project, agent_id, node,
         requested {id, state, requested_at, requested_by, ...}, store}; exit
         6 update_pending while one is requested or running for that node,
@@ -1668,8 +1668,8 @@ PROJECT VERBS (run inside a consuming project)
         connection's live session, is expected for this agent on one of its
         nodes, by id or label: on and off stand over what the placed
         services need, and default takes the word back. It is kept in the
-        store (capabilities_node_login_expectations and
-        capabilities_node_session_expectations), goes with the node, and no
+        store (node_login_expectations and
+        node_session_expectations), goes with the node, and no
         node's report replaces it. Answers {ok, project, agent_id, node,
         kind, tool | capability and connection, override, before, changed,
         store}, override and before each true, false or null. Exit 6
@@ -1754,10 +1754,10 @@ PROJECT VERBS (run inside a consuming project)
         again every 60 seconds; a write that fails
         is said once on stderr and changes nothing else. With the state it
         writes its own last lines as this folder's agent's manager log
-        (capabilities_node_logs, `node state` logs), once a line came since
+        (node_logs, `node state` logs), once a line came since
         the last write, and drops the lines of each service no longer placed
         here for an agent it serves. It never updates
-        unasked: a requested row of capabilities_node_updates for this node,
+        unasked: a requested row of node_updates for this node,
         seen within seconds on its channel and on each reconcile, runs
         `node update` as a child of its own session beside the loop, which
         goes on writing the state; it checks for updates (`node update
@@ -1773,7 +1773,7 @@ PROJECT VERBS (run inside a consuming project)
         command (a shared placement of a service declaring no machine command
         included), quarantined, a machine service outside --services, or its
         agent's folder not bound to it - is named once on stderr and keeps
-        this node's row in capabilities_service_instances, unusable, its
+        this node's row in service_instances, unusable, its
         problem saying why and its code service_not_runnable, quarantined,
         not_carried or agent_folder_unbound; the row goes once it runs or is
         no longer placed here, and when node run stops. Exit 6 supervisor_required,
@@ -1882,19 +1882,19 @@ PROJECT VERBS (run inside a consuming project)
         checking, so it takes over once the lease expires or is released.
         With no database resolvable no lease can be taken, and it runs as the
         gate says. Placed, it also takes or renews the agent's service lease
-        on this node as its own service (capabilities_service_leases, mode
+        on this node as its own service (service_leases, mode
         own); while the node's machine service of <name> holds it live for
         the agent (mode shared), it runs nothing, leaves that service's leases
         and instance row alone, and checks again every reconcile. Each
         reconcile it also reports this node seen (`node
         seen`); a report that fails is said once on stderr and changes nothing
         else. While the service is placed here it keeps this node's row in
-        capabilities_service_instances: its state - starting, ready, unusable,
+        service_instances: its state - starting, ready, unusable,
         degraded, failing, held, waiting or stopping - with the problem and
         its code, the payload, pid, host and start time of the running
         process, the last failure's exit code, stderr tail and time, and the
         settings skipped on this node, and, beside it, its own last lines and
-        what the service wrote to stderr in capabilities_node_logs (`node
+        what the service wrote to stderr in node_logs (`node
         state` logs), which stay when it stops. Whether a running service can do its
         work is its declared doctor's answer (service.deploy.doctor), asked
         10 seconds after it starts and then every reconcile, for at most 30
@@ -1956,7 +1956,7 @@ PROJECT VERBS (run inside a consuming project)
         project; the node defaults to this one. start places the service on
         the node (as `place --node`: an exclusive one leaves every other
         node in the same write) and waits up to S seconds (default 120, 0 to
-        3600) for that node's row in capabilities_service_instances: it
+        3600) for that node's row in service_instances: it
         answers {started, node, placement, changed, placed_on, ready, state,
         instance, waited_seconds, unplaced_from?} once the row is ready or
         degraded, and exits 6 service_<state> (unusable, held, failing,
@@ -2145,7 +2145,7 @@ PROJECT VERBS (run inside a consuming project)
              | save <name> <ref> --from FILE|- [--base ID] [--note TEXT]
              | retire <name> <ref> | import [<name>...] | export [<name>...]
         This project's references in its store: every capability's, in one
-        versioned table, capabilities_references, keyed by project,
+        versioned table, reference_versions, keyed by project,
         capability and name. A reference the store holds is what `<name>
         refs` and `<name> context show|edit|put` read and write, before any
         file of its key; one it does not hold is read from
@@ -2223,7 +2223,7 @@ PROJECT VERBS (run inside a consuming project)
         a project at "connections": "store" keeps only its connections and
         grants in the store, and its identifiers and policy in files, until
         this verb runs again. Every identity the project uses becomes a row
-        of capabilities_connections: each one its envelope declares, and an
+        of connections: each one its envelope declares, and an
         identity of the config home only where the capability is enabled for
         the project and the project may use that identity or points its
         default at it. One the config home merely offers stays out of the
@@ -2232,7 +2232,7 @@ PROJECT VERBS (run inside a consuming project)
         store mode writes it with `set <name> connection <id> <spec>` and
         `set <name> grant <id> '{"enabled": true}'`. Every row written that
         the project may use, switched off itself, or points its default at
-        gets a grant for every node in capabilities_connection_grants,
+        gets a grant for every node in grants,
         stamped with the project id (verified, as any write that stamps it),
         carrying the decision its files resolve to (a field no scope decided
         stays null). Rows already in the store are never removed.
@@ -2242,7 +2242,7 @@ PROJECT VERBS (run inside a consuming project)
         nothing; one that differs, or a grant of this project the files do
         not have, refuses the whole import (exit 6 import_conflict) and
         writes nothing. Each scope's identifiers and policy entries become
-        rows of capabilities_identifiers and capabilities_policy, the
+        rows of identifiers and policies, the
         envelope's under the project id and the config home's as global rows
         (agent_id null, for every project reading the store), and the store
         must resolve this project's identifiers and gate as its files do, each
@@ -2467,7 +2467,7 @@ VERIFICATION VERBS
         (node_id_in_environment), as `node id` does; it is not drift. A
         store-mode project whose store cannot be used is drift. In store mode `information` lists, never
         as drift, each agent_id holding grants in the store that the agent
-        registry (capabilities_agents) does not know (grant_agent_unknown), or
+        registry (agents) does not know (grant_agent_unknown), or
         that the registry is not in the store (agents_registry_absent).
         It also lists, never as drift, each program an installed capability
         declares in its manifest's `programs` that is neither on PATH nor in
@@ -2738,8 +2738,8 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # newest major; when a newer one lands there, the last commit of the older
 # major is kept as branch STORE_LINE_REF, and a major is crossed only by
 # STORE_UPGRADE_COMMAND.
-STORE_MAJOR = 1
-STORE_LIBRARY: str | None = ">=0.42,<0.43"
+STORE_MAJOR = 2
+STORE_LIBRARY: str | None = None
 STORE_CANONICAL_REF = "main"
 STORE_LINE_REF = "store-major-{major}"
 STORE_UPGRADE_COMMAND = "capabilities store upgrade"
@@ -2934,7 +2934,7 @@ def _global_records(root: Path | None = None):
     they are in force for the database `root` resolves (None: this machine's),
     else the config home's files."""
     store = _store_module()
-    return store.global_records(_CONFIG_HOME, root, application_name=store.STORE_OWNER)
+    return store.global_records(_CONFIG_HOME, root, application_name=store.STORE_APPLICATION)
 
 
 def _global_kept(adapter) -> str:
@@ -3299,14 +3299,14 @@ def _row_body_root(root: Path, agent_id: str) -> str | None:
             return "."
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     try:
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError:
         return None
     import psycopg
     try:
         conn.read_only = True
-        row = conn.execute("SELECT to_jsonb(a) -> 'body_root' FROM capabilities_agents a "
+        row = conn.execute("SELECT to_jsonb(a) -> 'body_root' FROM agents a "
                            "WHERE id = %s", (agent_id,)).fetchone()
     except psycopg.errors.UndefinedTable:
         return "."
@@ -5560,7 +5560,7 @@ def _store_major_here() -> dict:
     # whose major this asks.
     try:
         setting = db.resolve_setting(_project_root())
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True, connect_timeout=store._PROBE_TIMEOUT)
         schema = setting.schema
     except db.DbError as exc:
@@ -7581,12 +7581,12 @@ DEV_DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENT
                "AGENTKIT_DB_TRANSACTION_POOLER")
 # The tables a `dev run` projects an attached project's rows of one capability
 # through, each with the column naming the capability.
-DEV_PROJECTED_TABLES = (("capabilities_policy", "capability"),
-                        ("capabilities_connections", "capability"),
-                        ("capabilities_connection_grants", "capability"),
-                        ("capabilities_identifiers", "capability"),
-                        ("capabilities_settings", "capability"),
-                        ("capabilities_settings_documents", "capability"))
+DEV_PROJECTED_TABLES = (("policies", "capability"),
+                        ("connections", "capability"),
+                        ("grants", "capability"),
+                        ("identifiers", "capability"),
+                        ("settings", "capability"),
+                        ("settings_documents", "capability"))
 
 
 def _dev_schema(session: dict) -> str:
@@ -7731,7 +7731,7 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
     store = _store_module()
     real = setting.schema
     session_setting = dataclasses.replace(setting, schema=schema)
-    conn = db.connect(application_name=store.STORE_OWNER, setting=session_setting,
+    conn = db.connect(application_name=store.STORE_APPLICATION, setting=session_setting,
                       transaction=True)
     counts: dict = {}
     try:
@@ -7757,31 +7757,31 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
                                         names, sql.Identifier(real), sql.Identifier(table))
                                 + condition, params).rowcount
         with conn.transaction():
-            counts["capabilities_agents"] = copy(
-                "capabilities_agents", sql.SQL("id = %s"), (agent_id,))
+            counts["agents"] = copy(
+                "agents", sql.SQL("id = %s"), (agent_id,))
             # The agent's nodes before its links to them. A machine's store
             # from before the node registry keeps a node's fields on its links.
-            nodes_of = sql.SQL("id IN (SELECT node FROM {}.capabilities_agent_nodes "
+            nodes_of = sql.SQL("id IN (SELECT node FROM {}.agent_nodes "
                                "WHERE agent_id = %s)").format(sql.Identifier(real))
-            if columns("capabilities_nodes", real):
-                counts["capabilities_nodes"] = copy("capabilities_nodes", nodes_of,
+            if columns("nodes", real):
+                counts["nodes"] = copy("nodes", nodes_of,
                                                     (agent_id,))
             else:
-                conn.execute(sql.SQL("DELETE FROM {}.capabilities_nodes WHERE ").format(
+                conn.execute(sql.SQL("DELETE FROM {}.nodes WHERE ").format(
                     sql.Identifier(schema)) + nodes_of, (agent_id,))
-                counts["capabilities_nodes"] = conn.execute(sql.SQL(
-                    "INSERT INTO {}.capabilities_nodes (id, label, kind) SELECT DISTINCT ON "
-                    "(node) node, node, kind FROM {}.capabilities_agent_nodes WHERE agent_id "
+                counts["nodes"] = conn.execute(sql.SQL(
+                    "INSERT INTO {}.nodes (id, label, kind) SELECT DISTINCT ON "
+                    "(node) node, node, kind FROM {}.agent_nodes WHERE agent_id "
                     "= %s ORDER BY node").format(sql.Identifier(schema), sql.Identifier(real)),
                     (agent_id,)).rowcount
-            counts["capabilities_agent_nodes"] = copy(
-                "capabilities_agent_nodes", sql.SQL("agent_id = %s"), (agent_id,))
-            conn.execute(sql.SQL("UPDATE {}.capabilities_global SET global_migrated_at = "
-                                 "(SELECT global_migrated_at FROM {}.capabilities_global "
+            counts["agent_nodes"] = copy(
+                "agent_nodes", sql.SQL("agent_id = %s"), (agent_id,))
+            conn.execute(sql.SQL("UPDATE {}.store_state SET global_migrated_at = "
+                                 "(SELECT global_migrated_at FROM {}.store_state "
                                  "LIMIT 1)").format(sql.Identifier(schema),
                                                     sql.Identifier(real)))
             for table, column in DEV_PROJECTED_TABLES:
-                by_agent = table != "capabilities_connections"
+                by_agent = table != "connections"
                 condition = sql.SQL("{} = %s").format(sql.Identifier(column))
                 params: tuple = (capability,)
                 if by_agent:
@@ -8468,7 +8468,7 @@ def _dev_live_copy_register(source: str, target: str, project_id: str,
             return None
         table = sql.Identifier(DEV_LIVE_REGISTER_TABLE)
         names = sql.SQL(", ").join(sql.Identifier(c) for c in shared)
-        scope = sql.SQL(" WHERE project_id = %s AND connection = %s")
+        scope = sql.SQL(" WHERE agent_id = %s AND connection = %s")
         with conn.transaction():
             conn.execute(sql.SQL("DELETE FROM {}.{}").format(sql.Identifier(target), table)
                          + scope, (project_id, connection))
@@ -9835,7 +9835,7 @@ def _default_project_slug(root: Path) -> str:
     return slug or "project"
 
 
-# An agent's slug as the store keeps it (capabilities_agents.slug).
+# An agent's slug as the store keeps it (agents.slug).
 AGENT_SLUG_RE = re.compile(r"[a-z0-9-]+")
 # Letters NFKD leaves no ASCII for, by their usual Latin spelling.
 _SLUG_LETTERS = str.maketrans({
@@ -9880,7 +9880,7 @@ def _settle_agent_slug(conn, agent_id: str, root: Path, carried: str | None = No
     slug of an agent with no name whose folder does not name it. Answers what
     the row holds."""
     import psycopg
-    row = conn.execute("SELECT slug, name FROM capabilities_agents WHERE id = %s FOR UPDATE",
+    row = conn.execute("SELECT slug, name FROM agents WHERE id = %s FOR UPDATE",
                        (agent_id,)).fetchone()
     if row is None:
         return {"slug": None, "set": False, "reason": "agent_unregistered"}
@@ -9905,9 +9905,9 @@ def _settle_agent_slug(conn, agent_id: str, root: Path, carried: str | None = No
                 # System agents on different nodes may share a slug, which no
                 # ordinary agent shares with any agent.
                 done = conn.execute(
-                    "UPDATE capabilities_agents a SET slug = %s, updated_at = now() "
+                    "UPDATE agents a SET slug = %s, updated_at = now() "
                     "WHERE id = %s AND slug IS NULL AND NOT EXISTS (SELECT 1 FROM "
-                    "capabilities_agents o WHERE o.slug = %s AND o.id <> a.id "
+                    "agents o WHERE o.slug = %s AND o.id <> a.id "
                     "AND (o.kind = 'agent' OR a.kind = 'agent'))",
                     (candidate, agent_id, candidate)).rowcount
         except psycopg.errors.UniqueViolation:
@@ -9920,7 +9920,7 @@ def _settle_agent_slug(conn, agent_id: str, root: Path, carried: str | None = No
 def cmd_relabel(slug: str) -> None:
     """Give this project a new slug, keeping its id.
 
-    The slug is the agent's row's in the store (capabilities_agents.slug), and
+    The slug is the agent's row's in the store (agents.slug), and
     an older project.json that still names one is kept saying the same. Records
     were never scoped by the slug, and the directory on disk was never the slug
     either, so renaming the directory remains a thing that needs no command at
@@ -9964,10 +9964,10 @@ def cmd_relabel(slug: str) -> None:
         try:
             with conn.transaction():
                 _ensure_agent_row(conn, project_id)
-                row = conn.execute("SELECT slug FROM capabilities_agents WHERE id = %s "
+                row = conn.execute("SELECT slug FROM agents WHERE id = %s "
                                    "FOR UPDATE", (project_id,)).fetchone()
                 was = row[0] or was
-                conn.execute("UPDATE capabilities_agents SET slug = %s, updated_at = now() "
+                conn.execute("UPDATE agents SET slug = %s, updated_at = now() "
                              "WHERE id = %s AND slug IS DISTINCT FROM %s",
                              (slug, project_id, slug))
         except psycopg.errors.UniqueViolation:
@@ -10001,11 +10001,11 @@ AGENT_TEXT_FIELDS = {"--name": "name", "--description": "description",
 ONBOARDING_STATUSES = ("pending", "complete")
 # Where agents share the slug asked for - system agents on different nodes - the
 # one linked to this node (the query's last parameter) comes first.
-AGENT_HERE_FIRST = ("EXISTS (SELECT 1 FROM capabilities_agent_nodes h "
+AGENT_HERE_FIRST = ("EXISTS (SELECT 1 FROM agent_nodes h "
                     "WHERE h.agent_id = a.id AND h.node = %s) DESC")
-# A node is a row of the node registry (capabilities_nodes), keyed by its id
+# A node is a row of the node registry (nodes), keyed by its id
 # and shown by its label; which agent lives on it is a link
-# (capabilities_agent_nodes) holding what belongs to the pair - the folder the
+# (agent_nodes) holding what belongs to the pair - the folder the
 # agent lives in there, whether the node is the agent's master and whether it
 # may write rows of its own. A node created as a Coolify resource names the
 # coolify connection, the server and the resource it was created with, all
@@ -10021,7 +10021,7 @@ NODE_COLUMNS = ("node", "label", "kind", "address", "is_master", "may_write", "t
 NODE_SELECT = ("SELECT l.node, n.label, n.kind, n.address, l.is_master, l.may_write, "
                "n.target, n.last_seen_at, n.coolify_connection, n.coolify_server, "
                "n.coolify_resource, n.public_key, l.folder, n.disabled_at "
-               "FROM capabilities_agent_nodes l JOIN capabilities_nodes n ON n.id = l.node ")
+               "FROM agent_nodes l JOIN nodes n ON n.id = l.node ")
 # What a migration reads of a node, on a store at any version: it reads them
 # before the store is brought to this code's version, and a store from before
 # the node registry keeps a node's fields on its link, its name standing as id
@@ -10035,21 +10035,22 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 def _kernel_open(root: Path, placement: bool = False):
     """(connection, setting) for the project's store with the contract's tables
-    migrated, and with `placement` the manager's own steps after them, or the
-    store's refusal. The caller closes the connection."""
+    migrated - the core's, the manager's placement columns and leases among
+    them, whatever `placement` says - or the store's refusal. The caller
+    closes the connection."""
     db = _db_module()
     store = _store_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     import psycopg
     try:
         major, minor = store.STORE_TABLES_VERSION
-        db.migrate(conn, store.STORE_OWNER, store.record_table_steps()
-                   + (PLACEMENT_STEPS if placement else []), major=major, minor=minor)
+        db.migrate(conn, store.STORE_OWNER, store.record_table_steps(), major=major,
+                   minor=minor)
     except db.DbError as exc:
         conn.close()
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
@@ -10514,7 +10515,7 @@ def _seal_folders(root: Path) -> list[tuple[str, Path]]:
     linked: list = []
     if here is not None:
         def read(conn, _agent_id):
-            return conn.execute("SELECT agent_id, folder FROM capabilities_agent_nodes "
+            return conn.execute("SELECT agent_id, folder FROM agent_nodes "
                                 "WHERE node = %s ORDER BY agent_id", (here,)).fetchall()
         linked, _setting = _kernel_run(root, read)
     folders = [(own, root)]
@@ -10890,7 +10891,7 @@ def _agent_row(conn, agent_id: str) -> dict | None:
     stamp = _store_module()._stamp
     row = conn.execute(
         f"SELECT {', '.join(AGENT_COLUMNS)}, octet_length(icon) "
-        "FROM capabilities_agents WHERE id = %s", (agent_id,)).fetchone()
+        "FROM agents WHERE id = %s", (agent_id,)).fetchone()
     if row is None:
         return None
     agent = dict(zip(AGENT_COLUMNS, row[:-1]))
@@ -10910,7 +10911,7 @@ def _system_agent_refusal(verb: str, agent_id: str) -> NoReturn:
 
 def _refuse_system_agent(conn, agent_id: str, verb: str) -> None:
     """Refuse `verb` inside the caller's connection where `agent_id` is a
-    system agent (capabilities_agents.kind)."""
+    system agent (agents.kind)."""
     if _store_module().agent_kind(conn, agent_id) == "system":
         _system_agent_refusal(verb, agent_id)
 
@@ -10926,7 +10927,7 @@ def _is_system_agent(root: Path) -> bool:
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError:
         return False
@@ -10949,7 +10950,7 @@ def _system_agent_gate(root: Path, verb: str) -> None:
 def _ensure_agent_row(conn, agent_id: str) -> bool:
     """Register the agent with its id alone where it is not yet registered;
     True when this call registered it."""
-    cur = conn.execute("INSERT INTO capabilities_agents (id) VALUES (%s) "
+    cur = conn.execute("INSERT INTO agents (id) VALUES (%s) "
                        "ON CONFLICT (id) DO NOTHING", (agent_id,))
     return cur.rowcount == 1
 
@@ -10980,13 +10981,13 @@ def _agent_registered(root: Path, agent_id: str) -> bool:
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError:
         return True
     import psycopg
     try:
-        return conn.execute("SELECT 1 FROM capabilities_agents WHERE id = %s",
+        return conn.execute("SELECT 1 FROM agents WHERE id = %s",
                             (agent_id,)).fetchone() is not None
     except psycopg.errors.UndefinedTable:
         return False
@@ -11013,14 +11014,14 @@ def _store_agent_id(root: Path, agent_id: str | None) -> str | None:
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError:
         return agent_id
     import psycopg
     try:
         held = {row[0] for row in conn.execute(
-            "SELECT id FROM capabilities_agents WHERE id IN (%s, %s)",
+            "SELECT id FROM agents WHERE id IN (%s, %s)",
             (agent_id, old.group(1))).fetchall()}
     except psycopg.Error:
         return agent_id
@@ -11038,7 +11039,7 @@ def _preflight_new_agent(root: Path) -> None:
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         hint = ("a new agent keeps its records in the store: configure it with "
@@ -11082,7 +11083,7 @@ def _register_agent_on_init(root: Path, new_agent: bool = False,
         return {"registered": False, "error": _db_error(exc)}
     import psycopg
     try:
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         return {"registered": False, "error": _db_error(exc)}
@@ -11110,22 +11111,22 @@ def _register_agent_on_init(root: Path, new_agent: bool = False,
                     if refused:
                         raise _SystemRefused(refused)
                 if new_agent and node:
-                    conn.execute("UPDATE capabilities_agents SET migrated_at = now(), updated_at = now() "
+                    conn.execute("UPDATE agents SET migrated_at = now(), updated_at = now() "
                                  "WHERE id = %s AND migrated_at IS NULL AND migrating_since IS NULL", (agent_id,))
-                    if not conn.execute("SELECT 1 FROM capabilities_agent_nodes "
+                    if not conn.execute("SELECT 1 FROM agent_nodes "
                                         "WHERE agent_id = %s AND is_master", (agent_id,)).fetchone():
                         _ensure_node_row(conn, here)
-                        conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, "
+                        conn.execute("INSERT INTO agent_nodes (agent_id, node, "
                                      "is_master) VALUES (%s, %s, true) "
                                      "ON CONFLICT (agent_id, node) DO NOTHING", (agent_id, node))
                 if node:
                     # This node's row records the folder the agent lives in here,
                     # where it records none yet (or the agent is adopted into this
                     # one) and no other agent holds the folder.
-                    conn.execute("UPDATE capabilities_agent_nodes SET folder = %s "
+                    conn.execute("UPDATE agent_nodes SET folder = %s "
                                  "WHERE agent_id = %s AND node = %s "
                                  "AND (folder IS NULL OR %s) "
-                                 "AND NOT EXISTS (SELECT 1 FROM capabilities_agent_nodes "
+                                 "AND NOT EXISTS (SELECT 1 FROM agent_nodes "
                                  "WHERE node = %s AND folder = %s AND agent_id <> %s)",
                                  (folder, agent_id, node, adopted, node, folder, agent_id))
                 # A folder bound to an agent the store already held - a node's
@@ -11168,7 +11169,7 @@ def _node_system_agent(root: Path, name: str | None) -> str | None:
     try:
         node = store.this_node()["id"]
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True)
     except (db.DbError, store.StoreError):
         return None
@@ -11178,7 +11179,7 @@ def _node_system_agent(root: Path, name: str | None) -> str | None:
         db.migrate(conn, store.STORE_OWNER, store.record_table_steps(),
                    major=major, minor=minor)
         held = conn.execute(
-            "SELECT a.id, a.name FROM capabilities_agent_nodes l JOIN capabilities_agents a "
+            "SELECT a.id, a.name FROM agent_nodes l JOIN agents a "
             "ON a.id = l.agent_id WHERE l.node = %s AND a.kind = 'system' ORDER BY a.id",
             (node,)).fetchone()
     except (db.DbError, psycopg.Error):
@@ -11197,7 +11198,7 @@ def _make_system_agent(conn, agent_id: str, here: dict, name: str | None) -> dic
     already keeps its name. Answers the refusal, or None."""
     import psycopg
     node = here["id"]
-    row = conn.execute("SELECT to_jsonb(a) ->> 'kind', name FROM capabilities_agents a "
+    row = conn.execute("SELECT to_jsonb(a) ->> 'kind', name FROM agents a "
                        "WHERE id = %s FOR UPDATE", (agent_id,)).fetchone()
     if row[0] == "system":
         if name is not None and name != row[1]:
@@ -11208,7 +11209,7 @@ def _make_system_agent(conn, agent_id: str, here: dict, name: str | None) -> dic
                             "the name it has"}
         return None
     nodes = [r[0] for r in conn.execute(
-        "SELECT node FROM capabilities_agent_nodes WHERE agent_id = %s ORDER BY node",
+        "SELECT node FROM agent_nodes WHERE agent_id = %s ORDER BY node",
         (agent_id,)).fetchall()]
     if nodes and nodes != [node]:
         return {"exit": 6, "code": "system_agent_nodes",
@@ -11217,7 +11218,7 @@ def _make_system_agent(conn, agent_id: str, here: dict, name: str | None) -> dic
                 "hint": "run `capabilities init --system` on the agent's own node, or "
                         "remove its other nodes first"}
     held = conn.execute(
-        "SELECT l.agent_id FROM capabilities_agent_nodes l JOIN capabilities_agents a "
+        "SELECT l.agent_id FROM agent_nodes l JOIN agents a "
         "ON a.id = l.agent_id WHERE l.node = %s AND a.kind = 'system' AND l.agent_id <> %s",
         (node, agent_id)).fetchone()
     if held:
@@ -11227,11 +11228,11 @@ def _make_system_agent(conn, agent_id: str, here: dict, name: str | None) -> dic
                 "hint": "work in that agent's folder, or run this there"}
     if not nodes:
         _ensure_node_row(conn, here)
-        conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, is_master) "
+        conn.execute("INSERT INTO agent_nodes (agent_id, node, is_master) "
                      "VALUES (%s, %s, true)", (agent_id, node))
     try:
         with conn.transaction():
-            conn.execute("UPDATE capabilities_agents SET kind = 'system', "
+            conn.execute("UPDATE agents SET kind = 'system', "
                          "name = coalesce(%s, name), updated_at = now() WHERE id = %s",
                          (name, agent_id))
     except (psycopg.errors.CheckViolation, psycopg.errors.UniqueViolation) as exc:
@@ -11303,7 +11304,7 @@ def cmd_agent(args: list[str]) -> None:
             agent = _agent_row(conn, agent_id)
             icon = None
             if "--icon-out" in opts:
-                found = conn.execute("SELECT icon FROM capabilities_agents WHERE id = %s",
+                found = conn.execute("SELECT icon FROM agents WHERE id = %s",
                                      (agent_id,)).fetchone()
                 icon = bytes(found[0]) if found and found[0] is not None else None
             return agent_id, agent, icon
@@ -11395,7 +11396,7 @@ def _agent_list() -> dict:
     import psycopg
     try:
         ids = [row[0] for row in conn.execute(
-            "SELECT id FROM capabilities_agents ORDER BY slug NULLS LAST, name NULLS LAST, id")]
+            "SELECT id FROM agents ORDER BY slug NULLS LAST, name NULLS LAST, id")]
         agents = []
         for agent_id in ids:
             agent = _agent_row(conn, agent_id)
@@ -11423,7 +11424,7 @@ def _agent_state(ref: str) -> dict:
     try:
         # System agents on different nodes may share a slug: this node's is meant.
         found = conn.execute(
-            "SELECT id FROM capabilities_agents a WHERE id = %s OR slug = %s "
+            "SELECT id FROM agents a WHERE id = %s OR slug = %s "
             f"ORDER BY id = %s DESC, {AGENT_HERE_FIRST}", (ref, ref, ref, here)).fetchall()
         if not found:
             _die(6, "agent_unknown",
@@ -11434,11 +11435,11 @@ def _agent_state(ref: str) -> dict:
         nodes = _node_rows(conn, agent_id)
         ago = dict(conn.execute(
             "SELECT l.node, round(extract(epoch FROM now() - n.last_seen_at))::int "
-            "FROM capabilities_agent_nodes l JOIN capabilities_nodes n ON n.id = l.node "
+            "FROM agent_nodes l JOIN nodes n ON n.id = l.node "
             "WHERE l.agent_id = %s", (agent_id,)).fetchall())
         policy = conn.execute(
             "SELECT agent_id IS NOT NULL, capability, node, enabled, service "
-            "FROM capabilities_policy WHERE agent_id = %s OR agent_id IS NULL",
+            "FROM policies WHERE agent_id = %s OR agent_id IS NULL",
             (agent_id,)).fetchall()
         leases = []
         # deployment's table, written by its runner, keyed by the project id.
@@ -11446,7 +11447,7 @@ def _agent_state(ref: str) -> dict:
                         ).fetchone()[0] is not None:
             leases = conn.execute(
                 "SELECT node, capability, acquired_at, renewed_at, expires_at "
-                "FROM deployment_service_leases WHERE project = %s AND expires_at > now() "
+                "FROM deployment_service_leases WHERE agent_id = %s AND expires_at > now() "
                 "ORDER BY capability", (agent_id,)).fetchall()
     except psycopg.Error as exc:
         _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
@@ -11641,7 +11642,7 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
     import psycopg
     try:
         found = conn.execute(
-            "SELECT id FROM capabilities_agents WHERE id = %s OR slug = %s",
+            "SELECT id FROM agents WHERE id = %s OR slug = %s",
             (ref, ref)).fetchall()
         if not found:
             _die(6, "agent_unknown",
@@ -11658,14 +11659,14 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
                  "choose another folder")
         with conn.transaction():
             held = conn.execute(
-                "SELECT agent_id FROM capabilities_agent_nodes WHERE node = %s AND folder = %s "
+                "SELECT agent_id FROM agent_nodes WHERE node = %s AND folder = %s "
                 "AND agent_id <> %s", (node, str(folder), agent_id)).fetchone()
             if held:
                 _die(6, "folder_bound",
                      f"{folder} is the folder of agent {held[0]} on node {node}",
                      "choose another folder")
             row = conn.execute(
-                "SELECT folder FROM capabilities_agent_nodes WHERE agent_id = %s AND node = %s "
+                "SELECT folder FROM agent_nodes WHERE agent_id = %s AND node = %s "
                 "FOR UPDATE", (agent_id, node)).fetchone()
             node_before = row
             elsewhere = row[0] if row and row[0] and row[0] != str(folder) else None
@@ -11676,10 +11677,10 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
                      f"(its .env.local's {PROJECT_ID_ENV}) and run this again")
             made = _ensure_node_row(conn, here)
             cur = conn.execute(
-                "INSERT INTO capabilities_agent_nodes (agent_id, node, folder) "
+                "INSERT INTO agent_nodes (agent_id, node, folder) "
                 "VALUES (%s, %s, %s) ON CONFLICT (agent_id, node) DO UPDATE "
                 "SET folder = EXCLUDED.folder "
-                "WHERE capabilities_agent_nodes.folder IS DISTINCT FROM EXCLUDED.folder",
+                "WHERE agent_nodes.folder IS DISTINCT FROM EXCLUDED.folder",
                 (agent_id, node, str(folder)))
             node_changed = cur.rowcount == 1 or made
             node_row = _node_rows(conn, agent_id, node)[0]
@@ -11739,11 +11740,11 @@ def _unmaterialize(folder: Path, agent_id: str, node: str, node_before,
     try:
         with conn.transaction():
             if node_before is None:
-                conn.execute("DELETE FROM capabilities_agent_nodes "
+                conn.execute("DELETE FROM agent_nodes "
                              "WHERE agent_id = %s AND node = %s", (agent_id, node))
                 _drop_unlinked_node(conn, node)
             else:
-                conn.execute("UPDATE capabilities_agent_nodes SET folder = %s "
+                conn.execute("UPDATE agent_nodes SET folder = %s "
                              "WHERE agent_id = %s AND node = %s",
                              (node_before[0], agent_id, node))
     except psycopg.Error:
@@ -11774,7 +11775,7 @@ def _convert_preflight_store(root: Path, agent_id: str) -> dict:
         _die(6 if exc.slug == "store_not_configured" else _store_error_exit(exc),
              exc.slug, exc.message, hint)
     try:
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
@@ -11782,7 +11783,7 @@ def _convert_preflight_store(root: Path, agent_id: str) -> dict:
     try:
         conn.read_only = True
         row = conn.execute("SELECT to_jsonb(a) - 'icon', icon IS NOT NULL "
-                           "FROM capabilities_agents a WHERE id = %s", (agent_id,)).fetchone()
+                           "FROM agents a WHERE id = %s", (agent_id,)).fetchone()
     except psycopg.errors.UndefinedTable:
         row = None
     except psycopg.Error as exc:
@@ -11911,7 +11912,7 @@ def _agent_fill(root: Path, values: dict) -> dict:
             assignments.append(f"{column} = CASE WHEN {held} THEN %s ELSE {column} END")
             params.append(value)
         if assignments:
-            conn.execute(f"UPDATE capabilities_agents SET {', '.join(assignments)}, "
+            conn.execute(f"UPDATE agents SET {', '.join(assignments)}, "
                          "updated_at = now() WHERE id = %s", (*params, agent_id))
         return _agent_row(conn, agent_id)
 
@@ -12245,7 +12246,7 @@ def _agent_set(root: Path, values: dict) -> dict:
         columns = list(values)
         assignments = ", ".join(f"{c} = %s" for c in columns)
         cur = conn.execute(
-            f"UPDATE capabilities_agents SET {assignments}, updated_at = now() "
+            f"UPDATE agents SET {assignments}, updated_at = now() "
             f"WHERE id = %s AND ({', '.join(columns)}) IS DISTINCT FROM "
             f"({', '.join(['%s'] * len(columns))})",
             (*values.values(), agent_id, *values.values()))
@@ -12482,13 +12483,13 @@ def _agent_rekey(root: Path, given: str | None, dry_run: bool) -> dict:
     schema = setting.schema
     import psycopg
     try:
-        held = conn.execute("SELECT 1 FROM capabilities_agents WHERE id = %s",
+        held = conn.execute("SELECT 1 FROM agents WHERE id = %s",
                             (old,)).fetchone() is not None
         if not held:
             # The store moved already, from another node: what is left here
             # is this folder's binding, for an agent that lists this node.
             if given is None or not conn.execute(
-                    "SELECT 1 FROM capabilities_agent_nodes WHERE agent_id = %s AND node = %s",
+                    "SELECT 1 FROM agent_nodes WHERE agent_id = %s AND node = %s",
                     (given, node_name)).fetchone():
                 _die(6, "agent_unknown",
                      f"the store ({setting.level}, schema {schema}) holds no agent {old!r}",
@@ -12660,7 +12661,7 @@ def _node_values(opts: dict) -> dict:
 
 def _refuse_second_master(conn, agent_id: str, node: str) -> None:
     held = conn.execute(
-        "SELECT node FROM capabilities_agent_nodes WHERE agent_id = %s AND is_master "
+        "SELECT node FROM agent_nodes WHERE agent_id = %s AND is_master "
         "AND node <> %s FOR UPDATE", (agent_id, node)).fetchone()
     if held is not None:
         raise _KernelRefusal(
@@ -12695,15 +12696,15 @@ def _ensure_node_row(conn, node: dict, kind: str | None = None) -> bool:
     there keeps its label and fields. Answers whether it made one."""
     kind = kind or ("mac" if sys.platform == "darwin" else "server")
     return conn.execute(
-        "INSERT INTO capabilities_nodes (id, label, kind) VALUES (%s, %s, %s) "
+        "INSERT INTO nodes (id, label, kind) VALUES (%s, %s, %s) "
         "ON CONFLICT (id) DO NOTHING", (node["id"], node.get("label") or node["id"],
                                         kind)).rowcount > 0
 
 
 def _drop_unlinked_node(conn, node: str) -> None:
     """Remove a node's registry row once no agent lives on it."""
-    conn.execute("DELETE FROM capabilities_nodes WHERE id = %s AND NOT EXISTS "
-                 "(SELECT 1 FROM capabilities_agent_nodes WHERE node = %s)", (node, node))
+    conn.execute("DELETE FROM nodes WHERE id = %s AND NOT EXISTS "
+                 "(SELECT 1 FROM agent_nodes WHERE node = %s)", (node, node))
 
 
 def _node_id_or(default: str | None) -> str | None:
@@ -12722,7 +12723,7 @@ class _KernelRefusal(Exception):
 
 
 # Every column of the store that names a node by its id, apart from the
-# links (capabilities_agent_nodes), which follow the registry's id through
+# links (agent_nodes), which follow the registry's id through
 # their foreign key: `node rekey` moves each in one transaction. `prefix` is a
 # column holding `<node>:<more>`, of which only the node part moves; `foreign
 # key` is a column that, as the links do, follows the registry's id by its
@@ -12735,24 +12736,24 @@ NODE_REFERENCES = (
     ("agentrooms_sessions", "node", "whole"),
     ("agentrooms_turns", "node", "whole"),
     ("askproject_sessions", "host", "whole"),
-    ("automations_definitions", "node", "whole"),
+    ("automations_definition_versions", "node", "whole"),
     ("automations_runs", "node", "whole"),
     ("automations_runs", "environment", "whole"),
-    ("capabilities_connection_grants", "node", "whole"),
-    ("capabilities_identifiers", "node", "whole"),
-    ("capabilities_node_login_expectations", "node", "foreign key"),
-    ("capabilities_node_logins", "node", "foreign key"),
-    ("capabilities_node_logs", "node", "foreign key"),
-    ("capabilities_node_session_expectations", "node", "foreign key"),
-    ("capabilities_node_sessions", "node", "foreign key"),
-    ("capabilities_node_states", "node", "foreign key"),
-    ("capabilities_node_updates", "node", "foreign key"),
-    ("capabilities_policy", "node", "whole"),
-    ("capabilities_service_instances", "node", "whole"),
-    ("capabilities_service_leases", "node", "whole"),
-    ("capabilities_settings", "node", "whole"),
-    ("capabilities_settings_changes", "node", "whole"),
-    ("capabilities_settings_documents", "node", "whole"),
+    ("grants", "node", "whole"),
+    ("identifiers", "node", "whole"),
+    ("node_login_expectations", "node", "foreign key"),
+    ("node_logins", "node", "foreign key"),
+    ("node_logs", "node", "foreign key"),
+    ("node_session_expectations", "node", "foreign key"),
+    ("node_sessions", "node", "foreign key"),
+    ("node_states", "node", "foreign key"),
+    ("node_updates", "node", "foreign key"),
+    ("policies", "node", "whole"),
+    ("service_instances", "node", "whole"),
+    ("service_leases", "node", "whole"),
+    ("settings", "node", "whole"),
+    ("settings_changes", "node", "whole"),
+    ("settings_documents", "node", "whole"),
     ("deployment_service_leases", "node", "whole"),
     ("memory_entries", "node", "whole"),
     ("memory_events", "node", "whole"),
@@ -12818,7 +12819,7 @@ def _announce(root: Path, channel: str, scope: str) -> bool:
     reconcile; what it announces has already been written."""
     db = _db_module()
     try:
-        conn = db.connect(application_name=_store_module().STORE_OWNER,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION,
                           setting=db.resolve_setting(root), transaction=True)
     except db.DbError:
         return False
@@ -12993,9 +12994,9 @@ def _node_launcher_text(job: dict, manager: str) -> str:
 # ---------------------------------------------------------------- node state
 #
 # Each node writes what it says of itself into the store, one row per machine
-# (capabilities_node_states), and per agent whether its tools are signed in
-# here (capabilities_node_logins) and whether each device-bound connection
-# holds a live session here (capabilities_node_sessions): `node
+# (node_states), and per agent whether its tools are signed in
+# here (node_logins) and whether each device-bound connection
+# holds a live session here (node_sessions): `node
 # state report` once, `node run` on its own beat. The row stands for the node
 # for the contract's NODE_STATE_FRESH_SECONDS; after that it reads unreachable.
 # The tools' sign-ins and the sessions are each tool's and capability's own
@@ -13393,7 +13394,7 @@ def _node_state_logins(store, logins: list[dict], node: str) -> dict:
 class _NodeLogTail:
     """The last lines a node process - `node run`, or one service's `node
     supervise` with what its service writes to stderr - printed, each with
-    the time it was said, for its row of capabilities_node_logs: `take`
+    the time it was said, for its row of node_logs: `take`
     answers them only where a line came since the last take, and `again` asks
     for them once more after a write that failed. The store tier bounds and
     masks what it keeps."""
@@ -13447,7 +13448,7 @@ class _NodeManager:
         self.said: dict[str, object] = {}
         self.changed: set[str] = set()
         # The placed services this node will not run, by (agent, capability),
-        # whose rows in capabilities_service_instances this process wrote.
+        # whose rows in service_instances this process wrote.
         self.unrun: dict[tuple[str, str], tuple[str, str]] = {}
         self.unrun_now: dict[tuple[str, str], tuple[str, str]] = {}
         # This node's state, written on its own beat and right after a
@@ -13506,7 +13507,7 @@ class _NodeManager:
         db = self.db
         if self.setting is None:
             self.setting = db.resolve_setting(self.root)
-        conn = db.connect(application_name=self.store.STORE_OWNER, setting=self.setting,
+        conn = db.connect(application_name=self.store.STORE_APPLICATION, setting=self.setting,
                           transaction=True)
         try:
             with conn.transaction():
@@ -13538,16 +13539,16 @@ class _NodeManager:
         try:
             with conn.transaction():
                 agents = conn.execute(
-                    "SELECT l.agent_id, l.folder, a.slug FROM capabilities_agent_nodes l "
-                    "LEFT JOIN capabilities_agents a ON a.id = l.agent_id "
+                    "SELECT l.agent_id, l.folder, a.slug FROM agent_nodes l "
+                    "LEFT JOIN agents a ON a.id = l.agent_id "
                     "WHERE l.node = %s ORDER BY l.agent_id", (self.here,)).fetchall()
                 placed = conn.execute(
-                    "SELECT p.agent_id, p.capability, p.mode FROM capabilities_policy p "
-                    "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
+                    "SELECT p.agent_id, p.capability, p.mode FROM policies p "
+                    "JOIN agent_nodes l ON l.agent_id = p.agent_id "
                     "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
                     "ORDER BY p.agent_id, p.capability", (self.here,)).fetchall()
                 disabled = conn.execute(
-                    "UPDATE capabilities_nodes SET last_seen_at = now() "
+                    "UPDATE nodes SET last_seen_at = now() "
                     "WHERE id = %s RETURNING disabled_at IS NOT NULL",
                     (self.here,)).fetchone()
         except Exception as exc:
@@ -13642,7 +13643,7 @@ class _NodeManager:
         return jobs
 
     def record_unrun(self, unrun: dict[tuple[str, str], tuple[str, str]]) -> None:
-        """Keep a row in capabilities_service_instances for each placed
+        """Keep a row in service_instances for each placed
         service this node will not run, unusable with why, and drop the row
         this process wrote for one it now runs or that is no longer placed
         here, before its job starts and writes its own."""
@@ -13790,10 +13791,10 @@ class _NodeManager:
         fresh = [key for key in keys if key not in seen]
         try:
             if fresh:
-                base = db.Follower(fresh, application_name=self.store.STORE_OWNER,
+                base = db.Follower(fresh, application_name=self.store.STORE_APPLICATION,
                                    setting=self.setting).read()
                 seen.update(base)
-            self.follower = db.Follower(keys, application_name=self.store.STORE_OWNER,
+            self.follower = db.Follower(keys, application_name=self.store.STORE_APPLICATION,
                                         setting=self.setting, seen=seen)
             self.follow_keys = keys
         except Exception as exc:
@@ -13953,7 +13954,7 @@ class _NodeManager:
         try:
             with conn.transaction():
                 asked = conn.execute(
-                    "SELECT 1 FROM capabilities_node_updates WHERE node = %s "
+                    "SELECT 1 FROM node_updates WHERE node = %s "
                     "AND state = 'requested'", (self.here,)).fetchone() is not None
         except Exception as exc:
             self.say_once("update_request", type(exc).__name__,
@@ -13978,7 +13979,7 @@ class _NodeManager:
             with conn.transaction():
                 found = conn.execute(
                     "SELECT extract(epoch FROM now() - update_checked_at) "
-                    "FROM capabilities_node_states WHERE node = %s", (self.here,)).fetchone()
+                    "FROM node_states WHERE node = %s", (self.here,)).fetchone()
         except Exception:
             return None
         finally:
@@ -14011,7 +14012,7 @@ class _NodeManager:
             err.close()
         self.update_kind = kind
         if kind == "update":
-            self.say("updates this node, as a row of capabilities_node_updates asks")
+            self.say("updates this node, as a row of node_updates asks")
 
     def reap_update(self) -> tuple[str, int] | None:
         """(kind, exit code) of the `node update` child that ended since the
@@ -14736,10 +14737,10 @@ def _node_install(args: list[str]) -> None:
 
     def read(conn, agent_id):
         return agent_id, conn.execute(
-            "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
+            "SELECT agent_id, folder FROM agent_nodes WHERE node = %s "
             "ORDER BY agent_id", (here,)).fetchall(), conn.execute(
-            "SELECT p.agent_id, p.capability, p.mode FROM capabilities_policy p "
-            "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
+            "SELECT p.agent_id, p.capability, p.mode FROM policies p "
+            "JOIN agent_nodes l ON l.agent_id = p.agent_id "
             "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
             "ORDER BY p.agent_id, p.capability", (here,)).fetchall()
 
@@ -14915,7 +14916,7 @@ SUPERVISE_UNLOCKED = object()
 # writes the lease's last_error any more; the column stays, since a released
 # manager still on another node, and that runner, name it.
 SUPERVISE_LEASE_OWNER = "deployment"
-SUPERVISE_LEASE_VERSION = (1, 1)
+SUPERVISE_LEASE_VERSION = (2, 0)
 SUPERVISE_LEASE_STEPS = [
     ("0001-service-leases",
      "CREATE TABLE deployment_service_leases ("
@@ -14939,6 +14940,19 @@ SUPERVISE_LEASE_STEPS = [
      " could not be started; cleared when another node takes the lease';"
      " COMMENT ON COLUMN deployment_service_leases.last_error_at IS"
      " 'when the service last failed on the holding node'"),
+    # The store names an agent where it named a project: deployment's third
+    # step, byte for byte, and its major 2.
+    ("0003-agent-names",
+     "ALTER TABLE deployment_service_leases RENAME COLUMN project TO agent_id;"
+     " DO $$ BEGIN"
+     " IF EXISTS (SELECT 1 FROM pg_constraint"
+     " WHERE conrelid = 'deployment_service_leases'::regclass"
+     " AND conname = 'deployment_service_leases_project_not_null') THEN"
+     " ALTER TABLE deployment_service_leases RENAME CONSTRAINT"
+     " deployment_service_leases_project_not_null"
+     " TO deployment_service_leases_agent_id_not_null;"
+     " END IF;"
+     " END $$"),
 ]
 SUPERVISE_STORE_SETTING_SLUGS = frozenset({
     "store_not_configured", "store_not_postgres", "store_setting_unreadable",
@@ -15084,7 +15098,7 @@ class _SuperviseStore:
                      else "unreachable")
             raise _SuperviseProblem(state, exc.slug, exc.message) from None
         try:
-            conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+            conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                               transaction=True)
         except db.DbError as exc:
             raise _SuperviseProblem("unreachable", exc.slug, exc.message) from None
@@ -15170,9 +15184,9 @@ class _SuperviseLease(_SuperviseStore):
         def work(conn):
             row = conn.execute(
                 "INSERT INTO deployment_service_leases AS l "
-                "(project, capability, node, expires_at) "
+                "(agent_id, capability, node, expires_at) "
                 "VALUES (%s, %s, %s, now() + %s * interval '1 second') "
-                "ON CONFLICT (project, capability) DO UPDATE "
+                "ON CONFLICT (agent_id, capability) DO UPDATE "
                 "SET node = EXCLUDED.node, expires_at = EXCLUDED.expires_at, "
                 "renewed_at = now(), acquired_at = CASE WHEN l.node = EXCLUDED.node "
                 "THEN l.acquired_at ELSE now() END, "
@@ -15187,7 +15201,7 @@ class _SuperviseLease(_SuperviseStore):
                 row = conn.execute(
                     "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
                     "last_exit, last_error_at "
-                    "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                    "FROM deployment_service_leases WHERE agent_id = %s AND capability = %s",
                     (self.project, capability)).fetchone()
             return self._holding(row, self.node)
         found = self._run(work)
@@ -15206,12 +15220,12 @@ class _SuperviseLease(_SuperviseStore):
         def work(conn):
             gone = conn.execute(
                 "DELETE FROM deployment_service_leases "
-                "WHERE project = %s AND capability = %s AND node = %s",
+                "WHERE agent_id = %s AND capability = %s AND node = %s",
                 (self.project, capability, self.node)).rowcount
             row = conn.execute(
                 "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now(), "
                 "last_exit, last_error_at "
-                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                "FROM deployment_service_leases WHERE agent_id = %s AND capability = %s",
                 (self.project, capability)).fetchone()
             found = self._holding(row, self.node)
             found["released"] = bool(gone)
@@ -15235,7 +15249,7 @@ class _SuperviseLease(_SuperviseStore):
         def work(conn):
             done = conn.execute(
                 "UPDATE deployment_service_leases SET last_exit = %s, last_error_at = now() "
-                "WHERE project = %s AND capability = %s AND node = %s",
+                "WHERE agent_id = %s AND capability = %s AND node = %s",
                 (code, self.project, capability, self.node)).rowcount
             return {"recorded": bool(done)}
         return self._run(work)
@@ -15247,7 +15261,7 @@ class _SuperviseLease(_SuperviseStore):
 
 class _SuperviseNodeLease(_SuperviseStore):
     """Which service serves one agent's capability on this node, in the
-    store's `capabilities_service_leases`: a row per (agent, capability, node)
+    store's `service_leases`: a row per (agent, capability, node)
     naming the mode of the service that holds it - the agent's own service, or
     the node's one machine service of the capability - and when that hold
     expires. The holder renews it every reconcile; a service of the other mode
@@ -15286,10 +15300,10 @@ class _SuperviseNodeLease(_SuperviseStore):
 
         def work(conn):
             row = conn.execute(
-                "INSERT INTO capabilities_service_leases AS l "
-                "(project_id, capability, node, mode, expires_at) "
+                "INSERT INTO service_leases AS l "
+                "(agent_id, capability, node, mode, expires_at) "
                 "VALUES (%s, %s, %s, %s, now() + %s * interval '1 second') "
-                "ON CONFLICT (project_id, capability, node) DO UPDATE "
+                "ON CONFLICT (agent_id, capability, node) DO UPDATE "
                 "SET mode = EXCLUDED.mode, expires_at = EXCLUDED.expires_at, "
                 "renewed_at = now(), acquired_at = CASE WHEN l.mode = EXCLUDED.mode "
                 "THEN l.acquired_at ELSE now() END "
@@ -15299,7 +15313,7 @@ class _SuperviseNodeLease(_SuperviseStore):
             if row is None:
                 row = conn.execute(
                     "SELECT mode, acquired_at, renewed_at, expires_at, expires_at > now() "
-                    "FROM capabilities_service_leases WHERE project_id = %s "
+                    "FROM service_leases WHERE agent_id = %s "
                     "AND capability = %s AND node = %s",
                     (self.project, capability, self.node)).fetchone()
             return self._holding(row, self.mode)
@@ -15321,7 +15335,7 @@ class _SuperviseNodeLease(_SuperviseStore):
 
         def work(conn):
             gone = conn.execute(
-                "DELETE FROM capabilities_service_leases WHERE project_id = %s "
+                "DELETE FROM service_leases WHERE agent_id = %s "
                 "AND capability = %s AND node = %s AND mode = %s",
                 (self.project, capability, self.node, self.mode)).rowcount
             return {"state": "free", "released": bool(gone)}
@@ -15340,7 +15354,7 @@ class _SuperviseNodeLease(_SuperviseStore):
 
 class _SuperviseInstance(_SuperviseStore):
     """This node's row of what it runs of one service, in the store's
-    `capabilities_service_instances`, which the contract's ledger owns:
+    `service_instances`, which the contract's ledger owns:
     written on every start, reconcile and exit, and deleted once the
     supervisor no longer supervises the service here. `maybe_written` is
     whether a row may stand: unknown at first, since a supervisor killed
@@ -15370,7 +15384,7 @@ class _SuperviseInstance(_SuperviseStore):
 
     def log(self, capability: str, lines: list[str]) -> dict:
         """Replace this service's last lines on this node in
-        capabilities_node_logs, which outlive the supervisor: the node's
+        node_logs, which outlive the supervisor: the node's
         manager drops them once the service is no longer placed here."""
         def work(conn):
             secrets = _setting_secrets(self.setting) if self.setting is not None else ()
@@ -15650,7 +15664,7 @@ class _Supervisor:
             disabled = answer["records"] == "store" and any(
                 found for (found,) in records._read(
                     "SELECT to_jsonb(n) ->> 'disabled_at' IS NOT NULL "
-                    "FROM capabilities_nodes n WHERE n.id = %s", (node,)))
+                    "FROM nodes n WHERE n.id = %s", (node,)))
         except store.StoreError as exc:
             answer["error"] = {"code": exc.slug, "message": exc.message}
             answer["reason"] = f"the gate cannot be read: {exc.message}"
@@ -16207,9 +16221,9 @@ class _SupervisePlacement(_SuperviseStore):
     def placed(self, capability: str) -> dict:
         def work(conn):
             rows = conn.execute(
-                "SELECT l.agent_id, l.folder, p.mode, a.slug FROM capabilities_policy p "
-                "JOIN capabilities_agent_nodes l ON l.agent_id = p.agent_id "
-                "AND l.node = p.node LEFT JOIN capabilities_agents a ON a.id = p.agent_id "
+                "SELECT l.agent_id, l.folder, p.mode, a.slug FROM policies p "
+                "JOIN agent_nodes l ON l.agent_id = p.agent_id "
+                "AND l.node = p.node LEFT JOIN agents a ON a.id = p.agent_id "
                 "WHERE p.node = %s AND p.capability = %s "
                 "AND p.enabled AND p.service ORDER BY l.agent_id",
                 (self.node, capability)).fetchall()
@@ -16747,16 +16761,16 @@ def _node_supervise(args: list[str]) -> None:
 
 def _instance_rows(conn, agent_id: str, capability: str | None = None) -> list[dict]:
     """The rows of what each node runs of this agent's services
-    (capabilities_service_instances), with how long ago each was checked; none
+    (service_instances), with how long ago each was checked; none
     on a store that predates the table."""
     stamp = _store_module()._stamp
-    if conn.execute("SELECT to_regclass('capabilities_service_instances')"
+    if conn.execute("SELECT to_regclass('service_instances')"
                     ).fetchone()[0] is None:
         return []
     rows = conn.execute(
         f"SELECT capability, {', '.join(INSTANCE_COLUMNS)}, "
         "round(extract(epoch FROM now() - checked_at))::int "
-        "FROM capabilities_service_instances WHERE project_id = %s "
+        "FROM service_instances WHERE agent_id = %s "
         "AND (%s::text IS NULL OR capability = %s) ORDER BY capability, node",
         (agent_id, capability, capability)).fetchall()
     out = []
@@ -16843,7 +16857,7 @@ def _nodes_beside_a_server(root: Path) -> tuple[dict, list[dict]] | None:
     def read(conn, agent_id):
         nodes = [{k: row[k] for k in ("node", "label", "kind")}
                  for row in _node_rows(conn, agent_id)]
-        own = conn.execute("SELECT label, kind FROM capabilities_nodes WHERE id = %s",
+        own = conn.execute("SELECT label, kind FROM nodes WHERE id = %s",
                            (here,)).fetchone()
         return nodes, own
 
@@ -16986,7 +17000,7 @@ def _service_status(args: list[str]) -> None:
         agent_id = own_id
         if ref:
             found = conn.execute(
-                "SELECT id FROM capabilities_agents a WHERE id = %s OR slug = %s "
+                "SELECT id FROM agents a WHERE id = %s OR slug = %s "
                 f"ORDER BY id = %s DESC, {AGENT_HERE_FIRST}",
                 (ref, ref, ref, here)).fetchone()
             if found is None:
@@ -16995,7 +17009,7 @@ def _service_status(args: list[str]) -> None:
                                      "holds")
             agent_id = found[0]
         placed = conn.execute(
-            "SELECT capability, node FROM capabilities_policy WHERE agent_id = %s "
+            "SELECT capability, node FROM policies WHERE agent_id = %s "
             "AND node IS NOT NULL AND enabled AND service "
             "AND (%s::text IS NULL OR capability = %s) ORDER BY capability, node",
             (agent_id, name, name)).fetchall()
@@ -17134,15 +17148,15 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         here = _this_node()["id"]
 
         def links(conn, agent_id):
-            if not conn.execute("SELECT 1 FROM capabilities_agent_nodes WHERE agent_id = %s "
+            if not conn.execute("SELECT 1 FROM agent_nodes WHERE agent_id = %s "
                                 "AND node = %s", (agent_id, here)).fetchone():
                 raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {here}",
                                      f"register it with `capabilities node add {here} "
                                      "--label <label> --kind mac|server`")
             return agent_id, conn.execute(
-                "SELECT agent_id, folder FROM capabilities_agent_nodes WHERE node = %s "
+                "SELECT agent_id, folder FROM agent_nodes WHERE node = %s "
                 "ORDER BY agent_id", (here,)).fetchall(), conn.execute(
-                "SELECT agent_id, capability FROM capabilities_policy WHERE node = %s "
+                "SELECT agent_id, capability FROM policies WHERE node = %s "
                 "AND enabled AND service ORDER BY agent_id, capability", (here,)).fetchall()
         try:
             (agent_id, linked, placed), _setting = _kernel_run(root, links)
@@ -17185,17 +17199,19 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         runs = {r["node"]: r for r in store.node_updates(conn, ids)}
         logs = store.node_logs(conn, agent_id, ids)
         placed = conn.execute(
-            "SELECT node, capability FROM capabilities_policy WHERE agent_id = %s "
+            "SELECT node, capability FROM policies WHERE agent_id = %s "
             "AND node = ANY (%s) AND enabled AND service", (agent_id, ids)).fetchall()
         major, since = _store_major_since(
             conn, conn.execute("SELECT current_schema()").fetchone()[0])
+        created = _nodes_created(conn, ids)
         out = []
         for node in nodes:
             state = states.get(node["node"]) or dict.fromkeys(
                 ("node", *store.NODE_STATE_COLUMNS, *store.NODE_UPDATE_OFFER_COLUMNS,
                  "uptime_seconds"))
             state = {**state, **_node_state_logins(store, logins, node["node"])}
-            unread = _node_store_unread(node, state, major, since)
+            unread = _node_store_unread(node, state, major, since,
+                                        created.get(node["node"]))
             entry = {"node": node["node"], "label": node["label"],
                      "disabled_at": node["disabled_at"],
                      "reachable": bool(state.pop("reachable", False)) and unread is None,
@@ -17277,7 +17293,7 @@ def _node_expect_verb(root: Path, args: list[str]) -> None:
 # A node never updates unasked. Its manager checks on a cadence what is newer
 # - a manager release, a capability payload, the contract library a
 # capability's environment holds - and writes that onto the node's state row;
-# an update runs only for a row of capabilities_node_updates that asks for it,
+# an update runs only for a row of node_updates that asks for it,
 # or when `node update` is run on the node itself. A run updates the manager
 # and every installed capability, asks the doctor of every service placed
 # here, and where a step or a doctor fails returns the node to what it ran
@@ -17532,9 +17548,9 @@ def _node_update_placed(root: Path, here: str) -> tuple[dict[str, Path], list[tu
     """(the folders here bound to the agents the store links to this node,
     the (agent, capability, mode) of each service those agents place here)."""
     def read(conn, _agent_id):
-        return (conn.execute("SELECT agent_id, folder FROM capabilities_agent_nodes "
+        return (conn.execute("SELECT agent_id, folder FROM agent_nodes "
                              "WHERE node = %s ORDER BY agent_id", (here,)).fetchall(),
-                conn.execute("SELECT agent_id, capability, mode FROM capabilities_policy "
+                conn.execute("SELECT agent_id, capability, mode FROM policies "
                              "WHERE node = %s AND enabled AND service "
                              "ORDER BY agent_id, capability", (here,)).fetchall())
     (linked, placed), _setting = _kernel_run(root, read, placement=True)
@@ -17664,7 +17680,7 @@ def _node_update_check_write(root: Path, here: str) -> dict:
 def _node_update_linked(root: Path, here: str) -> str:
     """The agent id, where the store links it to this node; else exit 6."""
     def linked(conn, agent_id):
-        if not conn.execute("SELECT 1 FROM capabilities_agent_nodes WHERE agent_id = %s "
+        if not conn.execute("SELECT 1 FROM agent_nodes WHERE agent_id = %s "
                             "AND node = %s", (agent_id, here)).fetchone():
             raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {here}",
                                  f"register it with `capabilities node add {here} "
@@ -17700,7 +17716,8 @@ def _node_update_verb(root: Path, args: list[str]) -> None:
             # requested; a node merely not running takes it up when it starts.
             state = (store.node_states(conn, [node]) or [{}])[0]
             unread = _node_store_unread(row, state, *_store_major_since(
-                conn, conn.execute("SELECT current_schema()").fetchone()[0]))
+                conn, conn.execute("SELECT current_schema()").fetchone()[0]),
+                _nodes_created(conn, [node]).get(node))
             if unread is not None:
                 raise _KernelRefusal("node_cannot_read_store",
                                      f"node {node} cannot take the request: "
@@ -17845,7 +17862,8 @@ def _agent_node_project_slug(root: Path) -> str | None:
     slug = None
     if ident:
         try:
-            conn, _schema = store._store_connect(root, store.STORE_OWNER, store._PROBE_TIMEOUT)
+            conn, _schema = store._store_connect(root, store.STORE_APPLICATION,
+                                                 store._PROBE_TIMEOUT)
         except store.StoreError as exc:
             if exc.slug != "store_not_configured" and legacy is None:
                 raise
@@ -19154,7 +19172,7 @@ def _node_login_confirmed(root, node, tool):
     agent_id = _folder_agent_id(root)
     said = {"sign_in": None, "account": None, "checked_at": None}
     try:
-        conn = db.connect(application_name=store.STORE_OWNER,
+        conn = db.connect(application_name=store.STORE_APPLICATION,
                           setting=db.resolve_setting(root), transaction=True)
     except Exception:
         return said
@@ -19800,8 +19818,8 @@ def cmd_node(args: list[str]) -> None:
 
         def seen(conn, agent_id):
             _node_major_gate(conn)
-            if conn.execute("UPDATE capabilities_nodes SET last_seen_at = now() "
-                            "WHERE id = %s AND EXISTS (SELECT 1 FROM capabilities_agent_nodes "
+            if conn.execute("UPDATE nodes SET last_seen_at = now() "
+                            "WHERE id = %s AND EXISTS (SELECT 1 FROM agent_nodes "
                             "WHERE agent_id = %s AND node = %s)",
                             (here, agent_id, here)).rowcount == 0:
                 raise _KernelRefusal("node_unknown", f"agent {agent_id} has no node {here}",
@@ -19837,7 +19855,7 @@ def cmd_node(args: list[str]) -> None:
                 raise _KernelRefusal("node_exists",
                                      f"agent {agent_id} already has node {node}",
                                      f"change it with `capabilities node set {node}`")
-            known = conn.execute("SELECT 1 FROM capabilities_nodes WHERE id = %s FOR UPDATE",
+            known = conn.execute("SELECT 1 FROM nodes WHERE id = %s FOR UPDATE",
                                  (node,)).fetchone() is not None
             if not known:
                 # A machine's id, or the name a machine that predates ids - a
@@ -19866,7 +19884,7 @@ def cmd_node(args: list[str]) -> None:
                 _refuse_partial_coolify(node_values)
                 columns = ["id", *node_values]
                 conn.execute(
-                    f"INSERT INTO capabilities_nodes ({', '.join(columns)}) "
+                    f"INSERT INTO nodes ({', '.join(columns)}) "
                     f"VALUES ({', '.join(['%s'] * len(columns))})",
                     (node, *node_values.values()))
             elif node_values:
@@ -19875,14 +19893,14 @@ def cmd_node(args: list[str]) -> None:
                 _refuse_second_master(conn, agent_id, node)
             columns = ["agent_id", "node", *link_values]
             conn.execute(
-                f"INSERT INTO capabilities_agent_nodes ({', '.join(columns)}) "
+                f"INSERT INTO agent_nodes ({', '.join(columns)}) "
                 f"VALUES ({', '.join(['%s'] * len(columns))})",
                 (agent_id, node, *link_values.values()))
             return agent_id, _node_rows(conn, agent_id, node)[0], True
         node = _node_ref(conn, agent_id, ref)
         before = _node_rows(conn, agent_id, node)
         if sub == "remove":
-            conn.execute("DELETE FROM capabilities_agent_nodes "
+            conn.execute("DELETE FROM agent_nodes "
                          "WHERE agent_id = %s AND node = %s", (agent_id, node))
             _drop_unlinked_node(conn, node)
             return agent_id, before[0], True
@@ -19892,7 +19910,7 @@ def cmd_node(args: list[str]) -> None:
             _node_update(conn, node, node_values)
         if link_values:
             assignments = ", ".join(f"{c} = %s" for c in link_values)
-            conn.execute(f"UPDATE capabilities_agent_nodes SET {assignments} "
+            conn.execute(f"UPDATE agent_nodes SET {assignments} "
                          "WHERE agent_id = %s AND node = %s",
                          (*link_values.values(), agent_id, node))
         after = _node_rows(conn, agent_id, node)[0]
@@ -19925,7 +19943,7 @@ def _node_disable_verb(root: Path, sub: str, args: list[str]) -> None:
     def work(conn, agent_id):
         node = _node_ref(conn, agent_id, ref)
         changed = conn.execute(
-            "UPDATE capabilities_nodes SET disabled_at = "
+            "UPDATE nodes SET disabled_at = "
             + ("now()" if sub == "disable" else "NULL")
             + ", updated_at = now() WHERE id = %s AND disabled_at IS "
             + ("NULL" if sub == "disable" else "NOT NULL"), (node,)).rowcount > 0
@@ -19963,7 +19981,7 @@ def _node_update(conn, node: str, values: dict) -> None:
     """Change a node's own fields, in its registry row: a new label is that one
     column, and nothing that names the node by its id moves."""
     current = dict(zip(NODE_FIELDS, conn.execute(
-        f"SELECT {', '.join(NODE_FIELDS)} FROM capabilities_nodes WHERE id = %s FOR UPDATE",
+        f"SELECT {', '.join(NODE_FIELDS)} FROM nodes WHERE id = %s FOR UPDATE",
         (node,)).fetchone()))
     if "label" in values and not values["label"]:
         raise _KernelRefusal("input", "a node's label is the name it is shown by; it is "
@@ -19972,7 +19990,7 @@ def _node_update(conn, node: str, values: dict) -> None:
     if all(current.get(k) == v for k, v in values.items()):
         return
     assignments = ", ".join(f"{c} = %s" for c in values)
-    conn.execute(f"UPDATE capabilities_nodes SET {assignments}, updated_at = now() "
+    conn.execute(f"UPDATE nodes SET {assignments}, updated_at = now() "
                  "WHERE id = %s", (*values.values(), node))
 
 
@@ -20026,7 +20044,7 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
     import psycopg
     try:
         rows = dict(conn.execute(
-            "SELECT id, to_jsonb(n) FROM capabilities_nodes n WHERE id = ANY (%s)",
+            "SELECT id, to_jsonb(n) FROM nodes n WHERE id = ANY (%s)",
             ([old, new],)).fetchall())
         if old not in rows:
             conn.close()
@@ -20054,7 +20072,7 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                                  (prefix if how == "prefix" else old,)).fetchone()[0]
             if count:
                 plan.append({"table": table, "column": column, "rows": count, "how": how})
-        links = conn.execute("SELECT count(*) FROM capabilities_agent_nodes WHERE node = %s",
+        links = conn.execute("SELECT count(*) FROM agent_nodes WHERE node = %s",
                              (old,)).fetchone()[0]
         running = []
         for table, what in NODE_LEASES:
@@ -20072,14 +20090,14 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                  "stop them on that node and rekey it after: a lease a stopped service "
                  "held runs out at its time")
         triggers = _rekey_triggers(conn, schema, [hit["table"] for hit in plan]
-                                   + ["capabilities_nodes", "capabilities_agent_nodes"])
+                                   + ["nodes", "agent_nodes"])
     except psycopg.Error as exc:
         conn.close()
         _die(5, "store_unreachable", f"cannot read the store: {exc}",
              "check the database setting with `capabilities store doctor`")
     answer = {"ok": True, "project": str(root), "dry_run": dry_run, "old_id": old,
               "new_id": new, "label": rows[old].get("label"), "merged": new in rows,
-              "rows": [{"table": "capabilities_agent_nodes", "column": "node",
+              "rows": [{"table": "agent_nodes", "column": "node",
                         "rows": links, "how": "foreign key"}] + plan,
               "total_rows": links + sum(hit["rows"] for hit in plan),
               "triggers": [{"table": t["table"], "trigger": t["trigger"]} for t in triggers]}
@@ -20100,7 +20118,7 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                 # The machine registered itself under its id already: that row
                 # takes the links and what the old row knew of the node.
                 conn.execute(
-                    "UPDATE capabilities_nodes n SET label = o.label, kind = o.kind, "
+                    "UPDATE nodes n SET label = o.label, kind = o.kind, "
                     "address = coalesce(n.address, o.address), "
                     "target = coalesce(n.target, o.target), "
                     "coolify_connection = coalesce(n.coolify_connection, o.coolify_connection), "
@@ -20108,25 +20126,25 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                     "coolify_resource = coalesce(n.coolify_resource, o.coolify_resource), "
                     "public_key = coalesce(n.public_key, o.public_key), "
                     "last_seen_at = greatest(n.last_seen_at, o.last_seen_at), "
-                    "updated_at = now() FROM capabilities_nodes o "
+                    "updated_at = now() FROM nodes o "
                     "WHERE n.id = %s AND o.id = %s", (new, old))
                 # An agent linked on both ids keeps one link, on the new id,
                 # holding what either knew of the pair.
                 for agent, master, may_write, folder in conn.execute(
-                        "DELETE FROM capabilities_agent_nodes o USING capabilities_agent_nodes n "
+                        "DELETE FROM agent_nodes o USING agent_nodes n "
                         "WHERE o.node = %s AND n.node = %s AND n.agent_id = o.agent_id "
                         "RETURNING o.agent_id, o.is_master, o.may_write, o.folder",
                         (old, new)).fetchall():
                     conn.execute(
-                        "UPDATE capabilities_agent_nodes SET is_master = is_master OR %s, "
+                        "UPDATE agent_nodes SET is_master = is_master OR %s, "
                         "may_write = may_write OR %s, folder = coalesce(folder, %s) "
                         "WHERE agent_id = %s AND node = %s",
                         (master, may_write, folder, agent, new))
-                conn.execute("UPDATE capabilities_agent_nodes SET node = %s WHERE node = %s",
+                conn.execute("UPDATE agent_nodes SET node = %s WHERE node = %s",
                              (new, old))
-                conn.execute("DELETE FROM capabilities_nodes WHERE id = %s", (old,))
+                conn.execute("DELETE FROM nodes WHERE id = %s", (old,))
             else:
-                conn.execute("UPDATE capabilities_nodes SET id = %s, updated_at = now() "
+                conn.execute("UPDATE nodes SET id = %s, updated_at = now() "
                              "WHERE id = %s", (new, old))
             for hit in plan:
                 column = _rekey_ident(hit["column"])
@@ -20146,7 +20164,7 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
             # The node fields a store keeps on the links for older readers
             # copy the moved row again, which the merge changed with the
             # triggers off.
-            conn.execute("UPDATE capabilities_agent_nodes SET node = node WHERE node = %s",
+            conn.execute("UPDATE agent_nodes SET node = node WHERE node = %s",
                          (new,))
             left = [f"{hit['table']}.{hit['column']}" for hit in plan
                     if conn.execute(
@@ -20154,9 +20172,9 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                         + (f"{_rekey_ident(hit['column'])} LIKE %s" if hit["how"] == "prefix"
                            else f"{_rekey_ident(hit['column'])} = %s"),
                         (prefix if hit["how"] == "prefix" else old,)).fetchone()[0]]
-            if conn.execute("SELECT 1 FROM capabilities_agent_nodes WHERE node = %s",
+            if conn.execute("SELECT 1 FROM agent_nodes WHERE node = %s",
                             (old,)).fetchone():
-                left.append("capabilities_agent_nodes.node")
+                left.append("agent_nodes.node")
             if left:
                 raise RuntimeError("rows still name the old id: " + ", ".join(left))
     except RuntimeError as exc:
@@ -20955,6 +20973,9 @@ STORE_UPGRADE_PHASES = ("manager", "capabilities", "dump", "migrate")
 # The library's refusals whose hint names the commands that cross a major or
 # catch up with one: wherever the manager words such a refusal, it keeps them.
 STORE_MAJOR_SLUGS = ("schema_too_new", "store_upgrade_needed")
+# The owner the manager's tables had before the core's step made them the core's
+# (capabilities_contract.db._legacy); its schema_version row stays.
+STORE_LEGACY_OWNER = "capabilities"
 STORE_UPGRADE_TIMEOUT_SECONDS = 3600
 STORE_UPGRADE_HANDOVER_ENV = "CAPABILITIES_STORE_UPGRADE_HANDOVER"
 
@@ -21026,12 +21047,25 @@ def _node_reads_store(major: int | None, since, seen) -> bool:
     return seen is not None and seen >= since
 
 
-def _node_store_unread(node: dict, state: dict, major: int | None, since) -> dict | None:
+def _nodes_created(conn, ids: list[str]) -> dict:
+    """When each of `ids` was registered, from the node registry."""
+    if not ids:
+        return {}
+    return dict(conn.execute("SELECT id, created_at FROM nodes WHERE id = ANY (%s)",
+                             (list(ids),)).fetchall())
+
+
+def _node_store_unread(node: dict, state: dict, major: int | None, since,
+                       created=None) -> dict | None:
     """Why one of the agent's nodes cannot read the store, or None where it
     can: {store_major, since, last_seen_at, message, command}, for a node
     whose last sign of life (its registry row's last_seen_at, its state row's
-    reported_at) is older than the store's move to its major."""
+    reported_at) is older than the store's move to its major. A node
+    registered (`created`) after that move, by a release of its major, has
+    nothing older to run, and reads it until it shows a sign of life."""
     import datetime as _dt
+    if created is not None and since is not None and created >= since:
+        return None
     seen = []
     for value in (node.get("last_seen_at"), state.get("reported_at")):
         if isinstance(value, str):
@@ -21201,11 +21235,14 @@ def _store_survey(setting) -> dict:
     db = _db_module()
     store = _store_module()
     from psycopg import sql
-    conn = db.connect(application_name=store.STORE_OWNER, setting=setting, transaction=True)
+    conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting, transaction=True)
     schema = setting.schema
     ident = sql.Identifier(schema)
-    books = ("schema_version", "schema_ledger", "capabilities_nodes",
-             "capabilities_node_states", "capabilities_node_updates")
+    # The node tables under the core's names, and under the names a store at
+    # major 1 holds them by, whose stubs a store past the core's step keeps.
+    node_tables = (("nodes", "capabilities_nodes"), ("node_states", "capabilities_node_states"),
+                   ("node_updates", "capabilities_node_updates"))
+    books = ("schema_version", "schema_ledger", *(name for pair in node_tables for name in pair))
     try:
         with conn.transaction():
             server, now, *found, tables, size = conn.execute(
@@ -21219,6 +21256,10 @@ def _store_survey(setting) -> dict:
                 "AND c.relkind IN ('r', 'm'))",
                 (*(f'"{schema}".{table}' for table in books), schema, schema)).fetchone()
             exists = {table: at is not None for table, at in zip(books, found)}
+            names = {}
+            for new, old in node_tables:
+                names[new] = new if exists[new] else old
+                exists[new] = exists[new] or exists[old]
             owners, ledger, versions, applied = {}, None, [], None
             if exists["schema_version"]:
                 steps = _core_major_steps()
@@ -21241,28 +21282,32 @@ def _store_survey(setting) -> dict:
             core = next(((row[1], row[3]) for row in versions if row[0] == "core"), None)
             major, since = _major_since(bool(versions), core, applied)
             nodes = []
-            if exists["capabilities_nodes"]:
+            if exists["nodes"]:
                 state = (sql.SQL("s.image_version, s.boot_line, s.reported_at, "
                                  "s.fresh_until > now()")
-                         if exists["capabilities_node_states"] else sql.SQL("NULL, NULL, NULL, NULL"))
+                         if exists["node_states"] else sql.SQL("NULL, NULL, NULL, NULL"))
                 run = (sql.SQL("u.versions_after, u.versions_before")
-                       if exists["capabilities_node_updates"] else sql.SQL("NULL, NULL"))
+                       if exists["node_updates"] else sql.SQL("NULL, NULL"))
                 joins = sql.SQL(" ").join(
-                    ([sql.SQL("LEFT JOIN {}.capabilities_node_states s ON s.node = n.id")
-                      .format(ident)] if exists["capabilities_node_states"] else [])
+                    ([sql.SQL("LEFT JOIN {}.{} s ON s.node = n.id")
+                      .format(ident, sql.Identifier(names["node_states"]))]
+                     if exists["node_states"] else [])
                     + ([sql.SQL("LEFT JOIN (SELECT DISTINCT ON (node) node, versions_after, "
-                                "versions_before FROM {}.capabilities_node_updates ORDER BY "
-                                "node, requested_at DESC, id) u ON u.node = n.id").format(ident)]
-                       if exists["capabilities_node_updates"] else []))
-                for (node, label, kind, last_seen, disabled, resource, image, boot, reported,
-                     fresh, after, before) in conn.execute(sql.SQL(
+                                "versions_before FROM {}.{} ORDER BY "
+                                "node, requested_at DESC, id) u ON u.node = n.id")
+                        .format(ident, sql.Identifier(names["node_updates"]))]
+                       if exists["node_updates"] else []))
+                for (node, label, kind, last_seen, disabled, resource, created, image, boot,
+                     reported, fresh, after, before) in conn.execute(sql.SQL(
                         "SELECT n.id, n.label, n.kind, n.last_seen_at, n.disabled_at, "
-                        "n.coolify_resource, {state}, {run} FROM {schema}.capabilities_nodes n "
+                        "n.coolify_resource, n.created_at, {state}, {run} FROM {schema}.{nodes} n "
                         "{joins} ORDER BY n.label, n.id").format(
-                            state=state, run=run, schema=ident, joins=joins)):
+                            state=state, run=run, schema=ident,
+                            nodes=sql.Identifier(names["nodes"]), joins=joins)):
                     nodes.append({"node": node, "label": label, "kind": kind,
                                   "last_seen_at": last_seen, "reported_at": reported,
                                   "disabled_at": disabled, "coolify_resource": resource,
+                                  "created_at": created,
                                   "reachable": bool(fresh), "image_version": image,
                                   "boot_line": boot, "versions": after or before})
     finally:
@@ -21282,7 +21327,9 @@ def _store_nodes_answer(survey: dict, crossed_at=None) -> list[dict]:
     for node in survey["nodes"]:
         seen = max((at for at in (node["last_seen_at"], node["reported_at"]) if at is not None),
                    default=None)
-        reads = _node_reads_store(survey["major"], survey["since"], seen)
+        reads = _node_reads_store(survey["major"], survey["since"], seen) or (
+            node.get("created_at") is not None and survey["since"] is not None
+            and node["created_at"] >= survey["since"])
         reason = None
         last = f"last seen {stamp(seen)}" if seen else "never seen"
         if not reads:
@@ -21359,9 +21406,11 @@ def _store_upgrade_readers(setting, survey: dict, asked: list | None = None) -> 
     out.append({"owner": "core", "by": "manager", "store": core_store,
                 "reads": {"major": lib_major, "minor": None}, "state": state,
                 "crosses": state == "upgrade_needed"})
+    # The manager's tables were owner `capabilities` until the core's step
+    # moved them; that owner keeps its row, which the core's step takes to the
+    # core's version and which has no steps of its own.
     manager_owners = (
-        (store.STORE_OWNER, store.record_table_steps() + PLACEMENT_STEPS,
-         store.STORE_TABLES_VERSION),
+        (STORE_LEGACY_OWNER, (), store.STORE_TABLES_VERSION),
         (SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS, SUPERVISE_LEASE_VERSION))
     for owner, steps, (major, minor) in manager_owners:
         if owner not in survey["owners"]:
@@ -21371,7 +21420,7 @@ def _store_upgrade_readers(setting, survey: dict, asked: list | None = None) -> 
         conn = None
         try:
             with _upgrade_flag(False):
-                conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+                conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                                   transaction=True)
                 found = db.status(conn, owner, steps, major=major, minor=minor)
             entry["state"] = found.state
@@ -21497,8 +21546,8 @@ def _store_readers_key(setting, survey: dict, asked: list, identities: list) -> 
             "major": survey["major"], "owners": survey["owners"], "books": survey["books"],
             "ledger": survey["ledger"],
             "manager": {"library": library, "store_major": db.STORE_MAJOR,
-                        "steps": repr((store.STORE_OWNER, store.record_table_steps()
-                                       + PLACEMENT_STEPS, store.STORE_TABLES_VERSION,
+                        "steps": repr((store.STORE_OWNER, store.record_table_steps(),
+                                       store.STORE_TABLES_VERSION,
                                        SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS,
                                        SUPERVISE_LEASE_VERSION))},
             "capabilities": {name: found for (name, _, _), found in zip(asked, identities)}}
@@ -21879,9 +21928,9 @@ def _store_upgrade_migrate_owner(setting, entry: dict) -> dict:
     if owner == "core":
         steps = tuple(getattr(migrate_module, "CORE_STEPS", ()))
         major, minor = getattr(migrate_module, "CORE_VERSION", (0, 0))
-    elif owner == store.STORE_OWNER:
-        steps = store.record_table_steps() + PLACEMENT_STEPS
-        major, minor = store.STORE_TABLES_VERSION
+    elif owner == STORE_LEGACY_OWNER:
+        # Moved by the core's step, the one before it.
+        steps, (major, minor) = (), store.STORE_TABLES_VERSION
     else:
         steps, (major, minor) = SUPERVISE_LEASE_STEPS, SUPERVISE_LEASE_VERSION
     if not steps:
@@ -21889,7 +21938,7 @@ def _store_upgrade_migrate_owner(setting, entry: dict) -> dict:
     conn = None
     try:
         with _upgrade_flag(True):
-            conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+            conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                               transaction=True)
             done = db.migrate(conn, owner, steps, major=major, minor=minor)
     except db.DbError as exc:
@@ -22399,7 +22448,7 @@ def _core_reconcile(arriving: set[str] = frozenset(),
     db = _db_module()
     try:
         setting = db.resolve_setting(_project_root())
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         return {"written": [], "reason": exc.slug}
@@ -22409,21 +22458,21 @@ def _core_reconcile(arriving: set[str] = frozenset(),
             major, minor = store.STORE_TABLES_VERSION
             db.migrate(conn, store.STORE_OWNER, store.record_table_steps(), major=major,
                        minor=minor)
-        elif conn.execute("SELECT to_regclass('capabilities_policy') IS NULL OR "
-                          "to_regclass('capabilities_global') IS NULL").fetchone()[0]:
+        elif conn.execute("SELECT to_regclass('policies') IS NULL OR "
+                          "to_regclass('store_state') IS NULL").fetchone()[0]:
             return {"written": [], "reason": "store_tables_missing"}
         with conn.transaction():
-            migrated = conn.execute("SELECT global_migrated_at FROM capabilities_global"
+            migrated = conn.execute("SELECT global_migrated_at FROM store_state"
                                     ).fetchone()[0] is not None
             held = {row[0] for row in conn.execute(
-                "SELECT capability FROM capabilities_policy WHERE agent_id IS NULL AND "
+                "SELECT capability FROM policies WHERE agent_id IS NULL AND "
                 "node IS NULL")}
             gate = set() if migrated else set(_load_gate_file(GLOBAL_GATE_FILE)["capabilities"])
             written = _core_missing(held, gate, migrated, arriving)
             for name in written:
-                conn.execute("INSERT INTO capabilities_policy (agent_id, capability, node, "
+                conn.execute("INSERT INTO policies (agent_id, capability, node, "
                              "enabled) VALUES (NULL, %s, NULL, true)", (name,))
-        return {"written": written, "gate": f"store:{setting.schema}.capabilities_policy"}
+        return {"written": written, "gate": f"store:{setting.schema}.policies"}
     except (db.DbError, psycopg.Error) as exc:
         return {"written": [], "reason": getattr(exc, "slug", None) or "store_unreachable"}
     finally:
@@ -22450,55 +22499,18 @@ def _service_placement(service: dict) -> str:
 # mode: `shared`, the node's one machine service of the capability, serving
 # every agent there that places it so, or `own`, the agent's own service.
 PLACEMENT_MODES = ("shared", "own")
-# The manager's own steps in the contract's ledger, after the library's: they
-# extend its tables under its owner, so they are named apart from its numbered
-# steps, and the manager applies them where it reads or writes what they make.
-# Never edit one once released; add a step.
-PLACEMENT_STEPS = [
-    ("manager-0001-placement-mode",
-     "ALTER TABLE capabilities_policy"
-     " ADD COLUMN mode text CHECK (mode IN ('shared', 'own'));"
-     " ALTER TABLE capabilities_policy ADD CONSTRAINT capabilities_policy_mode"
-     "  CHECK (mode IS NULL OR (agent_id IS NOT NULL AND node IS NOT NULL));"
-     " COMMENT ON COLUMN capabilities_policy.mode IS"
-     " 'Which service serves the agent''s service of this capability on the node the row"
-     " names: shared, the node''s one machine service of the capability, or own, the"
-     " agent''s own service. Only an agent''s row naming a node carries one. Null where no"
-     " writer recorded one: the manager serves it as before modes, by the agent''s own"
-     " service where the capability declares a project command, else by the machine"
-     " service.'"),
-    ("manager-0002-service-leases",
-     "CREATE TABLE capabilities_service_leases ("
-     " project_id text NOT NULL CHECK (project_id <> ''),"
-     " capability text NOT NULL CHECK (capability ~ '^[a-z][a-z0-9_-]*$'),"
-     " node text NOT NULL CHECK (node <> ''),"
-     " mode text NOT NULL CHECK (mode IN ('shared', 'own')),"
-     " acquired_at timestamptz NOT NULL DEFAULT now(),"
-     " renewed_at timestamptz NOT NULL DEFAULT now(),"
-     " expires_at timestamptz NOT NULL,"
-     " PRIMARY KEY (project_id, capability, node));"
-     " COMMENT ON TABLE capabilities_service_leases IS"
-     " 'Which service serves an agent''s capability on a node: one row per agent,"
-     " capability and node, taken and renewed every reconcile by the service that serves"
-     " the agent there, so a service of the other mode on that node does not serve it"
-     " while the row is live. Apart from deployment_service_leases, which keeps an"
-     " exclusive service on one node at a time.';"
-     " COMMENT ON COLUMN capabilities_service_leases.mode IS"
-     " 'The service holding it: own, the agent''s own service on the node, or shared, the"
-     " node''s one machine service of the capability.';"
-     " COMMENT ON COLUMN capabilities_service_leases.expires_at IS"
-     " 'When the hold runs out unless renewed; past it the row holds nothing, and a"
-     " service of the other mode may take it.'"),
-]
+# The manager's own steps that once extended the contract's tables under its
+# owner - the placement mode of a policy row, and service_leases - are the
+# core's now: the library's core step replays them where a store lacks them,
+# so the manager migrates the core's steps alone.
 
 
 def _placement_migrate(conn, db=None) -> None:
-    """The contract's tables and the manager's own steps after them."""
+    """The contract's tables, the placement mode and service_leases among them."""
     db = db or _db_module()
     store = _store_module()
     major, minor = store.STORE_TABLES_VERSION
-    db.migrate(conn, store.STORE_OWNER, store.record_table_steps() + PLACEMENT_STEPS,
-               major=major, minor=minor)
+    db.migrate(conn, store.STORE_OWNER, store.record_table_steps(), major=major, minor=minor)
 
 
 def _service_machine_argv(name: str) -> list[str]:
@@ -22555,7 +22567,7 @@ def _placement_row(root: Path, name: str, node: str) -> tuple | None:
     or None where it has none; the manager's steps applied first."""
     def read(conn, agent_id):
         return conn.execute(
-            "SELECT service, mode FROM capabilities_policy WHERE agent_id = %s "
+            "SELECT service, mode FROM policies WHERE agent_id = %s "
             "AND capability = %s AND node = %s", (agent_id, name, node)).fetchone()
     found, _setting = _kernel_run(root, read, placement=True)
     return tuple(found) if found is not None else None
@@ -22566,7 +22578,7 @@ def _placement_mode_set(root: Path, name: str, node: str, mode: str) -> bool:
     changed."""
     def write(conn, agent_id):
         return conn.execute(
-            "UPDATE capabilities_policy SET mode = %s, updated_at = now() "
+            "UPDATE policies SET mode = %s, updated_at = now() "
             "WHERE agent_id = %s AND capability = %s AND node = %s "
             "AND mode IS DISTINCT FROM %s", (mode, agent_id, name, node, mode)).rowcount > 0
     changed, _setting = _kernel_run(root, write, placement=True)
@@ -22729,11 +22741,11 @@ def _place_everywhere(name: str, root: Path, adapter, serving: str | None = None
         nodes = [row["node"] for row in rows if row["disabled_at"] is None]
         parked = [row["node"] for row in rows if row["disabled_at"] is not None]
         modes = {node: _placement_mode(name, recorded) for node, recorded in conn.execute(
-            "SELECT node, mode FROM capabilities_policy WHERE agent_id = %s "
+            "SELECT node, mode FROM policies WHERE agent_id = %s "
             "AND capability = %s AND node IS NOT NULL AND service",
             (agent_id, name)).fetchall()}
         disabled = {node for (node,) in conn.execute(
-            "SELECT node FROM capabilities_policy WHERE agent_id = %s AND capability = %s "
+            "SELECT node FROM policies WHERE agent_id = %s AND capability = %s "
             "AND node IS NOT NULL AND NOT enabled", (agent_id, name)).fetchall()}
         refused = []
         for node in nodes:
@@ -22817,7 +22829,7 @@ def _placement_report(name: str, root: Path, adapter, mode: str) -> dict:
                 return None
             return conn.execute(
                 "SELECT node, acquired_at, renewed_at, expires_at, expires_at > now() "
-                "FROM deployment_service_leases WHERE project = %s AND capability = %s",
+                "FROM deployment_service_leases WHERE agent_id = %s AND capability = %s",
                 (agent_id, name)).fetchone()
         row, _setting = _kernel_run(root, read)
         if row is not None:
@@ -22832,18 +22844,18 @@ def _placement_report(name: str, root: Path, adapter, mode: str) -> dict:
         # manager's own steps have not reached yet answers every mode as before.
         recorded = {}
         if conn.execute("SELECT 1 FROM pg_attribute WHERE attrelid = "
-                        "'capabilities_policy'::regclass AND attname = 'mode' "
+                        "'policies'::regclass AND attname = 'mode' "
                         "AND NOT attisdropped").fetchone() is not None:
             recorded = dict(conn.execute(
-                "SELECT node, mode FROM capabilities_policy WHERE agent_id = %s "
+                "SELECT node, mode FROM policies WHERE agent_id = %s "
                 "AND capability = %s AND node IS NOT NULL AND service",
                 (agent_id, name)).fetchall())
-        if conn.execute("SELECT to_regclass('capabilities_service_leases')"
+        if conn.execute("SELECT to_regclass('service_leases')"
                         ).fetchone()[0] is None:
             return recorded, []
         return recorded, conn.execute(
             "SELECT node, mode, acquired_at, renewed_at, expires_at, expires_at > now() "
-            "FROM capabilities_service_leases WHERE project_id = %s AND capability = %s "
+            "FROM service_leases WHERE agent_id = %s AND capability = %s "
             "ORDER BY node", (agent_id, name)).fetchall()
     (recorded, held), _setting = _kernel_run(root, serving)
     return {"capability": name, "placement": mode, "placed_on": on, "holder": holder,
@@ -23302,7 +23314,7 @@ def _references_conn(root: Path, write: bool):
         return _kernel_open(root)[0]
     db = _db_module()
     try:
-        return db.connect(application_name=_store_module().STORE_OWNER,
+        return db.connect(application_name=_store_module().STORE_APPLICATION,
                           setting=db.resolve_setting(root), transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
@@ -23672,12 +23684,12 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
     writes: list[tuple[str, tuple]] = []
     for name, wanted in plan.items():
         held = dict(conn.execute(
-            "SELECT name, spec FROM capabilities_connections WHERE capability = %s",
+            "SELECT name, spec FROM connections WHERE capability = %s",
             (name,)).fetchall())
         grants = {(cid, node): (enabled, allow_write, bool(is_default))
                   for cid, node, enabled, allow_write, is_default in conn.execute(
                       "SELECT connection, node, enabled, allow_write, is_default "
-                      "FROM capabilities_connection_grants "
+                      "FROM grants "
                       "WHERE agent_id = %s AND capability = %s", (agent_id, name)).fetchall()}
         report = {"connections": {"imported": [], "unchanged": []},
                   "grants": {"imported": [], "unchanged": []},
@@ -23687,7 +23699,7 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
                 if cid not in wanted["connections"]:
                     continue
                 writes.append((
-                    "INSERT INTO capabilities_connections (capability, name, spec) "
+                    "INSERT INTO connections (capability, name, spec) "
                     "VALUES (%s, %s, %s::jsonb)",
                     (name, cid, json.dumps(spec, ensure_ascii=False))))
                 report["connections"]["imported"].append(cid)
@@ -23704,7 +23716,7 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
                 if cid not in wanted["grants"]:
                     continue
                 writes.append((
-                    "INSERT INTO capabilities_connection_grants (agent_id, capability, "
+                    "INSERT INTO grants (agent_id, capability, "
                     "connection, node, enabled, allow_write, is_default) "
                     "VALUES (%s, %s, %s, NULL, %s, %s, %s)", (agent_id, name, cid, *row)))
                 report["grants"]["imported"].append(cid)
@@ -23846,7 +23858,7 @@ def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
     held_ids = {(scope_of(agent), cap, label): (value, note or "")
                 for agent, cap, label, value, note in conn.execute(
                     "SELECT agent_id, capability, label, value, note "
-                    "FROM capabilities_identifiers "
+                    "FROM identifiers "
                     "WHERE agent_id IS NULL OR agent_id = %s", (agent_id,)).fetchall()}
     identifiers: dict = {}
     for cap, scopes in plan["identifiers"].items():
@@ -23857,7 +23869,7 @@ def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
                 found = held_ids.get((scope, cap, label))
                 if found is None:
                     writes.append((
-                        "INSERT INTO capabilities_identifiers "
+                        "INSERT INTO identifiers "
                         "(agent_id, capability, label, value, note) "
                         "VALUES (%s, %s, %s, %s::jsonb, %s)",
                         (agent_of[scope], cap, label,
@@ -23891,7 +23903,7 @@ def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
     held_policy = {(scope_of(agent), cap, row_node): enabled
                    for agent, cap, row_node, enabled in conn.execute(
                        "SELECT agent_id, capability, node, enabled "
-                       "FROM capabilities_policy "
+                       "FROM policies "
                        "WHERE agent_id IS NULL OR agent_id = %s", (agent_id,)).fetchall()}
     policy: dict = {}
     for scope in ("project", "global"):
@@ -23900,7 +23912,7 @@ def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
             found = held_policy.get((scope, cap, None))
             if found is None:
                 writes.append((
-                    "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+                    "INSERT INTO policies (agent_id, capability, node, enabled) "
                     "VALUES (%s, %s, NULL, %s)", (agent_of[scope], cap, enabled)))
                 done["imported"].append(cap)
             elif found == enabled:
@@ -23913,7 +23925,7 @@ def _import_record_rows(conn, agent_id: str, node: str, plan: dict) -> dict:
         found = held_policy.get(("project", cap, node))
         if found is None:
             writes.append((
-                "INSERT INTO capabilities_policy "
+                "INSERT INTO policies "
                 "(agent_id, capability, node, enabled, service) "
                 "VALUES (%s, %s, %s, true, true)", (agent_id, cap, node)))
             placed["placed"].append(cap)
@@ -23991,7 +24003,7 @@ def cmd_connections_list(names: list[str]) -> None:
     root = _project_root()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
@@ -23999,14 +24011,14 @@ def cmd_connections_list(names: list[str]) -> None:
     params = (names,) if names else ()
     try:
         connections = conn.execute(
-            "SELECT c.capability, c.name, c.owner, a.name, to_jsonb(c) ->> 'label' "
-            "FROM capabilities_connections c "
-            "LEFT JOIN capabilities_agents a ON a.id = c.owner" + only
+            "SELECT c.capability, c.name, c.owner_agent_id, a.name, to_jsonb(c) ->> 'label' "
+            "FROM connections c "
+            "LEFT JOIN agents a ON a.id = c.owner_agent_id" + only
             + " ORDER BY c.capability, c.name", params).fetchall()
         grants = conn.execute(
             "SELECT g.capability, g.connection, g.agent_id, a.name, g.node, g.enabled, "
-            "g.allow_write, g.is_default FROM capabilities_connection_grants g "
-            "LEFT JOIN capabilities_agents a ON a.id = g.agent_id"
+            "g.allow_write, g.is_default FROM grants g "
+            "LEFT JOIN agents a ON a.id = g.agent_id"
             + only.replace("c.capability", "g.capability")
             + " ORDER BY g.capability, g.connection, g.agent_id NULLS FIRST, "
             "g.node NULLS FIRST", params).fetchall()
@@ -24070,7 +24082,7 @@ def cmd_connections_import() -> None:
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
@@ -24086,9 +24098,9 @@ def cmd_connections_import() -> None:
         with conn.transaction():
             # One import at a time per store, so two cannot both find a row
             # missing and both write it.
-            conn.execute("LOCK TABLE capabilities_connections, "
-                          "capabilities_connection_grants, capabilities_identifiers, "
-                          "capabilities_policy IN SHARE ROW EXCLUSIVE MODE")
+            conn.execute("LOCK TABLE connections, "
+                          "grants, identifiers, "
+                          "policies IN SHARE ROW EXCLUSIVE MODE")
             imported = _import_rows(conn, agent_id, plan)
             records_imported = _import_record_rows(conn, agent_id, node, records_plan)
             stored = store.StoreRecords(envelope, _CONFIG_HOME, agent_id,
@@ -24468,7 +24480,7 @@ def _migrate_connect(root: Path):
     store = _store_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         raise _MigrateRefusal(exc.slug, exc.message, exc.hint,
@@ -24508,6 +24520,16 @@ def _migrate_tables_pending(conn) -> dict | None:
                               "check it with `capabilities store doctor`", exit_code=5) from None
     if status.state == "current":
         return None
+    if status.state == "upgrade_needed":
+        # Taking them there crosses the store's major, which only the store
+        # upgrade does: the refusal its apply meets.
+        raise _MigrateRefusal("store_upgrade_needed",
+                              f"the store's {store.STORE_OWNER} tables are at schema major "
+                              f"{status.stored_major or 1}, and this code wants major {major}; "
+                              "moving the store to a newer major is the store upgrade, which "
+                              "nothing runs by itself",
+                              f"a person runs `{STORE_UPGRADE_COMMAND}`, the one way to cross "
+                              f"a major; `{STORE_UPGRADE_COMMAND} --check` says what it will do")
     if status.state != "pending":
         raise _MigrateRefusal(status.state, f"the store's {store.STORE_OWNER} tables cannot "
                               f"be brought to {major}.{minor}: {status.state}",
@@ -24548,7 +24570,7 @@ def _migrate_upgrade_tables(conn) -> list[str]:
 
 
 def _migrate_global_at(conn) -> str | None:
-    rows = _migrate_rows(conn, "SELECT global_migrated_at FROM capabilities_global")
+    rows = _migrate_rows(conn, "SELECT global_migrated_at FROM store_state")
     return _store_module()._stamp(rows[0][0]) if rows and rows[0][0] else None
 
 
@@ -24564,7 +24586,7 @@ def _migrate_agent_state(conn, agent_id: str) -> dict | None:
         return None
     conn.rollback()
     if state is None and not _migrate_rows(
-            conn, "SELECT 1 WHERE to_regclass('capabilities_agents') IS NOT NULL") \
+            conn, "SELECT 1 WHERE to_regclass('agents') IS NOT NULL") \
             and _migrate_rows(conn, "SELECT 1 FROM contextkit_agents WHERE id = %s",
                               (agent_id,)):
         state = {"id": agent_id, "migrating_since": None, "migrated_at": None,
@@ -24573,26 +24595,26 @@ def _migrate_agent_state(conn, agent_id: str) -> dict | None:
 
 
 def _migrate_node_rows(conn, agent_id: str) -> dict:
-    if _migrate_rows(conn, "SELECT 1 WHERE to_regclass('capabilities_nodes') IS NOT NULL"):
+    if _migrate_rows(conn, "SELECT 1 WHERE to_regclass('nodes') IS NOT NULL"):
         query = ("SELECT l.node, n.label, n.kind, n.address, l.is_master, l.may_write, "
-                 "n.target, n.last_seen_at FROM capabilities_agent_nodes l "
-                 "JOIN capabilities_nodes n ON n.id = l.node WHERE l.agent_id = %s")
+                 "n.target, n.last_seen_at FROM agent_nodes l "
+                 "JOIN nodes n ON n.id = l.node WHERE l.agent_id = %s")
     else:
         query = ("SELECT node, node, kind, address, is_master, may_write, target, "
-                 "last_seen_at FROM capabilities_agent_nodes WHERE agent_id = %s")
+                 "last_seen_at FROM agent_nodes WHERE agent_id = %s")
     return {row[0]: dict(zip(NODE_BASE_COLUMNS, row))
             for row in _migrate_rows(conn, query, (agent_id,))}
 
 
 def _migrate_policy_rows(conn, agent_id: str | None) -> dict:
     return {(cap, node): enabled for cap, node, enabled in _migrate_rows(
-        conn, "SELECT capability, node, enabled FROM capabilities_policy "
+        conn, "SELECT capability, node, enabled FROM policies "
               "WHERE coalesce(agent_id, '') = coalesce(%s::text, '')", (agent_id,))}
 
 
 def _migrate_identifier_rows(conn, agent_id: str | None) -> dict:
     return {(cap, label): (value, note or "") for cap, label, value, note in _migrate_rows(
-        conn, "SELECT capability, label, value, note FROM capabilities_identifiers i "
+        conn, "SELECT capability, label, value, note FROM identifiers i "
               "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
               "AND to_jsonb(i) ->> 'node' IS NULL",
         (agent_id,))}
@@ -24602,14 +24624,14 @@ def _migrate_grant_rows(conn, agent_id: str | None) -> dict:
     return {(cap, cid): (enabled, allow_write, bool(is_default))
             for cap, cid, enabled, allow_write, is_default in _migrate_rows(
                 conn, "SELECT capability, connection, enabled, allow_write, is_default "
-                      "FROM capabilities_connection_grants "
+                      "FROM grants "
                       "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
                       "AND node IS NULL", (agent_id,))}
 
 
 def _migrate_connection_rows(conn) -> dict:
     return {(cap, name): spec for cap, name, spec in _migrate_rows(
-        conn, "SELECT capability, name, spec FROM capabilities_connections")}
+        conn, "SELECT capability, name, spec FROM connections")}
 
 
 def _migrate_setting_rows(conn, agent_id: str | None, document: str) -> dict | None:
@@ -24617,11 +24639,11 @@ def _migrate_setting_rows(conn, agent_id: str | None, document: str) -> dict | N
     document does not exist."""
     store = _store_module()
     exists = _migrate_rows(
-        conn, "SELECT generation FROM capabilities_settings_documents "
+        conn, "SELECT generation FROM settings_documents "
               "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
               "AND node IS NULL", (agent_id, document))
     rows = _migrate_rows(
-        conn, "SELECT path, value FROM capabilities_settings "
+        conn, "SELECT path, value FROM settings "
               "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') AND capability = %s "
               "AND node IS NULL", (agent_id, document))
     if not exists and not rows:
@@ -24983,8 +25005,8 @@ def _migrate_context(root: Path, opts: dict, answers: dict) -> dict:
 def _migrate_agent_rows_held(conn, agent_id: str) -> bool:
     """Whether the store holds any grant, identifier or gate row of this
     agent."""
-    for table in ("capabilities_connection_grants", "capabilities_identifiers",
-                  "capabilities_policy"):
+    for table in ("grants", "identifiers",
+                  "policies"):
         rows = _migrate_rows(conn, f"SELECT 1 FROM {table} WHERE agent_id = %s LIMIT 1",
                              (agent_id,))
         if rows:
@@ -25035,20 +25057,20 @@ def _migrate_global_home(ctx: dict) -> Path:
     conn, _setting = _migrate_connect(ctx["root"])
     try:
         gate = {name: {"enabled": bool(enabled)} for name, enabled in _migrate_rows(
-            conn, "SELECT capability, enabled FROM capabilities_policy "
+            conn, "SELECT capability, enabled FROM policies "
                   "WHERE agent_id IS NULL AND node IS NULL")}
         identifiers: dict = {}
         for name, label, value, note in _migrate_rows(
-                conn, "SELECT capability, label, value, note FROM capabilities_identifiers i "
+                conn, "SELECT capability, label, value, note FROM identifiers i "
                       "WHERE agent_id IS NULL AND to_jsonb(i) ->> 'node' IS NULL"):
             identifiers.setdefault(name, {})[label] = {"value": value, "note": note or ""}
         registries: dict = {}
         for name, cid, spec in _migrate_rows(
-                conn, "SELECT capability, name, spec FROM capabilities_connections"):
+                conn, "SELECT capability, name, spec FROM connections"):
             registries.setdefault(name, {"connections": {}})["connections"][cid] = dict(spec)
         for name, cid, allow_write, is_default in _migrate_rows(
                 conn, "SELECT capability, connection, allow_write, is_default FROM "
-                      "capabilities_connection_grants WHERE agent_id IS NULL AND node IS NULL"):
+                      "grants WHERE agent_id IS NULL AND node IS NULL"):
             entry = registries.get(name, {}).get("connections", {}).get(cid)
             if entry is None:
                 continue
@@ -25668,9 +25690,9 @@ def _migrate_main_checkout(ctx: dict) -> dict | None:
     conn, _setting = _migrate_connect(ctx["root"])
     try:
         held = {}
-        for collection, table in (("grant", "capabilities_connection_grants"),
-                                  ("identifier", "capabilities_identifiers"),
-                                  ("policy", "capabilities_policy")):
+        for collection, table in (("grant", "grants"),
+                                  ("identifier", "identifiers"),
+                                  ("policy", "policies")):
             if ctx["mode"] == "connections" and collection == "grant":
                 continue
             rows = _migrate_rows(conn, f"SELECT count(*) FROM {table} WHERE agent_id = %s",
@@ -25903,14 +25925,14 @@ def _migrate_register(ctx: dict, plan: dict) -> dict:
     def work(conn):
         created = _ensure_agent_row(conn, agent_id)
         if name:
-            conn.execute("UPDATE capabilities_agents SET name = %s WHERE id = %s "
+            conn.execute("UPDATE agents SET name = %s WHERE id = %s "
                          "AND name IS NULL", (name, agent_id))
-        master = conn.execute("SELECT node FROM capabilities_agent_nodes "
+        master = conn.execute("SELECT node FROM agent_nodes "
                               "WHERE agent_id = %s AND is_master", (agent_id,)).fetchone()
         registered = []
         if master is None:
             _ensure_node_row(conn, {"id": node, "label": ctx.get("node_label")}, kind)
-            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node, "
+            conn.execute("INSERT INTO agent_nodes (agent_id, node, "
                          "is_master) VALUES (%s, %s, true) ON CONFLICT (agent_id, node) "
                          "DO UPDATE SET is_master = true", (agent_id, node))
             registered.append({"node": node, "kind": kind, "master": True})
@@ -25923,19 +25945,19 @@ def _migrate_register(ctx: dict, plan: dict) -> dict:
                 continue
             # A node another machine runs is registered by the name the answers
             # give it, its id until it moves to its own there (`node rekey`).
-            conn.execute("INSERT INTO capabilities_nodes (id, label, kind, address, target) "
+            conn.execute("INSERT INTO nodes (id, label, kind, address, target) "
                          "VALUES (%s, %s, %s, %s, %s) ON CONFLICT (id) DO NOTHING",
                          (row["node"], row["node"], row.get("kind") or "server",
                           row.get("address"), row.get("target")))
-            conn.execute("INSERT INTO capabilities_agent_nodes (agent_id, node) "
+            conn.execute("INSERT INTO agent_nodes (agent_id, node) "
                          "VALUES (%s, %s) ON CONFLICT (agent_id, node) DO NOTHING",
                          (agent_id, row["node"]))
             registered.append({"node": row["node"], "kind": row.get("kind") or "server",
                                "target": row.get("target")})
-        conn.execute("UPDATE capabilities_agents SET migrating_since = now(), "
+        conn.execute("UPDATE agents SET migrating_since = now(), "
                      "updated_at = now() WHERE id = %s AND migrating_since IS NULL",
                      (agent_id,))
-        since = conn.execute("SELECT migrating_since FROM capabilities_agents WHERE id = %s",
+        since = conn.execute("SELECT migrating_since FROM agents WHERE id = %s",
                              (agent_id,)).fetchone()[0]
         return {"agent_created": created, "nodes_registered": registered,
                 "migrating_since": _store_module()._stamp(since)}
@@ -25956,7 +25978,7 @@ def _migrate_write_records(ctx: dict, plan: dict) -> dict:
         for row in records["connections"]:
             if row["outcome"] not in ("write", "replace"):
                 continue
-            conn.execute("INSERT INTO capabilities_connections (capability, name, spec) "
+            conn.execute("INSERT INTO connections (capability, name, spec) "
                          "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
                          "DO UPDATE SET spec = EXCLUDED.spec",
                          (row["capability"], row["name"],
@@ -25965,27 +25987,27 @@ def _migrate_write_records(ctx: dict, plan: dict) -> dict:
         for entry in records["remove"]:
             kind, name, key = entry["kind"], entry["capability"], entry["name"]
             if kind == "grant":
-                conn.execute("DELETE FROM capabilities_connection_grants WHERE agent_id = %s "
+                conn.execute("DELETE FROM grants WHERE agent_id = %s "
                              "AND capability = %s AND connection = %s AND node IS NULL",
                              (agent_id, name, key))
             elif kind == "identifier":
-                conn.execute("DELETE FROM capabilities_identifiers WHERE agent_id = %s "
+                conn.execute("DELETE FROM identifiers WHERE agent_id = %s "
                              "AND capability = %s AND label = %s AND node IS NULL",
                              (agent_id, name, key))
             else:
-                conn.execute("DELETE FROM capabilities_policy WHERE agent_id = %s "
+                conn.execute("DELETE FROM policies WHERE agent_id = %s "
                              "AND capability = %s AND node IS NULL", (agent_id, name))
             written["removed"] += 1
         for row in records["grants"]:
             if row["outcome"] != "write":
                 continue
             if row["is_default"]:
-                conn.execute("UPDATE capabilities_connection_grants SET is_default = false "
+                conn.execute("UPDATE grants SET is_default = false "
                              "WHERE agent_id = %s AND capability = %s AND node IS NULL "
                              "AND connection <> %s AND is_default",
                              (agent_id, row["capability"], row["connection"]))
             conn.execute(
-                "INSERT INTO capabilities_connection_grants (agent_id, capability, "
+                "INSERT INTO grants (agent_id, capability, "
                 "connection, node, enabled, allow_write, is_default) "
                 "VALUES (%s, %s, %s, NULL, %s, %s, %s) "
                 "ON CONFLICT ((coalesce(agent_id, '')), capability, connection, "
@@ -25998,7 +26020,7 @@ def _migrate_write_records(ctx: dict, plan: dict) -> dict:
             if row["outcome"] != "write":
                 continue
             conn.execute(
-                "INSERT INTO capabilities_identifiers (agent_id, capability, node, label, "
+                "INSERT INTO identifiers (agent_id, capability, node, label, "
                 "value, note) VALUES (%s, %s, NULL, %s, %s::jsonb, %s) "
                 "ON CONFLICT ((coalesce(agent_id, '')), capability, label, "
                 "(coalesce(node, ''))) DO UPDATE SET value = EXCLUDED.value, "
@@ -26011,7 +26033,7 @@ def _migrate_write_records(ctx: dict, plan: dict) -> dict:
                 continue
             # A placement row places the service where it enables the capability.
             conn.execute(
-                "INSERT INTO capabilities_policy (agent_id, capability, node, enabled, "
+                "INSERT INTO policies (agent_id, capability, node, enabled, "
                 "service) VALUES (%s, %s, %s, %s, %s) ON CONFLICT "
                 "((coalesce(agent_id, '')), capability, (coalesce(node, ''))) "
                 "DO UPDATE SET enabled = EXCLUDED.enabled, service = EXCLUDED.service, "
@@ -26134,7 +26156,7 @@ def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
         conn, _setting = _migrate_connect(ctx["root"])
         try:
             extra = {doc for (doc,) in _migrate_rows(
-                conn, "SELECT DISTINCT capability FROM capabilities_settings_documents "
+                conn, "SELECT DISTINCT capability FROM settings_documents "
                       "WHERE agent_id = %s AND node IS NULL", (agent_id,))}
             placed = _migrate_policy_rows(conn, agent_id)
         finally:
@@ -26186,7 +26208,7 @@ def _migrate_finalize(ctx: dict, plan: dict | None, journal: dict) -> dict:
 
     def work(conn):
         held = {row[0] for row in conn.execute(
-            "SELECT node FROM capabilities_agent_nodes WHERE agent_id = %s",
+            "SELECT node FROM agent_nodes WHERE agent_id = %s",
             (agent_id,)).fetchall()}
         missing = [node for node in targets if node not in held]
         if missing:
@@ -26197,7 +26219,7 @@ def _migrate_finalize(ctx: dict, plan: dict | None, journal: dict) -> dict:
                 "register each with `capabilities node add <node> --kind server --target "
                 "<target>` on this master, then run `capabilities migrate --apply` again",
                 detail={"nodes": missing})
-        moved = conn.execute("UPDATE capabilities_agents SET migrated_at = coalesce("
+        moved = conn.execute("UPDATE agents SET migrated_at = coalesce("
                              "migrated_at, now()), migrating_since = NULL, updated_at = now() "
                              "WHERE id = %s RETURNING migrated_at", (agent_id,)).fetchone()
         # The slug moves into the row with the agent, so nothing it names moves.
@@ -26633,7 +26655,7 @@ def _migrate_gate_flips(conn, plan: dict, given: list[str], setting=None) -> lis
         after[(row["capability"], None)] = row["enabled"]
     agents: dict[str, dict] = {}
     for agent_id, migrated in _migrate_rows(
-            conn, "SELECT id, migrated_at FROM capabilities_agents"):
+            conn, "SELECT id, migrated_at FROM agents"):
         agents[agent_id] = {"agent_id": agent_id, "reads": "store" if migrated else None}
     for entry in _migrate_discover(given):
         if not entry.get("id"):
@@ -26755,27 +26777,27 @@ def cmd_migrate_global(opts: dict) -> None:
         major, minor = store.STORE_TABLES_VERSION
         db.migrate(conn, store.STORE_OWNER, store.record_table_steps(), major=major, minor=minor)
         with conn.transaction():
-            conn.execute("LOCK TABLE capabilities_global IN EXCLUSIVE MODE")
-            if conn.execute("SELECT global_migrated_at FROM capabilities_global"
+            conn.execute("LOCK TABLE store_state IN EXCLUSIVE MODE")
+            if conn.execute("SELECT global_migrated_at FROM store_state"
                             ).fetchone()[0] is not None:
                 raise _MigrateRefusal("global_migrated", "the global rows were written by "
                                       "another run meanwhile", exit_code=6)
             for row in plan["remove"]:
                 if row["kind"] == "policy":
-                    conn.execute("DELETE FROM capabilities_policy WHERE agent_id IS NULL "
+                    conn.execute("DELETE FROM policies WHERE agent_id IS NULL "
                                  "AND capability = %s AND node IS NULL", (row["capability"],))
                 elif row["kind"] == "identifier":
-                    conn.execute("DELETE FROM capabilities_identifiers WHERE agent_id IS NULL "
+                    conn.execute("DELETE FROM identifiers WHERE agent_id IS NULL "
                                  "AND capability = %s AND label = %s AND node IS NULL",
                                  (row["capability"], row["name"]))
                 else:
-                    conn.execute("DELETE FROM capabilities_connection_grants WHERE "
+                    conn.execute("DELETE FROM grants WHERE "
                                  "agent_id IS NULL AND capability = %s AND connection = %s "
                                  "AND node IS NULL", (row["capability"], row["name"]))
             for row in plan["policy"]:
                 if row["outcome"] != "held":
                     conn.execute(
-                        "INSERT INTO capabilities_policy (agent_id, capability, node, enabled) "
+                        "INSERT INTO policies (agent_id, capability, node, enabled) "
                         "VALUES (NULL, %s, NULL, %s) ON CONFLICT ((coalesce(agent_id, '')), "
                         "capability, (coalesce(node, ''))) DO UPDATE SET enabled = "
                         "EXCLUDED.enabled, updated_at = now()",
@@ -26783,7 +26805,7 @@ def cmd_migrate_global(opts: dict) -> None:
             for row in plan["identifiers"]:
                 if row["outcome"] != "held":
                     conn.execute(
-                        "INSERT INTO capabilities_identifiers (agent_id, capability, node, "
+                        "INSERT INTO identifiers (agent_id, capability, node, "
                         "label, value, note) VALUES (NULL, %s, NULL, %s, %s::jsonb, %s) "
                         "ON CONFLICT ((coalesce(agent_id, '')), capability, label, "
                         "(coalesce(node, ''))) DO UPDATE SET value = EXCLUDED.value, "
@@ -26793,7 +26815,7 @@ def cmd_migrate_global(opts: dict) -> None:
             for row in plan["connections"]:
                 if row["outcome"] in ("add", "change"):
                     conn.execute(
-                        "INSERT INTO capabilities_connections (capability, name, spec) "
+                        "INSERT INTO connections (capability, name, spec) "
                         "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
                         "DO UPDATE SET spec = EXCLUDED.spec",
                         (row["capability"], row["name"],
@@ -26802,11 +26824,11 @@ def cmd_migrate_global(opts: dict) -> None:
                 if row["outcome"] == "held":
                     continue
                 if row["is_default"]:
-                    conn.execute("UPDATE capabilities_connection_grants SET is_default = "
+                    conn.execute("UPDATE grants SET is_default = "
                                  "false WHERE agent_id IS NULL AND capability = %s AND "
                                  "node IS NULL AND is_default", (row["capability"],))
                 conn.execute(
-                    "INSERT INTO capabilities_connection_grants (agent_id, capability, "
+                    "INSERT INTO grants (agent_id, capability, "
                     "connection, node, enabled, allow_write, is_default) VALUES (NULL, %s, "
                     "%s, NULL, NULL, %s, %s) ON CONFLICT ((coalesce(agent_id, '')), "
                     "capability, connection, (coalesce(node, ''))) DO UPDATE SET "
@@ -26851,12 +26873,12 @@ def cmd_migrate_global(opts: dict) -> None:
     conn, _setting = _migrate_connect(root)
     try:
         with conn.transaction():
-            conn.execute("LOCK TABLE capabilities_global IN EXCLUSIVE MODE")
-            if conn.execute("SELECT global_migrated_at FROM capabilities_global"
+            conn.execute("LOCK TABLE store_state IN EXCLUSIVE MODE")
+            if conn.execute("SELECT global_migrated_at FROM store_state"
                             ).fetchone()[0] is not None:
                 raise _MigrateRefusal("global_migrated", "the global rows were written by "
                                       "another run meanwhile", exit_code=6)
-            conn.execute("UPDATE capabilities_global SET global_migrated_at = now()")
+            conn.execute("UPDATE store_state SET global_migrated_at = now()")
         answer["global_migrated_at"] = _migrate_global_at(conn)
     except _MigrateRefusal as exc:
         conn.close()
@@ -26989,7 +27011,7 @@ def cmd_migrate_retire_connections() -> None:
         at = _migrate_global_at(conn)
         held = {(name, cid): dict(spec) if isinstance(spec, dict) else {}
                 for name, cid, spec in _migrate_rows(
-                    conn, "SELECT capability, name, spec FROM capabilities_connections")}
+                    conn, "SELECT capability, name, spec FROM connections")}
     finally:
         conn.close()
     if not at:
@@ -27822,7 +27844,7 @@ def _ck_store_read(root: Path, query) -> list[tuple] | None:
             return None
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     try:
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
@@ -27847,16 +27869,16 @@ def _ck_stored_rows(root: Path) -> list[tuple] | None:
     def query(conn, project):
         enabling = conn.execute("SELECT to_regclass('context_enablements') IS NOT NULL"
                                 ).fetchone()[0]
-        enabled = (" OR (d.project_id IS NULL AND EXISTS (SELECT 1 FROM context_enablements e "
-                   "WHERE e.document_id = d.id AND e.project_id = %(project)s) "
+        enabled = (" OR (d.agent_id IS NULL AND EXISTS (SELECT 1 FROM context_enablements e "
+                   "WHERE e.document_id = d.id AND e.agent_id = %(project)s) "
                    "AND NOT EXISTS (SELECT 1 FROM context_documents o "
-                   "WHERE o.project_id = %(project)s AND o.name = d.name "
+                   "WHERE o.agent_id = %(project)s AND o.name = d.name "
                    "AND o.retired_at IS NULL))") if enabling else ""
         return conn.execute(
-            "SELECT d.project_id IS NULL, d.name, v.title, v.description, v.load, v.position, "
+            "SELECT d.agent_id IS NULL, d.name, v.title, v.description, v.load, v.position, "
             "v.body FROM context_documents d JOIN context_versions v "
             "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
-            f"AND (d.project_id = %(project)s{enabled})", {"project": project}).fetchall()
+            f"AND (d.agent_id = %(project)s{enabled})", {"project": project}).fetchall()
     return _ck_store_read(root, query)
 
 
@@ -27875,7 +27897,7 @@ def _ck_stored_assets(root: Path) -> bool | None:
         found = []
         for table in ("assets_documents", "assets_files"):
             if conn.execute("SELECT to_regclass(%s) IS NOT NULL", (table,)).fetchone()[0]:
-                found += conn.execute(f"SELECT 1 FROM {table} WHERE project_id = %s "
+                found += conn.execute(f"SELECT 1 FROM {table} WHERE agent_id = %s "
                                       "AND retired_at IS NULL LIMIT 1", (project,)).fetchall()
         return found
     rows = _ck_store_read(root, query)
@@ -27993,17 +28015,17 @@ def _ck_stored_routine_rows(root: Path) -> list[tuple] | None:
             "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = "
             "to_regclass('routine_documents') AND attname = 'disabled_at' "
             "AND NOT attisdropped)").fetchone()[0]
-        enabled = (" OR (d.project_id IS NULL AND EXISTS (SELECT 1 FROM routine_enablements e "
-                   "WHERE e.document_id = d.id AND e.project_id = %(project)s) "
+        enabled = (" OR (d.agent_id IS NULL AND EXISTS (SELECT 1 FROM routine_enablements e "
+                   "WHERE e.document_id = d.id AND e.agent_id = %(project)s) "
                    "AND NOT EXISTS (SELECT 1 FROM routine_documents o "
-                   "WHERE o.project_id = %(project)s AND o.name = d.name "
+                   "WHERE o.agent_id = %(project)s AND o.name = d.name "
                    "AND o.retired_at IS NULL))") if enabling else ""
         return conn.execute(
             "SELECT d.name, v.description, "
             + ("d.disabled_at IS NOT NULL" if switching else "false")
             + " FROM routine_documents d JOIN routine_versions v "
             "ON v.document_id = d.id AND v.active WHERE d.retired_at IS NULL "
-            f"AND (d.project_id = %(project)s{enabled})", {"project": project}).fetchall()
+            f"AND (d.agent_id = %(project)s{enabled})", {"project": project}).fetchall()
     rows = _ck_store_read(root, query)
     return rows or None
 
@@ -28119,14 +28141,14 @@ def _ck_registry_onboarding(root: Path, with_mode: bool = False):
     store = _store_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=store.STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     import psycopg
     try:
         row = conn.execute("SELECT onboarding_status, onboarding_routine "
-                           "FROM capabilities_agents WHERE id = %s", (agent_id,)).fetchone()
+                           "FROM agents WHERE id = %s", (agent_id,)).fetchone()
     except psycopg.errors.UndefinedTable:
         row = None
     except psycopg.Error as exc:
@@ -28147,14 +28169,14 @@ def _agent_row_json(root: Path) -> dict | None:
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
-        conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                           transaction=True)
     except db.DbError as exc:
         _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
     import psycopg
     try:
         conn.read_only = True
-        row = conn.execute("SELECT to_jsonb(a) - 'icon' FROM capabilities_agents a "
+        row = conn.execute("SELECT to_jsonb(a) - 'icon' FROM agents a "
                            "WHERE id = %s", (agent_id,)).fetchone()
     except psycopg.errors.UndefinedTable:
         row = None
@@ -29551,16 +29573,16 @@ class _Creation:
         db = _db_module()
         try:
             setting = db.resolve_setting(self.root)
-            conn = db.connect(application_name=_store_module().STORE_OWNER, setting=setting,
+            conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
                               transaction=True)
         except db.DbError:
             return
         import psycopg
         try:
             with conn.transaction():
-                conn.execute("DELETE FROM capabilities_policy WHERE agent_id = %s",
+                conn.execute("DELETE FROM policies WHERE agent_id = %s",
                              (self.agent_id,))
-                conn.execute("DELETE FROM capabilities_agents WHERE id = %s", (self.agent_id,))
+                conn.execute("DELETE FROM agents WHERE id = %s", (self.agent_id,))
         except psycopg.Error:
             pass
         finally:
@@ -29757,7 +29779,7 @@ def _init_in(root: Path, claude: bool, codex: bool, with_body: bool, starter: bo
         if adapter is not None:
             adapter.close()
     if gate is None:
-        gate = "store:capabilities_policy (no database reachable here)"
+        gate = "store:policies (no database reachable here)"
     result: dict = {"project": str(root),
                     "gate": gate,
                     "agent": registration}
@@ -30560,7 +30582,7 @@ def _check_skill(findings: list[str]) -> None:
 
 def _grant_agents_information(root: Path) -> list[dict]:
     """Grants in this project's store whose agent the agent registry
-    (capabilities_agents) does not know, as information and never as a
+    (agents) does not know, as information and never as a
     failure: an agent id is a soft reference to an identity that lives outside
     these tables, and the registry may not exist in this store at all."""
     db = _db_module()
@@ -30573,19 +30595,19 @@ def _grant_agents_information(root: Path) -> list[dict]:
     out: list[dict] = []
     try:
         grants = conn.execute(
-            "SELECT agent_id, count(*) FROM capabilities_connection_grants "
+            "SELECT agent_id, count(*) FROM grants "
             "GROUP BY agent_id ORDER BY agent_id").fetchall()
         if not grants:
             return out
-        registry = conn.execute("SELECT to_regclass('capabilities_agents')").fetchone()[0]
+        registry = conn.execute("SELECT to_regclass('agents')").fetchone()[0]
         if registry is None:
             out.append({"code": "agents_registry_absent",
-                        "message": "the agent registry (capabilities_agents) is "
+                        "message": "the agent registry (agents) is "
                                    "not in this store, so no grant's agent_id was "
                                    "checked against it"})
             return out
         known = {row[0] for row in conn.execute(
-            "SELECT id::text FROM capabilities_agents WHERE id::text = ANY(%s)",
+            "SELECT id::text FROM agents WHERE id::text = ANY(%s)",
             ([agent for agent, _count in grants],)).fetchall()}
         for agent, count in grants:
             if agent not in known:

@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-11-05 — The store names the agent: whatsapp's tables go to schema major 2
+
+`whatsapp`'s tables name an agent where they named a project: `project_id` is `agent_id` in `whatsapp_register`, `whatsapp_jobs`, `whatsapp_job_amendments` and `whatsapp_job_slots`, and every constraint named for the column moves with it. Step `0023-agent-names` renames them in place with every row kept and takes the ledger to 2.0. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of whatsapp 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first whatsapp call makes them at 2.0. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. It pins `callva-harness-runner` 0.11.0, whose profiles are kept in `harness_profile_versions`, so the profiles the service reads and saves are the store's under their new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-11-05 — A job that stops names itself in the chat by a short label
 
 The message that tells the chat a job was stopped, interrupted by the listener stopping, or failed used to quote the job's whole description, the brief its worker reads, which is often paragraphs long. It now quotes a short label: the description's first line, cut on a word boundary to at most 80 characters and ending in `…` when anything was left out. A one-line description that fits is quoted as it is. The worker still receives the whole description, and nothing else changes.

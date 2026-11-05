@@ -124,6 +124,37 @@ class JobsCase(td.DialogueCase):
 # ── The tables ──────────────────────────────────────────────────────────────
 
 
+# Every name and comment in an owner's tables that still says project, where the
+# store now says agent: table columns, relations, constraints, triggers, comments, and
+# the bodies of the owner's functions.
+_SAYS_PROJECT = """
+SELECT 'column ' || c.relname || '.' || a.attname FROM pg_attribute a
+  JOIN pg_class c ON c.oid = a.attrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+   AND a.attname ~* 'project'
+UNION ALL SELECT 'relation ' || c.relname FROM pg_class c
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relname ~* 'project'
+UNION ALL SELECT 'constraint ' || o.conname FROM pg_constraint o
+  JOIN pg_class c ON c.oid = o.conrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND o.conname ~* 'project'
+UNION ALL SELECT 'trigger ' || g.tgname FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND g.tgname ~* 'project'
+UNION ALL SELECT 'comment on ' || c.relname || coalesce('.' || a.attname, '')
+  FROM pg_description d JOIN pg_class c ON c.oid = d.objoid AND d.classoid = 'pg_class'::regclass
+  LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid AND d.objsubid > 0
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND d.description ~* 'project'
+UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
+ WHERE p.pronamespace = %(schema)s::regnamespace AND p.proname LIKE %(like)s
+   AND p.prosrc ~* 'project'
+"""
+
+
+
 @_cli.needs_store
 class Migration(td.DialogueCase):
     """The three job tables arrive as steps of their own, under the naming law,
@@ -139,15 +170,16 @@ class Migration(td.DialogueCase):
         self.assertEqual(steps, [s.id for s in wa.STORE_STEPS])
         version = self.db.execute(
             "SELECT major, minor FROM schema_version WHERE owner = 'whatsapp'").fetchone()
-        self.assertEqual((version["major"], version["minor"]), (1, wa.STORE_SCHEMA_MINOR))
+        self.assertEqual((version["major"], version["minor"]),
+                         (wa.STORE_SCHEMA_MAJOR, wa.STORE_SCHEMA_MINOR))
         for table, wanted in (
-                ("whatsapp_jobs", {"project_id", "environment", "account", "chat_id",
+                ("whatsapp_jobs", {"agent_id", "environment", "account", "chat_id",
                                    "host", "requested_by", "origin_message_id",
                                    "session_id", "pid", "attempt_token", "lease_owner",
                                    "lease_expires_at", "delivery_state"}),
-                ("whatsapp_job_amendments", {"project_id", "environment", "account",
+                ("whatsapp_job_amendments", {"agent_id", "environment", "account",
                                              "job_id", "text", "state", "claim_token"}),
-                ("whatsapp_job_slots", {"project_id", "environment", "account", "slot",
+                ("whatsapp_job_slots", {"agent_id", "environment", "account", "slot",
                                         "job_id", "owner_id", "attempt_token"})):
             columns = {r["column_name"] for r in self.db.execute(
                 "SELECT column_name FROM information_schema.columns"
@@ -175,6 +207,61 @@ class Migration(td.DialogueCase):
         self.assertEqual(conn.execute("SELECT counters FROM whatsapp_register").fetchone()[0],
                          {"answered": 2})
         self.assertEqual(conn.execute("SELECT count(*) FROM whatsapp_jobs").fetchone()[0], 0)
+
+    def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(self):
+        """A store at 1.4 with a row in the register and in every job table
+        takes the agent names in place, keeps the rows, is reported as before,
+        and refuses a release that knows only major 1."""
+        import psycopg
+        from psycopg.rows import dict_row
+        old = [s for s in wa.STORE_STEPS if s.id != "0023-agent-names"]
+        name = f"wa_m1_{uuid.uuid4().hex[:8]}"
+        conn = psycopg.connect(_cli.STORE_DSN, autocommit=True)
+        self.addCleanup(conn.close)
+        conn.execute(f"CREATE SCHEMA {name}")
+        self.addCleanup(conn.execute, f"DROP SCHEMA {name} CASCADE")
+        wa.migrate(conn, "whatsapp", old, major=1, minor=4, schema=name)
+        conn.execute(f"SET search_path TO {name}")
+        conn.execute("INSERT INTO whatsapp_register (project_id, environment, account,"
+                     " chat_id, counters) VALUES ('p', 'e', 'a', 'c', '{\"answered\": 2}')")
+        conn.execute("INSERT INTO whatsapp_jobs (id, project_id, environment, account, chat_id,"
+                     " requested_by, description, state, created_at, updated_at)"
+                     " VALUES ('j1', 'p', 'e', 'a', 'c', 'r', 'kept', 'running', now(), now())")
+        conn.execute("INSERT INTO whatsapp_job_amendments (id, project_id, environment, account,"
+                     " job_id, text, state, created_at) VALUES ('m1', 'p', 'e', 'a', 'j1',"
+                     " 'more', 'pending', now())")
+        conn.execute("INSERT INTO whatsapp_job_slots (project_id, environment, account, slot,"
+                     " job_id, owner_id, attempt_token, lease_expires_at)"
+                     " VALUES ('p', 'e', 'a', 0, 'j1', 'o', 't', now())")
+
+        # Outside the store upgrade the major is not crossed; inside it, it is.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CAPABILITIES_STORE_UPGRADE", None)
+            with self.assertRaises(wa.DbError) as held:
+                wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
+                           minor=wa.STORE_SCHEMA_MINOR, schema=name)
+        self.assertEqual(held.exception.slug, "store_upgrade_needed")
+        with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
+            result = wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
+                                minor=wa.STORE_SCHEMA_MINOR, schema=name)
+        self.assertEqual(result.applied, ["0023-agent-names"])
+        self.assertEqual((result.major, result.minor), (2, 0))
+        conn.execute(f"SET search_path TO {name}")
+        for table in ("whatsapp_register", "whatsapp_jobs", "whatsapp_job_amendments",
+                      "whatsapp_job_slots"):
+            self.assertEqual(conn.execute(f"SELECT agent_id FROM {table}").fetchall(),
+                             [("p",)], table)
+        self.assertEqual(conn.execute("SELECT counters FROM whatsapp_register").fetchone()[0],
+                         {"answered": 2})
+        self.assertEqual(conn.execute(_SAYS_PROJECT, {"schema": name, "like": "whatsapp\\_%"}
+                                      ).fetchall(), [])
+        job = conn.cursor(row_factory=dict_row).execute("SELECT * FROM whatsapp_jobs").fetchone()
+        shown = wa._job_row(job)
+        self.assertEqual(shown["description"], "kept")
+        self.assertFalse({"agent_id", "project_id"} & set(shown))
+        with self.assertRaises(wa.DbError) as refused:
+            wa.migrate(conn, "whatsapp", old, major=1, minor=4, schema=name)
+        self.assertEqual(refused.exception.slug, "schema_too_new")
 
 
 # ── Settings ────────────────────────────────────────────────────────────────
@@ -764,7 +851,7 @@ class ServiceHarness(td.DialogueCase):
     def job(self, project, profile, state="waiting", outcome=None):
         job_id = f"job-{uuid.uuid4().hex[:8]}"
         self.db.execute(
-            "INSERT INTO whatsapp_jobs (id, project_id, environment, account, chat_id,"
+            "INSERT INTO whatsapp_jobs (id, agent_id, environment, account, chat_id,"
             " requested_by, description, profile, state, outcome, created_at, updated_at)"
             " VALUES (%s, %s, 'test', %s, %s, %s, 'work', %s, %s, %s, now(), now())",
             (job_id, project, self.db.account, ALICE_JID, ALICE, profile, state, outcome))
@@ -776,7 +863,7 @@ class ServiceHarness(td.DialogueCase):
         self.assertIn("harness", wa.SERVICE["verbs"])
         project = f"prj_{uuid.uuid4().hex[:12]}"
         self.db.execute(
-            "INSERT INTO whatsapp_register (project_id, environment, account, chat_id,"
+            "INSERT INTO whatsapp_register (agent_id, environment, account, chat_id,"
             " overrides) VALUES (%s, 'test', %s, %s, '{\"profile\": \"whatsapp-codex\"}')",
             (project, self.db.account, ALICE_JID))
         legacy = self.job(project, None)

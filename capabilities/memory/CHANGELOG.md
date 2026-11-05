@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-11-05 — The store names the agent: memory's tables go to schema major 2
+
+`memory`'s tables name an agent where they named a project: `project_id` is `agent_id` in `memory_entries`, `memory_events` and `memory_groom_leases`, the indexes `memory_entries_project` and `memory_events_project` are `memory_entries_agent` and `memory_events_agent`, every constraint named for the column and the lease table's comment move with it, and the entries' guard and the change trigger read the renamed column. The `memory_changed` notification's payload names the agent under `agent_id` where it said `project`; the channel and the change versions are unchanged. Step `0007-agent-names` renames them in place with every row kept and takes the ledger to 2.0. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of memory 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first memory call makes them at 2.0. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
 
 The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning; codex is unchanged. Nothing a turn does changes.

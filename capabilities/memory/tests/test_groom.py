@@ -73,7 +73,7 @@ def test_a_second_pass_does_not_start_while_one_holds_the_lease(world, tmp_path)
     ids = seed(world, root)
     with psycopg.connect(DSN, autocommit=True) as conn:
         conn.execute(f"INSERT INTO {world.schema}.memory_groom_leases "
-                     "(project_id, holder, expires_at) "
+                     "(agent_id, holder, expires_at) "
                      "VALUES (%s, gen_random_uuid(), now() + interval '1 hour')",
                      (project_id(root),))
     before = world.ok(root, "status")["last_event"]

@@ -71,7 +71,7 @@ def store(monkeypatch):
 def _task(conn, schema, key, status="todo", project=HERE, metadata=None,
           blocked_by=()) -> str:
     return str(conn.execute(
-        f"""insert into {schema}.tasks_tasks (project_id, type, unique_key, title, status,
+        f"""insert into {schema}.tasks_tasks (agent_id, type, unique_key, title, status,
                                         metadata, blocked_by)
             values (%s, 'change', %s, %s, %s, %s::jsonb, %s::uuid[]) returning id""",
         (project, key, f"title of {key}", status,
