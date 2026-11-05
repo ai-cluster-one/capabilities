@@ -1,5 +1,9 @@
 # inbox — change log
 
+## 2026-11-05 — An item links to the thing it came from, and an ask can be answered in words alone
+
+`inbox ask`, `inbox talk` and `inbox notify` take `--source-label L --source-ref R`, both or neither: the label the person reads for the thing the item came from and the asker's own reference to it, each one line of at most 200 characters. inbox reads neither; `show`, `status` and `list` return them as `"source": {"label", "ref"}`, null where the item names none, and the store keeps them among what an item asks, which never changes. An ask answered with `inbox answer <id> --reply TEXT` and neither yes nor no records the answer `other`, whose words are the whole answer; the on-answer command receives `INBOX_ANSWER=other` with the words in `INBOX_REPLY`, and the store refuses `other` without a reply. The word after `--reply` is the reply whatever it holds, a leading dash included. Ledger step `0005-source-other` (inbox tables 1.2) adds `source_label` and `source_ref` and admits `other` as an answer; items put before it name no source.
+
 ## 2026-11-05 — Whatever is put before a person is written for someone deciding, and every agent's context says so
 
 `inbox stub`, the line the manager composes into the context of every agent where `inbox` is enabled, now carries the rule for anything an agent puts before a person in the Inbox, itself or through another tool: say what this is, why it comes up now, what is needed from the person, and which answer you recommend and why, in plain language with no code, file paths, line numbers, commit or task ids, or internal names, under a title that says the matter itself. The manifest's `summary` carries the same text, since the stub is that summary closed by its discovery pointer. `inbox help` points `ask`, `talk` and `notify` at it. It is an instruction to the writer and not a check: nothing an item says is refused for its wording, and every verb answers as before.

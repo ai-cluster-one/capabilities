@@ -262,7 +262,8 @@ def test_a_move_into_waiting_on_a_person_puts_a_talk(lab):
     [call] = calls(lab)
     assert call["argv"] == ["talk", "Decide t-talk", "--text",
                             "The release needs a decision on the schedule.", "--key", key,
-                            "--on-answer", f"tasks answer '{tid}' --key '{key}'"]
+                            "--on-answer", f"tasks answer '{tid}' --key '{key}'",
+                            "--source-label", "Decide t-talk", "--source-ref", tid]
     assert Path(call["cwd"]) == lab["project"] and call["agent"] == lab["ident"]
 
 
@@ -279,7 +280,8 @@ def test_the_four_flags_put_an_ask_with_its_words(lab):
     assert call["argv"] == ["ask", "Decide t-ask", "--text", "Ship the release on Friday?",
                             "--yes", "Ship Friday", "--no", "Hold it a week",
                             "--recommend", "yes", "--key", key,
-                            "--on-answer", f"tasks answer '{tid}' --key '{key}'"]
+                            "--on-answer", f"tasks answer '{tid}' --key '{key}'",
+                            "--source-label", "Decide t-ask", "--source-ref", tid]
 
 
 def test_the_question_rides_only_on_a_move_into_waiting_on_a_person(lab):
@@ -347,6 +349,25 @@ def test_the_answer_lands_on_the_trail_and_returns_the_task(lab):
     # The return is a move away: its withdraw meets an answered item, and that is fine.
     [withdraw] = calls(lab)
     assert withdraw["argv"] == ["withdraw", "--key", key]
+
+
+def test_words_alone_on_a_yes_or_no_task_land_on_the_trail_and_return_it(lab):
+    tid = add(lab, "t-words", "--status", "todo", "--assignee", "default")
+    ok(tasks(lab, "set", tid, "--status", "waiting", "--assignee", PERSON,
+             "--question", "Ship it?", "--yes", "Ship now", "--no", "Hold",
+             "--recommend", "yes"))
+    key = move_key(lab, tid)
+    calls(lab)
+    words = "-x Ship half; $(touch pwned) 'and' \"wait\" `id`"
+    answer = ok(deliver(lab, answered(lab, key), "other", words))
+    assert answer["returned"] == {"status": "todo", "assignee": "default"}
+    task = shown(lab, tid)
+    assert (task["task"]["status"], task["task"]["assignee"]) == ("todo", "default")
+    entry = task["activities"][-1]["description"]
+    assert entry.startswith("Answered in the Inbox by alex@node at 2026-11-03T10:00:00."
+                            f"000000Z: neither yes nor no, in words: {words}\n\n")
+    assert "Returned to todo on default" in entry
+    assert not (lab["project"] / "pwned").exists()
 
 
 def test_a_stale_key_only_adds_a_note(lab):

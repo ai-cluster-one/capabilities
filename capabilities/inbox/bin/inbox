@@ -24,13 +24,21 @@ there are none: every verb that reads or writes them exits 6
 
 ASKING  (the agent of the folder the command runs in)
   inbox ask "<title>" --text T --yes WORDS --no WORDS --recommend yes|no
-            [--session ID] [--key K] [--on-answer CMD]
+            [--session ID] [--key K] [--on-answer CMD] [--source-label L --source-ref R]
       A question for a yes or a no. --yes and --no are the words the person
       reads for each answer, and --recommend the answer the agent would take.
+      The person may also answer it in words alone, neither yes nor no: its
+      answer is then `other` and the reply is the whole of it.
   inbox talk "<title>" --text T [--session ID] [--key K] [--on-answer CMD]
+             [--source-label L --source-ref R]
       A message the person answers in words.
-  inbox notify "<title>" --text T [--key K]
+  inbox notify "<title>" --text T [--key K] [--source-label L --source-ref R]
       Something the person should know; it takes no answer.
+      --source-label and --source-ref, both or neither, link the item to the
+      thing it came from: the label the person reads and the asker's own
+      reference to it, each one line of at most 200 characters. inbox does
+      not read either; show, status and list return them as
+      "source": {"label", "ref"}, null where the item names none.
       Each of the three answers {"created", "item"}. The title is one line of
       at most 200 characters. Write the title and the text as `inbox stub`
       says, for the person deciding. --key K makes the same question one item:
@@ -96,8 +104,12 @@ THE PERSON
       them, `archive`, and `undelivered` (answers whose on-answer command has
       not run to success).
   inbox answer <id> yes|no [--reply TEXT]      for an ask
-  inbox answer <id> --reply TEXT               for a talk
-      Record the answer and mark the item read. The first answer is final: a
+  inbox answer <id> --reply TEXT               for an ask in words alone,
+                                               or for a talk
+      Record the answer and mark the item read. An ask answered with --reply
+      and neither yes nor no records the answer `other`: the words are the
+      whole answer. The word after --reply is the reply whatever it holds, a
+      leading dash and shell characters included. The first answer is final: a
       second is refused (exit 7 `already_answered`), and the store refuses
       any change to an answer once it is given. A notify takes none (exit 6
       `not_answerable`), nor does a withdrawn item (exit 6 `withdrawn`).
@@ -124,7 +136,7 @@ ON ANSWER
     INBOX_ITEM_ID       the item's id
     INBOX_KEY           its key, empty where none
     INBOX_KIND          ask or talk
-    INBOX_ANSWER        yes or no for an ask, empty for a talk
+    INBOX_ANSWER        yes, no or other for an ask, empty for a talk
     INBOX_REPLY         the reply, empty where none
     INBOX_ANSWERED_BY   who answered, user@node
     INBOX_ANSWERED_AT   when, as 2026-10-01T12:00:00.000000Z
@@ -298,7 +310,7 @@ def _manifest() -> dict:
 # and its delivery are facts of that row written once each. An item is
 # withdrawn rather than deleted, so its row stays as the record of what was
 # asked; nothing refuses a delete, which no verb makes.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 1
+LEDGER_MAJOR, LEDGER_MINOR = 1, 2
 CHANNEL = "inbox_changed"
 LEDGER_STEPS = [
     ("0001-items", """
@@ -468,6 +480,48 @@ LEDGER_STEPS = [
     COMMENT ON COLUMN inbox_items.node IS
         'The node the item was put from, by the id `capabilities node id` answers; NULL on an item put before inbox recorded it.';
     """),
+    # An item may name the thing it came from, opaque to inbox and part of what
+    # it asks; and an ask may be answered in words alone, its answer `other`.
+    ("0005-source-other", """
+    ALTER TABLE inbox_items ADD COLUMN source_label text CHECK (source_label <> ''),
+        ADD COLUMN source_ref text CHECK (source_ref <> ''),
+        ADD CONSTRAINT inbox_items_source CHECK (
+            (source_label IS NULL) = (source_ref IS NULL));
+    ALTER TABLE inbox_items DROP CONSTRAINT inbox_items_answer_check,
+        ADD CONSTRAINT inbox_items_answer_check CHECK (answer IN ('yes', 'no', 'other')),
+        ADD CONSTRAINT inbox_items_other CHECK (answer IS DISTINCT FROM 'other'
+                                                OR reply IS NOT NULL);
+    CREATE OR REPLACE FUNCTION inbox_items_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF (new.agent_id, new.id, new.kind, new.key, new.title, new.text, new.yes_label,
+            new.no_label, new.recommend, new.session, new.on_answer, new.created_at,
+            new.created_by, new.node, new.source_label, new.source_ref)
+           IS DISTINCT FROM
+           (old.agent_id, old.id, old.kind, old.key, old.title, old.text, old.yes_label,
+            old.no_label, old.recommend, old.session, old.on_answer, old.created_at,
+            old.created_by, old.node, old.source_label, old.source_ref) THEN
+            RAISE EXCEPTION 'what an inbox item asks is never changed: withdraw it and ask again'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF old.answered_at IS NOT NULL
+           AND (new.answered_at, new.answered_by, new.answer, new.reply)
+               IS DISTINCT FROM (old.answered_at, old.answered_by, old.answer, old.reply) THEN
+            RAISE EXCEPTION 'the first answer to an inbox item is final'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF old.withdrawn_at IS NOT NULL AND new.withdrawn_at IS DISTINCT FROM old.withdrawn_at THEN
+            RAISE EXCEPTION 'a withdrawn inbox item stays withdrawn'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+    COMMENT ON COLUMN inbox_items.source_label IS
+        'What the asker names the thing the item came from, as the person reads it; opaque to inbox. NULL where the item names none.';
+    COMMENT ON COLUMN inbox_items.source_ref IS
+        'The asker''s own reference to the thing the item came from, beside source_label; opaque to inbox.';
+    COMMENT ON COLUMN inbox_items.answer IS
+        'For an ask, yes, no, or other where the person answered in words alone, the reply being the whole answer; NULL for a talk, whose answer is the reply.';
+    """),
 ]
 
 
@@ -592,7 +646,7 @@ def _one(conn, sql: str, params=()) -> dict | None:
 # ── an item ─────────────────────────────────────────────────────────────────
 
 _COLUMNS = ("agent_id, id, kind, key, title, text, yes_label, no_label, recommend, session, "
-            "node, on_answer, created_at, created_by, read_at, archived_at, withdrawn_at, "
+            "node, source_label, source_ref, on_answer, created_at, created_by, read_at, archived_at, withdrawn_at, "
             "answered_at, answered_by, answer, reply, delivered_at, delivery_attempts, "
             "delivery_error, delivery_due_at, delivery_lease_until")
 
@@ -623,7 +677,9 @@ def _view(row: dict) -> dict:
             "key": row["key"], "title": row["title"], "text": row["text"]}
     if row["kind"] == "ask":
         item.update(yes=row["yes_label"], no=row["no_label"], recommend=row["recommend"])
-    item.update(session=row["session"], node=row["node"])
+    item.update(session=row["session"], node=row["node"],
+                source=({"label": row["source_label"], "ref": row["source_ref"]}
+                        if row["source_ref"] is not None else None))
     if row["kind"] != "notify":
         item["on_answer"] = row["on_answer"]
     item.update(created_at=_iso(row["created_at"]), created_by=row["created_by"],
@@ -811,6 +867,11 @@ def _common(args, kind: str) -> dict:
         if not args.on_answer.strip():
             _die(6, "input", "--on-answer is empty")
         fields["on_answer"] = args.on_answer
+    if (args.source_label is None) != (args.source_ref is None):
+        _die(6, "input", "--source-label and --source-ref go together, or neither")
+    if args.source_ref is not None:
+        fields.update(source_label=_line(args.source_label, "--source-label", TITLE_MAX),
+                      source_ref=_line(args.source_ref, "--source-ref", TITLE_MAX))
     fields["session"] = _session(args, kind)
     return fields
 
@@ -1099,10 +1160,11 @@ def cmd_answer(args) -> None:
                 _die(7, "already_answered", f"item {row['id']} was answered at "
                      f"{_iso(row['answered_at'])} by {row['answered_by']}; the first answer "
                      "is final", f"`{NAME} show {row['id']}` reads it")
-            if row["kind"] == "ask" and args.answer is None:
+            if row["kind"] == "ask" and args.answer is None and reply is None:
                 _die(6, "input", f"item {row['id']} is an ask: answer it yes or no "
-                     f"(yes: {row['yes_label']}; no: {row['no_label']})",
-                     f"`{NAME} answer {row['id']} yes|no [--reply TEXT]`")
+                     f"(yes: {row['yes_label']}; no: {row['no_label']}), or in words alone",
+                     f"`{NAME} answer {row['id']} yes|no [--reply TEXT]` or "
+                     f"`{NAME} answer {row['id']} --reply TEXT`")
             if row["kind"] == "talk" and args.answer is not None:
                 _die(6, "input", f"item {row['id']} is a talk: it is answered in words, "
                      "not yes or no", f"`{NAME} answer {row['id']} --reply TEXT`")
@@ -1113,7 +1175,8 @@ def cmd_answer(args) -> None:
                        "answer = %s, reply = %s, read_at = coalesce(read_at, now()), "
                        "delivery_due_at = CASE WHEN on_answer IS NULL THEN NULL ELSE now() END "
                        f"WHERE id = %s RETURNING {_COLUMNS}",
-                       (_actor(), args.answer, reply, row["id"]))
+                       (_actor(), args.answer or ("other" if row["kind"] == "ask" else None),
+                        reply, row["id"]))
     _emit(_view(row))
 
 
@@ -1635,6 +1698,8 @@ def _parser() -> _Parser:
         one.add_argument("title")
         one.add_argument("--text", required=True)
         one.add_argument("--key")
+        one.add_argument("--source-label", dest="source_label")
+        one.add_argument("--source-ref", dest="source_ref")
     for one in (ask, talk):
         one.add_argument("--on-answer", dest="on_answer")
         one.add_argument("--session")
@@ -1674,6 +1739,23 @@ def _parser() -> _Parser:
     return parser
 
 
+def _words_whole(argv: list[str]) -> list[str]:
+    """`answer`'s --reply joined to the word after it, so a reply that begins
+    with a dash is still the reply rather than read as an option."""
+    if argv[:1] != ["answer"]:
+        return argv
+    out, rest = [], list(argv)
+    while rest:
+        one = rest.pop(0)
+        if one == "--":
+            out += [one, *rest]
+            break
+        if one == "--reply" and rest:
+            one = f"--reply={rest.pop(0)}"
+        out.append(one)
+    return out
+
+
 def main() -> None:
     _gate()
     argv = sys.argv[1:]
@@ -1684,7 +1766,7 @@ def main() -> None:
     if not argv:
         _cmd_help()
         return
-    args = _parser().parse_args(argv)
+    args = _parser().parse_args(_words_whole(argv))
     cmd = args.cmd
     if cmd == "help":
         _cmd_help()

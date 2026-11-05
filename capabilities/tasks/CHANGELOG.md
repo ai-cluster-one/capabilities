@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-05 — A task put before a person links back to it, and an answer in words alone returns it
+
+Every item a move puts in the Inbox for a person, and every item `tasks inbox` puts, names the task it came from as its source: the task's title as the label and its id as the reference, which `inbox show`, `inbox list` and `inbox status` return. `tasks answer` takes an ask answered in words alone (`INBOX_ANSWER` `other`): it records `neither yes nor no, in words:` and the words as given on the trail, and returns the task to where the move that put it before the person found it, exactly as a yes or a no does. It needs `inbox` from the same release, which takes the source flags.
+
 ## 2026-11-05 — A move to a person points at the Inbox's plain-language rule
 
 `tasks help` THE INBOX and `tasks guide loops` now say that what a move to a person puts before them - the task's title, its latest trail entry or objective, and the `--question` - is read by the person deciding and is written as `inbox stub` says, the line every agent's context carries where `inbox` is enabled. The rule itself lives there and is not repeated here. Nothing is refused for its wording, and every verb answers as before.

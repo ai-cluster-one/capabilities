@@ -414,6 +414,55 @@ def test_the_first_answer_is_final_and_the_store_refuses_changing_it(lab):
     assert lab.refused(lab.alpha, "answer", note["id"], "yes")[1]["code"] == "not_answerable"
 
 
+def test_an_item_links_to_the_thing_it_came_from_and_never_changes_it(lab):
+    linked = lab.ask(lab.alpha, "Ship it?", "--source-label", "Release 4", "--source-ref",
+                     "rel:4")
+    assert linked["source"] == {"label": "Release 4", "ref": "rel:4"}
+    talked = lab.ok(lab.alpha, "talk", "How?", "--text", "t", "--source-label", "Design",
+                    "--source-ref", "d-1")["item"]
+    noted = lab.ok(lab.alpha, "notify", "FYI", "--text", "t", "--source-label", "Note",
+                   "--source-ref", "n-1")["item"]
+    plain = lab.ok(lab.alpha, "notify", "Plain", "--text", "t")["item"]
+    assert plain["source"] is None
+    for item, ref in ((linked, "rel:4"), (talked, "d-1"), (noted, "n-1")):
+        assert lab.ok(lab.alpha, "show", item["id"])["source"]["ref"] == ref
+        assert lab.ok(lab.alpha, "status", item["id"])["source"]["ref"] == ref
+    listed = {i["id"]: i["source"] for i in lab.ok(lab.alpha, "list")["items"]}
+    assert listed[noted["id"]] == {"label": "Note", "ref": "n-1"} and listed[plain["id"]] is None
+    assert lab.refused(lab.alpha, "notify", "x", "--text", "t",
+                       "--source-ref", "r")[1]["code"] == "input"
+    import psycopg
+    with pytest.raises(psycopg.errors.CheckViolation, match="never changed"):
+        lab.sql(f"UPDATE {SCHEMA}.inbox_items SET source_ref = 'x' WHERE id = %s",
+                (linked["id"],))
+
+
+def test_an_ask_answered_in_words_alone_reaches_the_command_as_other_with_its_words(lab):
+    words = "-n " + NASTY
+    command = 'printf "%s|%s|%s\\n" "$INBOX_KIND" "$INBOX_ANSWER" "$INBOX_REPLY" > got'
+    item = lab.ask(lab.alpha, "Ship it?", "--on-answer", command)
+    answered = lab.ok(lab.beta, "answer", item["id"], "--reply", words)
+    assert (answered["answer"], answered["reply"]) == ("other", words)
+    assert lab.ok(lab.alpha, "status", item["id"])["answer"] == "other"
+    assert [d["id"] for d in lab.ok(lab.alpha, "deliver")["delivered"]] == [item["id"]]
+    assert (lab.alpha / "got").read_text() == f"ask|other|{words}\n"
+    assert not (lab.alpha / "pwned").exists() and not (lab.beta / "pwned").exists()
+    # The --reply=WORDS form says the same, and a dash-led reply on a talk too.
+    other = lab.ask(lab.alpha, "Other?")
+    assert lab.ok(lab.alpha, "answer", other["id"], f"--reply={words}")["reply"] == words
+    talk = lab.ok(lab.alpha, "talk", "How?", "--text", "t")["item"]
+    assert lab.ok(lab.alpha, "answer", talk["id"], "--reply", "--yes")["reply"] == "--yes"
+    # An ask with neither an answer nor words is still refused, and other
+    # without words is refused by the store.
+    bare = lab.ask(lab.alpha, "Bare?")
+    assert lab.refused(lab.alpha, "answer", bare["id"])[1]["code"] == "input"
+    assert lab.refused(lab.alpha, "answer", bare["id"], "other")[0] == 6
+    import psycopg
+    with pytest.raises(psycopg.errors.CheckViolation):
+        lab.sql(f"UPDATE {SCHEMA}.inbox_items SET answered_at = now(), answered_by = 'x', "
+                "answer = 'other' WHERE id = %s", (bare["id"],))
+
+
 def test_list_shows_the_folder_s_agent_or_every_agent_in_views_filters_and_pages(lab):
     made = [lab.ask(lab.alpha, f"Question {n}") for n in range(5)]
     note = lab.ok(lab.beta, "notify", "From beta", "--text", "t")["item"]

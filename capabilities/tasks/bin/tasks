@@ -1775,6 +1775,9 @@ THE INBOX
   is a new item. What the item carries - the task's title, that trail entry or
   objective, and the --question - is read by the person deciding, so it is
   written as `inbox stub` says, the inbox's line in every session's context.
+  Every item links to the task it came from: its source is the task's title as
+  the label and the task's id as the reference, which `inbox show`, `inbox
+  list` and `inbox status` return.
 
   --question TEXT --yes WORDS --no WORDS --recommend yes|no
                         on `set`, all four together and only on a call that
@@ -1789,7 +1792,9 @@ THE INBOX
   in this project's folder with the answer in its environment (INBOX_ITEM_ID,
   INBOX_KIND, INBOX_ANSWER, INBOX_REPLY, INBOX_ANSWERED_BY,
   INBOX_ANSWERED_AT), never in its text. It records the answer on the trail.
-  While the task still waits under that key it returns it to where that move
+  An ask may be answered yes, no, or in words alone (INBOX_ANSWER `other`),
+  neither yes nor no, whose words are the whole answer and are recorded as
+  given; each of the three is taken the same way. While the task still waits under that key it returns it to where that move
   found it - the status and assignee the move changed, an `in_progress` it
   found landing as `todo` - judged as `set` judges a move; a return that is
   refused says why on the trail. A task that has moved on gets only an entry
@@ -3989,18 +3994,20 @@ def _put_argv(cur, task: dict, key: str) -> list[str]:
         return "'" + value.replace("'", "'\"'\"'") + "'"
 
     on_answer = f"{NAME} answer {quoted(tid)} --key {quoted(key)}"
+    source = ["--source-label", title, "--source-ref", tid]
     question = (task.get("metadata") or {}).get(_QUESTION)
     if (isinstance(question, dict)
             and f"tasks:{tid}:{question.get('move')}" == key):
         return ["inbox", "ask", title, "--text", str(question.get("text")),
                 "--yes", str(question.get("yes")), "--no", str(question.get("no")),
                 "--recommend", str(question.get("recommend")),
-                "--key", key, "--on-answer", on_answer]
+                "--key", key, "--on-answer", on_answer, *source]
     cur.execute(f"""select description from {SCHEMA}.tasks_activities
                      where task_id = %s order by created_at desc limit 1""", (tid,))
     latest = _rows(cur)
     text = (latest[0]["description"] if latest else None) or task.get("objective") or title
-    return ["inbox", "talk", title, "--text", text, "--key", key, "--on-answer", on_answer]
+    return ["inbox", "talk", title, "--text", text, "--key", key, "--on-answer", on_answer,
+            *source]
 
 
 def _inbox_after() -> list[dict]:
@@ -4587,7 +4594,9 @@ def cmd_answer(entry, args: list[str]) -> None:
                 + (f" at {given['answered_at']}" if given["answered_at"] else "") + ": "
                 + (given["answer"] + (f" ({words})" if words else "")
                    + (f". Reply: {given['reply']}" if given["reply"] else "")
-                   if given["kind"] == "ask" else given["reply"] or "(no reply)"))
+                   if given["kind"] == "ask" and given["answer"] != "other"
+                   else ("neither yes nor no, in words: " if given["kind"] == "ask" else "")
+                   + (given["reply"] or "(no reply)")))
         answer = {"task": tid, "key": key, "item": given["item_id"], "returned": None}
         if task["status"] == "waiting" and _wait_key(cur, tid) == key:
             after, refused = _returned_from(cur, task, move, _execution_lookup(cur))
