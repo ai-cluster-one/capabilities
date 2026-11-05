@@ -3,8 +3,8 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "callva-harness-runner==0.10.2",
-#     "capabilities-contract>=0.42,<1",
+#     "callva-harness-runner==0.11.0",
+#     "capabilities-contract>=0.43,<1",
 # ]
 # ///
 """
@@ -448,7 +448,7 @@ class PeerTimeout(Exception):
 # store, so the next question to a target continues the same peer session. The
 # host is part of the key because a peer session lives in that machine's claude
 # or codex store, where the same target path means nothing on another machine.
-SESSIONS_MAJOR, SESSIONS_MINOR = 1, 0
+SESSIONS_MAJOR, SESSIONS_MINOR = 2, 0
 SESSIONS_STEPS = [
     ("0001-sessions", """
     CREATE TABLE askproject_sessions (
@@ -467,6 +467,23 @@ SESSIONS_STEPS = [
         CONSTRAINT askproject_sessions_pkey
             PRIMARY KEY (project_id, host, target_path)
     )"""),
+    # 2.0: the caller is an agent, so its column is agent_id; the rows stay.
+    ("0002-agent-id", """
+    ALTER TABLE askproject_sessions RENAME COLUMN project_id TO agent_id;
+    DO $rename$
+    DECLARE
+        one record;
+    BEGIN
+        FOR one IN
+            SELECT c.conname FROM pg_constraint c
+            WHERE c.conrelid = 'askproject_sessions'::regclass
+              AND c.conname LIKE '%project\\_id%'
+        LOOP
+            EXECUTE format('ALTER TABLE askproject_sessions RENAME CONSTRAINT %I TO %I',
+                           one.conname, replace(one.conname, 'project_id', 'agent_id'));
+        END LOOP;
+    END
+    $rename$"""),
 ]
 
 
@@ -575,7 +592,7 @@ class SessionMap:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT target_path, {', '.join(SESSION_COLUMNS)} "
-                    "FROM askproject_sessions WHERE project_id = %s AND host = %s"
+                    "FROM askproject_sessions WHERE agent_id = %s AND host = %s"
                     f"{where} ORDER BY last_used_at NULLS FIRST, target_path",
                     (self.project_id, self.host, *params))
                 rows = cur.fetchall()
@@ -601,10 +618,10 @@ class SessionMap:
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "INSERT INTO askproject_sessions (project_id, host, target_path, "
+                    "INSERT INTO askproject_sessions (agent_id, host, target_path, "
                     f"{', '.join(SESSION_COLUMNS)}) VALUES "
                     "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
-                    "ON CONFLICT (project_id, host, target_path) DO UPDATE SET "
+                    "ON CONFLICT (agent_id, host, target_path) DO UPDATE SET "
                     + ", ".join(f"{c} = EXCLUDED.{c}" for c in SESSION_COLUMNS
                                 if c != "interactions")
                     + ", interactions = askproject_sessions.interactions + %s",

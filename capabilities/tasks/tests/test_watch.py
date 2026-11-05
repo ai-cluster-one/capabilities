@@ -106,7 +106,7 @@ def test_the_watch_follows_the_version_and_listens_for_nothing(monkeypatch):
 def _insert_task(schema: str, project: str) -> None:
     import psycopg
     with psycopg.connect(DSN, autocommit=True) as conn:
-        conn.execute(f"""insert into {schema}.tasks_tasks (project_id, type, unique_key,
+        conn.execute(f"""insert into {schema}.tasks_tasks (agent_id, type, unique_key,
                                                             title, status)
                          values (%s, 'chore', %s, 'a chore', 'todo')""",
                      (project, uuid.uuid4().hex))
@@ -360,7 +360,7 @@ def test_what_is_printed_is_what_the_scope_reads(lab):
     mine = _answer(_tasks(lab, "add", "--type", "change", "--title", "mine"))["created"]
     with psycopg.connect(DSN) as conn:
         theirs = str(conn.execute(
-            f"insert into {lab['schema']}.tasks_tasks (project_id, type, title) "
+            f"insert into {lab['schema']}.tasks_tasks (agent_id, type, title) "
             "values (%s, 'change', 'theirs') returning id", (OTHER,)).fetchone()[0])
         conn.commit()
     seen_here = here.until(lambda l: l["event"] == "counts") + here.quiet()

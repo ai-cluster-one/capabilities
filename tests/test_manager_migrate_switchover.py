@@ -17,6 +17,7 @@ without `initdb`, `pg_ctl`, git or psycopg.
 from __future__ import annotations
 
 import json
+import os
 import plistlib
 import shutil
 import subprocess
@@ -26,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from test_manager_migrate import (MASTER, REPO, SCHEMA, WORKER, World, answers_file, gate,
-                                  nid, node_env)
+                                  legacy_store, nid, node_env)
 
 
 NAMES = ("automations", "coolify", "memory", "tasks", "whatsapp")
@@ -35,6 +36,11 @@ IDS = {"main": "prj_5a5a5a5a5a51", "empty": "prj_5a5a5a5a5a52", "first": "prj_5a
        "stray": "prj_5a5a5a5a5a57", "sched": "prj_5a5a5a5a5a58",
        "hidden": "prj_5a5a5a5a5a59", "bound": "prj_5a5a5a5a5a5a"}
 OTHER_NODE = "srv-discard"
+# The core's steps, which a store whose tables are still owner `capabilities`
+# is brought to its shape by. They cross the store's major, which only the
+# store upgrade does: a process runs as part of it under UPGRADING.
+CORE_STEPS = ["0039-core"]
+UPGRADING = {"CAPABILITIES_STORE_UPGRADE": "1"}
 
 
 def wa(phone: str) -> dict:
@@ -42,26 +48,41 @@ def wa(phone: str) -> dict:
 
 
 def upgrade_to(world: World, count: int, major: int, minor: int) -> None:
-    """The contract's tables brought to their first `count` steps."""
+    """The contract's tables as a release before the core left them: their
+    first `count` steps under owner `capabilities` at `major.minor`."""
+    from capabilities_contract import db
+    setting = db.Setting(url=world.url(), schema=SCHEMA, level="environment")
+    conn = db.connect(application_name="test", setting=setting)
+    try:
+        legacy_store(conn, SCHEMA, count, major, minor)
+    finally:
+        conn.close()
+
+
+def upgrade_core(world: World) -> None:
+    """The contract's tables brought to this code's version: the core's."""
     from capabilities_contract.capability import store as S
     from capabilities_contract import db
     setting = db.Setting(url=world.url(), schema=SCHEMA, level="environment")
-    conn = db.connect(application_name=S.STORE_OWNER, setting=setting)
+    conn = db.connect(application_name=S.STORE_APPLICATION, setting=setting)
+    held = os.environ.get(db.UPGRADE_ENV)
+    os.environ.update(UPGRADING)
     try:
-        db.migrate(conn, S.STORE_OWNER, S.record_table_steps()[:count], major=major,
-                   minor=minor)
+        db.migrate(conn, S.STORE_OWNER, S.record_table_steps(),
+                   major=S.STORE_TABLES_VERSION[0], minor=S.STORE_TABLES_VERSION[1])
     finally:
+        os.environ.pop(db.UPGRADE_ENV) if held is None else os.environ.update(
+            {db.UPGRADE_ENV: held})
         conn.close()
 
 
 def ensure_global(world: World) -> None:
     """The global rows written, whatever the global run under test did, so
     each later test meets its own defect."""
-    if world.sql("SELECT to_regclass('capabilities_global') IS NOT NULL")[0][0] and \
-            world.sql("SELECT global_migrated_at FROM capabilities_global")[0][0]:
+    if world.sql("SELECT to_regclass('store_state') IS NOT NULL")[0][0] and \
+            world.sql("SELECT global_migrated_at FROM store_state")[0][0]:
         return
-    from capabilities_contract.capability import store as S
-    upgrade_to(world, len(S.record_table_steps()), *S.STORE_TABLES_VERSION)
+    upgrade_core(world)
     world.answer(world.manager(world.roots["first"], "migrate", "--global", "--apply"))
 
 
@@ -175,7 +196,7 @@ def build(w: World) -> None:
 
 
 def state(w: World, agent_id: str) -> tuple:
-    rows = w.sql("SELECT migrating_since, migrated_at FROM capabilities_agents WHERE id = %s",
+    rows = w.sql("SELECT migrating_since, migrated_at FROM agents WHERE id = %s",
                  (agent_id,))
     return rows[0] if rows else (None, None)
 
@@ -207,28 +228,31 @@ def dry_runs_change_nothing(w: World, version: str) -> dict:
     before = store_snapshot(w)
     # The capabilities' own tables, not made yet or behind: planned as if
     # they stood at this code's version, their steps named, nothing written.
-    result = w.manager(w.roots["sched"], "migrate", "--dry-run")
+    result = w.manager(w.roots["sched"], "migrate", "--dry-run", **UPGRADING)
     sched = w.answer(result)
     assert not sched["plan"]["mover_failures"], sched["plan"]["mover_failures"]
     items = {name: [(i["name"], i["outcome"]) for i in report["items"]]
              for name, report in sched["plan"]["movers"].items() if report["items"]}
     assert items == {"automations": [("nightly", "would_write")],
                      "tasks": [("reviewer", "would_write")]}
-    assert {"capabilities", "automations", "tasks", "harness"} <= set(sched["tables_to_upgrade"])
+    assert {"core", "automations", "tasks", "harness"} <= set(sched["tables_to_upgrade"])
     assert store_snapshot(w) == before
-    result = w.manager(root, "migrate", "--global", "--dry-run")
+    result = w.manager(root, "migrate", "--global", "--dry-run", **UPGRADING)
     assert "Traceback" not in result.stderr, result.stderr[-2000:]
     dry = w.answer(result)
     assert dry["applied"] is False and dry["would_write"] is True
-    assert dry["tables_to_upgrade"]["capabilities"]["from"] == version
-    assert dry["tables_to_upgrade"]["capabilities"]["to"] == "1.23"
+    # The core has no version before its step: the tables are still owner
+    # `capabilities`, at `version`.
+    assert dry["tables_to_upgrade"]["core"] == {"from": None, "to": "2.0", "steps": CORE_STEPS}
+    assert w.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
+        == [tuple(int(part) for part in version.split("."))]
     assert "tables_upgraded" not in dry
     assert {r["capability"] for r in dry["plan"]["policy"]} == {"coolify", "memory"}
     assert store_snapshot(w) == before
-    result = w.manager(root, "migrate", "--dry-run")
+    result = w.manager(root, "migrate", "--dry-run", **UPGRADING)
     assert "Traceback" not in result.stderr, result.stderr[-2000:]
     agent = w.answer(result)
-    assert agent["tables_to_upgrade"]["capabilities"] == dry["tables_to_upgrade"]["capabilities"]
+    assert agent["tables_to_upgrade"]["core"] == dry["tables_to_upgrade"]["core"]
     assert [b["code"] for b in agent["blockers"]] == ["global_not_migrated"]
     assert not agent["plan"]["mover_failures"], agent["plan"]["mover_failures"]
     assert {(c["name"], c["outcome"]) for c in agent["plan"]["records"]["connections"]} \
@@ -262,26 +286,34 @@ def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(wor
     root = world.roots["first"]
     assert world.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
         == [(1, 1)]
-    dry = dry_runs_change_nothing(world, "1.1")
-    assert dry["tables_to_upgrade"]["capabilities"]["steps"][0].startswith("0009")
+    dry_runs_change_nothing(world, "1.1")
     # At 1.2: the registry is there, the node on identifiers and the
-    # settings tables are not; automations' tables are one step behind.
+    # settings tables are not.
     upgrade_to(world, 13, 1, 2)
+    dry_runs_change_nothing(world, "1.2")
+    # Outside the store upgrade, neither a dry run nor the apply crosses it.
+    for flags in (("--dry-run",), ("--apply",)):
+        refused = world.error(world.manager(root, "migrate", "--global", *flags))
+        assert refused["code"] == "store_upgrade_needed", flags
+    applied = world.answer(world.manager(root, "migrate", "--global", "--apply", **UPGRADING))
+    assert applied["state"] == "migrated" and applied["changed"] is True
+    assert applied["tables_upgraded"] == {"steps": CORE_STEPS, "version": "2.0"}
+    assert world.sql("SELECT owner, major, minor FROM schema_version WHERE owner IN "
+                     "('capabilities', 'core') ORDER BY owner") \
+        == [("capabilities", 2, 0), ("core", 2, 0)]
+    assert world.sql("SELECT count(*) FROM schema_ledger WHERE owner = 'capabilities'") \
+        == [(0,)]
+    # automations' tables one step behind, which any owner's migrate makes
+    # only once the core is current.
     last, current = automations_ledger_behind(world)
-    dry = dry_runs_change_nothing(world, "1.2")
-    assert dry["tables_to_upgrade"]["capabilities"]["steps"][0].startswith("0014")
     sched = world.answer(world.manager(world.roots["sched"], "migrate", "--dry-run"))
+    assert "core" not in sched["tables_to_upgrade"]
     assert sched["tables_to_upgrade"]["automations"] == {"from": "1.0", "to": current,
                                                          "steps": [last]}
-    applied = world.answer(world.manager(root, "migrate", "--global", "--apply"))
-    assert applied["state"] == "migrated" and applied["changed"] is True
-    assert applied["tables_upgraded"]["version"] == "1.23"
-    assert applied["tables_upgraded"]["steps"][0].startswith("0014")
-    assert world.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
-        == [(1, 23)]
-    # Each capability's own tables, as its install migrated them.
+    # Each capability's own tables, as its install migrated them; automations'
+    # last step crosses its major.
     for name in ("automations", "tasks", "whatsapp", "memory"):
-        result = world.cap(root, name, "migrate")
+        result = world.cap(root, name, "migrate", **UPGRADING)
         assert result.returncode == 0, (name, result.stderr)
 
 
@@ -307,7 +339,7 @@ def test_a_second_checkout_never_writes_the_agents_rows(world):
         assert [b["code"] for b in dry["blockers"]][:1] == ["second_checkout"]
         assert dry["would_write"] is False and "plan" not in dry
         assert world.everything() == before, name
-    assert world.sql("SELECT label FROM capabilities_identifiers WHERE agent_id = %s "
+    assert world.sql("SELECT label FROM identifiers WHERE agent_id = %s "
                      "ORDER BY label", (IDS["main"],)) == [("app",), ("extra",)]
     # The main checkout moves; the others then read its rows and change nothing.
     applied = world.answer(world.manager(main, "migrate", "--apply"))
@@ -344,7 +376,7 @@ def test_a_clone_whose_main_checkout_is_nowhere_found_writes_nothing(world):
     planned = world.answer(world.manager(clone, "migrate", "--answers", answers))
     assert "second_checkout" not in planned and planned["plan"]["records"]["remove"]
     assert store_snapshot(world) == rows
-    assert world.sql("SELECT label FROM capabilities_identifiers WHERE agent_id = %s "
+    assert world.sql("SELECT label FROM identifiers WHERE agent_id = %s "
                      "ORDER BY label", (IDS["hidden"],)) == [("app",), ("extra",)]
 
 
@@ -393,13 +425,13 @@ def test_a_connection_renamed_for_this_agent(world):
         "whatsapp/shared": {"rename": "second-shared"}}})
     applied = world.answer(world.manager(root, "migrate", "--apply", "--answers", answers))
     assert applied["state"] == "migrated" and not applied["verify"]["differences"]
-    assert dict(world.sql("SELECT name, spec->>'phone' FROM capabilities_connections "
+    assert dict(world.sql("SELECT name, spec->>'phone' FROM connections "
                           "WHERE capability = 'whatsapp'")) == {
         "shared": "+10000000001", "second-shared": "+10000000002"}
-    assert world.sql("SELECT connection, is_default FROM capabilities_connection_grants "
+    assert world.sql("SELECT connection, is_default FROM grants "
                      "WHERE agent_id = %s AND capability = 'whatsapp'", (IDS["second"],)) \
         == [("second-shared", True)]
-    assert world.sql("SELECT value FROM capabilities_settings WHERE agent_id = %s AND "
+    assert world.sql("SELECT value FROM settings WHERE agent_id = %s AND "
                      "capability = 'whatsapp' AND path = '{connection}'",
                      (IDS["second"],)) == [("second-shared",)]
     switch = world.through_switch(root, ["whatsapp"])
@@ -409,7 +441,7 @@ def test_a_connection_renamed_for_this_agent(world):
     assert switch["defaults"]["whatsapp"] == "second-shared"
     assert switch["settings"]["whatsapp"]["keys"]["connection"] == "second-shared"
     # The others keep the stored one.
-    assert world.sql("SELECT connection FROM capabilities_connection_grants WHERE "
+    assert world.sql("SELECT connection FROM grants WHERE "
                      "agent_id = %s AND capability = 'whatsapp'", (IDS["first"],)) == [("shared",)]
 
 
@@ -421,7 +453,7 @@ def test_keeping_the_stores_connection_adopts_it(world):
     applied = world.answer(result)
     assert applied["state"] == "migrated" and not applied["verify"]["differences"]
     assert state(world, IDS["third"])[0] is None
-    assert world.sql("SELECT spec->>'phone' FROM capabilities_connections WHERE "
+    assert world.sql("SELECT spec->>'phone' FROM connections WHERE "
                      "capability = 'whatsapp' AND name = 'shared'") == [("+10000000001",)]
     switch = world.through_switch(root, ["whatsapp"])
     assert {cid: v[0]["phone"] for cid, v in switch["connections"]["whatsapp/False"].items()} \
@@ -519,7 +551,7 @@ def test_list_counts_machine_connections_from_the_store_after_discard(world):
         path.unlink()
     listed = world.answer(world.manager(world.roots["first"], "list"))
     counts = {row["name"]: row["machine_connections"] for row in listed["installed"]}
-    held = dict(world.sql("SELECT capability, count(*) FROM capabilities_connections "
+    held = dict(world.sql("SELECT capability, count(*) FROM connections "
                           "GROUP BY capability"))
     assert counts["whatsapp"] == held["whatsapp"] == 2
     assert counts["coolify"] == held["coolify"] >= 1

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.43,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -1730,9 +1730,33 @@ CREATE TRIGGER whatsapp_outbox_announce
   AFTER INSERT ON whatsapp_messages
   FOR EACH ROW WHEN (new.delivery = 'pending')
   EXECUTE FUNCTION whatsapp_outbox_announce()"""),
+    # The store names an agent where it named a project: the column that holds
+    # one in the register and the job tables, and every constraint named for
+    # it. The rows stay where they are; this is major 2, so a release that
+    # still reads the old names refuses the store instead of failing on a
+    # missing column.
+    Step("0023-agent-names", """
+ALTER TABLE whatsapp_register RENAME COLUMN project_id TO agent_id;
+ALTER TABLE whatsapp_jobs RENAME COLUMN project_id TO agent_id;
+ALTER TABLE whatsapp_job_amendments RENAME COLUMN project_id TO agent_id;
+ALTER TABLE whatsapp_job_slots RENAME COLUMN project_id TO agent_id;
+DO $$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT c.conrelid::regclass AS tab, c.conname
+             FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid
+            WHERE t.relnamespace = current_schema()::regnamespace
+              AND t.relname IN ('whatsapp_register', 'whatsapp_jobs',
+                                'whatsapp_job_amendments', 'whatsapp_job_slots')
+              AND c.conname LIKE '%project%'
+  LOOP
+    EXECUTE format('ALTER TABLE %s RENAME CONSTRAINT %I TO %I',
+                   r.tab, r.conname, replace(r.conname, 'project', 'agent'));
+  END LOOP;
+END $$"""),
 ]
-STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 4
+STORE_SCHEMA_MAJOR = 2
+STORE_SCHEMA_MINOR = 0
 
 
 def _tables():
@@ -7679,13 +7703,13 @@ _SIGN_IN_HARNESSES = ("claude", "codex")
 # which the runner resumes on its own.
 _HARNESS_OPEN_JOBS = """
     SELECT id, profile FROM whatsapp_jobs
-     WHERE project_id = %s AND environment = %s AND surface = 'whatsapp'
+     WHERE agent_id = %s AND environment = %s AND surface = 'whatsapp'
        AND (state IN ('draft', 'waiting', 'running')
             OR (state = 'stopped' AND outcome = 'quota'))
      ORDER BY created_at, id"""
 _HARNESS_CHAT_PROFILES = """
     SELECT chat_id, overrides->>'profile' FROM whatsapp_register
-     WHERE project_id = %s AND environment = %s AND overrides->>'profile' IS NOT NULL
+     WHERE agent_id = %s AND environment = %s AND overrides->>'profile' IS NOT NULL
      ORDER BY chat_id"""
 
 
@@ -8900,7 +8924,7 @@ def _open_jobs(args):
 
 def _job_row(row: dict) -> dict:
     out = {k: v for k, v in row.items()
-           if k not in ("attempt_token", "lease_owner", "project_id", "surface")}
+           if k not in ("attempt_token", "lease_owner", "agent_id", "surface")}
     out["stopping"] = bool(out.pop("stop_requested", False))
     return out
 

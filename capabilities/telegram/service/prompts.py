@@ -3,12 +3,13 @@
 A prompt is the text a run class is given whole - `context` for a dialogue
 turn, `job-worker` for a job, a provider's voice prompts, a channel's
 `context.<x>` - by the document key `settings_schema.document_key` folds its
-file name to. Each save is a new row of `telegram_prompts`; exactly one row per
-project and key is active, and the store refuses any change to a row but
+file name to. Each save is a new row of `telegram_prompt_versions`; exactly one
+row per agent and key is active, and the store refuses any change to a row but
 clearing `active`, so every earlier version stays readable as it was.
 
 The table is this capability's own, created by step `0005-prompts` of the
-register's ledger (`jobs.STORE_STEPS`), so it exists wherever the register
+register's ledger (`jobs.STORE_STEPS`) and named for its versions by step
+`0007-agent-names`, so it exists wherever the register
 opens. The files under `capabilities/telegram/service/` are what `import`
 reads and `export` writes; the service reads a key's active row, and its file
 only while the store holds no version of that key. Reference documents
@@ -23,7 +24,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
-TABLE = "telegram_prompts"
+TABLE = "telegram_prompt_versions"
 # Where a key's file sits under a service directory: `context.<x>` in
 # `context/`, every other key beside settings.json.
 CONTEXT_PREFIX = "context."
@@ -57,7 +58,7 @@ def active(conn, project_id: str, key: str) -> dict | None:
     """The version of `key` in force for the project, or None where the store
     holds none."""
     found = conn.execute(
-        f"SELECT {_COLUMNS} FROM {TABLE} WHERE project_id = %s AND key = %s AND active",
+        f"SELECT {_COLUMNS} FROM {TABLE} WHERE agent_id = %s AND key = %s AND active",
         (project_id, key)).fetchone()
     return _row(found) if found else None
 
@@ -65,7 +66,7 @@ def active(conn, project_id: str, key: str) -> dict | None:
 def version(conn, project_id: str, key: str, version_id: str) -> dict | None:
     """One version of `key`, active or not, or None where it is not one."""
     found = conn.execute(
-        f"SELECT {_COLUMNS} FROM {TABLE} WHERE project_id = %s AND key = %s "
+        f"SELECT {_COLUMNS} FROM {TABLE} WHERE agent_id = %s AND key = %s "
         "AND id::text = %s", (project_id, key, version_id)).fetchone()
     return _row(found) if found else None
 
@@ -73,7 +74,7 @@ def version(conn, project_id: str, key: str, version_id: str) -> dict | None:
 def versions(conn, project_id: str, key: str) -> list[dict]:
     """Every version of `key`, newest first, without their text."""
     rows = conn.execute(
-        f"SELECT {_COLUMNS} FROM {TABLE} WHERE project_id = %s AND key = %s "
+        f"SELECT {_COLUMNS} FROM {TABLE} WHERE agent_id = %s AND key = %s "
         "ORDER BY created_at DESC, id", (project_id, key)).fetchall()
     return [{k: v for k, v in _row(r).items() if k != "body"} for r in rows]
 
@@ -83,7 +84,7 @@ def keys(conn, project_id: str) -> list[dict]:
     many versions it has."""
     rows = conn.execute(
         f"SELECT key, count(*), max(id::text) FILTER (WHERE active), "
-        f"max(created_at) FILTER (WHERE active) FROM {TABLE} WHERE project_id = %s "
+        f"max(created_at) FILTER (WHERE active) FROM {TABLE} WHERE agent_id = %s "
         "GROUP BY key ORDER BY key", (project_id,)).fetchall()
     return [{"key": key, "versions": count, "active": vid,
              "active_since": since.isoformat() if since else None}
@@ -105,7 +106,7 @@ def save(conn, project_id: str, key: str, body: str, created_by: str,
     try:
         with conn.transaction():
             current = conn.execute(
-                f"SELECT {_COLUMNS} FROM {TABLE} WHERE project_id = %s AND key = %s "
+                f"SELECT {_COLUMNS} FROM {TABLE} WHERE agent_id = %s AND key = %s "
                 "AND active FOR UPDATE", (project_id, key)).fetchone()
             current = _row(current) if current else None
             if base is not None and (current or {}).get("id") != base:
@@ -120,7 +121,7 @@ def save(conn, project_id: str, key: str, body: str, created_by: str,
                 conn.execute(f"UPDATE {TABLE} SET active = false WHERE id = %s::uuid",
                              (current["id"],))
             found = conn.execute(
-                f"INSERT INTO {TABLE} (project_id, key, body, created_by, note) "
+                f"INSERT INTO {TABLE} (agent_id, key, body, created_by, note) "
                 f"VALUES (%s, %s, %s, %s, %s) RETURNING {_COLUMNS}",
                 (project_id, key, body, created_by, note)).fetchone()
     except errors.UniqueViolation as exc:

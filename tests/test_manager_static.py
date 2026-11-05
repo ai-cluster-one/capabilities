@@ -62,9 +62,11 @@ class LeaseStepsTests(unittest.TestCase):
             [("0001-service-leases",
               "fa19c921e39a42a9070e78efabe9d05de191cf41acfc113a000f84a575d72d7b"),
              ("0002-service-lease-errors",
-              "c2b45f216e881d2140b3d1f4d41a2bca31513e52f6efe0ec86463c5aa0fff16c")])
+              "c2b45f216e881d2140b3d1f4d41a2bca31513e52f6efe0ec86463c5aa0fff16c"),
+             ("0003-agent-names",
+              "31f18acd4e64cf58a51145bd459e220707467a08af7b4295ecbf5f574b00d0a0")])
         self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_OWNER"), "deployment")
-        self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_VERSION"), (1, 1))
+        self.assertEqual(_literal(MANAGER, "SUPERVISE_LEASE_VERSION"), (2, 0))
         deployment = (REPO / "capabilities" / "deployment" / "bin" / "deployment").read_text()
         for name in ("TABLES", "LEASE_STEPS", "_tables"):
             self.assertNotRegex(deployment, rf"(?m)^(def )?{name}\b")

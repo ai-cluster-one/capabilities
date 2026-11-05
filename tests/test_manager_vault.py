@@ -57,7 +57,7 @@ def test_generate_writes_the_key_to_the_folder_and_only_its_fingerprint_to_the_s
     key = _key_line(lab)
     assert len(key) == 43 and key not in json.dumps(made)
     assert made["fingerprint"] == lab.sql(
-        f"SELECT vault_key FROM {SCHEMA}.capabilities_agents WHERE id = %s",
+        f"SELECT vault_key FROM {SCHEMA}.agents WHERE id = %s",
         (PROJECT_ID,))[0][0]
     assert made["written"] == str(lab.project / ".env.local")
     code, error = lab.refused("key", "generate")
@@ -73,7 +73,7 @@ def test_a_secret_is_set_from_stdin_listed_by_name_shown_on_request_and_removed(
     assert listed["secrets"][0]["readable"] is True and listed["unreadable"] == []
     assert listed["key"]["set"] is True and listed["key"]["matches"] is True
     assert "tok-2" not in json.dumps(listed)
-    stored = lab.sql(f"SELECT ciphertext FROM {SCHEMA}.capabilities_vault")
+    stored = lab.sql(f"SELECT ciphertext FROM {SCHEMA}.secrets")
     assert b"tok-2" not in bytes(stored[0][0])
     shown = lab.run("secrets", "show", "API_TOKEN")
     assert shown.returncode == 0 and shown.stdout == "tok-2\n"

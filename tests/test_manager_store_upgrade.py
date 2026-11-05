@@ -10,10 +10,11 @@ quarantined capability's too - goes on from where it stopped, speaks as
 events, and lists the nodes left to bring up. A node last seen before the
 store moved reads unreachable, and `node update --node` refuses it.
 
-The major is made here: a capability whose second release marks a step
-`major=2`, and a core major written into the store the way a crossing writes
-it, or crossed by a newest-line manager whose library carries a core step
-marked major. The stores are databases of a throwaway PostgreSQL on a loopback
+The store's own major is the manager's (STORE_MAJOR), which every fresh store
+takes on its first migration. A newer major is made here: a capability whose
+second release marks a step `major=2`, and a core major written into the store
+the way a crossing writes it, or crossed by a newest-line manager whose library
+carries a core step marked the next major. The stores are databases of a throwaway PostgreSQL on a loopback
 port, started when `initdb`, `pg_ctl`, `pg_dump` and `pg_restore` are on PATH
 and psycopg is importable, and skipped otherwise.
 """
@@ -47,6 +48,8 @@ PROJECT_ID = "prj_" + "5a6b7c8d9e0f"
 NODE_OLD, NODE_NEW, NODE_SILENT = "1a1b1c1d1e1f", "2a2b2c2d2e2f", "3a3b3c3d3e3f"
 UPGRADE = "capabilities store upgrade"
 M = runpy.run_path(str(MANAGER), run_name="manager_store_upgrade_test")
+# The major this manager reads, which a fresh store is at, and the next one.
+STORE, NEXT = M["STORE_MAJOR"], M["STORE_MAJOR"] + 1
 
 
 # --- a throwaway PostgreSQL ------------------------------------------------------
@@ -182,6 +185,11 @@ MAJOR = 2'''
 
 
 def _probe(root: Path, second: bool, extra: str = "") -> Path:
+    """probe's bundle in `root`, a `capabilities/` folder whose tree's catalogue
+    names the store major this manager reads, as a release of it does."""
+    (root.parent.parent / ".capability-source").mkdir(parents=True, exist_ok=True)
+    (root.parent.parent / ".capability-source" / "catalog.json").write_text(
+        json.dumps({"store_major": STORE}))
     (root / "bin").mkdir(parents=True, exist_ok=True)
     (root / "bin" / "probe").write_text(
         PROBE.replace("{second}", (SECOND if second else "") + "\n" + extra))
@@ -258,14 +266,20 @@ class Machine:
         """Three nodes: one seen a minute ago, one with no state row."""
         for node, label in ((NODE_OLD, "old-node"), (NODE_SILENT, "silent-node")):
             self.ok("node", "add", node, "--label", label, "--kind", "server")
-        self.sql("INSERT INTO capabilities_node_states (node, reported_at, fresh_until) "
+        self.sql("INSERT INTO node_states (node, reported_at, fresh_until) "
                  "VALUES (%s, now() - interval '1 minute', now() + interval '1 hour')",
                  (NODE_OLD,))
+
+    def cross(self, major: int) -> None:
+        """The core at `major`, crossed now, the way the upgrade writes it."""
+        self.sql("UPDATE schema_version SET major = %s, updated_at = now() "
+                 "WHERE owner = 'core'", (major,))
+        self.sql("UPDATE schema_ledger SET applied_at = now() WHERE owner = 'core'")
 
     def probe(self, quarantined: bool = False) -> Path:
         """probe installed at its first release with a row in its table, then
         its second release taken, whose migration refuses to cross alone."""
-        source = _probe(self.tmp / "src" / "probe", second=False)
+        source = _probe(self.tmp / "src" / "capabilities" / "probe", second=False)
         installed = self.ok("install", "probe", "--from", str(source), "--allow")
         assert installed["migrate"]["ok"] is True, installed
         if quarantined:
@@ -313,7 +327,7 @@ def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) ->
     assert checked["state"] == "upgrade_available"
     assert checked["upgrade_needed"] is True and checked["can_run"] is True
     assert checked["blockers"] == [] and checked["next"] == [UPGRADE]
-    assert checked["store"]["level"] == "project" and checked["store"]["major"] == 1
+    assert checked["store"]["level"] == "project" and checked["store"]["major"] == STORE
     assert checked["store"]["reachable"] is True
     owners = {entry["owner"]: entry for entry in checked["owners"]}
     assert owners["probe"]["by"] == "capability"
@@ -334,8 +348,12 @@ def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) ->
     assert set(node) >= {"label", "kind", "last_seen_at", "reachable", "runs", "command"}
     assert not (machine.data / "capabilities" / "backups").exists()
 
-    # What stops it is in the answer with what to do, and the upgrade refuses.
+    # An owner the store still records whose tables are gone, as a retired
+    # tool's, has nothing to move and stops nothing.
     machine.sql("INSERT INTO schema_version (owner, major, minor) VALUES ('ghost', 1, 0)")
+    assert machine.ok("store", "upgrade", "--check")["blockers"] == []
+    # What stops it is in the answer with what to do, and the upgrade refuses.
+    machine.sql("CREATE TABLE ghost_items (id int)")
     tools = {Path(shutil.which(t)).parent for t in ("pg_dump", "pg_restore")}
     path = os.pathsep.join(p for p in machine.base["PATH"].split(os.pathsep)
                            if Path(p) not in tools)
@@ -353,7 +371,7 @@ def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) ->
 
 
 def test_with_nothing_to_cross_it_changes_nothing_and_the_switch_refuses(machine) -> None:
-    source = _probe(machine.tmp / "src" / "probe", second=False)
+    source = _probe(machine.tmp / "src" / "capabilities" / "probe", second=False)
     machine.ok("install", "probe", "--from", str(source), "--allow")
     machine.ok("node", "add", NODE_OLD, "--label", "old-node", "--kind", "server")
     before = machine.books()
@@ -462,14 +480,16 @@ class _Quiet(http.server.SimpleHTTPRequestHandler):
         pass
 
 
-# The newest line's manager reads major 2, and its library carries a core step
-# that crosses the store's core to it.
-NEWEST = '''
+# The newest line's manager reads the next major, and its library carries a
+# core step that crosses the store's core to it.
+NEWEST = f'''
 import capabilities_contract.db as _store_db
 import capabilities_contract.db._migrate as _store_migrate
-_store_migrate.CORE_STEPS = (_store_migrate.Step("core-0001-major", "SELECT 1", major=2),)
-_store_migrate.CORE_VERSION = (2, 0)
-_store_migrate.STORE_MAJOR = _store_db.STORE_MAJOR = 2
+from capabilities_contract.capability import store as _store_tier
+_store_migrate.CORE_STEPS = (*_store_migrate.CORE_STEPS,
+                             _store_migrate.Step("core-{NEXT}-major", "SELECT 1", major={NEXT}))
+_store_migrate.CORE_VERSION = _store_tier.STORE_TABLES_VERSION = ({NEXT}, 0)
+_store_migrate.STORE_MAJOR = _store_db.STORE_MAJOR = {NEXT}
 # the newest manager
 '''
 
@@ -496,9 +516,9 @@ def _manager_release(root: Path, store_major: int, manager: bytes,
 
 
 def _newest_release(root: Path) -> None:
-    text = MANAGER.read_text().replace("\nSTORE_MAJOR = 1\n", "\nSTORE_MAJOR = 2\n", 1)
+    text = MANAGER.read_text().replace(f"\nSTORE_MAJOR = {STORE}\n", f"\nSTORE_MAJOR = {NEXT}\n", 1)
     head, tail, end = text.rpartition('\nif __name__ == "__main__":')
-    _manager_release(root, 2, (head + NEWEST + tail + end).encode())
+    _manager_release(root, NEXT, (head + NEWEST + tail + end).encode())
 
 
 def _legacy_link(machine) -> Path:
@@ -521,7 +541,7 @@ def test_upgrade_hands_over_to_the_newest_lines_manager_which_crosses_the_core(
         source = f"{base}/main"
         checked = machine.ok("store", "upgrade", "--check", exe=link,
                              CAPABILITIES_SOURCE=source)
-        assert checked["available"]["major"] == 2 and checked["target_major"] == 2
+        assert checked["available"]["major"] == NEXT and checked["target_major"] == NEXT
         assert checked["state"] == "upgrade_available"
         result = machine.run("store", "upgrade", "--events", exe=link,
                              CAPABILITIES_SOURCE=source)
@@ -539,16 +559,16 @@ def test_upgrade_hands_over_to_the_newest_lines_manager_which_crosses_the_core(
     assert ("capabilities", None, "done") in after and ("dump", None, "done") in after
     assert ("migrate", "core", "done") in after
     answer = events[-1]["result"]
-    assert answer["major"] == {"before": 1, "after": 2}
+    assert answer["major"] == {"before": STORE, "after": NEXT}
     assert answer["manager"]["release"] == handover["release"]
-    assert machine.sql("SELECT major FROM schema_version WHERE owner = 'core'") == [(2,)]
+    assert machine.sql("SELECT major FROM schema_version WHERE owner = 'core'") == [(NEXT,)]
     left = {node["node"] for node in answer["nodes_to_bring_up"]}
     assert left == {NODE_OLD, NODE_SILENT}
     # The node seen before the store moved reads unreachable, and takes no request.
     state = machine.ok("node", "state", exe=link)
     old = next(node for node in state["nodes"] if node["node"] == NODE_OLD)
     assert old["reachable"] is False and old["health"] == "red"
-    assert old["cannot_read_store"]["store_major"] == 2
+    assert old["cannot_read_store"]["store_major"] == NEXT
     code, error = machine.refused("node", "update", "--node", "old-node", exe=link)
     assert (code, error["code"]) == (6, "node_cannot_read_store")
 
@@ -560,10 +580,10 @@ def test_a_node_seen_before_the_crossing_reads_unreachable_and_takes_no_request(
 ) -> None:
     machine.nodes()
     machine.ok("node", "add", NODE_NEW, "--label", "new-node", "--kind", "server")
-    # The core crosses to major 2 the way the upgrade writes it, after the old
-    # node last reported; the new node reports after.
-    machine.sql("INSERT INTO schema_version (owner, major, minor) VALUES ('core', 2, 0)")
-    machine.sql("INSERT INTO capabilities_node_states (node, reported_at, fresh_until) "
+    # The core crosses to its major the way the upgrade writes it, after the
+    # old node last reported; the new node reports after.
+    machine.cross(STORE)
+    machine.sql("INSERT INTO node_states (node, reported_at, fresh_until) "
                 "VALUES (%s, now() + interval '1 second', now() + interval '1 hour')",
                 (NODE_NEW,))
     state = {node["node"]: node for node in machine.ok("node", "state")["nodes"]}
@@ -571,8 +591,8 @@ def test_a_node_seen_before_the_crossing_reads_unreachable_and_takes_no_request(
     assert new["reachable"] is True and new["cannot_read_store"] is None
     assert old["reachable"] is False and old["health"] == "red"
     unread = old["cannot_read_store"]
-    assert unread["store_major"] == 2 and unread["since"] and unread["last_seen_at"]
-    assert "schema major 2" in unread["message"] and unread["command"]
+    assert unread["store_major"] == STORE and unread["since"] and unread["last_seen_at"]
+    assert f"schema major {STORE}" in unread["message"] and unread["command"]
     assert state[NODE_SILENT]["reachable"] is False
 
     code, error = machine.refused("node", "update", "--node", "old-node")
@@ -580,7 +600,7 @@ def test_a_node_seen_before_the_crossing_reads_unreachable_and_takes_no_request(
     assert error["hint"].startswith("bring it up first")
     assert machine.refused("node", "update", "--node", "silent-node")[1]["code"] \
         == "node_cannot_read_store"
-    assert machine.sql("SELECT count(*) FROM capabilities_node_updates") == [(0,)]
+    assert machine.sql("SELECT count(*) FROM node_updates") == [(0,)]
     asked = machine.ok("node", "update", "--node", "new-node")
     assert asked["ok"] is True and asked["requested"]["state"] == "requested"
 
@@ -588,6 +608,20 @@ def test_a_node_seen_before_the_crossing_reads_unreachable_and_takes_no_request(
     nodes = {node["node"]: node for node in checked["nodes"]}
     assert nodes[NODE_OLD]["reads_store"] is False and nodes[NODE_OLD]["reason"]
     assert nodes[NODE_NEW]["reads_store"] is True
+
+
+def test_a_node_registered_since_the_store_reached_its_major_takes_a_request(
+    machine,
+) -> None:
+    # A fresh store is made at the manager's major; a node added to it has
+    # nothing older to run, so before it ever reports it is asked as on base.
+    machine.nodes()
+    state = {node["node"]: node for node in machine.ok("node", "state")["nodes"]}
+    assert state[NODE_SILENT]["cannot_read_store"] is None
+    asked = machine.ok("node", "update", "--node", "silent-node")
+    assert asked["ok"] is True and asked["requested"]["state"] == "requested"
+    nodes = {node["node"]: node for node in machine.ok("store", "upgrade", "--check")["nodes"]}
+    assert nodes[NODE_SILENT]["reads_store"] is True
 
 
 # --- the commands reach the person --------------------------------------------------
@@ -655,7 +689,7 @@ def test_a_lines_library_range_holds_the_managers_own_environment(machine) -> No
     link = _legacy_link(machine)
     machine.ok("node", "add", NODE_OLD, "--label", "old-node", "--kind", "server")
     _newest_release(machine.tmp / "src" / "main")
-    _manager_release(machine.tmp / "src" / "store-major-1", 1,
+    _manager_release(machine.tmp / "src" / f"store-major-{STORE}", STORE,
                      MANAGER.read_bytes() + b"\n# the line manager\n", ">=0.42,<0.50")
     log = _uv_logging_syncs(machine)
     with _serve(machine.tmp / "src") as base:
@@ -685,8 +719,8 @@ def _publish(root: Path, tag: str, store_major: int) -> None:
 
 def test_install_takes_the_stores_line_and_the_newest_without_a_store(machine) -> None:
     machine.ok("node", "add", NODE_OLD, "--label", "old-node", "--kind", "server")
-    _publish(machine.tmp / "src" / "main", "main", 2)
-    _publish(machine.tmp / "src" / "store-major-1", "line", 1)
+    _publish(machine.tmp / "src" / "main", "main", NEXT)
+    _publish(machine.tmp / "src" / f"store-major-{STORE}", "line", STORE)
     installed = Path(machine.base["CAPABILITIES_HOME"]) / "resend"
 
     def tag() -> str:
@@ -716,15 +750,15 @@ def test_a_manager_at_another_major_writes_nothing_that_says_its_node_reads_the_
     machine,
 ) -> None:
     machine.nodes()
-    # The store crosses to major 2; this manager reads major 1.
-    machine.sql("INSERT INTO schema_version (owner, major, minor) VALUES ('core', 2, 0)")
+    # The store crosses to the next major; this manager reads its own.
+    machine.cross(NEXT)
 
     def written():
-        return (machine.sql("SELECT reported_at, fresh_until FROM capabilities_node_states"
+        return (machine.sql("SELECT reported_at, fresh_until FROM node_states"
                             " WHERE node = %s", (NODE_OLD,)),
-                machine.sql("SELECT last_seen_at FROM capabilities_nodes WHERE id = %s",
+                machine.sql("SELECT last_seen_at FROM nodes WHERE id = %s",
                             (NODE_OLD,)),
-                machine.sql("SELECT count(*) FROM capabilities_node_updates"))
+                machine.sql("SELECT count(*) FROM node_updates"))
     before = written()
     for verb in (("node", "state", "report"), ("node", "seen"), ("node", "update")):
         code, error = machine.refused(*verb, AGENT_NODE_ID=NODE_OLD)
@@ -759,11 +793,11 @@ def test_a_manager_at_another_major_writes_nothing_that_says_its_node_reads_the_
             os.environ.pop(k) if v is None else os.environ.__setitem__(k, v)
     assert runner.lines and "capabilities self-update" in runner.lines[0]
     assert written() == before
-    # So the node stays unreachable, and takes no request.
-    old = next(n for n in machine.ok("node", "state")["nodes"] if n["node"] == NODE_OLD)
-    assert old["reachable"] is False and old["cannot_read_store"]["store_major"] == 2
-    assert machine.refused("node", "update", "--node", "old-node")[1]["code"] \
-        == "node_cannot_read_store"
+    # Nor does it read the store's nodes, which only a manager at its major
+    # does.
+    code, error = machine.refused("node", "state")
+    assert (code, error["code"]) == (6, "schema_too_new")
+    assert written() == before
 
 
 def test_a_store_at_another_major_is_refused_with_the_commands_not_read_as_disabled(
@@ -772,7 +806,7 @@ def test_a_store_at_another_major_is_refused_with_the_commands_not_read_as_disab
     machine.ok("install", "resend", "--from", str(REPO / "capabilities" / "resend"), "--allow")
     machine.ok("enable", "resend", "--project")
     assert machine.ok("list")["installed"][0]["name"] == "resend"
-    machine.sql("INSERT INTO schema_version (owner, major, minor) VALUES ('core', 2, 0)")
+    machine.cross(NEXT)
     code, error = machine.refused("list")
     assert (code, error["code"]) == (6, "schema_too_new")
     assert "capabilities self-update" in error["hint"]
@@ -801,7 +835,7 @@ def _owner_tables():
 
 
 def test_an_owner_a_capability_migrates_for_a_library_is_its_own_to_cross(machine) -> None:
-    source = _probe(machine.tmp / "src" / "probe", second=False,
+    source = _probe(machine.tmp / "src" / "capabilities" / "probe", second=False,
                     extra=LIBRARY_OWNER.format(major=1))
     installed = machine.ok("install", "probe", "--from", str(source), "--allow")
     assert installed["migrate"]["ok"] is True, installed

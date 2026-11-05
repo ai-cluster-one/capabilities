@@ -77,17 +77,17 @@ def rows(conn, scope: tuple[str, str, str]) -> dict:
     """The whole register for the scope, by channel key."""
     found = conn.execute(
         f"SELECT channel_key, {WATERMARK}, settings, voice_echo_senders, state "
-        f"FROM {TABLE} WHERE project_id = %s AND environment = %s AND connection = %s",
+        f"FROM {TABLE} WHERE agent_id = %s AND environment = %s AND connection = %s",
         tuple(scope)).fetchall()
     return {key: _row(watermark, settings, echoes, state)
             for key, watermark, settings, echoes, state in found}
 
 
 _UPSERT = f"""
-    INSERT INTO {TABLE} AS t (project_id, environment, connection, channel_key,
+    INSERT INTO {TABLE} AS t (agent_id, environment, connection, channel_key,
                               {WATERMARK}, settings, voice_echo_senders, state)
     VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
-    ON CONFLICT (project_id, environment, connection, channel_key) DO UPDATE SET
+    ON CONFLICT (agent_id, environment, connection, channel_key) DO UPDATE SET
         {WATERMARK} = GREATEST(t.{WATERMARK}, EXCLUDED.{WATERMARK}),
         settings = EXCLUDED.settings,
         voice_echo_senders = EXCLUDED.voice_echo_senders,
@@ -103,7 +103,7 @@ def write(conn, scope: tuple[str, str, str], changed: dict,
             conn.execute(_UPSERT, (*scope, str(key), *_values(row)))
         for key in removed:
             conn.execute(
-                f"DELETE FROM {TABLE} WHERE project_id = %s AND environment = %s "
+                f"DELETE FROM {TABLE} WHERE agent_id = %s AND environment = %s "
                 "AND connection = %s AND channel_key = %s", (*scope, str(key)))
 
 
@@ -117,7 +117,7 @@ def import_file(conn, scope: tuple[str, str, str], register: dict) -> list[str]:
             if not isinstance(row, dict):
                 continue
             stored = conn.execute(
-                f"SELECT {WATERMARK} FROM {TABLE} WHERE project_id = %s "
+                f"SELECT {WATERMARK} FROM {TABLE} WHERE agent_id = %s "
                 "AND environment = %s AND connection = %s AND channel_key = %s "
                 "FOR UPDATE", (*scope, str(key))).fetchone()
             if stored is not None and _watermark(row) <= int(stored[0] or 0):

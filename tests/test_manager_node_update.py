@@ -24,6 +24,7 @@ import hashlib
 import http.server
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -121,6 +122,12 @@ def cluster():
 
 # --- the manager's releases, a capability with a service, and a node ------------
 
+def _store_major() -> int:
+    """The store major the manager reads, as `source index` stamps it: the
+    test's stores are at it, and a release naming none reads major 1."""
+    return int(re.search(r"(?m)^STORE_MAJOR = (\d+)$", MANAGER.read_text()).group(1))
+
+
 def _release(root: Path, tag: str, log: str) -> Path:
     """A manager release in `root`, as the source publishes one: the manager,
     every asset the repository's release names, and a change log of `log`."""
@@ -135,6 +142,7 @@ def _release(root: Path, tag: str, log: str) -> Path:
     manifest = {"schema": "capabilities.manager-release.v1",
                 "manager": {"path": "bin/capabilities",
                             "sha256": hashlib.sha256(manager).hexdigest()},
+                "store_major": _store_major(),
                 "assets": {rel: hashlib.sha256(body).hexdigest()
                            for rel, body in files.items()}}
     (root / MANIFEST_REL).parent.mkdir(parents=True, exist_ok=True)
@@ -269,7 +277,12 @@ class Node:
             "AGENT_NODE_ID": NODE, "AGENT_NODE_NAME": "lab-node",
             "CLAUDE_PROJECT_DIR": str(self.project),
             "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}"})
-        self.source = tmp / "src" / "probe"
+        # probe's source is a catalogue tree's, which names the store major
+        # its releases read, as `source index` stamps it.
+        self.source = tmp / "src" / "capabilities" / "probe"
+        (tmp / "src" / ".capability-source").mkdir(parents=True)
+        (tmp / "src" / ".capability-source" / "catalog.json").write_text(
+            json.dumps({"store_major": _store_major()}))
         # The node runs the outgoing release, linked as the manager on PATH,
         # and probe from its source, its service placed on this node.
         outgoing = _release(tmp / "outgoing", "outgoing", OUTGOING)
@@ -279,8 +292,8 @@ class Node:
         self.ok("install", "probe", "--from", str(self.source))
         self.ok("allow", "probe")
         self.ok("node", "add", NODE, "--label", "lab-node", "--kind", "server")
-        self.sql("UPDATE capabilities_agent_nodes SET folder = %s", (str(self.project),))
-        self.sql("INSERT INTO capabilities_policy (agent_id, capability, node, enabled,"
+        self.sql("UPDATE agent_nodes SET folder = %s", (str(self.project),))
+        self.sql("INSERT INTO policies (agent_id, capability, node, enabled,"
                  " service) VALUES (%s, 'probe', %s, true, true)", (PROJECT_ID, NODE))
 
     def env(self, **extra: str) -> dict:
@@ -386,9 +399,9 @@ def test_check_answers_what_is_newer_and_what_it_brings_and_changes_nothing(node
     # Nothing moved, and nothing asked for an update.
     assert _tree(node.cap_home) == registry and _tree(node.bin) == links
     assert node.library() == "0.30.0"
-    assert node.sql("SELECT count(*) FROM capabilities_node_updates") == [(0,)]
+    assert node.sql("SELECT count(*) FROM node_updates") == [(0,)]
     [(available, offer)] = node.sql("SELECT update_available, update_offer FROM"
-                                    " capabilities_node_states WHERE node = %s", (NODE,))
+                                    " node_states WHERE node = %s", (NODE,))
     assert available is True and offer == checked["offer"]
     [state] = node.ok("node", "state")["nodes"]
     assert state["update"]["available"] is True
@@ -396,7 +409,7 @@ def test_check_answers_what_is_newer_and_what_it_brings_and_changes_nothing(node
     assert state["update"]["offer"] == checked["offer"] and state["update"]["last_run"] is None
     # The node's regular state write leaves what it checked as it is.
     node.ok("node", "state", "report")
-    assert node.sql("SELECT update_available FROM capabilities_node_states") == [(True,)]
+    assert node.sql("SELECT update_available FROM node_states") == [(True,)]
     code, error = node.refused("node", "update", "--check", CAPABILITIES_READ_ONLY="1")
     assert (code, error["code"]) == (4, "read_only_switch")
 
@@ -421,7 +434,7 @@ def test_an_update_moves_everything_asks_the_doctors_and_restarts_the_placed_ser
     assert node.restarts() == [(1,)]
     assert done["availability"]["update_available"] is False
     [(state, by, started)] = node.sql("SELECT state, requested_by, started_at IS NOT NULL"
-                                      " FROM capabilities_node_updates")
+                                      " FROM node_updates")
     assert (state, started) == ("updated", True) and by
     [listed] = node.ok("node", "state")["nodes"]
     assert listed["update"]["last_run"]["id"] == run["id"]
@@ -449,12 +462,12 @@ def test_a_red_doctor_returns_the_node_to_what_it_ran_and_restarts_nothing(node)
     assert _tree(node.cap_home / "probe") == payload and node.library() == "0.30.0"
     assert run["versions_after"] == run["versions_before"]
     assert node.restarts() == []
-    assert node.sql("SELECT state FROM capabilities_node_updates") == [("rolled_back",)]
+    assert node.sql("SELECT state FROM node_updates") == [("rolled_back",)]
     assert not any((node.cap_home / ".manager" / "node-update").glob("*-*"))
 
 
 def test_a_failing_step_returns_the_node_and_a_run_that_stopped_is_closed(node):
-    stale = node.sql("INSERT INTO capabilities_node_updates (node, state, started_at)"
+    stale = node.sql("INSERT INTO node_updates (node, state, started_at)"
                      " VALUES (%s, 'running', now()) RETURNING id", (NODE,))[0][0]
     shutil.move(node.source, node.tmp / "moved")
 
@@ -466,7 +479,7 @@ def test_a_failing_step_returns_the_node_and_a_run_that_stopped_is_closed(node):
     assert error["detail"]["interrupted"] == [str(stale)]
     assert os.readlink(node.link) == node.before
     assert PROBE_NEW not in node.probe_log()
-    [(state, reason)] = node.sql("SELECT state, reason FROM capabilities_node_updates"
+    [(state, reason)] = node.sql("SELECT state, reason FROM node_updates"
                                  " WHERE id = %s", (stale,))
     assert state == "failed" and reason.startswith("interrupted")
     assert node.restarts() == []
@@ -491,7 +504,7 @@ def test_node_run_updates_only_when_a_row_asks_and_then_runs_the_new_release(nod
         assert _wait(lambda: (jobs / f"probe.{PROJECT_ID}.conf").exists(), 60)
         # Newer releases are there and no row asks: nothing starts.
         time.sleep(8)
-        assert node.sql("SELECT count(*) FROM capabilities_node_updates") == [(0,)]
+        assert node.sql("SELECT count(*) FROM node_updates") == [(0,)]
         assert os.readlink(node.link) == node.before
 
         asked = node.ok("node", "update", "--node", "lab-node")
@@ -502,13 +515,13 @@ def test_node_run_updates_only_when_a_row_asks_and_then_runs_the_new_release(nod
                             CAPABILITIES_READ_ONLY="1")[1]["code"] == "read_only_switch"
 
         def state():
-            return node.sql("SELECT state FROM capabilities_node_updates WHERE id = %s",
+            return node.sql("SELECT state FROM node_updates WHERE id = %s",
                             (asked["requested"]["id"],))[0][0]
         assert _wait(lambda: state() == "running", 20)
         beats = set()
         while state() == "running":
             beats.update(r[0] for r in node.sql("SELECT reported_at FROM"
-                                                " capabilities_node_states"))
+                                                " node_states"))
             time.sleep(1)
         assert state() == "updated"
         # The state kept being written while the update ran.
@@ -519,7 +532,7 @@ def test_node_run_updates_only_when_a_row_asks_and_then_runs_the_new_release(nod
             node_run.terminate()
         _out, err = node_run.communicate(timeout=60)
     assert node_run.returncode == 75, err
-    assert "updates this node, as a row of capabilities_node_updates asks" in err
+    assert "updates this node, as a row of node_updates asks" in err
     assert "the manager on PATH is another release now" in err
     said = [json.loads(line) for line in calls.read_text().splitlines()]
     assert ["-s", "unix:///tmp/test.sock", "restart", f"probe.{PROJECT_ID}"] in said
@@ -537,7 +550,7 @@ def test_node_run_on_a_disabled_node_runs_nothing_writes_no_state_and_comes_back
                                 text=True)
 
     def reported():
-        return node.sql("SELECT reported_at FROM capabilities_node_states")
+        return node.sql("SELECT reported_at FROM node_states")
     try:
         assert _wait(job.exists, 60) and _wait(reported, 30)
         node.ok("node", "disable", "lab-node")
@@ -547,7 +560,7 @@ def test_node_run_on_a_disabled_node_runs_nothing_writes_no_state_and_comes_back
         time.sleep(20)
         assert reported() == last
         assert node.refused("node", "update", "--node", NODE)[1]["code"] == "node_disabled"
-        assert node.sql("SELECT count(*) FROM capabilities_policy WHERE node = %s"
+        assert node.sql("SELECT count(*) FROM policies WHERE node = %s"
                         " AND service", (NODE,)) == [(1,)]
         node.ok("node", "enable", "lab-node")
         assert _wait(job.exists, 20) and _wait(lambda: reported() != last, 30)

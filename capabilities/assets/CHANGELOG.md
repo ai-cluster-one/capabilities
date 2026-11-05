@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-11-05 — The store names the agent: assets' tables go to schema major 2
+
+`assets`' tables name an agent where they named a project: `project_id` is `agent_id` in `assets_documents`, `assets_files` and `assets_file_operations`, the index `assets_file_operations_project` is `assets_file_operations_agent`, every constraint and comment named for the column moves with it, and the guards of documents and files compare the renamed column. Step `0007-agent-names` renames them in place with every row and object kept and takes the ledger to 2.0. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of assets 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first assets call makes them at 2.0. A file's object key in the bucket is unchanged. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. No verb, flag, environment variable or output key changes.
+
 ## 2026-10-31 — `assets` carries its own icon
 
 The bundle holds its icon as `icon.png`, an archive box: Lucide's `archive` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon assets` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

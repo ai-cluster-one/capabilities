@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-11-05 — The service's tables name the agent as `agent_id`, at store version 2.0
+
+Breaking for an older release on the same store. Ledger step `0012-agent-names` (agentrooms 2.0) renames, in place and keeping every row: `project_id` to `agent_id` in every agentrooms table, and `agentrooms_workers` to `agentrooms_worker_versions`, with its key, indexes, triggers and their function. The notification a held wake sends on `agentrooms_held` names the agent as `agent_id` where it said `project`; the channel and its change versions are as before. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of agentrooms 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first agentrooms call makes them at 2.0. Nothing agentrooms prints changes. The runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions`. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names.
+
 ## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
 
 The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning; codex is unchanged. Nothing a turn does changes.

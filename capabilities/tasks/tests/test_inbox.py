@@ -307,7 +307,7 @@ def test_a_move_to_a_worker_an_agent_or_a_capability_puts_nothing(lab, monkeypat
     # of, so the judgment is asked here rather than through a move.
     monkeypatch.setattr(mod, "SCHEMA", lab["schema"])
     with psycopg.connect(DSN, autocommit=True, row_factory=dict_row) as conn:
-        conn.execute(f"""insert into {lab['schema']}.tasks_tasks (project_id, type, title)
+        conn.execute(f"""insert into {lab['schema']}.tasks_tasks (agent_id, type, title)
                          values ('prj_elsewhere000', 'probe', 'theirs')""")
         with conn.cursor() as cur:
             assert mod._no_person_here(cur, lab["ident"], "prj_elsewhere000") is True

@@ -58,6 +58,37 @@ def store_setting():
     return dataclasses.replace(setting, schema=f"tgtest_{uuid.uuid4().hex}")
 
 
+# Every name and comment in an owner's tables that still says project, where the
+# store now says agent: table columns, relations, constraints, triggers, comments, and
+# the bodies of the owner's functions.
+_SAYS_PROJECT = """
+SELECT 'column ' || c.relname || '.' || a.attname FROM pg_attribute a
+  JOIN pg_class c ON c.oid = a.attrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relkind IN ('r', 'p') AND a.attnum > 0 AND NOT a.attisdropped
+   AND a.attname ~* 'project'
+UNION ALL SELECT 'relation ' || c.relname FROM pg_class c
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND c.relname ~* 'project'
+UNION ALL SELECT 'constraint ' || o.conname FROM pg_constraint o
+  JOIN pg_class c ON c.oid = o.conrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND o.conname ~* 'project'
+UNION ALL SELECT 'trigger ' || g.tgname FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND g.tgname ~* 'project'
+UNION ALL SELECT 'comment on ' || c.relname || coalesce('.' || a.attname, '')
+  FROM pg_description d JOIN pg_class c ON c.oid = d.objoid AND d.classoid = 'pg_class'::regclass
+  LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid AND d.objsubid > 0
+ WHERE c.relnamespace = %(schema)s::regnamespace AND c.relname LIKE %(like)s
+   AND d.description ~* 'project'
+UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
+ WHERE p.pronamespace = %(schema)s::regnamespace AND p.proname LIKE %(like)s
+   AND p.prosrc ~* 'project'
+"""
+
+
+
 @unittest.skipUnless(STORE_DSN, "TELEGRAM_TEST_DSN is unset")
 class RegisterCase(unittest.TestCase):
     def setUp(self):
@@ -138,7 +169,7 @@ class RegisterCase(unittest.TestCase):
             "WHERE table_schema = current_schema() AND table_name LIKE ?",
             ("telegram\\_%",)).fetchall()}
         self.assertEqual(tables, {"telegram_jobs", "telegram_job_amendments",
-                                  "telegram_job_slots", "telegram_prompts",
+                                  "telegram_job_slots", "telegram_prompt_versions",
                                   "telegram_channels"})
 
     def test_the_profile_column_is_an_additive_fourth_step(self):
@@ -147,7 +178,7 @@ class RegisterCase(unittest.TestCase):
         registered without one keeps none, and a store at the earlier version
         takes the step without losing a row."""
         self.assertEqual([step for step, _sql in jobs.STORE_STEPS][3], "0004-job-profile")
-        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (1, 3))
+        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (2, 0))
         with_profile = self.register(engine="claude", profile="telegram-fast")
         without = self.register(engine="codex", model="gpt-5.5")
         self.assertEqual(self.reg.get(with_profile["id"])["profile"], "telegram-fast")
@@ -167,11 +198,89 @@ class RegisterCase(unittest.TestCase):
                         "'2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')",
                         (self.project_id,))
         conn.commit()
-        old_store, old_reg = jobs.open_register(self.envelope, "development", setting=older)
+        # Taking a store at 1.0 to 2.0 crosses a major: only the store upgrade does.
+        with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
+            old_store, old_reg = jobs.open_register(self.envelope, "development", setting=older)
         self.addCleanup(old_store.close)
         row = old_reg.get("old-1")
         self.assertEqual((row["description"], row["engine"], row["profile"]),
                          ("from before", "codex", None))
+
+    def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(self):
+        """A store at 1.3 with a row in every table takes the agent names in
+        place: the rows read under them, the prompts' table and everything
+        named for it carry the versions name, the guard still holds, and a
+        release that knows only major 1 is refused. Only the store upgrade
+        crosses the major."""
+        import psycopg
+        from capabilities_contract.db import DbError, connect, migrate
+        old = [step for step in jobs.STORE_STEPS if step[0] != "0007-agent-names"]
+        older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m1")
+        conn = connect(application_name="telegram", setting=older)
+        self.addCleanup(conn.close)
+        migrate(conn, jobs.STORE_OWNER, old, major=1, minor=3)
+        pid = self.project_id
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO telegram_jobs (id, project_id, environment, surface, "
+                        "channel_key, requested_by, description, engine, state, "
+                        "created_at, updated_at) VALUES ('old-1', %s, 'development', "
+                        "'telegram', '123', '42', 'from before', 'codex', 'running', "
+                        "'2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')", (pid,))
+            cur.execute("INSERT INTO telegram_job_amendments (id, project_id, environment, "
+                        "surface, job_id, text, state, created_at) VALUES ('a-1', %s, "
+                        "'development', 'telegram', 'old-1', 'more', 'pending', "
+                        "'2026-10-01T00:00:00Z')", (pid,))
+            cur.execute("INSERT INTO telegram_job_slots (project_id, environment, surface, "
+                        "slot, job_id, owner_id, attempt_token, lease_expires_at) VALUES "
+                        "(%s, 'development', 'telegram', 0, 'old-1', 'o', 't', "
+                        "'2026-10-01T00:00:00Z')", (pid,))
+            cur.execute("INSERT INTO telegram_prompts (project_id, key, body, created_by) "
+                        "VALUES (%s, 'context', 'kept prompt', 'a@n') RETURNING id::text",
+                        (pid,))
+            prompt = cur.fetchone()[0]
+            cur.execute("INSERT INTO telegram_channels (project_id, environment, connection, "
+                        "channel_key, last_processed_message_id) VALUES "
+                        "(%s, 'development', 'default', '123', 7)", (pid,))
+        conn.commit()
+
+        # Outside the store upgrade the major is not crossed; inside it, it is.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CAPABILITIES_STORE_UPGRADE", None)
+            with self.assertRaises(jobs.JobError) as held:
+                jobs.open_register(self.envelope, "development", setting=older)
+        self.assertEqual(held.exception.slug, "store_upgrade_needed")
+        with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
+            store, reg = jobs.open_register(self.envelope, "development", setting=older)
+        self.addCleanup(store.close)
+        self.assertEqual(reg.get("old-1")["description"], "from before")
+        self.assertEqual(reg.pending_amendment("old-1"), ["more"])
+        version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
+                                 (jobs.STORE_OWNER,)).fetchone()
+        self.assertEqual(tuple(version), (2, 0))
+        for table in ("telegram_jobs", "telegram_job_amendments", "telegram_job_slots",
+                      "telegram_prompt_versions", "telegram_channels"):
+            rows = store._execute(f"SELECT agent_id FROM {table}").fetchall()
+            self.assertEqual([tuple(r) for r in rows], [(pid,)], table)
+        raw = psycopg.connect(STORE_DSN, autocommit=True)
+        self.addCleanup(raw.close)
+        raw.execute(f'SET search_path TO "{older.schema}"')
+        self.assertEqual(raw.execute(_SAYS_PROJECT, {"schema": older.schema,
+                                                     "like": "telegram\\_%"}).fetchall(), [])
+        self.assertEqual(raw.execute(
+            "SELECT relname FROM pg_class WHERE relnamespace = %s::regnamespace "
+            "AND relname LIKE 'telegram\\_prompts%%' UNION ALL SELECT proname FROM pg_proc "
+            "WHERE pronamespace = %s::regnamespace AND proname LIKE 'telegram\\_prompts%%' "
+            "UNION ALL SELECT conname FROM pg_constraint WHERE connamespace = "
+            "%s::regnamespace AND conname LIKE 'telegram\\_prompts%%' UNION ALL SELECT "
+            "tgname FROM pg_trigger g JOIN pg_class c ON c.oid = g.tgrelid "
+            "WHERE c.relnamespace = %s::regnamespace AND tgname LIKE 'telegram\\_prompts%%'",
+            (older.schema,) * 4).fetchall(), [])
+        with self.assertRaises(psycopg.errors.CheckViolation):
+            raw.execute("UPDATE telegram_prompt_versions SET body = 'changed' "
+                        "WHERE id = %s::uuid", (prompt,))
+        with self.assertRaises(DbError) as refused:
+            migrate(raw, jobs.STORE_OWNER, old, major=1, minor=3, schema=older.schema)
+        self.assertEqual(refused.exception.slug, "schema_too_new")
 
     def test_reopening_applies_nothing_twice(self):
         again_store, again = self.open()

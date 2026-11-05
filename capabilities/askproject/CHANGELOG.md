@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-11-05 — The session map names the caller as an agent, at store version 2.0
+
+Breaking for an older release on the same store. Ledger step `0002-agent-id` (askproject 2.0) renames `askproject_sessions.project_id` to `agent_id`, and its constraints with it, in place: every session row stays. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of askproject 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first askproject call makes them at 2.0. Nothing askproject prints changes. The runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions` at its store version 2.0; a profile resolves as before. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names.
+
 ## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
 
 The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning; codex is unchanged. Nothing a turn does changes.

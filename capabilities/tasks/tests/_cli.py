@@ -210,13 +210,13 @@ def save_profiles(mod, root: Path | str, schema: str, project: str) -> dict:
     conn = db.connect(application_name="tasks-test", setting=store_setting(schema))
     try:
         with conn.cursor() as cur:
-            cur.execute(f"""select id, name, spec from "{schema}".harness_profiles
-                             where scope = 'project' and scope_id = %s and active""",
+            cur.execute(f"""select id, name, spec from "{schema}".harness_profile_versions
+                             where agent_id = %s and active""",
                         (project,))
             active = {row[1]: row for row in cur.fetchall()}
             for name, row in active.items():
                 if name not in docs or row[2] != docs[name]:
-                    cur.execute(f'update "{schema}".harness_profiles set active = false '
+                    cur.execute(f'update "{schema}".harness_profile_versions set active = false '
                                 "where id = %s", (row[0],))
             versions = {}
             for name, spec in docs.items():
@@ -224,9 +224,9 @@ def save_profiles(mod, root: Path | str, schema: str, project: str) -> dict:
                 if row is not None and row[2] == spec:
                     versions[name] = str(row[0])
                     continue
-                cur.execute(f"""insert into "{schema}".harness_profiles
-                                  (scope, scope_id, name, spec, active, created_by)
-                                values ('project', %s, %s, %s::jsonb, true, 'test')
+                cur.execute(f"""insert into "{schema}".harness_profile_versions
+                                  (agent_id, name, spec, active, created_by)
+                                values (%s, %s, %s::jsonb, true, 'test')
                                 returning id""", (project, name, json.dumps(spec)))
                 versions[name] = str(cur.fetchone()[0])
         conn.commit()
@@ -291,12 +291,12 @@ def save_workers(mod, root: Path | str, schema: str, project: str) -> dict:
     conn = db.connect(application_name="tasks-test", setting=store_setting(schema))
     try:
         with conn.cursor() as cur:
-            cur.execute(f"""select id, name, spec, body from "{schema}".tasks_workers
-                             where project_id = %s and active""", (project,))
+            cur.execute(f"""select id, name, spec, body from "{schema}".tasks_worker_versions
+                             where agent_id = %s and active""", (project,))
             active = {row[1]: row for row in cur.fetchall()}
             for name, row in active.items():
                 if name not in docs or (row[2], row[3]) != docs[name]:
-                    cur.execute(f'update "{schema}".tasks_workers set active = false '
+                    cur.execute(f'update "{schema}".tasks_worker_versions set active = false '
                                 "where id = %s", (row[0],))
             versions = {}
             for name, (spec, body) in docs.items():
@@ -304,8 +304,8 @@ def save_workers(mod, root: Path | str, schema: str, project: str) -> dict:
                 if row is not None and (row[2], row[3]) == (spec, body):
                     versions[name] = str(row[0])
                     continue
-                cur.execute(f"""insert into "{schema}".tasks_workers
-                                  (project_id, name, spec, body, active, created_by)
+                cur.execute(f"""insert into "{schema}".tasks_worker_versions
+                                  (agent_id, name, spec, body, active, created_by)
                                 values (%s, %s, %s::jsonb, %s, true, 'test')
                                 returning id""", (project, name, json.dumps(spec), body))
                 versions[name] = str(cur.fetchone()[0])

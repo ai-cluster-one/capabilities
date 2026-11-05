@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-11-05 — The store names automations' rows for agents, at store version 2.0
+
+Breaking for an older release on the same store. Ledger step `0008-agent-names` (automations 2.0) renames, in place and keeping every row: `project_id` to `agent_id` in `automations_runs` and in the definitions, and `automations_definitions` to `automations_definition_versions`, with its key, indexes, constraints, triggers and their functions. The notification a saved definition sends on `automations_changed` names the agent as `agent_id` where it said `project`; the channel and its change versions are as before. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of automations 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first automations call makes them at 2.0. Every key automations prints, `project_id` of a run included, is as before. The placement read names the manager's table `policies`, so automations declares `capabilities-contract>=0.43,<1`, and the runner is pinned at callva-harness-runner 0.11.0, whose stored profiles are `harness_profile_versions`.
+
 ## 2026-11-02 — Turns run on callva-harness-runner 0.10.2
 
 The runner is pinned at 0.10.2 in place of 0.10.1. Claude turns run through claude-agent-sdk 0.2.176, and a claude CLI up to 2.1.316 runs without the runner's out-of-range warning; codex is unchanged. Nothing a turn does changes.
