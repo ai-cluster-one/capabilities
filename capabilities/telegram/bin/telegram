@@ -169,7 +169,14 @@ Commands:
                                                came from: a root message id, 1
                                                for a forum's General topic, and
                                                null in a chat whose messages
-                                               live in no topic at all.
+                                               live in no topic at all. A message
+                                               Telegram attached a link preview
+                                               to also carries `web_preview`
+                                               {url, display_url, site_name,
+                                               title, description, type,
+                                               has_photo}, as the page's own
+                                               crawler saw it; it is absent
+                                               where there is none.
   telegram search <chat> <query> [--limit N] [--topic TOPIC_ID] [--json]
                                                Search messages inside a chat;
                                                the same forum-topic scoping and
@@ -2083,7 +2090,7 @@ async def _iter_topic_scope(client, entity, topic_id: int | None, topic_of, *,
 
 
 def msg_to_dict(m, topic_of) -> dict:
-    return {
+    out = {
         "id": m.id,
         "date": m.date.astimezone(timezone.utc).isoformat() if m.date else None,
         "sender_id": m.sender_id,
@@ -2091,6 +2098,34 @@ def msg_to_dict(m, topic_of) -> dict:
         "text": m.message or "",
         "reply_to": m.reply_to_msg_id,
         "topic_id": topic_of(m),
+    }
+    preview = _web_preview_meta(m)
+    if preview is not None:
+        out["web_preview"] = preview
+    return out
+
+
+def _web_preview_meta(m) -> dict | None:
+    """The link preview Telegram attached to a message, or None.
+
+    Telethon's `Message.web_preview` is the resolved `WebPage` (a pending or
+    empty preview answers None). Its photo is also what `Message.photo`
+    returns, which is why a previewed link classifies as `photo`; the preview's
+    own text - the page's title and description as Telegram's crawler read
+    them - is carried here so a reader does not have to open the page.
+    """
+    page = getattr(m, "web_preview", None)
+    if page is None:
+        return None
+    photo = getattr(page, "photo", None)
+    return {
+        "url": _json_text(getattr(page, "url", None)),
+        "display_url": _json_text(getattr(page, "display_url", None)),
+        "site_name": _json_text(getattr(page, "site_name", None)),
+        "title": _json_text(getattr(page, "title", None)),
+        "description": _json_text(getattr(page, "description", None)),
+        "type": _json_text(getattr(page, "type", None)),
+        "has_photo": photo is not None and type(photo).__name__ != "PhotoEmpty",
     }
 
 
@@ -2345,7 +2380,11 @@ def _classify_media(m):
     if m.sticker:
         return "sticker", {"mime_type": getattr(m.document, "mime_type", None)}
     if m.photo:
-        return "photo", {"photo_id": getattr(m.photo, "id", None)}
+        details = {"photo_id": getattr(m.photo, "id", None)}
+        preview = _web_preview_meta(m)
+        if preview is not None:
+            details["web_preview"] = preview
+        return "photo", details
     if m.document:
         doc = m.document
         filename = None
@@ -2357,7 +2396,7 @@ def _classify_media(m):
             "filename": filename,
         }
     if m.web_preview:
-        return "webpage", {"url": getattr(m.web_preview, "url", None)}
+        return "webpage", _web_preview_meta(m)
     if m.poll:
         return "poll", _poll_meta(m)
     if m.contact:
