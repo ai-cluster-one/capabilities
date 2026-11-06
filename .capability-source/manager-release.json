@@ -17,15 +17,15 @@
     "guides/repositories.md": "61c593b97dc699a8932892ceacbb86f8231222faa06a6915d0d97f25756d76b2",
     "guides/sanitizing.md": "ad943e412d31cb854d2f639bb24007a5841ef6659177d711d2d1ec5b9f826a09",
     "guides/store-connections.md": "6ee909e85f6d46d2b179959a9cec1d27f19691a5869a0320f9543a1210defbc6",
-    "guides/store-upgrade.md": "45fe6dc15c6d868aa5464e45426c065a7a359bb7a7a695cf06c903589ddb8107",
+    "guides/store-upgrade.md": "9e80c17df03ccf584d08ebc287c7ec5b6c9b4df4ddeb39ce9ae1f8559c24073b",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "7a9df6a290fd1e4e067b71f2816b077a518630a190db37a94584ea3eca8af4c0",
+    "manager/CHANGELOG.md": "f19653eea16ed39f343b516bd96f86d4e3da745432f4f3c5d8bf9482c3b38eba",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "33b18cc302d94140f089aee505fd6391502e679363c04e9c580ddf3a306519c5"
+    "sha256": "d3018b8e76f844293a8c7c31a0d80d8c3501ecdb2d5fa2d0fff2a61d59d0451d"
   },
   "schema": "capabilities.manager-release.v1",
   "store_major": 2

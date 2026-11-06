@@ -614,8 +614,14 @@ STORE VERBS
         pg_restore: {path, version, major} | null} (the one the upgrade uses:
         the first of the server's major or newer in each PATH entry, then in
         Homebrew's opt/postgresql@N, opt/postgresql and opt/libpq under
-        HOMEBREW_PREFIX, /opt/homebrew and /usr/local, then Postgres.app;
-        with none, the newest older one), nodes [{node, label,
+        HOMEBREW_PREFIX, /opt/homebrew and /usr/local, then Postgres.app,
+        then the client the upgrade fetched; with none, the newest older
+        one), fetch {version, platform, url, sha256, bytes, dir} | null (with
+        no pg_dump or pg_restore of the server's major, the PostgreSQL client
+        the upgrade fetches first, which is then a step rather than a
+        blocker: a pinned standalone build for macOS 15 or later or Linux
+        with glibc 2.34 or later, arm64 or x86_64, for a server up to its
+        major)}, nodes [{node, label,
         kind, disabled, last_seen_at, reported_at, reachable, runs
         {image_version, boot_line, versions}, reads_store, reason, command}],
         progress {started_at, target_major, phases, manager_release} | null}.
@@ -628,7 +634,8 @@ STORE VERBS
         thing that stops it: owner_not_installed (the store holds tables of an
         owner no release here declares; an owner it records with no tables
         left has nothing to move and stops nothing), owner_unreadable, pg_dump_missing
-        (installed nowhere searched; the hint names what to install),
+        (installed nowhere searched and no client to fetch for this machine
+        or the server's major; the hint names what to install),
         pg_dump_too_old (older than the server), pg_restore_missing,
         pg_restore_too_old, no_room_for_dump (the schema's size against the
         free space where the dump goes), read_only_switch, and
@@ -658,9 +665,16 @@ STORE VERBS
         runs `store upgrade` on, so the new major's own code does the rest;
         capabilities - where the store crosses its major, every installed
         capability is updated from the newest line, as update takes it with
-        no store major to keep to; dump - pg_dump of the store's schema, in
-        custom format, to $XDG_DATA_HOME/capabilities/backups/<store
-        key>/<UTC time>.dump (~/.local/share/capabilities/backups when
+        no store major to keep to; client - where the check names tools.fetch,
+        that PostgreSQL client is downloaded from its GitHub release, refused
+        unless its sha256 is the pinned one (exit 6
+        pg_client_checksum_mismatch, nothing of it kept; exit 5
+        pg_client_fetch_failed where it cannot be fetched), and pg_dump,
+        pg_restore, psql and the libraries they load are unpacked into
+        $XDG_DATA_HOME/capabilities/pg-client/<version>-<platform>, nowhere
+        else and with no package manager, for the dump to use; dump -
+        pg_dump of the store's schema, in custom format, to
+        $XDG_DATA_HOME/capabilities/backups/<store key>/<UTC time>.dump (~/.local/share/capabilities/backups when
         XDG_DATA_HOME is unset), proven: `pg_restore --list` reads the whole
         archive and its table of contents holds the data of every table the
         schema held; migrate - every owner under the upgrade's flag: core
@@ -20974,7 +20988,7 @@ def cmd_store_doctor(project: str | None) -> None:
 
 STORE_UPGRADE_DIR = _STATE_HOME / "capabilities" / "store-upgrade"
 STORE_BACKUP_DIR = _DATA_HOME / "capabilities" / "backups"
-STORE_UPGRADE_PHASES = ("manager", "capabilities", "dump", "migrate")
+STORE_UPGRADE_PHASES = ("manager", "capabilities", "client", "dump", "migrate")
 # The library's refusals whose hint names the commands that cross a major or
 # catch up with one: wherever the manager words such a refusal, it keeps them.
 STORE_MAJOR_SLUGS = ("schema_too_new", "store_upgrade_needed")
@@ -21220,7 +21234,8 @@ def _pg_tool_dirs() -> list[Path]:
     put on it, in the order searched: Homebrew's kegs - each opt/postgresql@N,
     newest first, then opt/postgresql and opt/libpq - under HOMEBREW_PREFIX,
     /opt/homebrew (Apple silicon) and /usr/local (Intel), then each version
-    Postgres.app holds, newest first."""
+    Postgres.app holds, newest first, then the client the upgrade fetched
+    (PG_CLIENT_ROOT)."""
     def newest_first(paths) -> list[Path]:
         def major(path: Path) -> int:
             found = re.search(r"(\d+)", path.name)
@@ -21234,6 +21249,9 @@ def _pg_tool_dirs() -> list[Path]:
         dirs += [opt / "postgresql" / "bin", opt / "libpq" / "bin"]
     versions = Path("/Applications/Postgres.app/Contents/Versions")
     dirs += [version / "bin" for version in newest_first(versions.glob("*"))]
+    pinned = _pg_client_pin()
+    if pinned is not None:
+        dirs.append(_pg_client_dir(pinned[0]) / "bin")
     return dirs
 
 
@@ -21280,6 +21298,179 @@ def _pg_install_hint(major: int) -> str:
     return (f"install the PostgreSQL client tools of version {major} or newer (on Debian or "
             f"Ubuntu the postgresql-client-{major} package, from apt.postgresql.org where the "
             "system's own is older), and check again")
+
+
+# The PostgreSQL client the upgrade fetches where none of the store server's
+# major or newer is installed: a standalone build from the GitHub releases of
+# theseus-rs/postgresql-binaries (PostgreSQL License; the libraries it carries
+# keep their own - OpenSSL Apache-2.0, zstd and lz4 BSD, Kerberos MIT, readline
+# GPL-3.0), refused unless its sha256 is the one pinned here for the platform,
+# and unpacked into PG_CLIENT_ROOT with only pg_dump, pg_restore, psql and the
+# libraries they load, which they find beside themselves. Nothing is installed
+# anywhere else and no package manager is used. The macOS builds need macOS 15
+# or later, the Linux ones glibc 2.34 or later.
+PG_CLIENT_VERSION = "18.6.1"
+PG_CLIENT_MAJOR = 18
+PG_CLIENT_URL = ("https://github.com/theseus-rs/postgresql-binaries/releases/download/"
+                 "{version}/postgresql-{version}-{platform}.tar.gz")
+PG_CLIENT_ROOT = _DATA_HOME / "capabilities" / "pg-client"
+PG_CLIENT_TOOLS = ("pg_dump", "pg_restore", "psql")
+_PG_CLIENT_MACOS_LIBS = ("libpq.5.dylib", "libssl.3.dylib", "libcrypto.3.dylib",
+                         "libzstd.1.dylib", "liblz4.1.dylib", "libreadline.8.dylib")
+_PG_CLIENT_LINUX_LIBS = ("libpq.so.5", "libssl.so.3", "libcrypto.so.3", "libzstd.so.1",
+                         "liblz4.so.1", "libz.so.1", "libgssapi_krb5.so.2", "libkrb5.so.3",
+                         "libk5crypto.so.3", "libcom_err.so.2", "libkrb5support.so.0",
+                         "libkeyutils.so.1", "libreadline.so.8", "libtinfo.so.6")
+PG_CLIENT_PINS = {
+    "aarch64-apple-darwin": {
+        "sha256": "89e91cc80650a43d22c018b95ca356a0c9e15838a1182fed2880bfb5d7d9c9a6",
+        "bytes": 88814625, "libs": _PG_CLIENT_MACOS_LIBS},
+    "x86_64-apple-darwin": {
+        "sha256": "4229812543e19c91864ebdf5d8f78883c5816d51d4cc5d065298260c1f64d37e",
+        "bytes": 92085423, "libs": _PG_CLIENT_MACOS_LIBS},
+    "x86_64-unknown-linux-gnu": {
+        "sha256": "e84b02dd8d0ce5879fb697330a789231c8b8f8d958dae3ad4d90fecc710b1315",
+        "bytes": 40484450, "libs": _PG_CLIENT_LINUX_LIBS},
+    "aarch64-unknown-linux-gnu": {
+        "sha256": "1ab47fa2f06ff70454309ad02e5d89c46488300d43977231481fd6b160b9d556",
+        "bytes": 39898635, "libs": _PG_CLIENT_LINUX_LIBS},
+}
+
+
+def _pg_client_pin() -> tuple[str, dict] | None:
+    """(platform, pin) of the pinned client build this machine runs, or None
+    where none does."""
+    import platform
+    arch = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64",
+            "amd64": "x86_64"}.get(platform.machine().lower())
+    if arch is None:
+        return None
+    if sys.platform == "darwin":
+        release = platform.mac_ver()[0]
+        if not release or int(release.split(".")[0]) < 15:
+            return None
+        key = f"{arch}-apple-darwin"
+    elif sys.platform.startswith("linux"):
+        try:
+            libc = os.confstr("CS_GNU_LIBC_VERSION") or ""
+        except (ValueError, OSError):
+            libc = ""
+        found = re.fullmatch(r"glibc (\d+)\.(\d+).*", libc)
+        if found is None or (int(found.group(1)), int(found.group(2))) < (2, 34):
+            return None
+        key = f"{arch}-unknown-linux-gnu"
+    else:
+        return None
+    pin = PG_CLIENT_PINS.get(key)
+    return (key, pin) if pin else None
+
+
+def _pg_client_dir(platform_key: str) -> Path:
+    return PG_CLIENT_ROOT / f"{PG_CLIENT_VERSION}-{platform_key}"
+
+
+def _pg_client_plan(server: int) -> dict | None:
+    """What the upgrade fetches to have a client for a server of major
+    `server`: {version, platform, url, sha256, bytes, dir}, or None where no
+    pinned build runs here or serves that major."""
+    pinned = _pg_client_pin()
+    if pinned is None or server > PG_CLIENT_MAJOR:
+        return None
+    key, pin = pinned
+    return {"version": PG_CLIENT_VERSION, "platform": key,
+            "url": PG_CLIENT_URL.format(version=PG_CLIENT_VERSION, platform=key),
+            "sha256": pin["sha256"], "bytes": pin["bytes"], "dir": str(_pg_client_dir(key))}
+
+
+def _pg_client_fetch(plan: dict) -> dict:
+    """Fetch the client `plan` names, refuse it unless its sha256 is the
+    pinned one, and unpack it into plan's dir: {pg_dump, pg_restore, psql:
+    {path, version, major}}. Nothing of a refused download is kept. Raises
+    _UpgradeFailed."""
+    dest = Path(plan["dir"])
+    again = "run `capabilities store upgrade` again"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f".{dest.name}-", dir=dest.parent))
+    try:
+        archive = work / "client.tar.gz"
+        digest = hashlib.sha256()
+        try:
+            with _httpx().stream("GET", plan["url"], follow_redirects=True,
+                                 timeout=120) as response:
+                response.raise_for_status()
+                with archive.open("wb") as out:
+                    for chunk in response.iter_bytes(1 << 20):
+                        digest.update(chunk)
+                        out.write(chunk)
+        except Exception as exc:  # httpx.HTTPError, OSError
+            raise _UpgradeFailed(5, "pg_client_fetch_failed",
+                                 f"the PostgreSQL {plan['version']} client tools could not be "
+                                 f"fetched from {plan['url']}: {exc}",
+                                 f"{again} once it answers") from None
+        if digest.hexdigest() != plan["sha256"]:
+            raise _UpgradeFailed(6, "pg_client_checksum_mismatch",
+                                 f"the PostgreSQL client fetched from {plan['url']} has sha256 "
+                                 f"{digest.hexdigest()}, not the {plan['sha256']} pinned for "
+                                 f"{plan['platform']}, so it is refused and nothing of it is kept",
+                                 f"{again}; where it refuses again, "
+                                 + _pg_install_hint(PG_CLIENT_MAJOR))
+        unpacked = work / "client"
+        _pg_client_unpack(archive, unpacked, PG_CLIENT_PINS[plan["platform"]]["libs"])
+        tools = {name: _pg_tool_version(str(unpacked / "bin" / name)) for name in PG_CLIENT_TOOLS}
+        if any(tool is None or tool["major"] < PG_CLIENT_MAJOR for tool in tools.values()):
+            raise _UpgradeFailed(6, "pg_client_unusable",
+                                 f"the PostgreSQL {plan['version']} client tools fetched for "
+                                 f"{plan['platform']} do not run here",
+                                 _pg_install_hint(PG_CLIENT_MAJOR))
+        if dest.exists():
+            shutil.rmtree(dest)
+        unpacked.rename(dest)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return {name: {**tool, "path": str(dest / "bin" / name)} for name, tool in tools.items()}
+
+
+def _pg_client_unpack(archive: Path, into: Path, libs) -> None:
+    """Unpack from the client `archive` only bin/<each of PG_CLIENT_TOOLS> and
+    lib/<each of `libs`>, a library's link followed to the file beside it
+    that it names. Raises _UpgradeFailed where one is missing or is neither."""
+    def unusable(why: str) -> _UpgradeFailed:
+        return _UpgradeFailed(6, "pg_client_unusable",
+                              f"the PostgreSQL client archive {why}",
+                              _pg_install_hint(PG_CLIENT_MAJOR))
+    try:
+        tar = tarfile.open(archive, "r:gz")
+    except (tarfile.TarError, OSError) as exc:
+        raise unusable(f"cannot be read: {exc}") from None
+    with tar:
+        members = {}
+        for member in tar.getmembers():
+            parts = member.name.strip("/").split("/")
+            if len(parts) == 3 and parts[1] in ("bin", "lib"):
+                members[f"{parts[1]}/{parts[2]}"] = member
+        (into / "bin").mkdir(parents=True)
+        (into / "lib").mkdir()
+        wanted = [f"bin/{name}" for name in PG_CLIENT_TOOLS] + [f"lib/{name}" for name in libs]
+        taken: set[str] = set()
+        while wanted:
+            rel = wanted.pop()
+            if rel in taken:
+                continue
+            taken.add(rel)
+            member = members.get(rel)
+            target = into / rel
+            if member is None:
+                raise unusable(f"holds no {rel}")
+            if member.issym() and member.linkname not in ("", ".", "..") \
+                    and "/" not in member.linkname:
+                os.symlink(member.linkname, target)
+                wanted.append(f"{rel.split('/')[0]}/{member.linkname}")
+            elif member.isfile():
+                with tar.extractfile(member) as src, target.open("wb") as out:
+                    shutil.copyfileobj(src, out)
+                target.chmod(0o755 if member.mode & 0o111 else 0o644)
+            else:
+                raise unusable(f"holds {rel} as neither a file nor a link beside it")
 
 
 def _store_survey(setting) -> dict:
@@ -21802,8 +21993,12 @@ def _store_upgrade_judge(answer: dict, setting, key: str, available: dict | None
                              or f"check them with `{entry['owner']} migrate status`"})
     server = survey["server_major"]
     dump, restore = _pg_tool("pg_dump", server), _pg_tool("pg_restore", server)
-    answer["tools"] = {"pg_dump": dump, "pg_restore": restore}
-    for name, tool in (("pg_dump", dump), ("pg_restore", restore)):
+    # Where neither is of the server's major, the upgrade fetches its own
+    # where it can, a step rather than a blocker.
+    plan = (_pg_client_plan(server) if any(tool is None or tool["major"] < server
+                                           for tool in (dump, restore)) else None)
+    answer["tools"] = {"pg_dump": dump, "pg_restore": restore, "fetch": plan}
+    for name, tool in (() if plan else (("pg_dump", dump), ("pg_restore", restore))):
         use = "taken" if name == "pg_dump" else "proven"
         if tool is None:
             blockers.append({"code": f"{name}_missing",
@@ -21843,7 +22038,9 @@ def _store_upgrade_judge(answer: dict, setting, key: str, available: dict | None
          f"{target}" if crossing else f"the store is on schema major {survey['major']}")
         + (f"; the installed releases cross the {', '.join(crossing_owners)} tables"
            if crossing_owners else "")
-        + ("; `capabilities store upgrade` takes a dump, then crosses" if not blockers
+        + ((f"; `capabilities store upgrade` fetches the PostgreSQL {plan['version']} client "
+            f"tools into {plan['dir']}, takes a dump, then crosses" if plan else
+            "; `capabilities store upgrade` takes a dump, then crosses") if not blockers
            else "; what stops the upgrade is under blockers, each with what to do"))
     answer["next"] = ([STORE_UPGRADE_COMMAND] if not blockers
                       else [b["hint"] for b in blockers if b.get("hint")])
@@ -22179,9 +22376,20 @@ def cmd_store_upgrade(events: bool) -> None:
     if kept:
         skipped("dump", f"kept from before: {dump['path']}")
     else:
+        tools, plan = check["tools"], check["tools"].get("fetch")
+        if plan:
+            _event("step", step="client", state="started", version=plan["version"],
+                   url=plan["url"], dir=plan["dir"])
+            try:
+                client = _pg_client_fetch(plan)
+            except _UpgradeFailed as exc:
+                failed("client", exc)
+            done("client", version=plan["version"], platform=plan["platform"],
+                 sha256=plan["sha256"], dir=plan["dir"], tools=client)
+            tools = {**tools, **client}
         _event("step", step="dump", state="started", dir=str(STORE_BACKUP_DIR / key))
         try:
-            dump = _store_dump(setting, survey, key, check["tools"])
+            dump = _store_dump(setting, survey, key, tools)
         except _UpgradeFailed as exc:
             failed("dump", exc)
         done("dump", **dump)
