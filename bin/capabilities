@@ -611,7 +611,11 @@ STORE VERBS
         upgrade_needed, schema_too_new, checksum_mismatch, empty, unknown),
         crosses, error?}], blockers [{code, message, hint, owner?}], next
         [command], backup {dir, needed_bytes, free_bytes}, tools {pg_dump,
-        pg_restore: {path, version, major} | null}, nodes [{node, label,
+        pg_restore: {path, version, major} | null} (the one the upgrade uses:
+        the first of the server's major or newer in each PATH entry, then in
+        Homebrew's opt/postgresql@N, opt/postgresql and opt/libpq under
+        HOMEBREW_PREFIX, /opt/homebrew and /usr/local, then Postgres.app;
+        with none, the newest older one), nodes [{node, label,
         kind, disabled, last_seen_at, reported_at, reachable, runs
         {image_version, boot_line, versions}, reads_store, reason, command}],
         progress {started_at, target_major, phases, manager_release} | null}.
@@ -623,7 +627,8 @@ STORE VERBS
         or an installed release crosses an owner's major. A blocker is each
         thing that stops it: owner_not_installed (the store holds tables of an
         owner no release here declares; an owner it records with no tables
-        left has nothing to move and stops nothing), owner_unreadable, pg_dump_missing,
+        left has nothing to move and stops nothing), owner_unreadable, pg_dump_missing
+        (installed nowhere searched; the hint names what to install),
         pg_dump_too_old (older than the server), pg_restore_missing,
         pg_restore_too_old, no_room_for_dump (the schema's size against the
         free space where the dump goes), read_only_switch, and
@@ -21175,20 +21180,71 @@ def _store_upgrade_key(setting) -> str:
     return f"{slug or 'store'}-{hashlib.sha256(ident.encode()).hexdigest()[:12]}"
 
 
-def _pg_tool(name: str) -> dict | None:
-    """{path, version, major} of a PostgreSQL client tool on PATH, or None."""
-    path = shutil.which(name)
-    if path is None:
-        return None
+def _pg_tool_dirs() -> list[Path]:
+    """The places beside PATH a PostgreSQL client is installed without being
+    put on it, in the order searched: Homebrew's kegs - each opt/postgresql@N,
+    newest first, then opt/postgresql and opt/libpq - under HOMEBREW_PREFIX,
+    /opt/homebrew (Apple silicon) and /usr/local (Intel), then each version
+    Postgres.app holds, newest first."""
+    def newest_first(paths) -> list[Path]:
+        def major(path: Path) -> int:
+            found = re.search(r"(\d+)", path.name)
+            return int(found.group(1)) if found else -1
+        return sorted(paths, key=major, reverse=True)
+    dirs: list[Path] = []
+    for prefix in dict.fromkeys(p for p in (os.environ.get("HOMEBREW_PREFIX"), "/opt/homebrew",
+                                            "/usr/local") if p):
+        opt = Path(prefix) / "opt"
+        dirs += [keg / "bin" for keg in newest_first(opt.glob("postgresql@*"))]
+        dirs += [opt / "postgresql" / "bin", opt / "libpq" / "bin"]
+    versions = Path("/Applications/Postgres.app/Contents/Versions")
+    dirs += [version / "bin" for version in newest_first(versions.glob("*"))]
+    return dirs
+
+
+def _pg_tool_version(path: str) -> dict | None:
+    """{path, version, major} of the PostgreSQL client tool at `path`, or None
+    when it does not answer --version."""
     try:
         proc = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
-    found = re.search(r"(\d+)(?:\.(\d+))?", proc.stdout or "")
+    found = re.search(r"(\d+)(?:\.\d+)*", proc.stdout or "")
     if proc.returncode != 0 or found is None:
         return None
-    return {"path": path, "version": proc.stdout.strip().split()[-1],
-            "major": int(found.group(1))}
+    return {"path": path, "version": found.group(0), "major": int(found.group(1))}
+
+
+def _pg_tool(name: str, need: int) -> dict | None:
+    """{path, version, major} of the first PostgreSQL client tool `name` of
+    major `need` or newer, looked for in each PATH entry in order and then in
+    each versioned install (_pg_tool_dirs); with none, the newest older one
+    found, or None when there is none at all."""
+    dirs = [Path(entry) for entry in os.environ.get("PATH", "").split(os.pathsep) if entry]
+    older, seen = [], set()
+    for folder in [*dirs, *_pg_tool_dirs()]:
+        path = shutil.which(name, path=str(folder))
+        if path is None or os.path.realpath(path) in seen:
+            continue
+        seen.add(os.path.realpath(path))
+        tool = _pg_tool_version(path)
+        if tool is None:
+            continue
+        if tool["major"] >= need:
+            return tool
+        older.append(tool)
+    return max(older, key=lambda tool: tool["major"]) if older else None
+
+
+def _pg_install_hint(major: int) -> str:
+    """What a person installs to give the upgrade a client of `major`."""
+    if sys.platform == "darwin":
+        return (f"install the PostgreSQL {major} client tools - `brew install "
+                f"postgresql@{major}`, or Postgres.app - and check again; the upgrade finds "
+                "them where they install, without a change to PATH")
+    return (f"install the PostgreSQL client tools of version {major} or newer (on Debian or "
+            f"Ubuntu the postgresql-client-{major} package, from apt.postgresql.org where the "
+            "system's own is older), and check again")
 
 
 def _store_survey(setting) -> dict:
@@ -21694,24 +21750,26 @@ def _store_upgrade_judge(answer: dict, setting, key: str, available: dict | None
                                         + (error.get("message") or entry["state"]),
                              "hint": error.get("hint")
                              or f"check them with `{entry['owner']} migrate status`"})
-    dump, restore = _pg_tool("pg_dump"), _pg_tool("pg_restore")
+    server = survey["server_major"]
+    dump, restore = _pg_tool("pg_dump", server), _pg_tool("pg_restore", server)
     answer["tools"] = {"pg_dump": dump, "pg_restore": restore}
     for name, tool in (("pg_dump", dump), ("pg_restore", restore)):
+        use = "taken" if name == "pg_dump" else "proven"
         if tool is None:
             blockers.append({"code": f"{name}_missing",
-                             "message": f"{name} is not on PATH, so the dump the upgrade takes "
-                                        "first cannot be " + ("taken" if name == "pg_dump"
-                                                              else "proven"),
-                             "hint": f"install the PostgreSQL client tools of version "
-                                     f"{survey['server_major']} or newer and put them on PATH"})
-        elif tool["major"] < survey["server_major"]:
+                             "message": f"{name}, one of the PostgreSQL client tools, is not "
+                                        "installed here - neither on PATH nor where Homebrew or "
+                                        "Postgres.app put it - so the dump the upgrade takes "
+                                        f"first cannot be {use}; the store's server is "
+                                        f"PostgreSQL {server}",
+                             "hint": _pg_install_hint(server)})
+        elif tool["major"] < server:
             blockers.append({"code": f"{name}_too_old",
-                             "message": f"{name} {tool['version']} is older than the server "
-                                        f"(PostgreSQL {survey['server_major']}), which it "
-                                        "cannot dump",
-                             "hint": f"install the PostgreSQL client tools of version "
-                                     f"{survey['server_major']} or newer and put them first on "
-                                     "PATH"})
+                             "message": f"the newest {name} installed here is {tool['version']} "
+                                        f"({tool['path']}), older than the store's server "
+                                        f"(PostgreSQL {server}), so the dump the upgrade takes "
+                                        f"first cannot be {use}",
+                             "hint": _pg_install_hint(server)})
     backups = STORE_BACKUP_DIR / key
     probe = backups
     while not probe.exists() and probe != probe.parent:
@@ -21768,8 +21826,9 @@ def _store_upgrade_fail(exit_code: int, code: str, message: str, hint: str | Non
     sys.exit(exit_code)
 
 
-def _store_dump(setting, survey: dict, key: str) -> dict:
-    """Take the dump of the store's schema with pg_dump to the standard place,
+def _store_dump(setting, survey: dict, key: str, tools: dict) -> dict:
+    """Take the dump of the store's schema with the pg_dump the check chose
+    (`tools`, the check's answer) to the standard place,
     STORE_BACKUP_DIR/<store key>/<UTC time>.dump (custom format), and prove it:
     pg_restore reads its whole table of contents, and it holds the data of
     every table the schema held when it was taken. Raises _UpgradeFailed."""
@@ -21783,7 +21842,7 @@ def _store_dump(setting, survey: dict, key: str) -> dict:
     env = {k: v for k, v in os.environ.items() if k != "PGPASSWORD"}
     if password:
         env["PGPASSWORD"] = str(password)
-    argv = ["pg_dump", "--format=custom", f"--schema={setting.schema}", "--no-password",
+    argv = [tools["pg_dump"]["path"], "--format=custom", f"--schema={setting.schema}", "--no-password",
             f"--file={partial}", f"--dbname={make_conninfo(**params)}"]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, env=env,
@@ -21798,7 +21857,8 @@ def _store_dump(setting, survey: dict, key: str) -> dict:
                              + _store_scrub(proc.stderr.strip()[-500:], setting),
                              "fix what it says and run `capabilities store upgrade` again")
     partial.rename(path)
-    proven = _store_dump_proof(path, setting.schema, survey["tables"])
+    proven = _store_dump_proof(path, setting.schema, survey["tables"],
+                               tools["pg_restore"]["path"])
     if not proven["ok"]:
         raise _UpgradeFailed(6, "dump_unproven", f"the dump at {path} does not prove: "
                              + proven["reason"],
@@ -21808,12 +21868,13 @@ def _store_dump(setting, survey: dict, key: str) -> dict:
             "taken_at": _utc_now(), "proven": proven}
 
 
-def _store_dump_proof(path: Path, schema: str, tables: list[str]) -> dict:
+def _store_dump_proof(path: Path, schema: str, tables: list[str],
+                      pg_restore: str = "pg_restore") -> dict:
     """{ok, reason?, restore_list, table_data, tables, missing}: whether
-    `pg_restore --list` reads the archive whole and its table of contents
-    carries the data of each of `tables`."""
+    `pg_restore --list` (the one at `pg_restore`) reads the archive whole and
+    its table of contents carries the data of each of `tables`."""
     try:
-        proc = subprocess.run(["pg_restore", "--list", str(path)], capture_output=True,
+        proc = subprocess.run([pg_restore, "--list", str(path)], capture_output=True,
                               text=True, timeout=600)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "reason": f"pg_restore did not run: {exc}", "restore_list": False,
@@ -22070,7 +22131,7 @@ def cmd_store_upgrade(events: bool) -> None:
     else:
         _event("step", step="dump", state="started", dir=str(STORE_BACKUP_DIR / key))
         try:
-            dump = _store_dump(setting, survey, key)
+            dump = _store_dump(setting, survey, key, check["tools"])
         except _UpgradeFailed as exc:
             failed("dump", exc)
         done("dump", **dump)

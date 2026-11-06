@@ -346,7 +346,15 @@ def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) ->
     blocked = machine.ok("store", "upgrade", "--check", PATH=path)
     assert blocked["state"] == "blocked" and blocked["can_run"] is False
     codes = {b["code"]: b for b in blocked["blockers"]}
-    assert set(codes) == {"owner_not_installed", "pg_dump_missing", "pg_restore_missing"}
+    # A client installed beside PATH, as Homebrew's or Postgres.app's, is found.
+    if _clients_beside_path():
+        assert set(codes) == {"owner_not_installed"}
+    else:
+        assert set(codes) == {"owner_not_installed", "pg_dump_missing", "pg_restore_missing"}
+        server = blocked["store"]["server_major"]
+        for code in ("pg_dump_missing", "pg_restore_missing"):
+            assert f"PostgreSQL {server}" in codes[code]["message"]
+            assert f"{server}" in codes[code]["hint"] and "install" in codes[code]["hint"]
     assert codes["owner_not_installed"]["hint"].startswith("install it here")
     assert all(b["hint"] for b in blocked["blockers"])
     before = machine.books()
@@ -354,6 +362,66 @@ def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) ->
     assert (code, error["code"]) == (6, "store_upgrade_blocked")
     assert machine.books() == before
     assert not (machine.data / "capabilities" / "backups").exists()
+
+
+def _clients_beside_path() -> bool:
+    """Whether this machine has a PostgreSQL client where the manager looks
+    beside PATH, which a test that strips PATH cannot take away."""
+    return any(shutil.which("pg_dump", path=str(folder)) for folder in M["_pg_tool_dirs"]())
+
+
+def _older_client(folder: Path, major: int) -> None:
+    """A pg_dump and pg_restore of `major` that answer --version and fail at
+    anything else, as an older client first on PATH would against the server."""
+    folder.mkdir(parents=True)
+    for name in ("pg_dump", "pg_restore"):
+        tool = folder / name
+        tool.write_text(f'#!/bin/sh\nif [ "$1" = --version ]; then echo "{name} (PostgreSQL) '
+                        f'{major}.6"; exit 0; fi\necho "{name} {major}.6 cannot" >&2\nexit 1\n')
+        tool.chmod(0o755)
+
+
+def test_a_client_of_the_servers_major_beside_an_older_one_first_on_path_is_used(
+    machine,
+) -> None:
+    machine.probe()
+    machine.ok("update", "probe")
+    server = machine.ok("store", "upgrade", "--check")["store"]["server_major"]
+    # An older client first on PATH, the server's major in a Homebrew keg.
+    older = machine.tmp / "older" / "bin"
+    _older_client(older, server - 1)
+    brew = machine.tmp / "brew"
+    keg = brew / "opt" / f"postgresql@{server}" / "bin"
+    keg.mkdir(parents=True)
+    for name in ("pg_dump", "pg_restore"):
+        (keg / name).symlink_to(shutil.which(name))
+    tools = {Path(shutil.which(t)).parent for t in ("pg_dump", "pg_restore")}
+    path = os.pathsep.join([str(older)] + [p for p in machine.base["PATH"].split(os.pathsep)
+                                           if Path(p) not in tools])
+    checked = machine.ok("store", "upgrade", "--check", PATH=path, HOMEBREW_PREFIX=str(brew))
+    assert checked["can_run"] is True and checked["blockers"] == [], checked["blockers"]
+    for name in ("pg_dump", "pg_restore"):
+        assert checked["tools"][name]["path"] == str(keg / name)
+        assert checked["tools"][name]["major"] == server
+    if not _clients_beside_path():
+        # With only the older one, it is named, and so is what to install.
+        blocked = machine.ok("store", "upgrade", "--check", PATH=path, HOMEBREW_PREFIX=None)
+        codes = {b["code"]: b for b in blocked["blockers"]}
+        assert set(codes) == {"pg_dump_too_old", "pg_restore_too_old"}
+        for name in ("pg_dump", "pg_restore"):
+            assert blocked["tools"][name] == {"path": str(older / name),
+                                              "version": f"{server - 1}.6",
+                                              "major": server - 1}
+            assert str(older / name) in codes[f"{name}_too_old"]["message"]
+            assert f"PostgreSQL {server}" in codes[f"{name}_too_old"]["message"]
+            assert f"{server}" in codes[f"{name}_too_old"]["hint"]
+    # The upgrade's dump and its proof run with the chosen tools; the older
+    # ones would fail.
+    upgraded = machine.run("store", "upgrade", "--events", PATH=path, HOMEBREW_PREFIX=str(brew))
+    assert upgraded.returncode == 0, upgraded.stdout + upgraded.stderr
+    dump = next(e for e in _events(upgraded.stdout) if e["event"] == "step"
+                and e["step"] == "dump" and e["state"] == "done")["check"]
+    assert dump["proven"]["ok"] is True and dump["proven"]["restore_list"] is True
 
 
 def test_with_nothing_to_cross_it_changes_nothing_and_the_switch_refuses(machine) -> None:

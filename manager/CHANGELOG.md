@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-06 — `store upgrade` finds PostgreSQL client tools of the server's major wherever they are installed
+
+`capabilities store upgrade --check` no longer takes only the `pg_dump` and `pg_restore` first on PATH: it takes the first of the server's major or newer in each PATH entry in order, then in Homebrew's `opt/postgresql@N` (newest first), `opt/postgresql` and `opt/libpq` under `HOMEBREW_PREFIX`, `/opt/homebrew` and `/usr/local`, then in Postgres.app, so a machine with an older client first on PATH and a matching one installed beside it is no longer blocked. Its `tools` names the path and version it chose, and the upgrade's dump and its `pg_restore --list` proof run with those same tools. With none of the server's major, `pg_dump_too_old` and `pg_restore_too_old` name the newest one found and where; with none at all, `pg_dump_missing` and `pg_restore_missing` say no client is installed and name the server's major, and every one of them names what to install: `brew install postgresql@<major>` (or Postgres.app) on a Mac, the `postgresql-client-<major>` package elsewhere.
+
 ## 2026-11-05 — `store upgrade` is not stopped by an owner whose tables are gone
 
 `capabilities store upgrade --check` no longer reports `owner_not_installed` for an owner the store records in `schema_version` but whose tables are all gone, as a retired tool's whose tables were dropped: it has nothing to move, so it no longer stops the upgrade, and a store that holds such a row can be crossed from this line.
