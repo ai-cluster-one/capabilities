@@ -38,7 +38,7 @@
     "automations": {
       "icon": true,
       "path": "capabilities/automations",
-      "payload_sha256": "ae11889c290c32ff6f171656d0a90e45030039d5450921b9d10b69fdca185cec",
+      "payload_sha256": "a1adff70b52d079f0d1390fa505df7776189b164403cff20ac9decb28e7e7c90",
       "store_major": 2,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation."
     },

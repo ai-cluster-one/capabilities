@@ -183,9 +183,17 @@ Commands:
   automations agents
       List agent profiles and which one is the default.
   automations agent <prompt|-> [--profile NAME] [--schema PATH] [--timeout SEC]
+                    [--resume SESSION [--fork]]
       Run one agent turn in this project and return its answer as JSON. `-`
       reads the prompt from stdin. --schema names a JSON Schema file and makes
-      `answer` a parsed object instead of prose.
+      `answer` a parsed object instead of prose. --resume continues the engine
+      session a previous answer named as `session_id`; with --fork the turn
+      runs in a new session branched from it and leaves that session as it
+      was, so one prepared session can seed many turns (claude --resume
+      --fork-session, codex exec resume or fork). `session_id` names the
+      session the turn ran in. `tokens` carries input, output, cache_read and
+      cache_creation for the whole turn, and first_call, the same four for its
+      first model call, null for codex, which reports usage per turn only.
   automations service init [--force]
       Create project-local config and an example script; the example is
       defined in the store with `set`.
@@ -3727,12 +3735,20 @@ def _agent_prompt(raw: str) -> str:
 
 
 def _agent_command(profile: dict[str, Any], root: Path, schema: Path | None,
-                   answer_file: Path) -> list[str]:
+                   answer_file: Path, resume: str | None = None,
+                   fork: bool = False) -> list[str]:
     engine = profile["engine"]
     if engine == "claude":
+        # stream-json rather than json: the final `result` event is the same
+        # payload json prints, and the events before it carry each model call's
+        # own usage, which is the only place the first call's cache tokens are.
         command = [_engine_binary("claude"), "-p",
-                   "--output-format", "json",
+                   "--output-format", "stream-json", "--verbose",
                    "--model", profile["model"]]
+        if resume:
+            command += ["--resume", resume]
+            if fork:
+                command += ["--fork-session"]
         if profile["effort"]:
             command += ["--effort", profile["effort"]]
         if profile["mode"] == "read":
@@ -3752,12 +3768,18 @@ def _agent_command(profile: dict[str, Any], root: Path, schema: Path | None,
         if schema is not None:
             command += ["--json-schema", schema.read_text(encoding="utf-8")]
         return command
-    command = [_engine_binary("codex"), "exec", "-",
-               "-m", profile["model"],
-               "-C", str(root),
-               "--skip-git-repo-check",
-               "--json",
-               "-o", str(answer_file)]
+    # -C and -s belong to `codex exec` alone and go before a `resume` or `fork`
+    # subcommand, which honours them; every other option goes after it.
+    command = [_engine_binary("codex"), "exec", "-C", str(root)]
+    if profile["mode"] != "act":
+        command += ["-s", "read-only" if profile["mode"] == "read" else "workspace-write"]
+    if resume:
+        command += ["fork" if fork else "resume", resume]
+    command += ["-",
+                "-m", profile["model"],
+                "--skip-git-repo-check",
+                "--json",
+                "-o", str(answer_file)]
     if profile["mode"] == "act":
         # A worker that operates tools rather than files needs the machine those
         # tools run on: a CLI reaches the network, writes a session file outside
@@ -3769,8 +3791,6 @@ def _agent_command(profile: dict[str, Any], root: Path, schema: Path | None,
         # `write` for a file-editing job never hands out the machine by
         # accident.
         command += ["--dangerously-bypass-approvals-and-sandbox"]
-    else:
-        command += ["-s", "read-only" if profile["mode"] == "read" else "workspace-write"]
     if profile["effort"]:
         command += ["-c", f"model_reasoning_effort={profile['effort']}"]
     if profile["service_tier"]:
@@ -3808,11 +3828,36 @@ def _agent_env() -> dict[str, str]:
     return env
 
 
+def _usage_tokens(usage: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "input": usage.get("input_tokens"),
+        "output": usage.get("output_tokens"),
+        "cache_read": usage.get("cache_read_input_tokens"),
+        "cache_creation": usage.get("cache_creation_input_tokens"),
+    }
+
+
 def _claude_answer(stdout: str, structured: bool) -> dict[str, Any]:
-    try:
-        payload = json.loads(stdout)
-    except json.JSONDecodeError as exc:
-        _die(5, "engine_output_unparseable", f"claude did not return JSON: {exc}")
+    payload: dict[str, Any] | None = None
+    first_call: dict[str, Any] | None = None
+    for line in (stdout or "").splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError as exc:
+            _die(5, "engine_output_unparseable", f"claude did not return JSON: {exc}")
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "result":
+            payload = event
+        elif (event.get("type") == "assistant" and first_call is None
+              and not event.get("parent_tool_use_id")):
+            # A subagent's calls carry the tool use that started them; the
+            # first call is the turn's own.
+            first_call = _usage_tokens((event.get("message") or {}).get("usage") or {})
+    if payload is None:
+        _die(5, "engine_output_unparseable", "claude returned no result")
     if payload.get("is_error"):
         _die(5, "agent_failed", str(payload.get("result") or "claude reported an error"))
     answer = payload.get("result")
@@ -3834,19 +3879,13 @@ def _claude_answer(stdout: str, structured: bool) -> dict[str, Any]:
                      "must be the structured object")
         else:
             _die(5, "schema_unsatisfied", "the agent returned no structured answer")
-    usage = payload.get("usage") or {}
     return {
         "answer": answer,
         "cost_usd": payload.get("total_cost_usd"),
         "duration_ms": payload.get("duration_ms"),
         "num_turns": payload.get("num_turns"),
         "session_id": payload.get("session_id"),
-        "tokens": {
-            "input": usage.get("input_tokens"),
-            "output": usage.get("output_tokens"),
-            "cache_read": usage.get("cache_read_input_tokens"),
-            "cache_creation": usage.get("cache_creation_input_tokens"),
-        },
+        "tokens": {**_usage_tokens(payload.get("usage") or {}), "first_call": first_call},
     }
 
 
@@ -3873,8 +3912,11 @@ def _codex_answer(answer_file: Path, stdout: str, structured: bool) -> dict[str,
                     "output": usage.get("output_tokens"),
                     "cache_read": usage.get("cached_input_tokens"),
                     "cache_creation": None,
+                    # codex reports usage per turn, never per model call
+                    "first_call": None,
                 }
-            session_id = event.get("session_id") or session_id
+            # codex names the session `thread_id` on `thread.started`
+            session_id = event.get("session_id") or event.get("thread_id") or session_id
     return {"answer": answer, "cost_usd": None, "duration_ms": None,
             "num_turns": None, "session_id": session_id, "tokens": tokens}
 
@@ -3900,7 +3942,8 @@ def cmd_agents() -> dict[str, Any]:
 
 
 def cmd_agent(profile_name: str | None, prompt_raw: str, schema_raw: str | None,
-              timeout_override: float | None) -> dict[str, Any]:
+              timeout_override: float | None, resume: str | None = None,
+              fork: bool = False) -> dict[str, Any]:
     root = _root_required()
     config = _agents_config(root)
     agents = config["agents"]
@@ -3926,7 +3969,7 @@ def cmd_agent(profile_name: str | None, prompt_raw: str, schema_raw: str | None,
 
     with tempfile.TemporaryDirectory(prefix="automations-agent-") as tmp:
         answer_file = Path(tmp) / "answer.txt"
-        command = _agent_command(profile, root, schema, answer_file)
+        command = _agent_command(profile, root, schema, answer_file, resume, fork)
         started = time.monotonic()
         try:
             completed = subprocess.run(
@@ -4003,6 +4046,8 @@ def main() -> None:
     agent.add_argument("--profile")
     agent.add_argument("--schema")
     agent.add_argument("--timeout", type=float)
+    agent.add_argument("--resume")
+    agent.add_argument("--fork", action="store_true")
 
     service = sub.add_parser("service", add_help=False)
     service_sub = service.add_subparsers(dest="service_cmd", required=True)
@@ -4073,7 +4118,13 @@ def main() -> None:
     elif args.cmd == "agent":
         if args.timeout is not None and args.timeout < 1:
             _die(6, "invalid_timeout", "--timeout must be at least 1 second")
-        _emit(cmd_agent(args.profile, args.prompt, args.schema, args.timeout))
+        if args.resume is not None and not args.resume.strip():
+            _die(6, "invalid_resume", "--resume needs a session id")
+        if args.fork and args.resume is None:
+            _die(6, "fork_needs_resume", "--fork branches from a session --resume names",
+                 f"`{NAME} agent <prompt> --resume SESSION --fork`")
+        _emit(cmd_agent(args.profile, args.prompt, args.schema, args.timeout,
+                        args.resume, args.fork))
     elif args.cmd == "service" and getattr(args, "machine", False):
         # The machine verbs resolve no project: the gate let them through for
         # that reason, and the machine service checks each project itself.

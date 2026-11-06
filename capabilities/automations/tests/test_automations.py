@@ -873,6 +873,76 @@ environments = ["production"]
         self.assertIn("bypassPermissions", claude_act)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", claude_act)
 
+    def test_agent_command_resumes_and_forks_a_session(self) -> None:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_loader("automations_cli_resume_test", loader=None)
+        cli = _ilu.module_from_spec(spec)
+        cli.__dict__["__file__"] = str(CLI)
+        exec(compile(CLI.read_text(), str(CLI), "exec"), cli.__dict__)
+        agent_command = cli.__dict__["_agent_command"]
+        answer = Path(self.tmp.name) / "answer.txt"
+        claude = {"engine": "claude", "model": "sonnet", "effort": None,
+                  "mode": "read", "timeout_seconds": 60.0, "service_tier": None}
+        codex = {**claude, "engine": "codex", "model": "gpt-5.6-sol"}
+        fresh = agent_command(claude, self.root, None, answer)
+        self.assertNotIn("--resume", fresh)
+        resumed = agent_command(claude, self.root, None, answer, "base-id")
+        self.assertEqual(resumed[resumed.index("--resume") + 1], "base-id")
+        self.assertNotIn("--fork-session", resumed)
+        self.assertIn("--fork-session",
+                      agent_command(claude, self.root, None, answer, "base-id", True))
+        # codex resumes and forks through subcommands of `exec`; -C and -s are
+        # exec's own and stay before them.
+        self.assertNotIn("resume", agent_command(codex, self.root, None, answer))
+        for fork, verb in ((False, "resume"), (True, "fork")):
+            with self.subTest(fork=fork):
+                argv = agent_command(codex, self.root, None, answer, "base-id", fork)
+                at = argv.index(verb)
+                self.assertEqual(argv[at + 1:at + 3], ["base-id", "-"])
+                self.assertLess(argv.index("-C"), at)
+                self.assertLess(argv.index("-s"), at)
+
+    def test_agent_answer_reports_cache_tokens_and_the_session(self) -> None:
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_loader("automations_cli_tokens_test", loader=None)
+        cli = _ilu.module_from_spec(spec)
+        cli.__dict__["__file__"] = str(CLI)
+        exec(compile(CLI.read_text(), str(CLI), "exec"), cli.__dict__)
+
+        def usage(read: int, written: int) -> dict:
+            return {"input_tokens": 2, "output_tokens": 9,
+                    "cache_read_input_tokens": read,
+                    "cache_creation_input_tokens": written}
+
+        events = [{"type": "system", "subtype": "init"},
+                  {"type": "assistant", "parent_tool_use_id": None,
+                   "message": {"usage": usage(3532, 2356)}},
+                  {"type": "assistant", "parent_tool_use_id": None,
+                   "message": {"usage": usage(5888, 3799)}},
+                  {"type": "result", "is_error": False, "result": "hello",
+                   "session_id": "fork-id", "num_turns": 2, "total_cost_usd": 0.01,
+                   "duration_ms": 900, "usage": usage(9420, 6155)}]
+        stdout = "\n".join(json.dumps(event) for event in events) + "\n"
+        result = cli.__dict__["_claude_answer"](stdout, False)
+        self.assertEqual(result["answer"], "hello")
+        self.assertEqual(result["session_id"], "fork-id")
+        self.assertEqual(result["tokens"]["cache_read"], 9420)
+        self.assertEqual(result["tokens"]["cache_creation"], 6155)
+        self.assertEqual(result["tokens"]["first_call"],
+                         {"input": 2, "output": 9, "cache_read": 3532,
+                          "cache_creation": 2356})
+
+        answer = Path(self.tmp.name) / "answer.txt"
+        answer.write_text("ok")
+        codex_out = "\n".join(json.dumps(event) for event in (
+            {"type": "thread.started", "thread_id": "thread-id"},
+            {"type": "turn.completed",
+             "usage": {"input_tokens": 10, "cached_input_tokens": 4, "output_tokens": 1}}))
+        codex = cli.__dict__["_codex_answer"](answer, codex_out, False)
+        self.assertEqual(codex["session_id"], "thread-id")
+        self.assertEqual(codex["tokens"]["cache_read"], 4)
+        self.assertIsNone(codex["tokens"]["first_call"])
+
     def test_agents_verb_lists_profiles(self) -> None:
         listed = json.loads(self.cli("agents").stdout)
         self.assertEqual(listed["default"], "sonnet")
