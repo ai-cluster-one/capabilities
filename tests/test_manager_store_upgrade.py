@@ -29,6 +29,7 @@ import runpy
 import shutil
 import socket
 import subprocess
+import tarfile
 import tempfile
 import threading
 import uuid
@@ -347,11 +348,15 @@ def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) ->
     assert blocked["state"] == "blocked" and blocked["can_run"] is False
     codes = {b["code"]: b for b in blocked["blockers"]}
     # A client installed beside PATH, as Homebrew's or Postgres.app's, is found.
+    server = blocked["store"]["server_major"]
     if _clients_beside_path():
         assert set(codes) == {"owner_not_installed"}
+    elif _fetchable(server):
+        # The upgrade fetches its own where it can: a step, not a blocker.
+        assert set(codes) == {"owner_not_installed"}
+        assert blocked["tools"]["fetch"] == _plan(machine)
     else:
         assert set(codes) == {"owner_not_installed", "pg_dump_missing", "pg_restore_missing"}
-        server = blocked["store"]["server_major"]
         for code in ("pg_dump_missing", "pg_restore_missing"):
             assert f"PostgreSQL {server}" in codes[code]["message"]
             assert f"{server}" in codes[code]["hint"] and "install" in codes[code]["hint"]
@@ -362,6 +367,23 @@ def test_check_changes_nothing_and_answers_what_the_upgrade_would_do(machine) ->
     assert (code, error["code"]) == (6, "store_upgrade_blocked")
     assert machine.books() == before
     assert not (machine.data / "capabilities" / "backups").exists()
+    assert not (machine.data / "capabilities" / "pg-client").exists()
+
+
+def _fetchable(server: int) -> bool:
+    """Whether the upgrade fetches its own client on this machine for a
+    server of major `server`."""
+    return M["_pg_client_pin"]() is not None and server <= M["PG_CLIENT_MAJOR"]
+
+
+def _plan(machine) -> dict:
+    """The client fetch the machine's check names, under its data home."""
+    key, pin = M["_pg_client_pin"]()
+    version = M["PG_CLIENT_VERSION"]
+    return {"version": version, "platform": key,
+            "url": M["PG_CLIENT_URL"].format(version=version, platform=key),
+            "sha256": pin["sha256"], "bytes": pin["bytes"],
+            "dir": str(machine.data / "capabilities" / "pg-client" / f"{version}-{key}")}
 
 
 def _clients_beside_path() -> bool:
@@ -403,12 +425,18 @@ def test_a_client_of_the_servers_major_beside_an_older_one_first_on_path_is_used
     for name in ("pg_dump", "pg_restore"):
         assert checked["tools"][name]["path"] == str(keg / name)
         assert checked["tools"][name]["major"] == server
+    assert checked["tools"]["fetch"] is None
     if not _clients_beside_path():
         # With only the older one, it is named, and so is what to install.
         blocked = machine.ok("store", "upgrade", "--check", PATH=path, HOMEBREW_PREFIX=None)
         codes = {b["code"]: b for b in blocked["blockers"]}
-        assert set(codes) == {"pg_dump_too_old", "pg_restore_too_old"}
-        for name in ("pg_dump", "pg_restore"):
+        if _fetchable(server):
+            # It fetches its own rather than stopping at the older one.
+            assert codes == {} and blocked["tools"]["fetch"] == _plan(machine)
+            assert blocked["can_run"] is True
+            assert f"fetches the PostgreSQL {M['PG_CLIENT_VERSION']} client" in blocked["message"]
+            assert blocked["tools"]["pg_dump"]["path"] == str(older / "pg_dump")
+        for name in (() if _fetchable(server) else ("pg_dump", "pg_restore")):
             assert blocked["tools"][name] == {"path": str(older / name),
                                               "version": f"{server - 1}.6",
                                               "major": server - 1}
@@ -422,6 +450,71 @@ def test_a_client_of_the_servers_major_beside_an_older_one_first_on_path_is_used
     dump = next(e for e in _events(upgraded.stdout) if e["event"] == "step"
                 and e["step"] == "dump" and e["state"] == "done")["check"]
     assert dump["proven"]["ok"] is True and dump["proven"]["restore_list"] is True
+    # A client of the server's major installed here is used and nothing is fetched.
+    assert not any(e.get("step") == "client" for e in _events(upgraded.stdout))
+    assert not (machine.data / "capabilities" / "pg-client").exists()
+
+
+def _client_archive(root: Path, major: int) -> Path:
+    """A client archive laid out as the pinned builds are: its tools answer
+    --version as `major`, a library is a link to the file beside it, and the
+    server and an extension ride along."""
+    top = root / "build" / "postgresql-x"
+    (top / "bin").mkdir(parents=True)
+    (top / "lib").mkdir()
+    for name in ("pg_dump", "pg_restore", "psql", "postgres"):
+        tool = top / "bin" / name
+        tool.write_text(f'#!/bin/sh\necho "{name} (PostgreSQL) {major}.6"\n')
+        tool.chmod(0o755)
+    (top / "lib" / "libpq.so.5.18").write_bytes(b"libpq")
+    (top / "lib" / "libpq.so.5").symlink_to("libpq.so.5.18")
+    (top / "lib" / "plpgsql.so").write_bytes(b"plpgsql")
+    (top / "LICENSE").write_text("licence")
+    archive = root / "served" / "client.tar.gz"
+    archive.parent.mkdir()
+    with tarfile.open(archive, "w:gz") as tar:
+        tar.add(top, arcname=top.name)
+    return archive
+
+
+@pytest.fixture
+def pinned(tmp_path, monkeypatch):
+    """A served client archive and the pin the manager's fetch reads for it,
+    with the fetched client's folder under `tmp_path`."""
+    pytest.importorskip("httpx")
+    archive = _client_archive(tmp_path, M["PG_CLIENT_MAJOR"])
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    # The globals the manager's functions read, which runpy's answer copies.
+    monkeypatch.setitem(M["_pg_client_fetch"].__globals__, "PG_CLIENT_PINS", {"test-platform": {
+        "sha256": digest, "bytes": archive.stat().st_size, "libs": ("libpq.so.5",)}})
+    with _serve(archive.parent) as base:
+        yield {"version": M["PG_CLIENT_VERSION"], "platform": "test-platform",
+               "url": f"{base}/client.tar.gz", "sha256": digest,
+               "bytes": archive.stat().st_size, "dir": str(tmp_path / "pg-client" / "x")}
+
+
+def test_the_fetched_client_keeps_only_the_tools_and_their_libraries(pinned) -> None:
+    tools = M["_pg_client_fetch"](pinned)
+    dest = Path(pinned["dir"])
+    for name in ("pg_dump", "pg_restore", "psql"):
+        assert tools[name] == {"path": str(dest / "bin" / name),
+                               "version": f"{M['PG_CLIENT_MAJOR']}.6",
+                               "major": M["PG_CLIENT_MAJOR"]}
+    kept = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*"))
+    assert kept == ["bin", "bin/pg_dump", "bin/pg_restore", "bin/psql", "lib",
+                    "lib/libpq.so.5", "lib/libpq.so.5.18"]
+    assert os.readlink(dest / "lib" / "libpq.so.5") == "libpq.so.5.18"
+    assert [p.name for p in dest.parent.iterdir()] == [dest.name]
+
+
+def test_a_fetched_client_whose_sha256_is_not_the_pin_is_refused_and_not_kept(
+    pinned,
+) -> None:
+    with pytest.raises(M["_UpgradeFailed"]) as refused:
+        M["_pg_client_fetch"]({**pinned, "sha256": "0" * 64})
+    assert (refused.value.exit_code, refused.value.code) == (6, "pg_client_checksum_mismatch")
+    assert pinned["sha256"] in refused.value.message and "0" * 64 in refused.value.message
+    assert list(Path(pinned["dir"]).parent.iterdir()) == []
 
 
 def test_with_nothing_to_cross_it_changes_nothing_and_the_switch_refuses(machine) -> None:
