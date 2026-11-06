@@ -44,7 +44,7 @@ CONNECTIONS
   (`Where a secret resolves`, at the end of this help).
 
   WRITES ARE OFF BY DEFAULT: mailbox writes leave the system (mail reaches
-  real people), so send/move/seen (and fetch --mark-seen) exit 4 unless the
+  real people), so send/draft/move/seen (and fetch --mark-seen) exit 4 unless the
   connection carries an explicit "allow_write": true. No flag lifts the
   gate; granting it is a deliberate registry edit, made after asking the
   user.
@@ -136,6 +136,26 @@ Commands:
                                               sent_copy.saved=false; do not retry
                                               the send or the recipient may get
                                               a duplicate.
+  mailbox draft --to A [--to B ...] --subject S
+        [--body TEXT|- | --body-file F|-]     Save a prepared letter into the
+        [--cc A ...] [--attach FILE ...]      account's Drafts folder without
+        [--in-reply-to MESSAGE-ID]            sending it: the message is built
+                                              as send builds it (--in-reply-to
+                                              sets In-Reply-To and References,
+                                              so the draft threads under that
+                                              message) and APPENDed with the
+                                              \\Draft flag to the folder the
+                                              server marks \\Drafts, else one
+                                              named Drafts. Nothing is sent.
+                                              JSON: folder, uid (null when the
+                                              server does not report it),
+                                              message_id. Not idempotent: each
+                                              call saves another draft. A draft
+                                              is a write: on a read-only
+                                              connection it exits 4 and writes
+                                              nothing; ask the user for write
+                                              access rather than working
+                                              around it.
 
 IMAP concurrency:
   Folder reads (list/search/show/fetch) each open one IMAP connection. Many
@@ -184,6 +204,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 import smtplib
 import ssl
 import sys
@@ -202,7 +223,8 @@ from imap_tools import AND, MailBox, MailboxLoginError, MailMessageFlags
 NAME = "mailbox"
 SUMMARY = ("Thin IMAP/SMTP CLI for mailboxes — list/show messages, save "
            "attachments, render PDF, save raw .eml, flag `\\Seen`, move "
-           "between folders, and send.")
+           "between folders, send, and save a draft into Drafts without "
+           "sending it; send, draft, move and seen need a write grant.")
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [       # an override-free registry entry resolves these flat keys
     {"key": "MAILBOX_ADDRESS", "secret": False, "required": True, "note": "mailbox address"},
@@ -249,7 +271,7 @@ CONN_FIELDS = [{'key': 'address',
   'secret': True,
   'required': True,
   'env': 'MAILBOX_{ID}_APP_PASSWORD'}]
-WRITE_VERBS = {"send", "move", "seen"}   # domain verbs that mutate the mailbox
+WRITE_VERBS = {"send", "draft", "move", "seen"}   # domain verbs that mutate the mailbox
 WRITE_DEFAULT = False   # mailbox writes leave the system (mail to real people) — granted per connection, explicitly
 MACHINE_READS = ("connections", "doctor")   # outside any project, read-only on the machine's connections
 DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
@@ -935,6 +957,64 @@ def _sent_folder_name(folders) -> str | None:
     return next((name for name in _SENT_FOLDER_NAMES if name in names), None)
 
 
+_DRAFTS_FOLDER_NAMES = ("Drafts", "Draft", "[Gmail]/Drafts")
+
+
+def _drafts_folder_name(folders) -> str | None:
+    """Resolve the provider's Drafts mailbox by special-use flag, then name."""
+    for folder in folders:
+        if any(str(flag).casefold() == r"\drafts" for flag in (folder.flags or ())):
+            return folder.name
+    names = {folder.name for folder in folders}
+    return next((name for name in _DRAFTS_FOLDER_NAMES if name in names), None)
+
+
+def _appended_uid(append_result, mb: MailBox, folder: str,
+                  message_id: str) -> str | None:
+    """The new message's UID: the server's APPENDUID, else a Message-ID search."""
+    for line in (append_result[1] if append_result else None) or ():
+        text = line.decode(errors="replace") if isinstance(line, bytes) else str(line)
+        match = re.search(r"APPENDUID\s+\d+\s+(\d+)", text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    try:
+        mb.folder.set(folder)
+        uids = mb.uids(f'HEADER MESSAGE-ID "{message_id.strip()}"')
+    except Exception:
+        return None
+    return max(uids, key=int) if uids else None
+
+
+def cmd_draft(cfg: dict, to: list[str], cc: list[str], subject: str,
+              body: str, attach: list[str], in_reply_to: str | None) -> dict:
+    saved_at = datetime.now().astimezone()
+    msg = _build_message(cfg, to, cc, subject, body, attach, in_reply_to,
+                         None, saved_at)
+    message_id = str(msg["Message-ID"])
+    with _imap(cfg) as mb:
+        try:
+            folder = _drafts_folder_name(mb.folder.list())
+        except Exception as exc:
+            _die(5, "drafts_folder_lookup_failed",
+                 f"cannot inspect IMAP folders: {exc}", "no draft was saved")
+        if folder is None:
+            _die(6, "drafts_folder_missing",
+                 "no IMAP Drafts folder was advertised or found by a conventional name",
+                 "no draft was saved; create/configure a Drafts folder first")
+        try:
+            appended = mb.append(msg.as_bytes(policy=SMTP),
+                                 folder=folder, dt=saved_at,
+                                 flag_set=[MailMessageFlags.DRAFT])
+        except Exception as exc:
+            _die(5, "draft_save_failed", f"saving the draft failed: {exc}",
+                 "no draft was saved")
+        uid = _appended_uid(appended, mb, folder, message_id)
+    return {"drafted": True, "sent": False, "folder": folder, "uid": uid,
+            "message_id": message_id, "to": to, "cc": cc, "subject": subject,
+            "in_reply_to": in_reply_to,
+            "attachments": [Path(f).name for f in attach]}
+
+
 def _folder_has_message_id(mb: MailBox, folder: str, message_id: str) -> bool:
     """Whether the selected provider already stored this outgoing message."""
     mb.folder.set(folder)
@@ -942,11 +1022,10 @@ def _folder_has_message_id(mb: MailBox, folder: str, message_id: str) -> bool:
     return bool(mb.uids(criterion))
 
 
-def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
-             body: str, attach: list[str], in_reply_to: str | None,
-             html: str | None = None, bcc: list[str] | None = None) -> dict:
-    bcc = list(bcc or [])
-    sent_at = datetime.now().astimezone()
+def _build_message(cfg: dict, to: list[str], cc: list[str], subject: str,
+                   body: str, attach: list[str], in_reply_to: str | None,
+                   html: str | None, at: datetime) -> EmailMessage:
+    """The outgoing MIME message, as send delivers it and draft saves it."""
     msg = EmailMessage()
     msg["From"] = cfg["user"]
     msg["To"] = ", ".join(to)
@@ -956,7 +1035,7 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
         msg["References"] = in_reply_to
-    msg["Date"] = format_datetime(sent_at)
+    msg["Date"] = format_datetime(at)
     msg["Message-ID"] = make_msgid(domain=cfg["user"].rsplit("@", 1)[-1])
     msg.set_content(body)
     if html is not None:
@@ -971,6 +1050,16 @@ def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
         ctype, _ = mimetypes.guess_type(p.name)
         maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
         msg.add_attachment(p.read_bytes(), maintype=maintype, subtype=subtype, filename=p.name)
+    return msg
+
+
+def cmd_send(cfg: dict, to: list[str], cc: list[str], subject: str,
+             body: str, attach: list[str], in_reply_to: str | None,
+             html: str | None = None, bcc: list[str] | None = None) -> dict:
+    bcc = list(bcc or [])
+    sent_at = datetime.now().astimezone()
+    msg = _build_message(cfg, to, cc, subject, body, attach, in_reply_to,
+                         html, sent_at)
 
     from_addr = getaddresses([str(msg["From"])])[0][1]
     # Bcc recipients join the SMTP envelope only. The message carries no Bcc
@@ -1172,6 +1261,16 @@ def main() -> None:
     sp.add_argument("--attach", action="append", default=[])
     sp.add_argument("--in-reply-to", default=None)
 
+    sp = sub.add_parser("draft", parents=[conn_parent],
+                        help="save a message into Drafts without sending it")
+    sp.add_argument("--to", action="append", required=True)
+    sp.add_argument("--cc", action="append", default=[])
+    sp.add_argument("--subject", required=True)
+    sp.add_argument("--body", default=None, help="body text, or '-' for stdin")
+    sp.add_argument("--body-file", default=None, help="file path or '-' for stdin")
+    sp.add_argument("--attach", action="append", default=[])
+    sp.add_argument("--in-reply-to", default=None)
+
     args = p.parse_args()
 
     if args.cmd == "help":
@@ -1182,6 +1281,14 @@ def main() -> None:
         return
 
     cfg = _load_config(args.connection)
+    if args.cmd == "draft" and not cfg["allow_write"]:
+        _read_only_gate(f"write verb 'draft' on connection {cfg['id']!r}")
+        _die(4, "read_only",
+             f"connection {cfg['id']!r} is read-only; writing drafts needs "
+             "write access, so no draft was saved",
+             "Do not work around it — ask the user; granting is "
+             f"`capabilities set {NAME} grant {cfg['id']} "
+             "'{\"allow_write\": true}'` run inside this project.")
     _write_gate(cfg["id"], cfg["allow_write"], args.cmd)
     if args.cmd == "fetch" and args.mark_seen and cfg["allow_write"] is False:
         _read_only_gate("`fetch --mark-seen`")
@@ -1222,6 +1329,10 @@ def main() -> None:
             html = _read_body(args.html_file)
         _emit(cmd_send(cfg, args.to, args.cc, args.subject, body, args.attach,
                        args.in_reply_to, html, args.bcc))
+    elif args.cmd == "draft":
+        body = _resolve_send_body(args.body, args.body_file)
+        _emit(cmd_draft(cfg, args.to, args.cc, args.subject, body, args.attach,
+                        args.in_reply_to))
 
 
 if __name__ == "__main__":

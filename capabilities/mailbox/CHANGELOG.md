@@ -1,5 +1,9 @@
 # mailbox — change log
 
+## 2026-11-06 — `mailbox draft` saves a letter into Drafts without sending it
+
+`mailbox draft --to A --subject S` takes the body, `--cc`, `--attach` and `--in-reply-to` as `send` does and builds the same message, then saves it into the account's Drafts folder - the one the server marks `\Drafts`, else one named Drafts - with the `\Draft` flag. Nothing is sent. The answer names the folder, the new message's uid and its Message-ID; `--in-reply-to` writes `In-Reply-To` and `References`, so the draft threads under the message it answers. A draft is a write: on a connection without `allow_write` it exits 4 `read_only`, saying that writing drafts needs write access, and saves nothing. With no Drafts folder it exits 6 `drafts_folder_missing` and saves nothing. `help` and the stub line name the verb and its grant. `send` is unchanged.
+
 ## 2026-10-31 — `mailbox` carries its own icon
 
 The bundle holds its icon as `icon.png`, an envelope: Lucide's `mail` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon mailbox` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

@@ -164,9 +164,9 @@
     "mailbox": {
       "icon": true,
       "path": "capabilities/mailbox",
-      "payload_sha256": "4cfc5f747dab7e249b45d7e21e8209a135c0c404c750691806dd797795374249",
+      "payload_sha256": "cc37464b3f1b0fddce8eebb610645852ea64fe126328d781e8c3e38864d94dc6",
       "store_major": 2,
-      "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, and send."
+      "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, send, and save a draft into Drafts without sending it; send, draft, move and seen need a write grant."
     },
     "memory": {
       "icon": true,
