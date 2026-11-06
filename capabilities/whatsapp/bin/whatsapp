@@ -410,6 +410,31 @@ Commands
                                        files. Exit 6 naming a file that cannot
                                        be read or differs from the version the
                                        project already holds.
+  whatsapp prompts list                The service's prompts - context (the
+                                       dialogue's), delegation (what a turn is
+                                       told about handing work to a job) and
+                                       job-worker (the whole of a job's prompt) -
+                                       each with the source the next turn reads
+                                       it from: store (the agent's active
+                                       version), file (a project not yet moved),
+                                       or bundle (the standard text it ships).
+  whatsapp prompts show <key>          The text the next turn reads, and its
+                                       source and version.
+  whatsapp prompts put <key> [--base ID] [--note TEXT]
+                                       Save a new version from stdin; the one it
+                                       replaces stays in history. --base names
+                                       the version you read and refuses the save
+                                       (exit 6 base_mismatch) when another was
+                                       saved since. Read every turn: no restart.
+  whatsapp prompts history <key>       Every saved version, newest first.
+  whatsapp prompts retire <key>        Leave the key with no active version;
+                                       deletes nothing.
+  whatsapp prompts import [--apply]    Move this project's prompt files from
+                                       capabilities/whatsapp/service/ into the
+                                       store, their text byte for byte, all or
+                                       none; --apply saves them and removes the
+                                       files. Exit 6 naming a file that differs
+                                       from the version the store already holds.
   whatsapp send <chat_id> <text> [--reply-to MESSAGE_ID]
                 [--mention PHONE]... [--typing]
                                        Send one text message. Write-enabled
@@ -1754,9 +1779,44 @@ BEGIN
                    r.tab, r.conname, replace(r.conname, 'project', 'agent'));
   END LOOP;
 END $$"""),
+    # The service's prompts, which an agent in the store keeps here rather
+    # than in files: every saved version by key, one active, history immutable.
+    Step("0024-prompts", """
+CREATE TABLE whatsapp_prompts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id text NOT NULL CHECK (agent_id <> ''),
+  key text NOT NULL CHECK (key IN ('context', 'delegation', 'job-worker')),
+  body text NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  created_by text NOT NULL CHECK (created_by <> ''),
+  note text);
+CREATE UNIQUE INDEX whatsapp_prompts_active ON whatsapp_prompts (agent_id, key)
+  WHERE active;
+CREATE INDEX whatsapp_prompts_by_key ON whatsapp_prompts (agent_id, key, created_at DESC);
+CREATE FUNCTION whatsapp_prompts_guard() RETURNS trigger AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'whatsapp_prompts keeps every version';
+  END IF;
+  IF new.id <> old.id OR new.agent_id <> old.agent_id OR new.key <> old.key
+     OR new.body <> old.body OR new.created_at <> old.created_at
+     OR new.created_by <> old.created_by OR new.note IS DISTINCT FROM old.note
+     OR (new.active AND NOT old.active) THEN
+    RAISE EXCEPTION 'a whatsapp_prompts version is immutable but for clearing active';
+  END IF;
+  RETURN new;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER whatsapp_prompts_guard BEFORE UPDATE OR DELETE ON whatsapp_prompts
+  FOR EACH ROW EXECUTE FUNCTION whatsapp_prompts_guard();
+COMMENT ON TABLE whatsapp_prompts IS
+  'Every saved version of an agent''s whatsapp service prompts (context, delegation, job-worker); one active per key, a save clears it on the version it replaces.';
+COMMENT ON COLUMN whatsapp_prompts.body IS
+  'The prompt text byte for byte; it replaces the bundle''s standard text for its key.'"""),
 ]
 STORE_SCHEMA_MAJOR = 2
-STORE_SCHEMA_MINOR = 0
+STORE_SCHEMA_MINOR = 1
 
 
 def _tables():
@@ -7454,17 +7514,229 @@ def _inventory_verdict() -> dict:
             "problem": f"{first.get('code') or first['item']}: {first['detail']}"}
 
 
-# The service's prose, seeded from the bundle's templates: the dialogue's
-# context, what a turn is told about handing work to a job, and the whole of a
-# job worker's prompt.
+# The service's prompts: the dialogue's context, what a turn is told about
+# handing work to a job, and the whole of a job worker's prompt. Each is the
+# agent's active version in the store, else - for a project not yet moved - its
+# file, else the standard text the bundle ships.
 SERVICE_DOCUMENTS = ("context", "delegation", "job-worker")
+
+
+def _stored_prompt(db, agent_id: str, key: str):
+    """The agent's active version of one prompt, read from the store now."""
+    return db.execute(
+        "SELECT id::text AS id, key, body, created_at, created_by, note"
+        " FROM whatsapp_prompts WHERE agent_id = %s AND key = %s AND active",
+        (agent_id, key)).fetchone()
+
+
+def _prompt(db, agent_id: str | None, key: str) -> dict:
+    """One prompt as the next turn reads it: {key, body, source, ...}, the
+    source `store` (with its version), `file` (with its path), `bundle`, or
+    `none` where the bundle ships no text for the key."""
+    row = _stored_prompt(db, agent_id, key) if agent_id else None
+    if row is not None:
+        return {"key": key, "body": row["body"], "source": "store", "version": row["id"],
+                "created_at": row["created_at"], "created_by": row["created_by"]}
+    doc = _records().document_read(NAME, key)
+    if doc is not None:
+        return {"key": key, "body": doc.get("body") or "", "source": "file",
+                "path": doc.get("path")}
+    template = _service_template(f"{key}.md")
+    if template.is_file():
+        return {"key": key, "body": template.read_text(), "source": "bundle"}
+    return {"key": key, "body": "", "source": "none"}
+
+
+def _prompt_sources(db, agent_id: str) -> list[dict]:
+    """Each of the service's prompts as the next turn reads it, for `service
+    doctor` to name where it comes from."""
+    return [_prompt(db, agent_id, key) for key in SERVICE_DOCUMENTS]
+
+
+def _prompt_source_text(prompt: dict) -> str:
+    if prompt["source"] == "store":
+        return f"from the store (version {prompt['version']})"
+    if prompt["source"] == "file":
+        return (f"from the file {prompt.get('path')}; `{NAME} prompts import --apply` "
+                "moves it into the store")
+    if prompt["source"] == "bundle":
+        return "the bundle's standard text (no stored version, no file)"
+    return "empty (no stored version, no file, no standard text)"
+
+
+def _prompts_db(root: Path) -> "_Store":
+    """The project's store with the whatsapp tables migrated, for the prompt
+    verbs: the prompts are the agent's, not an account's."""
+    setting = _store_setting(root)
+    try:
+        conn = connect(application_name=NAME, setting=setting, transaction=True)
+    except DbError as exc:
+        _store_refusal(exc)
+    try:
+        migrate(conn, NAME, STORE_STEPS, major=STORE_SCHEMA_MAJOR,
+                minor=STORE_SCHEMA_MINOR)
+        conn.autocommit = True
+    except DbError as exc:
+        conn.close()
+        _store_refusal(exc)
+    return _Store(conn, "", setting)
+
+
+def _save_prompt(db, agent_id: str, key: str, body: str, by: str, *,
+                 base: str | None = None, note: str | None = None) -> dict:
+    """Add a version and make it active, clearing the one it replaces, in one
+    transaction. `base`, where given, must name the active version (its id or
+    six or more of its first characters), else exit 6 base_mismatch."""
+    with _writing(db):
+        found = db.execute(
+            "SELECT id::text AS id FROM whatsapp_prompts WHERE agent_id = %s AND key = %s"
+            " AND active FOR UPDATE", (agent_id, key)).fetchone()
+        current = found["id"] if found else None
+        if base is not None and not (current and len(base) >= 6
+                                     and current.startswith(base.lower())):
+            _refuse(6, "base_mismatch",
+                    f"the active version of {key!r} is {current}, not {base!r}",
+                    f"`{NAME} prompts show {key}` reads the active version")
+        if current:
+            db.execute("UPDATE whatsapp_prompts SET active = false WHERE id = %s",
+                       (current,))
+        row = db.execute(
+            "INSERT INTO whatsapp_prompts (agent_id, key, body, created_by, note)"
+            " VALUES (%s, %s, %s, %s, %s) RETURNING id::text AS id, created_at",
+            (agent_id, key, body, by, note)).fetchone()
+    return {"key": key, "version": row["id"], "replaced": current,
+            "created_at": row["created_at"]}
+
+
+def _prompt_actor() -> str:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+    return f"{user}@{node_name()}"
+
+
+def _prompts_import(root: Path, apply: bool) -> dict:
+    """Carry the project's prompt files into the store, their text byte for
+    byte, all or none, then remove them; without `apply`, say what that would
+    do. A file whose key already has a different version in the store refuses
+    the import, naming it: the stored one is what turns read."""
+    agent_id = _service_project_id(root)
+    adapter = _records()
+    found = []
+    for key in SERVICE_DOCUMENTS:
+        doc = adapter.document_read(NAME, key)
+        if doc and doc.get("path") and (doc.get("scope") or ("",))[0] == "project":
+            found.append((key, Path(doc["path"])))
+    if not found:
+        return {"project": str(root), "apply": apply, "prompts": [],
+                "detail": f"no prompt files in {root / SERVICE['config']}"}
+    if apply:
+        _read_only_gate(f"`{NAME} prompts import --apply`")
+    db = _prompts_db(root)
+    try:
+        plan, refused = [], []
+        for key, path in found:
+            try:
+                body = path.read_bytes().decode("utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                refused.append(f"{path}: cannot be read as UTF-8 text ({exc})")
+                continue
+            held = _stored_prompt(db, agent_id, key)
+            if held is None:
+                action = "write"
+            elif held["body"] == body:
+                action = "held"
+            else:
+                action = "refused"
+                refused.append(f"{path}: differs from the version {held['id']} the "
+                               f"store already holds for {key!r}")
+            plan.append({"key": key, "file": str(path), "action": action,
+                         "chars": len(body), "body": body,
+                         **({"version": held["id"]} if held is not None else {})})
+        if refused:
+            _refuse(6, "prompts_import_refused", "; ".join(refused),
+                    f"nothing was saved; remove the file named, or save it over the "
+                    f"stored version with `{NAME} prompts put <key> --base <version>`, "
+                    "then import again")
+        shown = [{k: v for k, v in row.items() if k != "body"} for row in plan]
+        if not apply:
+            return {"project": str(root), "agent_id": agent_id, "apply": False,
+                    "prompts": shown,
+                    "next": f"`{NAME} prompts import --apply` saves them in the store "
+                            "and removes the files"}
+        by = f"{NAME} prompts import"
+        imported = []
+        with _writing(db):
+            for row in plan:
+                if row["action"] == "write":
+                    saved = _save_prompt(db, agent_id, row["key"], row["body"], by,
+                                         note=f"imported from {row['file']}")
+                    imported.append({"key": row["key"], "file": row["file"],
+                                     "version": saved["version"], "chars": row["chars"]})
+    finally:
+        db.close()
+    for row in plan:
+        Path(row["file"]).unlink(missing_ok=True)
+    return {"project": str(root), "agent_id": agent_id, "apply": True,
+            "imported": imported,
+            "held": [{"key": r["key"], "file": r["file"], "version": r["version"]}
+                     for r in plan if r["action"] == "held"],
+            "removed": [row["file"] for row in plan]}
+
+
+def cmd_prompts(args) -> dict:
+    """The service's prompts: the agent's own text over the bundle's standard."""
+    action = args.prompts_command
+    root = _service_project_root()
+    if action == "import":
+        return _prompts_import(root, args.apply)
+    if action in ("put", "retire"):
+        _read_only_gate(f"`{NAME} prompts {action}`")
+    agent_id = _service_project_id(root)
+    db = _prompts_db(root)
+    try:
+        if action == "list":
+            rows = []
+            for key in SERVICE_DOCUMENTS:
+                prompt = _prompt(db, agent_id, key)
+                rows.append({k: v for k, v in prompt.items() if k != "body"}
+                            | {"chars": len(prompt["body"])})
+            return {"project": str(root), "agent_id": agent_id, "prompts": rows}
+        key = args.key
+        if action == "show":
+            return _prompt(db, agent_id, key)
+        if action == "history":
+            rows = db.execute(
+                "SELECT id::text AS id, active, length(body) AS chars, created_at,"
+                " created_by, note FROM whatsapp_prompts WHERE agent_id = %s AND key = %s"
+                " ORDER BY created_at DESC", (agent_id, key)).fetchall()
+            return {"key": key, "versions": [dict(row) for row in rows]}
+        if action == "retire":
+            row = db.execute(
+                "UPDATE whatsapp_prompts SET active = false WHERE agent_id = %s"
+                " AND key = %s AND active RETURNING id::text AS id",
+                (agent_id, key)).fetchone()
+            return {"key": key, "retired": row["id"] if row else None,
+                    "now": _prompt_source_text(_prompt(db, agent_id, key))}
+        body = sys.stdin.read()
+        if not body.strip():
+            _refuse(6, "empty_prompt", "the prompt on stdin is empty",
+                    f"`{NAME} prompts retire {key}` leaves the key to the file or the "
+                    "bundle's standard text")
+        return _save_prompt(db, agent_id, key, body, _prompt_actor(), base=args.base,
+                            note=args.note)
+    finally:
+        db.close()
 
 
 def _seed_service_context(adapter) -> tuple[list[str], list[str]]:
     """Seed the service's prose where the project has none. It is the
     project's to write, so a document it holds is never overwritten, `--force`
-    included. Answers what was written and what was left as it was."""
+    included. Answers what was written and what was left as it was. A project
+    whose records are in the store keeps its prompts there, so nothing is
+    seeded for it: the bundle's standard text is what it reads until it saves
+    its own with `prompts put`."""
     written, kept = [], []
+    if adapter.mode_of("setting") == "store":
+        return written, kept
     for key in SERVICE_DOCUMENTS:
         template = _service_template(f"{key}.md")
         label = f"{adapter.source}:{NAME}/{key}"
@@ -7837,9 +8109,10 @@ def _cmd_service_doctor(connection_flag: str | None,
               6, None if settings else "service_not_initialized")
     except ValueError as exc:
         check("settings", False, str(exc), 6, "service_settings_invalid")
+    prompt_agent = None
     if valid and _service_schema().dialogue_configured(settings):
         try:
-            project_id = _service_project_id(root)
+            project_id = prompt_agent = _service_project_id(root)
             check("dialogue", True, f"answers admitted messages; register keyed by "
                   f"project {project_id}")
         except _Refusal as refusal:
@@ -7884,9 +8157,14 @@ def _cmd_service_doctor(connection_flag: str | None,
     try:
         if not local:
             db = _open_store(cfg)
-            location = _store_location(db)
-            db.close()
+            try:
+                location = _store_location(db)
+                prompts = _prompt_sources(db, prompt_agent) if prompt_agent else []
+            finally:
+                db.close()
             check("store", True, location)
+            for prompt in prompts:
+                check(f"prompt {prompt['key']}", True, _prompt_source_text(prompt))
     except _Refusal as refusal:
         check("store", False, refusal.message, refusal.exit_code, refusal.code)
     account_id, _jid, _name = _session_account(
@@ -9198,6 +9476,22 @@ def main():
     pimport.add_argument("--apply", action="store_true",
                          help="save them and remove the files (default: say what it would do)")
 
+    pprompts = _sub("prompts", help="The assistant service's prompts, kept in the store")
+    prompts = pprompts.add_subparsers(dest="prompts_command", required=True)
+    prompts.add_parser("list", help="Each prompt and the source a turn reads it from")
+    for action, text in (("show", "The prompt a turn reads now, and its source"),
+                         ("history", "Every saved version of a prompt"),
+                         ("retire", "Leave a prompt with no active version")):
+        prompts.add_parser(action, help=text).add_argument("key", choices=SERVICE_DOCUMENTS)
+    pput = prompts.add_parser("put", help="Save a new version of a prompt, read from stdin")
+    pput.add_argument("key", choices=SERVICE_DOCUMENTS)
+    pput.add_argument("--base", help="the version you read (its id or six or more of its "
+                      "first characters); refuses the save when another was saved since")
+    pput.add_argument("--note", help="why this version was saved")
+    pin = prompts.add_parser("import", help="Move the project's prompt files into the store")
+    pin.add_argument("--apply", action="store_true",
+                     help="save them and remove the files (default: say what it would do)")
+
     psend = _sub(
         "send", help="Send a text message (write-enabled connections only)")
     psend.add_argument("chat_id", nargs="?", help="recipient chat id")
@@ -9314,6 +9608,7 @@ def main():
         "render": cmd_render,
         "import-legacy": cmd_import_legacy,
         "profiles": cmd_profiles,
+        "prompts": cmd_prompts,
         "send": cmd_send,
         "service": cmd_service,
         "jobs": cmd_jobs,

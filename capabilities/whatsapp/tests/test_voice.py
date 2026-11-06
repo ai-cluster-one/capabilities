@@ -133,6 +133,7 @@ class Settings(unittest.TestCase):
                 mock.patch.object(wa, "_service_settings", return_value=settings), \
                 mock.patch.object(wa, "_service_cfg", return_value=cfg), \
                 mock.patch.object(wa, "_open_store", return_value=mock.Mock()), \
+                mock.patch.object(wa, "_prompt_sources", return_value=[]), \
                 mock.patch.object(wa, "_store_location", return_value="pg"), \
                 mock.patch.object(wa, "_session_account",
                                   return_value=(td.OWN_PHONE, OWN, "Owner")), \

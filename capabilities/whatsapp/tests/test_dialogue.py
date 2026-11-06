@@ -1268,6 +1268,10 @@ class Wiring(unittest.TestCase):
                 mock.patch.object(wa, "_service_settings", return_value=settings), \
                 mock.patch.object(wa, "_service_cfg", return_value=cfg), \
                 mock.patch.object(wa, "_open_store", return_value=db), \
+                mock.patch.object(wa, "_prompt_sources", return_value=[
+                    {"key": "context", "source": "store", "version": "v-ctx"},
+                    {"key": "delegation", "source": "file", "path": "/p/delegation.md"},
+                    {"key": "job-worker", "source": "bundle"}]) as sources, \
                 mock.patch.object(wa, "_store_location", return_value="pg"), \
                 mock.patch.object(wa, "_session_account",
                                   return_value=(OWN_PHONE, OWN, "Owner")), \
@@ -1285,6 +1289,10 @@ class Wiring(unittest.TestCase):
         self.assertFalse(checks["profile claude-read-sandboxed"]["ok"])
         self.assertIn(f"allowed_users.{ALICE}.profile",
                       checks["profile claude-read-sandboxed"]["detail"])
+        sources.assert_called_once_with(db, "prj_x")
+        self.assertIn("from the store (version v-ctx)", checks["prompt context"]["detail"])
+        self.assertIn("from the file /p/delegation.md", checks["prompt delegation"]["detail"])
+        self.assertIn("the bundle's standard text", checks["prompt job-worker"]["detail"])
         self.assertEqual(fail, 6)
 
 

@@ -214,7 +214,7 @@ class Migration(td.DialogueCase):
         and refuses a release that knows only major 1."""
         import psycopg
         from psycopg.rows import dict_row
-        old = [s for s in wa.STORE_STEPS if s.id != "0023-agent-names"]
+        old = [s for s in wa.STORE_STEPS if s.id < "0023"]
         name = f"wa_m1_{uuid.uuid4().hex[:8]}"
         conn = psycopg.connect(_cli.STORE_DSN, autocommit=True)
         self.addCleanup(conn.close)
@@ -244,8 +244,8 @@ class Migration(td.DialogueCase):
         with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
             result = wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
                                 minor=wa.STORE_SCHEMA_MINOR, schema=name)
-        self.assertEqual(result.applied, ["0023-agent-names"])
-        self.assertEqual((result.major, result.minor), (2, 0))
+        self.assertEqual(result.applied, ["0023-agent-names", "0024-prompts"])
+        self.assertEqual((result.major, result.minor), (2, 1))
         conn.execute(f"SET search_path TO {name}")
         for table in ("whatsapp_register", "whatsapp_jobs", "whatsapp_job_amendments",
                       "whatsapp_job_slots"):
@@ -295,13 +295,23 @@ class Settings(unittest.TestCase):
         put = []
         adapter = types.SimpleNamespace(
             source="files", document_read=lambda cap, key: held.get(key),
-            document_put=lambda cap, key, body, author=None: put.append(key))
+            document_put=lambda cap, key, body, author=None: put.append(key),
+            mode_of=lambda collection, key=None: "files")
         written, kept = wa._seed_service_context(adapter)
         self.assertEqual(put, ["delegation", "job-worker"])
         self.assertEqual(kept, ["files:whatsapp/context"])
         self.assertEqual(written, ["files:whatsapp/delegation", "files:whatsapp/job-worker"])
         for key in ("delegation", "job-worker"):
             self.assertTrue(wa._service_template(f"{key}.md").is_file())
+
+    def test_init_seeds_no_prompt_files_for_a_project_in_the_store(self):
+        put = []
+        adapter = types.SimpleNamespace(
+            source="store", document_read=lambda cap, key: None,
+            document_put=lambda cap, key, body, author=None: put.append(key),
+            mode_of=lambda collection, key=None: "store")
+        self.assertEqual(wa._seed_service_context(adapter), ([], []))
+        self.assertEqual(put, [])
 
 
 # ── The shim and the CLI's scope ────────────────────────────────────────────

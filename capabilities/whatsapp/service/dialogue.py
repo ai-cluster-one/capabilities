@@ -1521,8 +1521,9 @@ class Dialogue:
         return out
 
     def context_document(self, key: str = "context") -> str:
-        doc = self.cli._records().document_read(self.cli.NAME, key)
-        return ((doc or {}).get("body") or "").strip()
+        """One of the service's prompts, read now: the agent's active version in
+        the store, else the project's file, else the bundle's standard text."""
+        return (self.cli._prompt(self.db, self.project_id, key)["body"] or "").strip()
 
     # -- jobs -----------------------------------------------------------------
 
