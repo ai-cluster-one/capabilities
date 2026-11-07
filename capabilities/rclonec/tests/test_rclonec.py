@@ -209,6 +209,30 @@ def test_child_env_defines_exactly_one_remote_and_no_config_file():
     assert remotes == {"GD"}, "the child must know exactly one remote"
 
 
+def test_a_connection_is_addressed_by_its_label_and_its_id(project, flags):
+    """A connection the store keys by an id is addressed as `<label>:path`,
+    as before it had one: the child's remote is named for the label (and the
+    id answers too), and a write addressed to either is refused on a
+    read-only connection."""
+    cid = "a1b2c3d4e5f6"
+    cfg, problem = module._build_cfg(cid, {"type": "drive", "label": "gd",
+                                           "options": {"scope": "drive"}})
+    assert problem is None
+    env = module._child_env(cfg)
+    assert env["RCLONE_CONFIG_GD_TYPE"] == "drive"
+    assert env["RCLONE_CONFIG_GD_SCOPE"] == "drive"
+    assert env[f"RCLONE_CONFIG_{cid.upper()}_TYPE"] == "drive"
+    with pytest.raises(SystemExit) as refused:
+        module._forward_gate(cid, False, ["copy", "/tmp/x", "gd:dest"], "gd")
+    assert refused.value.code == 4
+    with pytest.raises(SystemExit) as refused:
+        module._forward_gate(cid, False, ["copy", "/tmp/x", f"{cid}:dest"], "gd")
+    assert refused.value.code == 4
+    module._forward_gate(cid, False, ["copy", "gd:src", "/tmp/x"], "gd")
+    _, problem = module._build_cfg(cid, {"type": "drive", "label": "not-a-remote"})
+    assert problem["code"] == "bad_connection_id"
+
+
 def test_child_env_drops_inherited_rclone_variables(monkeypatch):
     monkeypatch.setenv("RCLONE_CONFIG_OTHER_TYPE", "s3")
     monkeypatch.setenv("RCLONE_DRIVE_IMPERSONATE", "someone@example.test")

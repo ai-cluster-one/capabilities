@@ -5,7 +5,7 @@
 #     "httpx>=0.27",
 #     "click>=8.1",
 #     "beautifulsoup4>=4.12",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.44,<1",
 # ]
 # ///
 """simplbooks — agent-first CLI for the SimpleBooks accounting app."""
@@ -159,9 +159,11 @@ _CONN: dict | None = None
 def _conn_session_dir() -> Path:
     """Where the resolved connection's minted session lives. The implicit
     default keeps its established home (the bare state dir); a named connection
-    gets its own subdir so two connections never share a session."""
+    gets its own subdir, keyed by its id, so two connections never share a
+    session; one made under the connection's former name is moved there on
+    first use."""
     if _CONN and _CONN.get("id") and _CONN.get("entry") is not None:
-        return _state_dir() / _CONN["id"]
+        return _connection_state_dir(_state_dir(), _CONN["id"])
     return _state_dir()
 
 

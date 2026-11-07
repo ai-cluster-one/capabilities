@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.44,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -821,6 +821,24 @@ _contract_bind(globals(), "store")
 
 _contract_bind(globals(), "connections")
 
+
+def _connection_word(word: str | None) -> str | None:
+    """The id of the connection `word` names - its id, else its label - or
+    `word` itself where it names neither."""
+    if not word:
+        return word
+    return _labelled(str(word)) or word
+
+
+def _is_connection(recorded, cid: str) -> bool:
+    """Whether `recorded`, the connection a file on this machine records
+    (linked-by, an export payload), is connection `cid`: its id, or the name
+    it was kept under before connections were given ids."""
+    if not isinstance(recorded, str) or not recorded or not cid:
+        return False
+    return recorded == cid or recorded == _connection_former_name(cid)
+
+
 _contract_connection = _cmd_connection
 
 
@@ -1034,7 +1052,7 @@ def _build_cfg(cid: str, entry: dict | None,
             cfg.update({
                 "account_key": None,
                 "unbound": True,
-                "home": str(_state_dir() / cid),
+                "home": str(_connection_state_dir(_state_dir(), cid)),
                 "device_name": entry.get("device_name") or None,
                 "initial_sync_days": days,
             })
@@ -1179,10 +1197,11 @@ def _session_state(cid: str, entry: dict, engine: str) -> dict:
         return {"live": False, "account": (held or {}).get("id") or bound}
     key = bound or _digits(entry.get("number"))
     root = _state_dir()
-    home = root / (key or cid)
-    if key and not home.exists() and (root / cid).is_dir() \
-            and _home_account(root / cid) in (None, key):
-        home = root / cid
+    home = root / key if key else _connection_state_dir(root, cid)
+    if key and not home.exists():
+        legacy = _connection_state_dir(root, cid)
+        if legacy.is_dir() and _home_account(legacy) in (None, key):
+            home = legacy
     device = _engine_device(home / "session.db")
     health = _json_file(home / "service" / "health.json")
     logged_out = isinstance(health, dict) and health.get("state") == "logged_out"
@@ -1814,9 +1833,44 @@ COMMENT ON TABLE whatsapp_prompts IS
   'Every saved version of an agent''s whatsapp service prompts (context, delegation, job-worker); one active per key, a save clears it on the version it replaces.';
 COMMENT ON COLUMN whatsapp_prompts.body IS
   'The prompt text byte for byte; it replaces the bundle''s standard text for its key.'"""),
+    # A connection is named by the id the store gave it, no longer by its
+    # name, which the core's step to 3.0 dropped after keeping each one in its
+    # map (`core_premig_connection_names`). A role's grant of another
+    # account in the service settings
+    # (`authority.roles.<role>.allowed_capabilities.<cap>.connections.<conn>`)
+    # takes the id of `<cap>`'s connection `<conn>` (`*` is whatsapp's own); a
+    # row whose segment names no connection is kept in this step's pre-image
+    # and removed. No column of whatsapp's own changes, so this is a minor.
+    Step("0025-connection-ids", r"""
+CREATE TABLE whatsapp_premig_m4_settings AS SELECT * FROM settings WITH NO DATA;
+COMMENT ON TABLE whatsapp_premig_m4_settings IS
+    'WhatsApp settings rows whose authority grant named no connection at the 2026-11 id cutover, removed from settings by step 0025-connection-ids; never written again.';
+WITH granted AS (
+    SELECT t.ctid AS at, coalesce(
+        (SELECT m.id FROM core_premig_connection_names m
+          WHERE m.capability = g.cap AND m.name = t.path[7]),
+        (SELECT k.id FROM connections k WHERE k.capability = g.cap AND k.id = t.path[7]),
+        (SELECT k.id FROM connections k WHERE k.capability = g.cap AND k.label = t.path[7])
+    ) AS cid
+      FROM settings t
+     CROSS JOIN LATERAL (SELECT CASE t.path[5] WHEN '*' THEN 'whatsapp'
+                                ELSE t.path[5] END AS cap) g
+     WHERE t.capability = 'whatsapp' AND cardinality(t.path) >= 7
+       AND t.path[1] = 'authority' AND t.path[2] = 'roles'
+       AND t.path[4] = 'allowed_capabilities' AND t.path[6] = 'connections'),
+kept AS (
+    INSERT INTO whatsapp_premig_m4_settings
+    SELECT s.* FROM settings s JOIN granted ON s.ctid = granted.at
+     WHERE granted.cid IS NULL),
+gone AS (
+    DELETE FROM settings s USING granted WHERE s.ctid = granted.at AND granted.cid IS NULL)
+UPDATE settings s
+   SET path = s.path[1:6] || granted.cid || s.path[8:cardinality(s.path)],
+       connection_id = granted.cid
+  FROM granted WHERE s.ctid = granted.at AND granted.cid IS NOT NULL""", core=(3, 0)),
 ]
 STORE_SCHEMA_MAJOR = 2
-STORE_SCHEMA_MINOR = 1
+STORE_SCHEMA_MINOR = 2
 
 
 def _tables():
@@ -2104,7 +2158,8 @@ def _account_home(key: str, cid: str) -> Path:
     home = root / key
     if home.exists():
         return home
-    legacy = root / cid
+    # A folder made under the connection's former name comes to its id first.
+    legacy = _connection_state_dir(root, cid)
     if legacy != home and legacy.is_dir() \
             and _home_account(legacy) in (None, key):
         with contextlib.suppress(OSError):
@@ -2164,13 +2219,12 @@ def _holder_gone(held: dict) -> bool:
     try:
         adapter = _records()
         if held["owner"] is None:
-            return (held["connection"] not in adapter.resolve_scope(
-                        NAME, "connection", "global")
-                    and held["connection"] not in adapter.connections(
-                        NAME, include_disabled=True))
+            return not any(_is_connection(held["connection"], cid) for cid in (
+                *adapter.resolve_scope(NAME, "connection", "global"),
+                *adapter.connections(NAME, include_disabled=True)))
         if held["owner"] == adapter.project_id:
-            return held["connection"] not in adapter.connections(
-                NAME, include_disabled=True)
+            return not any(_is_connection(held["connection"], cid)
+                           for cid in adapter.connections(NAME, include_disabled=True))
         if held.get("store") and adapter.mode_of("connection") == "store":
             return adapter.connection_owner(NAME, held["connection"]) != held["owner"]
         return False
@@ -2185,7 +2239,11 @@ def _record_linked_by(cfg: dict, *, adopt: bool = False) -> None:
     opens it."""
     home = Path(cfg["home"]).expanduser()
     held = _linked_by(home)
-    if adopt and held is not None and not _holder_gone(held):
+    # A record naming this connection by its former name is the same
+    # holder, and takes its id now.
+    if (adopt and held is not None and not _holder_gone(held)
+            and not (held["connection"] != cfg["id"]
+                     and _is_connection(held["connection"], cfg["id"]))):
         return
     record = {"connection": cfg["id"], "owner": _connection_owner(cfg["id"])}
     if _connection_in_store(cfg["id"]):
@@ -2212,7 +2270,7 @@ def _refuse_number_linked(number, cid: str, owner) -> None:
     held = _linked_by(home)
     if held is None or _home_account(home) is None:
         return
-    if held["connection"] == cid:
+    if _is_connection(held["connection"], cid):
         if (owner() if callable(owner) else owner) == held["owner"]:
             return
     if _holder_gone(held):
@@ -6202,7 +6260,7 @@ def _transcript_store(args, payload: dict):
         return None
     if problem or cfg["engine"] != ENGINE_INHOUSE:
         return None
-    if payload.get("connection") and payload["connection"] != cfg["id"]:
+    if payload.get("connection") and not _is_connection(payload["connection"], cfg["id"]):
         return None
     return _open_store(cfg)
 
@@ -6646,7 +6704,7 @@ def _first_link(cid: str, entry: dict | None):
     entry = entry if isinstance(entry, dict) else {}
     engine, _waha_engine, _stated = _entry_engine(entry)
     root = _state_dir()
-    homes = {root / cid}
+    homes = {_connection_state_dir(root, cid)}
     if _digits(entry.get("number")):
         homes.add(root / _digits(entry.get("number")))
     if (not _EVENTS_ON[0] or engine != ENGINE_INHOUSE
@@ -7775,7 +7833,8 @@ def _cmd_service_init(connection_flag: str | None, force: bool) -> dict:
                 "settings": existing}
     settings = json.loads(template.read_text())
     if connection_flag:
-        settings["connection"] = connection_flag
+        # The setting holds the connection's id, whichever word named it.
+        settings["connection"] = _connection_word(connection_flag)
     try:
         _validate_service_settings(settings)
     except ValueError as exc:
@@ -8694,7 +8753,7 @@ class _ServiceDaemon:
         try:
             data = _validate_service_settings(_service_settings())
             wanted = data.get("connection")
-            if wanted and wanted != self.cfg["id"]:
+            if wanted and _connection_word(wanted) != self.cfg["id"]:
                 raise ValueError(
                     f"settings.connection {wanted!r} differs from the running "
                     f"{self.cfg['id']!r}; a connection change takes effect on "

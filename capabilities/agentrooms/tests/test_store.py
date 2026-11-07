@@ -19,6 +19,10 @@ pytestmark = pytest.mark.skipif(not DSN, reason="AGENTROOMS_TEST_DSN is not set"
 
 engine = load_engine()
 
+# The agents' connections: each row names its agent by the connection's id,
+# which a row of connections holds.
+ALPHA, BETA = "a1b2c3d4e5f6", "b1c2d3e4f5a6"
+
 
 @pytest.fixture()
 def store():
@@ -32,63 +36,66 @@ def store():
                          database=info.get("dbname"), user=info.get("user"),
                          password=info.get("password"), sslmode=info.get("sslmode") or "disable")
     opened = engine.Store(setting).open()
+    opened.execute("INSERT INTO connections (id, capability, label, spec) VALUES "
+                   "(%s, 'agentrooms', 'alpha', '{}'), (%s, 'agentrooms', 'beta', '{}')",
+                   (ALPHA, BETA))
     yield opened
     opened.execute(f"DROP SCHEMA {schema} CASCADE")
     opened.close()
 
 
 def test_one_holder_per_agent(store):
-    assert store.acquire("p", "alpha", "h1", "n1", 1) is None
-    assert store.acquire("p", "alpha", "h1", "n1", 1) is None  # renewal
-    held = store.acquire("p", "alpha", "h2", "n2", 2)
+    assert store.acquire("p", ALPHA, "h1", "n1", 1) is None
+    assert store.acquire("p", ALPHA, "h1", "n1", 1) is None  # renewal
+    held = store.acquire("p", ALPHA, "h2", "n2", 2)
     assert held["holder"] == "h1"
-    assert store.acquire("p", "beta", "h2", "n2", 2) is None  # another agent is free
-    store.release("p", "alpha", "h1")
-    assert store.acquire("p", "alpha", "h2", "n2", 2) is None
+    assert store.acquire("p", BETA, "h2", "n2", 2) is None  # another agent is free
+    store.release("p", ALPHA, "h1")
+    assert store.acquire("p", ALPHA, "h2", "n2", 2) is None
 
 
 def test_a_sync_is_recorded_only_by_the_holder(store):
     wake = {"room_id": "!r", "key": "$1", "kind": "mention", "event_id": "$1", "sender": "@b:x"}
-    assert store.acquire("p", "alpha", "h1", "n1", 1) is None
-    assert store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", [wake, wake]) is True
-    assert store.next_batch("p", "alpha", "@alpha:x") == "b1"
-    assert store.next_batch("p", "alpha", "@other:x") is None
-    assert store.save_sync("p", "alpha", "@alpha:x", "h2", "b2", []) is False
-    assert store.next_batch("p", "alpha", "@alpha:x") == "b1"
-    assert [(a, r) for a, r, _ in store.ready("p")] == [("alpha", "!r")]
+    assert store.acquire("p", ALPHA, "h1", "n1", 1) is None
+    assert store.save_sync("p", ALPHA, "@alpha:x", "h1", "b1", [wake, wake]) is True
+    assert store.next_batch("p", ALPHA, "@alpha:x") == "b1"
+    assert store.next_batch("p", ALPHA, "@other:x") is None
+    assert store.save_sync("p", ALPHA, "@alpha:x", "h2", "b2", []) is False
+    assert store.next_batch("p", ALPHA, "@alpha:x") == "b1"
+    assert [(a, r) for a, r, _ in store.ready("p")] == [(ALPHA, "!r")]
 
 
 def test_wakes_are_claimed_once_and_new_ones_wait(store):
-    store.acquire("p", "alpha", "h1", "n1", 1)
+    store.acquire("p", ALPHA, "h1", "n1", 1)
     first = {"room_id": "!r", "key": "$1", "kind": "mention", "event_id": "$1", "sender": "@b:x"}
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", [first])
-    claimed = store.claim("p", "alpha", "!r", "t1")
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b1", [first])
+    claimed = store.claim("p", ALPHA, "!r", "t1")
     assert [w["event_id"] for w in claimed] == ["$1"]
-    assert store.claim("p", "alpha", "!r", "t2") == []
+    assert store.claim("p", ALPHA, "!r", "t2") == []
     second = {**first, "key": "$2", "event_id": "$2"}
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b2", [second])
-    store.finish("p", "alpha", "!r", "t1")
-    assert [w["event_id"] for w in store.claim("p", "alpha", "!r", "t3")] == ["$2"]
-    store.restore("p", "alpha", "!r", "t3")
-    assert store.unclaim("p", "alpha") == 0
-    store.claim("p", "alpha", "!r", "t4")
-    assert store.unclaim("p", "alpha") == 1
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b2", [second])
+    store.finish("p", ALPHA, "!r", "t1")
+    assert [w["event_id"] for w in store.claim("p", ALPHA, "!r", "t3")] == ["$2"]
+    store.restore("p", ALPHA, "!r", "t3")
+    assert store.unclaim("p", ALPHA) == 0
+    store.claim("p", ALPHA, "!r", "t4")
+    assert store.unclaim("p", ALPHA) == 1
 
 
 def test_sessions_and_pause(store):
-    assert store.session("p", "alpha", "!r") is None
-    store.save_session("p", "alpha", "!r", harness="claude", session_id="s1", node="n1", seen_ts=5)
-    store.save_session("p", "alpha", "!r", harness="claude", session_id="s1", node="n1", seen_ts=3)
-    found = store.session("p", "alpha", "!r")
+    assert store.session("p", ALPHA, "!r") is None
+    store.save_session("p", ALPHA, "!r", harness="claude", session_id="s1", node="n1", seen_ts=5)
+    store.save_session("p", ALPHA, "!r", harness="claude", session_id="s1", node="n1", seen_ts=3)
+    found = store.session("p", ALPHA, "!r")
     assert found == {"harness": "claude", "session_id": "s1", "node": "n1", "seen_ts": 5, "turns": 2}
-    store.save_session("p", "alpha", "!s", harness="codex", session_id="s2", node="n1", seen_ts=1)
-    store.save_session("p", "beta", "!r", harness="claude", session_id="s3", node="n1", seen_ts=1)
-    mapped = store.sessions("p", "alpha")
+    store.save_session("p", ALPHA, "!s", harness="codex", session_id="s2", node="n1", seen_ts=1)
+    store.save_session("p", BETA, "!r", harness="claude", session_id="s3", node="n1", seen_ts=1)
+    mapped = store.sessions("p", ALPHA)
     assert [(r["room_id"], r["session_id"], r["turns"]) for r in mapped] == [("!r", "s1", 2),
                                                                             ("!s", "s2", 1)]
     assert mapped[0]["updated_at"]
-    assert [r["session_id"] for r in store.sessions("p", "alpha", "!s")] == ["s2"]
-    assert store.sessions("p", "alpha", "!none") == []
+    assert [r["session_id"] for r in store.sessions("p", ALPHA, "!s")] == ["s2"]
+    assert store.sessions("p", ALPHA, "!none") == []
     assert store.pause_of("p") is None
     store.pause("p", "me@host", "testing")
     assert store.pause_of("p")["reason"] == "testing"
@@ -118,51 +125,51 @@ def test_workers_are_versions_and_history_is_never_edited(store):
 
 def test_turn_counts_reset_a_room_after_quiet_and_skip_refusals(store):
     for n, ago in enumerate((10, 20, 2000)):
-        store.start_turn(f"t{n}", "p", "alpha", "!r", "w", None, ["@b:x"], ["mention"])
+        store.start_turn(f"t{n}", "p", ALPHA, "!r", "w", None, ["@b:x"], ["mention"])
         store.execute("UPDATE agentrooms_turns SET started_at = now() - make_interval(secs => %s) "
                       "WHERE id = %s", (ago, f"t{n}"))
     # A refusal, and one an earlier release recorded as the default worker's.
-    store.start_turn("refusal:t9:@s:x", "p", "alpha", "!r", "refusal", None, ["@s:x"], ["direct"])
-    store.start_turn("default:t8:@o:x", "p", "alpha", "!r", "default", None, ["@o:x"], ["direct"])
-    counts = store.turn_counts("p", "alpha", "!r", ["@b:x", "@s:x"], window=3600, quiet=900,
+    store.start_turn("refusal:t9:@s:x", "p", ALPHA, "!r", "refusal", None, ["@s:x"], ["direct"])
+    store.start_turn("default:t8:@o:x", "p", ALPHA, "!r", "default", None, ["@o:x"], ["direct"])
+    counts = store.turn_counts("p", ALPHA, "!r", ["@b:x", "@s:x"], window=3600, quiet=900,
                                room_cap=10)
     assert counts == {"agent": 3, "room": 2, "senders": {"@b:x": 3, "@s:x": 0}}
-    assert store.turn_counts("p", "alpha", "!r", [], window=15, quiet=5, room_cap=10)["room"] == 0
-    assert store.refused("p", "alpha", "!r", "@s:x", 60)
-    assert store.refused("p", "alpha", "!r", "@o:x", 60)
-    assert not store.refused("p", "alpha", "!other", "@s:x", 60)
+    assert store.turn_counts("p", ALPHA, "!r", [], window=15, quiet=5, room_cap=10)["room"] == 0
+    assert store.refused("p", ALPHA, "!r", "@s:x", 60)
+    assert store.refused("p", ALPHA, "!r", "@o:x", 60)
+    assert not store.refused("p", ALPHA, "!other", "@s:x", 60)
     # A turn the default worker ran is a turn, and counts.
-    store.start_turn("t7", "p", "alpha", "!r", "default", None, ["@s:x"], ["mention"])
-    assert store.turn_counts("p", "alpha", "!r", ["@s:x"], window=3600, quiet=900,
+    store.start_turn("t7", "p", ALPHA, "!r", "default", None, ["@s:x"], ["mention"])
+    assert store.turn_counts("p", ALPHA, "!r", ["@s:x"], window=3600, quiet=900,
                              room_cap=10)["senders"] == {"@s:x": 1}
-    assert not store.refused("p", "alpha", "!r", "@b:x", 60)
+    assert not store.refused("p", ALPHA, "!r", "@b:x", 60)
     # So is one a project worker named `refusal` ran: it is held to its limits.
-    store.start_turn("t6", "p", "alpha", "!r", "refusal", None, ["@q:x"], ["mention"])
-    assert store.turn_counts("p", "alpha", "!r", ["@q:x"], window=3600, quiet=900,
+    store.start_turn("t6", "p", ALPHA, "!r", "refusal", None, ["@q:x"], ["mention"])
+    assert store.turn_counts("p", ALPHA, "!r", ["@q:x"], window=3600, quiet=900,
                              room_cap=10)["senders"] == {"@q:x": 1}
-    assert not store.refused("p", "alpha", "!r", "@q:x", 60)
+    assert not store.refused("p", ALPHA, "!r", "@q:x", 60)
     store.end_turn("t0", "answered")
     assert store.execute("SELECT outcome FROM agentrooms_turns WHERE id = 't0'", fetch="one") == ("answered",)
-    assert store.answered_by("p", "alpha", "$a") is None
+    assert store.answered_by("p", ALPHA, "$a") is None
     store.end_turn("t1", "answered", event_id="$a", harness="claude", session_id="s1", node="n1")
-    found = store.answered_by("p", "alpha", "$a")
+    found = store.answered_by("p", ALPHA, "$a")
     assert {k: found[k] for k in ("turn", "room_id", "worker", "harness", "session_id", "node",
                                   "outcome")} == {
         "turn": "t1", "room_id": "!r", "worker": "w", "harness": "claude", "session_id": "s1",
         "node": "n1", "outcome": "answered"}
     assert found["started_at"]
-    assert store.answered_by("p", "beta", "$a") is None
+    assert store.answered_by("p", BETA, "$a") is None
 
 
 def test_only_the_named_wakes_are_handed_back(store):
-    store.acquire("p", "alpha", "h1", "n1", 1)
+    store.acquire("p", ALPHA, "h1", "n1", 1)
     wakes = [{"room_id": "!r", "key": k, "kind": "mention", "event_id": k, "sender": "@b:x"}
              for k in ("$1", "$2")]
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", wakes)
-    store.claim("p", "alpha", "!r", "t1")
-    store.restore("p", "alpha", "!r", "t1", ["$2"])
-    store.finish("p", "alpha", "!r", "t1")
-    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t2")] == ["$2"]
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b1", wakes)
+    store.claim("p", ALPHA, "!r", "t1")
+    store.restore("p", ALPHA, "!r", "t1", ["$2"])
+    store.finish("p", ALPHA, "!r", "t1")
+    assert [w["key"] for w in store.claim("p", ALPHA, "!r", "t2")] == ["$2"]
 
 
 def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
@@ -172,40 +179,40 @@ def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
 
     listener = psycopg.connect(DSN, autocommit=True)
     listener.execute(f"LISTEN {engine.HELD_CHANNEL}")
-    store.acquire("p", "alpha", "h1", "n1", 1)
+    store.acquire("p", ALPHA, "h1", "n1", 1)
 
     def wake(key, sender, held):
         return {"room_id": "!r", "key": key, "kind": "mention", "event_id": key, "sender": sender,
                 "held": held}
 
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1",
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b1",
                     [wake("$1", "@c:x", True), wake("$2", "@b:x", False), wake("$3", "@d:x", True)])
     # A held wake is never claimed; the rest of the room is.
-    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t1")] == ["$2"]
-    store.finish("p", "alpha", "!r", "t1")
+    assert [w["key"] for w in store.claim("p", ALPHA, "!r", "t1")] == ["$2"]
+    store.finish("p", ALPHA, "!r", "t1")
     assert store.ready("p") == []
-    assert store.held_rooms("p", "alpha") == {"!r": {"count": 2, "senders": ["@c:x", "@d:x"]}}
-    assert [(w["event_id"], w["sender"]) for w in store.held("p", "alpha")] == [
+    assert store.held_rooms("p", ALPHA) == {"!r": {"count": 2, "senders": ["@c:x", "@d:x"]}}
+    assert [(w["event_id"], w["sender"]) for w in store.held("p", ALPHA)] == [
         ("$1", "@c:x"), ("$3", "@d:x")]
-    assert store.held("p", "alpha", "!other") == [] and store.held_rooms("p", "beta") == {}
+    assert store.held("p", ALPHA, "!other") == [] and store.held_rooms("p", BETA) == {}
     # A grant the sync brings releases what it now admits, and only that.
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b2", [],
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b2", [],
                     {"!r": {"everyone": False, "users": ["@c:x"]}})
-    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t2")] == ["$1"]
-    store.finish("p", "alpha", "!r", "t2")
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b3", [wake("$4", "@d:x", True),
+    assert [w["key"] for w in store.claim("p", ALPHA, "!r", "t2")] == ["$1"]
+    store.finish("p", ALPHA, "!r", "t2")
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b3", [wake("$4", "@d:x", True),
                                                            wake("$5", "@e:x", True)])
     # Answered once: released into a turn, the rest still held.
-    assert [w["event_id"] for w in store.answer_held("p", "alpha", "!r", "@d:x")] == ["$3", "$4"]
-    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t3")] == ["$3", "$4"]
-    store.finish("p", "alpha", "!r", "t3")
-    assert [w["event_id"] for w in store.dismiss_held("p", "alpha", "!r")] == ["$5"]
-    assert store.held_rooms("p", "alpha") == {} and store.ready("p") == []
+    assert [w["event_id"] for w in store.answer_held("p", ALPHA, "!r", "@d:x")] == ["$3", "$4"]
+    assert [w["key"] for w in store.claim("p", ALPHA, "!r", "t3")] == ["$3", "$4"]
+    store.finish("p", ALPHA, "!r", "t3")
+    assert [w["event_id"] for w in store.dismiss_held("p", ALPHA, "!r")] == ["$5"]
+    assert store.held_rooms("p", ALPHA) == {} and store.ready("p") == []
     # No grant, or everyone on, releases every held wake in the room.
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b4", [wake("$6", "@f:x", True)])
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b5", [], {"!r": None})
-    assert [w["key"] for w in store.claim("p", "alpha", "!r", "t4")] == ["$6"]
-    store.finish("p", "alpha", "!r", "t4")
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b4", [wake("$6", "@f:x", True)])
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b5", [], {"!r": None})
+    assert [w["key"] for w in store.claim("p", ALPHA, "!r", "t4")] == ["$6"]
+    store.finish("p", ALPHA, "!r", "t4")
     # Every change to what is held was announced, with ids only, and raised
     # the agent's version once for each of the ten held rows it changed; a
     # transaction's identical notifications fold into one.
@@ -213,9 +220,9 @@ def test_held_wakes_wait_for_the_operator_and_a_grant_releases_them(store):
     version = listener.execute(
         f'SELECT version FROM "{store.setting.schema}".schema_channel '
         "WHERE channel = %s AND scope = %s",
-        (engine.HELD_CHANNEL, engine.held_scope("p", "alpha"))).fetchone()
+        (engine.HELD_CHANNEL, engine.held_scope("p", ALPHA))).fetchone()
     listener.close()
-    assert said and all(n == {"schema": store.setting.schema, "agent_id": "p", "agent": "alpha",
+    assert said and all(n == {"schema": store.setting.schema, "agent_id": "p", "agent": ALPHA,
                               "room": "!r"} for n in said)
     assert version == (10,) and len(said) <= 10
 
@@ -230,22 +237,23 @@ def test_a_sync_releasing_a_room_and_a_dismiss_of_it_both_commit(store):
 
     import psycopg
 
-    store.acquire("p", "alpha", "h1", "n1", 1)
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", [
+    store.acquire("p", ALPHA, "h1", "n1", 1)
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b1", [
         {"room_id": "!r", "key": "$1", "kind": "mention", "event_id": "$1",
          "sender": "@s:x", "held": True}])
     dsn = f"{DSN}{'&' if '?' in DSN else '?'}options=-csearch_path%3D{store.setting.schema}"
     sync, operator = psycopg.connect(dsn), psycopg.connect(dsn)
     out = {}
     try:
-        sync.execute("INSERT INTO agentrooms_wakes (agent_id, agent, room_id, wake_key, kind, "
-                     "event_id, sender, held_at) VALUES ('p', 'alpha', '!q', '$2', 'mention', "
-                     "'$2', '@t:x', now())")
+        sync.execute("INSERT INTO agentrooms_wakes (agent_id, connection_id, room_id, wake_key, "
+                     "kind, event_id, sender, held_at) VALUES ('p', %s, '!q', '$2', 'mention', "
+                     "'$2', '@t:x', now())", (ALPHA,))
 
         def dismiss():
             try:
                 operator.execute("DELETE FROM agentrooms_wakes WHERE agent_id = 'p' "
-                                 "AND agent = 'alpha' AND room_id = '!r' AND held_at IS NOT NULL")
+                                 "AND connection_id = %s AND room_id = '!r' "
+                                 "AND held_at IS NOT NULL", (ALPHA,))
                 operator.commit()
                 out["operator"] = "committed"
             except Exception as exc:
@@ -257,7 +265,8 @@ def test_a_sync_releasing_a_room_and_a_dismiss_of_it_both_commit(store):
         thread.join(0.5)
         try:
             sync.execute("UPDATE agentrooms_wakes SET held_at = NULL WHERE agent_id = 'p' "
-                         "AND agent = 'alpha' AND room_id = '!r' AND held_at IS NOT NULL")
+                         "AND connection_id = %s AND room_id = '!r' AND held_at IS NOT NULL",
+                         (ALPHA,))
             sync.commit()
             out["sync"] = "committed"
         except Exception as exc:
@@ -268,17 +277,17 @@ def test_a_sync_releasing_a_room_and_a_dismiss_of_it_both_commit(store):
         sync.close()
         operator.close()
     assert out == {"sync": "committed", "operator": "committed"}
-    assert store.held_rooms("p", "alpha") == {"!q": {"count": 1, "senders": ["@t:x"]}}
+    assert store.held_rooms("p", ALPHA) == {"!q": {"count": 1, "senders": ["@t:x"]}}
 
 def test_catch_up_takes_the_admitted_wakes_and_a_later_one_is_known_taken(store):
-    store.acquire("p", "alpha", "h1", "n1", 1)
+    store.acquire("p", ALPHA, "h1", "n1", 1)
     wake = {"room_id": "!r", "kind": "mention", "sender": "@b:x"}
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", [{**wake, "key": "$1", "event_id": "$1"}])
-    store.claim("p", "alpha", "!r", "t1")
-    store.start_turn("t1", "p", "alpha", "!r", "w", None, ["@b:x"], ["mention"])
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b1", [{**wake, "key": "$1", "event_id": "$1"}])
+    store.claim("p", ALPHA, "!r", "t1")
+    store.start_turn("t1", "p", ALPHA, "!r", "w", None, ["@b:x"], ["mention"])
     store.mark_turn("t1", 100)
     assert store.running_turn("t1")["seen_ts"] == 100
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b2", [
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b2", [
         {**wake, "key": "$2", "event_id": "$2"},
         {**wake, "key": "$3", "event_id": "$3", "sender": "@s:x"}])
     events = [{"event_id": f"${n}", "origin_server_ts": 100 + n} for n in (2, 3, 4)]
@@ -289,31 +298,31 @@ def test_catch_up_takes_the_admitted_wakes_and_a_later_one_is_known_taken(store)
     assert turn[0] == 104 and sorted(turn[1]) == ["$2", "$3", "$4"] and turn[2] == ["@b:x"]
     assert store.turn_seen("t1") == 104
     # A wake for a message the turn took, recorded after catch-up ran.
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b3", [
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b3", [
         {**wake, "key": "$4", "event_id": "$4", "sender": "@c:x"}])
     store.end_turn("t1", "answered")
-    store.finish("p", "alpha", "!r", "t1")
+    store.finish("p", ALPHA, "!r", "t1")
     assert store.catch_up("t1", [], lambda w: True) is None
-    pending = store.claim("p", "alpha", "!r", "t2")
+    pending = store.claim("p", ALPHA, "!r", "t2")
     assert sorted(w["event_id"] for w in pending) == ["$3", "$4"]
-    known = store.taken_before("p", "alpha", "!r", pending)
+    known = store.taken_before("p", ALPHA, "!r", pending)
     assert [(w["event_id"], w["taken_by"]) for w in known] == [("$3", "t1"), ("$4", "t1")]
     assert sorted(store.execute("SELECT senders FROM agentrooms_turns WHERE id = 't1'",
                                 fetch="one")[0]) == ["@b:x", "@c:x", "@s:x"]
 
 
 def test_a_turn_that_took_nothing_hands_its_taken_wakes_back(store):
-    store.acquire("p", "alpha", "h1", "n1", 1)
+    store.acquire("p", ALPHA, "h1", "n1", 1)
     wake = {"room_id": "!r", "kind": "mention", "sender": "@b:x"}
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b1", [{**wake, "key": "$1", "event_id": "$1"}])
-    store.claim("p", "alpha", "!r", "t1")
-    store.start_turn("t1", "p", "alpha", "!r", "w", None, ["@b:x"], ["mention"])
-    store.save_sync("p", "alpha", "@alpha:x", "h1", "b2", [{**wake, "key": "$2", "event_id": "$2"}])
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b1", [{**wake, "key": "$1", "event_id": "$1"}])
+    store.claim("p", ALPHA, "!r", "t1")
+    store.start_turn("t1", "p", ALPHA, "!r", "w", None, ["@b:x"], ["mention"])
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b2", [{**wake, "key": "$2", "event_id": "$2"}])
     store.catch_up("t1", [{"event_id": "$2", "origin_server_ts": 5}], lambda w: True)
-    store.untake("p", "alpha", "!r", "t1")
-    store.finish("p", "alpha", "!r", "t1")
-    assert [w["event_id"] for w in store.claim("p", "alpha", "!r", "t2")] == ["$2"]
-    assert store.taken_before("p", "alpha", "!r", [{"key": "$2", "kind": "mention",
+    store.untake("p", ALPHA, "!r", "t1")
+    store.finish("p", ALPHA, "!r", "t1")
+    assert [w["event_id"] for w in store.claim("p", ALPHA, "!r", "t2")] == ["$2"]
+    assert store.taken_before("p", ALPHA, "!r", [{"key": "$2", "kind": "mention",
                                                      "event_id": "$2", "sender": "@b:x"}]) == []
 
 
@@ -323,7 +332,7 @@ def test_the_store_keeps_one_working_connection_between_operations(store):
     its own between operations and every operation runs on the same one."""
     import psycopg
     assert store.conn is None
-    assert store.acquire("p", "alpha", "h1", "n1", 1) is None
+    assert store.acquire("p", ALPHA, "h1", "n1", 1) is None
     assert store.conn is None
     with store.transaction() as cur:
         cur.execute("SELECT pg_backend_pid()")
@@ -361,6 +370,9 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(monkeypatch):
         db.migrate(conn, engine.LEDGER_OWNER, engine.LEDGER_STEPS[:11], major=1, minor=5)
         with conn.transaction():
             for sql in (
+                # The agent's connection, under the label its rows name it by.
+                f"INSERT INTO connections (id, capability, label, spec) "
+                f"VALUES ('{ALPHA}', 'agentrooms', 'alpha', '{{}}')",
                 "INSERT INTO agentrooms_sync (project_id, agent, user_id, next_batch) "
                 "VALUES ('p', 'alpha', '@alpha:x', 'b1')",
                 "INSERT INTO agentrooms_wakes (project_id, agent, room_id, wake_key, kind, "
@@ -387,17 +399,17 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(monkeypatch):
     store = engine.Store(setting).open()
     monkeypatch.delenv(db.UPGRADE_ENV)
     try:
-        assert store.next_batch("p", "alpha", "@alpha:x") == "b1"
-        assert [w["sender"] for w in store.held("p", "alpha")] == ["@b:x"]
-        assert store.session("p", "alpha", "!r")["session_id"] == "s1"
+        assert store.next_batch("p", ALPHA, "@alpha:x") == "b1"
+        assert [w["sender"] for w in store.held("p", ALPHA)] == ["@b:x"]
+        assert store.session("p", ALPHA, "!r")["session_id"] == "s1"
         assert store.pause_of("p")["reason"] == "why"
         assert [w["body"] for w in store.worker_history("p", "lab")] == ["old", "new"]
         assert store.worker("p", "lab")["body"] == "new"
-        assert store.acquire("p", "alpha", "h2", "n2", 2) is None  # the old lease ran out
+        assert store.acquire("p", ALPHA, "h2", "n2", 2) is None  # the old lease ran out
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'SET search_path TO "{schema}"')
             assert admin.execute("SELECT major, minor FROM schema_version "
-                                 "WHERE owner = 'agentrooms'").fetchone() == (2, 0)
+                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 0)
             assert admin.execute("SELECT agent_id, worker, outcome FROM agentrooms_turns"
                                  ).fetchall() == [("p", "lab", "answered")]
             names = [r[0] for r in admin.execute(
@@ -423,7 +435,100 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(monkeypatch):
             admin.execute("LISTEN agentrooms_held")
             admin.execute("UPDATE agentrooms_wakes SET held_at = NULL WHERE agent_id = 'p'")
             said = [json.loads(n.payload) for n in admin.notifies(timeout=2, stop_after=1)]
-        assert said == [{"schema": schema, "agent_id": "p", "agent": "alpha", "room": "!r"}]
+        assert said == [{"schema": schema, "agent_id": "p", "agent": ALPHA, "room": "!r"}]
+    finally:
+        store.execute(f"DROP SCHEMA {schema} CASCADE")
+        store.close()
+
+
+def test_a_store_at_major_2_names_every_row_and_binding_by_the_connection_id(monkeypatch):
+    """A store at schema major 2 - the core keying connections by name, the
+    agentrooms tables at 2.0 with a row in every table under an agent's
+    connection name and a binding setting under it - is migrated in place by
+    the store upgrade: every row and the binding of a connection the store
+    holds are kept under the id the core gave it, in `connection_id`, and go
+    with the connection; a row naming a connection only files hold is kept
+    under that name in `file_connection` and stays; a binding naming no
+    connection is kept in the step's pre-image and removed."""
+    import psycopg
+    from capabilities_contract import db
+    from capabilities_contract.db import _migrate
+    from psycopg.conninfo import conninfo_to_dict
+
+    info = conninfo_to_dict(DSN)
+    schema = f"ar_m2_{uuid.uuid4().hex[:8]}"
+    setting = db.Setting(schema=schema, level="machine", sources=("AGENTROOMS_TEST_DSN",),
+                         host=info.get("host") or "127.0.0.1", port=int(info.get("port") or 5432),
+                         database=info.get("dbname"), user=info.get("user"),
+                         password=info.get("password"), sslmode=info.get("sslmode") or "disable")
+    with monkeypatch.context() as at_two:
+        # The store as a release of major 2 left it: the core at 2.0.
+        at_two.setattr(_migrate, "CORE_STEPS", _migrate.CORE_STEPS[:1])
+        at_two.setattr(_migrate, "CORE_VERSION", (2, 0))
+        conn = db.connect(application_name="agentrooms-test", setting=setting, transaction=True)
+        try:
+            db.migrate(conn, engine.LEDGER_OWNER, engine.LEDGER_STEPS[:12], major=2, minor=0)
+            with conn.transaction():
+                for sql in (
+                    "INSERT INTO connections (capability, name, spec) "
+                    "VALUES ('agentrooms', 'work', '{}')",
+                    "INSERT INTO agentrooms_sync (agent_id, agent, user_id, next_batch) "
+                    "VALUES ('p', 'work', '@work:x', 'b1'), ('p', 'gone', '@gone:x', 'b9')",
+                    "INSERT INTO agentrooms_wakes (agent_id, agent, room_id, wake_key, kind, "
+                    "sender, held_at) VALUES ('p', 'work', '!r', '$1', 'mention', '@b:x', now())",
+                    "INSERT INTO agentrooms_sessions (agent_id, agent, room_id, harness, "
+                    "session_id, node, turns) VALUES ('p', 'work', '!r', 'claude', 's1', 'n1', 2)",
+                    "INSERT INTO agentrooms_leases (agent_id, agent, holder, node, pid, "
+                    "acquired_at, expires_at) "
+                    "VALUES ('p', 'work', 'h1', 'n1', 1, now(), now() - interval '1 h')",
+                    "INSERT INTO agentrooms_turns (id, agent_id, agent, room_id, worker, outcome) "
+                    "VALUES ('t1', 'p', 'work', '!r', 'lab', 'answered')",
+                    "INSERT INTO settings (agent_id, capability, path, value, updated_by) VALUES "
+                    "('p', 'agentrooms', '{binding.work,worker}', '\"lab\"', 'u@n1'), "
+                    "('p', 'agentrooms', '{binding.work,opened}', 'true', 'u@n1'), "
+                    "('p', 'agentrooms', '{binding.gone,worker}', '\"old\"', 'u@n1')"):
+                    conn.execute(sql)
+        finally:
+            conn.close()
+    monkeypatch.setenv(db.UPGRADE_ENV, "1")
+    store = engine.Store(setting).open()
+    monkeypatch.delenv(db.UPGRADE_ENV)
+    try:
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            admin.execute(f'SET search_path TO "{schema}"')
+            (cid,) = admin.execute("SELECT id FROM connections WHERE label = 'work'").fetchone()
+            assert admin.execute("SELECT major, minor FROM schema_version "
+                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 0)
+            assert store.next_batch("p", cid, "@work:x") == "b1"
+            assert [w["sender"] for w in store.held("p", cid)] == ["@b:x"]
+            assert store.session("p", cid, "!r")["session_id"] == "s1"
+            assert store.running_turn("t1")["agent"] == cid
+            assert store.acquire("p", cid, "h2", "n2", 2) is None  # the old lease ran out
+            assert sorted(admin.execute(
+                "SELECT path, value, connection_id FROM settings "
+                "WHERE capability = 'agentrooms'").fetchall()) == [
+                ([f"binding.{cid}", "opened"], True, cid),
+                ([f"binding.{cid}", "worker"], "lab", cid)]
+            assert admin.execute("SELECT path FROM agentrooms_premig_m4_settings").fetchall() == [
+                (["binding.gone", "worker"],)]
+            for table in ("sync", "wakes", "sessions", "leases", "turns"):
+                assert admin.execute(
+                    f"SELECT connection_id, file_connection FROM agentrooms_{table} "
+                    "WHERE connection_id IS NOT NULL OR file_connection <> 'gone'").fetchall() == [
+                    (cid, None)], table
+            assert admin.execute("SELECT connection_id, file_connection, user_id "
+                                 "FROM agentrooms_sync WHERE file_connection IS NOT NULL"
+                                 ).fetchall() == [(None, "gone", "@gone:x")]
+            assert store.next_batch("p", "gone", "@gone:x") == "b9"
+            assert admin.execute("SELECT to_regclass('agentrooms_premig_m4_rows')"
+                                 ).fetchone() == (None,)
+            admin.execute("DELETE FROM connections WHERE id = %s", (cid,))
+            for table in ("wakes", "sessions", "leases", "turns"):
+                assert admin.execute(f"SELECT count(*) FROM agentrooms_{table}").fetchone() == (0,)
+            assert admin.execute("SELECT connection_id, file_connection, next_batch "
+                                 "FROM agentrooms_sync").fetchall() == [(None, "gone", "b9")]
+            assert admin.execute("SELECT count(*) FROM settings "
+                                 "WHERE capability = 'agentrooms'").fetchone() == (0,)
     finally:
         store.execute(f"DROP SCHEMA {schema} CASCADE")
         store.close()

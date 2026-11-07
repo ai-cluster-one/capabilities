@@ -93,3 +93,106 @@ def test_prompts_keep_every_version_and_check_the_base(store):
     assert store.prompt(A, "bot") is None and len(store.prompt_history(A, "bot")) == 2
     with pytest.raises(Exception):
         store.save_prompt(A, "Bad Key", "x", "me@node")
+
+
+
+def _setting(schema: str):
+    from capabilities_contract import db
+    from psycopg.conninfo import conninfo_to_dict
+
+    info = conninfo_to_dict(DSN)
+    return db.Setting(schema=schema, level="machine", sources=("TELEGRAMBOT_TEST_DSN",),
+                      host=info.get("host") or "127.0.0.1", port=int(info.get("port") or 5432),
+                      database=info.get("dbname"), user=info.get("user"),
+                      password=info.get("password"), sslmode=info.get("sslmode") or "disable")
+
+
+def test_a_store_at_major_1_takes_connection_ids_in_place_and_keeps_its_rows(monkeypatch):
+    """A store whose core is at 2.0 and whose telegrambot tables are at 1.0,
+    every row naming its bot by the connection's name, takes the ids in place
+    under the store upgrade: a row of a connection the store holds reads under
+    its id and goes with it, and a row of a connection only files hold keeps
+    its name and keeps working. Only the store upgrade crosses."""
+    import psycopg
+    import capabilities_contract.db._migrate as core_migrate
+    from capabilities_contract import db
+
+    schema = f"tgb_m1_{uuid.uuid4().hex[:8]}"
+    setting = _setting(schema)
+    old = [step for step in s.steps()
+           if (step.id if hasattr(step, "id") else step[0]) != "0007-connection-ids"]
+    conn = db.connect(application_name="telegrambot", setting=setting)
+    try:
+        # The store as the release before the cutover left it: the core at 2.0.
+        with monkeypatch.context() as m:
+            m.setattr(core_migrate, "CORE_STEPS", core_migrate.CORE_STEPS[:1])
+            m.setattr(core_migrate, "CORE_VERSION", (2, 0))
+            db.migrate(conn, s.OWNER, old, major=1, minor=0)
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO connections (capability, name, spec) VALUES "
+                        "('telegrambot', 'helper', '{}'::jsonb)")
+            for bot in ("helper", "filed"):
+                cur.execute("INSERT INTO telegrambot_channels (agent_id, connection, chat_id, "
+                            "last_message_id) VALUES (%s, %s, 42, 9)", (A, bot))
+                cur.execute("INSERT INTO telegrambot_seen (agent_id, connection, kind, "
+                            "peer_id, title) VALUES (%s, %s, 'chat', 42, 'G')", (A, bot))
+                cur.execute("INSERT INTO telegrambot_jobs (id, agent_id, connection, chat_id, "
+                            "requested_by, description, state, created_at, updated_at) VALUES "
+                            "(%s, %s, %s, 42, '42', 'from before', 'running', now(), now())",
+                            (f"job-{bot}", A, bot))
+                cur.execute("INSERT INTO telegrambot_job_amendments (id, agent_id, connection, "
+                            "job_id, text, state, created_at) VALUES (%s, %s, %s, %s, 'more', "
+                            "'pending', now())", (f"a-{bot}", A, bot, f"job-{bot}"))
+                cur.execute("INSERT INTO telegrambot_job_slots (agent_id, connection, slot, "
+                            "job_id, owner_id, attempt_token, lease_expires_at) VALUES "
+                            "(%s, %s, 0, %s, 'o', 't', now())", (A, bot, f"job-{bot}"))
+        conn.commit()
+    finally:
+        conn.close()
+
+    monkeypatch.delenv("CAPABILITIES_STORE_UPGRADE", raising=False)
+    with pytest.raises(s.StoreUnavailable) as refused:
+        s.Store(setting).open()
+    assert refused.value.slug == "store_upgrade_needed"
+    monkeypatch.setenv("CAPABILITIES_STORE_UPGRADE", "1")
+    store = s.Store(setting).open()
+    try:
+        assert store.execute("SELECT major, minor FROM schema_version WHERE owner = %s",
+                             (s.OWNER,), fetch="one") == {"major": 2, "minor": 0}
+        helper = store.execute("SELECT id FROM core_premig_connection_names "
+                               "WHERE name = 'helper'", fetch="one")["id"]
+        jobs = load_service("jobs")
+        tables = ("channels", "seen", "jobs", "job_amendments", "job_slots")
+        for bot, held, filed in ((helper, helper, None), ("filed", None, "filed")):
+            assert store.channel(A, bot, 42)["last_message_id"] == 9
+            assert [r["title"] for r in store.seen(A, bot)] == ["G"]
+            reg = jobs.JobRegister(jobs.Db(store), A, bot)
+            job = f"job-{'helper' if bot == helper else 'filed'}"
+            assert reg.get(job)["description"] == "from before"
+            assert reg.pending_amendment(job) == ["more"]
+            for table in tables:
+                assert store.execute(
+                    f"SELECT connection_id, file_connection FROM telegrambot_{table} "
+                    "WHERE coalesce(connection_id, file_connection) = %s", (bot,),
+                    fetch="all") == [{"connection_id": held, "file_connection": filed}], table
+        assert store.execute(
+            "SELECT count(*) AS n FROM information_schema.columns WHERE table_schema = "
+            "current_schema() AND table_name LIKE 'telegrambot\\_%%' "
+            "AND column_name = 'connection'", fetch="one") == {"n": 0}
+        # A new row of either kind lands in its own column.
+        assert store.reserve(A, helper, 43, 0, 1, "h") and store.reserve(A, "filed", 43, 0, 1, "h")
+        store.execute("DELETE FROM connections WHERE id = %s", (helper,))
+        for table in tables:
+            assert store.execute(
+                f"SELECT DISTINCT file_connection FROM telegrambot_{table}",
+                fetch="all") == [{"file_connection": "filed"}], table
+        raw = psycopg.connect(DSN, autocommit=True)
+        try:
+            with pytest.raises(db.DbError) as newer:
+                db.migrate(raw, s.OWNER, old, major=1, minor=0, schema=schema)
+            assert newer.value.slug == "schema_too_new"
+        finally:
+            raw.close()
+    finally:
+        store.execute(f"DROP SCHEMA {schema} CASCADE")
+        store.close()

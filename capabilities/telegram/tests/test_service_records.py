@@ -36,16 +36,18 @@ def store_env(schema: str) -> dict:
     return {"AGENTKIT_DB_URL": STORE_DSN, "AGENTKIT_DB_SCHEMA": schema}
 
 
-def seed_store(project: Path, config_home: Path, schema: str, cid: str, entry: dict) -> None:
+def seed_store(project: Path, config_home: Path, schema: str, cid: str, entry: dict) -> str:
     """Declare `cid` in the store and grant it to `project`, as the manager
-    would after an import."""
+    would after an import; the id the store gave the connection labelled
+    `cid`."""
     with mock.patch.dict(os.environ, store_env(schema)):
         adapter = records.open_records(project / "capabilities", config_home, project)
         try:
-            adapter.set("telegram", "connection", cid, entry)
+            held = adapter.set("telegram", "connection", cid, entry)
             adapter.set("telegram", "grant", cid, {"enabled": True, "allow_write": True})
         finally:
             adapter.close()
+    return held
 
 
 def store_project(project: Path, schema: str, extra_env: dict | None = None) -> None:
@@ -174,6 +176,7 @@ class DaemonStoreMode(unittest.TestCase):
             raise unittest.SkipTest("TELEGRAM_TEST_DSN is unset")
         schema = f"tgrec_{uuid.uuid4().hex[:12]}"
         cid = f"conn-{uuid.uuid4().hex[:8]}"
+        seeded = []
 
         def records(project, config_home):
             store_project(project, schema, {"TELEGRAM_SERVICE_CONNECTION": cid})
@@ -182,15 +185,17 @@ class DaemonStoreMode(unittest.TestCase):
             stale = {"api_id": 9, "allow_write": False, "expected_account_id": 99}
             write_json(project / "capabilities" / "telegram" / "connections.json",
                        {"default": cid, "connections": {cid: stale, "ghost": stale}})
-            seed_store(project, config_home, schema, cid,
-                       {"api_id": 1, "expected_account_id": 42})
+            seeded.append(seed_store(project, config_home, schema, cid,
+                                     {"api_id": 1, "expected_account_id": 42}))
 
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), {**SETTINGS, "connection": cid},
                                    store=True,
                                    connections_file=False, before_import=records)
             try:
-                self.assertEqual(daemon.CONNECTION, cid)
+                # Named by its label, the connection is the one the store holds
+                # under its id.
+                self.assertEqual(daemon.CONNECTION, seeded[0])
                 self.assertEqual(daemon.CONNECTION_ENTRY,
                                  {"api_id": 1, "expected_account_id": 42,
                                   "allow_write": True})
@@ -250,9 +255,9 @@ class RecorderConnections(unittest.TestCase):
         store_project(self.project, schema)
         write_json(self.project / "capabilities" / "telegram" / "connections.json",
                    {"default": cid, "connections": {cid: {"api_id": 9}}})
-        seed_store(self.project, self.config_home, schema, cid, {"api_id": 1})
+        held = seed_store(self.project, self.config_home, schema, cid, {"api_id": 1})
         config = self.recorder.resolve_connection(self.project, cid)
-        self.assertEqual((config["id"], config["api_id"]), (cid, 1))
+        self.assertEqual((config["id"], config["api_id"]), (held, 1))
         self.assertTrue(config["registry"].startswith(f"store:{schema}."))
 
 

@@ -1029,7 +1029,7 @@ class ServiceHarness(unittest.TestCase):
         self.addCleanup(conn.close)
         lib.save_profile(conn, "telegram-fast", CODEX, scope="project",
                          schema=setting.schema, scope_id=project)
-        conn.execute("INSERT INTO telegram_channels (agent_id, connection, "
+        conn.execute("INSERT INTO telegram_channels (agent_id, file_connection, "
                      "channel_key, settings) VALUES (%s, 'probe', '11', "
                      "'{\"profile\": \"telegram-fast\"}'::jsonb)", (project,))
         conn.commit()

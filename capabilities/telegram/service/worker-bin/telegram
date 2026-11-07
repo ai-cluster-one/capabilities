@@ -320,7 +320,10 @@ def names_another_connection(argv):
     if not present or not requested:
         return False
     authorized = os.environ.get("TELEGRAM_AUTHORIZED_CONNECTION", "").strip()
-    return bool(authorized) and requested != authorized
+    # The connection is named by its id or by its label; the label the daemon
+    # handed over with the authority context is the same connection.
+    label = str((auth_context() or {}).get("connection_label") or "").strip()
+    return bool(authorized) and requested not in (authorized, label or authorized)
 
 
 def parse_command_and_chat(argv):

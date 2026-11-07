@@ -5,7 +5,7 @@
 #     "py-tgcalls==3.0.1b1",
 #     "ntgcalls==3.0.3",
 #     "telethon==1.45.0",
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.44,<1",
 # ]
 # ///
 # The 3.x line is what carries conference calls: joining one needs
@@ -212,7 +212,13 @@ def connections_registry(root: Path) -> tuple[dict | None, str | None]:
         registry, source = records.connections(adapter)
     except records.store().StoreError as exc:
         raise RecorderError(6, exc.slug, exc.message, exc.hint) from exc
+    _ADAPTERS[Path(root)] = adapter
     return registry, source if registry is not None else None
+
+
+# The records adapter each project's connections were read through, which
+# also answers where a connection's state lies on this machine.
+_ADAPTERS: dict = {}
 
 
 def select_connection(registry: dict | None, wanted: str | None) -> tuple[str, dict | None]:
@@ -223,7 +229,8 @@ def select_connection(registry: dict | None, wanted: str | None) -> tuple[str, d
         return "default", None
     connections = registry["connections"]
     withheld = registry.get("withheld") or ()
-    selected = wanted or registry.get("default")
+    # A connection is named by its id or by its label; either is the same one.
+    selected = records.resolve(registry, wanted or registry.get("default"))
     if selected in withheld:
         raise RecorderError(4, "connection_not_granted",
                             f"Telegram connection {selected!r} is not granted to this project")
@@ -247,6 +254,10 @@ def select_connection(registry: dict | None, wanted: str | None) -> tuple[str, d
 def resolve_connection(root: Path, wanted: str | None) -> dict:
     registry, registry_path = connections_registry(root)
     connection_id, entry = select_connection(registry, wanted)
+    if registry is not None and Path(root) in _ADAPTERS:
+        # The connection's folder under <state>/telegram, every path below
+        # names; one made under its former name is moved to its id first.
+        records.state_dir(_ADAPTERS[Path(root)], STATE_HOME / "telegram", connection_id)
     entry = entry or {}
     api_id = entry.get("api_id") or env_value(root, "TELEGRAM_API_ID")
     secret_key = entry.get("secret_env") or "TELEGRAM_API_HASH"

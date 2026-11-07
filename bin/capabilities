@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.44,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -1374,6 +1374,13 @@ PROJECT VERBS (run inside a consuming project)
         names the coolify connection it was created through, its server and
         the resource, all three or none (exit 6
         coolify_incomplete); the token stays in that connection.
+        --coolify-connection names the store's coolify connection by its id
+        or its label, and the row keeps its id; a connection only files
+        hold, which the row keeps by its base_url and which is reached again
+        through the connection visible here at that address; or a lent
+        connection's address (exit 6 unknown_connection for a word that
+        names none of them). coolify_connection reads as that id, else
+        that address.
         --public-key is the node's X25519 public key, its 32 bytes in base64
         (`node enrol` records it). An agent has at most one
         master: --master while another node is master exits 6 master_exists
@@ -1694,7 +1701,9 @@ PROJECT VERBS (run inside a consuming project)
         store}, override and before each true, false or null. Exit 6
         node_unknown for a node the agent does not have, not_device_bound
         for a session of an installed capability whose connections are not
-        device-bound.
+        device-bound. <connection> is the store's connection by its id or
+        label, kept and answered as its id; any other word is kept as it
+        is, the key of a connection only files hold (the node's own).
   node state report
         Write this node's state once: the row `node state` reads, and the
         sign-ins and sessions of every agent the store links to this node
@@ -2203,8 +2212,10 @@ PROJECT VERBS (run inside a consuming project)
         and may carry node (a node id, or null for every node, the default)
         and is_default (the default pointer, one per capability and node), and
         setting connection.default moves is_default; a connection, a grant
-        and the default pointer name the connection by its id or by the label
-        `<name> connection rename` gave it, and the row holds its id. Such a
+        and the default pointer name the connection by its id or by its label
+        (the name it was added under, or `<name> connection rename` gave it),
+        and the row holds its id; a connection a word names none of is added
+        under that label with an id the store mints, which set answers as key. Such a
         write stamps the
         project id, so it refuses (exit 6) where the id is not verified, and
         `records.mode` answers `store` with the table as `source`. A grant
@@ -2216,8 +2227,9 @@ PROJECT VERBS (run inside a consuming project)
         that cannot be reached is exit 5 store_unreachable.
   connections list [<name> ...]
         Every connection the store holds, per capability - of the capabilities
-        named, or of all - with its id (`connection`), what it is called
-        (`label`, its id until `<name> connection rename` changes it), its
+        named, or of all - with its id (`connection`, twelve hex characters
+        the store minted), what it is called (`label`, the name it was added
+        under until `<name> connection rename` changes it), its
         owner and every grant on it, read from the
         database `store show` names here, inside a project or outside one. A
         connection is shared by the capability (owner null, shared true),
@@ -2228,7 +2240,7 @@ PROJECT VERBS (run inside a consuming project)
         (null: the grant for every agent), node (null: every node), enabled,
         allow_write (null falls to the capability's WRITE_DEFAULT) and
         is_default; a registered agent's name rides beside its id. Reads only.
-        JSON {store {schema}, capabilities {<name> [{connection, owner,
+        JSON {store {schema}, capabilities {<name> [{connection, label, owner,
         owner_name, shared, grants [{agent, agent_name, node, enabled,
         allow_write, is_default}]}]}}. Exit 6 tables_behind where the store's
         tables predate owners, 5 when the store cannot be reached.
@@ -2757,8 +2769,8 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # newest major; when a newer one lands there, the last commit of the older
 # major is kept as branch STORE_LINE_REF, and a major is crossed only by
 # STORE_UPGRADE_COMMAND.
-STORE_MAJOR = 2
-STORE_LIBRARY: str | None = ">=0.43,<0.44"
+STORE_MAJOR = 3
+STORE_LIBRARY: str | None = None
 STORE_CANONICAL_REF = "main"
 STORE_LINE_REF = "store-major-{major}"
 STORE_UPGRADE_COMMAND = "capabilities store upgrade"
@@ -6999,6 +7011,11 @@ def _inventory_rows(root: Path) -> list[dict]:
             # truth is "one, withheld".
             usable = sorted(cid for cid, e in declared.items() if e["enabled"])
             withheld = sorted(cid for cid, e in declared.items() if not e["enabled"])
+            # The default pointer names its connection by id or label; it is
+            # answered as the id the entries are keyed by.
+            if isinstance(default, str) and default not in declared:
+                default = next((cid for cid, e in declared.items()
+                                if e.get("label") == default), default)
             service = manifest.get("service") or None
             rows.append({
                 "name": name,
@@ -7007,7 +7024,9 @@ def _inventory_rows(root: Path) -> list[dict]:
                 "icon": _has_icon(_registry_dir(name)),
                 "gate": {"effective": effective, "source": source},
                 "connections": {"count": len(usable), "default": default,
-                                "ids": usable, "withheld": withheld},
+                                "ids": usable, "withheld": withheld,
+                                "labels": {cid: e.get("label") or cid
+                                           for cid, e in sorted(declared.items())}},
                 "service": None if service is None else {
                     "name": service.get("name"),
                     "summary": service.get("summary"),
@@ -7764,8 +7783,10 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
                 "AND table_name = %s AND is_generated = 'NEVER' AND identity_generation "
                 "IS NULL ORDER BY ordinal_position", (where, table)).fetchall()]
 
-        def copy(table: str, condition: sql.Composable, params: tuple) -> int:
-            shared = [c for c in columns(table, schema) if c in set(columns(table, real))]
+        def copy(table: str, condition: sql.Composable, params: tuple,
+                 omit: tuple = ()) -> int:
+            shared = [c for c in columns(table, schema)
+                      if c in set(columns(table, real)) and c not in omit]
             if not shared:
                 return 0
             names = sql.SQL(", ").join(sql.Identifier(c) for c in shared)
@@ -7782,9 +7803,14 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
             # from before the node registry keeps a node's fields on its links.
             nodes_of = sql.SQL("id IN (SELECT node FROM {}.agent_nodes "
                                "WHERE agent_id = %s)").format(sql.Identifier(real))
+            # A node's coolify connection is a reference to a connection row,
+            # which the session schema holds only once the connections are
+            # projected below: the node comes without it and takes it back
+            # then, where the connection came with them.
+            coolify_reference = ("coolify_connection_id",)
             if columns("nodes", real):
                 counts["nodes"] = copy("nodes", nodes_of,
-                                                    (agent_id,))
+                                                    (agent_id,), coolify_reference)
             else:
                 conn.execute(sql.SQL("DELETE FROM {}.nodes WHERE ").format(
                     sql.Identifier(schema)) + nodes_of, (agent_id,))
@@ -7794,7 +7820,7 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
                     "= %s ORDER BY node").format(sql.Identifier(schema), sql.Identifier(real)),
                     (agent_id,)).rowcount
             counts["agent_nodes"] = copy(
-                "agent_nodes", sql.SQL("agent_id = %s"), (agent_id,))
+                "agent_nodes", sql.SQL("agent_id = %s"), (agent_id,), coolify_reference)
             conn.execute(sql.SQL("UPDATE {}.store_state SET global_migrated_at = "
                                  "(SELECT global_migrated_at FROM {}.store_state "
                                  "LIMIT 1)").format(sql.Identifier(schema),
@@ -7808,6 +7834,16 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
                         " AND (agent_id IS NULL OR agent_id = %s)")
                     params = (*params, agent_id)
                 counts[table] = copy(table, condition, params)
+            if "coolify_connection_id" in set(columns("nodes", real)) \
+                    and "coolify_connection_id" in set(columns("nodes", schema)):
+                conn.execute(sql.SQL(
+                    "UPDATE {}.nodes n SET coolify_connection_id = r.coolify_connection_id "
+                    "FROM {}.nodes r WHERE r.id = n.id AND r.coolify_connection_id IN "
+                    "(SELECT id FROM {}.connections) AND n.coolify_connection_id IS "
+                    "DISTINCT FROM r.coolify_connection_id AND n.id IN (SELECT node FROM "
+                    "{}.agent_nodes WHERE agent_id = %s)").format(
+                        sql.Identifier(schema), sql.Identifier(real),
+                        sql.Identifier(schema), sql.Identifier(schema)), (agent_id,))
     except (db.DbError, psycopg.Error) as exc:
         _die(5, "dev_projection_failed",
              f"cannot project {capability}'s rows into the session schema {schema}: {exc}",
@@ -8117,14 +8153,26 @@ def _dev_connection_selector(args: list[str]) -> str | None:
     return found[0] if found else None
 
 
+def _dev_labelled(registry: dict, word: str) -> str | None:
+    """The id of the registry's connection whose id, else label, is `word`."""
+    conns = registry.get("connections") or {}
+    if word in conns:
+        return word
+    labels = registry.get("labels") or {}
+    return next((cid for cid, label in labels.items() if label == word and cid in conns),
+                None)
+
+
 def _dev_select_connection(registry: dict, wanted: str | None) -> tuple[str, dict]:
-    """Apply the shared flag/default/sole-entry selection contract."""
+    """Apply the shared flag/default/sole-entry selection contract: a word
+    names a connection by its id, else its label, else its address field."""
     conns = registry.get("connections")
     if not isinstance(conns, dict) or not conns:
         _die(6, "bad_config", "connections registry has no connections")
     if wanted:
-        if wanted in conns:
-            return wanted, conns[wanted] if isinstance(conns[wanted], dict) else {}
+        named = _dev_labelled(registry, wanted)
+        if named is not None:
+            return named, conns[named] if isinstance(conns[named], dict) else {}
         matches = [(cid, entry) for cid, entry in conns.items()
                    if isinstance(entry, dict)
                    and str(entry.get("address") or "").lower() == wanted.lower()]
@@ -8133,10 +8181,11 @@ def _dev_select_connection(registry: dict, wanted: str | None) -> tuple[str, dic
         _die(6, "unknown_connection", f"no connection matches {wanted!r}")
     default = registry.get("default")
     if default:
-        if default not in conns:
+        named = _dev_labelled(registry, default)
+        if named is None:
             _die(6, "bad_default", f"default points to unknown connection {default!r}")
-        entry = conns[default]
-        return default, entry if isinstance(entry, dict) else {}
+        entry = conns[named]
+        return named, entry if isinstance(entry, dict) else {}
     if len(conns) == 1:
         cid = next(iter(conns))
         entry = conns[cid]
@@ -8166,12 +8215,21 @@ def _resolved_registry(root: Path, capability: str, *,
                 cid: {**row["value"], "allow_write": row["allow_write"]}
                 for cid, row in effective.items()
             },
+            # What each connection is called, beside the entries a payload
+            # reads: a selector names a connection by its id or its label.
+            "labels": {cid: row.get("label") or cid for cid, row in effective.items()},
         }
         return registry, adapter.mode_of("connection"), source
     except _store_module().StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
     finally:
         adapter.close()
+
+
+def _dev_registry_file(registry: dict) -> dict:
+    """The registry as a connections file holds it: its default and entries,
+    where a connection is called by its id."""
+    return {key: value for key, value in registry.items() if key != "labels"}
 
 
 def _dev_redact(text: str, secrets: list[str]) -> str:
@@ -8300,7 +8358,7 @@ def cmd_dev_run(session_id: str, capability: str, args: list[str],
                         {"capabilities": {capability: global_gate}})
         if (projected is None and registry_data is not None and registry_mode == "files"
                 and not project_only):
-            _write_json(config / capability / "connections.json", registry_data)
+            _write_json(config / capability / "connections.json", _dev_registry_file(registry_data))
         env = _dev_env(session)
         env.update(child_values)
         env.update({
@@ -8365,12 +8423,13 @@ def _dev_live_inputs(session: dict) -> dict:
         settings = {key: row["value"] for key, row in
                     adapter.resolve("telegram", "setting").items()
                     if key != "connection.default"}
+        wanted = str(settings.get("connection")) if settings.get("connection") else None
+        connection, entry = _dev_select_connection(registry, wanted)
+        former = adapter.connection_former_name("telegram", connection)
     except _store_module().StoreError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
     finally:
         adapter.close()
-    wanted = str(settings.get("connection")) if settings.get("connection") else None
-    connection, entry = _dev_select_connection(registry, wanted)
     if not bool(entry.get("allow_write", False)):
         _die(4, "connection_read_only",
              f"Telegram connection {connection!r} does not allow writes")
@@ -8381,8 +8440,8 @@ def _dev_live_inputs(session: dict) -> dict:
     except (TypeError, ValueError):
         _die(6, "expected_account_required",
              f"Telegram connection {connection!r} needs a positive expected_account_id")
-    session_path = Path(str(entry.get("session") or
-                            (_STATE_HOME / "telegram" / connection / "session"))).expanduser()
+    session_path = Path(str(entry.get("session") or (_connection_state_dir(
+        _STATE_HOME / "telegram", connection, former) / "session"))).expanduser()
     if not session_path.is_absolute():
         session_path = project / session_path
     project_values = _project_env(project)
@@ -8426,6 +8485,32 @@ def _dev_live_inputs(session: dict) -> dict:
     }
 
 
+def _connection_state_dir(base: Path, cid: str, former: str | None) -> Path:
+    """A connection's state folder under `base`, kept under its id: where
+    `base/<id>` does not exist and the folder made under the connection's
+    former name (the store's map of the id cutover) does, it moves to the id
+    first, once, never over a path that exists, saying so on stderr; where
+    both exist the id's is the one used, and that is said too."""
+    target = base / cid
+    if not former or former == cid or "/" in former or former in (".", ".."):
+        return target
+    old = base / former
+    if not old.exists() and not old.is_symlink():
+        return target
+    if target.exists() or target.is_symlink():
+        sys.stderr.write(f"capabilities: {old} is kept under the connection's former name "
+                         f"beside {target}; {target} is used\n")
+        return target
+    try:
+        old.rename(target)
+    except OSError as exc:
+        sys.stderr.write(f"capabilities: cannot move {old} to {target}: {exc}; "
+                         f"{target} is used\n")
+        return target
+    sys.stderr.write(f"capabilities: moved {old} to {target}, the connection's id\n")
+    return target
+
+
 def _dev_live_env(session: dict, inputs: dict,
                   projection: Path) -> tuple[dict[str, str], Path]:
     """Create the lease-owned non-secret config projection for one live daemon."""
@@ -8436,7 +8521,7 @@ def _dev_live_env(session: dict, inputs: dict,
     config = projection / "config"
     config.mkdir(mode=0o700)
     if inputs["registry_mode"] == "files":
-        _write_json(config / "telegram" / "connections.json", inputs["registry"])
+        _write_json(config / "telegram" / "connections.json", _dev_registry_file(inputs["registry"]))
     env = _dev_env(session)
     env.update(inputs["values"])
     env.update({
@@ -8487,7 +8572,7 @@ def _dev_live_copy_register(source: str, target: str, project_id: str,
             return None
         table = sql.Identifier(DEV_LIVE_REGISTER_TABLE)
         names = sql.SQL(", ").join(sql.Identifier(c) for c in shared)
-        scope = sql.SQL(" WHERE agent_id = %s AND connection = %s")
+        scope = sql.SQL(" WHERE agent_id = %s AND connection_id = %s")
         with conn.transaction():
             conn.execute(sql.SQL("DELETE FROM {}.{}").format(sql.Identifier(target), table)
                          + scope, (project_id, connection))
@@ -10038,9 +10123,13 @@ NODE_COLUMNS = ("node", "label", "kind", "address", "is_master", "may_write", "t
                 "last_seen_at", "coolify_connection", "coolify_server",
                 "coolify_resource", "public_key", "folder", "disabled_at")
 NODE_SELECT = ("SELECT l.node, n.label, n.kind, n.address, l.is_master, l.may_write, "
-               "n.target, n.last_seen_at, n.coolify_connection, n.coolify_server, "
-               "n.coolify_resource, n.public_key, l.folder, n.disabled_at "
+               "n.target, n.last_seen_at, coalesce(n.coolify_connection_id, n.coolify_address), "
+               "n.coolify_server, n.coolify_resource, n.public_key, l.folder, n.disabled_at "
                "FROM agent_nodes l JOIN nodes n ON n.id = l.node ")
+# A node's coolify_connection reads as one field and is kept as two columns:
+# the id of the store's coolify connection it was created through, or the
+# address of a connection lent for the run that created it.
+NODE_FIELD_SQL = {"coolify_connection": "coalesce(coolify_connection_id, coolify_address)"}
 # What a migration reads of a node, on a store at any version: it reads them
 # before the store is brought to this code's version, and a store from before
 # the node registry keeps a node's fields on its link, its name standing as id
@@ -11584,7 +11673,7 @@ def _node_address(row: dict, folder: Path | None) -> dict:
         return {**out, "address_error": "coolify_unavailable"}
     try:
         result = subprocess.run(
-            [coolify, "--connection", row["coolify_connection"], "servers",
+            [coolify, "--connection", _node_coolify_word(row["coolify_connection"]), "servers",
              row["coolify_server"]], cwd=folder or _project_root() or Path.cwd(),
             text=True, capture_output=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -12466,7 +12555,7 @@ def _rekey_server(root: Path, node: dict, new: str, write: bool) -> dict:
     env = {**os.environ, PROJECT_ID_ENV: new, PROJECT_ID_ROOT_ENV: str(root.resolve())}
     try:
         result = subprocess.run(
-            [coolify, "--connection", node["coolify_connection"], "env", "set",
+            [coolify, "--connection", _node_coolify_word(node["coolify_connection"]), "env", "set",
              node["coolify_resource"], PROJECT_ID_ENV, "--value-stdin"],
             cwd=root, env=env, input=new, text=True, capture_output=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -12676,6 +12765,37 @@ def _node_values(opts: dict) -> dict:
         elif off in opts:
             values[column] = False
     return values
+
+
+def _node_coolify_reference(conn, word: str | None) -> dict:
+    """The columns a node's coolify connection is kept in, from the word a
+    caller names it by: a lent connection's address, else the id of the
+    store's coolify connection whose id or label it is."""
+    if word is None:
+        return {"coolify_connection_id": None, "coolify_address": None}
+    if _node_lent_address(word):
+        return {"coolify_connection_id": None, "coolify_address": word.rstrip("/")}
+    cid = _store_module().connection_id_for(conn, "coolify", word)
+    if cid is None:
+        # A connection visible here that is no store row - one the project's
+        # or the machine's files keep - is kept by its address, as a lent one.
+        found = _node_visible_coolify(word=word)
+        url = (found[1].get("value") or {}).get("base_url") if found else None
+        if isinstance(url, str) and _node_lent_address(url):
+            return {"coolify_connection_id": None, "coolify_address": url.rstrip("/")}
+        raise _KernelRefusal(
+            "unknown_connection", f"no coolify connection {word!r} is visible here",
+            "a node names the coolify connection it was created through by its id or "
+            "label (`coolify connections`), or a lent connection's address")
+    return {"coolify_connection_id": cid, "coolify_address": None}
+
+
+def _node_columns(conn, values: dict) -> dict:
+    """A node's fields as the columns of its registry row hold them."""
+    out = {k: v for k, v in values.items() if k != "coolify_connection"}
+    if "coolify_connection" in values:
+        out.update(_node_coolify_reference(conn, values["coolify_connection"]))
+    return out
 
 
 def _refuse_second_master(conn, agent_id: str, node: str) -> None:
@@ -13394,10 +13514,38 @@ def _node_state_write(conn, here: str, facts: dict, logins: dict | None,
     if sessions is not None:
         for (agent_id, capability), rows in sorted(sessions.items()):
             if rows is not None:
-                store.node_sessions_put(conn, agent_id, here, capability, rows)
+                store.node_sessions_put(conn, agent_id, here, capability,
+                                        _node_stored_sessions(conn, capability, rows))
     store.node_agents_prune(conn, here, agents if sessions is not None else [],
                             sorted(sessions or {}))
     return stamp
+
+
+def _node_stored_sessions(conn, capability: str, rows: list) -> list:
+    """The sessions a capability answered, each naming its connection by the
+    id of the store's connection its key is the id or label of, and a
+    connection only files hold by the key the capability gave it, which the
+    store keeps as that session's file connection."""
+    out, ids = [], {}
+    for row in rows:
+        if row[0] not in ids:
+            ids[row[0]] = _store_module().connection_id_for(conn, capability, row[0]) \
+                or row[0]
+        out.append((ids[row[0]], *row[1:]))
+    return out
+
+
+def _node_session_answer(session: dict) -> dict:
+    """A session or expectation row as the manager answers it: under
+    `connection`, the store connection's id, else the key of the connection
+    only files hold."""
+    out: dict = {}
+    for key, value in session.items():
+        if key == "connection_id":
+            out["connection"] = value if value is not None else session.get("file_connection")
+        elif key != "file_connection":
+            out[key] = value
+    return out
 
 
 def _node_state_logins(store, logins: list[dict], node: str) -> dict:
@@ -17196,7 +17344,7 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
                        if k not in store.NODE_UPDATE_OFFER_COLUMNS}
             return ({**written,
                      **_node_state_logins(store, store.node_logins(conn, agent_id, [here]), here)},
-                    store.node_sessions(conn, agent_id, [here]))
+                    [_node_session_answer(s) for s in store.node_sessions(conn, agent_id, [here])])
         (row, own_sessions), setting = _kernel_run(root, write)
         _emit({"ok": True, "project": str(root), "agent_id": agent_id, "node": here,
                "state": _node_state_answer(row),
@@ -17213,8 +17361,9 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         ids = [n["node"] for n in nodes]
         states = {r["node"]: r for r in store.node_states(conn, ids)}
         logins = store.node_logins(conn, agent_id, ids)
-        sessions = store.node_sessions(conn, agent_id, ids)
+        sessions = [_node_session_answer(s) for s in store.node_sessions(conn, agent_id, ids)]
         words = store.node_expectations(conn, agent_id, ids)
+        words["sessions"] = [_node_session_answer(w) for w in words.get("sessions") or []]
         runs = {r["node"]: r for r in store.node_updates(conn, ids)}
         logs = store.node_logs(conn, agent_id, ids)
         placed = conn.execute(
@@ -17295,6 +17444,13 @@ def _node_expect_verb(root: Path, args: list[str]) -> None:
 
     def work(conn, agent_id):
         node = _node_ref(conn, agent_id, pos[0].strip())
+        if "connection" in target:
+            # The word is kept as the id of the store's connection whose id or
+            # label it is, the key a node reports that session under; any
+            # other word as it is, the key of a connection only files hold -
+            # the node's own files, which need not be visible here.
+            target["connection"] = store.connection_id_for(
+                conn, target["capability"], target["connection"]) or target["connection"]
         return agent_id, node, store.node_expectation_set(
             conn, agent_id, node, expected=word, by=_vault_actor(), **target)
     try:
@@ -17844,6 +18000,36 @@ def _agent_node_records():
     return _AGENT_NODE_RECORDS[0]
 
 
+def _node_visible_coolify(word: str | None = None,
+                          address: str | None = None) -> tuple[str, dict] | None:
+    """The coolify connection visible here - the store's, the project's files
+    or the machine's - whose id or label is `word`, or whose base_url is
+    `address`: (id, entry), or None where none is, or none can be read."""
+    try:
+        rows = _agent_node_records().connections("coolify", write_default=True, include_disabled=True)
+    except _store_module().StoreError:
+        return None
+    for cid, row in sorted(rows.items()):
+        url = (row.get("value") or {}).get("base_url") if isinstance(row, dict) else None
+        if word is not None and word in (cid, row.get("label")):
+            return cid, row
+        if address is not None and isinstance(url, str) and url.rstrip("/") == address:
+            return cid, row
+    return None
+
+
+def _node_coolify_word(recorded):
+    """The word `coolify --connection` reaches what a node row records by: a
+    connection the store holds by its id, and one kept only in files - which
+    the row records by its address - by the id it is visible here under; a
+    lent connection's address as it is, and anything while one is lent, the
+    one connection the run reaches."""
+    if not _node_lent_address(recorded) or _NODE_LENT:
+        return recorded
+    found = _node_visible_coolify(address=recorded)
+    return found[0] if found else recorded
+
+
 def _agent_node_store_placed(root: Path) -> bool:
     """Whether this project's gate is in the store, where a row can name a
     node."""
@@ -18065,6 +18251,12 @@ def _agent_node_target(row):
     """The target a node is reached through: the connection its row names, or
     the one lent to this run for the Coolify address the row names instead."""
     recorded = row["coolify_connection"]
+    if _node_lent_address(recorded) and not _NODE_LENT:
+        # A connection kept only in files is recorded by its address, and
+        # reached through the connection visible here at that address.
+        found = _node_visible_coolify(address=recorded)
+        if found is not None:
+            return {"connection": found[0]}
     if _node_lent_address(recorded):
         if not _NODE_LENT:
             raise NodeFailure("coolify_connection_required", f"node {row['node']} was created "
@@ -18087,6 +18279,16 @@ def _node_origin(target):
     return _NODE_LENT["url"] if _NODE_LENT else target["connection"]
 
 
+def _node_origin_is(target, recorded) -> bool:
+    """Whether a node row's coolify connection is the one `target` reaches:
+    the same id or lent address, or the address of the connection kept in
+    files that `target` names."""
+    origin = _node_origin(target)
+    return origin == recorded or (
+        not _NODE_LENT and _node_lent_address(recorded)
+        and _node_coolify_word(recorded) == origin)
+
+
 def _node_connection(target, write=False):
     if _NODE_LENT:
         if target.get("connection"):
@@ -18099,7 +18301,11 @@ def _node_connection(target, write=False):
         if len(rows) != 1:
             raise NodeFailure("connection_required", "target must select a Coolify connection", 6)
         cid = next(iter(rows))
-        target["connection"] = cid
+    elif cid not in rows:
+        # A connection is named by its id or by its label; the target holds
+        # the id from here on, which is what a node row records.
+        cid = next((key for key, row in rows.items() if row.get("label") == cid), cid)
+    target["connection"] = cid
     row = rows.get(cid)
     if not row or not row["enabled"]:
         raise NodeFailure("connection_not_granted", f"Coolify connection {cid!r} is not granted to this project", 4)
@@ -18741,8 +18947,8 @@ def _agent_node_enrol(root, row, services, wait, inputs, reached):
                              stdin=key)
         check.update({"placed": key is not None, "fingerprint": fingerprint})
     with _NodeStep("secrets", node=node) as check:
-        withheld = ({} if _node_lent_address(row["coolify_connection"])
-                    else {"coolify": {row["coolify_connection"]}})
+        reached = _node_coolify_word(row["coolify_connection"])
+        withheld = ({} if _node_lent_address(reached) else {"coolify": {reached}})
         secrets, skipped, environment_only = _agent_node_secrets(
             root, sorted({*_usable_capabilities(root), *services}), withheld)
         held = {}
@@ -18890,7 +19096,7 @@ def cmd_node_add(args):
         raise NodeFailure("node_exists", f"{label} is the id of this agent's node "
                           f"{row.get('label')}; a new node takes a label of its own", 6)
     if row is not None and (row.get("coolify_server") != args.server
-                            or _node_origin(target) != row.get("coolify_connection")):
+                            or not _node_origin_is(target, row.get("coolify_connection"))):
         raise NodeFailure("node_exists", f"this agent already has node {label} on server "
                           f"{row.get('coolify_server')} through connection "
                           f"{row.get('coolify_connection')}", 6)
@@ -19252,6 +19458,11 @@ def _node_login_device(root, host, container, node, capability, wanted, method_i
                               f"{len(entries)} connections; name one with --connection: "
                               + (", ".join(sorted(entries)) or "none"), 6)
         wanted = next(iter(entries))
+    elif wanted not in entries:
+        # --connection names it by its id or its label; the id is what the
+        # node's sessions are reported under and what the link is handed.
+        wanted = next((cid for cid, e in entries.items()
+                       if isinstance(e, dict) and e.get("label") == wanted), wanted)
     entry = entries.get(wanted)
     if not isinstance(entry, dict):
         raise NodeFailure("connection_unknown", f"{capability} on node {node} has no "
@@ -19901,11 +20112,12 @@ def cmd_node(args: list[str]) -> None:
                                              "--label, the name it is shown by")
                     node_values["label"] = here["label"]
                 _refuse_partial_coolify(node_values)
-                columns = ["id", *node_values]
+                stored = _node_columns(conn, node_values)
+                columns = ["id", *stored]
                 conn.execute(
                     f"INSERT INTO nodes ({', '.join(columns)}) "
                     f"VALUES ({', '.join(['%s'] * len(columns))})",
-                    (node, *node_values.values()))
+                    (node, *stored.values()))
             elif node_values:
                 _node_update(conn, node, node_values)
             if link_values.get("is_master"):
@@ -20000,17 +20212,22 @@ def _node_update(conn, node: str, values: dict) -> None:
     """Change a node's own fields, in its registry row: a new label is that one
     column, and nothing that names the node by its id moves."""
     current = dict(zip(NODE_FIELDS, conn.execute(
-        f"SELECT {', '.join(NODE_FIELDS)} FROM nodes WHERE id = %s FOR UPDATE",
-        (node,)).fetchone()))
+        f"SELECT {', '.join(NODE_FIELD_SQL.get(f, f) for f in NODE_FIELDS)} FROM nodes "
+        "WHERE id = %s FOR UPDATE", (node,)).fetchone()))
     if "label" in values and not values["label"]:
         raise _KernelRefusal("input", "a node's label is the name it is shown by; it is "
                              "never empty")
+    stored = _node_columns(conn, values)
+    if "coolify_connection" in values:
+        # What the row will read as: the id the word resolved to, else the address.
+        values = {**values, "coolify_connection": stored["coolify_connection_id"]
+                  or stored["coolify_address"]}
     _refuse_partial_coolify({**current, **values})
     if all(current.get(k) == v for k, v in values.items()):
         return
-    assignments = ", ".join(f"{c} = %s" for c in values)
+    assignments = ", ".join(f"{c} = %s" for c in stored)
     conn.execute(f"UPDATE nodes SET {assignments}, updated_at = now() "
-                 "WHERE id = %s", (*values.values(), node))
+                 "WHERE id = %s", (*stored.values(), node))
 
 
 def _node_id_verb(args: list[str]) -> None:
@@ -20140,7 +20357,12 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                     "UPDATE nodes n SET label = o.label, kind = o.kind, "
                     "address = coalesce(n.address, o.address), "
                     "target = coalesce(n.target, o.target), "
-                    "coolify_connection = coalesce(n.coolify_connection, o.coolify_connection), "
+                    "coolify_connection_id = CASE WHEN n.coolify_connection_id IS NULL "
+                    "AND n.coolify_address IS NULL THEN o.coolify_connection_id "
+                    "ELSE n.coolify_connection_id END, "
+                    "coolify_address = CASE WHEN n.coolify_connection_id IS NULL "
+                    "AND n.coolify_address IS NULL THEN o.coolify_address "
+                    "ELSE n.coolify_address END, "
                     "coolify_server = coalesce(n.coolify_server, o.coolify_server), "
                     "coolify_resource = coalesce(n.coolify_resource, o.coolify_resource), "
                     "public_key = coalesce(n.public_key, o.public_key), "
@@ -20999,6 +21221,14 @@ STORE_UPGRADE_TIMEOUT_SECONDS = 3600
 STORE_UPGRADE_HANDOVER_ENV = "CAPABILITIES_STORE_UPGRADE_HANDOVER"
 
 
+def _store_legacy_version() -> tuple[int, int]:
+    """The version the core's first step (`0039-core`) leaves the legacy
+    owner's row at, which no later core step moves: the core's own version
+    rises past it with each later major."""
+    from capabilities_contract.db import _core
+    return (_core.CORE_MAJOR, getattr(_core, "CORE_MINOR", 0))
+
+
 def _upgrade_message(code: object, message: object, hint: object) -> str:
     """One line of what a store refusal says: its message, and for a refusal
     of the store's major (STORE_MAJOR_SLUGS) its hint after it, which names the
@@ -21655,9 +21885,9 @@ def _store_upgrade_readers(setting, survey: dict, asked: list | None = None) -> 
                 "crosses": state == "upgrade_needed"})
     # The manager's tables were owner `capabilities` until the core's step
     # moved them; that owner keeps its row, which the core's step takes to the
-    # core's version and which has no steps of its own.
+    # version of that step and which has no steps of its own.
     manager_owners = (
-        (STORE_LEGACY_OWNER, (), store.STORE_TABLES_VERSION),
+        (STORE_LEGACY_OWNER, (), _store_legacy_version()),
         (SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS, SUPERVISE_LEASE_VERSION))
     for owner, steps, (major, minor) in manager_owners:
         if owner not in survey["owners"]:
@@ -22188,7 +22418,7 @@ def _store_upgrade_migrate_owner(setting, entry: dict) -> dict:
         major, minor = getattr(migrate_module, "CORE_VERSION", (0, 0))
     elif owner == STORE_LEGACY_OWNER:
         # Moved by the core's step, the one before it.
-        steps, (major, minor) = (), store.STORE_TABLES_VERSION
+        steps, (major, minor) = (), _store_legacy_version()
     else:
         steps, (major, minor) = SUPERVISE_LEASE_STEPS, SUPERVISE_LEASE_VERSION
     if not steps:
@@ -23192,7 +23422,7 @@ def _loopback_warning(name: str, nodes: list[str], adapter) -> str | None:
         for key in keys:
             address = _loopback_address(value.get(key))
             if address is not None:
-                found.append(f"connection {cid} has {key} {address}")
+                found.append(f"connection {row.get('label') or cid} has {key} {address}")
     if not found:
         return None
     return (f"{name}'s service is placed on {', '.join(away)}, which is not this "
@@ -23759,6 +23989,9 @@ def cmd_get(name: str, collection: str, key: str) -> None:
     root = _require_project()
     adapter = _records_for(root)
     try:
+        if collection in ("connection", "grant"):
+            # A connection is named by its id or by its label.
+            key = _connection_key(adapter, name, key)
         value = adapter.get(name, collection, key)
         if value is None:
             _die(3, "not_found", f"no resolved {name}/{collection}/{key}")
@@ -23793,8 +24026,12 @@ def cmd_set(name: str, collection: str, key: str,
             # A store row carries the project id as its agent, so the write
             # takes the id only once it is verified for this invocation.
             _project_id_for_write(root)
-        adapter.set(name, collection, key, value,
-                    actor="capabilities set", note=note)
+        done = adapter.set(name, collection, key, value,
+                           actor="capabilities set", note=note)
+        if collection == "connection" and isinstance(done, str) and done:
+            # A word that named no connection added one labelled so, under
+            # the id the store minted for it.
+            key = done
         answer = {"set": {"capability": name, "collection": collection,
                           "key": key, "value": value},
                   "records": {"mode": adapter.mode_of(collection, key),
@@ -23819,12 +24056,9 @@ def cmd_set(name: str, collection: str, key: str,
 def _connection_key(adapter, name: str, wanted: str) -> str:
     """The id of `name`'s connection `wanted` names, by its id or by its
     label; the store keeps every label apart from every id, so a word that
-    is no label is taken as the id it already is."""
-    labels = getattr(adapter, "connection_labels", None)
-    held = labels(name) if labels is not None else {}
-    if wanted in held:
-        return wanted
-    return next((cid for cid, label in held.items() if label == wanted), wanted)
+    names no connection is passed on as it is - a new connection's label, or
+    the word a refusal names."""
+    return adapter.connection_id(name, wanted) or wanted
 
 
 # ---------------------------------------------------------------- connections import
@@ -23952,14 +24186,15 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
     conflicts: list[str] = []
     writes: list[tuple[str, tuple]] = []
     for name, wanted in plan.items():
-        held = dict(conn.execute(
-            "SELECT name, spec FROM connections WHERE capability = %s",
-            (name,)).fetchall())
+        # A file's connection is the store's connection labelled with its
+        # key; the store mints its id.
+        held = _labelled_specs(conn, name)
         grants = {(cid, node): (enabled, allow_write, bool(is_default))
                   for cid, node, enabled, allow_write, is_default in conn.execute(
-                      "SELECT connection, node, enabled, allow_write, is_default "
-                      "FROM grants "
-                      "WHERE agent_id = %s AND capability = %s", (agent_id, name)).fetchall()}
+                      "SELECT c.label, g.node, g.enabled, g.allow_write, g.is_default "
+                      "FROM grants g JOIN connections c ON c.id = g.connection_id "
+                      "WHERE g.agent_id = %s AND g.capability = %s",
+                      (agent_id, name)).fetchall()}
         report = {"connections": {"imported": [], "unchanged": []},
                   "grants": {"imported": [], "unchanged": []},
                   "default": wanted["default"]}
@@ -23968,7 +24203,7 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
                 if cid not in wanted["connections"]:
                     continue
                 writes.append((
-                    "INSERT INTO connections (capability, name, spec) "
+                    "INSERT INTO connections (capability, label, spec) "
                     "VALUES (%s, %s, %s::jsonb)",
                     (name, cid, json.dumps(spec, ensure_ascii=False))))
                 report["connections"]["imported"].append(cid)
@@ -23986,8 +24221,9 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
                     continue
                 writes.append((
                     "INSERT INTO grants (agent_id, capability, "
-                    "connection, node, enabled, allow_write, is_default) "
-                    "VALUES (%s, %s, %s, NULL, %s, %s, %s)", (agent_id, name, cid, *row)))
+                    "connection_id, node, enabled, allow_write, is_default) "
+                    "VALUES (%s, %s, (SELECT id FROM connections WHERE capability = %s "
+                    "AND label = %s), NULL, %s, %s, %s)", (agent_id, name, name, cid, *row)))
                 report["grants"]["imported"].append(cid)
             elif found == row:
                 report["grants"]["unchanged"].append(cid)
@@ -24015,6 +24251,34 @@ def _import_rows(conn, agent_id: str, plan: dict) -> dict:
     return result
 
 
+def _labelled_specs(conn, capability: str | None = None) -> dict:
+    """The spec of each connection the store holds, by its label, or by
+    (capability, label) across every capability: what a file's connection,
+    keyed by what it is called, is compared with."""
+    if capability is not None:
+        return dict(conn.execute("SELECT label, spec FROM connections "
+                                 "WHERE capability = %s", (capability,)).fetchall())
+    return {(cap, label): spec for cap, label, spec in conn.execute(
+        "SELECT capability, label, spec FROM connections").fetchall()}
+
+
+def _by_label(records, name: str, entries: dict) -> dict:
+    """Entries keyed by connection id, keyed instead by what each connection
+    is called: its label in the store, its key in files."""
+    labels = records.connection_labels(name)
+    return {(entry.get("label") if isinstance(entry, dict) else None)
+            or labels.get(cid) or cid: entry for cid, entry in entries.items()}
+
+
+def _label_of(records, name: str, word):
+    """What the connection `word` names (by id or label) is called, or the
+    word as it is where it names none."""
+    if not isinstance(word, str) or not word:
+        return word
+    cid = records.connection_id(name, word) or word
+    return records.connection_labels(name).get(cid) or word
+
+
 def _import_verify(files, stored, plan: dict) -> None:
     """The import holds only if the store now resolves, for this project on this
     node, the connections its files resolve among those the store holds - every
@@ -24027,8 +24291,8 @@ def _import_verify(files, stored, plan: dict) -> None:
         for write_default in (False, True):
             before = files.connections(name, write_default=write_default,
                                        include_disabled=True)
-            after = stored.connections(name, write_default=write_default,
-                                       include_disabled=True)
+            after = _by_label(stored, name, stored.connections(
+                name, write_default=write_default, include_disabled=True))
             present |= set(after)
             usable_before = {cid: (e["value"], e["allow_write"])
                              for cid, e in before.items() if e["enabled"] and cid in present}
@@ -24045,7 +24309,7 @@ def _import_verify(files, stored, plan: dict) -> None:
                     "report this as a defect in `capabilities connections import`")
         default = files.get(name, "setting", "connection.default")
         if ((default if default in present else None)
-                != stored.get(name, "setting", "connection.default")):
+                != _label_of(stored, name, stored.get(name, "setting", "connection.default"))):
             raise _ImportRefused(
                 "import_mismatch",
                 f"after the import the store would point {name}'s default elsewhere "
@@ -24280,16 +24544,16 @@ def cmd_connections_list(names: list[str]) -> None:
     params = (names,) if names else ()
     try:
         connections = conn.execute(
-            "SELECT c.capability, c.name, c.owner_agent_id, a.name, to_jsonb(c) ->> 'label' "
+            "SELECT c.capability, c.id, c.owner_agent_id, a.name, c.label "
             "FROM connections c "
             "LEFT JOIN agents a ON a.id = c.owner_agent_id" + only
-            + " ORDER BY c.capability, c.name", params).fetchall()
+            + " ORDER BY c.capability, c.label", params).fetchall()
         grants = conn.execute(
-            "SELECT g.capability, g.connection, g.agent_id, a.name, g.node, g.enabled, "
+            "SELECT g.capability, g.connection_id, g.agent_id, a.name, g.node, g.enabled, "
             "g.allow_write, g.is_default FROM grants g "
             "LEFT JOIN agents a ON a.id = g.agent_id"
             + only.replace("c.capability", "g.capability")
-            + " ORDER BY g.capability, g.connection, g.agent_id NULLS FIRST, "
+            + " ORDER BY g.capability, g.connection_id, g.agent_id NULLS FIRST, "
             "g.node NULLS FIRST", params).fetchall()
     except (psycopg.errors.UndefinedColumn, psycopg.errors.UndefinedTable):
         major, minor = _store_module().STORE_TABLES_VERSION
@@ -24890,17 +25154,22 @@ def _migrate_identifier_rows(conn, agent_id: str | None) -> dict:
 
 
 def _migrate_grant_rows(conn, agent_id: str | None) -> dict:
-    return {(cap, cid): (enabled, allow_write, bool(is_default))
-            for cap, cid, enabled, allow_write, is_default in _migrate_rows(
-                conn, "SELECT capability, connection, enabled, allow_write, is_default "
-                      "FROM grants "
-                      "WHERE coalesce(agent_id, '') = coalesce(%s::text, '') "
-                      "AND node IS NULL", (agent_id,))}
+    """The grants of an agent (None: the global ones) for every node, by
+    (capability, label of the connection granted): a file's connection is
+    the store's labelled with its key."""
+    return {(cap, label): (enabled, allow_write, bool(is_default))
+            for cap, label, enabled, allow_write, is_default in _migrate_rows(
+                conn, "SELECT g.capability, c.label, g.enabled, g.allow_write, "
+                      "g.is_default FROM grants g "
+                      "JOIN connections c ON c.id = g.connection_id "
+                      "WHERE coalesce(g.agent_id, '') = coalesce(%s::text, '') "
+                      "AND g.node IS NULL", (agent_id,))}
 
 
 def _migrate_connection_rows(conn) -> dict:
-    return {(cap, name): spec for cap, name, spec in _migrate_rows(
-        conn, "SELECT capability, name, spec FROM connections")}
+    """Every connection's spec, by (capability, label)."""
+    return {(cap, label): spec for cap, label, spec in _migrate_rows(
+        conn, "SELECT capability, label, spec FROM connections")}
 
 
 def _migrate_setting_rows(conn, agent_id: str | None, document: str) -> dict | None:
@@ -24917,7 +25186,20 @@ def _migrate_setting_rows(conn, agent_id: str | None, document: str) -> dict | N
               "AND node IS NULL", (agent_id, document))
     if not exists and not rows:
         return None
-    return store.settings_tree([(list(path), value) for path, value in rows])
+    labels = dict(_migrate_rows(conn, "SELECT id, label FROM connections "
+                                      "WHERE capability = %s", (document,)))
+    return _settings_by_label(store.settings_tree([(list(path), value) for path, value in rows]),
+                              labels)
+
+
+def _settings_by_label(document, labels: dict):
+    """A settings document as files say it: a top-level `connection`, which
+    the store keeps as the id of the connection it names, called by that
+    connection's label, as a file calls it."""
+    if isinstance(document, dict) and isinstance(document.get("connection"), str) \
+            and document["connection"] in labels:
+        return {**document, "connection": labels[document["connection"]]}
+    return document
 
 
 # --- what the files say -------------------------------------------------------------
@@ -25334,12 +25616,15 @@ def _migrate_global_home(ctx: dict) -> Path:
                       "WHERE agent_id IS NULL AND to_jsonb(i) ->> 'node' IS NULL"):
             identifiers.setdefault(name, {})[label] = {"value": value, "note": note or ""}
         registries: dict = {}
+        # The store's global rows as a config home's files, each connection
+        # keyed by its label, which is what an agent's files call it.
         for name, cid, spec in _migrate_rows(
-                conn, "SELECT capability, name, spec FROM connections"):
+                conn, "SELECT capability, label, spec FROM connections"):
             registries.setdefault(name, {"connections": {}})["connections"][cid] = dict(spec)
         for name, cid, allow_write, is_default in _migrate_rows(
-                conn, "SELECT capability, connection, allow_write, is_default FROM "
-                      "grants WHERE agent_id IS NULL AND node IS NULL"):
+                conn, "SELECT g.capability, c.label, g.allow_write, g.is_default FROM "
+                      "grants g JOIN connections c ON c.id = g.connection_id "
+                      "WHERE g.agent_id IS NULL AND g.node IS NULL"):
             entry = registries.get(name, {}).get("connections", {}).get(cid)
             if entry is None:
                 continue
@@ -26247,8 +26532,8 @@ def _migrate_write_records(ctx: dict, plan: dict) -> dict:
         for row in records["connections"]:
             if row["outcome"] not in ("write", "replace"):
                 continue
-            conn.execute("INSERT INTO connections (capability, name, spec) "
-                         "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
+            conn.execute("INSERT INTO connections (capability, label, spec) "
+                         "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, label) "
                          "DO UPDATE SET spec = EXCLUDED.spec",
                          (row["capability"], row["name"],
                           json.dumps(row["spec"], ensure_ascii=False)))
@@ -26257,8 +26542,9 @@ def _migrate_write_records(ctx: dict, plan: dict) -> dict:
             kind, name, key = entry["kind"], entry["capability"], entry["name"]
             if kind == "grant":
                 conn.execute("DELETE FROM grants WHERE agent_id = %s "
-                             "AND capability = %s AND connection = %s AND node IS NULL",
-                             (agent_id, name, key))
+                             "AND capability = %s AND connection_id = (SELECT id FROM "
+                             "connections WHERE capability = %s AND label = %s) "
+                             "AND node IS NULL", (agent_id, name, name, key))
             elif kind == "identifier":
                 conn.execute("DELETE FROM identifiers WHERE agent_id = %s "
                              "AND capability = %s AND label = %s AND node IS NULL",
@@ -26273,17 +26559,21 @@ def _migrate_write_records(ctx: dict, plan: dict) -> dict:
             if row["is_default"]:
                 conn.execute("UPDATE grants SET is_default = false "
                              "WHERE agent_id = %s AND capability = %s AND node IS NULL "
-                             "AND connection <> %s AND is_default",
-                             (agent_id, row["capability"], row["connection"]))
+                             "AND connection_id IS DISTINCT FROM (SELECT id FROM "
+                             "connections WHERE capability = %s AND label = %s) "
+                             "AND is_default",
+                             (agent_id, row["capability"], row["capability"],
+                              row["connection"]))
             conn.execute(
                 "INSERT INTO grants (agent_id, capability, "
-                "connection, node, enabled, allow_write, is_default) "
-                "VALUES (%s, %s, %s, NULL, %s, %s, %s) "
-                "ON CONFLICT ((coalesce(agent_id, '')), capability, connection, "
+                "connection_id, node, enabled, allow_write, is_default) "
+                "VALUES (%s, %s, (SELECT id FROM connections WHERE capability = %s "
+                "AND label = %s), NULL, %s, %s, %s) "
+                "ON CONFLICT ((coalesce(agent_id, '')), capability, connection_id, "
                 "(coalesce(node, ''))) DO UPDATE SET enabled = EXCLUDED.enabled, "
                 "allow_write = EXCLUDED.allow_write, is_default = EXCLUDED.is_default",
-                (agent_id, row["capability"], row["connection"], row["enabled"],
-                 row["allow_write"], row["is_default"]))
+                (agent_id, row["capability"], row["capability"], row["connection"],
+                 row["enabled"], row["allow_write"], row["is_default"]))
             written["grants"] += 1
         for row in records["identifiers"]:
             if row["outcome"] != "write":
@@ -26371,8 +26661,8 @@ def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
                 for write_default in (False, True):
                     before = files.connections(name, write_default=write_default,
                                                include_disabled=True)
-                    after = rows.connections(name, write_default=write_default,
-                                             include_disabled=True)
+                    after = _by_label(rows, name, rows.connections(
+                        name, write_default=write_default, include_disabled=True))
                     before = {renames.get((name, cid)) or cid: e for cid, e in before.items()}
                     before = {cid: ({**e, "value": kept[(name, cid)]}
                                     if (name, cid) in kept else e)
@@ -26389,7 +26679,7 @@ def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
                                 f"{usable_after.get(cid)}")
                 left = files.get(name, "setting", "connection.default")
                 left = renames.get((name, left)) or left
-                right = rows.get(name, "setting", "connection.default")
+                right = _label_of(rows, name, rows.get(name, "setting", "connection.default"))
                 if left != right:
                     differences.append(f"{name} default: the files point to {left!r}, the "
                                        f"store to {right!r}")
@@ -26416,7 +26706,8 @@ def _migrate_verify(ctx: dict, plan: dict) -> list[str]:
             wanted, _problem, _questions, _warnings = _migrate_settings_document(
                 entry, ctx.get("answers") or {})
             wanted = wanted if wanted is not None else {}
-            held = rows.setting_document(entry["document"], "project")
+            held = _settings_by_label(rows.setting_document(entry["document"], "project"),
+                                      rows.connection_labels(entry["document"]))
             moved.add(entry["document"])
             if held != wanted:
                 differences.append(f"{entry['document']} settings: the file says "
@@ -27061,8 +27352,10 @@ def cmd_migrate_global(opts: dict) -> None:
                                  (row["capability"], row["name"]))
                 else:
                     conn.execute("DELETE FROM grants WHERE "
-                                 "agent_id IS NULL AND capability = %s AND connection = %s "
-                                 "AND node IS NULL", (row["capability"], row["name"]))
+                                 "agent_id IS NULL AND capability = %s AND connection_id = "
+                                 "(SELECT id FROM connections WHERE capability = %s AND "
+                                 "label = %s) AND node IS NULL",
+                                 (row["capability"], row["capability"], row["name"]))
             for row in plan["policy"]:
                 if row["outcome"] != "held":
                     conn.execute(
@@ -27084,8 +27377,8 @@ def cmd_migrate_global(opts: dict) -> None:
             for row in plan["connections"]:
                 if row["outcome"] in ("add", "change"):
                     conn.execute(
-                        "INSERT INTO connections (capability, name, spec) "
-                        "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, name) "
+                        "INSERT INTO connections (capability, label, spec) "
+                        "VALUES (%s, %s, %s::jsonb) ON CONFLICT (capability, label) "
                         "DO UPDATE SET spec = EXCLUDED.spec",
                         (row["capability"], row["name"],
                          json.dumps(row["spec"], ensure_ascii=False)))
@@ -27098,13 +27391,14 @@ def cmd_migrate_global(opts: dict) -> None:
                                  "node IS NULL AND is_default", (row["capability"],))
                 conn.execute(
                     "INSERT INTO grants (agent_id, capability, "
-                    "connection, node, enabled, allow_write, is_default) VALUES (NULL, %s, "
-                    "%s, NULL, NULL, %s, %s) ON CONFLICT ((coalesce(agent_id, '')), "
-                    "capability, connection, (coalesce(node, ''))) DO UPDATE SET "
+                    "connection_id, node, enabled, allow_write, is_default) VALUES (NULL, %s, "
+                    "(SELECT id FROM connections WHERE capability = %s AND label = %s), "
+                    "NULL, NULL, %s, %s) ON CONFLICT ((coalesce(agent_id, '')), "
+                    "capability, connection_id, (coalesce(node, ''))) DO UPDATE SET "
                     "enabled = NULL, allow_write = EXCLUDED.allow_write, "
                     "is_default = EXCLUDED.is_default",
-                    (row["capability"], row["connection"], row["allow_write"],
-                     row["is_default"]))
+                    (row["capability"], row["capability"], row["connection"],
+                     row["allow_write"], row["is_default"]))
     except _MigrateRefusal as exc:
         conn.close()
         _migrate_refuse(exc, answer)
@@ -27278,9 +27572,10 @@ def cmd_migrate_retire_connections() -> None:
         _migrate_refuse(exc)
     try:
         at = _migrate_global_at(conn)
+        # A config home's connection is the store's labelled with its key.
         held = {(name, cid): dict(spec) if isinstance(spec, dict) else {}
                 for name, cid, spec in _migrate_rows(
-                    conn, "SELECT capability, name, spec FROM connections")}
+                    conn, "SELECT capability, label, spec FROM connections")}
     finally:
         conn.close()
     if not at:
@@ -33403,7 +33698,12 @@ def _connections_report() -> dict:
     reg, _reg_file = _connections_registry()
     out: dict = {"default": None, "connections": {}}
     conns = reg["connections"]
-    out["default"] = reg.get("default") or (next(iter(conns)) if len(conns) == 1 else None)
+    default = reg.get("default")
+    if default and default not in conns:
+        # The default pointer names its connection by id or label.
+        default = next((cid for cid, label in (reg.get("labels") or {}).items()
+                        if label == default), default)
+    out["default"] = default or (next(iter(conns)) if len(conns) == 1 else None)
     for cid, raw in conns.items():
         entry = raw if isinstance(raw, dict) else {}
         rows = []

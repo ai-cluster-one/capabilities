@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.44,<1",
 # ]
 # ///
 """slack — managed capability scaffold.
@@ -785,8 +785,10 @@ def _service_connection_id(root: Path, flag: str | None) -> str:
 
 
 def _service_state_dir(cid: str) -> Path:
+    """<state>/slack/<id>/service; the library answers the connection's own
+    folder, first moving there one made under the connection's former name."""
     base = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
-    return base / NAME / cid / "service"
+    return _connection_state_dir(base / NAME, cid) / "service"
 
 
 def _read_pid(path: Path) -> int | None:
@@ -844,7 +846,8 @@ def cmd_service_init(flag: str | None) -> None:
     if not _service_initialized(held):
         settings = json.loads(settings_template.read_text())
         if flag:
-            settings["connection"] = flag
+            # The setting holds the connection's id, whichever word named it.
+            settings["connection"] = _labelled(flag) or flag
         for key, value in settings.items():
             if key in held:
                 # The allow-list an agent kept before its service was set up.

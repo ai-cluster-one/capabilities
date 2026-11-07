@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.44,<1",
 #     "slack_sdk>=3.33",
 #     "websocket-client>=1.8",
 # ]
@@ -672,13 +672,18 @@ def _persist_link(cid: str, scope: str, token: str, cookie: str, team: dict,
     the non-secret workspace identity into the registry. Mirrors the write
     `connection add` makes, so link and paste leave the same shape."""
     declared = {f["key"]: f for f in (globals().get("CONN_FIELDS") or [])}
-    token_env = _connection_env_name(declared["token_env"], cid)
-    cookie_env = _connection_env_name(declared["cookie_env"], cid)
     adapter = _records()
     try:
-        held = adapter.resolve_scope(NAME, "connection", scope).get(cid)
+        # `cid` is the connection's id or its label; a new one is added under
+        # it as its label and given an id.
+        held_id = adapter.connection_id(NAME, cid)
+        held = adapter.resolve_scope(NAME, "connection", scope).get(held_id or cid)
     except StoreError as e:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
+    # The keys are filled from the label, never from an id.
+    named = _connection_label(held_id) if held is not None and held_id else cid
+    token_env = _connection_env_name(declared["token_env"], named)
+    cookie_env = _connection_env_name(declared["cookie_env"], named)
     if held is not None and not replace:
         _die(6, "connection_exists",
              f"a {scope} connection {cid!r} already exists; link writes over it "
@@ -692,13 +697,14 @@ def _persist_link(cid: str, scope: str, token: str, cookie: str, team: dict,
     credentials = _scope_credentials(scope)
     _env_file_write(credentials, {token_env: token, cookie_env: cookie})
     try:
-        adapter.set(NAME, "connection", cid, entry, scope=scope)
+        written = adapter.set(NAME, "connection", held_id if held is not None and held_id
+                              else cid, entry, scope=scope) or held_id or cid
         if default:
-            adapter.set(NAME, "setting", "connection.default", cid, scope=scope)
+            adapter.set(NAME, "setting", "connection.default", written, scope=scope)
         source = adapter.scope_source(NAME, "connection", scope)
     except StoreError as e:
         _die(5 if e.slug in STORE_ENVIRONMENT_SLUGS else 6, e.slug, e.message, e.hint)
-    return {"registry": source, "credentials": str(credentials),
+    return {"connection": written, "registry": source, "credentials": str(credentials),
             "token_env": token_env, "cookie_env": cookie_env}
 
 
@@ -793,6 +799,7 @@ def cmd_link(args) -> dict | None:
     default = getattr(args, "default", False)
     written = _persist_link(cid, scope, team["token"], cookie, team, default,
                             getattr(args, "replace", False))
+    cid = written.get("connection") or cid
     _event("linked", connection=cid, workspace=cfg["workspace"],
            user=proof.get("user"))
     return {"ok": True, "action": "link", "connection": cid, "scope": scope,
@@ -1061,11 +1068,23 @@ def _store_setting(root: Path | None = None):
         _store_refusal(exc)
 
 
+def _store_account(cfg: dict) -> str:
+    """The account a connection's rows are keyed by: the team id it binds,
+    else the name it was kept under before connections were given ids, else
+    its id."""
+    if cfg.get("account_binding"):
+        return cfg["account_binding"]
+    cid = cfg.get("id")
+    return (_connection_former_name(cid) if cid else None) or cid or "default"
+
+
 def _open_store(cfg: dict) -> _Store:
     """The store for one connection's account, its tables migrated. The account
     is the workspace team id the connection binds, else the connection id, so a
-    capture is never split and never confused between two workspaces."""
-    account = cfg.get("account_binding") or cfg.get("id") or "default"
+    capture is never split and never confused between two workspaces. A
+    connection binding no team keeps the rows it kept under the name it had
+    before connections were given ids."""
+    account = _store_account(cfg)
     setting = _store_setting()
     try:
         conn = connect(application_name=NAME, setting=setting, transaction=True)
@@ -1873,9 +1892,15 @@ def cmd_sync(args) -> dict:
 # --- Live-capture service ----------------------------------------------------
 
 def _service_home(cfg: dict) -> Path:
-    account = cfg.get("account_binding") or cfg.get("id") or "default"
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", account)
-    home = _STATE_HOME / NAME / safe / "service"
+    """<state>/slacker/<team id>/service, else the connection's own folder,
+    <state>/slacker/<id>/service, where the library first moves one made under
+    the connection's former name."""
+    account = cfg.get("account_binding")
+    if account:
+        home = _STATE_HOME / NAME / re.sub(r"[^A-Za-z0-9_.-]", "_", account) / "service"
+    else:
+        cid = re.sub(r"[^A-Za-z0-9_.-]", "_", cfg.get("id") or "default")
+        home = _connection_state_dir(_STATE_HOME / NAME, cid) / "service"
     home.mkdir(parents=True, exist_ok=True)
     return home
 

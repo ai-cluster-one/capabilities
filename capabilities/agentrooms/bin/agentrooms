@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.44,<1",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.11.0",
@@ -2903,8 +2903,22 @@ def cmd_card_avatar(cfg: dict, who: str | None, out: str) -> dict:
 # ── register ─────────────────────────────────────────────────────────────────
 
 
-def _connection_env_key(cid: str) -> str:
-    return "AGENTROOMS_" + re.sub(r"[^A-Z0-9]", "_", cid.upper()) + "_TOKEN"
+def _connection_env_key(label: str) -> str:
+    """The token variable a new connection keeps its token in, filled from the
+    label it is added under, as the spec's `AGENTROOMS_{ID}_TOKEN` template is;
+    a connection that names one in its spec keeps that one."""
+    return "AGENTROOMS_" + re.sub(r"[^A-Z0-9]", "_", label.upper()) + "_TOKEN"
+
+
+def _declared_as(declared: dict, word: str) -> tuple[str | None, dict | None]:
+    """The declared connection a word a person gives names - by its id, else by
+    its label - as (id, entry), or (None, None)."""
+    if word in declared:
+        return word, declared[word]
+    for cid, entry in declared.items():
+        if (entry or {}).get("label") == word:
+            return cid, entry
+    return None, None
 
 
 def _env_line_key(line: str) -> str | None:
@@ -2983,6 +2997,8 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
         problem = _supervisor_problem(supervisor, None)
         if problem:
             _die(6, "bad_user", problem, "e.g. --supervisor @person:example.org")
+    # The word a person gives names the connection by its id or its label; a
+    # new one is added under it as its label, and the store gives it its id.
     cid = as_id or name
     if not KEY_RE.fullmatch(cid):
         _die(6, "bad_connection_id", f"connection id {cid!r} must match {KEY_RE.pattern}")
@@ -2993,8 +3009,9 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
         _die(6, "no_envelope", "register writes the agent's connection into this project's "
              "capabilities/ envelope, and there is none here", "run `capabilities init` first")
     declared_all = _inventory_connections()["connections"] or {}
-    declared = declared_all.get(cid)
-    secret_env = (declared or {}).get("secret_env") or _connection_env_key(cid)
+    found, declared = _declared_as(declared_all, cid)
+    label = (declared or {}).get("label") or cid
+    secret_env = (declared or {}).get("secret_env") or _connection_env_key(label)
     if declared is not None:
         # A connection declared before its account exists is completed rather
         # than refused: one that already names another account, or whose token
@@ -3008,8 +3025,9 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
     else:
         # Two ids that differ only in case share one token variable; a second
         # connection on it would overwrite the first one's token.
-        sharing = sorted(other for other, entry in declared_all.items()
-                         if (entry.get("secret_env") or _connection_env_key(other)) == secret_env)
+        sharing = sorted((entry.get("label") or other) for other, entry in declared_all.items()
+                         if (entry.get("secret_env")
+                             or _connection_env_key(entry.get("label") or other)) == secret_env)
         if sharing:
             _die(6, "connection_exists",
                  f"connection {sharing[0]!r} already keeps its token in {secret_env}",
@@ -3090,7 +3108,8 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
         _die(5, "registration_incomplete", "the homeserver registered without returning a token")
     credentials = root / ".env.local"
     _write_env_key(credentials, secret_env, access)
-    entry = {k: v for k, v in (declared or {}).items() if k not in ("allow_write", "granted")}
+    entry = {k: v for k, v in (declared or {}).items()
+             if k not in ("allow_write", "granted", "id", "label")}
     entry.update({"homeserver": homeserver, "user_id": user_id, "secret_env": secret_env,
                   "device_id": device})
     unset = _supervisor_problem(supervisor, user_id) if supervisor is not None else None
@@ -3098,7 +3117,7 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
         entry["supervisor"] = supervisor
     default_unset = None
     try:
-        adapter.set(NAME, "connection", cid, entry, scope="project")
+        cid = adapter.set(NAME, "connection", found or cid, entry, scope="project") or found or cid
         if make_default:
             # The default pointer names only a connection this project may use;
             # an ungranted default would leave every verb refused.
@@ -3110,8 +3129,9 @@ def cmd_register(name: str, homeserver_flag: str | None, as_id: str | None,
         registry = adapter.scope_source(NAME, "connection", "project")
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
-    out = {"registered": True, "connection": cid, "user_id": user_id, "homeserver": homeserver,
-           "device_id": device, "secret_env": secret_env, "credentials": str(credentials),
+    out = {"registered": True, "connection": cid, "label": label, "user_id": user_id,
+           "homeserver": homeserver, "device_id": device, "secret_env": secret_env,
+           "credentials": str(credentials),
            "registry": str(registry), "default": make_default and default_unset is None,
            "allow_write": WRITE_DEFAULT, "supervisor": entry.get("supervisor")}
     if default_unset:
@@ -3168,7 +3188,8 @@ def cmd_login(user_id: str, homeserver_flag: str | None, as_id: str | None, scop
         if envelope is None or not Path(envelope).is_dir():
             _die(6, "no_envelope", "no capabilities/ envelope in this project",
                  "run `capabilities init` first")
-    declared = (_inventory_connections()["connections"] or {}).get(cid)
+    known, declared = _declared_as(_inventory_connections()["connections"] or {}, cid)
+    label = (declared or {}).get("label") or cid
     if declared is not None and declared.get("user_id") != user_id:
         _die(6, "connection_exists",
              f"connection {cid!r} is already declared for {declared.get('user_id')!r}",
@@ -3203,7 +3224,7 @@ def cmd_login(user_id: str, homeserver_flag: str | None, as_id: str | None, scop
     if found != user_id:
         _die(6, "login_mismatch", f"the homeserver signed in {found!r}, not {user_id!r}",
              "name the account by its full user id")
-    secret_env = _connection_env_key(cid)
+    secret_env = (declared or {}).get("secret_env") or _connection_env_key(label)
     credentials = CREDENTIALS_ENV if scope == "global" else root / ".env.local"
     _write_env_key(credentials, secret_env, access)
     entry = {"homeserver": homeserver, "user_id": found, "secret_env": secret_env,
@@ -3212,14 +3233,15 @@ def cmd_login(user_id: str, homeserver_flag: str | None, as_id: str | None, scop
     if supervisor or kept:
         entry["supervisor"] = supervisor or kept
     try:
-        adapter.set(NAME, "connection", cid, entry, scope=scope)
+        cid = adapter.set(NAME, "connection", known or cid, entry, scope=scope) or known or cid
         if make_default:
             adapter.set(NAME, "setting", "connection.default", cid, scope=scope)
         registry = adapter.scope_source(NAME, "connection", scope)
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
-    out = {"logged_in": True, "connection": cid, "scope": scope, "user_id": found,
-           "homeserver": homeserver, "device_id": device, "secret_env": secret_env,
+    out = {"logged_in": True, "connection": cid, "label": label, "scope": scope,
+           "user_id": found, "homeserver": homeserver, "device_id": device,
+           "secret_env": secret_env,
            "credentials": str(credentials), "registry": str(registry), "default": make_default,
            "supervisor": entry.get("supervisor")}
     if supervisor:
@@ -3920,10 +3942,39 @@ def _open_store(root: Path):
                        exc.slug, exc.message, exc.hint) from None
 
 
-def _worker_name_for(cid: str) -> str:
-    """The worker an agents-map entry is moved into: named after its connection."""
-    name = re.sub(r"[^a-z0-9_-]+", "-", cid.lower()).strip("-_")[:64] or "agent"
+def _worker_name_for(word: str) -> str:
+    """The worker an agents-map entry is moved into: named after the word the
+    map keys it by, the connection's name when the map was written, so the
+    worker is named as before the connections had ids."""
+    name = re.sub(r"[^a-z0-9_-]+", "-", word.lower()).strip("-_")[:64] or "agent"
     return f"{name}-agent" if name == _engine().DEFAULT_WORKER else name
+
+
+def _identity_of(identities: dict, word: str) -> tuple[str | None, dict | None]:
+    """The resolved connection record a word names among `identities` (keyed
+    by connection id), by its id, else by the id the word resolves to as a
+    label, as (id, record); (None, None) where it names none."""
+    if word in identities:
+        return word, identities[word]
+    with contextlib.suppress(StoreError, AttributeError):
+        cid = _records().connection_id(NAME, word)
+        if cid in identities:
+            return cid, identities[cid]
+    return None, None
+
+
+def _legacy_connection(identities: dict, word: str) -> str | None:
+    """The connection an earlier release's agents map names by `word`: the
+    connection whose id it is, else whose name it was before the connections
+    had ids, else whose label it is; None where it names none."""
+    if word in identities:
+        return word
+    adapter = _records()
+    with contextlib.suppress(StoreError, AttributeError):
+        for cid in sorted(identities):
+            if adapter.connection_former_name(NAME, cid) == word:
+                return cid
+    return _identity_of(identities, word)[0]
 
 
 def _binding_settings() -> dict:
@@ -3932,10 +3983,27 @@ def _binding_settings() -> dict:
     return {key: row["value"] for key, row in rows.items() if key.startswith("binding.")}
 
 
+def _binding_key(cid: str, settings: dict) -> str:
+    """The setting that holds connection `cid`'s binding: `binding.<id>`; where
+    that holds none and one is kept under the word the connection is called by
+    - its label, or the name it had before connections had ids, which a
+    settings file the store's step does not reach still names it by - that
+    one."""
+    key = f"binding.{cid}"
+    if key in settings or not any(k.startswith("binding.") for k in settings):
+        return key
+    words = []
+    with contextlib.suppress(StoreError, AttributeError):
+        words.append((_records().connection_labels(NAME) or {}).get(cid))
+    words.append(_connection_former_name(cid))
+    return next((f"binding.{word}" for word in words
+                 if word and word != cid and f"binding.{word}" in settings), key)
+
+
 def _binding_of(cid: str, entry: dict | None, settings: dict) -> dict:
     """What binds an agent: this project's `binding.<connection>` setting, else
     the keys an earlier release wrote onto the connection itself."""
-    held = settings.get(f"binding.{cid}")
+    held = settings.get(_binding_key(cid, settings))
     source = held if isinstance(held, dict) else {
         key: value for key, value in (entry or {}).items() if key in ("worker", "rooms")}
     return {key: source.get(key) for key in BINDING_KEYS}
@@ -3953,7 +4021,7 @@ def _supervisor_of(cid: str, entry: dict | None, settings: dict) -> str | None:
     value = (entry or {}).get("supervisor")
     if isinstance(value, str) and value:
         return value
-    held = settings.get(f"binding.{cid}")
+    held = settings.get(_binding_key(cid, settings))
     legacy = held.get(LEGACY_SUPERVISOR) if isinstance(held, dict) else None
     return legacy if isinstance(legacy, str) and legacy else None
 
@@ -3964,8 +4032,8 @@ def _room_default(cid: str, which: str) -> bool:
     if _project_root() is None:
         return ROOM_DEFAULTS[which]
     try:
-        ident = _records().resolve(NAME, "connection").get(cid) or {}
-        bound = _binding_of(cid, ident.get("value"), _binding_settings())
+        found, ident = _identity_of(_records().resolve(NAME, "connection"), cid)
+        bound = _binding_of(found or cid, (ident or {}).get("value"), _binding_settings())
     except StoreError:
         return ROOM_DEFAULTS[which]
     return _room_defaults(bound)[which]
@@ -3991,9 +4059,10 @@ def _write_binding(cid: str, changes: dict) -> tuple[dict, str]:
     it. Raises _Refusal."""
     adapter = _records()
     try:
-        ident = adapter.resolve(NAME, "connection").get(cid)
+        found, ident = _identity_of(adapter.resolve(NAME, "connection"), cid)
         if ident is None or not ident.get("value"):
             raise _Refusal(3, "unknown_connection", f"no connection {cid!r} is declared here")
+        cid = found
         settings = _binding_settings()
         current = _binding_of(cid, ident["value"], settings)
         legacy = _supervisor_of(cid, {}, settings)
@@ -4009,6 +4078,11 @@ def _write_binding(cid: str, changes: dict) -> tuple[dict, str]:
         moved = bool(legacy) and not entry.get("supervisor") and \
             _supervisor_problem(legacy, entry.get("user_id")) is None
         adapter.set(NAME, "setting", f"binding.{cid}", value, scope="project")
+        # A binding kept under the connection's label or former name moves
+        # under its id, and is kept there alone.
+        former = _binding_key(cid, settings)
+        if former != f"binding.{cid}":
+            adapter.delete(NAME, "setting", former, scope="project")
         if moved:
             entry["supervisor"] = legacy
         if ident.get("scope") == "project" and set(entry) & {"worker", "rooms"}:
@@ -4047,9 +4121,10 @@ def _write_supervisor(cid: str, value: str | None) -> tuple[dict, str]:
     where it is kept. Raises _Refusal."""
     adapter = _records()
     try:
-        ident = adapter.resolve(NAME, "connection").get(cid)
+        found, ident = _identity_of(adapter.resolve(NAME, "connection"), cid)
         if ident is None or not ident.get("value"):
             raise _Refusal(3, "unknown_connection", f"no connection {cid!r} is declared here")
+        cid = found
         entry = dict(ident["value"])
         if value is not None:
             problem = _supervisor_problem(value, entry.get("user_id"))
@@ -4062,11 +4137,15 @@ def _write_supervisor(cid: str, value: str | None) -> tuple[dict, str]:
         scope = _write_scope(ident)
         adapter.set(NAME, "connection", cid, entry, scope=scope)
         if _project_root() is not None:
-            held = _binding_settings().get(f"binding.{cid}")
+            settings = _binding_settings()
+            former = _binding_key(cid, settings)
+            held = settings.get(former)
             if isinstance(held, dict) and LEGACY_SUPERVISOR in held:
                 adapter.set(NAME, "setting", f"binding.{cid}",
                             {k: v for k, v in held.items() if k != LEGACY_SUPERVISOR},
                             scope="project")
+                if former != f"binding.{cid}":
+                    adapter.delete(NAME, "setting", former, scope="project")
         return entry, adapter.scope_source(NAME, "connection", scope)
     except StoreError as e:
         raise _Refusal(4 if e.slug == "read_only_switch" else 6, e.slug, e.message,
@@ -4095,25 +4174,26 @@ def _import_agents_map(root: Path, apply: bool, remove: bool = True) -> dict | N
         raise _Refusal(6, e.slug, e.message, e.hint) from None
     moves: dict = {}
     dropped: list = []
-    for cid, conf in sorted(agents.items()):
-        ident = identities.get(cid)
+    for word, conf in sorted(agents.items()):
+        cid = _legacy_connection(identities, word)
+        ident = identities.get(cid) if cid else None
         if ident is None or not ident.get("value"):
-            dropped.append(cid)
+            dropped.append(word)
             continue
         bound = _binding_of(cid, ident["value"], settings)["worker"]
         if bound:
             moves[cid] = (bound, None)
             continue
-        name = _worker_name_for(cid)
+        name = _worker_name_for(word)
         spec = {"description": "Moved from service/settings.json: admits every sender, as the "
                                "service did before workers.",
                 "profile": conf["profile"], "history": conf["history"],
                 "accepts_from": ["*"], "limits": {"turn_timeout": conf["turn_timeout"]}}
         try:
-            engine.read_worker(name, spec, "", f"{path}: agents.{cid}")
+            engine.read_worker(name, spec, "", f"{path}: agents.{word}")
         except engine.WorkerInvalid as exc:
             raise _Refusal(6, "settings_invalid", str(exc),
-                           f"repair agents.{cid} in {path}, or remove the file and bind a "
+                           f"repair agents.{word} in {path}, or remove the file and bind a "
                            f"worker with `{NAME} workers bind`") from None
         moves[cid] = (name, spec)
     answer = {"settings": str(path), "moved": {cid: name for cid, (name, _s) in moves.items()},
@@ -4716,6 +4796,15 @@ def cmd_service_harness() -> dict:
     if not _records_in_store():
         legacy = _legacy_agents(root) or {}
         found = _import_agents_map(root, apply=False) or {}
+        if found.get("moved"):
+            try:
+                identities = _records().resolve(NAME, "connection")
+            except StoreError as exc:
+                raise _Refusal(6, exc.slug, exc.message, exc.hint) from None
+            # The map is keyed by the word it was written under; what it moves
+            # is keyed by the connection's id.
+            legacy = {_legacy_connection(identities, word): conf
+                      for word, conf in legacy.items()}
         for cid, name in (found.get("moved") or {}).items():
             moves[cid] = name
             pending.setdefault(name, {"profile": legacy[cid]["profile"]})

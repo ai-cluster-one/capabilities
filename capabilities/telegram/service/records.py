@@ -135,4 +135,48 @@ def connections(adapter) -> tuple[dict | None, str]:
                         for cid, entry in effective.items() if entry["enabled"]},
         "withheld": sorted(cid for cid, entry in effective.items()
                            if not entry["enabled"]),
+        "labels": dict(adapter.connection_labels(NAME)),
     }, source
+
+
+def resolve(registry: dict | None, word):
+    """The id of the connection `word` names in `registry` - its id, else its
+    label - or `word` itself where it names neither, so a caller comparing it
+    to a resolved connection compares ids."""
+    if not registry or not word:
+        return word
+    word = str(word)
+    if word in registry.get("connections", {}) or word in (registry.get("withheld") or ()):
+        return word
+    return next((cid for cid, label in (registry.get("labels") or {}).items()
+                 if label == word), word)
+
+
+def state_dir(adapter, base: Path, cid: str) -> Path:
+    """`base/<cid>`, the folder a connection's state is kept in on this
+    machine: the library's own answer, asked of the CLI with the service's
+    own records `adapter`, which first moves a folder made under the
+    connection's former name to it. Where the map names no former name, or
+    nothing lies under it, the answer is `base/<cid>` and the CLI is not
+    loaded."""
+    former = former_name(adapter, cid)
+    made = Path(base) / former if former else None
+    if made is None or not (made.exists() or made.is_symlink()):
+        return Path(base) / cid
+    cli = _cli()
+    held = cli.__dict__.get("_records")
+    cli._records = lambda: adapter
+    try:
+        return cli._connection_state_dir(Path(base), cid)
+    finally:
+        cli._records = held
+
+
+def former_name(adapter, cid: str) -> str | None:
+    """The name connection `cid` was kept under before connections were given
+    ids, as the store's map of that cutover keeps it, or None."""
+    held = getattr(adapter, "connection_former_name", None)
+    try:
+        return held(NAME, cid) if held is not None and cid else None
+    except store().StoreError:
+        return None

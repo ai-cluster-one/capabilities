@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.44,<1",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
 #     "telethon==1.45.0",
@@ -557,7 +557,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     token_env = entry.get("secret_env")
     token = _resolve_env_key(token_env)[0] if token_env else None
     if not token:
-        named = token_env or _connection_env_name(_FIELD["secret_env"], cid)
+        named = token_env or _connection_env_name(_FIELD["secret_env"], _connection_label(cid))
         return None, {"exit": 2, "code": "missing_secret",
                       "message": f"connection {cid!r} has no bot token ({named} resolves "
                                  "nowhere)",
@@ -608,7 +608,9 @@ def _bot(cfg: dict):
 
 
 def _conn_state(cfg: dict) -> Path:
-    path = _state_dir() / cfg["id"]
+    """<state>/<id>, the bot's own folder on this machine; one made under the
+    connection's former name is moved there first (the library's answer)."""
+    path = _connection_state_dir(_state_dir(), cfg["id"])
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -1137,7 +1139,10 @@ draft, a stop and a resume are asks the bot's runner acts on within seconds.
 
 
 def _job_view(row: dict) -> dict:
-    out = {k: _iso(v) for k, v in row.items() if k not in ("attempt_token", "lease_owner")}
+    out = {k: _iso(v) for k, v in row.items()
+           if k not in ("attempt_token", "lease_owner", "connection_id", "file_connection")}
+    # The bot's id, wherever the row holds it.
+    out["connection"] = row.get("connection_id") or row.get("file_connection")
     out["stopping"] = bool(row.get("stop_requested")) and row.get("state") != "stopped"
     return out
 
@@ -1392,7 +1397,7 @@ def _plan_here(root: Path, expected_id: str | None) -> dict:
         if problem:
             skipped[cid] = problem["message"]
             continue
-        state = _state_dir() / cid
+        state = _connection_state_dir(_state_dir(), cid)
         state.mkdir(parents=True, exist_ok=True)
         prints = "|".join(str(v) for v in (cfg["token"], cfg["api_id"], cfg["api_hash"],
                                             cfg["deepgram"]))

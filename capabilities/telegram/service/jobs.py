@@ -59,6 +59,8 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from uuid import uuid4
 
+from capabilities_contract.db import Step
+
 
 # How `channel_key` spells a forum topic. The column is written by whoever
 # registers a job and read back by the daemon that has to find the channel
@@ -137,7 +139,7 @@ def job_label(description: Any) -> str:
 # always kept: a timestamp is TEXT holding an ISO instant and a flag is INTEGER,
 # so every comparison and every reader below sees the values it always saw.
 STORE_OWNER = "telegram"
-STORE_SCHEMA_MAJOR = 2
+STORE_SCHEMA_MAJOR = 3
 STORE_SCHEMA_MINOR = 0
 STORE_STEPS = (
     ("0001-jobs", """
@@ -504,6 +506,74 @@ STORE_STEPS = (
     COMMENT ON COLUMN telegram_channels.settings IS
         'The channel''s /set overrides, over the agent''s settings.';
     """),
+    # A connection is named by the id the store gave it, no longer by its name,
+    # which the core's step to 3.0 dropped after keeping each one in its map
+    # (`core_premig_connection_names`). A register row names its connection in
+    # one of two columns: `connection_id`, with a foreign key that removes the
+    # row with its connection, for a connection the store holds, and
+    # `file_connection` for one that only files hold (a files-mode project, or
+    # a machine's own connection lent to a store-mode project), whose register
+    # keeps working. Every case over the convenient case: the same shape as a
+    # node's `coolify_connection_id` / `coolify_address`. The key takes
+    # whichever is set where the name was. A role's grant of another account
+    # in the service settings
+    # (`authority.roles.<role>.allowed_capabilities.<cap>.connections.<conn>`)
+    # takes the id of `<cap>`'s connection `<conn>` (`*` is telegram's own); a
+    # row whose segment names no connection is kept in this step's pre-image
+    # and removed. The column a release of major 2 reads is gone, so this is
+    # major 3.
+    Step("0009-connection-ids", r"""
+    ALTER TABLE telegram_channels ADD COLUMN connection_id text,
+        ADD COLUMN file_connection text;
+    UPDATE telegram_channels c SET connection_id = coalesce(
+        (SELECT m.id FROM core_premig_connection_names m
+          WHERE m.capability = 'telegram' AND m.name = c.connection),
+        (SELECT k.id FROM connections k
+          WHERE k.capability = 'telegram' AND k.id = c.connection));
+    UPDATE telegram_channels SET file_connection = connection WHERE connection_id IS NULL;
+    ALTER TABLE telegram_channels DROP CONSTRAINT telegram_channels_pkey;
+    ALTER TABLE telegram_channels DROP COLUMN connection;
+    ALTER TABLE telegram_channels
+        ADD CONSTRAINT telegram_channels_connection_id_fkey
+            FOREIGN KEY (connection_id) REFERENCES connections (id) ON DELETE CASCADE,
+        ADD CONSTRAINT telegram_channels_file_connection_check
+            CHECK (file_connection <> ''),
+        ADD CONSTRAINT telegram_channels_connection_check
+            CHECK (num_nonnulls(connection_id, file_connection) = 1);
+    CREATE UNIQUE INDEX telegram_channels_key
+        ON telegram_channels (agent_id, (coalesce(connection_id, file_connection)), channel_key);
+    COMMENT ON COLUMN telegram_channels.connection_id IS
+        'The id of the Telegram connection the service runs on, where the store holds it; message ids are numbered by its account.';
+    COMMENT ON COLUMN telegram_channels.file_connection IS
+        'The id of the Telegram connection the service runs on, where only files hold it; exactly one of connection_id and file_connection is set.';
+
+    CREATE TABLE telegram_premig_m4_settings AS SELECT * FROM settings WITH NO DATA;
+    COMMENT ON TABLE telegram_premig_m4_settings IS
+        'Telegram settings rows whose authority grant named no connection at the 2026-11 id cutover, removed from settings by step 0009-connection-ids; never written again.';
+    WITH granted AS (
+        SELECT t.ctid AS at, coalesce(
+            (SELECT m.id FROM core_premig_connection_names m
+              WHERE m.capability = g.cap AND m.name = t.path[7]),
+            (SELECT k.id FROM connections k WHERE k.capability = g.cap AND k.id = t.path[7]),
+            (SELECT k.id FROM connections k WHERE k.capability = g.cap AND k.label = t.path[7])
+        ) AS cid
+          FROM settings t
+         CROSS JOIN LATERAL (SELECT CASE t.path[5] WHEN '*' THEN 'telegram'
+                                    ELSE t.path[5] END AS cap) g
+         WHERE t.capability = 'telegram' AND cardinality(t.path) >= 7
+           AND t.path[1] = 'authority' AND t.path[2] = 'roles'
+           AND t.path[4] = 'allowed_capabilities' AND t.path[6] = 'connections'),
+    kept AS (
+        INSERT INTO telegram_premig_m4_settings
+        SELECT s.* FROM settings s JOIN granted ON s.ctid = granted.at
+         WHERE granted.cid IS NULL),
+    gone AS (
+        DELETE FROM settings s USING granted WHERE s.ctid = granted.at AND granted.cid IS NULL)
+    UPDATE settings s
+       SET path = s.path[1:6] || granted.cid || s.path[8:cardinality(s.path)],
+           connection_id = granted.cid
+      FROM granted WHERE s.ctid = granted.at AND granted.cid IS NOT NULL;
+    """, core=(3, 0)),
 )
 
 # The harness runner's profile table lives in the same store, under the

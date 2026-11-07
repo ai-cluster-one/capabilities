@@ -878,6 +878,8 @@ def test_a_connection_held_in_the_store_is_bound_in_this_projects_settings(cli, 
     records.set("agentrooms", "connection", "alpha", {
         "homeserver": HS, "user_id": f"@alpha:{SERVER}", "secret_env": "AGENTROOMS_ALPHA_TOKEN"})
     records.set("agentrooms", "grant", "alpha", {"enabled": True, "allow_write": True})
+    # The store keys the connection by the id it gave it; `alpha` is its label.
+    cid = records.connection_id("agentrooms", "alpha")
     doc = tmp_path / "lab.md"
     doc.write_text(ROLE)
     code, _out, err = run(cli, capsys, "workers", "save", "lab", str(doc))
@@ -886,30 +888,59 @@ def test_a_connection_held_in_the_store_is_bound_in_this_projects_settings(cli, 
     assert code == 0 and out["worker"] == "lab", err
     # An earlier release kept the supervisor in this project's binding setting:
     # it holds, and moves onto the connection at the next binding write.
-    records.set("agentrooms", "setting", "binding.alpha",
+    records.set("agentrooms", "setting", f"binding.{cid}",
                 {"worker": "lab", "supervisor": "@old:example.org"}, scope="project")
     code, out, _err = run(cli, capsys, "workers", "supervisor")
     assert out["supervisor"] == "@old:example.org"
     code, out, err = run(cli, capsys, "workers", "bind", "lab")
     assert code == 0, err
     cli._RECORDS = None
-    spec = cli._records().resolve("agentrooms", "connection")["alpha"]["value"]
+    spec = cli._records().resolve("agentrooms", "connection")[cid]["value"]
     assert "worker" not in spec and spec["supervisor"] == "@old:example.org"
     code, out, _err = run(cli, capsys, "workers", "supervisor", "@boss:example.org")
     assert out["supervisor"] == "@boss:example.org"
     settings = json.loads((project / "capabilities" / "agentrooms" / "service"
                            / "settings.json").read_text())
-    assert settings["binding.alpha"] == {"worker": "lab"}
+    assert settings[f"binding.{cid}"] == {"worker": "lab"}
     cli._RECORDS = None
-    spec = cli._records().resolve("agentrooms", "connection")["alpha"]["value"]
+    spec = cli._records().resolve("agentrooms", "connection")[cid]["value"]
     assert "worker" not in spec and spec["supervisor"] == "@boss:example.org"
     code, out, _err = run(cli, capsys, "workers", "list")
-    assert out["bindings"]["alpha"]["worker"] == "lab"
+    assert out["bindings"][cid]["worker"] == "lab"
     code, out, _err = run(cli, capsys, "workers", "unbind")
     assert code == 0 and out["worker"] is None
     code, out, _err = run(cli, capsys, "workers", "list")
-    assert out["bindings"]["alpha"]["worker"] is None
-    assert out["bindings"]["alpha"]["supervisor"] == "@boss:example.org"
+    assert out["bindings"][cid]["worker"] is None
+    assert out["bindings"][cid]["supervisor"] == "@boss:example.org"
+
+
+@needs_store
+def test_a_binding_kept_under_the_connections_label_is_read_and_moved_to_its_id(
+        cli, project, stored, capsys, tmp_path):
+    # A settings file is not reached by the store's step to connection ids, so
+    # a binding an earlier release wrote there names the connection by the word
+    # it was called by; it is read for the connection and moved under its id.
+    identity = project / "capabilities" / "project.json"
+    identity.write_text(json.dumps({"slug": "project", "connections": "store"}))
+    (project / ".env.local").write_text(f"AGENTROOMS_ALPHA_TOKEN={TOKEN}\n")
+    records = cli._records()
+    records.set("agentrooms", "connection", "alpha", {
+        "homeserver": HS, "user_id": f"@alpha:{SERVER}", "secret_env": "AGENTROOMS_ALPHA_TOKEN"})
+    records.set("agentrooms", "grant", "alpha", {"enabled": True, "allow_write": True})
+    cid = records.connection_id("agentrooms", "alpha")
+    doc = tmp_path / "lab.md"
+    doc.write_text(ROLE)
+    code, _out, err = run(cli, capsys, "workers", "save", "lab", str(doc))
+    assert code == 0, err
+    records.set("agentrooms", "setting", "binding.alpha", {"worker": "lab"}, scope="project")
+    code, out, _err = run(cli, capsys, "workers", "list")
+    assert out["bindings"][cid]["worker"] == "lab"
+    code, out, err = run(cli, capsys, "workers", "defaults", "--opened", "on")
+    assert code == 0 and out["opened"] is True, err
+    settings = json.loads((project / "capabilities" / "agentrooms" / "service"
+                           / "settings.json").read_text())
+    assert settings[f"binding.{cid}"] == {"worker": "lab", "opened": True}
+    assert "binding.alpha" not in settings
 
 
 @needs_store
@@ -924,23 +955,26 @@ def test_register_completes_a_declared_connection_and_defaults_only_to_a_granted
         "homeserver": HS, "user_id": f"@beta:{SERVER}", "secret_env": "AGENTROOMS_BETA_TOKEN",
         "supervisor": f"@boss:{SERVER}"})
     records.set("agentrooms", "grant", "Beta", {"enabled": True})
+    # The store keys the connection by the id it gave it; `Beta` is its label.
+    beta = records.connection_id("agentrooms", "Beta")
     # A second id on Beta's token variable is refused before the network.
     code, _out, err = run(cli, capsys, "register", "beta", "--default")
     assert code == 6 and err["error"]["code"] == "connection_exists", err
     assert "--as Beta" in err["error"]["hint"] and not homeserver.requests
     code, out, err = run(cli, capsys, "register", "beta", "--as", "Beta", "--default")
     assert code == 0, err
-    assert out["connection"] == "Beta" and out["default"] is True and "default_unset" not in out
+    assert out["connection"] == beta and out["label"] == "Beta"
+    assert out["default"] is True and "default_unset" not in out
     assert out["secret_env"] == "AGENTROOMS_BETA_TOKEN" and out["supervisor"] == f"@boss:{SERVER}"
     assert f"AGENTROOMS_BETA_TOKEN='{TOKEN}'" in (project / ".env.local").read_text()
     cli._RECORDS = None
     held = cli._records().resolve("agentrooms", "connection")
-    assert set(held) == {"Beta"}
-    assert held["Beta"]["value"] == {"homeserver": HS, "user_id": f"@beta:{SERVER}",
+    assert set(held) == {beta}
+    assert held[beta]["value"] == {"homeserver": HS, "user_id": f"@beta:{SERVER}",
                                      "secret_env": "AGENTROOMS_BETA_TOKEN", "device_id": "DEV1",
                                      "supervisor": f"@boss:{SERVER}"}
     code, out, err = run(cli, capsys, "connections")
-    assert code == 0 and out["default"] == "Beta", err
+    assert code == 0 and out["default"] == beta, err
     # Now that it has its account it is not registered again.
     code, _out, err = run(cli, capsys, "register", "beta", "--as", "Beta")
     assert code == 6 and err["error"]["code"] == "connection_exists"
@@ -948,7 +982,7 @@ def test_register_completes_a_declared_connection_and_defaults_only_to_a_granted
     code, out, err = run(cli, capsys, "register", "gamma", "--homeserver", HS, "--default")
     assert code == 0 and out["default"] is False and "not granted" in out["default_unset"], err
     code, out, err = run(cli, capsys, "connections")
-    assert code == 0 and out["default"] == "Beta", err
+    assert code == 0 and out["default"] == beta, err
 
 
 # ── a person's connection, the stream, owners, sessions ──────────────────────
@@ -1501,8 +1535,9 @@ def test_watch_no_held_follows_matrix_holding_no_store_connection(cli, project, 
     homeserver.syncs += [{"next_batch": "b0"}, count_backends, cli._WatchStopped()]
     code, lines, err = run_stream(cli, capsys, "--connection", "alpha", "watch", "--no-held")
     assert code == 0, err
-    assert lines == [{"event": "ready", "connection": "alpha", "user_id": f"@alpha:{SERVER}",
-                      "rooms": None, "held": False}]
+    # The store keys the connection by the id it gave it, which `connection` carries.
+    assert lines == [{"event": "ready", "connection": records.connection_id("agentrooms", "alpha"),
+                      "user_id": f"@alpha:{SERVER}", "rooms": None, "held": False}]
     assert held_open == [0]
 
 

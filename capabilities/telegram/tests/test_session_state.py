@@ -209,5 +209,49 @@ class MachineLocalSessionTests(unittest.TestCase):
         self.assertEqual((code, error["code"]), (5, "network_error"))
 
 
+class FormerNameSessionTests(unittest.TestCase):
+    """A session signed in before connections were given ids lies under the
+    connection's former name; the connection, named by its id now, finds it
+    there and moves it under the id once, so no new sign-in is needed."""
+
+    CID = "a1b2c3d4e5f6"
+
+    def setUp(self):
+        self.cli = import_cli()
+        self.addCleanup(restore_modules, self.cli)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.state = self.tmp / "state" / "telegram"
+        conns = {self.CID: {"expected_account_id": 1001}}
+        reg = {"default": self.CID, "connections": conns,
+               "sources": {self.CID: str(self.tmp / "connections.json")}}
+        keys = {"TELEGRAM_API_ID": "12345", "TELEGRAM_API_HASH": "hash"}
+        for target, value in (("_connections_registry", lambda: (reg, None)),
+                              ("_state_dir", lambda: self.state),
+                              ("_STATE_HOME", self.tmp / "state"),
+                              ("_resolve_env_key", lambda key: (keys.get(key), None, None))):
+            patcher = mock.patch.object(self.cli, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(self.cli, "_connection_former_name",
+                                    lambda cid: "personal" if cid == self.CID else None,
+                                    create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_session_made_under_the_former_name_is_found_and_moved(self):
+        write_session(self.state / "personal" / "session", signed_in_as=1001)
+        err = __import__("io").StringIO()
+        with __import__("contextlib").redirect_stderr(err):
+            session = self.cli._load_config(self.CID, None)["session"]
+        self.assertEqual(session, str(self.state / self.CID / "session"))
+        self.assertTrue((self.state / self.CID / "session.session").is_file())
+        self.assertFalse((self.state / "personal").exists())
+        self.assertIn("personal", err.getvalue())
+        self.assertEqual(self.cli._connections_report()["connections"][self.CID]["session"],
+                         {"live": True, "account": "1001"})
+
+
+
 if __name__ == "__main__":
     unittest.main()

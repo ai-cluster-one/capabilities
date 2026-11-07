@@ -52,8 +52,10 @@ from pathlib import Path
 from string import Template
 from typing import Any, Callable
 
+from capabilities_contract.db import Step
+
 LEDGER_OWNER = "agentrooms"
-LEDGER_MAJOR = 2
+LEDGER_MAJOR = 3
 LEDGER_MINOR = 0
 LEDGER_STEPS = [
     ("0001-sync", """
@@ -312,6 +314,144 @@ LEDGER_STEPS = [
         RETURN NULL;
     END $$;
     """),
+    # 3.0 names each agent's rows by its connection's id, no longer by the
+    # connection's name, which the core's step to 3.0 dropped after keeping each
+    # one in its map (`core_premig_connection_names`). In place of `agent`, a
+    # row names the connection in one of two columns: `connection_id`, with a
+    # foreign key that removes the row with its connection, for a connection
+    # the store holds, and `file_connection` for one that only files hold (a
+    # project whose connections are kept in files while its state is in the
+    # store, or a machine's own connection lent to a store-mode project), whose
+    # rows keep working. Every case over the convenient case: the same shape as
+    # a node's `coolify_connection_id` / `coolify_address`. A value the map
+    # names as a former name, or that is an agentrooms connection's id or
+    # label, takes that connection's id in `connection_id`; any other value is
+    # kept, unchanged, in `file_connection`, so no row is removed. Each key and
+    # index takes whichever is set where `agent` was, a primary key becoming a
+    # unique index. The binding settings (`binding.<connection>...`) take the
+    # id in that segment, and one naming no connection is kept in
+    # `agentrooms_premig_m4_settings` and removed. The held notification still
+    # says agent, and it and the change version's scope carry whichever is set.
+    # A release of major 2 reads the column that is gone, so this is major 3:
+    # a store whose agentrooms tables are at 2 crosses only in the store
+    # upgrade, and, as with 0012, the step is not marked major, so a project
+    # taking agentrooms up on a store that already holds other tables makes
+    # them at 3.0 at once.
+    Step("0013-connection-ids", r"""
+    ALTER TABLE agentrooms_sync ADD COLUMN connection_id text, ADD COLUMN file_connection text;
+    ALTER TABLE agentrooms_wakes ADD COLUMN connection_id text, ADD COLUMN file_connection text;
+    ALTER TABLE agentrooms_sessions ADD COLUMN connection_id text, ADD COLUMN file_connection text;
+    ALTER TABLE agentrooms_leases ADD COLUMN connection_id text, ADD COLUMN file_connection text;
+    ALTER TABLE agentrooms_turns ADD COLUMN connection_id text, ADD COLUMN file_connection text;
+
+    CREATE OR REPLACE FUNCTION agentrooms_wakes_held_notify() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        changed record;
+    BEGIN
+        IF tg_op = 'INSERT' AND new.held_at IS NULL
+           OR tg_op = 'DELETE' AND old.held_at IS NULL
+           OR tg_op = 'UPDATE' AND old.held_at IS NOT DISTINCT FROM new.held_at THEN
+            RETURN NULL;
+        END IF;
+        IF tg_op = 'DELETE' THEN changed := old; ELSE changed := new; END IF;
+        PERFORM pg_notify('agentrooms_held', json_build_object(
+            'schema', tg_table_schema, 'agent_id', changed.agent_id,
+            'agent', coalesce(changed.connection_id, changed.file_connection),
+            'room', changed.room_id)::text);
+        EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                       'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                       'DO UPDATE SET version = c.version + 1',
+                       tg_table_schema, 'agentrooms_held')
+            USING changed.agent_id || '/' || coalesce(changed.connection_id, changed.file_connection);
+        RETURN NULL;
+    END $$;
+
+    -- The held notification fires as each row changes here, so the table
+    -- holds no pending trigger event when its column is dropped below.
+    SET CONSTRAINTS agentrooms_wakes_held_notify IMMEDIATE;
+
+    CREATE TABLE agentrooms_premig_m4_settings AS SELECT * FROM settings WITH NO DATA;
+    COMMENT ON TABLE agentrooms_premig_m4_settings IS
+        'agentrooms binding settings (binding.<connection>...) whose segment named no agentrooms connection at the 2026-11 id cutover, removed from settings by step 0013-connection-ids; never written again.';
+
+    DO $convert$
+    DECLARE
+        words text := 'SELECT c.id AS word, c.id, 2 AS rank FROM connections c '
+                      'WHERE c.capability = ''agentrooms'' '
+                      'UNION ALL SELECT c.label, c.id, 3 FROM connections c '
+                      'WHERE c.capability = ''agentrooms''';
+        one text;
+    BEGIN
+        IF to_regclass('core_premig_connection_names') IS NOT NULL THEN
+            words := 'SELECT m.name AS word, m.id, 1 AS rank FROM core_premig_connection_names m '
+                     'JOIN connections c ON c.id = m.id WHERE m.capability = ''agentrooms'' '
+                     'UNION ALL ' || words;
+        END IF;
+        words := 'SELECT DISTINCT ON (word) word, id FROM (' || words || ') w '
+                 'ORDER BY word, rank';
+        FOREACH one IN ARRAY ARRAY['agentrooms_sync', 'agentrooms_wakes', 'agentrooms_sessions',
+                                   'agentrooms_leases', 'agentrooms_turns'] LOOP
+            EXECUTE format('UPDATE %I r SET connection_id = w.id FROM (%s) w '
+                           'WHERE w.word = r.agent', one, words);
+            EXECUTE format('UPDATE %I SET file_connection = agent WHERE connection_id IS NULL',
+                           one);
+        END LOOP;
+        EXECUTE format('INSERT INTO agentrooms_premig_m4_settings SELECT s.* FROM settings s '
+                       'WHERE s.capability = ''agentrooms'' AND s.path[1] LIKE ''binding.%%'' '
+                       'AND NOT EXISTS (SELECT 1 FROM (%s) w '
+                       'WHERE ''binding.'' || w.word = s.path[1])', words);
+        DELETE FROM settings s USING agentrooms_premig_m4_settings p
+         WHERE s.capability = p.capability AND s.path = p.path
+           AND s.agent_id IS NOT DISTINCT FROM p.agent_id AND s.node IS NOT DISTINCT FROM p.node;
+        EXECUTE format('UPDATE settings s SET path = (''binding.'' || w.id) '
+                       '|| s.path[2:cardinality(s.path)], connection_id = w.id FROM (%s) w '
+                       'WHERE s.capability = ''agentrooms'' '
+                       'AND ''binding.'' || w.word = s.path[1]', words);
+    END
+    $convert$;
+
+    SET CONSTRAINTS agentrooms_wakes_held_notify DEFERRED;
+
+    -- Dropping `agent` drops the primary keys and indexes it was in; each is
+    -- made again below on whichever column is set.
+    DO $keys$
+    DECLARE
+        one text;
+    BEGIN
+        FOREACH one IN ARRAY ARRAY['agentrooms_sync', 'agentrooms_wakes', 'agentrooms_sessions',
+                                   'agentrooms_leases', 'agentrooms_turns'] LOOP
+            EXECUTE format('ALTER TABLE %I DROP COLUMN agent, '
+                           'ADD CONSTRAINT %I FOREIGN KEY (connection_id) '
+                           'REFERENCES connections (id) ON DELETE CASCADE, '
+                           'ADD CONSTRAINT %I CHECK (file_connection <> %L), '
+                           'ADD CONSTRAINT %I CHECK (num_nonnulls(connection_id, file_connection) = 1)',
+                           one, one || '_connection_id_fkey', one || '_file_connection_check', '',
+                           one || '_connection_check');
+            EXECUTE format('COMMENT ON COLUMN %I.connection_id IS %L', one,
+                           'The id of the agent''s agentrooms connection, where the store holds '
+                           'it; the row goes with it.');
+            EXECUTE format('COMMENT ON COLUMN %I.file_connection IS %L', one,
+                           'The id of the agent''s agentrooms connection, where only files hold '
+                           'it; exactly one of connection_id and file_connection is set.');
+        END LOOP;
+    END
+    $keys$;
+    CREATE UNIQUE INDEX agentrooms_sync_key ON agentrooms_sync
+        (agent_id, (coalesce(connection_id, file_connection)));
+    CREATE UNIQUE INDEX agentrooms_wakes_key ON agentrooms_wakes
+        (agent_id, (coalesce(connection_id, file_connection)), room_id, wake_key);
+    CREATE INDEX agentrooms_wakes_held_idx ON agentrooms_wakes
+        (agent_id, (coalesce(connection_id, file_connection)), room_id)
+        WHERE held_at IS NOT NULL;
+    CREATE UNIQUE INDEX agentrooms_sessions_key ON agentrooms_sessions
+        (agent_id, (coalesce(connection_id, file_connection)), room_id);
+    CREATE UNIQUE INDEX agentrooms_leases_key ON agentrooms_leases
+        (agent_id, (coalesce(connection_id, file_connection)));
+    CREATE INDEX agentrooms_turns_agent_idx ON agentrooms_turns
+        (agent_id, (coalesce(connection_id, file_connection)), started_at);
+    CREATE INDEX agentrooms_turns_room_idx ON agentrooms_turns
+        (agent_id, (coalesce(connection_id, file_connection)), room_id, started_at);
+    """, core=(3, 0)),
 ]
 # The channel a change to an agent's held wakes is announced on: its version
 # for the agent's held_scope in the store's change versions, which `watch`
@@ -323,6 +463,22 @@ HELD_CHANNEL = "agentrooms_held"
 def held_scope(project: str, agent: str) -> str:
     """The scope of an agent's version of HELD_CHANNEL, as the trigger names it."""
     return f"{project}/{agent}"
+
+
+# A row names its agent's connection by id in `connection_id` where the store
+# holds that connection, else in `file_connection` (one only files hold); every
+# key and every read takes whichever is set. A write gives the id three times:
+# `_HELD` asks the store whether it holds it, and `file_connection` keeps it
+# only where the store does not.
+CONNECTION = "coalesce(connection_id, file_connection)"
+_HELD = ("(SELECT k.id FROM connections k WHERE k.id = %s"
+         " AND k.capability = 'agentrooms')")
+CONNECTION_VALUES = f"{_HELD}, nullif(%s, {_HELD})"
+
+
+def connection_values(cid: str) -> tuple:
+    """The parameters `CONNECTION_VALUES` takes for connection `cid`."""
+    return (cid, cid, cid)
 
 # How long a lease outlives its last renewal, and how often it is renewed. A
 # process that dies leaves its agents to another process once this runs out.
@@ -834,33 +990,38 @@ class Store:
         """Take or keep the agent's lease. None when it is ours now; else who
         holds it and until when."""
         row = self.execute(
-            """
-            INSERT INTO agentrooms_leases (agent_id, agent, holder, node, pid, acquired_at, expires_at)
-            VALUES (%s, %s, %s, %s, %s, now(), now() + make_interval(secs => %s))
-            ON CONFLICT (agent_id, agent) DO UPDATE
-               SET holder = EXCLUDED.holder, node = EXCLUDED.node, pid = EXCLUDED.pid,
+            f"""
+            INSERT INTO agentrooms_leases (agent_id, connection_id, file_connection, holder, node,
+                                           pid, acquired_at, expires_at)
+            VALUES (%s, {CONNECTION_VALUES}, %s, %s, %s, now(),
+                    now() + make_interval(secs => %s))
+            ON CONFLICT (agent_id, ({CONNECTION})) DO UPDATE
+               SET connection_id = EXCLUDED.connection_id,
+                   file_connection = EXCLUDED.file_connection,
+                   holder = EXCLUDED.holder, node = EXCLUDED.node, pid = EXCLUDED.pid,
                    acquired_at = CASE WHEN agentrooms_leases.holder = EXCLUDED.holder
                                       THEN agentrooms_leases.acquired_at ELSE now() END,
                    expires_at = EXCLUDED.expires_at
              WHERE agentrooms_leases.expires_at < now() OR agentrooms_leases.holder = EXCLUDED.holder
             RETURNING holder
-            """, (project, agent, holder, node, pid, LEASE_SECONDS), fetch="one")
+            """, (project, *connection_values(agent), holder, node, pid, LEASE_SECONDS),
+            fetch="one")
         if row is not None:
             return None
         found = self.execute(
             "SELECT holder, node, pid, expires_at FROM agentrooms_leases "
-            "WHERE agent_id = %s AND agent = %s", (project, agent), fetch="one")
+            f"WHERE agent_id = %s AND {CONNECTION} = %s", (project, agent), fetch="one")
         if found is None:
             return {"holder": "unknown"}
         return {"holder": found[0], "node": found[1], "pid": found[2],
                 "expires_at": found[3].isoformat() if found[3] else None}
 
     def release(self, project: str, agent: str, holder: str) -> None:
-        self.execute("DELETE FROM agentrooms_leases WHERE agent_id = %s AND agent = %s "
+        self.execute(f"DELETE FROM agentrooms_leases WHERE agent_id = %s AND {CONNECTION} = %s "
                      "AND holder = %s", (project, agent, holder))
 
     def holds(self, cur, project: str, agent: str, holder: str) -> bool:
-        cur.execute("SELECT 1 FROM agentrooms_leases WHERE agent_id = %s AND agent = %s "
+        cur.execute(f"SELECT 1 FROM agentrooms_leases WHERE agent_id = %s AND {CONNECTION} = %s "
                     "AND holder = %s AND expires_at > now() FOR UPDATE",
                     (project, agent, holder))
         return cur.fetchone() is not None
@@ -871,7 +1032,7 @@ class Store:
         """The sync position, or None for an agent seen first or now under
         another identity."""
         row = self.execute("SELECT user_id, next_batch FROM agentrooms_sync "
-                           "WHERE agent_id = %s AND agent = %s", (project, agent), fetch="one")
+                           f"WHERE agent_id = %s AND {CONNECTION} = %s", (project, agent), fetch="one")
         if row is None or row[0] != user_id:
             return None
         return row[1]
@@ -892,46 +1053,51 @@ class Store:
                 return False
             if unserved:
                 cur.execute(
-                    "DELETE FROM agentrooms_wakes WHERE agent_id = %s AND agent = %s "
+                    f"DELETE FROM agentrooms_wakes WHERE agent_id = %s AND {CONNECTION} = %s "
                     "AND room_id = ANY(%s) AND claimed_by IS NULL AND held_at IS NULL",
                     (project, agent, sorted(unserved)))
             for wake in wakes:
                 cur.execute(
-                    "INSERT INTO agentrooms_wakes (agent_id, agent, room_id, wake_key, kind, "
-                    "event_id, sender, held_at) VALUES (%s, %s, %s, %s, %s, %s, %s, "
-                    "CASE WHEN %s THEN now() END) ON CONFLICT DO NOTHING",
-                    (project, agent, wake["room_id"], wake["key"], wake["kind"],
+                    "INSERT INTO agentrooms_wakes (agent_id, connection_id, file_connection, "
+                    "room_id, wake_key, kind, event_id, sender, held_at) "
+                    f"VALUES (%s, {CONNECTION_VALUES}, %s, %s, %s, %s, %s, "
+                    "CASE WHEN %s THEN now() END) "
+                    f"ON CONFLICT (agent_id, ({CONNECTION}), room_id, wake_key) DO NOTHING",
+                    (project, *connection_values(agent), wake["room_id"], wake["key"], wake["kind"],
                      wake.get("event_id"), wake.get("sender"), bool(wake.get("held"))))
             for room_id, grant in (grants or {}).items():
                 everyone = grant is None or grant["everyone"]
                 cur.execute(
                     "UPDATE agentrooms_wakes SET held_at = NULL WHERE agent_id = %s "
-                    "AND agent = %s AND room_id = %s AND held_at IS NOT NULL "
+                    f"AND {CONNECTION} = %s AND room_id = %s AND held_at IS NOT NULL "
                     "AND (%s OR sender = ANY(%s))",
                     (project, agent, room_id, everyone, [] if everyone else grant["users"]))
             cur.execute(
-                "INSERT INTO agentrooms_sync (agent_id, agent, user_id, next_batch, updated_at) "
-                "VALUES (%s, %s, %s, %s, now()) ON CONFLICT (agent_id, agent) DO UPDATE "
-                "SET user_id = EXCLUDED.user_id, next_batch = EXCLUDED.next_batch, "
-                "updated_at = now()", (project, agent, user_id, next_batch))
+                "INSERT INTO agentrooms_sync (agent_id, connection_id, file_connection, user_id, "
+                f"next_batch, updated_at) VALUES (%s, {CONNECTION_VALUES}, %s, %s, now()) "
+                f"ON CONFLICT (agent_id, ({CONNECTION})) DO UPDATE "
+                "SET connection_id = EXCLUDED.connection_id, "
+                "file_connection = EXCLUDED.file_connection, user_id = EXCLUDED.user_id, "
+                "next_batch = EXCLUDED.next_batch, updated_at = now()",
+                (project, *connection_values(agent), user_id, next_batch))
         return True
 
     def unclaim(self, project: str, agent: str) -> int:
         """Hand back what a process that held the agent before claimed and never
         finished; called by the new holder, which alone may claim."""
         return self.execute("UPDATE agentrooms_wakes SET claimed_by = NULL WHERE agent_id = %s "
-                            "AND agent = %s AND claimed_by IS NOT NULL", (project, agent))
+                            f"AND {CONNECTION} = %s AND claimed_by IS NOT NULL", (project, agent))
 
     def ready(self, project: str) -> list[tuple[str, str, Any]]:
         return [tuple(r) for r in self.execute(
-            "SELECT agent, room_id, min(received_at) FROM agentrooms_wakes "
+            f"SELECT {CONNECTION}, room_id, min(received_at) FROM agentrooms_wakes "
             "WHERE agent_id = %s AND claimed_by IS NULL AND held_at IS NULL "
-            "GROUP BY agent, room_id "
+            f"GROUP BY {CONNECTION}, room_id "
             "ORDER BY 3", (project,), fetch="all")]
 
     def claim(self, project: str, agent: str, room_id: str, turn: str) -> list[dict]:
         rows = self.execute(
-            "UPDATE agentrooms_wakes SET claimed_by = %s WHERE agent_id = %s AND agent = %s "
+            f"UPDATE agentrooms_wakes SET claimed_by = %s WHERE agent_id = %s AND {CONNECTION} = %s "
             "AND room_id = %s AND claimed_by IS NULL AND held_at IS NULL "
             "RETURNING wake_key, kind, event_id, sender, received_at",
             (turn, project, agent, room_id), fetch="all")
@@ -940,7 +1106,7 @@ class Store:
         return sorted(out, key=lambda w: w["received_at"])
 
     def finish(self, project: str, agent: str, room_id: str, turn: str) -> None:
-        self.execute("DELETE FROM agentrooms_wakes WHERE agent_id = %s AND agent = %s "
+        self.execute(f"DELETE FROM agentrooms_wakes WHERE agent_id = %s AND {CONNECTION} = %s "
                      "AND room_id = %s AND claimed_by = %s", (project, agent, room_id, turn))
 
     def restore(self, project: str, agent: str, room_id: str, turn: str,
@@ -949,11 +1115,11 @@ class Store:
         ones `keys` names."""
         if keys is None:
             self.execute("UPDATE agentrooms_wakes SET claimed_by = NULL WHERE agent_id = %s "
-                         "AND agent = %s AND room_id = %s AND claimed_by = %s",
+                         f"AND {CONNECTION} = %s AND room_id = %s AND claimed_by = %s",
                          (project, agent, room_id, turn))
             return
         self.execute("UPDATE agentrooms_wakes SET claimed_by = NULL WHERE agent_id = %s "
-                     "AND agent = %s AND room_id = %s AND claimed_by = %s "
+                     f"AND {CONNECTION} = %s AND room_id = %s AND claimed_by = %s "
                      "AND wake_key = ANY(%s)", (project, agent, room_id, turn, list(keys)))
 
     # -- held wakes -----------------------------------------------------------
@@ -966,7 +1132,7 @@ class Store:
              sender: str | None = None) -> list[dict]:
         rows = self.execute(
             "SELECT room_id, kind, event_id, sender, received_at, held_at FROM agentrooms_wakes "
-            "WHERE agent_id = %s AND agent = %s AND held_at IS NOT NULL "
+            f"WHERE agent_id = %s AND {CONNECTION} = %s AND held_at IS NOT NULL "
             "AND (%s::text IS NULL OR room_id = %s) AND (%s::text IS NULL OR sender = %s) "
             "ORDER BY room_id, received_at",
             (project, agent, room_id, room_id, sender, sender), fetch="all")
@@ -978,7 +1144,7 @@ class Store:
         """Each room's held wakes as `rooms` reports them: {count, senders}."""
         rows = self.execute(
             "SELECT room_id, count(*), array_agg(DISTINCT sender) FROM agentrooms_wakes "
-            "WHERE agent_id = %s AND agent = %s AND held_at IS NOT NULL GROUP BY room_id",
+            f"WHERE agent_id = %s AND {CONNECTION} = %s AND held_at IS NOT NULL GROUP BY room_id",
             (project, agent), fetch="all")
         return {r[0]: {"count": int(r[1]), "senders": sorted(s for s in (r[2] or []) if s)}
                 for r in rows}
@@ -987,7 +1153,7 @@ class Store:
                     sender: str | None = None) -> list[dict]:
         """Release the room's held wakes, or one sender's, into a turn."""
         rows = self.execute(
-            "UPDATE agentrooms_wakes SET held_at = NULL WHERE agent_id = %s AND agent = %s "
+            f"UPDATE agentrooms_wakes SET held_at = NULL WHERE agent_id = %s AND {CONNECTION} = %s "
             "AND room_id = %s AND held_at IS NOT NULL AND (%s::text IS NULL OR sender = %s) "
             "RETURNING kind, event_id, sender", (project, agent, room_id, sender, sender),
             fetch="all")
@@ -996,7 +1162,7 @@ class Store:
     def dismiss_held(self, project: str, agent: str, room_id: str,
                      sender: str | None = None) -> list[dict]:
         rows = self.execute(
-            "DELETE FROM agentrooms_wakes WHERE agent_id = %s AND agent = %s "
+            f"DELETE FROM agentrooms_wakes WHERE agent_id = %s AND {CONNECTION} = %s "
             "AND room_id = %s AND held_at IS NOT NULL AND (%s::text IS NULL OR sender = %s) "
             "RETURNING kind, event_id, sender", (project, agent, room_id, sender, sender),
             fetch="all")
@@ -1008,7 +1174,7 @@ class Store:
         """The room-to-session map of `agent`, every room or the one named."""
         rows = self.execute(
             "SELECT room_id, harness, session_id, node, seen_ts, turns, updated_at "
-            "FROM agentrooms_sessions WHERE agent_id = %s AND agent = %s "
+            f"FROM agentrooms_sessions WHERE agent_id = %s AND {CONNECTION} = %s "
             "AND (%s::text IS NULL OR room_id = %s) ORDER BY room_id",
             (project, agent, room_id, room_id), fetch="all")
         return [{"room_id": r[0], "harness": r[1], "session_id": r[2], "node": r[3],
@@ -1018,7 +1184,7 @@ class Store:
     def session(self, project: str, agent: str, room_id: str) -> dict | None:
         row = self.execute(
             "SELECT harness, session_id, node, seen_ts, turns FROM agentrooms_sessions "
-            "WHERE agent_id = %s AND agent = %s AND room_id = %s",
+            f"WHERE agent_id = %s AND {CONNECTION} = %s AND room_id = %s",
             (project, agent, room_id), fetch="one")
         if row is None:
             return None
@@ -1028,19 +1194,21 @@ class Store:
     def save_session(self, project: str, agent: str, room_id: str, *, harness: str | None,
                      session_id: str | None, node: str, seen_ts: int | None) -> None:
         self.execute(
-            "INSERT INTO agentrooms_sessions (agent_id, agent, room_id, harness, session_id, "
-            "node, seen_ts, turns, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, 1, now()) "
-            "ON CONFLICT (agent_id, agent, room_id) DO UPDATE SET "
+            "INSERT INTO agentrooms_sessions (agent_id, connection_id, file_connection, room_id, "
+            "harness, session_id, node, seen_ts, turns, updated_at) "
+            f"VALUES (%s, {CONNECTION_VALUES}, %s, %s, %s, %s, %s, 1, now()) "
+            f"ON CONFLICT (agent_id, ({CONNECTION}), room_id) DO UPDATE SET "
+            "connection_id = EXCLUDED.connection_id, file_connection = EXCLUDED.file_connection, "
             "harness = EXCLUDED.harness, session_id = EXCLUDED.session_id, node = EXCLUDED.node, "
             "seen_ts = GREATEST(COALESCE(agentrooms_sessions.seen_ts, 0), "
             "COALESCE(EXCLUDED.seen_ts, 0)), turns = agentrooms_sessions.turns + 1, "
             "updated_at = now()",
-            (project, agent, room_id, harness, session_id, node, seen_ts))
+            (project, *connection_values(agent), room_id, harness, session_id, node, seen_ts))
 
     def counts(self, project: str) -> dict:
         rows = self.execute(
-            "SELECT agent, count(*), sum(turns) FROM agentrooms_sessions WHERE agent_id = %s "
-            "GROUP BY agent", (project,), fetch="all")
+            f"SELECT {CONNECTION}, count(*), sum(turns) FROM agentrooms_sessions "
+            f"WHERE agent_id = %s GROUP BY {CONNECTION}", (project,), fetch="all")
         return {r[0]: {"rooms": int(r[1]), "turns": int(r[2] or 0)} for r in rows}
 
     # -- pause ----------------------------------------------------------------
@@ -1152,10 +1320,12 @@ class Store:
 
     def start_turn(self, turn: str, project: str, agent: str, room_id: str, worker: str,
                    worker_id: str | None, senders: list[str], kinds: list[str]) -> None:
-        self.execute("INSERT INTO agentrooms_turns (id, agent_id, agent, room_id, worker, "
-                     "worker_id, senders, kinds) VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        self.execute("INSERT INTO agentrooms_turns (id, agent_id, connection_id, file_connection, "
+                     "room_id, worker, worker_id, senders, kinds) "
+                     f"VALUES (%s, %s, {CONNECTION_VALUES}, %s, %s, %s, %s, %s) "
                      "ON CONFLICT (id) DO NOTHING",
-                     (turn, project, agent, room_id, worker, worker_id, senders, kinds))
+                     (turn, project, *connection_values(agent), room_id, worker, worker_id,
+                      senders, kinds))
 
     def mark_turn(self, turn: str, seen_ts: int | None) -> None:
         """The newest message the turn's prompt carries: where `catch-up` starts."""
@@ -1163,7 +1333,7 @@ class Store:
                      "WHERE id = %s", (seen_ts or 0, turn))
 
     def running_turn(self, turn: str) -> dict | None:
-        row = self.execute("SELECT agent_id, agent, room_id, worker, worker_id, outcome, "
+        row = self.execute(f"SELECT agent_id, {CONNECTION}, room_id, worker, worker_id, outcome, "
                            "seen_ts FROM agentrooms_turns WHERE id = %s", (turn,), fetch="one")
         if row is None:
             return None
@@ -1180,14 +1350,14 @@ class Store:
         ids = [e["event_id"] for e in events if e.get("event_id")]
         newest = max([e.get("origin_server_ts") or 0 for e in events] or [0])
         with self.transaction() as cur:
-            cur.execute("SELECT agent_id, agent, room_id FROM agentrooms_turns "
+            cur.execute(f"SELECT agent_id, {CONNECTION}, room_id FROM agentrooms_turns "
                         "WHERE id = %s AND outcome IS NULL FOR UPDATE", (turn,))
             row = cur.fetchone()
             if row is None:
                 return None
             project, agent, room_id = row
             cur.execute("SELECT wake_key, kind, event_id, sender FROM agentrooms_wakes "
-                        "WHERE agent_id = %s AND agent = %s AND room_id = %s "
+                        f"WHERE agent_id = %s AND {CONNECTION} = %s AND room_id = %s "
                         "AND claimed_by IS NULL AND held_at IS NULL AND event_id = ANY(%s) "
                         "FOR UPDATE", (project, agent, room_id, ids))
             wakes = [{"key": r[0], "kind": r[1], "event_id": r[2], "sender": r[3]}
@@ -1195,7 +1365,7 @@ class Store:
             took = [w for w in wakes if admitted(w)]
             if took:
                 cur.execute("UPDATE agentrooms_wakes SET claimed_by = %s WHERE agent_id = %s "
-                            "AND agent = %s AND room_id = %s AND wake_key = ANY(%s)",
+                            f"AND {CONNECTION} = %s AND room_id = %s AND wake_key = ANY(%s)",
                             (turn, project, agent, room_id, [w["key"] for w in took]))
             cur.execute(
                 "UPDATE agentrooms_turns SET seen_ts = GREATEST(COALESCE(seen_ts, 0), %s), "
@@ -1216,7 +1386,7 @@ class Store:
         claimed for it are handed back and what it took is forgotten."""
         with self.transaction() as cur:
             cur.execute("UPDATE agentrooms_wakes SET claimed_by = NULL WHERE agent_id = %s "
-                        "AND agent = %s AND room_id = %s AND claimed_by = %s AND wake_key IN "
+                        f"AND {CONNECTION} = %s AND room_id = %s AND claimed_by = %s AND wake_key IN "
                         "(SELECT unnest(taken) FROM agentrooms_turns WHERE id = %s)",
                         (project, agent, room_id, turn, turn))
             cur.execute("UPDATE agentrooms_turns SET taken = '{}' WHERE id = %s", (turn,))
@@ -1234,7 +1404,7 @@ class Store:
                 "senders = ARRAY(SELECT DISTINCT unnest(senders || %s::text[])), "
                 "kinds = ARRAY(SELECT DISTINCT unnest(kinds || %s::text[])) "
                 "WHERE id = (SELECT id FROM agentrooms_turns WHERE agent_id = %s "
-                "AND agent = %s AND room_id = %s AND %s = ANY(taken) "
+                f"AND {CONNECTION} = %s AND room_id = %s AND %s = ANY(taken) "
                 "ORDER BY started_at DESC LIMIT 1) RETURNING id",
                 ([wake["sender"]] if wake.get("sender") else [], [wake["kind"]],
                  project, agent, room_id, wake["event_id"]), fetch="one")
@@ -1255,7 +1425,7 @@ class Store:
         """The turn of `agent` that posted `event_id`, with the session it ran in."""
         row = self.execute(
             "SELECT id, room_id, worker, harness, session_id, node, started_at, outcome "
-            "FROM agentrooms_turns WHERE agent_id = %s AND agent = %s AND event_id = %s "
+            f"FROM agentrooms_turns WHERE agent_id = %s AND {CONNECTION} = %s AND event_id = %s "
             "ORDER BY started_at DESC LIMIT 1", (project, agent, event_id), fetch="one")
         if row is None:
             return None
@@ -1270,19 +1440,19 @@ class Store:
         was last quiet for `quiet` seconds - at most `room_cap`, since that is all
         the room limit asks."""
         agent_n = self.execute(
-            "SELECT count(*) FROM agentrooms_turns WHERE agent_id = %s AND agent = %s "
+            f"SELECT count(*) FROM agentrooms_turns WHERE agent_id = %s AND {CONNECTION} = %s "
             f"AND {self.A_TURN} AND started_at > now() - make_interval(secs => %s)",
             (project, agent, window), fetch="one")[0]
         per_sender = {}
         for sender in senders:
             per_sender[sender] = self.execute(
-                "SELECT count(*) FROM agentrooms_turns WHERE agent_id = %s AND agent = %s "
+                f"SELECT count(*) FROM agentrooms_turns WHERE agent_id = %s AND {CONNECTION} = %s "
                 f"AND {self.A_TURN} AND %s = ANY(senders) "
                 "AND started_at > now() - make_interval(secs => %s)",
                 (project, agent, sender, window), fetch="one")[0]
         rows = self.execute(
             "SELECT extract(epoch FROM now() - started_at) FROM agentrooms_turns "
-            f"WHERE agent_id = %s AND agent = %s AND room_id = %s AND {self.A_TURN} "
+            f"WHERE agent_id = %s AND {CONNECTION} = %s AND room_id = %s AND {self.A_TURN} "
             "ORDER BY started_at DESC LIMIT %s",
             (project, agent, room_id, room_cap), fetch="all")
         room_n, since = 0, 0.0
@@ -1297,7 +1467,7 @@ class Store:
                 window: int) -> bool:
         """Whether the refusal answered `sender` in the room within the window."""
         return self.execute(
-            "SELECT 1 FROM agentrooms_turns WHERE agent_id = %s AND agent = %s "
+            f"SELECT 1 FROM agentrooms_turns WHERE agent_id = %s AND {CONNECTION} = %s "
             f"AND room_id = %s AND NOT {self.A_TURN} AND %s = ANY(senders) "
             "AND started_at > now() - make_interval(secs => %s) LIMIT 1",
             (project, agent, room_id, sender, window), fetch="one") is not None
@@ -1888,7 +2058,7 @@ class Agent:
         self.last_sync = now_iso()
         self.last_renew = time.monotonic()  # the transaction proved the lease is held
         store.execute("UPDATE agentrooms_leases SET expires_at = now() + make_interval(secs => %s) "
-                      "WHERE agent_id = %s AND agent = %s AND holder = %s",
+                      f"WHERE agent_id = %s AND {CONNECTION} = %s AND holder = %s",
                       (LEASE_SECONDS, self.slot.project_id, self.cid, self.engine.holder))
         if initial:
             self.log("first sync recorded; history before now wakes nothing")

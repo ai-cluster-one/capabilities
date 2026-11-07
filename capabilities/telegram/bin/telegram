@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.44,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -815,20 +815,25 @@ def _auth_connection_gate(connection_flag: str | None,
         return connection_flag, session_flag
     allowed = str(ctx.get("connection") or "").strip()
     crossing = False
-    if allowed and connection_flag and connection_flag != allowed:
+    # A connection is named by its id or by its label: the flag and each grant
+    # are resolved to the id before they are compared.
+    requested = _connection_word(connection_flag)
+    if allowed and connection_flag and requested != allowed:
         cross_commands = _CROSS_CONNECTION_READ_COMMANDS | WRITE_VERBS
         if command not in cross_commands:
             _die(4, "connection_scope_denied",
                  "telegram connection is fixed for this service request",
                  f"requested={connection_flag}; allowed={allowed}; "
                  "only Telegram data verbs reach another account")
-        grants = _granted_connections(ctx)
-        if connection_flag not in grants:
+        grants = {}
+        for named, write in _granted_connections(ctx).items():
+            grants[_connection_word(named)] = grants.get(_connection_word(named)) or write
+        if requested not in grants:
             _die(4, "connection_scope_denied",
                  f"this request does not reach the telegram connection {connection_flag!r}",
                  "name it under authority.roles.<role>.allowed_capabilities."
                  "telegram.connections in the service settings")
-        if command in WRITE_VERBS and not grants[connection_flag]:
+        if command in WRITE_VERBS and not grants[requested]:
             _die(4, "connection_write_denied",
                  f"this request may only read the telegram connection {connection_flag!r}",
                  "set allow_write: true on that connection in the sender role's "
@@ -846,6 +851,24 @@ def _auth_connection_gate(connection_flag: str | None,
 
 
 _contract_bind(globals(), "connections")
+
+
+def _connection_word(word: str | None) -> str | None:
+    """The id of the connection `word` names - its id, else its label - or
+    `word` itself where it names neither."""
+    if not word:
+        return word
+    return _labelled(str(word)) or word
+
+
+def _is_connection(recorded, cid: str) -> bool:
+    """Whether `recorded`, the connection a file on this machine records
+    (linked-by, owner, health), is connection `cid`: its id, or the name it
+    was kept under before connections were given ids."""
+    if not isinstance(recorded, str) or not recorded or not cid:
+        return False
+    return recorded == cid or recorded == _connection_former_name(cid)
+
 
 _contract_connection = _cmd_connection
 
@@ -961,13 +984,12 @@ def _holder_gone(held: dict) -> bool:
     try:
         adapter = _records()
         if held["owner"] is None:
-            return (held["connection"] not in adapter.resolve_scope(
-                        NAME, "connection", "global")
-                    and held["connection"] not in adapter.connections(
-                        NAME, include_disabled=True))
+            return not any(_is_connection(held["connection"], cid) for cid in (
+                *adapter.resolve_scope(NAME, "connection", "global"),
+                *adapter.connections(NAME, include_disabled=True)))
         if held["owner"] == adapter.project_id:
-            return held["connection"] not in adapter.connections(
-                NAME, include_disabled=True)
+            return not any(_is_connection(held["connection"], cid)
+                           for cid in adapter.connections(NAME, include_disabled=True))
         if held.get("store") and adapter.mode_of("connection") == "store":
             return adapter.connection_owner(NAME, held["connection"]) != held["owner"]
         return False
@@ -984,7 +1006,11 @@ def _record_linked_by(cid: str, account, *, adopt: bool = False) -> None:
     if key is None:
         return
     held = _linked_by(key)
-    if adopt and held is not None and not _holder_gone(held):
+    # A record naming this connection by its former name is the same
+    # holder, and takes its id now.
+    if (adopt and held is not None and not _holder_gone(held)
+            and not (held["connection"] != cid
+                     and _is_connection(held["connection"], cid))):
         return
     record = {"connection": cid, "owner": _connection_owner(cid)}
     if _connection_in_store(cid):
@@ -1009,7 +1035,7 @@ def _account_holder(account, cid: str, owner) -> tuple[str, dict] | None:
     held = _linked_by(key)
     if held is None:
         return None
-    if held["connection"] == cid:
+    if _is_connection(held["connection"], cid):
         if (owner() if callable(owner) else owner) == held["owner"]:
             return None
     if _holder_gone(held):
@@ -1072,9 +1098,23 @@ def _app_keys(cid: str | None, entry: dict | None) -> tuple[str | None, str]:
     entry = entry or {}
     literal_id, secret_env = entry.get("api_id"), entry.get("secret_env")
     if literal_id is not None and not secret_env and cid:
+        # Its own key is filled from its label, or from the name it had before
+        # connections were given ids; never from the id itself.
         field = next(f for f in CONN_FIELDS if f["key"] == "secret_env")
-        secret_env = _connection_env_name(field, cid)
+        own = _own_env_names(field, cid)
+        secret_env = next((key for key in own if _resolve_env_key(key)[0]), own[0])
     return literal_id, secret_env or "TELEGRAM_API_HASH"
+
+
+def _own_env_names(field: dict, cid: str) -> list[str]:
+    """The keys `field` of connection `cid` is its own under: the field's
+    template filled from the connection's label, then from its former name."""
+    names = []
+    for word in (_connection_label(cid), _connection_former_name(cid)):
+        key = _connection_env_name(field, word) if word else None
+        if key and key not in names:
+            names.append(key)
+    return names or [_connection_env_name(field, cid)]
 
 
 def _connection_prefill(cid: str, entry: dict) -> dict:
@@ -1096,7 +1136,7 @@ def _connection_prefill(cid: str, entry: dict) -> dict:
     except (TypeError, ValueError):
         return {}
     field = next(f for f in CONN_FIELDS if f["key"] == "secret_env")
-    own = _connection_env_name(field, cid)
+    own = _own_env_names(field, cid)[0]
     return {"fields": {"api_id": api_id, "secret_env": own}, "secrets": {own: api_hash}}
 
 
@@ -1172,14 +1212,15 @@ def _connection_session(cid: str, entry: dict) -> str:
     record is read by every machine that reaches its store, so a `session` path
     it carries is the path of the machine that set it: it is kept where a session
     already lives there or where it lies under this machine's home, and anywhere
-    else the session is this machine's own <state-dir>/<id>/session."""
+    else the session is this machine's own <state-dir>/<id>/session, where a
+    folder made under the connection's former name is moved first."""
     recorded = entry.get("session")
     if recorded:
         path = Path(str(recorded)).expanduser()
         if (not path.is_absolute() or _session_file(str(path)).exists()
                 or path.is_relative_to(Path.home())):
             return str(recorded)
-    return str(_state_dir() / cid / "session")
+    return str(_connection_state_dir(_state_dir(), cid) / "session")
 
 
 def _require_account_connection(cfg: dict, *, allow_discovery: bool = False) -> None:
@@ -1641,7 +1682,7 @@ def _first_link(wanted: str | None, session_flag: str | None):
     if not isinstance(entry, dict) or entry.get("expected_account_id"):
         yield
         return
-    folder = _state_dir() / cid
+    folder = _connection_state_dir(_state_dir(), cid)
     session = _session_file(_connection_session(cid, entry))
     if session.exists():
         yield
@@ -2689,7 +2730,7 @@ async def cmd_download(cfg: dict, chat: str, msg_id: int, as_json: bool):
             else:
                 base = _synthesize_media_name(message.id, kind, meta_d)
 
-            cache_dir = _state_dir() / cfg["id"] / "media" / str(chat_id)
+            cache_dir = _connection_state_dir(_state_dir(), cfg["id"]) / "media" / str(chat_id)
             existing = _find_cached_media(cache_dir, message.id)
             if existing is not None:
                 dest = existing
@@ -4106,7 +4147,8 @@ def cmd_service_init(connection_flag: str | None, force: bool) -> dict:
     if force or not existing_settings:
         settings = json.loads(settings_template.read_text())
         if connection_flag:
-            settings["connection"] = connection_flag
+            # The setting holds the connection's id, whichever word named it.
+            settings["connection"] = _connection_word(connection_flag)
         _validate_service_settings(root, settings)
         adapter = _records()
         for key in set(existing_settings) - set(settings):
@@ -4824,7 +4866,7 @@ def cmd_service_status(connection_flag: str | None, session_flag: str | None) ->
     if isinstance(owner, dict):
         if owner.get("project_root") != str(root):
             expectation_mismatches.append("project")
-        if owner.get("connection") != cid:
+        if not _is_connection(owner.get("connection"), cid):
             expectation_mismatches.append("connection")
         if owner.get("service_state_path") != str(paths["state"]):
             expectation_mismatches.append("service_state")
@@ -4949,7 +4991,7 @@ def _service_owner_matches_launch(owner: object, *, launch_nonce: str,
         and owner.get("mode") == expected_mode
         and owner.get("dev_session_id") == dev_session
         and owner.get("project_root") == str(root.resolve())
-        and owner.get("connection") == cfg["id"]
+        and _is_connection(owner.get("connection"), cfg["id"])
         and owner.get("account_id") == _service_account_id(cfg)
         and owner.get("service_state_path") == str(paths["state"].resolve())
         and owner.get("health_file") == str(paths["health"].resolve())
@@ -5080,7 +5122,8 @@ def _service_stop_result(connection_flag: str | None, session_flag: str | None,
     owner = _json_file(control["owner"])
     expected_stop_health = None
     if isinstance(owner, dict):
-        if owner.get("project_root") != str(root) or owner.get("connection") != cid:
+        if (owner.get("project_root") != str(root)
+                or not _is_connection(owner.get("connection"), cid)):
             _die(6, "service_owned_elsewhere",
                  f"account {account_id} is owned by another project or connection",
                  json.dumps(owner, sort_keys=True))

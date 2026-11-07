@@ -1529,7 +1529,11 @@ def test_a_lent_node_is_reached_through_the_address_its_first_lent_reach_records
         lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["true"]))
     assert exited.value.code == 0 and ran[0][-2] == "root@203.0.113.7"
     assert not lab.fake.of("coolify")
-    # A lent node whose row records no address still needs it lent.
+    # A lent node whose row records no address still needs it lent: the
+    # connections visible here are read for one kept in files at that
+    # address, and none is.
+    monkeypatch.setattr(lab.m, "_agent_node_records", lambda: SimpleNamespace(
+        connections=lambda *a, **kw: {}))
     lab.fake.rows[BOX1]["address"] = None
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["true"]))
@@ -1544,3 +1548,16 @@ def test_a_lent_connection_is_a_url_and_a_token_on_stdin(lab, monkeypatch, given
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m._node_lend()
     assert refused.value.code == "input" and "a b" not in refused.value.message
+
+
+def test_a_node_made_through_a_connection_kept_in_files_is_reached_through_it(lab):
+    # The row keeps such a connection's address; with nothing lent, the
+    # connection visible here at that address is the one reached.
+    row = {"node": BOX1, "coolify_connection": "https://coolify.invalid"}
+    assert lab.m._agent_node_target(row) == {"connection": "infra"}
+    assert lab.m._node_coolify_word("https://coolify.invalid") == "infra"
+    assert lab.m._node_origin_is({"connection": "infra"}, "https://coolify.invalid")
+    # An address no connection here has is a lent one's, and wants it lent.
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m._agent_node_target({**row, "coolify_connection": "https://other.invalid"})
+    assert refused.value.code == "coolify_connection_required"

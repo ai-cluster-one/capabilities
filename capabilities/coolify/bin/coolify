@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.44,<1",
 # ]
 # ///
 """coolify — Coolify CLI over the REST API. Drives a self-hosted Coolify
@@ -1822,8 +1822,22 @@ def _env_set_value(args) -> str:
 
 # ── connect: write a connection and its token in one act ───────────────────
 
-def _connection_env_key(name: str) -> str:
-    return "COOLIFY_" + re.sub(r"[^A-Z0-9]", "_", name.upper()) + "_TOKEN"
+def _connection_env_key(label: str) -> str:
+    """The token variable a new connection keeps its token in, filled from the
+    label it is added under, as the spec's `COOLIFY_{ID}_TOKEN` template is."""
+    return "COOLIFY_" + re.sub(r"[^A-Z0-9]", "_", label.upper()) + "_TOKEN"
+
+
+def _declared_as(word: str) -> tuple[str | None, dict | None]:
+    """The connection declared here that a word names - by its id, else by its
+    label - as (id, entry), or (None, None)."""
+    declared = _inventory_connections()["connections"] or {}
+    if word in declared:
+        return word, declared[word]
+    for cid, entry in declared.items():
+        if (entry or {}).get("label") == word:
+            return cid, entry
+    return None, None
 
 
 def _connect_url(raw: str) -> str:
@@ -1931,24 +1945,30 @@ def cmd_connect(args) -> None:
         "the token", stdin=args.token_stdin, file=args.token_file,
         env=args.token_env))
 
-    secret_env = _connection_env_key(name)
+    # The name is the connection's label: a connection already called by it
+    # (or whose id it is) is paired again, keeping the token variable its
+    # spec names; a new one is added under it, and the store gives it its id.
+    known, declared = _declared_as(name)
+    label = (declared or {}).get("label") or name
+    secret_env = (declared or {}).get("secret_env") or _connection_env_key(label)
     credentials = CREDENTIALS_ENV if scope == "global" else root / ".env.local"
     _write_env_key(credentials, secret_env, token)
     entry = {"base_url": url, "secret_env": secret_env}
     if ssh:
         entry["ssh"] = ssh
     try:
-        adapter.set(NAME, "connection", name, entry, scope=scope)
+        cid = adapter.set(NAME, "connection", known or name, entry,
+                          scope=scope) or known or name
         if args.default:
-            adapter.set(NAME, "setting", "connection.default", name, scope=scope)
+            adapter.set(NAME, "setting", "connection.default", cid, scope=scope)
         registry = adapter.scope_source(NAME, "connection", scope)
     except StoreError as e:
         _die(6, e.slug, e.message, e.hint)
 
-    probe = _check_connection({"id": name, "allow_write": WRITE_DEFAULT,
+    probe = _check_connection({"id": cid, "label": label, "allow_write": WRITE_DEFAULT,
                                "base_url": url, "token": token})
     category = probe.pop("category", None)
-    out = {"ok": bool(probe.get("ok")), "connection": name, "scope": scope,
+    out = {"ok": bool(probe.get("ok")), "connection": cid, "label": label, "scope": scope,
            "base_url": url, "secret_env": secret_env,
            "credentials": str(credentials), "registry": registry,
            "default": bool(args.default)}
@@ -1956,11 +1976,11 @@ def cmd_connect(args) -> None:
         out["ssh"] = ssh
     out["doctor"] = probe
     machine_read = _machine_read("doctor")
-    granted = (_inventory_connections(machine_read)["connections"].get(name)
+    granted = (_inventory_connections(machine_read)["connections"].get(cid)
                or {}).get("granted")
     if granted is False:
         out["usable_here"] = False
-        out["hint"] = _grant_hint(name)
+        out["hint"] = _grant_hint(cid)
     elif granted and machine_read:
         out["usable_here"] = True
         out["machine_reads"] = list(MACHINE_READS)

@@ -1,5 +1,9 @@
 # emta — change log
 
+## 2026-11-07 — A stored session made under a connection's former name is found again under its id
+
+The stored session (`session.json`) is kept under `<state>/<connection id>/`. Where that does not exist and the store's map names the connection's former name, the folder made under that name is moved to the id once, saying so on stderr, so a session already ingested survives the store's move to connection ids. Declares `capabilities-contract>=0.44,<1`, the library that keeps the map and moves the folder.
+
 ## 2026-10-30 — `emta` carries its own icon
 
 The bundle holds its icon as `icon.png`; `capabilities icon emta` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

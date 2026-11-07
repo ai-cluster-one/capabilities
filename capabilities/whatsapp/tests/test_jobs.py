@@ -244,8 +244,9 @@ class Migration(td.DialogueCase):
         with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
             result = wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
                                 minor=wa.STORE_SCHEMA_MINOR, schema=name)
-        self.assertEqual(result.applied, ["0023-agent-names", "0024-prompts"])
-        self.assertEqual((result.major, result.minor), (2, 1))
+        self.assertEqual(result.applied, ["0023-agent-names", "0024-prompts",
+                                          "0025-connection-ids"])
+        self.assertEqual((result.major, result.minor), (2, 2))
         conn.execute(f"SET search_path TO {name}")
         for table in ("whatsapp_register", "whatsapp_jobs", "whatsapp_job_amendments",
                       "whatsapp_job_slots"):
@@ -262,6 +263,61 @@ class Migration(td.DialogueCase):
         with self.assertRaises(wa.DbError) as refused:
             wa.migrate(conn, "whatsapp", old, major=1, minor=4, schema=name)
         self.assertEqual(refused.exception.slug, "schema_too_new")
+
+    def test_a_store_at_2_1_takes_connection_ids_in_its_settings(self):
+        """A store whose core is at 2.0 and whose whatsapp tables are at 2.1,
+        its connections keyed by name, takes the ids under the store upgrade:
+        a role's grant of an account in the service settings names it by id
+        with the connection beside it, and the grant that named no connection
+        is kept in the step's pre-image and gone from the settings. The step is
+        a minor; the store upgrade crosses the core's major."""
+        import psycopg
+        import capabilities_contract.db._migrate as core_migrate
+        old = [s for s in wa.STORE_STEPS if s.id != "0025-connection-ids"]
+        name = f"wa_m2_{uuid.uuid4().hex[:8]}"
+        conn = psycopg.connect(_cli.STORE_DSN, autocommit=True)
+        self.addCleanup(conn.close)
+        conn.execute(f"CREATE SCHEMA {name}")
+        self.addCleanup(conn.execute, f"DROP SCHEMA {name} CASCADE")
+        # The store as the release before the cutover left it: the core at 2.0.
+        with mock.patch.object(core_migrate, "CORE_STEPS", core_migrate.CORE_STEPS[:1]), \
+                mock.patch.object(core_migrate, "CORE_VERSION", (2, 0)):
+            wa.migrate(conn, "whatsapp", old, major=2, minor=1, schema=name)
+        conn.execute(f"SET search_path TO {name}")
+        conn.execute("INSERT INTO connections (capability, name, spec) VALUES "
+                     "('whatsapp', 'work', '{}'::jsonb), ('telegram', 'personal', '{}'::jsonb)")
+        role = ["authority", "roles", "ops", "allowed_capabilities"]
+        for path, value in ((role + ["whatsapp", "connections", "work", "allow_write"], True),
+                            (role + ["telegram", "connections", "personal"], {}),
+                            (role + ["whatsapp", "connections", "missing", "allow_write"],
+                             True)):
+            conn.execute("INSERT INTO settings (agent_id, capability, path, value, updated_by)"
+                         " VALUES ('p', 'whatsapp', %s, %s::jsonb, 'a@n')",
+                         (path, json.dumps(value)))
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CAPABILITIES_STORE_UPGRADE", None)
+            with self.assertRaises(wa.DbError) as held:
+                wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
+                           minor=wa.STORE_SCHEMA_MINOR, schema=name)
+        self.assertEqual(held.exception.slug, "store_upgrade_needed")
+        with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
+            result = wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
+                                minor=wa.STORE_SCHEMA_MINOR, schema=name)
+        self.assertEqual(result.applied, ["0025-connection-ids"])
+        self.assertEqual((result.major, result.minor), (2, 2))
+        conn.execute(f"SET search_path TO {name}")
+        ids = dict(conn.execute("SELECT name, id FROM core_premig_connection_names"))
+        self.assertEqual(
+            {tuple(path): (value, cid) for path, value, cid in conn.execute(
+                "SELECT path, value, connection_id FROM settings WHERE capability = 'whatsapp'")},
+            {tuple(role + ["whatsapp", "connections", ids["work"], "allow_write"]):
+                (True, ids["work"]),
+             tuple(role + ["telegram", "connections", ids["personal"]]):
+                ({}, ids["personal"])})
+        self.assertEqual([tuple(r[0]) for r in conn.execute(
+            "SELECT path FROM whatsapp_premig_m4_settings")],
+            [tuple(role + ["whatsapp", "connections", "missing", "allow_write"])])
 
 
 # ── Settings ────────────────────────────────────────────────────────────────

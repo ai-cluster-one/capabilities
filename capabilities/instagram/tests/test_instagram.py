@@ -1324,5 +1324,34 @@ class PolicyTests(unittest.TestCase):
             self.assertEqual(json.loads(proc.stderr)["error"]["code"], "read_only")
 
 
+
+class FormerNameSessionTests(unittest.TestCase):
+    """A session saved before connections were given ids lies under the
+    connection's former name; the connection, named by its id now, finds it
+    there and moves it under the id once, so no new sign-in is needed."""
+
+    def test_a_session_made_under_the_former_name_is_found_and_moved(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        cid = "a1b2c3d4e5f6"
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state" / "instagram"
+            (state / "work").mkdir(parents=True)
+            (state / "work" / "session.json").write_text("{}")
+            err = io.StringIO()
+            with mock.patch.object(instagram, "_state_dir", lambda: state), \
+                    mock.patch.object(instagram, "_connection_former_name",
+                                      lambda wanted: "work" if wanted == cid else None,
+                                      create=True), \
+                    contextlib.redirect_stderr(err):
+                conn = instagram._connection_from_entry(cid, {"expected_username": "example"})
+            self.assertEqual(conn.session_path, state / cid / "session.json")
+            self.assertEqual(conn.session_path.read_text(), "{}")
+            self.assertFalse((state / "work").exists())
+            self.assertIn("work", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

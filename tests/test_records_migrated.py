@@ -354,10 +354,12 @@ def test_grants_and_defaults_for_every_agent_cannot_duplicate(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
-    lab.sql("INSERT INTO connections (capability, name, spec) "
+    lab.sql("INSERT INTO connections (capability, label, spec) "
             "VALUES ('coolify', 'box', '{}'), ('coolify', 'two', '{}')")
-    grant = ("INSERT INTO grants (agent_id, capability, connection, "
-             "node, allow_write, is_default) VALUES (NULL, 'coolify', %s, %s, true, %s)")
+    grant = ("INSERT INTO grants (agent_id, capability, connection_id, "
+             "node, allow_write, is_default) VALUES (NULL, 'coolify', "
+             "(SELECT id FROM connections WHERE capability = 'coolify' AND label = %s), "
+             "%s, true, %s)")
     lab.sql(grant, ("box", None, True))
     with pytest.raises(psycopg.errors.UniqueViolation):
         lab.sql(grant, ("box", None, False))
@@ -386,8 +388,15 @@ def _ledger_before_owners(lab: Lab) -> None:
 
 
 def _owners(lab: Lab) -> dict:
-    return {(cap, name): owner for cap, name, owner in lab.sql(
-        "SELECT capability, name, owner_agent_id FROM connections")}
+    return {(cap, label): owner for cap, label, owner in lab.sql(
+        "SELECT capability, label, owner_agent_id FROM connections")}
+
+
+def _cid(lab: Lab, capability: str, label: str) -> str:
+    """The id the store keeps the connection labelled `label` under."""
+    [(cid,)] = lab.sql("SELECT id FROM connections WHERE capability = %s AND label = %s",
+                       (capability, label))
+    return cid
 
 
 def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
@@ -429,7 +438,8 @@ def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
     assert set(listed["capabilities"]) == {"agentrooms", "clickup"}
     ada, clinic = listed["capabilities"]["agentrooms"]
     assert clinic == {
-        "connection": "clinic", "label": "clinic", "owner": OTHER, "owner_name": "Clinic Desk",
+        "connection": _cid(lab, "agentrooms", "clinic"), "label": "clinic", "owner": OTHER,
+        "owner_name": "Clinic Desk",
         "shared": False, "grants": [{"agent": OTHER, "agent_name": "Clinic Desk",
                                      "node": None, "enabled": True, "allow_write": None,
                                      "is_default": False}]}
@@ -443,11 +453,13 @@ def test_an_agents_own_connection_is_granted_to_no_other_agent(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
-    lab.sql("INSERT INTO connections (capability, name, spec, owner_agent_id) VALUES "
+    lab.sql("INSERT INTO connections (capability, label, spec, owner_agent_id) VALUES "
             "('telegram', 'mine', '{}', %s), ('telegram', 'ours', '{}', NULL)", (PROJECT_ID,))
     grant = ("INSERT INTO grants "
-             "(agent_id, capability, connection, node, allow_write) "
-             "VALUES (%s, 'telegram', %s, %s, %s)")
+             "(agent_id, capability, connection_id, node, allow_write) "
+             "VALUES (%s, 'telegram', "
+             "(SELECT id FROM connections WHERE capability = 'telegram' AND label = %s), "
+             "%s, %s)")
     lab.sql(grant, (PROJECT_ID, "mine", None, False))
     lab.sql(grant, (PROJECT_ID, "mine", SERVER, True))
     for agent in (OTHER, None):
@@ -457,13 +469,13 @@ def test_an_agents_own_connection_is_granted_to_no_other_agent(lab):
     lab.sql(grant, (OTHER, "ours", None, True))
     lab.sql(grant, (PROJECT_ID, "ours", None, False))
     with pytest.raises(psycopg.errors.CheckViolation):
-        lab.sql("UPDATE connections SET owner_agent_id = %s WHERE name = 'ours'",
+        lab.sql("UPDATE connections SET owner_agent_id = %s WHERE label = 'ours'",
                 (PROJECT_ID,))
     with pytest.raises(psycopg.errors.CheckViolation):
         lab.sql("UPDATE grants SET agent_id = %s "
-                "WHERE connection = 'mine'", (OTHER,))
+                "WHERE connection_id = %s", (OTHER, _cid(lab, "telegram", "mine")))
     [ours] = [c for c in lab.ok(MANAGER, "connections", "list", "telegram")
-              ["capabilities"]["telegram"] if c["connection"] == "ours"]
+              ["capabilities"]["telegram"] if c["label"] == "ours"]
     assert {g["agent"]: g["allow_write"] for g in ours["grants"]} == {
         OTHER: True, PROJECT_ID: False}
 
@@ -479,16 +491,16 @@ def test_a_moved_agent_adds_its_own_connection_with_its_grant_and_a_machine_one_
     lab.ok(COOLIFY, "connection", "add", "box", "--machine", *fields)
     assert _owners(lab)[("coolify", "box")] is None
     assert lab.sql("SELECT count(*) FROM grants "
-                   "WHERE connection = 'box'") == [(0,)]
+                   "WHERE connection_id = %s", (_cid(lab, "coolify", "box"),)) == [(0,)]
     lab.ok(MANAGER, "set", "coolify", "grant", "mine", '{"allow_write": false}')
-    listed = {c["connection"]: c for c in
+    listed = {c["label"]: c for c in
               lab.ok(MANAGER, "connections", "list")["capabilities"]["coolify"]}
     assert listed["box"]["shared"] is True and listed["box"]["grants"] == []
     assert listed["mine"]["owner"] == PROJECT_ID and listed["mine"]["shared"] is False
     assert [(g["agent"], g["enabled"], g["allow_write"]) for g in listed["mine"]["grants"]] \
         == [(PROJECT_ID, True, False)]
     # Another agent's own connection is neither changed nor removed from here.
-    lab.sql("INSERT INTO connections (capability, name, spec, owner_agent_id) "
+    lab.sql("INSERT INTO connections (capability, label, spec, owner_agent_id) "
             "VALUES ('coolify', 'theirs', '{}', %s)", (OTHER,))
     _code, error = lab.refused(COOLIFY, "connection", "add", "theirs", "--project",
                                "--replace", *fields)
@@ -505,19 +517,20 @@ def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
     lab = moved
     fields = ("--field", "base_url=http://box.invalid", "--env", "secret_env=COOLIFY_TOKEN")
     lab.ok(COOLIFY, "connection", "add", "mine", "--project", *fields)
-    lab.sql("INSERT INTO connections (capability, name, spec) VALUES "
+    lab.sql("INSERT INTO connections (capability, label, spec) VALUES "
             "('coolify', 'stray', '{\"base_url\": \"http://stray.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}')")
+    stray = _cid(lab, "coolify", "stray")
     lab.sql("INSERT INTO grants "
-            "(agent_id, capability, connection, enabled) VALUES (%s, 'coolify', 'stray', true)",
-            (OTHER,))
+            "(agent_id, capability, connection_id, enabled) VALUES (%s, 'coolify', %s, true)",
+            (OTHER, stray))
     # Granted to another agent, it is not taken from it, at either name of the scope.
     for scope in ("--global", "--machine"):
         _code, error = lab.refused(COOLIFY, "connection", "remove", "stray", scope)
         assert error["code"] == "connection_granted" and OTHER in error["message"]
     assert ("coolify", "stray") in _owners(lab)
     lab.sql("UPDATE grants SET enabled = false "
-            "WHERE connection = 'stray'")
+            "WHERE connection_id = %s", (stray,))
     removed = lab.ok(COOLIFY, "connection", "remove", "stray", "--machine")
     assert removed["action"] == "remove" and removed["scope"] == "global"
     assert _owners(lab) == {("coolify", "mine"): PROJECT_ID}
@@ -534,19 +547,20 @@ def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
 def _rows_for_reads(lab: Lab) -> None:
     """Rows that say what the agent should read: its own, every agent's, this
     node's and every node's, each differing from the stale files."""
-    lab.sql("INSERT INTO connections (capability, name, spec) VALUES "
+    lab.sql("INSERT INTO connections (capability, label, spec) VALUES "
             "('coolify', 'box', '{\"base_url\": \"http://box.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}'), "
             "('coolify', 'glob', '{\"base_url\": \"http://glob.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}')")
+    box, glob = _cid(lab, "coolify", "box"), _cid(lab, "coolify", "glob")
     lab.sql("INSERT INTO grants "
-            "(agent_id, capability, connection, node, enabled, allow_write, is_default) VALUES "
-            "(%s, 'coolify', 'box', NULL, true, NULL, false), "
-            "(%s, 'coolify', 'glob', NULL, true, NULL, false), "
-            "(NULL, 'coolify', 'box', NULL, NULL, true, false), "
-            "(NULL, 'coolify', 'glob', NULL, true, false, true), "
-            "(%s, 'coolify', 'box', %s, NULL, false, true)",
-            (PROJECT_ID, PROJECT_ID, PROJECT_ID, SERVER))
+            "(agent_id, capability, connection_id, node, enabled, allow_write, is_default) "
+            "VALUES (%s, 'coolify', %s, NULL, true, NULL, false), "
+            "(%s, 'coolify', %s, NULL, true, NULL, false), "
+            "(NULL, 'coolify', %s, NULL, NULL, true, false), "
+            "(NULL, 'coolify', %s, NULL, true, false, true), "
+            "(%s, 'coolify', %s, %s, NULL, false, true)",
+            (PROJECT_ID, box, PROJECT_ID, glob, box, glob, PROJECT_ID, box, SERVER))
     lab.sql("INSERT INTO identifiers (agent_id, capability, node, label, value) "
             "VALUES (%s, 'coolify', NULL, 'team', '\"agent-team\"'), "
             "(NULL, 'coolify', NULL, 'team', '\"global-team\"'), "
@@ -583,11 +597,13 @@ def test_a_migrated_agent_reads_rows_and_never_its_stale_files(lab):
     assert ids["team"]["value"] == "agent-team"
     assert ids["region"]["value"] == "global-region"
     connections = lab.ok(COOLIFY, "connections")
-    assert sorted(connections["connections"]) == ["box", "glob"]
-    assert connections["default"] == "glob"
+    assert sorted(e["label"] for e in connections["connections"].values()) == ["box", "glob"]
+    assert connections["default"] == _cid(lab, "coolify", "glob")
     assert lab.ok(MANAGER, "get", "coolify", "grant", "box") == {
         "enabled": True, "node": None, "is_default": False, "scope": "project"}
-    assert lab.ok(MANAGER, "get", "coolify", "setting", "connection.default") == "glob"
+    # Printed as it is: an id may read as a number to a JSON parser.
+    assert lab.run(MANAGER, "get", "coolify", "setting", "connection.default").stdout.strip() \
+        == _cid(lab, "coolify", "glob")
     assert lab.ok(MANAGER, "get", "memory", "setting", "window_days") == 5
     assert lab.ok(MANAGER, "get", "memory", "setting", "max_entries") == 40
 
@@ -612,8 +628,8 @@ def test_rows_for_this_node_are_read_over_the_shared_rows(lab):
     assert ids["region"]["value"] == "server-region"
     assert lab.ok(MANAGER, "get", "coolify", "grant", "box", **on_server) == {
         "allow_write": False, "node": SERVER, "is_default": True, "scope": "project"}
-    assert lab.ok(MANAGER, "get", "coolify", "setting", "connection.default",
-                  **on_server) == "box"
+    assert lab.run(MANAGER, "get", "coolify", "setting", "connection.default",
+                   **on_server).stdout.strip() == _cid(lab, "coolify", "box")
     settings = lab.ok(MEMORY, "settings", **on_server)
     assert settings["generations"] == {"project": 12, "global": 7}
     assert {h["scope"]: h["document"] for h in settings["homes"]}["project"] \
@@ -625,21 +641,22 @@ def test_rows_for_this_node_are_read_over_the_shared_rows(lab):
 
 def test_a_global_grant_never_enables_a_connection_by_itself(lab):
     lab.migrate()
-    lab.sql("INSERT INTO connections (capability, name, spec) VALUES "
+    lab.sql("INSERT INTO connections (capability, label, spec) VALUES "
             "('coolify', 'glob', '{\"base_url\": \"http://glob.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}')")
+    glob = _cid(lab, "coolify", "glob")
     lab.sql("INSERT INTO grants "
-            "(agent_id, capability, connection, enabled, allow_write) "
-            "VALUES (NULL, 'coolify', 'glob', true, true)")
+            "(agent_id, capability, connection_id, enabled, allow_write) "
+            "VALUES (NULL, 'coolify', %s, true, true)", (glob,))
     lab.sql("INSERT INTO policies (agent_id, capability, enabled) "
             "VALUES (NULL, 'coolify', true)")
     code, error = lab.refused(COOLIFY, "connections")
     assert (code, error["code"]) == (4, "connection_not_granted")
-    assert "withheld: glob" in error["message"]
+    assert f"withheld: {glob}" in error["message"]
     lab.sql("INSERT INTO grants "
-            "(agent_id, capability, connection, enabled) VALUES (%s, 'coolify', 'glob', true)",
-            (PROJECT_ID,))
-    assert "glob" in lab.ok(COOLIFY, "connections")["connections"]
+            "(agent_id, capability, connection_id, enabled) VALUES (%s, 'coolify', %s, true)",
+            (PROJECT_ID, glob))
+    assert glob in lab.ok(COOLIFY, "connections")["connections"]
 
 
 def test_a_migrated_agent_refuses_without_a_node_name_or_on_an_unregistered_node(lab):
@@ -786,8 +803,9 @@ def test_capabilities_set_writes_a_literal_top_level_key_and_the_default_to_gran
            '{"base_url": "http://box.invalid", "secret_env": "COOLIFY_TOKEN"}')
     out = lab.ok(MANAGER, "set", "coolify", "setting", "connection.default", "box")
     assert out["records"]["source"] == f"store:{SCHEMA}.grants"
-    assert lab.sql("SELECT agent_id, connection, node, is_default FROM "
-                   "grants") == [(PROJECT_ID, "box", None, True)]
+    assert lab.sql("SELECT g.agent_id, c.label, g.node, g.is_default FROM grants g "
+                   "JOIN connections c ON c.id = g.connection_id") == [
+        (PROJECT_ID, "box", None, True)]
     assert lab.sql("SELECT count(*) FROM settings WHERE capability = 'coolify'") \
         == [(0,)]
 
@@ -879,7 +897,7 @@ def test_a_node_allowed_to_write_writes_the_shared_rows_as_the_master_does(moved
            '{"base_url": "http://other.invalid", "secret_env": "COOLIFY_TOKEN"}',
            **on_server)
     assert lab.sql("SELECT spec->>'base_url' FROM connections "
-                   "WHERE name = 'box'") == [("http://other.invalid",)]
+                   "WHERE label = 'box'") == [("http://other.invalid",)]
     lab.ok(MANAGER, "set", "coolify", "grant", "box", '{"enabled": true}', **on_server)
     assert lab.sql("SELECT agent_id, node, enabled FROM grants") \
         == [(PROJECT_ID, None, True)]

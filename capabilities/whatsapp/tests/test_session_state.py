@@ -109,5 +109,32 @@ class SessionState(unittest.TestCase):
         self.assertIn("service", manifest)
 
 
+class FormerNameHome(unittest.TestCase):
+    """A home made under a connection's former name, before connections were
+    given ids, is found by the connection under its id and moved, so its
+    device and files are not lost to a new link."""
+
+    def test_a_home_made_under_the_former_name_is_found_and_moved(self):
+        wa = _cli.load()
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        root = tmp / "state" / "whatsapp"
+        cid = "a1b2c3d4e5f6"
+        (root / "work" / "media").mkdir(parents=True)
+        (root / "work" / "media" / "kept.bin").write_text("kept")
+        err = io.StringIO()
+        with mock.patch.object(wa, "_state_dir", lambda: root), \
+                mock.patch.object(wa, "_connection_former_name",
+                                  lambda wanted: "work" if wanted == cid else None,
+                                  create=True), \
+                contextlib.redirect_stderr(err):
+            home = wa._account_home("15550001", cid)
+        self.assertEqual(home, root / "15550001")
+        self.assertEqual((home / "media" / "kept.bin").read_text(), "kept")
+        self.assertFalse((root / "work").exists())
+        self.assertIn("work", err.getvalue())
+
+
+
 if __name__ == "__main__":
     unittest.main()

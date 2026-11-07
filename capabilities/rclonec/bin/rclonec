@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.44,<1",
 # ]
 # ///
 """rclonec — a credential harness around the official `rclone` binary. It resolves one
@@ -13,7 +13,8 @@ stays rclone's own.
 USAGE
   rclonec <command> [args...]   Forward to `rclone <command> [args...]` with the selected
                                 connection defined as a remote. Address the remote by the
-                                connection id: `rclonec lsjson gdrive:Reports`.
+                                connection's label (or its id): `rclonec lsjson
+                                gdrive:Reports`.
   rclonec connections           Where every connection's values resolve from (tier,
                                 source, secrets masked). Local only.
   rclonec doctor [--connection <id>]
@@ -42,7 +43,8 @@ MODEL
   `rclone`. stdout, stderr and the exit code are rclone's, passed through untouched, so
   streaming, --json, progress and colors behave exactly as in rclone itself.
 
-  The child process knows exactly one remote — the selected connection. A connection
+  The child process knows exactly one remote — the selected connection, named for its
+  label, and for its id as well where the two differ. A connection
   declared for Google Drive therefore cannot reach S3: that name is not defined in the
   environment the child is given. The containment is a property of that environment,
   not a check rclonec performs.
@@ -62,8 +64,8 @@ MODEL
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one connection. An
   entry names its rclone backend `type`, its non-secret `options`, and the env keys
-  holding its secrets. The id becomes the remote name, so it must be usable as one:
-  letters, digits and underscore only.
+  holding its secrets. The connection's label becomes the remote name, so it must be
+  usable as one: letters, digits and underscore only.
 
     {
       "default": "<id>",
@@ -95,7 +97,7 @@ CONNECTIONS
   connection, in place of the remote's top level - a bucket, or `bucket/prefix`, for a
   key scoped to one bucket that may not list them all. It is rclonec's own field, sits
   beside `options` rather than in it, and never reaches rclone's configuration; without
-  it doctor lists `<id>:`.
+  it doctor lists `<label>:`.
 
   Outside any project, connections and doctor are machine reads: they use the
   machine's own connections read-only, unless a grant switched one off; every
@@ -169,8 +171,8 @@ PROGRAMS = [{"name": RCLONE,
 PROGRAMS_DIR = _STATE_HOME / NAME / "programs"
 RCLONE_DOWNLOADS = "https://downloads.rclone.org/"
 FETCH_TIMEOUT = 300.0
-# The id becomes an rclone remote name and an environment variable fragment, so it is
-# held to the intersection of what both accept.
+# The label becomes an rclone remote name and an environment variable fragment, so it
+# is held to the intersection of what both accept.
 REMOTE_ID = re.compile(r"^[A-Za-z0-9_]+$")
 
 # Verbs that mutate whatever path they are pointed at. Membership is enough to refuse.
@@ -221,6 +223,16 @@ def _options_of(entry: dict) -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
+def _remote_names(cid: str, label: str | None = None) -> list[str]:
+    """The names the connection's remote answers to: its label, which the
+    person types (`<label>:path`), and its id where the two differ, as
+    `--connection` takes either."""
+    names = [label or cid]
+    if cid != names[0] and REMOTE_ID.match(cid):
+        names.append(cid)
+    return names
+
+
 def _connections_report() -> dict:
     """The resolution report — every connection, every value, its winning tier and
     source, secrets masked. Local only: no network, no backend reached."""
@@ -245,7 +257,8 @@ def _connections_report() -> dict:
             rows.append(_key_report(env_key, True, True, value, tier, source))
         report["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
-            "remote": f"{cid}:",
+            "label": entry.get("label") or cid,
+            "remote": f"{entry.get('label') or cid}:",
             "keys": rows}
     return report
 
@@ -264,12 +277,13 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
             "message": f"connection {cid!r} carries no definition",
             "hint": "an rclone remote needs a declared backend; add the entry to "
                     "connections.json with at least a 'type'"}
-    if not REMOTE_ID.match(cid):
+    label = entry.get("label") or cid
+    if not REMOTE_ID.match(label):
         return None, {
             "exit": 6, "code": "bad_connection_id",
-            "message": f"connection id {cid!r} cannot be an rclone remote name",
-            "hint": "use letters, digits and underscore only — the id becomes the "
-                    "remote you address on the command line"}
+            "message": f"connection {label!r} cannot be an rclone remote name",
+            "hint": "use letters, digits and underscore only — the connection's label "
+                    "becomes the remote you address on the command line"}
     backend = entry.get("type")
     if not backend:
         return None, {
@@ -294,7 +308,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
                 "hint": f"set {env_key} in the project's .env / .env.local or the "
                         f"environment"}
         secrets[opt] = value
-    return {"id": cid, "type": backend, "options": _options_of(entry),
+    return {"id": cid, "label": label, "type": backend, "options": _options_of(entry),
             "secrets": secrets, "check_path": check_path or "",
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT))}, None
 
@@ -307,12 +321,13 @@ def _child_env(cfg: dict) -> dict:
     dropped so ambient environment can neither redirect the remote nor lift a gate."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("RCLONE_")}
     env["RCLONE_CONFIG"] = os.devnull
-    prefix = f"RCLONE_CONFIG_{cfg['id'].upper()}_"
-    env[prefix + "TYPE"] = str(cfg["type"])
-    for opt, value in cfg["options"].items():
-        env[prefix + str(opt).upper()] = str(value)
-    for opt, value in cfg["secrets"].items():
-        env[prefix + str(opt).upper()] = str(value)
+    for name in _remote_names(cfg["id"], cfg.get("label")):
+        prefix = f"RCLONE_CONFIG_{name.upper()}_"
+        env[prefix + "TYPE"] = str(cfg["type"])
+        for opt, value in cfg["options"].items():
+            env[prefix + str(opt).upper()] = str(value)
+        for opt, value in cfg["secrets"].items():
+            env[prefix + str(opt).upper()] = str(value)
     return env
 
 
@@ -475,12 +490,16 @@ def _refuse_read_only(cid: str, what: str, hint: str) -> NoReturn:
                 "`allow_write: true` on this connection in connections.json.")
 
 
-def _addresses_remote(token: str, cid: str) -> bool:
-    """rclone remote names set through the environment are case-insensitive."""
-    return token.lower().startswith(f"{cid.lower()}:")
+def _addresses_remote(token: str, names) -> bool:
+    """Whether `token` addresses the connection's remote by one of its names
+    (`_remote_names`); rclone remote names set through the environment are
+    case-insensitive."""
+    names = [names] if isinstance(names, str) else names
+    return any(token.lower().startswith(f"{name.lower()}:") for name in names)
 
 
-def _forward_gate(cid: str, allow_write: bool, argv: list[str]) -> None:
+def _forward_gate(cid: str, allow_write: bool, argv: list[str],
+                  label: str | None = None) -> None:
     """Policy from the committed registry; nothing in the cascade lifts it.
 
     rclone's transfer verbs are directional — the same word reads or writes depending
@@ -491,6 +510,7 @@ def _forward_gate(cid: str, allow_write: bool, argv: list[str]) -> None:
     if allow_write:
         return
     _write_gate(cid, allow_write, verb)          # verbs that mutate whatever they touch
+    names = _remote_names(cid, label)
 
     if verb == "backend":
         sub = next((a for a in argv[1:] if not a.startswith("-")), None)
@@ -510,20 +530,20 @@ def _forward_gate(cid: str, allow_write: bool, argv: list[str]) -> None:
                 "cannot be determined.")
         for i, a in enumerate(argv):
             if a in DEST_VALUE_FLAGS and i + 1 < len(argv) \
-                    and _addresses_remote(argv[i + 1], cid):
+                    and _addresses_remote(argv[i + 1], names):
                 _refuse_read_only(cid, f"`{a}` writes to this remote",
                                   "point it at another destination.")
             if "=" in a and a.split("=", 1)[0] in DEST_VALUE_FLAGS \
-                    and _addresses_remote(a.split("=", 1)[1], cid):
+                    and _addresses_remote(a.split("=", 1)[1], names):
                 _refuse_read_only(cid, f"`{a.split('=', 1)[0]}` writes to this remote",
                                   "point it at another destination.")
         positional = _positionals(argv[1:], value_flags)
-        if positional and _addresses_remote(positional[-1], cid):
+        if positional and _addresses_remote(positional[-1], names):
             _refuse_read_only(cid, f"`{verb}` would write to this remote "
                                    f"({positional[-1]} is the destination)",
                               "reading from it is available; transfer the other way.")
         if verb in SRC_MUTATING_VERBS and \
-                any(_addresses_remote(t, cid) for t in positional):
+                any(_addresses_remote(t, names) for t in positional):
             _refuse_read_only(cid, f"`{verb}` removes what it transfers from the source",
                               "use `copy` to read without emptying the source.")
         return
@@ -557,7 +577,7 @@ def _check_connection(cfg: dict, rclone: str = RCLONE) -> dict:
     """One connection's round-trip: list the path the connection declares for the check,
     or the remote's top level, under its own configuration. Reported rather than died,
     so doctor covers every connection."""
-    target = f"{cfg['id']}:{cfg.get('check_path') or ''}"
+    target = f"{cfg.get('label') or cfg['id']}:{cfg.get('check_path') or ''}"
     try:
         proc = subprocess.run([rclone, "lsd", target, "--retries", "1"],
                               env=_child_env(cfg), capture_output=True, text=True,
@@ -594,6 +614,10 @@ def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
                         f"{RCLONE_DOWNLOADS}")
     results: dict = {}
     worst = 0
+    if wanted and wanted not in report["connections"]:
+        # `--connection` names a connection by its id, else by its label.
+        wanted = next((cid for cid, row in report["connections"].items()
+                       if row.get("label") == wanted), wanted)
     for cid, row in report["connections"].items():
         if wanted and cid != wanted:
             continue
@@ -610,7 +634,7 @@ def cmd_doctor(reg: dict | None, wanted: str | None) -> None:
             worst = max(worst, 5)
             continue
         outcome = _check_connection(cfg, found)
-        results[cid] = {"ok": outcome["ok"], "remote": f"{cid}:",
+        results[cid] = {"ok": outcome["ok"], "remote": f"{cfg['label']}:",
                         "type": cfg["type"], "allow_write": cfg["allow_write"]}
         if not outcome["ok"]:
             results[cid]["error"] = outcome["error"]
@@ -682,7 +706,7 @@ def main() -> None:
     _grant_gate(reg, cid)
     entry = _entry_of(entry)
     allow_write = bool(entry.get("allow_write", WRITE_DEFAULT))
-    _forward_gate(cid, allow_write, cleaned)
+    _forward_gate(cid, allow_write, cleaned, entry.get("label"))
 
     cfg, problem = _build_cfg(cid, entry)
     if problem:

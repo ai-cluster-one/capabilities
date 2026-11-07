@@ -274,3 +274,23 @@ def test_help_and_manifest_carry_the_surface(cli, project, capsys):
     assert set(fields) == {"secret_env", "api_id_env", "api_hash_env", "deepgram_env"}
     assert all(f["secret"] and f["env"].startswith("TELEGRAMBOT_{ID}_") for f in fields.values())
     assert fields["secret_env"]["required"] and out["tables"] is True
+
+
+def test_a_session_made_under_the_former_name_is_found_and_moved(tmp_path, monkeypatch,
+                                                                  capsys):
+    """A bot's MTProto session kept under its connection's former name, before
+    connections were given ids, is found under the id and moved there once, so
+    the bot signs in with it again."""
+    cli = load_cli()
+    cid = "a1b2c3d4e5f6"
+    state = tmp_path / "state"
+    monkeypatch.setattr(cli, "_state_dir", lambda: state)
+    monkeypatch.setattr(cli, "_connection_former_name",
+                        lambda wanted: "helper" if wanted == cid else None, raising=False)
+    made = state / "helper" / "123456" / "mtproto.session"
+    made.parent.mkdir(parents=True)
+    made.write_text("session")
+    assert cli._conn_state({"id": cid}) == state / cid
+    assert (state / cid / "123456" / "mtproto.session").read_text() == "session"
+    assert not (state / "helper").exists()
+    assert "helper" in capsys.readouterr().err

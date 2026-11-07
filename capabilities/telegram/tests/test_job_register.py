@@ -38,6 +38,11 @@ jobs = _module("telegram_service_jobs_test", SERVICE_DIR / "jobs.py")
 channels = _module("telegram_service_channels_test", SERVICE_DIR / "channels.py")
 
 
+def _step_id(step) -> str:
+    """A register step's id, whether it is a (step_id, sql) pair or a Step."""
+    return step.id if hasattr(step, "id") else step[0]
+
+
 def project_id() -> str:
     return f"prj_test_{uuid.uuid4().hex}"
 
@@ -159,7 +164,7 @@ class RegisterCase(unittest.TestCase):
             "SELECT step FROM schema_ledger WHERE owner = ? ORDER BY step",
             (jobs.STORE_OWNER,)).fetchall()
         self.assertEqual([row[0] for row in ledger],
-                         [step for step, _sql in jobs.STORE_STEPS])
+                         [_step_id(step) for step in jobs.STORE_STEPS])
         version = self.store._execute(
             "SELECT major, minor FROM schema_version WHERE owner = ?",
             (jobs.STORE_OWNER,)).fetchone()
@@ -171,15 +176,15 @@ class RegisterCase(unittest.TestCase):
             ("telegram\\_%",)).fetchall()}
         self.assertEqual(tables, {"telegram_jobs", "telegram_job_amendments",
                                   "telegram_job_slots", "telegram_prompt_versions",
-                                  "telegram_channels"})
+                                  "telegram_channels", "telegram_premig_m4_settings"})
 
     def test_the_profile_column_is_an_additive_fourth_step(self):
         """A job carries the profile it runs on in a nullable column of its own,
         added by a step of its own after the three the register had: a row
         registered without one keeps none, and a store at the earlier version
         takes the step without losing a row."""
-        self.assertEqual([step for step, _sql in jobs.STORE_STEPS][3], "0004-job-profile")
-        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (2, 0))
+        self.assertEqual([_step_id(step) for step in jobs.STORE_STEPS][3], "0004-job-profile")
+        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (3, 0))
         with_profile = self.register(engine="claude", profile="telegram-fast")
         without = self.register(engine="codex", model="gpt-5.5")
         self.assertEqual(self.reg.get(with_profile["id"])["profile"], "telegram-fast")
@@ -329,7 +334,8 @@ class RegisterCase(unittest.TestCase):
         import psycopg
         from capabilities_contract.db import DbError, connect, migrate
         old = [step for step in jobs.STORE_STEPS
-               if step[0] not in ("0007-one-register", "0008-agent-names")]
+               if _step_id(step) not in ("0007-one-register", "0008-agent-names",
+                                         "0009-connection-ids")]
         older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m1")
         conn = connect(application_name="telegram", setting=older)
         self.addCleanup(conn.close)
@@ -371,7 +377,7 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(reg.pending_amendment("old-1"), ["more"])
         version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
                                  (jobs.STORE_OWNER,)).fetchone()
-        self.assertEqual(tuple(version), (2, 0))
+        self.assertEqual(tuple(version), (3, 0))
         for table in ("telegram_jobs", "telegram_job_amendments", "telegram_job_slots",
                       "telegram_prompt_versions", "telegram_channels"):
             rows = store._execute(f"SELECT agent_id FROM {table}").fetchall()
@@ -395,6 +401,106 @@ class RegisterCase(unittest.TestCase):
                         "WHERE id = %s::uuid", (prompt,))
         with self.assertRaises(DbError) as refused:
             migrate(raw, jobs.STORE_OWNER, old, major=1, minor=3, schema=older.schema)
+        self.assertEqual(refused.exception.slug, "schema_too_new")
+
+    def test_a_store_at_major_2_takes_connection_ids_in_place_and_keeps_its_rows(self):
+        """A store whose core and register are at major 2, its connections
+        keyed by name, takes the ids in place under the store upgrade: a
+        register row of a connection the store holds reads under its id and
+        goes with it, one of a connection only files hold keeps its name and
+        keeps working, a role's grant of an account names it by id with the
+        connection beside it, and the grant that named no connection is kept in
+        the pre-image and gone from the settings. A release that knows only
+        major 2 is refused."""
+        import psycopg
+        import capabilities_contract.db._migrate as core_migrate
+        from capabilities_contract.db import DbError, connect, migrate
+        old = [step for step in jobs.STORE_STEPS
+               if _step_id(step) != "0009-connection-ids"]
+        older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m2")
+        conn = connect(application_name="telegram", setting=older)
+        self.addCleanup(conn.close)
+        # The store as the release before the cutover left it: the core at 2.0.
+        with mock.patch.object(core_migrate, "CORE_STEPS", core_migrate.CORE_STEPS[:1]), \
+                mock.patch.object(core_migrate, "CORE_VERSION", (2, 0)):
+            migrate(conn, jobs.STORE_OWNER, old, major=2, minor=0)
+        pid = self.project_id
+        role = ["authority", "roles", "ops", "allowed_capabilities"]
+        with conn.cursor() as cur:
+            for capability, name in (("telegram", "work"), ("telegram", "personal"),
+                                     ("clickup", "tasks")):
+                cur.execute("INSERT INTO connections (capability, name, spec) "
+                            "VALUES (%s, %s, '{}'::jsonb)", (capability, name))
+            cur.execute("INSERT INTO telegram_channels (agent_id, connection, channel_key, "
+                        "last_processed_message_id) VALUES (%s, 'work', '-100:7', 7), "
+                        "(%s, 'filed', '-100:8', 3)", (pid, pid))
+            for path, value in (
+                    (role + ["telegram", "connections", "personal", "allow_write"], True),
+                    (role + ["clickup", "connections", "tasks", "allow_write"], False),
+                    (role + ["telegram", "connections", "missing", "allow_write"], True),
+                    (["connection"], "work")):
+                cur.execute("INSERT INTO settings (agent_id, capability, path, value, "
+                            "updated_by) VALUES (%s, 'telegram', %s, %s::jsonb, 'a@n')",
+                            (pid, path, json.dumps(value)))
+        conn.commit()
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CAPABILITIES_STORE_UPGRADE", None)
+            with self.assertRaises(jobs.JobError) as held:
+                jobs.open_register(self.envelope, setting=older)
+        self.assertEqual(held.exception.slug, "store_upgrade_needed")
+        with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
+            store, _reg = jobs.open_register(self.envelope, setting=older)
+        self.addCleanup(store.close)
+        version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
+                                 (jobs.STORE_OWNER,)).fetchone()
+        self.assertEqual(tuple(version), (3, 0))
+        ids = dict(store._execute(
+            "SELECT name, id FROM core_premig_connection_names").fetchall())
+        self.assertEqual(set(ids), {"work", "personal", "tasks"})
+
+        self.assertEqual(channels.rows(store.conn, (pid, ids["work"]))["-100:7"][
+            "last_processed_message_id"], 7)
+        self.assertEqual(channels.rows(store.conn, (pid, "filed"))["-100:8"][
+            "last_processed_message_id"], 3)
+        self.assertEqual(sorted(store._execute(
+            "SELECT connection_id, file_connection, channel_key FROM telegram_channels"
+        ).fetchall(), key=lambda r: r[2]), [(ids["work"], None, "-100:7"),
+                                            (None, "filed", "-100:8")])
+        # A row written now lands in the column its connection's holder names.
+        channels.write(store.conn, (pid, ids["work"]), {"-100:9": {"last_processed_message_id": 1}})
+        channels.write(store.conn, (pid, "filed"), {"-100:9": {"last_processed_message_id": 2}})
+        self.assertEqual(store._execute(
+            "SELECT connection_id, file_connection FROM telegram_channels "
+            "WHERE channel_key = '-100:9' ORDER BY 1").fetchall(),
+            [(ids["work"], None), (None, "filed")])
+        self.assertEqual(store._execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema = "
+            "current_schema() AND table_name = 'telegram_channels' "
+            "AND column_name LIKE 'connection%%'").fetchall(), [("connection_id",)])
+
+        settings = {tuple(path): (value, cid) for path, value, cid in store._execute(
+            "SELECT path, value, connection_id FROM settings WHERE agent_id = ? "
+            "AND capability = 'telegram'", (pid,)).fetchall()}
+        self.assertEqual(settings, {
+            tuple(role + ["telegram", "connections", ids["personal"], "allow_write"]):
+                (True, ids["personal"]),
+            tuple(role + ["clickup", "connections", ids["tasks"], "allow_write"]):
+                (False, ids["tasks"]),
+            ("connection",): (ids["work"], ids["work"])})
+        self.assertEqual([tuple(r[0]) for r in store._execute(
+            "SELECT path FROM telegram_premig_m4_settings").fetchall()],
+            [tuple(role + ["telegram", "connections", "missing", "allow_write"])])
+
+        raw = psycopg.connect(STORE_DSN, autocommit=True)
+        self.addCleanup(raw.close)
+        raw.execute(f'SET search_path TO "{older.schema}"')
+        raw.execute("DELETE FROM connections WHERE id = %s", (ids["work"],))
+        self.assertEqual(raw.execute(
+            "SELECT file_connection, channel_key FROM telegram_channels ORDER BY 2").fetchall(),
+            [("filed", "-100:8"), ("filed", "-100:9")])
+        with self.assertRaises(DbError) as refused:
+            migrate(raw, jobs.STORE_OWNER, old, major=2, minor=0, schema=older.schema)
         self.assertEqual(refused.exception.slug, "schema_too_new")
 
     def test_reopening_applies_nothing_twice(self):

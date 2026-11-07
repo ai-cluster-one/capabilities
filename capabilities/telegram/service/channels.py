@@ -22,7 +22,7 @@ a tie, since it is the one in use.
 
 Every function takes an autocommit psycopg connection bound to the store's
 schema - the register's own, `JobStore.conn` - and the scope
-`(project_id, connection)`.
+`(agent_id, connection id)`, the connection named by its id.
 """
 
 from __future__ import annotations
@@ -37,6 +37,12 @@ WATERMARK = "last_processed_message_id"
 SETTINGS = "settings"
 VOICE_ECHO_SENDERS = "voice_echo_senders"
 _OWN_COLUMNS = (WATERMARK, SETTINGS, VOICE_ECHO_SENDERS)
+# A row names its connection by id in `connection_id` where the store holds
+# that connection, else in `file_connection` (one only files hold); its key and
+# every read take whichever is set.
+CONNECTION = "coalesce(connection_id, file_connection)"
+# The store's connection with this id, else null: what `connection_id` takes.
+_HELD = "(SELECT k.id FROM connections k WHERE k.id = %s AND k.capability = 'telegram')"
 
 
 def _watermark(row: dict) -> int:
@@ -73,21 +79,30 @@ def _values(row: dict) -> tuple:
             json.dumps(state, ensure_ascii=False))
 
 
+def _upsert_scope(scope: tuple[str, str]) -> tuple:
+    """The scope as `_UPSERT` takes it: the agent, then the connection's id
+    for each place it is asked of."""
+    agent, cid = scope
+    return (agent, cid, cid, cid)
+
+
 def rows(conn, scope: tuple[str, str]) -> dict:
     """The whole register for the scope, by channel key."""
     found = conn.execute(
         f"SELECT channel_key, {WATERMARK}, settings, voice_echo_senders, state "
-        f"FROM {TABLE} WHERE agent_id = %s AND connection = %s",
+        f"FROM {TABLE} WHERE agent_id = %s AND {CONNECTION} = %s",
         tuple(scope)).fetchall()
     return {key: _row(watermark, settings, echoes, state)
             for key, watermark, settings, echoes, state in found}
 
 
 _UPSERT = f"""
-    INSERT INTO {TABLE} AS t (agent_id, connection, channel_key,
+    INSERT INTO {TABLE} AS t (agent_id, connection_id, file_connection, channel_key,
                               {WATERMARK}, settings, voice_echo_senders, state)
-    VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
-    ON CONFLICT (agent_id, connection, channel_key) DO UPDATE SET
+    VALUES (%s, {_HELD}, nullif(%s, {_HELD}), %s, %s, %s::jsonb, %s::jsonb, %s::jsonb)
+    ON CONFLICT (agent_id, ({CONNECTION}), channel_key) DO UPDATE SET
+        connection_id = EXCLUDED.connection_id,
+        file_connection = EXCLUDED.file_connection,
         {WATERMARK} = GREATEST(t.{WATERMARK}, EXCLUDED.{WATERMARK}),
         settings = EXCLUDED.settings,
         voice_echo_senders = EXCLUDED.voice_echo_senders,
@@ -100,11 +115,11 @@ def write(conn, scope: tuple[str, str], changed: dict,
     """Write the changed rows and drop the removed ones, in one transaction."""
     with conn.transaction():
         for key, row in changed.items():
-            conn.execute(_UPSERT, (*scope, str(key), *_values(row)))
+            conn.execute(_UPSERT, (*_upsert_scope(scope), str(key), *_values(row)))
         for key in removed:
             conn.execute(
                 f"DELETE FROM {TABLE} WHERE agent_id = %s "
-                "AND connection = %s AND channel_key = %s", (*scope, str(key)))
+                f"AND {CONNECTION} = %s AND channel_key = %s", (*scope, str(key)))
 
 
 def import_file(conn, scope: tuple[str, str], register: dict) -> list[str]:
@@ -118,10 +133,10 @@ def import_file(conn, scope: tuple[str, str], register: dict) -> list[str]:
                 continue
             stored = conn.execute(
                 f"SELECT {WATERMARK} FROM {TABLE} WHERE agent_id = %s "
-                "AND connection = %s AND channel_key = %s "
+                f"AND {CONNECTION} = %s AND channel_key = %s "
                 "FOR UPDATE", (*scope, str(key))).fetchone()
             if stored is not None and _watermark(row) <= int(stored[0] or 0):
                 continue
-            conn.execute(_UPSERT, (*scope, str(key), *_values(row)))
+            conn.execute(_UPSERT, (*_upsert_scope(scope), str(key), *_values(row)))
             taken.append(str(key))
     return taken

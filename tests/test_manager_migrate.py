@@ -347,15 +347,22 @@ class World:
             records = S.open_records(envelope, self.config, project_root=root)
             out = {"adapter": type(records).__name__, "gate": {}, "connections": {},
                    "defaults": {}, "identifiers": {}, "settings": {}}
+            labels: dict = {}
             try:
                 out["gate"] = {k: r["value"] for k, r in
                                records.resolve("capabilities", "policy").items()}
                 for name in names:
+                    # Each connection by what it is called: its key in files,
+                    # its label in the store, which keys it by its id.
+                    labels[name] = {cid: e.get("label") or cid for cid, e in
+                                    records.connections(name, include_disabled=True).items()}
                     for write_default in (False, True):
                         out["connections"][f"{name}/{write_default}"] = {
-                            cid: [e["value"], e["allow_write"]] for cid, e in
+                            labels[name].get(cid, cid): [e["value"], e["allow_write"]]
+                            for cid, e in
                             records.connections(name, write_default=write_default).items()}
-                    out["defaults"][name] = records.get(name, "setting", "connection.default")
+                    default = records.get(name, "setting", "connection.default")
+                    out["defaults"][name] = labels[name].get(default, default)
                     out["identifiers"][name] = {k: [r["value"], r["note"] or ""] for k, r in
                                                 records.resolve(name, "identifier").items()}
             finally:
@@ -374,9 +381,15 @@ class World:
                 out["settings"][name] = {"error": self.error(shown)["code"]}
                 continue
             report = json.loads(shown.stdout)
-            out["settings"][name] = {
-                "document": next((h["document"] for h in report["homes"]), None),
-                "keys": {k["key"]: k["value"] for k in report["keys"]}}
+            document = next((h["document"] for h in report["homes"]), None)
+            keys = {k["key"]: k["value"] for k in report["keys"]}
+            # A top-level `connection` the store keeps as the id it names.
+            named = labels.get(name) or {}
+            if isinstance(document, dict) and document.get("connection") in named:
+                document = {**document, "connection": named[document["connection"]]}
+            if keys.get("connection") in named:
+                keys["connection"] = named[keys["connection"]]
+            out["settings"][name] = {"document": document, "keys": keys}
         return out
 
 

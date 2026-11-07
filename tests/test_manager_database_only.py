@@ -677,8 +677,9 @@ def test_an_agent_made_after_discard_migrates_without_the_config_home(blank):
     _say("migrate-after-discard", {"dry": dry, "applied": applied})
     assert applied["state"] == "migrated", applied
     assert not applied["verify"]["differences"], applied["verify"]
-    assert w.sql("SELECT connection, enabled FROM grants WHERE "
-                 "agent_id = 'prj_blank0000002'") == [("ops", True)]
+    assert w.sql("SELECT c.label, g.enabled FROM grants g JOIN connections c ON "
+                 "c.id = g.connection_id WHERE g.agent_id = 'prj_blank0000002'") == [
+        ("ops", True)]
 
 
 def test_a_refused_write_while_an_agent_moves_creates_no_file(blank):

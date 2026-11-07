@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx[http2]>=0.27",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.44,<1",
 # ]
 # ///
 """skyscanner — Skyscanner flight search over plain HTTP: resolve places, search
@@ -667,7 +667,9 @@ class _Http:
 # ── site rotation ───────────────────────────────────────────────────────────
 
 def _domains_file(cid: str) -> Path:
-    return _state_dir() / cid / "domains.json"
+    """Per connection id; the file made under the connection's former name is
+    moved there on first use."""
+    return _connection_state_dir(_state_dir(), cid) / "domains.json"
 
 
 def _domain_state(cid: str) -> dict:

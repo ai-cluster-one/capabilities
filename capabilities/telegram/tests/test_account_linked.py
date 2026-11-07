@@ -42,6 +42,9 @@ class _Records:
     def mode_of(self, collection, key=None):
         return "file"
 
+    def connection_labels(self, name):
+        return {}
+
 
 class _Client:
     """A client already signed in, or signing in as ACCOUNT by QR."""

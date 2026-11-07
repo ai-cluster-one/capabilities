@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.44,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -4377,14 +4377,29 @@ def cmd_sync(args) -> None:
 
 
 def _telegram_connection(root: Path) -> str:
-    settings = _records().resolve("telegram", "setting")
-    service_connection = settings.get("connection", {}).get("value")
-    if isinstance(service_connection, str):
-        return service_connection
-    default_connection = settings.get("connection.default", {}).get("value")
-    if isinstance(default_connection, str):
-        return default_connection
+    """The telegram connection the project's service signs in with, as a person
+    types it: the label of the connection its `connection` setting, else its
+    default pointer, names by id or label; the word itself where it names none
+    here."""
+    adapter = _records()
+    settings = adapter.resolve("telegram", "setting")
+    for key in ("connection", "connection.default"):
+        word = settings.get(key, {}).get("value")
+        if isinstance(word, str):
+            return _connection_label(adapter, "telegram", word)
     return "default"
+
+
+def _connection_label(adapter, capability: str, word: str) -> str:
+    """The label of `capability`'s connection a word names by its id or label;
+    the word itself where it names none the records hold."""
+    try:
+        cid = adapter.connection_id(capability, word)
+        if not cid:
+            return word
+        return (adapter.connection_labels(capability) or {}).get(cid) or word
+    except StoreError:
+        return word
 
 
 def _resolve_target(root: Path, target_name: str | None) -> tuple[dict, Path]:
@@ -6246,7 +6261,11 @@ def _node_connection(target, write=False):
         if len(rows) != 1:
             raise NodeFailure("connection_required", "target must select a Coolify connection", 6)
         cid = next(iter(rows))
-        target["connection"] = cid
+    elif cid not in rows:
+        # The target names its connection by id or by label; from here on the
+        # run names it by its id.
+        cid = next((key for key, row in rows.items() if row.get("label") == cid), cid)
+    target["connection"] = cid
     row = rows.get(cid)
     if not row or not row["enabled"]:
         raise NodeFailure("connection_not_granted", f"Coolify connection {cid!r} is not granted to this project", 4)

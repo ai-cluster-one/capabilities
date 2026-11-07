@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "click>=8.1",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.44,<1",
 # ]
 # ///
 """directo — agent-first CLI for a Directo ERP instance (login.directo.ee).
@@ -328,9 +328,10 @@ def _build_cfg(cid: str, entry: dict | None,
 
 
 def _session_file(cid: str) -> Path:
-    """The live session's one home — keyed per connection, in the state dir
-    for the declared scope."""
-    return _state_dir() / cid / "session.env"
+    """The live session's one home — keyed per connection id, in the state dir
+    for the declared scope; one made under the connection's former name is
+    moved there on first use."""
+    return _connection_state_dir(_state_dir(), cid) / "session.env"
 
 
 def _persist_session(cid: str, cookie_str: str, koht: str) -> None:

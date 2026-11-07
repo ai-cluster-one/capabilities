@@ -52,17 +52,20 @@ def test_telegram_service_start_proves_runner_child_by_nonce_and_provenance(
 ) -> None:
     """A PEP runner's Popen PID may differ from the actual daemon child PID."""
     tree = ast.parse(TELEGRAM_SCRIPT.read_text())
-    function = next(
+    # The owner record names its connection by its id, or by the name it was
+    # kept under before connections were given ids, which `_is_connection` reads.
+    functions = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_service_owner_matches_launch"
-    )
-    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+        and node.name in ("_service_owner_matches_launch", "_is_connection")
+    ]
+    module = ast.fix_missing_locations(ast.Module(body=functions, type_ignores=[]))
     namespace = {
         "Path": Path,
         "__file__": str(TELEGRAM_SCRIPT),
         "_pid_alive": lambda pid: pid == 202,
         "_service_account_id": lambda cfg: cfg["expected_account_id"],
+        "_connection_former_name": lambda cid: None,
     }
     exec(compile(module, str(TELEGRAM_SCRIPT), "exec"), namespace)
 

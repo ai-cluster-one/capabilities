@@ -8,7 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.44,<1",
 #     "callva-harness-runner==0.11.0",
 # ]
 # ///
@@ -955,9 +955,16 @@ def _connection_file_override():
     return _project_path(value)
 
 
+# Whether the connections came from the file an override names rather than
+# the records adapter: a file names each connection by its own key, and no
+# state of the store's (a connection's former name) reaches it.
+CONNECTIONS_FROM_FILE = False
+
+
 def _connections_envelope():
     """The connections this project may use and where they were read: through
     the records adapter, or from the file a connections-file override names."""
+    global CONNECTIONS_FROM_FILE
     path = _connection_file_override()
     if path is None:
         try:
@@ -974,6 +981,7 @@ def _connections_envelope():
         sys.exit(f"cannot read {path}: {e}")
     if not isinstance(data.get("connections"), dict) or not data["connections"]:
         sys.exit(f"{path} is not a valid Telegram connections envelope")
+    CONNECTIONS_FROM_FILE = True
     return data, path
 
 
@@ -989,7 +997,8 @@ def _select_connection(data):
         return "default", None
     conns = data["connections"]
     withheld = data.get("withheld") or ()
-    wanted = wanted or data.get("default")
+    # A connection is named by its id or by its label; either is the same one.
+    wanted = records.resolve(data, wanted or data.get("default"))
     if wanted:
         if wanted in withheld:
             sys.exit(f"Telegram connection {wanted!r} in {CONN_FILE} is not granted "
@@ -1024,12 +1033,26 @@ if not bool((CONNECTION_ENTRY or {}).get("allow_write", False)):
     )
 
 
+def _connection_home(cid):
+    """<state>/telegram/<cid>, the connection's own folder on this machine. The
+    library answers it for a connection the records hold, first moving there
+    a folder made under the connection's former name, so a session signed in
+    before connections were given ids is found again."""
+    base = STATE_HOME / "telegram"
+    if CONNECTIONS_FROM_FILE or CONNECTIONS is None:
+        return base / cid
+    return records.state_dir(_records(), base, cid)
+
+
+CONNECTION_HOME = _connection_home(CONNECTION)
+
+
 def _session_stem(cid, conn):
     if conn is None:
         return _project_path(_env_value("TELEGRAM_SESSION")) if _env_value("TELEGRAM_SESSION") else DEFAULT_SESSION
     if conn.get("session"):
         return _project_path(conn["session"])
-    return STATE_HOME / "telegram" / cid / "session"
+    return CONNECTION_HOME / "session"
 
 
 SESSION = _session_stem(CONNECTION, CONNECTION_ENTRY)
@@ -2166,7 +2189,8 @@ def reload_runtime_settings():
     try:
         skipped = []
         candidate = _read_settings(skipped)
-        if candidate.get("connection") != SETTINGS.get("connection"):
+        if (records.resolve(CONNECTIONS, candidate.get("connection"))
+                != records.resolve(CONNECTIONS, SETTINGS.get("connection"))):
             raise SettingsError("settings.connection changed; a daemon restart is required")
         project_layout = _read_project_layout(reload_file=True)
         runtime = _runtime_settings(candidate, project_layout, skipped)
@@ -2250,6 +2274,22 @@ def acquire_daemon_lock():
 
 
 # --- credentials (resolve the connection the way the capability does) ---------
+def _own_hash_keys():
+    """The keys a connection naming its own api_id and no secret_env keeps its
+    hash under: TELEGRAM_<ID>_API_HASH, filled from its label and from the name
+    it had before connections were given ids. Never from the id, which no key
+    was ever made from."""
+    names = [(CONNECTIONS or {}).get("labels", {}).get(CONNECTION) or CONNECTION]
+    if not CONNECTIONS_FROM_FILE and CONNECTIONS is not None:
+        names.append(records.former_name(_records(), CONNECTION))
+    keys = []
+    for name in names:
+        key = f"TELEGRAM_{re.sub(r'[^A-Z0-9]', '_', str(name).upper())}_API_HASH" if name else None
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
 def resolve_creds():
     # An app is an id and its hash together: a connection naming its own api_id
     # takes the hash its secret_env names, else the one under its own key, where
@@ -2258,9 +2298,8 @@ def resolve_creds():
     entry = CONNECTION_ENTRY or {}
     if entry.get("api_id"):
         api_id_raw = entry["api_id"]
-        own_key = f"TELEGRAM_{re.sub(r'[^A-Z0-9]', '_', str(CONNECTION).upper())}_API_HASH"
-        secret_env = (entry.get("secret_env")
-                      or (own_key if _env_value(own_key) else "TELEGRAM_API_HASH"))
+        own_key = next((key for key in _own_hash_keys() if _env_value(key)), None)
+        secret_env = entry.get("secret_env") or own_key or "TELEGRAM_API_HASH"
     elif entry.get("secret_env"):
         sys.exit(f"connection {CONNECTION!r} names secret_env but no api_id")
     else:
@@ -2757,6 +2796,9 @@ def _authority_policy_for(job, group_policy, is_direct):
         "version": 1,
         "source": "telegram",
         "connection": CONNECTION,
+        # What a person may name the same connection by, so the worker's fence
+        # does not read it as another account.
+        "connection_label": (CONNECTIONS or {}).get("labels", {}).get(CONNECTION),
         "chat_id": job.get("chat_id"),
         "topic_id": job.get("topic_id"),
         "topic_title": job.get("topic_title"),
@@ -8634,7 +8676,7 @@ async def run_session(client):
 
         def recording_output(caller_id: int, mode: str) -> Path:
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            return (STATE_HOME / "telegram" / CONNECTION / "calls" / "recordings"
+            return (CONNECTION_HOME / "calls" / "recordings"
                     / f"{timestamp}-{mode}-{caller_id}.ogg")
 
         async def read_chain_last_block(invite_msg_id: int):

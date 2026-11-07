@@ -137,6 +137,14 @@ COMMENT ON TABLE telegrambot_job_slots IS
 ]
 
 
+# A row names its bot by id in `connection_id` where the store holds that
+# connection, else in `file_connection` (service/store.py); an insert gives the
+# id three times (`JobRegister._written`).
+_HELD = ("(SELECT k.id FROM connections k WHERE k.id = %s"
+         " AND k.capability = 'telegrambot')")
+CONNECTION_VALUES = f"{_HELD}, nullif(%s, {_HELD})"
+
+
 class JobError(Exception):
     def __init__(self, slug: str, message: str, hint: str | None = None):
         super().__init__(message)
@@ -237,11 +245,17 @@ class JobRegister:
         self.db, self.agent_id, self.connection = db, str(agent_id), str(connection)
 
     def _where(self, *predicates: str) -> tuple[str, list]:
-        parts = ["agent_id = %s", "connection = %s", *predicates]
+        parts = ["agent_id = %s", "coalesce(connection_id, file_connection) = %s", *predicates]
         return " WHERE " + " AND ".join(parts), [self.agent_id, self.connection]
 
     def _scope(self) -> list:
         return [self.agent_id, self.connection]
+
+    def _written(self) -> list:
+        """The scope as an insert takes it: the agent, then the connection's id
+        for `connection_id` where the store holds it, else for
+        `file_connection` (`CONNECTION_VALUES`)."""
+        return [self.agent_id, self.connection, self.connection, self.connection]
 
     def _rows(self, predicates: str = "", params=(), order: str = "created_at, id",
               limit: int | None = None) -> list[dict]:
@@ -323,7 +337,7 @@ class JobRegister:
         return self._rows(
             "state = %s AND EXISTS (SELECT 1 FROM telegrambot_job_amendments a"
             " WHERE a.agent_id = telegrambot_jobs.agent_id"
-            " AND a.connection = telegrambot_jobs.connection"
+            " AND coalesce(a.connection_id, a.file_connection) = coalesce(telegrambot_jobs.connection_id, telegrambot_jobs.file_connection)"
             " AND a.job_id = telegrambot_jobs.id AND a.state = 'pending')",
             [RUNNING], order="started_at, id")
 
@@ -369,13 +383,14 @@ class JobRegister:
         with self.db.writing():
             row = self.db.execute(
                 """INSERT INTO telegrambot_jobs
-                       (id, agent_id, connection, chat_id, topic_id, requested_by,
+                       (id, agent_id, connection_id, file_connection, chat_id, topic_id,
+                        requested_by,
                         origin_message_id, external, description, profile, engine, state,
                         created_at, updated_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           clock_timestamp(), clock_timestamp())
+                   VALUES (%s, %s, """ + CONNECTION_VALUES + """, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, clock_timestamp(), clock_timestamp())
                    ON CONFLICT DO NOTHING RETURNING *""",
-                (job_id, *self._scope(), chat_id, topic_id, str(requested_by),
+                (job_id, *self._written(), chat_id, topic_id, str(requested_by),
                  origin_message_id, bool(external), description, profile, engine,
                  DRAFT)).fetchone()
         if row is None and origin_message_id is not None:
@@ -410,7 +425,7 @@ class JobRegister:
 
     def _amendment_rows(self, job_id: str, states) -> list[dict]:
         return self.db.execute(
-            "SELECT * FROM telegrambot_job_amendments WHERE agent_id = %s AND connection = %s"
+            "SELECT * FROM telegrambot_job_amendments WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s"
             " AND job_id = %s AND state = ANY(%s) ORDER BY created_at, id",
             self._scope() + [job_id, list(states)]).fetchall()
 
@@ -430,9 +445,10 @@ class JobRegister:
         clause, scope = self._where("id = %s")
         with self.db.writing():
             self.db.execute(
-                "INSERT INTO telegrambot_job_amendments (id, agent_id, connection, job_id,"
-                " text, state, created_at) VALUES (%s, %s, %s, %s, %s, 'pending',"
-                " clock_timestamp())", (amendment_id, *self._scope(), job_id, text))
+                "INSERT INTO telegrambot_job_amendments (id, agent_id, connection_id,"
+                " file_connection, job_id, text, state, created_at) VALUES (%s, %s,"
+                f" {CONNECTION_VALUES}, %s, %s, 'pending', clock_timestamp())",
+                (amendment_id, *self._written(), job_id, text))
             self.db.execute("UPDATE telegrambot_jobs SET amendments = amendments + 1,"
                             " updated_at = now()" + clause, scope + [job_id])
         return amendment_id
@@ -451,7 +467,7 @@ class JobRegister:
                 return []
             self.db.execute(
                 "UPDATE telegrambot_job_amendments SET state = 'claimed', claim_token = %s,"
-                " claimed_at = now() WHERE agent_id = %s AND connection = %s"
+                " claimed_at = now() WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s"
                 " AND job_id = %s AND state = 'pending'", [token] + self._scope() + [job_id])
         return [r for r in self._amendment_rows(job_id, ("claimed",))
                 if r["claim_token"] == token]
@@ -462,7 +478,7 @@ class JobRegister:
                 return 0
             done = self.db.execute(
                 "UPDATE telegrambot_job_amendments SET state = 'acked', acked_at = now()"
-                " WHERE agent_id = %s AND connection = %s AND job_id = %s"
+                " WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND job_id = %s"
                 " AND state = 'claimed' AND claim_token = %s RETURNING id",
                 self._scope() + [job_id, token]).fetchall()
         return len(done)
@@ -470,7 +486,7 @@ class JobRegister:
     def _release_amendments(self, job_id: str, token: str) -> None:
         self.db.execute(
             "UPDATE telegrambot_job_amendments SET state = 'pending', claim_token = NULL,"
-            " claimed_at = NULL WHERE agent_id = %s AND connection = %s AND job_id = %s"
+            " claimed_at = NULL WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND job_id = %s"
             " AND state = 'claimed' AND claim_token = %s", self._scope() + [job_id, token])
 
     def _holds(self, job_id: str, token: str, owner: str) -> bool:
@@ -481,7 +497,7 @@ class JobRegister:
         if not job:
             return False
         slot = self.db.execute(
-            "SELECT 1 AS one FROM telegrambot_job_slots WHERE agent_id = %s AND connection = %s"
+            "SELECT 1 AS one FROM telegrambot_job_slots WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s"
             " AND job_id = %s AND attempt_token = %s AND owner_id = %s FOR UPDATE",
             self._scope() + [job_id, token, owner]).fetchone()
         return bool(slot)
@@ -536,7 +552,7 @@ class JobRegister:
             if row is None:
                 return None
             self.db.execute(
-                "DELETE FROM telegrambot_job_slots WHERE agent_id = %s AND connection = %s"
+                "DELETE FROM telegrambot_job_slots WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s"
                 " AND job_id = %s AND attempt_token = %s AND owner_id = %s",
                 self._scope() + [job_id, token, owner])
             self._release_amendments(job_id, token)
@@ -579,7 +595,7 @@ class JobRegister:
             with self.db.writing():
                 used = {int(r["slot"]) for r in self.db.execute(
                     "SELECT slot FROM telegrambot_job_slots WHERE agent_id = %s"
-                    " AND connection = %s", self._scope()).fetchall()}
+                    " AND coalesce(connection_id, file_connection) = %s", self._scope()).fetchall()}
                 slot = next((n for n in range(max_parallel) if n not in used), None)
                 if slot is None:
                     return None
@@ -592,11 +608,12 @@ class JobRegister:
                     return None
                 job_id = candidate["id"]
                 taken = self.db.execute(
-                    "INSERT INTO telegrambot_job_slots (agent_id, connection, slot, job_id,"
-                    " owner_id, attempt_token, lease_expires_at) VALUES (%s, %s, %s, %s, %s,"
-                    " %s, now() + make_interval(secs => %s)) ON CONFLICT DO NOTHING"
+                    "INSERT INTO telegrambot_job_slots (agent_id, connection_id, file_connection,"
+                    " slot, job_id, owner_id, attempt_token, lease_expires_at) VALUES (%s,"
+                    f" {CONNECTION_VALUES}, %s, %s, %s, %s,"
+                    " now() + make_interval(secs => %s)) ON CONFLICT DO NOTHING"
                     " RETURNING slot",
-                    self._scope() + [slot, job_id, owner_id, token,
+                    self._written() + [slot, job_id, owner_id, token,
                                      float(lease_seconds)]).fetchone()
                 if taken is None:
                     raise _ClaimLost()
@@ -639,7 +656,7 @@ class JobRegister:
                 return False
             self.db.execute(
                 "UPDATE telegrambot_job_slots SET lease_expires_at = %s WHERE agent_id = %s"
-                " AND connection = %s AND job_id = %s AND attempt_token = %s"
+                " AND coalesce(connection_id, file_connection) = %s AND job_id = %s AND attempt_token = %s"
                 " AND owner_id = %s", [until] + self._scope() + [job_id, token, owner])
         return True
 
@@ -672,7 +689,7 @@ class JobRegister:
             if before_release is not None:
                 before_release()
             self.db.execute(
-                "DELETE FROM telegrambot_job_slots WHERE agent_id = %s AND connection = %s"
+                "DELETE FROM telegrambot_job_slots WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s"
                 " AND job_id = %s AND attempt_token = %s AND owner_id = %s",
                 self._scope() + [row["id"], token, owner])
             self._release_amendments(row["id"], token)

@@ -2,7 +2,7 @@
   "assets": {
     "DOCTRINE.md": "e2f59f31eab7f90ec192080205d3c22c63701c0a9bfdb1c1578579a7d9c9e5b0",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "05402752f2838cf95c8847f3698ee8d072d265dcac1468f217fa81470fd19eae",
+    "SHEBANG.md": "3c0b2d178e8dd13ae9992d48e3ebf8cc65282a87dcb78f777027f38056473217",
     "SOURCES.md": "2bddcf041b3c4175c36fa64cf26cc1aabf8b2defa0640ced302570f60c6444eb",
     "TEMPLATE.md": "ee2c64778fb1b8f54660fa6fc41190d25753486d35caceaa9e7482cc3958def9",
     "contract/CHANGELOG.md": "b9e2a6b9b186694d6b141c3cd1e67ef996559032c1d8a253c190e34afbd88443",
@@ -20,14 +20,13 @@
     "guides/store-upgrade.md": "9e80c17df03ccf584d08ebc287c7ec5b6c9b4df4ddeb39ce9ae1f8559c24073b",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "6603e8bd77947a2387dc15d98d92334b5229edb20d7bf65fdb1478036d52df6e",
+    "manager/CHANGELOG.md": "870e8675090e6f3e368844805352d480bd4f3cd05bbc47208405c5cd4fa8487b",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
-  "library": ">=0.43,<0.44",
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "bbc1847b21006c8f34cff474bb5b491994b68505c813891a1fc88e61adc739de"
+    "sha256": "c75fe4a74afb821fa5bb74ec230f93fd432d682077c8255b7f31d2cad5201cf3"
   },
   "schema": "capabilities.manager-release.v1",
-  "store_major": 2
+  "store_major": 3
 }

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -539,13 +540,23 @@ def test_nodes_are_added_changed_listed_and_removed(lab):
     assert (code, error["code"]) == (6, "node_unknown")
 
 
+def _store_connection(lab: Lab, capability: str, label: str) -> str:
+    """A connection of `capability` the store holds, labelled `label`; its id,
+    which the store mints."""
+    lab.ok("agent", "show")
+    [(cid,)] = lab.sql(f"INSERT INTO {SCHEMA}.connections (capability, label, spec) "
+                       "VALUES (%s, %s, '{}') RETURNING id", (capability, label))
+    return cid
+
+
 def test_a_coolify_node_names_its_connection_server_and_resource_and_its_key(lab):
+    infra = _store_connection(lab, "coolify", "infra")
     added = lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server",
                    "--coolify-connection", "infra", "--coolify-server", "srv-uuid",
                    "--coolify-resource", "res-uuid")["node"]
     assert (added["coolify_connection"], added["coolify_server"],
             added["coolify_resource"], added["public_key"]) == (
-        "infra", "srv-uuid", "res-uuid", None)
+        infra, "srv-uuid", "res-uuid", None)
 
     key = "A" * 42 + "Q="
     assert lab.ok("node", "set", nid("box-one"), "--public-key", key)["node"]["public_key"] == key
@@ -558,6 +569,73 @@ def test_a_coolify_node_names_its_connection_server_and_resource_and_its_key(lab
     assert (code, error["code"]) == (6, "coolify_incomplete")
     assert lab.sql(f"SELECT coolify_server FROM {SCHEMA}.nodes "
                    "WHERE id = %s", (nid("box-one"),)) == [("srv-uuid",)]
+
+
+def test_a_coolify_node_keeps_the_id_of_the_connection_it_names_or_a_lent_address(lab):
+    infra = _store_connection(lab, "coolify", "infra")
+    assert re.fullmatch(r"[0-9a-f]{12}", infra)
+    coolify = ("--coolify-server", "srv-uuid", "--coolify-resource", "res-uuid")
+    by_label = lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server",
+                      "--coolify-connection", "infra", *coolify)["node"]
+    assert by_label["coolify_connection"] == infra
+    assert lab.sql(f"SELECT coolify_connection_id, coolify_address FROM {SCHEMA}.nodes "
+                   "WHERE id = %s", (nid("box-one"),)) == [(infra, None)]
+    # Named again by its id, it is the same connection, and nothing moves.
+    assert lab.ok("node", "set", nid("box-one"), "--coolify-connection", infra)[
+        "changed"] is False
+    lent = lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server",
+                  "--coolify-connection", "https://coolify.example.test", *coolify)["node"]
+    assert lent["coolify_connection"] == "https://coolify.example.test"
+    assert lab.sql(f"SELECT coolify_connection_id, coolify_address FROM {SCHEMA}.nodes "
+                   "WHERE id = %s", (nid("box-two"),)) == [
+        (None, "https://coolify.example.test")]
+    listed = {n["node"]: n["coolify_connection"] for n in lab.ok("node", "list")["nodes"]}
+    assert listed == {nid("box-one"): infra, nid("box-two"): "https://coolify.example.test"}
+    code, error = lab.refused("node", "add", nid("box-six"), "--label", "box-six", "--kind",
+                              "server", "--coolify-connection", "nowhere", *coolify)
+    assert (code, error["code"]) == (6, "unknown_connection")
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.nodes WHERE id = %s",
+                   (nid("box-six"),)) == [(0,)]
+
+
+def test_a_coolify_node_made_through_a_connection_kept_in_files_keeps_and_reaches_its_address(lab):
+    # A coolify connection the project's files keep is no store row: the node
+    # records its address, as it does a lent connection's, and is reached
+    # again through the connection visible here at that address.
+    registry = lab.project / "capabilities" / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "connections.json").write_text(json.dumps({"connections": {"files-box": {
+        "base_url": "https://coolify.example.test/", "secret_env": "COOLIFY_TOKEN"}}}))
+    added = lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server",
+                   "--coolify-connection", "files-box", "--coolify-server", "srv-uuid",
+                   "--coolify-resource", "res-uuid")["node"]
+    assert added["coolify_connection"] == "https://coolify.example.test"
+    assert lab.sql(f"SELECT coolify_connection_id, coolify_address FROM {SCHEMA}.nodes "
+                   "WHERE id = %s", (nid("box-two"),)) == [
+        (None, "https://coolify.example.test")]
+    tools = lab.tmp / "tools"
+    _fake_tool(tools, "coolify", "import json, sys\nassert sys.argv[1:] == ['--connection', "
+               "'files-box', 'servers', 'srv-uuid'], sys.argv\n"
+               "print(json.dumps({'uuid': 'srv-uuid', 'ip': '198.51.100.7'}))\n")
+    result = lab.run("agent", "state", PROJECT_ID, "--json", **node_env("box-two"),
+                     PATH=f"{tools}{os.pathsep}{os.environ.get('PATH', '')}")
+    assert result.returncode == 0, result.stderr
+    [node] = json.loads(result.stdout)["nodes"]
+    assert (node["address"], node["address_source"]) == ("198.51.100.7", "coolify")
+    # A word that names no connection here is still refused.
+    code, error = lab.refused("node", "add", nid("box-six"), "--label", "box-six", "--kind",
+                              "server", "--coolify-connection", "elsewhere",
+                              "--coolify-server", "srv-uuid", "--coolify-resource", "res-uuid")
+    assert (code, error["code"]) == (6, "unknown_connection")
+
+
+def test_connections_list_names_each_connection_by_its_id_beside_its_label(lab):
+    work = _store_connection(lab, "clickup", "work")
+    lab.sql(f"INSERT INTO {SCHEMA}.grants (agent_id, capability, connection_id, enabled) "
+            "VALUES (NULL, 'clickup', %s, true) RETURNING connection_id", (work,))
+    [listed] = lab.ok("connections", "list", "clickup")["capabilities"]["clickup"]
+    assert (listed["connection"], listed["label"]) == (work, "work")
+    assert [(g["agent"], g["enabled"]) for g in listed["grants"]] == [(None, True)]
 
 
 def test_an_agent_has_one_master(lab):
@@ -691,6 +769,57 @@ def test_a_session_that_is_down_on_a_node_says_why(lab):
     assert [(s["connection"], s["live"], s["reason"], s["reason_keys"])
             for s in node["sessions"]] == expected
     assert [s["account"] for s in node["sessions"]][1] == "+10000000000"
+
+
+def test_a_node_keeps_each_session_under_the_id_of_the_connection_it_names_or_its_files_key(lab):
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server")
+    here = {**node_env("box-one"), **_state_tools(lab)}
+    # The capability answers its connections by what it calls them, its
+    # label; `local` is kept only in a project's files, not in the store.
+    main = _store_connection(lab, "phonelink", "work")
+    answer = json.dumps({"connections": {
+        "work": {"session": {"live": True, "account": "+10000000000"}},
+        "local": {"session": {"live": False, "account": None}}}})
+    script = lab.tmp / "registry" / "phonelink" / "phonelink"
+    script.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(answer)}\n")
+    reported = lab.ok("node", "state", "report", **here)
+    assert sorted((s["connection"], s["live"]) for s in reported["sessions"]) == sorted(
+        [(main, True), ("local", False)])
+    assert sorted(lab.sql(f"SELECT connection_id, file_connection, live "
+                          f"FROM {SCHEMA}.node_sessions"), key=str) == sorted(
+        [(main, None, True), (None, "local", False)], key=str)
+    [node] = lab.ok("node", "state")["nodes"]
+    assert sorted((s["connection"], s["live"]) for s in node["sessions"]) == sorted(
+        [(main, True), ("local", False)])
+
+
+def test_a_session_is_expected_of_a_connection_named_by_its_id_its_label_or_its_files_key(lab):
+    lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server")
+    _state_tools(lab)
+    main = _store_connection(lab, "phonelink", "work")
+    said = lab.ok("node", "expect", "box-one", "session", "phonelink", "work", "on")
+    assert (said["connection"], said["override"], said["changed"]) == (main, True, True)
+    assert lab.ok("node", "expect", "box-one", "session", "phonelink", main, "on")[
+        "changed"] is False
+    assert lab.sql(f"SELECT connection_id, expected FROM "
+                   f"{SCHEMA}.node_session_expectations") == [(main, True)]
+    [node] = lab.ok("node", "state")["nodes"]
+    assert node["attention"] == [{"kind": "session", "capability": "phonelink",
+                                  "connection": main, "reason": "not_reported"}]
+    # A connection only the project's files hold is expected by its key.
+    registry = lab.project / "capabilities" / "phonelink"
+    registry.mkdir(parents=True)
+    (registry / "connections.json").write_text(json.dumps({"connections": {"local": {}}}))
+    said = lab.ok("node", "expect", "box-one", "session", "phonelink", "local", "off")
+    assert (said["connection"], said["override"], said["changed"]) == ("local", False, True)
+    assert lab.sql(f"SELECT file_connection, expected FROM {SCHEMA}.node_session_expectations "
+                   "WHERE connection_id IS NULL") == [("local", False)]
+    # So is one only the node's own files hold, which nothing here names.
+    said = lab.ok("node", "expect", "box-one", "session", "phonelink", "remote", "on")
+    assert said["connection"] == "remote"
+    assert sorted(lab.sql(f"SELECT coalesce(connection_id, file_connection) FROM "
+                          f"{SCHEMA}.node_session_expectations")) == sorted(
+        [(main,), ("local",), ("remote",)])
 
 
 def test_a_node_reports_its_state_and_the_agent_reads_every_nodes(lab):
@@ -1081,6 +1210,8 @@ def _fake_tool(bin_dir: Path, name: str, body: str) -> None:
 def test_agent_state_reads_an_agent_across_its_nodes(lab):
     lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server", "--master", "--may-write",
            "--address", "203.0.113.10")
+    [(infra,)] = lab.sql(f"INSERT INTO {SCHEMA}.connections (capability, label, spec) "
+                         "VALUES ('coolify', 'infra', '{}') RETURNING id")
     lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server", "--coolify-connection", "infra",
            "--coolify-server", "srv-uuid", "--coolify-resource", "res-uuid")
     lab.ok("node", "add", nid("mac-one"), "--label", "mac-one", "--kind", "mac")
@@ -1124,7 +1255,7 @@ def test_agent_state_reads_an_agent_across_its_nodes(lab):
                "open(os.environ['STATE_CALLS'], 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
                "sys.exit(9)\n")
     _fake_tool(tools, "coolify", "import json, sys\nassert sys.argv[1:] == ['--connection', "
-               "'infra', 'servers', 'srv-uuid'], sys.argv\n"
+               f"'{infra}', 'servers', 'srv-uuid'], sys.argv\n"
                "print(json.dumps({'uuid': 'srv-uuid', 'ip': '198.51.100.7'}))\n")
     calls = lab.tmp / "calls"
     path = f"{tools}{os.pathsep}{os.environ.get('PATH', '')}"
@@ -2350,6 +2481,8 @@ def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(la
             conn.execute(query, params)
 
     lab.ok("agent", "set", "--name", "Lab")
+    [(infra,)] = lab.sql(f"INSERT INTO {SCHEMA}.connections (capability, label, spec) "
+                         "VALUES ('coolify', 'infra', '{}') RETURNING id")
     for name, kind, extra in (("lab-node", "mac", ()), ("far-mac", "mac", ()),
                               ("old-box", "server", ()),
                               ("box", "server", ("--coolify-connection", "infra",
@@ -2437,7 +2570,7 @@ def test_agent_rekey_moves_an_agent_to_a_new_id_in_the_store_and_on_its_nodes(la
     assert (lab.project / ".env.local").read_text() == env_before.replace(
         f"CAPABILITIES_PROJECT_ID={old}", f"CAPABILITIES_PROJECT_ID={new}")
     assert calls.read_text() == (
-        f"--connection infra env set res-uuid CAPABILITIES_PROJECT_ID --value-stdin|{new}|{new}\n")
+        f"--connection {infra} env set res-uuid CAPABILITIES_PROJECT_ID --value-stdin|{new}|{new}\n")
     assert [u["node"] for u in answer["unreached"]] == [nid("far-mac"), nid("old-box")]
     assert lab.ok("agent", "show")["agent"]["name"] == "Lab"
 
@@ -2499,11 +2632,11 @@ def test_a_system_agent_is_made_or_adopted_on_its_one_node_and_no_edit_changes_i
     lab.sql(f"INSERT INTO {SCHEMA}.policies (agent_id, capability, node, enabled)"
             " VALUES (NULL, 'askproject', NULL, true), (%s, 'tasks', NULL, true),"
             " (%s, 'memory', NULL, true) RETURNING capability", (agent_id, agent_id))
-    lab.sql(f"INSERT INTO {SCHEMA}.connections (capability, name, spec)"
-            " VALUES ('clickup', 'work', '{}') RETURNING name")
+    [(work,)] = lab.sql(f"INSERT INTO {SCHEMA}.connections (capability, label, spec)"
+                        " VALUES ('clickup', 'work', '{}') RETURNING id")
     lab.sql(f"INSERT INTO {SCHEMA}.grants (agent_id, capability,"
-            " connection, enabled, is_default) VALUES (%s, 'clickup', 'work', true, true)"
-            " RETURNING agent_id", (agent_id,))
+            " connection_id, enabled, is_default) VALUES (%s, 'clickup', %s, true, true)"
+            " RETURNING agent_id", (agent_id, work))
     (keeper / "AGENTS.md").write_text("# The app's own doctrine\n")
     with (keeper / ".env.local").open("a") as env_local:
         env_local.write("CAPABILITIES_CONTEXT_PROMPT=An override of the prompt.\n")
@@ -2516,8 +2649,8 @@ def test_a_system_agent_is_made_or_adopted_on_its_one_node_and_no_edit_changes_i
     assert (adopted["id"], adopted["kind"], adopted["slug"]) == (agent_id, "system", "keeper")
     assert lab.sql(f"SELECT id, name, kind FROM {SCHEMA}.agents WHERE kind = "
                    "'system'") == [(agent_id, "Keeper", "system")]
-    assert lab.sql(f"SELECT agent_id, connection FROM {SCHEMA}.grants"
-                   ) == [(agent_id, "work")]
+    assert lab.sql(f"SELECT agent_id, connection_id FROM {SCHEMA}.grants"
+                   ) == [(agent_id, work)]
     assert ok("init", "--system")["agent"]["kind"] == "system"
     assert ok("agent", "show")["agent"]["kind"] == "system"
     assert _error_of(run("init", "--system", "--name", "Other")) == (4, "system_agent")

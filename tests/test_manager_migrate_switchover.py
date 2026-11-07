@@ -39,7 +39,7 @@ OTHER_NODE = "srv-discard"
 # The core's steps, which a store whose tables are still owner `capabilities`
 # is brought to its shape by. They cross the store's major, which only the
 # store upgrade does: a process runs as part of it under UPGRADING.
-CORE_STEPS = ["0039-core"]
+CORE_STEPS = ["0039-core", "0040-connection-ids"]
 UPGRADING = {"CAPABILITIES_STORE_UPGRADE": "1"}
 
 
@@ -243,7 +243,7 @@ def dry_runs_change_nothing(w: World, version: str) -> dict:
     assert dry["applied"] is False and dry["would_write"] is True
     # The core has no version before its step: the tables are still owner
     # `capabilities`, at `version`.
-    assert dry["tables_to_upgrade"]["core"] == {"from": None, "to": "2.0", "steps": CORE_STEPS}
+    assert dry["tables_to_upgrade"]["core"] == {"from": None, "to": "3.0", "steps": CORE_STEPS}
     assert w.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
         == [tuple(int(part) for part in version.split("."))]
     assert "tables_upgraded" not in dry
@@ -297,10 +297,10 @@ def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(wor
         assert refused["code"] == "store_upgrade_needed", flags
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply", **UPGRADING))
     assert applied["state"] == "migrated" and applied["changed"] is True
-    assert applied["tables_upgraded"] == {"steps": CORE_STEPS, "version": "2.0"}
+    assert applied["tables_upgraded"] == {"steps": CORE_STEPS, "version": "3.0"}
     assert world.sql("SELECT owner, major, minor FROM schema_version WHERE owner IN "
                      "('capabilities', 'core') ORDER BY owner") \
-        == [("capabilities", 2, 0), ("core", 2, 0)]
+        == [("capabilities", 2, 0), ("core", 3, 0)]
     assert world.sql("SELECT count(*) FROM schema_ledger WHERE owner = 'capabilities'") \
         == [(0,)]
     # automations' tables one step behind, which any owner's migrate makes
@@ -425,15 +425,18 @@ def test_a_connection_renamed_for_this_agent(world):
         "whatsapp/shared": {"rename": "second-shared"}}})
     applied = world.answer(world.manager(root, "migrate", "--apply", "--answers", answers))
     assert applied["state"] == "migrated" and not applied["verify"]["differences"]
-    assert dict(world.sql("SELECT name, spec->>'phone' FROM connections "
+    assert dict(world.sql("SELECT label, spec->>'phone' FROM connections "
                           "WHERE capability = 'whatsapp'")) == {
         "shared": "+10000000001", "second-shared": "+10000000002"}
-    assert world.sql("SELECT connection, is_default FROM grants "
-                     "WHERE agent_id = %s AND capability = 'whatsapp'", (IDS["second"],)) \
+    ids = dict(world.sql("SELECT label, id FROM connections WHERE capability = 'whatsapp'"))
+    assert world.sql("SELECT c.label, g.is_default FROM grants g JOIN connections c ON "
+                     "c.id = g.connection_id WHERE g.agent_id = %s AND "
+                     "g.capability = 'whatsapp'", (IDS["second"],)) \
         == [("second-shared", True)]
-    assert world.sql("SELECT value FROM settings WHERE agent_id = %s AND "
+    # The setting that names the connection holds its id.
+    assert world.sql("SELECT value, connection_id FROM settings WHERE agent_id = %s AND "
                      "capability = 'whatsapp' AND path = '{connection}'",
-                     (IDS["second"],)) == [("second-shared",)]
+                     (IDS["second"],)) == [(ids["second-shared"], ids["second-shared"])]
     switch = world.through_switch(root, ["whatsapp"])
     assert switch["adapter"] == "AgentRecords"
     assert {cid: v[0]["phone"] for cid, v in switch["connections"]["whatsapp/False"].items()} \
@@ -441,8 +444,8 @@ def test_a_connection_renamed_for_this_agent(world):
     assert switch["defaults"]["whatsapp"] == "second-shared"
     assert switch["settings"]["whatsapp"]["keys"]["connection"] == "second-shared"
     # The others keep the stored one.
-    assert world.sql("SELECT connection FROM grants WHERE "
-                     "agent_id = %s AND capability = 'whatsapp'", (IDS["first"],)) == [("shared",)]
+    assert world.sql("SELECT connection_id FROM grants WHERE agent_id = %s AND "
+                     "capability = 'whatsapp'", (IDS["first"],)) == [(ids["shared"],)]
 
 
 def test_keeping_the_stores_connection_adopts_it(world):
@@ -454,7 +457,7 @@ def test_keeping_the_stores_connection_adopts_it(world):
     assert applied["state"] == "migrated" and not applied["verify"]["differences"]
     assert state(world, IDS["third"])[0] is None
     assert world.sql("SELECT spec->>'phone' FROM connections WHERE "
-                     "capability = 'whatsapp' AND name = 'shared'") == [("+10000000001",)]
+                     "capability = 'whatsapp' AND label = 'shared'") == [("+10000000001",)]
     switch = world.through_switch(root, ["whatsapp"])
     assert {cid: v[0]["phone"] for cid, v in switch["connections"]["whatsapp/False"].items()} \
         == {"shared": "+10000000001"}

@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-07 — Targets name their Coolify connection by id or label
+
+A target's `connection` names a Coolify connection by its id or its label; the node verbs resolve it among the project's Coolify connections and from then on name it by its id, which is what `--connection` hands `coolify` and `--coolify-connection` hands the manager when a node is created. The printed `telegram login --connection` step names the connection the telegram `connection` setting (else its default pointer) points at, by id or label, by its label. No verb, flag, environment variable or output key changes. Declares `capabilities-contract>=0.44,<1`.
+
 ## 2026-11-05 — The service runner reads the lease by `agent_id`, on a store at schema major 2
 
 The service runner's lease turns and `deployment services` read and write `deployment_service_leases` by `agent_id`, the column that was `project`. The rename is the capabilities manager's: its `node supervise` migrates the lease table under the ledger entry deployment gave it, and the move crosses, with every other owner's, only through `capabilities store upgrade`. The rows of what a node runs are the store's `service_instances`, written through the library. deployment declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. No verb, flag, environment variable or output key changes.

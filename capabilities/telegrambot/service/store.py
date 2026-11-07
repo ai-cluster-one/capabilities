@@ -27,7 +27,7 @@ import threading
 from pathlib import Path
 
 OWNER = "telegrambot"
-MAJOR = 1
+MAJOR = 2
 MINOR = 0
 
 STEPS: list[tuple[str, str]] = [
@@ -115,6 +115,84 @@ COMMENT ON TABLE telegrambot_prompts IS
 ]
 
 
+# A connection is named by the id the store gave it, no longer by its name,
+# which the core's step to 3.0 dropped after keeping each one in its map
+# (`core_premig_connection_names`). Every row names its bot in one of two
+# columns: `connection_id`, with a foreign key that removes the row with its
+# connection, for a connection the store holds, and `file_connection` for one
+# that only files hold (a files-mode project, or a machine's own connection
+# lent to a store-mode project), whose rows keep working. Every case over the
+# convenient case: the same shape as a node's `coolify_connection_id` /
+# `coolify_address`. Each key and index takes whichever is set where the name
+# was. The column a release of major 1 reads is gone, so this is major 2. It
+# runs after the job tables (service/jobs.py) it converts too.
+CUTOVER_STEPS: list[tuple[str, str]] = [
+    ("0007-connection-ids", r"""
+DO $$
+DECLARE
+  t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['channels', 'seen', 'jobs', 'job_amendments', 'job_slots'] LOOP
+    EXECUTE format('ALTER TABLE %I ADD COLUMN connection_id text, ADD COLUMN file_connection text',
+                   'telegrambot_' || t);
+    EXECUTE format(
+      'UPDATE %I x SET connection_id = coalesce('
+      '(SELECT m.id FROM core_premig_connection_names m'
+      ' WHERE m.capability = ''telegrambot'' AND m.name = x.connection),'
+      '(SELECT k.id FROM connections k'
+      ' WHERE k.capability = ''telegrambot'' AND k.id = x.connection))', 'telegrambot_' || t);
+    EXECUTE format('UPDATE %I SET file_connection = connection WHERE connection_id IS NULL',
+                   'telegrambot_' || t);
+    EXECUTE format('ALTER TABLE %I DROP COLUMN connection CASCADE', 'telegrambot_' || t);
+    EXECUTE format(
+      'ALTER TABLE %I ADD CONSTRAINT %I FOREIGN KEY (connection_id) REFERENCES connections (id)'
+      ' ON DELETE CASCADE, ADD CONSTRAINT %I CHECK (file_connection <> %L),'
+      ' ADD CONSTRAINT %I CHECK (num_nonnulls(connection_id, file_connection) = 1)',
+      'telegrambot_' || t, 'telegrambot_' || t || '_connection_id_fkey',
+      'telegrambot_' || t || '_file_connection_check', '',
+      'telegrambot_' || t || '_connection_check');
+    EXECUTE format('COMMENT ON COLUMN %I.connection_id IS %L', 'telegrambot_' || t,
+                   'The id of the connection - the bot - the row is about, where the store '
+                   'holds it.');
+    EXECUTE format('COMMENT ON COLUMN %I.file_connection IS %L', 'telegrambot_' || t,
+                   'The id of the connection - the bot - the row is about, where only files '
+                   'hold it; exactly one of connection_id and file_connection is set.');
+  END LOOP;
+END $$;
+CREATE UNIQUE INDEX telegrambot_channels_key ON telegrambot_channels
+  (agent_id, (coalesce(connection_id, file_connection)), chat_id, topic_id);
+CREATE UNIQUE INDEX telegrambot_seen_key ON telegrambot_seen
+  (agent_id, (coalesce(connection_id, file_connection)), kind, peer_id, topic_id);
+CREATE INDEX telegrambot_jobs_queue ON telegrambot_jobs
+  (agent_id, (coalesce(connection_id, file_connection)), state, created_at);
+CREATE INDEX telegrambot_jobs_by_chat ON telegrambot_jobs
+  (agent_id, (coalesce(connection_id, file_connection)), chat_id, topic_id, state);
+CREATE UNIQUE INDEX telegrambot_jobs_by_origin ON telegrambot_jobs
+  (agent_id, (coalesce(connection_id, file_connection)), chat_id, topic_id, origin_message_id)
+  WHERE origin_message_id IS NOT NULL;
+CREATE INDEX telegrambot_job_amendments_pending ON telegrambot_job_amendments
+  (agent_id, (coalesce(connection_id, file_connection)), job_id, state, created_at);
+CREATE UNIQUE INDEX telegrambot_job_slots_key ON telegrambot_job_slots
+  (agent_id, (coalesce(connection_id, file_connection)), slot);
+CREATE UNIQUE INDEX telegrambot_job_slots_job_key ON telegrambot_job_slots
+  (agent_id, (coalesce(connection_id, file_connection)), job_id);
+"""),
+]
+
+# A row names its bot by id in `connection_id` where the store holds that
+# connection, else in `file_connection`; every key and read takes whichever is
+# set. A write gives the id three times: `_HELD` asks the store whether it
+# holds it, and `file_connection` keeps it only where the store does not.
+CONNECTION = "coalesce(connection_id, file_connection)"
+_HELD = ("(SELECT k.id FROM connections k WHERE k.id = %s"
+         " AND k.capability = 'telegrambot')")
+CONNECTION_VALUES = f"{_HELD}, nullif(%s, {_HELD})"
+
+
+def connection_values(cid: str) -> tuple:
+    """The parameters `CONNECTION_VALUES` takes for connection `cid`."""
+    return (cid, cid, cid)
+
 class StoreUnavailable(Exception):
     """The store cannot be used; `slug` is the shared library's word for why."""
 
@@ -151,7 +229,8 @@ def steps() -> list:
         module = util.module_from_spec(spec)
         spec.loader.exec_module(module)
         extra = list(getattr(module, "STEPS", []))
-    return STEPS + extra
+    step = database().Step
+    return STEPS + extra + [step(sid, sql, core=(3, 0)) for sid, sql in CUTOVER_STEPS]
 
 
 class Store:
@@ -240,10 +319,10 @@ class Store:
         sighting is over an hour old. True when a row was written."""
         return bool(self.execute(
             """
-            INSERT INTO telegrambot_seen AS s (agent_id, connection, kind, peer_id, topic_id,
-                title, username, chat_type, is_bot, member_status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (agent_id, connection, kind, peer_id, topic_id) DO UPDATE SET
+            INSERT INTO telegrambot_seen AS s (agent_id, connection_id, file_connection, kind,
+                peer_id, topic_id, title, username, chat_type, is_bot, member_status)
+            VALUES (%s, """ + CONNECTION_VALUES + """, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (agent_id, (coalesce(connection_id, file_connection)), kind, peer_id, topic_id) DO UPDATE SET
                 title = coalesce(excluded.title, s.title),
                 username = coalesce(excluded.username, s.username),
                 chat_type = coalesce(excluded.chat_type, s.chat_type),
@@ -256,7 +335,8 @@ class Store:
                OR s.is_bot IS DISTINCT FROM excluded.is_bot
                OR s.member_status IS DISTINCT FROM coalesce(excluded.member_status, s.member_status)
                OR s.last_seen_at < now() - interval '1 hour'
-            """, (agent, connection, kind, peer_id, topic_id, title, username, chat_type,
+            """, (agent, *connection_values(connection), kind, peer_id, topic_id, title,
+                  username, chat_type,
                   bool(is_bot), member_status)))
 
     def seen(self, agent: str, connection: str, kind: str | None = None) -> list[dict]:
@@ -266,13 +346,13 @@ class Store:
         return self.execute(
             "SELECT kind, peer_id, topic_id, title, username, chat_type, is_bot, member_status,"
             " first_seen_at, last_seen_at FROM telegrambot_seen"
-            f" WHERE agent_id = %s AND connection = %s{clause}"
+            f" WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s{clause}"
             " ORDER BY kind, last_seen_at DESC", tuple(params), fetch="all")
 
     def seen_chat(self, agent: str, connection: str, chat_id: int) -> dict | None:
         return self.execute(
             "SELECT kind, peer_id, topic_id, title, username, chat_type, is_bot, member_status"
-            " FROM telegrambot_seen WHERE agent_id = %s AND connection = %s AND kind = 'chat'"
+            " FROM telegrambot_seen WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND kind = 'chat'"
             " AND peer_id = %s", (agent, connection, chat_id), fetch="one")
 
     # -- channels --------------------------------------------------------------
@@ -280,7 +360,7 @@ class Store:
     def channel(self, agent: str, connection: str, chat_id: int, topic_id: int = 0) -> dict:
         row = self.execute(
             "SELECT overrides, last_message_id, reserved, reserved_by, bot_turns"
-            " FROM telegrambot_channels WHERE agent_id = %s AND connection = %s"
+            " FROM telegrambot_channels WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s"
             " AND chat_id = %s AND topic_id = %s",
             (agent, connection, chat_id, topic_id), fetch="one")
         return row or {"overrides": {}, "last_message_id": 0, "reserved": [],
@@ -289,7 +369,7 @@ class Store:
     def channels(self, agent: str, connection: str) -> list[dict]:
         return self.execute(
             "SELECT chat_id, topic_id, overrides, last_message_id, reserved, bot_turns,"
-            " updated_at FROM telegrambot_channels WHERE agent_id = %s AND connection = %s"
+            " updated_at FROM telegrambot_channels WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s"
             " ORDER BY updated_at DESC", (agent, connection), fetch="all")
 
     def reserve(self, agent: str, connection: str, chat_id: int, topic_id: int,
@@ -298,12 +378,13 @@ class Store:
         it is already answered or already taken: then nothing more is done."""
         with self.transaction() as cur:
             cur.execute(
-                "INSERT INTO telegrambot_channels (agent_id, connection, chat_id, topic_id)"
-                " VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (agent, connection, chat_id, topic_id))
+                "INSERT INTO telegrambot_channels (agent_id, connection_id, file_connection,"
+                f" chat_id, topic_id) VALUES (%s, {CONNECTION_VALUES}, %s, %s)"
+                " ON CONFLICT DO NOTHING",
+                (agent, *connection_values(connection), chat_id, topic_id))
             cur.execute(
                 "SELECT last_message_id, reserved FROM telegrambot_channels"
-                " WHERE agent_id = %s AND connection = %s AND chat_id = %s AND topic_id = %s"
+                " WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND chat_id = %s AND topic_id = %s"
                 " FOR UPDATE", (agent, connection, chat_id, topic_id))
             last, reserved = cur.fetchone()
             if message_id <= last or message_id in (reserved or []):
@@ -311,7 +392,7 @@ class Store:
             cur.execute(
                 "UPDATE telegrambot_channels SET reserved = array_append(reserved, %s),"
                 " reserved_by = %s, reserved_at = now(), updated_at = now()"
-                " WHERE agent_id = %s AND connection = %s AND chat_id = %s AND topic_id = %s",
+                " WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND chat_id = %s AND topic_id = %s",
                 (message_id, holder, agent, connection, chat_id, topic_id))
             return True
 
@@ -327,7 +408,7 @@ class Store:
             " reserved = ARRAY(SELECT x FROM unnest(reserved) x WHERE NOT x = ANY(%s::bigint[])),"
             f" last_message_id = greatest(last_message_id, %s), bot_turns = {count},"
             " updated_at = now()"
-            " WHERE agent_id = %s AND connection = %s AND chat_id = %s AND topic_id = %s",
+            " WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND chat_id = %s AND topic_id = %s",
             (list(message_ids), top, agent, connection, chat_id, topic_id))
 
     def reset_bot_turns(self, agent: str, connection: str, chat_id: int,
@@ -335,7 +416,7 @@ class Store:
         """A person wrote here: the count of bot-started turns starts again."""
         self.execute(
             "UPDATE telegrambot_channels SET bot_turns = 0, updated_at = now()"
-            " WHERE agent_id = %s AND connection = %s AND chat_id = %s AND topic_id = %s"
+            " WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND chat_id = %s AND topic_id = %s"
             " AND bot_turns > 0", (agent, connection, chat_id, topic_id))
 
     def release(self, agent: str, connection: str, chat_id: int, topic_id: int,
@@ -345,7 +426,7 @@ class Store:
             "UPDATE telegrambot_channels SET"
             " reserved = ARRAY(SELECT x FROM unnest(reserved) x WHERE NOT x = ANY(%s::bigint[])),"
             " updated_at = now()"
-            " WHERE agent_id = %s AND connection = %s AND chat_id = %s AND topic_id = %s",
+            " WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND chat_id = %s AND topic_id = %s",
             (list(message_ids), agent, connection, chat_id, topic_id))
 
     def stale_reservations(self, agent: str, connection: str) -> list[dict]:
@@ -353,7 +434,7 @@ class Store:
         finished. They are cleared, not acted on again."""
         return self.execute(
             "SELECT chat_id, topic_id, reserved FROM telegrambot_channels"
-            " WHERE agent_id = %s AND connection = %s AND cardinality(reserved) > 0",
+            " WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND cardinality(reserved) > 0",
             (agent, connection), fetch="all")
 
     def set_override(self, agent: str, connection: str, chat_id: int, topic_id: int,
@@ -361,20 +442,21 @@ class Store:
         """Set (or, with None, clear) one `/set` override; the overrides after it."""
         with self.transaction() as cur:
             cur.execute(
-                "INSERT INTO telegrambot_channels (agent_id, connection, chat_id, topic_id)"
-                " VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (agent, connection, chat_id, topic_id))
+                "INSERT INTO telegrambot_channels (agent_id, connection_id, file_connection,"
+                f" chat_id, topic_id) VALUES (%s, {CONNECTION_VALUES}, %s, %s)"
+                " ON CONFLICT DO NOTHING",
+                (agent, *connection_values(connection), chat_id, topic_id))
             if value is None:
                 cur.execute(
                     "UPDATE telegrambot_channels SET overrides = overrides - %s,"
-                    " updated_at = now() WHERE agent_id = %s AND connection = %s"
+                    " updated_at = now() WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s"
                     " AND chat_id = %s AND topic_id = %s RETURNING overrides",
                     (key, agent, connection, chat_id, topic_id))
             else:
                 cur.execute(
                     "UPDATE telegrambot_channels SET overrides = overrides ||"
                     " jsonb_build_object(%s::text, %s::jsonb), updated_at = now()"
-                    " WHERE agent_id = %s AND connection = %s AND chat_id = %s"
+                    " WHERE agent_id = %s AND coalesce(connection_id, file_connection) = %s AND chat_id = %s"
                     " AND topic_id = %s RETURNING overrides",
                     (key, json.dumps(value), agent, connection, chat_id, topic_id))
             return cur.fetchone()[0] or {}
