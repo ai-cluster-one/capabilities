@@ -655,6 +655,19 @@ class Reports(unittest.TestCase):
                     mock.patch.object(wa, "_inventory_verdict", lambda: {"ok": True}):
                 self.assertEqual(wa._inventory(False)["service"]["detail"], expected)
 
+    def test_status_names_the_connection_by_its_label(self):
+        """The store keys a connection by its id; the status a person reads
+        names it by its label."""
+        cfg = {"id": "c0ffee000003", "label": "personal", "mode": "personal",
+               "engine": "inhouse"}
+        facts = {"chats": 0, "messages": 0, "oldest": None, "newest": None,
+                 "chunks": 0, "last_capture": None, "location": "store"}
+        with mock.patch.object(wa, "_session_account", lambda c: (None, None, None)), \
+                mock.patch.object(wa, "_store_facts", lambda c: facts), \
+                mock.patch.object(wa, "_session_exists", lambda c: False):
+            first = wa._wm_status(cfg).splitlines()[0]
+        self.assertEqual(first, "Profile:  personal (mode: personal, engine: inhouse)")
+
     def test_the_inventory_verdict_leaves_a_stopped_account_as_it_found_it(self):
         """With the service stopped, the verdict neither creates the account's
         home nor takes its lock, which `service run` and every session take

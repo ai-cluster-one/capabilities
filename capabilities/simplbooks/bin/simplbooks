@@ -837,15 +837,16 @@ def _resolve_connection(wanted: str | None) -> dict:
                  or os.environ.get("SIMPLBOOKS_EMAIL") or "")
         return {"id": cid, "entry": None, "email": email or None,
                 "password": None, "allow_write": WRITE_DEFAULT}
+    named = entry.get("label") or cid  # the word a person reads; the id keys it
     email = entry.get("email")
     if not email:
         _die(6, "incomplete_connection",
-             f"connection {cid!r} is missing 'email'",
+             f"connection {named!r} is missing 'email'",
              f"add the login email to this connection in connections.json")
     secret_env = entry.get("secret_env")
     if not secret_env:
         _die(6, "no_secret_env",
-             f"connection {cid!r} is missing 'secret_env'",
+             f"connection {named!r} is missing 'secret_env'",
              "name the env var that holds this identity's SimpleBooks password")
     password = _resolve_env_key(secret_env)[0]
     return {"id": cid, "entry": entry, "email": email,

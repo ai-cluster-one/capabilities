@@ -143,7 +143,7 @@
     "instagram": {
       "icon": true,
       "path": "capabilities/instagram",
-      "payload_sha256": "3d4752e524f0911af864dde1ae52a5fe92b119cb445840628cd359622da8ea58",
+      "payload_sha256": "9024dfca9c3831371e249bd4df48d4cab7f225e28a9fad983319e3206cf88bec",
       "store_major": 3,
       "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first."
     },
@@ -220,7 +220,7 @@
     "simplbooks": {
       "icon": true,
       "path": "capabilities/simplbooks",
-      "payload_sha256": "9bd158247cb62db711655836b26bf39db59043500a70450ffdd470399632d94b",
+      "payload_sha256": "dcc3bd177ab4f0ee5d88da867b6b80d241e95c10b854043ee1917aabb33f054e",
       "store_major": 3,
       "summary": "SimpleBooks accounting CLI over a browser session (no public API) — read clients/invoices/purchases/accounts/bank-transactions/financial_transactions, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist. Stateful — run `simplbooks doctor` first."
     },
@@ -283,7 +283,7 @@
     "whatsapp": {
       "icon": true,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "4b8ceead69b7b8dbb09c6d3b1593936cd3dab7e6e2b02635db8276a4f63e80d0",
+      "payload_sha256": "c176b6921f3c7dbb9f274614af113ea8bfd7b22b9301d06a6eab720d0385869d",
       "store_major": 3,
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },

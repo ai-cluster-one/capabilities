@@ -1353,5 +1353,47 @@ class FormerNameSessionTests(unittest.TestCase):
             self.assertIn("work", err.getvalue())
 
 
+
+class ConnectionLabelTests(unittest.TestCase):
+    """The store keys a connection by its id; what doctor says of it names it
+    by its label."""
+
+    def test_an_entry_check_names_the_connection_by_its_label(self) -> None:
+        with self.assertRaises(instagram.InstagramFailure) as caught:
+            instagram._connection_from_entry(
+                "0a1b2c3d4e5f", {"label": "personal", "expected_username": ""})
+        self.assertEqual(caught.exception.message,
+                         "Connection 'personal' requires a valid expected_username")
+
+    def test_doctor_names_a_connection_not_ready_by_its_label(self) -> None:
+        from unittest import mock
+
+        reg = {"connections": {"0a1b2c3d4e5f": {"label": "personal",
+                                                "expected_username": "example"}}}
+
+        class _Client:
+            def __init__(self, _conn):
+                pass
+
+            def __enter__(self):
+                raise instagram.InstagramFailure(2, "session_missing", "no session")
+
+            def __exit__(self, *exc):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(instagram, "_state_dir", lambda: Path(tmp)), \
+                mock.patch.object(instagram, "_connection_former_name",
+                                  lambda wanted: None, create=True), \
+                mock.patch.object(instagram, "_connections_registry", lambda: (reg, None)), \
+                mock.patch.object(instagram, "_connections_report", lambda: {}), \
+                mock.patch.object(instagram, "_doctor_gate", lambda *a: None), \
+                mock.patch.object(instagram, "InstagramWebClient", _Client), \
+                self.assertRaises(instagram.InstagramFailure) as caught:
+            instagram.cmd_doctor(None)
+        self.assertEqual(caught.exception.message,
+                         "One or more Instagram connections are not ready: "
+                         "personal: session_missing")
+
 if __name__ == "__main__":
     unittest.main()

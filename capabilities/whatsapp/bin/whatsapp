@@ -3881,7 +3881,7 @@ def _wm_status(cfg: dict) -> str:
     account_id, account_jid, push_name = _session_account(cfg)
     facts = _store_facts(cfg)
     lines = [
-        f"Profile:  {cfg['id']} (mode: {cfg['mode']}, engine: {cfg['engine']})",
+        f"Profile:  {cfg.get('label') or cfg['id']} (mode: {cfg['mode']}, engine: {cfg['engine']})",
         f"Linked:   {'yes' if _session_exists(cfg) else 'no'}",
         f"Account:  {push_name or '—'} ({account_jid or '—'})",
         f"Bound to: {cfg.get('expected_account_id') or '— (unbound)'}",

@@ -238,6 +238,7 @@ class Connection:
     allow_write: bool
     timeout_seconds: int
     session_path: Path
+    label: str = ""  # the word a person reads; the id keys it
 
 
 @dataclass(frozen=True)
@@ -514,28 +515,29 @@ def _load_template(path: Path) -> RequestTemplate:
 
 
 def _connection_from_entry(cid: str, raw: Any) -> Connection:
+    named = (raw.get("label") if isinstance(raw, dict) else None) or cid
     if not isinstance(raw, dict):
         raise InstagramFailure(
-            6, "bad_config", f"Connection {cid!r} must be a JSON object"
+            6, "bad_config", f"Connection {named!r} must be a JSON object"
         )
     username = str(raw.get("expected_username") or "").strip().removeprefix("@")
     if not PROFILE_RE.fullmatch(username):
         raise InstagramFailure(
             6,
             "bad_config",
-            f"Connection {cid!r} requires a valid expected_username",
+            f"Connection {named!r} requires a valid expected_username",
         )
     try:
         timeout = int(raw.get("timeout_seconds", 30))
     except (TypeError, ValueError) as exc:
         raise InstagramFailure(
-            6, "bad_config", f"Connection {cid!r} timeout_seconds must be an integer"
+            6, "bad_config", f"Connection {named!r} timeout_seconds must be an integer"
         ) from exc
     if timeout < 5 or timeout > 120:
         raise InstagramFailure(
             6,
             "bad_config",
-            f"Connection {cid!r} timeout_seconds must be between 5 and 120",
+            f"Connection {named!r} timeout_seconds must be between 5 and 120",
         )
     return Connection(
         id=cid,
@@ -545,6 +547,7 @@ def _connection_from_entry(cid: str, raw: Any) -> Connection:
         # A session made under the connection's former name is moved to its
         # id on first use, so a signed-in device is found again.
         session_path=_connection_state_dir(_state_dir(), cid) / "session.json",
+        label=named,
     )
 
 
@@ -2383,7 +2386,8 @@ def cmd_doctor(wanted: str | None) -> None:
             )
         except InstagramFailure as exc:
             failures.append(
-                {"connection": conn.id, "code": exc.code, "message": exc.message}
+                {"connection": conn.id, "label": conn.label or conn.id,
+                 "code": exc.code, "message": exc.message}
             )
     if failures:
         raise InstagramFailure(
@@ -2391,7 +2395,7 @@ def cmd_doctor(wanted: str | None) -> None:
             "doctor_failed",
             "One or more Instagram connections are not ready: "
             + "; ".join(
-                f"{item['connection']}: {item['code']}" for item in failures
+                f"{item['label']}: {item['code']}" for item in failures
             ),
             "run `instagram connections`, refresh the affected session, and retry",
         )

@@ -4,6 +4,8 @@
 
 The stored session (`session.json`) is kept under `<state>/<connection id>/`. Where that does not exist and the store's map names the connection's former name, the folder made under that name is moved to the id once, saying so on stderr, so a device already signed in is found again after the store's move to connection ids, with no new sign-in. Declares `capabilities-contract>=0.44,<1`, the library that keeps the map and moves the folder.
 
+`doctor` names a connection by its label where it is not ready or its entry is incomplete, where it named the id. The `connection` key of its output keeps the id.
+
 ## 2026-10-30 — `instagram` carries its own icon
 
 The bundle holds its icon as `icon.png`; `capabilities icon instagram` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

@@ -4,6 +4,8 @@
 
 The minted session of a named connection is kept under `<state>/<connection id>/`. Where that does not exist and the store's map names the connection's former name, the folder made under that name is moved to the id once, saying so on stderr, so a session already made survives the store's move to connection ids. Declares `capabilities-contract>=0.44,<1`, the library that keeps the map and moves the folder.
 
+A connection missing its `email` or `secret_env` is named by its label in the refusal, `doctor`'s included, where it was named by the id.
+
 ## 2026-11-02 — `simplbooks` reads back every column of a binding and a purchase's reference
 
 `simplbooks payments show <id> --json` and `simplbooks incomings show <id> --json` give each `bound` row a `columns` object: every cell of that row of the bound-documents table under the page's own header label, with an unlabelled or repeated header keyed by its position. `simplbooks purchases show <id>` read from the edit form also returns the saved reference number (`reference`), the payment description (`payment_description`) and the payments and incomings bound to the purchase (`bindings`, read from its view page; `null` when that page cannot be read). The view-page read (`--view`, or a payment-locked purchase) returns every label/value pair the page shows as `fields`. Every existing key keeps its name and value.
