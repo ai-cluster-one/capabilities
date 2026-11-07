@@ -12875,6 +12875,7 @@ NODE_REFERENCES = (
     ("agentrooms_sessions", "node", "whole"),
     ("agentrooms_turns", "node", "whole"),
     ("askproject_sessions", "host", "whole"),
+    ("askproject_sessions", "node_id", "whole"),
     ("automations_definition_versions", "node", "whole"),
     ("automations_runs", "node", "whole"),
     ("automations_runs", "environment", "whole"),
