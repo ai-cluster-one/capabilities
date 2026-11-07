@@ -444,11 +444,14 @@ class PeerTimeout(Exception):
         self.session_id = session_id
 
 
-# The session map: one row per caller, machine and target in the machine's
-# store, so the next question to a target continues the same peer session. The
-# host is part of the key because a peer session lives in that machine's claude
-# or codex store, where the same target path means nothing on another machine.
-SESSIONS_MAJOR, SESSIONS_MINOR = 2, 0
+# The session map: one row per caller, node and target in the machine's store,
+# so the next question to a target continues the same peer session. The node is
+# part of the key because a peer session lives in that node's claude or codex
+# store, under the target's folder, where the same path means nothing on another
+# node; so the folder stays the target even where it is an agent's.
+from capabilities_contract.db import Step  # noqa: E402  (bound with the tiers above)
+
+SESSIONS_MAJOR, SESSIONS_MINOR = 3, 0
 SESSIONS_STEPS = [
     ("0001-sessions", """
     CREATE TABLE askproject_sessions (
@@ -484,6 +487,49 @@ SESSIONS_STEPS = [
         END LOOP;
     END
     $rename$"""),
+    # 3.0: the node is named by its id in `node_id`, an agent caller by its id
+    # alone and a caller with no id by its root, and the target also by the
+    # agent whose folder it is on that node. The rows as they stood are copied
+    # whole into askproject_premig_m7 first. A node value that is not a node id
+    # is left as it is: nothing in the store says which node it was.
+    Step("0003-node-and-target-agent", """
+    CREATE TABLE askproject_premig_m7 AS TABLE askproject_sessions;
+    COMMENT ON TABLE askproject_premig_m7 IS
+        'askproject_sessions exactly as it stood before step 0003 (askproject 3.0), every row, so the re-key can be undone';
+    ALTER TABLE askproject_sessions DROP CONSTRAINT askproject_sessions_pkey;
+    ALTER TABLE askproject_sessions RENAME COLUMN host TO node_id;
+    ALTER TABLE askproject_sessions ALTER COLUMN agent_id DROP NOT NULL;
+    ALTER TABLE askproject_sessions ADD COLUMN caller_root text;
+    ALTER TABLE askproject_sessions ADD COLUMN target_agent_id text;
+    UPDATE askproject_sessions SET caller_root = substr(agent_id, 6), agent_id = NULL
+     WHERE agent_id LIKE 'path:%';
+    UPDATE askproject_sessions s SET target_agent_id = an.agent_id
+      FROM agent_nodes an WHERE an.node = s.node_id AND an.folder = s.target_path;
+    ALTER TABLE askproject_sessions
+        ADD CONSTRAINT askproject_sessions_agent_id_check CHECK (agent_id <> ''),
+        ADD CONSTRAINT askproject_sessions_caller_root_check CHECK (caller_root <> ''),
+        ADD CONSTRAINT askproject_sessions_one_caller
+            CHECK ((agent_id IS NULL) <> (caller_root IS NULL)),
+        ADD CONSTRAINT askproject_sessions_node_id_check CHECK (node_id <> ''),
+        ADD CONSTRAINT askproject_sessions_target_agent_id_check
+            CHECK (target_agent_id <> '');
+    CREATE UNIQUE INDEX askproject_sessions_agent_key
+        ON askproject_sessions (agent_id, node_id, target_path) WHERE agent_id IS NOT NULL;
+    CREATE UNIQUE INDEX askproject_sessions_root_key
+        ON askproject_sessions (caller_root, node_id, target_path) WHERE caller_root IS NOT NULL;
+    COMMENT ON TABLE askproject_sessions IS
+        'The peer session each caller last ran in each target on each node, so -c continues it: one row per caller, node and target folder';
+    COMMENT ON COLUMN askproject_sessions.agent_id IS
+        'The calling agent''s id; null for a caller with no id, which caller_root names instead';
+    COMMENT ON COLUMN askproject_sessions.caller_root IS
+        'The root of a calling project that has no agent id (else the working directory it called from); null for an agent caller';
+    COMMENT ON COLUMN askproject_sessions.node_id IS
+        'The node whose claude or codex store holds the peer session';
+    COMMENT ON COLUMN askproject_sessions.target_path IS
+        'The target folder on that node, where the peer session lives';
+    COMMENT ON COLUMN askproject_sessions.target_agent_id IS
+        'The agent whose folder target_path is on that node (agent_nodes), written with every row; null for a target that is no agent''s folder'""",
+         core=(2, 0), major=3),
 ]
 
 
@@ -513,13 +559,15 @@ class SessionStoreError(Exception):
              self.slug, self.message, self.hint)
 
 
-def _caller_key() -> str:
-    """Whose sessions these are: the calling project's id, or, for a caller
-    with no id a write may stamp, `path:` and its root (else the working
+def _caller() -> tuple[str | None, str | None]:
+    """Whose sessions these are, as (agent id, root): the calling project's id,
+    or, for a caller with no id a write may stamp, its root (else the working
     directory), so two callers without an id never share a session."""
     root = _project_root()
     project_id = _project_id(write=True, refuse=False) if root is not None else None
-    return project_id or f"path:{root or Path.cwd().resolve()}"
+    if project_id:
+        return project_id, None
+    return None, str(root or Path.cwd().resolve())
 
 
 def _db():
@@ -551,8 +599,8 @@ class SessionMap:
     across a network is worth holding idle."""
 
     def __init__(self):
-        self.project_id = _caller_key()
-        self.host = node_name()
+        self.agent_id, self.caller_root = _caller()
+        self.node_id = node_name()
         self.setting = None
 
     def _open(self):
@@ -579,6 +627,11 @@ class SessionMap:
             raise SessionStoreError(exc.slug, exc.message, exc.hint) from exc
         return conn
 
+    @property
+    def _caller_column(self) -> str:
+        """The column that names this caller: its agent id, else its root."""
+        return "agent_id" if self.agent_id is not None else "caller_root"
+
     @staticmethod
     def _entry(row) -> dict:
         entry = {k: v for k, v in zip(SESSION_COLUMNS, row) if v is not None}
@@ -592,9 +645,9 @@ class SessionMap:
             with conn.cursor() as cur:
                 cur.execute(
                     f"SELECT target_path, {', '.join(SESSION_COLUMNS)} "
-                    "FROM askproject_sessions WHERE agent_id = %s AND host = %s"
-                    f"{where} ORDER BY last_used_at NULLS FIRST, target_path",
-                    (self.project_id, self.host, *params))
+                    f"FROM askproject_sessions WHERE {self._caller_column} = %s "
+                    f"AND node_id = %s{where} ORDER BY last_used_at NULLS FIRST, target_path",
+                    (self.agent_id or self.caller_root, self.node_id, *params))
                 rows = cur.fetchall()
             conn.commit()
         finally:
@@ -617,15 +670,21 @@ class SessionMap:
         conn = self._open()
         try:
             with conn.cursor() as cur:
+                caller = self._caller_column
                 cur.execute(
-                    "INSERT INTO askproject_sessions (agent_id, host, target_path, "
-                    f"{', '.join(SESSION_COLUMNS)}) VALUES "
-                    "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
-                    "ON CONFLICT (agent_id, host, target_path) DO UPDATE SET "
+                    "INSERT INTO askproject_sessions (agent_id, caller_root, node_id, "
+                    f"target_path, target_agent_id, {', '.join(SESSION_COLUMNS)}) VALUES "
+                    "(%s, %s, %s, %s, (SELECT agent_id FROM agent_nodes "
+                    "WHERE node = %s AND folder = %s), "
+                    "%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) "
+                    f"ON CONFLICT ({caller}, node_id, target_path) "
+                    f"WHERE {caller} IS NOT NULL DO UPDATE SET "
+                    "target_agent_id = EXCLUDED.target_agent_id, "
                     + ", ".join(f"{c} = EXCLUDED.{c}" for c in SESSION_COLUMNS
                                 if c != "interactions")
                     + ", interactions = askproject_sessions.interactions + %s",
-                    (self.project_id, self.host, target, *values,
+                    (self.agent_id, self.caller_root, self.node_id, target,
+                     self.node_id, target, *values,
                      int(interaction),
                      None if used is None else datetime.datetime.fromtimestamp(
                          used, tz=datetime.timezone.utc),
