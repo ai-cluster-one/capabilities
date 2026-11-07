@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-07 — `node rekey` moves askproject's session rows under `node_id`
+
+`node rekey` moves `askproject_sessions.node_id`, the name askproject 3.0 gives the column that was `host`, with every other column that names a node, so a conversation `askproject -c` continued on a node is still found there after the node's id changes. A store whose askproject tables are still at 2.0 has its rows moved under `host` as before.
+
 ## 2026-11-06 — `store upgrade` fetches its own PostgreSQL client where none of the server's major is installed
 
 Where `capabilities store upgrade --check` finds no `pg_dump` or `pg_restore` of the server's major or newer, on macOS 15 or later or on Linux with glibc 2.34 or later, arm64 or x86_64, it no longer stops at `pg_dump_missing`, `pg_restore_missing` or their `_too_old`: its `tools.fetch` names the PostgreSQL client the upgrade fetches first - version 18.6.1 from the GitHub releases of theseus-rs/postgresql-binaries (PostgreSQL License), its URL, the sha256 pinned for the platform, its size and the folder it goes to - and the message says the upgrade fetches it, takes a dump, then crosses. `store upgrade` then runs a `client` step before the dump, spoken as its own `step` events: it downloads the archive, refuses it unless its sha256 is the pin (exit 6 `pg_client_checksum_mismatch`, nothing of it kept; exit 5 `pg_client_fetch_failed` where it cannot be fetched), keeps only `pg_dump`, `pg_restore`, `psql` and the libraries they load under `$XDG_DATA_HOME/capabilities/pg-client/18.6.1-<platform>`, and the dump and its proof run with those tools. Nothing is installed anywhere else and no package manager is used; a later check finds the fetched client where it went. A client already installed of the server's major is used as before and nothing is fetched; elsewhere, or for a server newer than 18, the blockers stand as before.
