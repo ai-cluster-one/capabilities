@@ -944,6 +944,35 @@ def test_a_binding_kept_under_the_connections_label_is_read_and_moved_to_its_id(
 
 
 @needs_store
+def test_service_doctor_and_inventory_name_each_agent_by_its_connections_label(
+        cli, project, stored, homeserver, capsys):
+    # The store keys a connection by the id it gave it; what a person reads
+    # names the agent by its label.
+    identity = project / "capabilities" / "project.json"
+    identity.write_text(json.dumps({"slug": "project", "connections": "store"}))
+    (project / ".env.local").write_text(f"AGENTROOMS_ALPHA_TOKEN={TOKEN}\n")
+    records = cli._records()
+    records.set("agentrooms", "connection", "alpha", {
+        "homeserver": HS, "user_id": f"@alpha:{SERVER}", "secret_env": "AGENTROOMS_ALPHA_TOKEN"})
+    records.set("agentrooms", "grant", "alpha", {"enabled": True, "allow_write": True})
+    records.set("agentrooms", "connection", "beta", {
+        "homeserver": HS, "user_id": f"@beta:{SERVER}", "secret_env": "AGENTROOMS_ALPHA_TOKEN"})
+    records.set("agentrooms", "grant", "beta", {"enabled": True, "allow_write": False})
+    alpha = records.connection_id("agentrooms", "alpha")
+    beta = records.connection_id("agentrooms", "beta")
+    assert alpha not in ("alpha", None) and beta not in ("beta", None)
+    code, out, err = run(cli, capsys, "inventory")
+    assert code == 0, err
+    assert sorted(item["name"] for item in out["items"]) == ["alpha", "beta"]
+    _code, out, err = run(cli, capsys, "service", "doctor")
+    assert out is not None, err
+    assert out["agents"]["served"] == ["alpha"]
+    assert list(out["agents"]["skipped"]) == ["beta"]
+    assert "'beta'" in out["agents"]["skipped"]["beta"] and beta not in json.dumps(out)
+    assert "agent:alpha" in out and f"agent:{alpha}" not in out
+
+
+@needs_store
 def test_register_completes_a_declared_connection_and_defaults_only_to_a_granted_one(
         cli, project, stored, capsys, homeserver, monkeypatch):
     monkeypatch.setattr(sys, "stdin", Piped("reg-token\n"))

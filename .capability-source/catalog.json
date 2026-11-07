@@ -3,7 +3,7 @@
     "agentrooms": {
       "icon": true,
       "path": "capabilities/agentrooms",
-      "payload_sha256": "f2021e86ecae3e90e2adcd77869fde093468b348b81676ae2f72d7e9dd3c8d40",
+      "payload_sha256": "371bdd47356f3f68b908c81ae8e637790d4359d3c0e596d4daf3fad90f093e42",
       "store_major": 3,
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
@@ -234,14 +234,14 @@
     "slack": {
       "icon": true,
       "path": "capabilities/slack",
-      "payload_sha256": "2adb3ced9cb72ee65bbd39d5182679c25c609564830545db714c0051e66cf225",
+      "payload_sha256": "5048170a99d6d1258bae5f7ed01bf65c9fb0ac36abb3ec723a474444bd7e2cbd",
       "store_major": 3,
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy."
     },
     "slacker": {
       "icon": true,
       "path": "capabilities/slacker",
-      "payload_sha256": "be853d340dfcb5cec6d1c3fca6eac2323e74108b570416957c1194ad6e809f56",
+      "payload_sha256": "5868f2d485128950a3ea7d4d826769a92cce6545da23b56664ca7a1f4cd504ae",
       "store_major": 3,
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live. Read-only: it never writes to Slack."
     },
@@ -262,14 +262,14 @@
     "telegram": {
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "b928e5d803c9d3dc83a2897721b23a5026447ed05790c157b68645c86eb833e8",
+      "payload_sha256": "082aa3610a82dec458729418f9b67a1452711d22a1332ebb337f96e003326f09",
       "store_major": 3,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "telegrambot": {
       "icon": false,
       "path": "capabilities/telegrambot",
-      "payload_sha256": "b26fffede27afbb5f10cc74b86369c7248ff6d8912dab18010860b7835488fb8",
+      "payload_sha256": "625eac3ec4dd127601dc5614ccb77cc999eacfc51f609b8000aea276ec27ea17",
       "store_major": 3,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation."
     },
@@ -283,14 +283,14 @@
     "whatsapp": {
       "icon": true,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "cf75ea7e02247cb6c507be205788a341ecc37cbafd5af7f476d28505343f1ffa",
+      "payload_sha256": "528689b1c4c60b1c684ff4811fc836f51d740bcb7062abb54a440240f0b9ec2f",
       "store_major": 3,
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {
       "icon": true,
       "path": "capabilities/windmill",
-      "payload_sha256": "cdb9e2bcf0a3e58b9a0f82521b533732e850022153a9a32fce81996cc54ea55c",
+      "payload_sha256": "af7946b755ce933e06da71317fb6d26664c9096b4eb4290f43f9db9942ef21fd",
       "store_major": 3,
       "summary": "Windmill CLI over the REST API — deploy scripts, attach cron schedules, run jobs, read run history/logs, and manage secret variables and folders."
     },

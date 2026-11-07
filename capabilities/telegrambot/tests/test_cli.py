@@ -294,3 +294,15 @@ def test_a_session_made_under_the_former_name_is_found_and_moved(tmp_path, monke
     assert (state / cid / "123456" / "mtproto.session").read_text() == "session"
     assert not (state / "helper").exists()
     assert "helper" in capsys.readouterr().err
+
+
+
+def test_the_inventory_names_each_bot_by_its_connections_label(cli, monkeypatch):
+    # The store keys a connection by its id; the item a person reads names it
+    # by its label.
+    held = {"connections": {"0123456789ab": {"id": "0123456789ab", "label": "helper",
+                                             "granted": True}}}
+    monkeypatch.setattr(cli, "_inventory_connections", lambda *a: held)
+    monkeypatch.setattr(cli, "_readiness", lambda entry: {"history": True, "voice": False})
+    items = cli._inventory(False)["items"]
+    assert [item["name"] for item in items] == ["helper"]

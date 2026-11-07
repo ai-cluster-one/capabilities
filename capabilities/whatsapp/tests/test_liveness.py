@@ -639,6 +639,22 @@ class Reports(unittest.TestCase):
         self.assertFalse(verdict["ok"])
         self.assertTrue(verdict["problem"].startswith("service_stale: pid "))
 
+    def test_the_inventory_service_line_names_the_connection_by_its_label(self):
+        """The store keys a connection by its id; the service line a person
+        reads names it by its label, running or not."""
+        labels = {"c0ffee000002": "personal"}
+        for running, expected in (
+                (True, "pid 42, healthy, connection personal"),
+                (False, "connection personal")):
+            status = {"connection": "c0ffee000002", "running": running, "pid": 42,
+                      "state": "healthy", "initialized": True}
+            with mock.patch.object(wa, "_project_root", lambda: Path("/p")), \
+                    mock.patch.object(wa, "_cmd_service_status", lambda *a: dict(status)), \
+                    mock.patch.object(wa, "_connection_label",
+                                      lambda cid: labels.get(cid, cid)), \
+                    mock.patch.object(wa, "_inventory_verdict", lambda: {"ok": True}):
+                self.assertEqual(wa._inventory(False)["service"]["detail"], expected)
+
     def test_the_inventory_verdict_leaves_a_stopped_account_as_it_found_it(self):
         """With the service stopped, the verdict neither creates the account's
         home nor takes its lock, which `service run` and every session take

@@ -2082,11 +2082,16 @@ class _Capture:
 def _inventory(network: bool) -> dict:
     """What this capability holds on this machine, read from local state only:
     the linked accounts (one state home each) and the capture service's last
-    health. Secret-free, no network, no store — the per-account message counts
-    the store holds are deferred, since they need a project's database and a
-    connection the inventory does not resolve."""
+    health, each account named by its connection's label. Secret-free and no
+    network; the per-account message counts the store holds are deferred,
+    since they need a project's database and a connection the inventory does
+    not resolve."""
     root = _STATE_HOME / NAME
     accounts = sorted(p.name for p in root.iterdir()) if root.is_dir() else []
+    # A home is kept under the connection's id; a person reads its label. The
+    # read never dies: with no store to answer, the folder's own name stands.
+    labels = {cid: entry.get("label") or cid for cid, entry
+              in (_inventory_connections().get("connections") or {}).items()}
     service_state = "stopped"
     for name in accounts:
         health = _service_read(root / name / "service", "health.json")
@@ -2095,7 +2100,7 @@ def _inventory(network: bool) -> dict:
             break
     return {
         "metrics": [{"label": "linked accounts", "value": len(accounts)}],
-        "items": [{"name": a, "kind": "linked_account"} for a in accounts],
+        "items": [{"name": labels.get(a) or a, "kind": "linked_account"} for a in accounts],
         "service": {"state": service_state},
         "deferred": [{"label": "captured message counts",
                       "reason": "needs a project database and a connection; "

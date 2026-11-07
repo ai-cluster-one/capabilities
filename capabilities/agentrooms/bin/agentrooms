@@ -3699,18 +3699,20 @@ def _resolve_profile(store, project_id: str, name: str):
     return profile, knobs.get("harness"), origin
 
 
-def _agent_refusal(cid: str, reg: dict) -> tuple | None:
+def _agent_refusal(cid: str, reg: dict, label: str | None = None) -> tuple | None:
     """Why the service may not act for this agent in the project now, or None:
-    the connection is declared, granted, and allows writes."""
+    the connection is declared, granted, and allows writes. The reason names
+    the connection by `label`, the word a person reads, where one is given."""
+    named = label or cid
     if cid in (reg.get("withheld") or {}):
-        return ("refused", f"connection {cid!r} is not granted in this project")
+        return ("refused", f"connection {named!r} is not granted in this project")
     entry = (reg.get("connections") or {}).get(cid)
     if entry is None:
-        return ("refused", f"connection {cid!r} is not declared in this project")
+        return ("refused", f"connection {named!r} is not declared in this project")
     if read_only_switch():
         return ("refused", f"{READ_ONLY_ENV} is set, so no answer may be posted")
     if not entry.get("allow_write", WRITE_DEFAULT):
-        return ("refused", f"connection {cid!r} has no write grant, and the service answers by "
+        return ("refused", f"connection {named!r} has no write grant, and the service answers by "
                            "posting; ask the user to grant allow_write")
     return None
 
@@ -3743,16 +3745,19 @@ def _plan_here(root: Path, expected_id: str | None) -> dict:
     agents: dict = {}
     skipped: dict = {}
     for cid in sorted(declared):
-        refusal = _agent_refusal(cid, reg)
+        # What a person reads names each agent by its connection's label;
+        # the service keys it by the id.
+        label = declared[cid].get("label") or cid
+        refusal = _agent_refusal(cid, reg, label)
         if refusal:
-            skipped[cid] = refusal[1]
+            skipped[label] = refusal[1]
             continue
         cfg, problem = _build_cfg(cid, reg["connections"][cid])
         if problem:
-            skipped[cid] = problem["message"]
+            skipped[label] = problem["message"]
             continue
         token_print = engine.fingerprint_of(cfg["token"].encode())
-        agents[cid] = {"connection": cid, "homeserver": cfg["homeserver"],
+        agents[cid] = {"connection": cid, "label": label, "homeserver": cfg["homeserver"],
                        "user_id": cfg["user_id"], "token": cfg["token"],
                        "token_fingerprint": token_print,
                        "identity": (cfg["homeserver"], cfg["user_id"], token_print)}
@@ -4970,7 +4975,8 @@ def cmd_service_doctor(machine: bool) -> None:
         root = _project_root()
         try:
             plan = _plan_here(root, None)
-            note("agents", {"ok": True, "served": sorted(plan["agents"]),
+            note("agents", {"ok": True, "served": sorted(agent["label"] for agent
+                                                         in plan["agents"].values()),
                             "skipped": plan["skipped"]})
         except _Refusal as exc:
             plan = None
@@ -5009,7 +5015,7 @@ def cmd_service_doctor(machine: bool) -> None:
                         row["card"] = waiting
                     if not row["workers"].get("ok", True) and row.get("ok"):
                         row.update(ok=False, category=6)
-                    note(f"agent:{cid}", row)
+                    note(f"agent:{agent['label']}", row)
             finally:
                 if store is not None:
                     store.close()
@@ -5043,7 +5049,8 @@ def _inventory(_network: bool) -> dict:
     bindings = _bindings()
     items = []
     for cid, entry in sorted(conns.items()):
-        items.append({"group": "agents", "name": cid, "state": "granted" if entry.get("granted")
+        items.append({"group": "agents", "name": entry.get("label") or cid,
+                      "state": "granted" if entry.get("granted")
                       else "withheld", "detail": entry.get("user_id"),
                       "attributes": [{"label": "homeserver", "value": entry.get("homeserver")},
                                      {"label": "writes", "value": bool(entry.get("allow_write"))},

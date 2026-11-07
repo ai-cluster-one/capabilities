@@ -4,6 +4,8 @@
 
 A connection is keyed by the opaque id the store gives it, and called by its label; `--connection` and the service setting `connection` take either, and `service init` writes the id. The service's state folder made under a connection's former name is moved to `<state>/slack/<id>/service` the first time the connection is used, saying so on stderr, so the service keeps its watermarks and register. Declares `capabilities-contract>=0.44,<1`. No verb, flag, environment variable or output key changes; a `connection` key carries the id.
 
+What a person reads names a connection by its label: the service line `inventory` reports reads `connection <label>`, where it read the id.
+
 ## 2026-11-01 — `slack` carries Slack's official logo as its icon
 
 The bundle's `icon.png` is now Slack's official full-colour mark on its aubergine square, the 256 x 256 image Slack serves for its media kit, unmodified, where it was a 35 x 34 image. The mark is a trademark of Slack, used here only to identify the service the capability reaches. `capabilities icon slack` answers its path and size. Nothing else changes.

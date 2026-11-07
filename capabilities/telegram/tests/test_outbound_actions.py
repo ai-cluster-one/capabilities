@@ -1585,6 +1585,25 @@ class ServiceDoctorExitTests(unittest.TestCase):
                         mock.patch.object(cli, "_service_worker_preflight", no_worker_call):
                     self.assertEqual(cli._inventory_verdict(), expected)
 
+    def test_the_inventory_service_line_names_the_connection_by_its_label(self):
+        """The store keys a connection by its id; the service line a person
+        reads names it by its label, running or not."""
+        cli = import_cli()
+        labels = {"c0ffee000001": "assistant"}
+        for running, expected in (
+                (True, "pid 42, health healthy, connection assistant"),
+                (False, "connection assistant")):
+            live = {"connection": "c0ffee000001", "owner_running": running,
+                    "owner": {"pid": 42}, "pid": 42, "health": {"state": "healthy"}}
+            with tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.object(cli, "_project_root", lambda: Path(tmp)), \
+                    mock.patch.object(cli, "_service_liveness", lambda *a: dict(live)), \
+                    mock.patch.object(cli, "_service_initialized", lambda *a: True), \
+                    mock.patch.object(cli, "_connection_label",
+                                      lambda cid: labels.get(cid, cid)), \
+                    mock.patch.object(cli, "_inventory_verdict", lambda: {"ok": True}):
+                self.assertEqual(cli._inventory(False)["service"]["detail"], expected)
+
     def test_a_refused_local_check_is_the_inventory_problem(self):
         cli = import_cli()
 

@@ -1829,7 +1829,7 @@ def _inventory(_network: bool) -> dict:
     items = []
     for cid, entry in sorted(conns.items()):
         ready = _readiness(entry)
-        items.append({"group": "bots", "name": cid,
+        items.append({"group": "bots", "name": entry.get("label") or cid,
                       "state": "granted" if entry.get("granted") else "withheld",
                       "detail": ", ".join(f"{part} {'on' if ready[part] else 'off'}"
                                           for part in ("history", "voice"))})

@@ -4,6 +4,8 @@
 
 A connection is keyed by the opaque id the store gives it, and called by its label; `--connection` takes either. `link` writes to the connection whose id or label it was given, else adds one labelled with the word it made from the workspace, filling the token and cookie keys from the label, and answers the connection's id under `connection`. A connection that binds no workspace keeps reading the rows it captured under the name it had before the cutover, and its service folder made under that name is moved to `<state>/slacker/<id>/service` the first time it is used, saying so on stderr. A connection that binds a workspace is keyed by its team id as before. Declares `capabilities-contract>=0.44,<1`. No verb, flag, environment variable or output key changes; a `connection` key carries the id.
 
+`inventory` names each linked account by its connection's label, where it named the id its state home is kept under; a home no connection here names keeps its folder's name.
+
 ## 2026-10-31 — `slacker` carries its own icon
 
 The bundle holds its icon as `icon.png`, Slack's mark, the same file `slack` carries, byte for byte. The mark is a trademark of Slack, used here only to identify the service the capability reads. `capabilities icon slacker` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

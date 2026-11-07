@@ -911,6 +911,8 @@ def _inventory(_network: bool) -> dict:
     try:
         with contextlib.redirect_stderr(io.StringIO()) as refused:
             status = _service_status(None)
+            # A person reads the line: the connection by its label, not its id.
+            label = _connection_label(status["connection"])
     except SystemExit:
         reason = _inventory_refusal(refused.getvalue())
         return {"service": {"state": "not configured", "detail": reason,
@@ -923,10 +925,10 @@ def _inventory(_network: bool) -> dict:
         verdict = {"ok": False, "problem": _inventory_refusal(refused.getvalue())}
     if status["running"]:
         return {"service": {"state": "running",
-                            "detail": f"pid {status['pid']}, connection {status['connection']}",
+                            "detail": f"pid {status['pid']}, connection {label}",
                             **verdict}}
     return {"service": {"state": "stopped" if status["initialized"] else "not initialized",
-                        "detail": f"connection {status['connection']}", **verdict}}
+                        "detail": f"connection {label}", **verdict}}
 
 
 def _inventory_refusal(stderr: str) -> str:

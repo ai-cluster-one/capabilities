@@ -7528,6 +7528,8 @@ def _inventory(_network: bool) -> dict:
     try:
         with contextlib.redirect_stderr(io.StringIO()) as refused:
             status = _cmd_service_status(None)
+            # A person reads the line: the connection by its label, not its id.
+            label = _connection_label(status["connection"])
     except _Refusal as refusal:
         return {"service": {"state": "not configured", "detail": refusal.message,
                             "ok": False, "problem": refusal.message}}
@@ -7538,11 +7540,11 @@ def _inventory(_network: bool) -> dict:
     if status["running"]:
         return {"service": {"state": "running",
                             "detail": f"pid {status['pid']}, {status['state']}, "
-                                      f"connection {status['connection']}",
+                                      f"connection {label}",
                             **_inventory_verdict()}}
     return {"service": {"state": status["state"] if status["initialized"]
                         else "not initialized",
-                        "detail": f"connection {status['connection']}",
+                        "detail": f"connection {label}",
                         **_inventory_verdict()}}
 
 

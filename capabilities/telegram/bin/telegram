@@ -4807,6 +4807,8 @@ def _inventory(_network: bool) -> dict:
         with contextlib.redirect_stderr(io.StringIO()) as refused:
             live = _service_liveness(root, None, None)
             initialized = _service_initialized(root)
+            # A person reads the line: the connection by its label, not its id.
+            label = _connection_label(live["connection"])
     except SystemExit:
         reason = _inventory_refusal(refused.getvalue())
         return {"service": {"state": "not configured", "detail": reason,
@@ -4816,10 +4818,10 @@ def _inventory(_network: bool) -> dict:
         pid = owner.get("pid") or live["pid"]
         service = {"state": "running",
                    "detail": f"pid {pid}, health {live['health']['state']}, "
-                             f"connection {live['connection']}"}
+                             f"connection {label}"}
     else:
         service = {"state": "stopped" if initialized else "not initialized",
-                   "detail": f"connection {live['connection']}"}
+                   "detail": f"connection {label}"}
     return {"service": {**service, **_inventory_verdict()}}
 
 

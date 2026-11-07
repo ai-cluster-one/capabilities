@@ -50,5 +50,20 @@ class FormerName(unittest.TestCase):
                          "b2c3d4e5f6a1")
 
 
+
+class Inventory(unittest.TestCase):
+    def test_each_linked_account_is_named_by_its_connections_label(self):
+        # A home is kept under the connection's id; a person reads its label.
+        # A home no connection here names is shown under its own name.
+        with tempfile.TemporaryDirectory() as state:
+            for name in (CID, "orphan"):
+                (Path(state) / "slacker" / name / "service").mkdir(parents=True)
+            known = {"connections": {CID: {"id": CID, "label": "work"}}}
+            with mock.patch.object(su, "_STATE_HOME", Path(state)), \
+                    mock.patch.object(su, "_inventory_connections", lambda *a: known):
+                items = su._inventory(False)["items"]
+        self.assertEqual([item["name"] for item in items], ["work", "orphan"])
+
+
 if __name__ == "__main__":
     unittest.main()

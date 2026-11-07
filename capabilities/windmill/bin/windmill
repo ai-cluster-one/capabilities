@@ -455,7 +455,7 @@ def _inventory_connection(cid: str, entry: dict | None, folder: str | None) -> d
         state = "writable"
     else:
         state = "read-only"
-    return {"group": "connections", "name": cid, "state": state,
+    return {"group": "connections", "name": (entry or {}).get("label") or cid, "state": state,
             "detail": (entry or {}).get("url") or "-",
             "attributes": attributes}
 
@@ -464,7 +464,8 @@ INVENTORY_TIMEOUT = httpx.Timeout(8.0)
 
 
 def _inventory_remote(cid: str, conn: dict, folder: str | None) -> tuple[dict, list]:
-    """Scripts and schedules under this project's folder, from the instance.
+    """Scripts and schedules under this project's folder, from the instance,
+    each naming the connection `cid` by the word a person reads, its label.
 
     Reached only on the caller's explicit consent, and on one short attempt
     rather than the retry ladder the domain verbs run: a reader assembling a
@@ -532,7 +533,7 @@ def _inventory(network: bool) -> dict:
             row["state"] = "unconfigured"
             row["detail"] = problem["message"]
             continue
-        trouble, rows = _inventory_remote(cid, conn, folder)
+        trouble, rows = _inventory_remote(entry.get("label") or cid, conn, folder)
         if trouble:
             row.update(trouble)
         found.extend(rows)

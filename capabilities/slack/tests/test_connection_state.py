@@ -39,3 +39,17 @@ def test_service_state_made_under_the_former_name_is_found_and_moved(tmp_path, m
     assert (found / "watermarks.json").read_text() == "{}"
     assert not (tmp_path / "state" / "slack" / "work").exists()
     assert "work" in err.getvalue()
+
+
+def test_the_inventory_service_line_names_the_connection_by_its_label(monkeypatch):
+    # The store keys a connection by its id; the service line a person reads
+    # names it by its label, running or not.
+    cli = _load()
+    labels = {"a1b2c3d4e5f6": "team"}
+    monkeypatch.setattr(cli, "_connection_label", lambda cid: labels.get(cid, cid))
+    monkeypatch.setattr(cli, "_service_local_check", lambda flag: None)
+    for running, expected in ((True, "pid 42, connection team"), (False, "connection team")):
+        status = {"connection": "a1b2c3d4e5f6", "running": running, "pid": 42,
+                  "initialized": True}
+        monkeypatch.setattr(cli, "_service_status", lambda flag, status=status: dict(status))
+        assert cli._inventory(False)["service"]["detail"] == expected
