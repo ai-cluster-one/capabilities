@@ -220,6 +220,19 @@ def test_the_manifest_and_the_catalogue_carry_the_store_major() -> None:
     assert "library" not in manifest and "library" not in catalog
 
 
+def test_a_kept_lines_manager_declares_its_library_in_its_own_header() -> None:
+    """The bootstrap runs a manager it placed before anything holds that
+    manager's environment, so on a kept line the script's own header admits
+    only the library the line names."""
+    if M["STORE_LIBRARY"] is None:
+        pytest.skip("this tree is not a kept line")
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
+    declared = [Requirement(dep) for dep in M["_script_dependencies"](MANAGER.read_text())]
+    assert [req.specifier for req in declared if req.name == "capabilities-contract"] \
+        == [SpecifierSet(M["STORE_LIBRARY"])]
+
+
 def test_a_kept_line_names_its_library_and_an_older_tree_names_nothing(tmp_path: Path) -> None:
     line = tmp_path / "line"
     (line / "bin").mkdir(parents=True)
