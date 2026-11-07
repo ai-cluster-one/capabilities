@@ -668,6 +668,17 @@ class Reports(unittest.TestCase):
             first = wa._wm_status(cfg).splitlines()[0]
         self.assertEqual(first, "Profile:  personal (mode: personal, engine: inhouse)")
 
+    def test_a_waha_connections_status_names_it_by_its_label(self):
+        """A WAHA connection's status names it by its label too; its
+        `profile` is the id the store keys it by."""
+        cfg = {"id": "c0ffee000004", "label": "personal", "profile": "c0ffee000004",
+               "mode": "send", "engine": wa.ENGINE_WAHA}
+        facts = {"session": "c0ffee000004", "status": "WORKING", "me_name": None,
+                 "me_id": None, "engine": None}
+        with mock.patch.object(wa, "_session_facts", lambda c: facts):
+            first = wa._waha_status(cfg).splitlines()[0]
+        self.assertEqual(first, "Profile:  personal (mode: send)")
+
     def test_the_inventory_verdict_leaves_a_stopped_account_as_it_found_it(self):
         """With the service stopped, the verdict neither creates the account's
         home nor takes its lock, which `service run` and every session take

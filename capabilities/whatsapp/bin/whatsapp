@@ -5027,7 +5027,7 @@ def _waha_status(cfg, args=None):
     facts = _session_facts(config)
     lines = []
     if config.get("profile"):
-        lines.append(f"Profile:  {config['profile']} (mode: {config.get('mode')})")
+        lines.append(f"Profile:  {config.get('label') or config['profile']} (mode: {config.get('mode')})")
     lines.append(f"Session:  {facts['session']}")
     lines.append(f"Status:   {facts['status']}")
     lines.append(f"Account:  {facts['me_name'] or '—'} ({facts['me_id'] or '—'})")

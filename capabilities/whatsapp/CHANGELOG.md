@@ -8,7 +8,7 @@ What a person reads names a connection by its label: the service line `inventory
 
 `doctor` and `service doctor` name a connection by its label where its config is incomplete, it has no linked device, or it runs an engine the service does not hold, and the service doctor's `connection` check reads `<label> (account ...)`, where each named the id. The `--connection` in a hint stays the id, which resolves.
 
-`status` names the connection by its label on its `Profile:` line, where it named the id.
+`status` names the connection by its label on its `Profile:` line, for an in-house, whatsmeow or WAHA connection alike, where it named the id.
 
 ## 2026-11-06 — The service's prompts live in the store
 
