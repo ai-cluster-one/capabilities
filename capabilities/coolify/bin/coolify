@@ -477,6 +477,7 @@ def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict |
     """Materialize one connection. Returns (conn, problem) — problem is an error
     dict ({"exit", "code", "message", "hint"?}) instead of a die, so doctor can
     report every connection rather than stopping at the first."""
+    named = (entry or {}).get("label") or cid  # the word a person reads; the id keys it
     if entry is None:   # declared entry without overrides — use the flat-key cascade
         base_url = (getattr(args, "base_url", None)
                     or _resolve_env_key("COOLIFY_BASE_URL")[0])
@@ -494,17 +495,17 @@ def _build_conn(cid: str, entry: dict | None, args) -> tuple[dict | None, dict |
     secret_env = entry.get("secret_env")
     if not secret_env:
         return None, {"exit": 6, "code": "no_secret_env",
-                      "message": f"connection {cid!r} is missing 'secret_env'"}
+                      "message": f"connection {named!r} is missing 'secret_env'"}
     token = getattr(args, "token", None) or _resolve_env_key(secret_env)[0]
     if not token:
         return None, {
             "exit": 2, "code": "missing_secret",
-            "message": f"env var {secret_env} (for connection {cid!r}) is unset",
+            "message": f"env var {secret_env} (for connection {named!r}) is unset",
             "hint": f"set {secret_env} in the project's .env / .env.local, "
                     f"{CREDENTIALS_ENV}, or the environment"}
     if not base_url:
         return None, {"exit": 6, "code": "incomplete_connection",
-                      "message": f"connection {cid!r} is missing 'base_url'"}
+                      "message": f"connection {named!r} is missing 'base_url'"}
     ssh = entry.get("ssh")
     return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
             "base_url": base_url.rstrip("/"), "token": token,

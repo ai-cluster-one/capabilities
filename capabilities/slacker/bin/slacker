@@ -336,6 +336,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     """Materialize one connection into the config the commands consume. Returns
     (cfg, problem) — problem is an error dict instead of a die, so doctor can
     report every connection rather than stopping at the first."""
+    named = (entry or {}).get("label") or cid  # the word a person reads; the id keys it
     entry = entry if isinstance(entry, dict) else {}
     token_env = entry.get("token_env") or "SLACKER_TOKEN"
     cookie_env = entry.get("cookie_env") or "SLACKER_COOKIE"
@@ -344,20 +345,20 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     if not token:
         return None, {
             "exit": 2, "code": "missing_secret",
-            "message": f"env var {token_env} (for connection {cid!r}) is unset",
+            "message": f"env var {token_env} (for connection {named!r}) is unset",
             "hint": f"set {token_env} in the project .env/.env.local, "
                     f"{CREDENTIALS_ENV}, or the environment — the xoxc- token "
                     f"from the signed-in browser's localConfig_v2"}
     if not cookie:
         return None, {
             "exit": 2, "code": "missing_secret",
-            "message": f"env var {cookie_env} (for connection {cid!r}) is unset",
+            "message": f"env var {cookie_env} (for connection {named!r}) is unset",
             "hint": f"set {cookie_env} to the `d` cookie value from the "
                     f"signed-in browser"}
     if not str(token).startswith("xoxc-"):
         return None, {
             "exit": 6, "code": "not_a_session_token",
-            "message": f"connection {cid!r}: {token_env} is not an xoxc- "
+            "message": f"connection {named!r}: {token_env} is not an xoxc- "
                        f"web-session token",
             "hint": "this capability reads as the web client; a bot (xoxb-) or "
                     "user (xoxp-) OAuth token is a different route"}

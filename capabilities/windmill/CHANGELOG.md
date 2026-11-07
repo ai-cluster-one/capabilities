@@ -4,6 +4,8 @@
 
 At store schema major 3 a connection is keyed by an opaque id and called by its label. `inventory` names each connection item, and the `connection` attribute of each script and schedule it reads with `--network`, by that label, where it named the id. A connection kept in files is still named by its key. Nothing else changes.
 
+`doctor` names a connection by its label where its token, URL or workspace is missing, where it named the id.
+
 ## 2026-11-01 — `windmill` carries Windmill's own logo as its icon
 
 The bundle's `icon.png` is now Windmill's official icon, `windmill_icon.png` from the brand assets windmill.dev/brand links, unmodified: 1123 x 1123, full colour on a transparent ground, where it was a 32 x 32 image. The mark is Windmill's, used here only to identify the service the capability reaches. `capabilities icon windmill` answers its path and size. Nothing else changes.

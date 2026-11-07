@@ -6,6 +6,8 @@ A connection is keyed by the opaque id the store gives it, and called by its lab
 
 `inventory` names each linked account by its connection's label, where it named the id its state home is kept under; a home no connection here names keeps its folder's name.
 
+`doctor` names a connection by its label where its token or cookie variable is unset or the token is not a web-session token, where it named the id.
+
 ## 2026-10-31 — `slacker` carries its own icon
 
 The bundle holds its icon as `icon.png`, Slack's mark, the same file `slack` carries, byte for byte. The mark is a trademark of Slack, used here only to identify the service the capability reads. `capabilities icon slacker` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

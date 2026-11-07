@@ -3,7 +3,7 @@
     "agentrooms": {
       "icon": true,
       "path": "capabilities/agentrooms",
-      "payload_sha256": "371bdd47356f3f68b908c81ae8e637790d4359d3c0e596d4daf3fad90f093e42",
+      "payload_sha256": "613b03a32dc1093a2c5058e4fc75786c1516bb23f2bca4d71797490381a8b39e",
       "store_major": 3,
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room."
     },
@@ -87,7 +87,7 @@
     "coolify": {
       "icon": true,
       "path": "capabilities/coolify",
-      "payload_sha256": "05c03d538a9f0ad97ef1e8b39b1215af2d4bfb86c1e2e9b71a2d4f262e7de005",
+      "payload_sha256": "c9ae6d8a20ddde207d93a26750dddd41ac2bf32b42af9d58a3902e996ced846f",
       "store_major": 3,
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance."
     },
@@ -101,7 +101,7 @@
     "directo": {
       "icon": true,
       "path": "capabilities/directo",
-      "payload_sha256": "494411f099e24258abe51ef57e88b7036fc2493969b71bf5196032b747c68bef",
+      "payload_sha256": "fba562677b2ef99ab8a63bbed79ff6f59e8d7230bff36d133d75476a1ae0dd3d",
       "store_major": 3,
       "summary": "Directo ERP CLI over the browser-session endpoints its web UI uses — log in, select a location, and read the authed `*.asp` surface (sales, purchases, stock, ledger). Stateful — run `directo doctor` first."
     },
@@ -192,7 +192,7 @@
     "rclonec": {
       "icon": true,
       "path": "capabilities/rclonec",
-      "payload_sha256": "ce9a324cf22c5669a7f2e4f9481ea4de75c204dda4a48240ac029d6dc86a98fd",
+      "payload_sha256": "f429737040e07d15ef3a86cc2326ed85e165aed5a156956fc25765b9ffd08ab2",
       "store_major": 3,
       "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`."
     },
@@ -227,7 +227,7 @@
     "skyscanner": {
       "icon": true,
       "path": "capabilities/skyscanner",
-      "payload_sha256": "631b1e8f37e10611853a5fdb04896be0dee232c1de83aa4b4deefa447ff18c53",
+      "payload_sha256": "d1a8d8320f9b22f8c89c1e2dc3cbfaf54278541b361dbb58971851f80412226d",
       "store_major": 3,
       "summary": "Skyscanner flight search over plain HTTP — resolve places, search live itineraries with prices, comfort facts (stops, layovers, self-transfer, airport changes) and booking links, and read the cached cheapest price per day; read-only, optionally through an Oxylabs residential proxy that keeps Skyscanner's bot protection from blocking the address."
     },
@@ -241,7 +241,7 @@
     "slacker": {
       "icon": true,
       "path": "capabilities/slacker",
-      "payload_sha256": "5868f2d485128950a3ea7d4d826769a92cce6545da23b56664ca7a1f4cd504ae",
+      "payload_sha256": "e6fc7397a71622f655cab561f1b7e6f5d7e12867294123603362f6783a819465",
       "store_major": 3,
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live. Read-only: it never writes to Slack."
     },
@@ -262,14 +262,14 @@
     "telegram": {
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "082aa3610a82dec458729418f9b67a1452711d22a1332ebb337f96e003326f09",
+      "payload_sha256": "914846a5b6054bb7b33b03ce0c1cdbdd22f23f2657a0437acd5e0dba4c15ee5e",
       "store_major": 3,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },
     "telegrambot": {
       "icon": false,
       "path": "capabilities/telegrambot",
-      "payload_sha256": "625eac3ec4dd127601dc5614ccb77cc999eacfc51f609b8000aea276ec27ea17",
+      "payload_sha256": "9f30baa4685601f5498599a287c50f9373068a0f800cd47d96d930494c7cd8ec",
       "store_major": 3,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation."
     },
@@ -283,14 +283,14 @@
     "whatsapp": {
       "icon": true,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "528689b1c4c60b1c684ff4811fc836f51d740bcb7062abb54a440240f0b9ec2f",
+      "payload_sha256": "4b8ceead69b7b8dbb09c6d3b1593936cd3dab7e6e2b02635db8276a4f63e80d0",
       "store_major": 3,
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON."
     },
     "windmill": {
       "icon": true,
       "path": "capabilities/windmill",
-      "payload_sha256": "af7946b755ce933e06da71317fb6d26664c9096b4eb4290f43f9db9942ef21fd",
+      "payload_sha256": "15e29271b88c0c10837b3217fede66ebfcc8905e4b1f4fa1bb966c421ab10c2b",
       "store_major": 3,
       "summary": "Windmill CLI over the REST API — deploy scripts, attach cron schedules, run jobs, read run history/logs, and manage secret variables and folders."
     },

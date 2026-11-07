@@ -1017,10 +1017,12 @@ def _build_cfg(cid: str, entry: dict | None,
     for `pair` alone: it pairs in a home named for the connection, with no
     account to key the store by until the pairing says whose it is."""
     entry = entry if isinstance(entry, dict) else {}
+    named = (entry or {}).get("label") or cid  # the word a person reads; the id keys it
     engine, waha_engine, _stated = _entry_engine(entry)
     allow_write = bool(entry.get("allow_write", WRITE_DEFAULT))
     cfg = {
         "id": cid,
+        "label": named,
         "profile": cid,
         "engine": engine,
         "allow_write": allow_write,
@@ -1034,7 +1036,7 @@ def _build_cfg(cid: str, entry: dict | None,
         if entry.get("base_url"):
             return None, {
                 "exit": 6, "code": "engine_mismatch",
-                "message": f"connection {cid!r} declares the in-house engine, "
+                "message": f"connection {named!r} declares the in-house engine, "
                            f"which addresses no server, and carries a base_url",
                 "hint": 'change "engine" to "waha" to drive that bridge, or drop '
                         "base_url to run the engine this CLI carries"}
@@ -1042,11 +1044,11 @@ def _build_cfg(cid: str, entry: dict | None,
             days = int(entry.get("initial_sync_days") or DEFAULT_SYNC_DAYS)
         except (TypeError, ValueError):
             return None, {"exit": 6, "code": "bad_sync_days",
-                          "message": f"connection {cid!r}: initial_sync_days must "
+                          "message": f"connection {named!r}: initial_sync_days must "
                                      f"be a whole number of days"}
         if days < 1:
             return None, {"exit": 6, "code": "bad_sync_days",
-                          "message": f"connection {cid!r}: initial_sync_days must be >= 1"}
+                          "message": f"connection {named!r}: initial_sync_days must be >= 1"}
         key = cfg["expected_account_id"] or cfg["number"]
         if not key and pairing:
             cfg.update({
@@ -1060,7 +1062,7 @@ def _build_cfg(cid: str, entry: dict | None,
         if not key:
             return None, {
                 "exit": 6, "code": "no_account_identity",
-                "message": f"connection {cid!r} names no account, and this "
+                "message": f"connection {named!r} names no account, and this "
                            f"engine keeps a capture under the account's own "
                            f"identity rather than under the connection's name",
                 "hint": "add the account's phone number as `number` (digits "
@@ -1078,7 +1080,7 @@ def _build_cfg(cid: str, entry: dict | None,
         base_url = entry.get("base_url")
         if not base_url:
             return None, {"exit": 6, "code": "missing_base_url",
-                          "message": f"connection {cid!r} has no base_url",
+                          "message": f"connection {named!r} has no base_url",
                           "hint": "add the WAHA instance URL as base_url in connections.json"}
         secret_env = entry.get("secret_env")
         api_key = _resolve_env_key(secret_env)[0] if secret_env else None
@@ -1089,7 +1091,7 @@ def _build_cfg(cid: str, entry: dict | None,
         if not api_key and not (username and password):
             return None, {
                 "exit": 2, "code": "missing_secret",
-                "message": f"connection {cid!r}: no credentials resolved",
+                "message": f"connection {named!r}: no credentials resolved",
                 "hint": f"set the env var named by secret_env "
                         f"({secret_env or 'unset'}) in the project .env(.local), "
                         f"{CREDENTIALS_ENV}, or the environment"}
@@ -1105,7 +1107,7 @@ def _build_cfg(cid: str, entry: dict | None,
         return cfg, None
 
     return None, {"exit": 6, "code": "unknown_engine",
-                  "message": f"connection {cid!r} declares engine {engine!r}",
+                  "message": f"connection {named!r} declares engine {engine!r}",
                   "hint": f'engine is "{ENGINE_INHOUSE}" (the default) or "{ENGINE_WAHA}"'}
 
 
@@ -2479,7 +2481,7 @@ def _session_lock(cfg: dict):
                  f"to use a connected verb, stop it with `{NAME} service stop` "
                  "in that project")
         _refuse(8, "session_busy",
-             f"another invocation holds the session for connection {cfg['id']!r}",
+             f"another invocation holds the session for connection {cfg.get('label') or cfg['id']!r}",
              "wait for it to finish and retry; never work around the lock — two "
              "clients on one linked device desync the account")
     try:
@@ -3071,7 +3073,7 @@ class Session:
     def open(self, *, expect_session: bool = True) -> "Session":
         if expect_session and not _session_exists(self.cfg):
             _refuse(7, "not_linked",
-                 f"connection {self.cfg['id']!r} has no linked WhatsApp device",
+                 f"connection {self.cfg.get('label') or self.cfg['id']!r} has no linked WhatsApp device",
                  f"run `{NAME} pair --connection {self.cfg['id']}` and enter the "
                  "code on the phone")
         engine = _engine()
@@ -3130,13 +3132,13 @@ class Session:
             return
         if self._logged_out.is_set():
             _refuse(7, "logged_out",
-                 f"the device for connection {self.cfg['id']!r} is no longer linked "
+                 f"the device for connection {self.cfg.get('label') or self.cfg['id']!r} is no longer linked "
                  "to this WhatsApp account",
                  f"someone removed it under Linked Devices; run "
                  f"`{NAME} pair --connection {self.cfg['id']} --recreate --yes`")
         _refuse(5, "connect_failed",
              f"the engine did not reach WhatsApp within {CONNECT_TIMEOUT}s "
-             f"for connection {self.cfg['id']!r}",
+             f"for connection {self.cfg.get('label') or self.cfg['id']!r}",
              "check connectivity and retry")
 
     def drain(self, *, timeout: float = DRAIN_TIMEOUT,
@@ -3164,7 +3166,7 @@ class Session:
         with self._engine_lock:
             if self._closed:
                 _refuse(5, "not_connected",
-                     f"the session for connection {self.cfg['id']!r} is closed",
+                     f"the session for connection {self.cfg.get('label') or self.cfg['id']!r} is closed",
                      "the assistant service reconnects on its own; retry once "
                      "it is connected")
             me = self._client.get_me()
@@ -3188,14 +3190,14 @@ class Session:
         expected = self.cfg.get("expected_account_id")
         if expected and account["id"] and account["id"] != expected:
             _refuse(2, "account_identity_mismatch",
-                 f"session for connection {self.cfg['id']!r} authorises as "
+                 f"session for connection {self.cfg.get('label') or self.cfg['id']!r} authorises as "
                  f"{account['id']}, not the bound {expected}",
                  "use the session owned by the configured account, or correct "
                  "expected_account_id in connections.json")
         held = _get_meta(self.db, "account_id")
         if held and account["id"] and held != account["id"]:
             _refuse(2, "store_account_mismatch",
-                 f"the store for connection {self.cfg['id']!r} holds the history "
+                 f"the store for connection {self.cfg.get('label') or self.cfg['id']!r} holds the history "
                  f"of {held}, and this session authorises as {account['id']}",
                  f"correct the account this connection names — a home and its "
                  f"rows in the store are named for one account "
@@ -3802,7 +3804,7 @@ def _wm_probe_connection(cfg: dict) -> dict:
     if not _session_exists(cfg):
         return {"ok": False, "category": 7, "engine": cfg["engine"],
                 "linked": False,
-                "error": f"connection {cfg['id']!r} has no linked WhatsApp device",
+                "error": f"connection {cfg.get('label') or cfg['id']!r} has no linked WhatsApp device",
                 "hint": f"run `{NAME} pair --connection {cfg['id']}`"}
     expected = cfg.get("expected_account_id")
     result: dict = {"ok": False, "engine": cfg["engine"], "linked": True,
@@ -3870,7 +3872,7 @@ def _require_linked(cfg: dict) -> None:
     if _session_exists(cfg):
         return
     _refuse(7, "not_linked",
-         f"connection {cfg['id']!r} has no linked WhatsApp device, so its store "
+         f"connection {cfg.get('label') or cfg['id']!r} has no linked WhatsApp device, so its store "
          "is empty",
          f"run `{NAME} pair --connection {cfg['id']}` and enter the code on the phone")
 
@@ -3935,7 +3937,7 @@ def _wm_health(cfg: dict) -> None:
     if not linked:
         _emit(out)
         _refuse(7, "not_linked",
-             f"connection {cfg['id']!r} has no linked WhatsApp device",
+             f"connection {cfg.get('label') or cfg['id']!r} has no linked WhatsApp device",
              f"run `{NAME} pair --connection {cfg['id']}` and enter the code on "
              f"the phone")
     if mismatch:
@@ -4027,7 +4029,7 @@ def _wm_pair(cfg: dict, args) -> None:
         if not args.recreate:
             account_id, account_jid, _ = _session_account(cfg)
             _refuse(6, "already_paired",
-                 f"connection {cfg['id']!r} already has a linked device ({account_jid})",
+                 f"connection {cfg.get('label') or cfg['id']!r} already has a linked device ({account_jid})",
                  f"nothing to do — run `{NAME} doctor`; pass --recreate --yes to "
                  "link a new one")
         if not args.yes:
@@ -6586,7 +6588,7 @@ def _refuse_foreign_flags(cfg: dict, args, extra: dict | None = None) -> None:
              if getattr(args, dest, None) not in (None, False)]
     if given:
         _refuse(6, "flag_not_supported",
-             f"connection {cfg['id']!r} runs the {engine} engine, which does not "
+             f"connection {cfg.get('label') or cfg['id']!r} runs the {engine} engine, which does not "
              f"take {', '.join(sorted(given))}",
              f"drop the flag, or select a connection running the other engine "
              f"with --connection")
@@ -6797,7 +6799,7 @@ def cmd_import_legacy(args):
     cfg = get_config(args)
     if cfg["engine"] != ENGINE_INHOUSE:
         _refuse(6, "flag_not_supported",
-                f"connection {cfg['id']!r} runs the {cfg['engine']} engine, which "
+                f"connection {cfg.get('label') or cfg['id']!r} runs the {cfg['engine']} engine, which "
                 "keeps no legacy store to import",
                 "import-legacy applies to in-house connections only")
     return _wm_import_legacy(cfg, args)
@@ -7249,7 +7251,7 @@ def _service_cfg(settings: dict, connection_flag: str | None) -> dict:
                 problem.get("hint"))
     if cfg["engine"] != ENGINE_INHOUSE:
         _refuse(6, "service_engine_unsupported",
-                f"connection {cid!r} runs the {cfg['engine']} engine; the "
+                f"connection {cfg.get('label') or cid!r} runs the {cfg['engine']} engine; the "
                 f"assistant service holds the engine this CLI carries",
                 "select an in-house connection")
     return cfg
@@ -8214,7 +8216,7 @@ def _cmd_service_doctor(connection_flag: str | None,
         check("connection", False, refusal.message, refusal.exit_code,
               refusal.code)
         return {"ok": False, "project": str(root), "checks": checks}, fail
-    check("connection", True, f"{cfg['id']} (account {cfg['account_key']})")
+    check("connection", True, f"{cfg.get('label') or cfg['id']} (account {cfg['account_key']})")
     try:
         if not local:
             db = _open_store(cfg)

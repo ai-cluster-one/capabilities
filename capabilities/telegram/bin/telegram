@@ -1146,15 +1146,16 @@ def _app_credentials(cid: str | None, entry: dict | None
     machine's app that `telegram setup set` writes once and every connection
     naming none inherits. Returns (api_id, api_hash, problem)."""
     literal_id, secret_env = _app_keys(cid, entry)
+    named = (entry or {}).get("label") or cid  # the word a person reads
     if literal_id is None and (entry or {}).get("secret_env"):
         return None, None, {
             "exit": 6, "code": "incomplete_connection",
-            "message": f"connection {cid!r} names 'secret_env' but no 'api_id'",
+            "message": f"connection {named!r} names 'secret_env' but no 'api_id'",
             "hint": "name the id of the app the hash belongs to, or neither to sign in "
                     "through the machine's app"}
     api_id = literal_id if literal_id is not None else _resolve_env_key("TELEGRAM_API_ID")[0]
     api_hash = _resolve_env_key(secret_env)[0]
-    whose = f" (for connection {cid!r})" if cid and entry is not None else ""
+    whose = f" (for connection {named!r})" if cid and entry is not None else ""
     if literal_id is not None and not api_hash:
         return None, None, {
             "exit": 2, "code": "missing_secret",
@@ -1202,7 +1203,8 @@ def _build_cfg(cid: str, entry: dict | None,
             raise ValueError
     except (TypeError, ValueError):
         expected_account_id = None
-    return {"id": cid, "api_id": api_id_int, "api_hash": api_hash,
+    return {"id": cid, "label": (entry or {}).get("label") or cid,
+            "api_id": api_id_int, "api_hash": api_hash,
             "session": session, "allow_write": allow_write,
             "expected_account_id": expected_account_id}, None
 
@@ -1227,7 +1229,8 @@ def _require_account_connection(cfg: dict, *, allow_discovery: bool = False) -> 
     if cfg.get("expected_account_id") is not None or allow_discovery:
         return
     _die(6, "expected_account_required",
-         f"Telegram connection {cfg['id']!r} has no positive expected_account_id",
+         f"Telegram connection {cfg.get('label') or cfg['id']!r} has no positive "
+         "expected_account_id",
          f"run `telegram login --connection {cfg['id']}` to discover the account ID, "
          "then bind expected_account_id in connections.json")
 
@@ -1632,7 +1635,8 @@ def cmd_doctor(wanted: str | None) -> None:
                 res = {
                     "ok": False,
                     "category": 6,
-                    "error": f"connection {cid!r} has no positive expected_account_id",
+                    "error": f"connection {(entry or {}).get('label') or cid!r} has no "
+                             "positive expected_account_id",
                     "hint": (f"run `telegram login --connection {cid}` to discover the account ID, "
                              "then bind expected_account_id"),
                 }
@@ -4837,7 +4841,7 @@ def _inventory_verdict() -> dict:
     if not status["initialized"]:
         problem = "the service is not initialized"
     elif not cfg["allow_write"]:
-        problem = f"connection {cfg['id']} does not allow send"
+        problem = f"connection {cfg.get('label') or cfg['id']} does not allow send"
     else:
         problem = (f"the running service is not healthy: health "
                    f"{status['health']['state']}")

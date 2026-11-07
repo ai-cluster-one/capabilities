@@ -4,6 +4,8 @@
 
 A connection the store keys by an id is still addressed as `<label>:path`: the remote rclonec defines for rclone (`RCLONE_CONFIG_<LABEL>_*`) is named for the connection's label, and for its id as well where the two differ, so `<id>:path` answers as `--connection <id>` does. The write gate recognises a destination addressed by either name, the remote-name check applies to the label, `doctor` lists `<label>:` and takes `--connection` by id or label, and `connections` gives each connection's `label` beside its `remote`. In a files project the key is both, as before. Declares `capabilities-contract>=0.44,<1`.
 
+`doctor` names a connection by its label where it lacks a backend `type`, has a bad `check_path`, or a secret variable is unset, where it named the id.
+
 ## 2026-11-01 — `rclonec` carries rclone's own logo as its icon
 
 The bundle's `icon.png` is now rclone's official logo symbol, `graphics/logo/logo_symbol/logo_symbol_color_128px.png` from the rclone repository, unmodified: 128 x 128, full colour on a transparent ground, where it was a 32 x 32 image. `capabilities icon rclonec` answers its path and size. Nothing else changes.

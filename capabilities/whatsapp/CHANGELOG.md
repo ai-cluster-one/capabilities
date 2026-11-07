@@ -6,6 +6,8 @@ A connection is keyed by the opaque id the store gives it, and called by its lab
 
 What a person reads names a connection by its label: the service line `inventory` reports reads `connection <label>`, where it read the id.
 
+`doctor` and `service doctor` name a connection by its label where its config is incomplete, it has no linked device, or it runs an engine the service does not hold, and the service doctor's `connection` check reads `<label> (account ...)`, where each named the id. The `--connection` in a hint stays the id, which resolves.
+
 ## 2026-11-06 — The service's prompts live in the store
 
 The assistant service's three prompts - `context`, `delegation` and `job-worker` - are the agent's versioned rows in a new table, `whatsapp_prompts` (step `0024-prompts`, schema 2.1, additive), edited with `whatsapp prompts list`, `show`, `put [--base ID] [--note TEXT]`, `history` and `retire` over the standard text the bundle ships. Every turn and every job reads its prompt fresh: the agent's active version, else the project's file in `capabilities/whatsapp/service/` for a project whose prompts have not moved, else the bundle's standard text - where a project with no file used to answer with no instructions at all. `whatsapp prompts import [--apply]` moves the three files into the store byte for byte, all or none, and removes them; a file that differs from a version the store already holds refuses the import, naming it. `service doctor` names each prompt's source, and `service init` writes no prompt files for a project whose records are in the store. The guide no longer presents a files mode for the prompts as a choice.

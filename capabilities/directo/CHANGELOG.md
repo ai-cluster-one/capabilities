@@ -4,6 +4,8 @@
 
 The live session (`session.env`) is kept under `<state>/<connection id>/`. Where that does not exist and the store's map names the connection's former name, the folder made under that name is moved to the id once, saying so on stderr, so a session already made survives the store's move to connection ids. Declares `capabilities-contract>=0.44,<1`, the library that keeps the map and moves the folder.
 
+`doctor` and the login remedy name a connection by its label where it resolves no database or names its login keys, where each named the id.
+
 ## 2026-10-31 — `directo help` names the agent's vault in the credential cascade
 
 Bare `directo help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.

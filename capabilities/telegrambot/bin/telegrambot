@@ -554,19 +554,20 @@ def _cmd_connections() -> None:
 def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     """One connection, materialized; or its problem as an error dict."""
     entry = entry if isinstance(entry, dict) else {}
+    label = entry.get("label") or cid  # the word a person reads; the id keys it
     token_env = entry.get("secret_env")
     token = _resolve_env_key(token_env)[0] if token_env else None
     if not token:
         named = token_env or _connection_env_name(_FIELD["secret_env"], _connection_label(cid))
         return None, {"exit": 2, "code": "missing_secret",
-                      "message": f"connection {cid!r} has no bot token ({named} resolves "
+                      "message": f"connection {label!r} has no bot token ({named} resolves "
                                  "nowhere)",
                       "hint": f"`{NAME} connection add {cid} --replace --stdin` with "
                               '{"secret_env": "<token>"}'}
     t = _transport()
     if t.bot_id_of(token) is None:
         return None, {"exit": 2, "code": "token_malformed",
-                      "message": f"connection {cid!r}: {token_env} does not hold a bot token "
+                      "message": f"connection {label!r}: {token_env} does not hold a bot token "
                                  "(<digits>:<secret>)"}
     cfg = {"id": cid, "token": token, "bot_id": t.bot_id_of(token),
            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
@@ -697,7 +698,7 @@ _FIELD_WORDS = {"secret_env": "a bot token", "api_id_env": "an api_id",
                 "api_hash_env": "an api_hash", "deepgram_env": "a Deepgram key"}
 
 
-def _lacking_sentence(cid: str, row: dict) -> str:
+def _lacking_sentence(cid: str, row: dict, label: str | None = None) -> str:
     """What one connection lacks, in words: the required token, and what goes off
     without the rest."""
     unset = [k for k in row["keys"] if not k["set"]]
@@ -705,7 +706,7 @@ def _lacking_sentence(cid: str, row: dict) -> str:
                                                   if k["key"] != k["field"] else "")
                       for k in unset)
     off = [part for part in ("history", "voice") if row[part] != "ready"]
-    return (f"connection {cid!r} lacks {words}" + (f"; without them {' and '.join(off)} "
+    return (f"connection {label or cid!r} lacks {words}" + (f"; without them {' and '.join(off)} "
                                                    "would be off" if off else ""))
 
 
@@ -716,9 +717,13 @@ def cmd_doctor(wanted: str | None) -> None:
     lacking = {cid: conns[cid] for cid in targets if _missing_required(conns[cid]["keys"])}
     if lacking:
         # The contract's readiness gate gives this same verdict from the same rows;
-        # here it names everything each connection lacks, not only the token.
+        # here it names everything each connection lacks, not only the token, and
+        # names each by its label, the word a person reads.
+        labels = {cid: entry.get("label") or cid for cid, entry
+                  in (_inventory_connections().get("connections") or {}).items()}
         _die(2, "credentials_missing",
-             "; ".join(_lacking_sentence(cid, row) for cid, row in sorted(lacking.items())),
+             "; ".join(_lacking_sentence(cid, row, labels.get(cid))
+                       for cid, row in sorted(lacking.items())),
              f"`{NAME} connection add <id> --replace --stdin` with "
              '{"secret_env": "<token>", "api_id_env": "<api_id>", "api_hash_env": '
              '"<api_hash>", "deepgram_env": "<key>"}, or --env <field>=<KEY> for a key the '
@@ -1345,16 +1350,18 @@ def _joined_here() -> dict | None:
 
 
 def _bot_refusal(cid: str, reg: dict) -> tuple | None:
-    """Why the service may not serve this bot in the project now, or None."""
+    """Why the service may not serve this bot in the project now, or None. The
+    reason names the connection by its label, the word a person reads."""
+    named = (reg.get("labels") or {}).get(cid) or cid
     if cid in (reg.get("withheld") or {}):
-        return ("refused", f"connection {cid!r} is not granted in this project")
+        return ("refused", f"connection {named!r} is not granted in this project")
     entry = (reg.get("connections") or {}).get(cid)
     if entry is None:
-        return ("refused", f"connection {cid!r} is not declared in this project")
+        return ("refused", f"connection {named!r} is not declared in this project")
     if read_only_switch():
         return ("refused", f"{READ_ONLY_ENV} is set, so no answer may be sent")
     if not entry.get("allow_write", WRITE_DEFAULT):
-        return ("refused", f"connection {cid!r} has no write grant, and the service answers "
+        return ("refused", f"connection {named!r} has no write grant, and the service answers "
                            "by sending; ask the user to grant allow_write")
     return None
 
@@ -1389,19 +1396,23 @@ def _plan_here(root: Path, expected_id: str | None) -> dict:
     reg = _connections_composed()
     bots, skipped = {}, {}
     for cid in sorted(declared):
+        # What a person reads names each bot by its connection's label; the
+        # service keys it by the id.
+        label = declared[cid].get("label") or cid
         refusal = _bot_refusal(cid, reg)
         if refusal:
-            skipped[cid] = refusal[1]
+            skipped[label] = refusal[1]
             continue
         cfg, problem = _build_cfg(cid, reg["connections"][cid])
         if problem:
-            skipped[cid] = problem["message"]
+            skipped[label] = problem["message"]
             continue
         state = _connection_state_dir(_state_dir(), cid)
         state.mkdir(parents=True, exist_ok=True)
         prints = "|".join(str(v) for v in (cfg["token"], cfg["api_id"], cfg["api_hash"],
                                             cfg["deepgram"]))
-        bots[cid] = {"connection": cid, "token": cfg["token"], "bot_id": cfg["bot_id"],
+        bots[cid] = {"connection": cid, "label": label, "token": cfg["token"],
+                     "bot_id": cfg["bot_id"],
                      "api_id": cfg["api_id"], "api_hash": cfg["api_hash"],
                      "deepgram": cfg["deepgram"], "history_off": cfg["history_off"],
                      "voice_off": cfg["voice_off"], "state_dir": state,
@@ -1779,12 +1790,13 @@ def cmd_service_doctor(machine: bool) -> None:
                     hook = api.webhook_info()
                 row["bot"] = me.get("username")
                 if hook.get("url"):
-                    problems.append(f"{cid}: a webhook is set, so the service cannot poll it")
+                    problems.append(f"{bot['label']}: a webhook is set, so the service cannot "
+                                    "poll it")
                     row["webhook"] = True
             except t.TelegramError as exc:
-                problems.append(f"{cid}: {exc.code}: {exc.message}")
+                problems.append(f"{bot['label']}: {exc.code}: {exc.message}")
                 row["error"] = exc.message
-            bots[cid] = row
+            bots[bot["label"]] = row
     out["bots"] = bots
     view = _status_view(False)
     out["service"] = view
@@ -1792,9 +1804,12 @@ def cmd_service_doctor(machine: bool) -> None:
         problems.append("the service is not running")
     elif view.get("current") is False:
         problems.append("the running process holds another declaration; `service reload`")
+    labels = {cid: entry.get("label") or cid for cid, entry
+              in (_inventory_connections().get("connections") or {}).items()}
     for bot in (view.get("project") or {}).get("bots") or []:
+        named = labels.get(bot["connection"]) or bot["connection"]
         for channel, failure in ((bot.get("dialogue") or {}).get("gate_failures") or {}).items():
-            problems.append(f"{bot['connection']}: gate_failing in {channel}: {failure['error']}")
+            problems.append(f"{named}: gate_failing in {channel}: {failure['error']}")
     _emit({"ok": not problems, "problems": problems, **out})
     if problems:
         sys.exit(7)

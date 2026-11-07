@@ -306,3 +306,18 @@ def test_the_inventory_names_each_bot_by_its_connections_label(cli, monkeypatch)
     monkeypatch.setattr(cli, "_readiness", lambda entry: {"history": True, "voice": False})
     items = cli._inventory(False)["items"]
     assert [item["name"] for item in items] == ["helper"]
+
+
+def test_why_a_bot_is_not_served_names_its_connection_by_its_label(cli, monkeypatch):
+    # `service doctor` reports these reasons under `skipped`; a person reads
+    # them, so they name the connection by its label rather than its id.
+    monkeypatch.delenv("TELEGRAMBOT_HELPER_TOKEN_UNSET", raising=False)
+    monkeypatch.delenv(cli.READ_ONLY_ENV, raising=False)
+    entry = {"id": "0123456789ab", "label": "helper", "allow_write": False,
+             "secret_env": "TELEGRAMBOT_HELPER_TOKEN_UNSET"}
+    _cfg, problem = cli._build_cfg("0123456789ab", entry)
+    reg = {"connections": {"0123456789ab": entry}, "withheld": {},
+           "labels": {"0123456789ab": "helper"}}
+    refusal = cli._bot_refusal("0123456789ab", reg)
+    for said in (problem["message"], refusal[1]):
+        assert "'helper'" in said and "0123456789ab" not in said, said

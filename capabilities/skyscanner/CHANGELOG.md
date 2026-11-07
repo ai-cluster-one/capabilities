@@ -4,6 +4,8 @@
 
 The site rotation state (`domains.json`) is kept under `<state>/<connection id>/`. Where that does not exist and the store's map names the connection's former name, the folder made under that name is moved to the id once, saying so on stderr, so what each site last answered survives the store's move to connection ids. Declares `capabilities-contract>=0.44,<1`, the library that keeps the map and moves the folder.
 
+`doctor` names a connection by its label where its domains or Oxylabs settings are malformed or its password variable is unset, where it named the id.
+
 ## 2026-10-31 — `skyscanner` carries its own icon
 
 The bundle holds its icon as `icon.png`, Skyscanner's own symbol, taken unaltered from the square PNG Skyscanner publishes on its partner site (`https://www.partners.skyscanner.net/hubfs/Skyscanner_Logo_Symbol_SkyBlue_RGB-202x202.png`, 202 x 202). The mark is a trademark of Skyscanner, used here only to identify the service the capability reaches. `capabilities icon skyscanner` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

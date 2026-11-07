@@ -1134,23 +1134,24 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     """One connection, materialized; or the problem with it as an error dict, so
     doctor can report every connection rather than stopping at the first."""
     entry = entry if isinstance(entry, dict) else {}
+    named = entry.get("label") or cid  # the word a person reads; the id keys it
     missing = [f for f in (*CONNECTION_FIELDS, "secret_env") if not entry.get(f)]
     if missing:
         return None, {"exit": 6, "code": "bad_connection",
-                      "message": f"connection {cid!r} lacks {', '.join(missing)}",
+                      "message": f"connection {named!r} lacks {', '.join(missing)}",
                       "hint": "`agentrooms register NAME` writes a whole connection"}
     homeserver = str(entry["homeserver"]).rstrip("/")
     if not re.match(r"https?://[^/\s]+", homeserver):
         return None, {"exit": 6, "code": "bad_connection",
-                      "message": f"connection {cid!r}: homeserver must be http(s)://host"}
+                      "message": f"connection {named!r}: homeserver must be http(s)://host"}
     user_id = str(entry["user_id"])
     if not USER_RE.fullmatch(user_id):
         return None, {"exit": 6, "code": "bad_connection",
-                      "message": f"connection {cid!r}: user_id {user_id!r} is not @name:server"}
+                      "message": f"connection {named!r}: user_id {user_id!r} is not @name:server"}
     token = _resolve_env_key(entry["secret_env"])[0]
     if not token:
         return None, {"exit": 2, "code": "missing_secret",
-                      "message": f"env var {entry['secret_env']} (connection {cid!r}) is unset",
+                      "message": f"env var {entry['secret_env']} (connection {named!r}) is unset",
                       "hint": f"`register` writes it into the project's .env.local; on a "
                               f"server inject {entry['secret_env']} into the environment"}
     return {"id": cid, "homeserver": homeserver, "user_id": user_id,
@@ -3703,7 +3704,7 @@ def _agent_refusal(cid: str, reg: dict, label: str | None = None) -> tuple | Non
     """Why the service may not act for this agent in the project now, or None:
     the connection is declared, granted, and allows writes. The reason names
     the connection by `label`, the word a person reads, where one is given."""
-    named = label or cid
+    named = label or (reg.get("labels") or {}).get(cid) or cid
     if cid in (reg.get("withheld") or {}):
         return ("refused", f"connection {named!r} is not granted in this project")
     entry = (reg.get("connections") or {}).get(cid)

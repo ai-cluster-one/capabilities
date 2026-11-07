@@ -313,6 +313,7 @@ def _build_cfg(cid: str, entry: dict | None,
     Missing username/password is not an immediate problem (the persisted cookie
     may still be live); they ride along as empty strings and the login path
     names what's missing."""
+    named = (entry or {}).get("label") or cid  # the word a person reads; the id keys it
     cfg = _materialize_cfg(cid, entry, overrides)
     if not cfg["DIRECTO_DB"]:
         if entry is None:
@@ -320,9 +321,9 @@ def _build_cfg(cid: str, entry: dict | None,
                     f"{CREDENTIALS_ENV}, or the environment — or declare a "
                     f"connections registry (capabilities/{NAME}/connections.json)")
         else:
-            hint = f'set "db" on connection {cid!r} in connections.json'
+            hint = f'set "db" on connection {named!r} in connections.json'
         return None, {"exit": 6, "code": "missing_db",
-                      "message": f"connection {cid!r} resolves no DIRECTO_DB",
+                      "message": f"connection {named!r} resolves no DIRECTO_DB",
                       "hint": hint}
     return cfg, None
 
@@ -458,7 +459,8 @@ def _login_remedy() -> str:
     if entry is not None:
         u_env = entry.get("username_env") or '"username_env" (unset on the entry)'
         p_env = entry.get("password_env") or '"password_env" (unset on the entry)'
-        return (f"connection {cid!r} names its login keys in connections.json — "
+        return (f"connection {entry.get('label') or cid!r} names its login keys in "
+                "connections.json — "
                 f"username_env: {u_env}, password_env: {p_env}; set those keys in "
                 f"the project .env(.local), {CREDENTIALS_ENV}, or the environment.")
     return f"set them in {CREDENTIALS_ENV} (or a project .env / the environment)."

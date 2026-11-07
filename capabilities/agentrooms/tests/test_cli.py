@@ -973,6 +973,35 @@ def test_service_doctor_and_inventory_name_each_agent_by_its_connections_label(
 
 
 @needs_store
+def test_service_doctor_names_a_misconfigured_agent_by_its_connections_label(
+        cli, project, stored, homeserver, capsys):
+    # A connection declared and granted but not fully configured is what doctor
+    # reports; the reason it gives names the connection the way a person does.
+    identity = project / "capabilities" / "project.json"
+    identity.write_text(json.dumps({"slug": "project", "connections": "store"}))
+    (project / ".env.local").write_text(f"AGENTROOMS_ALPHA_TOKEN={TOKEN}\n")
+    records = cli._records()
+    records.set("agentrooms", "connection", "alpha", {
+        "homeserver": HS, "user_id": f"@alpha:{SERVER}", "secret_env": "AGENTROOMS_ALPHA_TOKEN"})
+    records.set("agentrooms", "grant", "alpha", {"enabled": True, "allow_write": True})
+    records.set("agentrooms", "connection", "gamma", {
+        "homeserver": HS, "user_id": f"@gamma:{SERVER}", "secret_env": "AGENTROOMS_GAMMA_TOKEN"})
+    records.set("agentrooms", "grant", "gamma", {"enabled": True, "allow_write": True})
+    gamma = records.connection_id("agentrooms", "gamma")
+    assert gamma not in ("gamma", None)
+    _code, out, err = run(cli, capsys, "service", "doctor")
+    assert out is not None, err
+    reason = out["agents"]["skipped"]["gamma"]
+    assert "AGENTROOMS_GAMMA_TOKEN" in reason and "'gamma'" in reason, reason
+    assert gamma not in json.dumps(out["agents"])
+    # Plain doctor refuses at the readiness gate, before any round-trip, and
+    # names the connection the same way.
+    code, out, err = run(cli, capsys, "doctor", "--connection", "gamma")
+    said = json.dumps(err if out is None else out)
+    assert code == 2 and "gamma: AGENTROOMS_GAMMA_TOKEN" in said and gamma not in said, said
+
+
+@needs_store
 def test_register_completes_a_declared_connection_and_defaults_only_to_a_granted_one(
         cli, project, stored, capsys, homeserver, monkeypatch):
     monkeypatch.setattr(sys, "stdin", Piped("reg-token\n"))

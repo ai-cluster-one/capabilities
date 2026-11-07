@@ -4,6 +4,8 @@
 
 `coolify connect <name>` writes the connection whose id or label is `<name>`, else adds one labelled `<name>`, whose id the store mints (in a files project the name stays its key). A new connection's token variable is filled from that label (`COOLIFY_<LABEL>_TOKEN`); one already declared keeps the variable its spec names. `--default` points at the connection's id. The output keeps its keys: `connection` carries the id, and `label` is added. Declares `capabilities-contract>=0.44,<1`, the library that gives connections ids.
 
+`doctor` names a connection by its label where its token or base URL is missing, where it named the id.
+
 ## 2026-10-31 — `coolify help` names the agent's vault in the credential cascade
 
 Bare `coolify help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.

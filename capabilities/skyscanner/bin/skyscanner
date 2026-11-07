@@ -420,6 +420,7 @@ def _problem(exit_code: int, code: str, message: str, hint: str | None = None) -
 def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     """Materialize one connection. Returns (cfg, problem) — problem is an error
     dict instead of a die, so doctor reports every connection."""
+    named = (entry or {}).get("label") or cid  # the word a person reads; the id keys it
     entry = _entry_of(entry)
     cfg: dict = {"id": cid,
                  "market": str(_effective(entry, "market")).upper(),
@@ -431,7 +432,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
            if not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", h)]
     if bad:
         return None, _problem(6, "bad_domains",
-                              f"connection {cid!r}: domains names {bad[0]!r}, which "
+                              f"connection {named!r}: domains names {bad[0]!r}, which "
                               "is not a host name",
                               "comma-separated hosts such as www.skyscanner.de, or "
                               "empty for the built-in pool")
@@ -443,7 +444,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
             or "-sessid-" in user or not re.fullmatch(r"[A-Za-z0-9_.]+", user)):
         return None, _problem(
             6, "bad_oxylabs_username",
-            f"connection {cid!r}: oxylabs_username is not a bare proxy user name",
+            f"connection {named!r}: oxylabs_username is not a bare proxy user name",
             "give the Oxylabs proxy user's own name only; skyscanner adds the "
             "customer- prefix, the country and the session itself "
             f"(`{NAME} guide oxylabs`)")
@@ -452,7 +453,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
         country = "auto"
     elif not re.fullmatch(r"[A-Z]{2}", country):
         return None, _problem(6, "bad_oxylabs_country",
-                              f"connection {cid!r}: oxylabs_country {country!r} is "
+                              f"connection {named!r}: oxylabs_country {country!r} is "
                               "not a two-letter country code or auto",
                               "e.g. auto, EE, DE, US")
     host = str(_effective(entry, "oxylabs_host")).strip()
@@ -462,7 +463,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
         port = 0
     if not host or not 1 <= port <= 65535:
         return None, _problem(6, "bad_oxylabs_endpoint",
-                              f"connection {cid!r}: oxylabs_host/oxylabs_port do not "
+                              f"connection {named!r}: oxylabs_host/oxylabs_port do not "
                               "name a proxy endpoint",
                               "the residential entry is pr.oxylabs.io:7777")
     try:
@@ -471,20 +472,20 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
         minutes = 0
     if not 1 <= minutes <= 30:
         return None, _problem(6, "bad_oxylabs_session_minutes",
-                              f"connection {cid!r}: oxylabs_session_minutes is "
+                              f"connection {named!r}: oxylabs_session_minutes is "
                               "a whole number of minutes from 1 to 30")
     env_key = entry.get("oxylabs_password_env")
     if not env_key:
         return None, _problem(
             2, "missing_secret",
-            f"connection {cid!r} names an Oxylabs user but no oxylabs_password_env",
+            f"connection {named!r} names an Oxylabs user but no oxylabs_password_env",
             f"write the password with `{NAME} connection add {cid} --replace --stdin` "
             "and {\"oxylabs_password_env\": \"<password>\"} on stdin")
     password = _resolve_env_key(env_key)[0]
     if not password:
         return None, _problem(
             2, "missing_secret",
-            f"env var {env_key} (for connection {cid!r}) is unset",
+            f"env var {env_key} (for connection {named!r}) is unset",
             f"set {env_key} in the project's .env.local / .env, {CREDENTIALS_ENV}, "
             "or the environment")
     cfg["proxy"] = {"user": user, "password": password, "country": country,

@@ -6,6 +6,8 @@ A connection - a bot - is keyed by the opaque id the store gives it, and called 
 
 `inventory` names each bot by its connection's label, where it named the id.
 
+`doctor` and `service doctor` name each bot by its connection's label: what a bot lacks, why it is not served (`skipped`, keyed by label), its row under `bots` and each problem line, where each named the id.
+
 ## 2026-11-05 — The harness profiles are `harness_profile_versions`, behind the store upgrade
 
 telegrambot migrates the harness runner's profile table before its own, so it now pins `callva-harness-runner` 0.11.0, whose step takes that table to schema major 2 as `harness_profile_versions` with the agent in `agent_id`, and declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. The move crosses only through `capabilities store upgrade`, which migrates the harness owner through telegrambot as its further owner; outside it, telegrambot refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command. telegrambot's own tables, which already name the agent `agent_id`, stay at 1.0, and `telegrambot_prompts` keeps its name. Profiles resolve and save as before. No verb, flag, environment variable or output key changes.

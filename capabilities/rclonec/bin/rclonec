@@ -288,14 +288,14 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
     if not backend:
         return None, {
             "exit": 6, "code": "no_type",
-            "message": f"connection {cid!r} is missing 'type'",
+            "message": f"connection {label!r} is missing 'type'",
             "hint": "name the rclone backend, e.g. \"drive\" or \"s3\"; "
                     "`rclone help backends` lists them"}
     check_path = entry.get("check_path")
     if check_path is not None and not isinstance(check_path, str):
         return None, {
             "exit": 6, "code": "bad_check_path",
-            "message": f"connection {cid!r} has a 'check_path' that is not a string",
+            "message": f"connection {label!r} has a 'check_path' that is not a string",
             "hint": "name the path doctor lists under the remote, e.g. \"bucket\" or "
                     "\"bucket/prefix\""}
     secrets: dict = {}
@@ -304,7 +304,7 @@ def _build_cfg(cid: str, entry: dict | None) -> tuple[dict | None, dict | None]:
         if not value:
             return None, {
                 "exit": 2, "code": "missing_secret",
-                "message": f"env var {env_key} (for {opt!r} on connection {cid!r}) is unset",
+                "message": f"env var {env_key} (for {opt!r} on connection {label!r}) is unset",
                 "hint": f"set {env_key} in the project's .env / .env.local or the "
                         f"environment"}
         secrets[opt] = value
