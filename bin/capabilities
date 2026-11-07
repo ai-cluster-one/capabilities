@@ -2758,7 +2758,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # major is kept as branch STORE_LINE_REF, and a major is crossed only by
 # STORE_UPGRADE_COMMAND.
 STORE_MAJOR = 2
-STORE_LIBRARY: str | None = None
+STORE_LIBRARY: str | None = ">=0.43,<0.44"
 STORE_CANONICAL_REF = "main"
 STORE_LINE_REF = "store-major-{major}"
 STORE_UPGRADE_COMMAND = "capabilities store upgrade"
