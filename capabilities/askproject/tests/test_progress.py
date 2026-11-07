@@ -54,10 +54,10 @@ def _stored(lab) -> list[tuple]:
     import psycopg
     with psycopg.connect(STORE_DSN) as conn:
         return conn.execute(
-            "SELECT agent_id, host, target_path, engine, last_session_id, "
+            "SELECT caller_root, node_id, target_path, engine, last_session_id, "
             "last_mode, last_profile, interactions, last_used_at, last_attempt "
-            "FROM agentkit.askproject_sessions WHERE agent_id = %s",
-            (f"path:{lab.caller.resolve()}",)).fetchall()
+            "FROM agentkit.askproject_sessions WHERE caller_root = %s AND agent_id IS NULL",
+            (str(lab.caller.resolve()),)).fetchall()
 
 
 def _here(lab) -> str:
@@ -83,7 +83,7 @@ def test_a_second_question_resumes_the_session_the_first_recorded_in_the_store(l
     session = result["session_id"]
 
     [row] = _stored(lab)
-    assert row[:7] == (f"path:{lab.caller.resolve()}", _here(lab),
+    assert row[:7] == (str(lab.caller.resolve()), _here(lab),
                        str(lab.target), "codex", session, "read", "codex-read")
     assert row[7] == 1 and row[8] is not None
     assert row[9]["status"] == "completed" and row[9]["session_id"] == session
@@ -283,9 +283,9 @@ def test_timeout_without_session_id_does_not_fall_back_to_older_session(lab):
 def test_a_store_at_major_1_keeps_its_sessions_under_agent_id(lab, monkeypatch):
     """A store whose askproject tables are at 1.0, with sessions in them, is
     refused outside the store upgrade and migrated in place by the next call
-    inside it: every row stays, the caller's column is
-    agent_id, nothing is named for project_id, and the caller's own session is
-    still found."""
+    inside it: every row stays, an agent caller's column is agent_id, a caller
+    with no id is named by its root, nothing is named for project_id or host,
+    and the caller's own session is still found."""
     import secrets
 
     import psycopg
@@ -323,12 +323,12 @@ def test_a_store_at_major_1_keeps_its_sessions_under_agent_id(lab, monkeypatch):
         with psycopg.connect(STORE_DSN) as conn:
             conn.execute(f'SET search_path TO "{schema}"')
             assert conn.execute(
-                "SELECT agent_id, host, target_path, last_session_id, interactions "
-                "FROM askproject_sessions ORDER BY last_session_id").fetchall() == [
-                (caller, node, str(lab.target), "s-1", 3),
-                ("prj_000000000002", "elsewhere", "/t/other", "s-2", 1)]
+                "SELECT agent_id, caller_root, node_id, target_path, last_session_id, "
+                "interactions FROM askproject_sessions ORDER BY last_session_id").fetchall() == [
+                (None, str(lab.caller.resolve()), node, str(lab.target), "s-1", 3),
+                ("prj_000000000002", None, "elsewhere", "/t/other", "s-2", 1)]
             assert conn.execute("SELECT major, minor FROM schema_version "
-                                "WHERE owner = 'askproject'").fetchone() == (2, 0)
+                                "WHERE owner = 'askproject'").fetchone() == (3, 0)
             names = [r[0] for r in conn.execute(
                 "SELECT attname::text FROM pg_attribute WHERE attrelid = "
                 "'askproject_sessions'::regclass AND attnum > 0 UNION ALL "
@@ -337,6 +337,108 @@ def test_a_store_at_major_1_keeps_its_sessions_under_agent_id(lab, monkeypatch):
                 "SELECT indexname::text FROM pg_indexes WHERE schemaname = current_schema()"
             ).fetchall()]
             assert "agent_id" in names and not [n for n in names if "project_id" in n], names
+            assert "node_id" in names and "host" not in names, names
+    finally:
+        with psycopg.connect(STORE_DSN, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def test_a_store_at_2_0_crosses_to_node_id_and_minus_c_continues_for_both_callers(
+        lab, monkeypatch):
+    """A store whose askproject tables are at 2.0 crosses to 3.0 only inside the
+    store upgrade: the rows as they stood are copied whole into
+    askproject_premig_m7, `host` becomes `node_id`, a `path:` caller becomes a
+    null agent id with its root beside it, a target that is an agent's folder on
+    that node gets that agent's id, and -c continues the same session for an
+    agent caller and for a caller with no id; a new write names its target's
+    agent too."""
+    import secrets
+
+    import psycopg
+    from capabilities_contract import db
+
+    store_env(lab.env)
+    schema = "askproject_m2_" + secrets.token_hex(4)
+    node, agent, target_agent = "6c61622d6e6f", "prj_aaaaaaaaaaaa", "bbbbbbbbbbbb"
+    root, target = str(lab.caller.resolve()), str(lab.target.resolve())
+    other = lab.root / "other"
+    other.mkdir()
+    for key in [k for k in os.environ if k.startswith("AGENTKIT_DB_")]:
+        monkeypatch.delenv(key)
+    monkeypatch.setenv("AGENTKIT_DB_URL", STORE_DSN)
+    monkeypatch.setenv("AGENTKIT_DB_SCHEMA", schema)
+    conn = db.connect(application_name="test", setting=db.resolve_setting(None))
+    try:
+        db.migrate(conn, "askproject", CLI.SESSIONS_STEPS[:2], major=2, minor=0)
+        conn.execute("INSERT INTO agents (id) VALUES (%s), (%s)", (agent, target_agent))
+        conn.execute("INSERT INTO nodes (id, label, kind) VALUES (%s, 'lab', 'server')",
+                     (node,))
+        conn.execute("INSERT INTO agent_nodes (agent_id, node, folder) VALUES (%s, %s, %s)",
+                     (target_agent, node, target))
+        conn.execute(
+            "INSERT INTO askproject_sessions (agent_id, host, target_path, engine, "
+            "last_session_id, interactions) VALUES "
+            "(%s, %s, %s, 'codex', 's-path', 2), (%s, %s, %s, 'codex', 's-agent', 5), "
+            "(%s, %s, %s, 'claude', 's-other', 1)",
+            (f"path:{root}", node, target, agent, node, target, agent, node, str(other)))
+        conn.commit()
+    finally:
+        conn.close()
+    as_agent = {"CAPABILITIES_PROJECT_ID": agent, "CAPABILITIES_PROJECT_ID_ROOT": root}
+    base = {"AGENTKIT_DB_SCHEMA": schema, "AGENT_NODE_ID": node}
+    try:
+        refused = lab.run("targets", "--json", env=base)
+        assert refused.returncode != 0 and "store_upgrade_needed" in refused.stderr, refused
+        crossed = lab.run("targets", "--json", env={**base, db.UPGRADE_ENV: "1"})
+        assert crossed.returncode == 0, crossed.stderr
+        with psycopg.connect(STORE_DSN) as conn:
+            conn.execute(f'SET search_path TO "{schema}"')
+            assert conn.execute("SELECT major, minor FROM schema_version "
+                                "WHERE owner = 'askproject'").fetchone() == (3, 0)
+            assert conn.execute(
+                "SELECT agent_id, host, target_path, last_session_id FROM "
+                "askproject_premig_m7 ORDER BY last_session_id").fetchall() == [
+                (agent, node, target, "s-agent"), (agent, node, str(other), "s-other"),
+                (f"path:{root}", node, target, "s-path")]
+            assert conn.execute(
+                "SELECT agent_id, caller_root, node_id, target_path, target_agent_id, "
+                "last_session_id, interactions FROM askproject_sessions "
+                "ORDER BY last_session_id").fetchall() == [
+                (agent, None, node, target, target_agent, "s-agent", 5),
+                (agent, None, node, str(other), None, "s-other", 1),
+                (None, root, node, target, target_agent, "s-path", 2)]
+        for env, session in ((as_agent, "s-agent"), ({}, "s-path")):
+            proc, result, launch = lab.ask("-c", env={**base, **env})
+            assert proc.returncode == 0, proc.stderr
+            assert (result["resumed"], result["session_id"]) == (True, session)
+            assert request(launch, "thread/resume")["threadId"] == session
+        fresh, _, _ = lab.ask("--engine", "codex", env={**base, **as_agent,
+                                                       "AGENT_NODE_ID": "6c61622d6e70"})
+        assert fresh.returncode == 0, fresh.stderr
+        with psycopg.connect(STORE_DSN) as conn:
+            conn.execute(f'SET search_path TO "{schema}"')
+            assert conn.execute(
+                "SELECT target_path, interactions FROM askproject_sessions WHERE "
+                "agent_id = %s AND node_id = %s ORDER BY target_path",
+                (agent, node)).fetchall() == [(str(other), 1), (target, 6)]
+            assert conn.execute(
+                "SELECT interactions FROM askproject_sessions WHERE caller_root = %s",
+                (root,)).fetchall() == [(3,)]
+            assert conn.execute(
+                "SELECT target_agent_id FROM askproject_sessions WHERE node_id = "
+                "'6c61622d6e70'").fetchall() == [(None,)]
+            conn.execute("INSERT INTO nodes (id, label, kind) VALUES "
+                         "('6c61622d6e70', 'lab2', 'server')")
+            conn.execute("INSERT INTO agent_nodes (agent_id, node, folder) VALUES "
+                         "(%s, '6c61622d6e70', %s)", (target_agent, target))
+            conn.commit()
+        again, _, _ = lab.ask("-c", env={**base, **as_agent, "AGENT_NODE_ID": "6c61622d6e70"})
+        assert again.returncode == 0, again.stderr
+        with psycopg.connect(STORE_DSN) as conn:
+            conn.execute(f'SET search_path TO "{schema}"')
+            assert conn.execute(
+                "SELECT target_agent_id FROM askproject_sessions WHERE node_id = "
+                "'6c61622d6e70'").fetchall() == [(target_agent,)]
     finally:
         with psycopg.connect(STORE_DSN, autocommit=True) as conn:
             conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
