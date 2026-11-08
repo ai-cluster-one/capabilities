@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — `chats` and title resolution read the archive as well as the main list
+
+`telegram chats` and resolving a chat by title walk the main list and the archive one folder at a time and merge them, where each made one folder-less walk that the server can end early on a large account with no error, so `chats` came back with a fraction of the dialogs and a title in the archive answered `chat_not_found`. The merged order is the folder-less one: the main list's pinned dialogs first, then both folders by the date of their last message, a dialog that appears in both listed once. `--limit N` is still the N most recent dialogs across everything, and an ambiguous title still resolves to the match nearest the top of that listing, not to the main list ahead of the archive. No verb, flag or output key changes.
+
 ## 2026-11-08 — A quota stop waits for the stated reset and tells the person once per job
 
 When a job stops on a spent quota and the engine's sentence says when the limit lifts - an epoch after `|`, an ISO timestamp, `try again in` a duration, or `resets` / `try again at` a clock time with an optional date and `(Area/City)` zone - the queue stays paused until that moment plus a minute, never more than eight days, instead of retrying every five minutes into the same limit. A sentence that names no reset keeps the five-minute retry, and the daemon's log says `no reset stated`. The quota notice reaches the person on the first quota stop of a job; a later quota stop of the same job lands silently, until the job ends another way or takes an amendment. A daemon restart forgets which jobs were told, so one may be told once more. No verb, flag, setting, store column or output key changes.

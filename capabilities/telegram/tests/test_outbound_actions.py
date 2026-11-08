@@ -200,16 +200,25 @@ def _forum_message(message_id, *, text="", reply_to=None, forum_topic=False):
 
 
 class _DialogClient(_Client):
-    """Answers iter_dialogs with one fixed listing, in the order given."""
+    """Answers iter_dialogs per folder: `dialogs` is the main list and
+    `archive` the archive, each in the order given. The folder-less call
+    answers `folderless`, which defaults to their concatenation and can be
+    set to a partial listing, the way the server cuts it short on a large
+    account."""
 
-    def __init__(self, dialogs):
+    def __init__(self, dialogs, archive=(), folderless=None):
         super().__init__()
         self.dialogs = list(dialogs)
+        self.archive = list(archive)
+        self.folderless = (self.dialogs + self.archive
+                           if folderless is None else list(folderless))
         self.limits = []
 
-    async def iter_dialogs(self, limit=None):
+    async def iter_dialogs(self, limit=None, archived=None):
         self.limits.append(limit)
-        for dialog in self.dialogs:
+        listing = {None: self.folderless, False: self.dialogs,
+                   True: self.archive}[archived]
+        for dialog in listing[:limit] if limit is not None else listing:
             yield dialog
 
 
@@ -221,9 +230,10 @@ def _entity(class_name, **flags):
     return entity
 
 
-def _dialog(dialog_id, name, entity, unread=0):
+def _dialog(dialog_id, name, entity, unread=0, date=None, pinned=False):
     return types.SimpleNamespace(
-        id=dialog_id, name=name, entity=entity, unread_count=unread)
+        id=dialog_id, name=name, entity=entity, unread_count=unread,
+        date=date, pinned=pinned)
 
 
 class _ExportClient(_Client):
@@ -631,9 +641,78 @@ class OutboundActionsTests(unittest.TestCase):
         self.assertEqual(self.client.asked,
                          [{"limit": None, "search": None, "reply_to": 7151}])
 
-    def _use_dialogs(self, dialogs):
-        self.client = _DialogClient(dialogs)
+    def _use_dialogs(self, dialogs, archive=(), folderless=None):
+        self.client = _DialogClient(dialogs, archive, folderless)
         self.cli.make_client = lambda _cfg: self.client
+
+    def _two_folders(self):
+        """A main list with a pinned dialog and an archive, interleaved by
+        date, and a folder-less listing the server cut short (gh-67)."""
+        day = datetime(2026, 9, 1, tzinfo=timezone.utc)
+        at = lambda n: day + timedelta(hours=n)  # noqa: E731
+        main = [
+            _dialog(1, "Pinned friend", _entity("User"), date=at(1), pinned=True),
+            _dialog(2, "Main group", _entity("Chat"), date=at(9)),
+            _dialog(3, "Main person", _entity("User"), date=at(5)),
+            _dialog(4, "Old main", _entity("User"), date=at(2)),
+        ]
+        archive = [
+            _dialog(10, "Archived person", _entity("User"), date=at(7)),
+            _dialog(11, "Archived group", _entity("Chat"), date=at(3)),
+        ]
+        return main, archive
+
+    def test_chats_list_the_archive_when_the_folderless_walk_stops_short(self):
+        """gh-67: the folder-less walk ends early on a large account with no
+        error; `chats` reads both folders and merges them by recency."""
+        main, archive = self._two_folders()
+        self._use_dialogs(main, archive, folderless=main[:2])
+
+        result = asyncio.run(self.cli.cmd_chats({"id": "test"}, 50))
+
+        self.assertEqual([entry["id"] for entry in result], [1, 2, 10, 3, 11, 4])
+        self.assertEqual(set(result[0]), {"id", "kind", "name", "unread",
+                                          "category", "forum"})
+
+    def test_chats_limit_takes_the_most_recent_across_both_folders(self):
+        main, archive = self._two_folders()
+        self._use_dialogs(main, archive, folderless=main[:2])
+
+        result = asyncio.run(self.cli.cmd_chats({"id": "test"}, 3))
+
+        self.assertEqual([entry["id"] for entry in result], [1, 2, 10])
+
+    def test_chats_list_a_dialog_once_when_both_folders_return_it(self):
+        main, archive = self._two_folders()
+        self._use_dialogs(main, archive + [main[2]], folderless=main[:2])
+
+        result = asyncio.run(self.cli.cmd_chats({"id": "test"}, 50))
+
+        self.assertEqual([entry["id"] for entry in result], [1, 2, 10, 3, 11, 4])
+
+    def test_resolve_by_title_finds_an_archived_chat(self):
+        """gh-67: a title in the archive resolved to `chat_not_found`."""
+        main, archive = self._two_folders()
+        client = _DialogClient(main, archive, folderless=main[:2])
+        cli = import_cli()
+
+        entity = asyncio.run(cli.resolve_chat(client, "archived group"))
+
+        self.assertIs(entity, archive[1].entity)
+
+    def test_resolve_by_title_keeps_the_most_recent_match_first(self):
+        """An ambiguous title resolves to the match nearest the top of the
+        whole listing, not to the main list ahead of the archive."""
+        main, archive = self._two_folders()
+        client = _DialogClient(main, archive, folderless=main[:2])
+        cli = import_cli()
+
+        entity = asyncio.run(cli.resolve_chat(client, "person"))
+        self.assertIs(entity, archive[0].entity)
+        entity = asyncio.run(cli.resolve_chat(client, "group"))
+        self.assertIs(entity, main[1].entity)
+        entity = asyncio.run(cli.resolve_chat(client, "friend"))
+        self.assertIs(entity, main[0].entity)
 
     def test_chats_separate_a_group_from_a_feed_and_a_bot_from_a_person(self):
         """`kind` files a supergroup, a gigagroup and a broadcast under one
@@ -658,7 +737,7 @@ class OutboundActionsTests(unittest.TestCase):
                           "user", "bot", "unknown"])
         self.assertEqual([entry["kind"] for entry in result[:2]],
                          ["Channel", "Channel"])
-        self.assertEqual(self.client.limits, [50])
+        self.assertEqual(self.client.limits, [50, 50])
         self.assertTrue(self.client.disconnected)
 
     def test_chats_flag_a_forum_beside_its_category_rather_than_instead_of_it(self):

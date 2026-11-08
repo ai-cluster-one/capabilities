@@ -1447,6 +1447,49 @@ def entity_label(ent) -> str:
     return str(ent)
 
 
+async def iter_all_dialogs(client: TelegramClient, limit: int | None = None):
+    """Every dialog in the main list and the archive, most recent first.
+
+    The folder-less `iter_dialogs()` asks the server for all folders at once,
+    and on a large account the server ends that walk early with no error, so
+    the main list (folder 0) and the archive (folder 1) are walked one by one
+    and merged here. The main list's pinned dialogs lead, as they do in the
+    folder-less listing; after them the two folders interleave by the date of
+    their last message, the main list first on a tie. A dialog seen twice,
+    because it moved folder between the two walks, is yielded once. `limit`
+    caps the merged result, and each folder walk needs no more than that.
+    """
+    main = client.iter_dialogs(limit=limit, archived=False).__aiter__()
+    archive = client.iter_dialogs(limit=limit, archived=True).__aiter__()
+
+    async def head(it):
+        try:
+            return await it.__anext__()
+        except StopAsyncIteration:
+            return None
+
+    def newer(left, right) -> bool:
+        a, b = getattr(left, "date", None), getattr(right, "date", None)
+        return a is not None and (b is None or a > b)
+
+    m, a = await head(main), await head(archive)
+    seen: set = set()
+    count = 0
+    while m is not None or a is not None:
+        if limit is not None and count >= limit:
+            return
+        if m is not None and (a is None or getattr(m, "pinned", False)
+                              or not newer(a, m)):
+            dialog, m = m, await head(main)
+        else:
+            dialog, a = a, await head(archive)
+        if dialog.id in seen:
+            continue
+        seen.add(dialog.id)
+        count += 1
+        yield dialog
+
+
 async def resolve_chat(client: TelegramClient, chat: str):
     try:
         if chat.lstrip("-").isdigit():
@@ -1454,7 +1497,7 @@ async def resolve_chat(client: TelegramClient, chat: str):
         if chat.startswith("@") or chat.startswith("+"):
             return await client.get_entity(chat)
         lowered = chat.lower()
-        async for dialog in client.iter_dialogs():
+        async for dialog in iter_all_dialogs(client):
             if dialog.name and lowered in dialog.name.lower():
                 return dialog.entity
         return await client.get_entity(chat)
@@ -1969,7 +2012,7 @@ async def cmd_chats(cfg: dict, limit: int) -> list[dict]:
     client = make_client(cfg)
     await _require_auth(client)
     out: list[dict] = []
-    async for dialog in client.iter_dialogs(limit=limit):
+    async for dialog in iter_all_dialogs(client, limit):
         ent = dialog.entity
         out.append({
             "id": dialog.id,
