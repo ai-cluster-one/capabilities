@@ -2031,7 +2031,13 @@ PROJECT VERBS (run inside a consuming project)
         carries composed after its stub line, from the manifest snapshot
         taken at install, reading no file and no store; a declaration that is
         malformed or over the manager's ceiling is replaced by one line naming
-        `capabilities update <name>`, and costs nothing else. Run by hand, a
+        `capabilities update <name>`, and costs nothing else. While `teams`
+        is enabled, its block goes on with the agent's own teams, read from
+        the store at each composition: every team the agent is a member of
+        by its line, and for a team in always mode its enabled always
+        documents whole, each headed by the team's name, and its enabled
+        on-request documents by their line; nothing for an agent in no team,
+        and one line naming the failure where the store does not answer. Run by hand, a
         host mode prints the file it wrote and the enabled set. Run as the host's SessionStart hook (the
         harness pipes a payload whose hook_event_name is SessionStart), it
         prints nothing unless the session must be told: the file was just
@@ -2719,7 +2725,7 @@ SERVICE_SUPERVISION_POINTER = (
     "  Keeping it running - on this machine or on a server - is the "
     f"`{SERVICE_SUPERVISION_CAPABILITY}` capability's domain: "
 )
-CORE_CAPABILITIES = ("agenttemplates", "askproject", "assets", "automations", "context", "deployment", "inbox", "memory", "routine", "tasks")
+CORE_CAPABILITIES = ("agenttemplates", "askproject", "assets", "automations", "context", "deployment", "inbox", "memory", "routine", "tasks", "teams")
 # The catalogue's core tier, and its only declaration. Which capabilities are
 # foundational is a fact about the catalogue, which no single capability is
 # part of deciding, so the manager declares it rather than any manifest. Every
@@ -23550,6 +23556,88 @@ def _context_contribution(name: str, manifest: dict | None) -> list[str]:
     return [contribution["markdown"].strip("\n").rstrip(), ""]
 
 
+TEAMS_CAPABILITY = "teams"
+
+
+def _teams_rows(root: Path) -> tuple[list[tuple], list[tuple]] | None:
+    """The teams this agent is a member of, as (name, description, always),
+    and the active version of every enabled document of those in always mode,
+    as (team, name, load, description, body), read from its store in a
+    read-only transaction; empty where the store has no teams tables; None
+    where there is nothing to read: no project id, or no store. A store that
+    does not answer raises its DbError or psycopg error."""
+    agent = _project_id_state(root)["id"]
+    if not agent:
+        return None
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+    except db.DbError as exc:
+        if exc.slug == "store_not_configured":
+            return None
+        raise
+    conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
+                      transaction=True)
+    import psycopg
+    try:
+        conn.read_only = True
+        teams = conn.execute(
+            "SELECT t.name, t.description, t.always FROM teams_teams t JOIN teams_members m "
+            "ON m.team = t.name WHERE m.agent_id = %s ORDER BY t.name", (agent,)).fetchall()
+        always = [row[0] for row in teams if row[2]]
+        documents = conn.execute(
+            "SELECT d.team, d.name, v.load, v.description, v.body FROM teams_documents d "
+            "JOIN teams_versions v ON v.team = d.team AND v.document = d.name AND v.active "
+            "WHERE d.enabled AND d.team = ANY(%s) ORDER BY d.team, d.name",
+            (always,)).fetchall() if always else []
+        return teams, documents
+    except psycopg.errors.UndefinedTable:
+        return [], []
+    finally:
+        conn.close()
+
+
+def _teams_context(root: Path) -> list[str]:
+    """The part of the `teams` block that is this agent's own, composed from
+    the store at each build: every team it is a member of by its line, and for
+    a team in always mode its enabled always documents whole, each headed by
+    the team's name, and its enabled on-request documents by their line. It
+    reads nothing that changes from one session to the next, so it changes
+    only when the teams do. Nothing where the agent is in no team or has no
+    store; one line naming the failure where the store does not answer."""
+    import psycopg
+    db = _db_module()
+    try:
+        read = _teams_rows(root)
+    except (db.DbError, psycopg.Error) as exc:
+        reason = exc.message if isinstance(exc, db.DbError) else str(exc).splitlines()[0]
+        return [f"This agent's teams are unavailable: {_md_escape(reason)}. "
+                f"`{TEAMS_CAPABILITY} doctor` names the repair.", ""]
+    if not read or not read[0]:
+        return []
+    teams, documents = read
+    lines = ["This agent is a member of these teams:", ""]
+    for name, description, always in teams:
+        how = ("always in context, below" if always
+               else f"its instructions: `{TEAMS_CAPABILITY} show {name}`")
+        lines.append(f"- **{name}** - {_md_escape(description)} ({how})")
+    lines.append("")
+    for name, _description, always in teams:
+        if not always:
+            continue
+        own = [doc for doc in documents if doc[0] == name]
+        for _team, doc, load, _line, body in own:
+            if load == "always":
+                lines += [f"### Team {name}: {doc}", "", body.strip(), ""]
+        on_request = [doc for doc in own if doc[2] == "on-request"]
+        if on_request:
+            lines += [f"### Team {name}: on request", ""]
+            lines += [f"- `{TEAMS_CAPABILITY} doc show {name} {doc}` - {_md_escape(line)}"
+                      for _team, doc, _load, line, _body in on_request]
+            lines.append("")
+    return lines
+
+
 # Set by `init` alone: its offline part (envelope, identity, host wiring) never
 # needs the database, so where the project's gate is in a store this process
 # cannot reach - an image built without one - the context file says so and is
@@ -23615,6 +23703,8 @@ def _compose_context(root: Path, build: bool = False) -> str:
                 continue
             lines += [_md_escape(stub), ""]
             lines += _context_contribution(name, manifest)
+            if name == TEAMS_CAPABILITY:
+                lines += _teams_context(root)
             try:
                 ids = adapter.resolve(name, "identifier")
                 refs = _context_references(adapter, root, name)

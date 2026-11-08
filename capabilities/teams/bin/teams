@@ -1,0 +1,987 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "capabilities-contract>=0.43,<1",
+#     "psycopg[binary]>=3.2",
+# ]
+# ///
+"""teams — teams of agents that carry shared instructions, in the store.
+
+A team is a store record: a name, one line saying what it is for and when to
+turn to it, its members (agents, by their declared id), and its instruction
+documents. Knowledge that applies to a group of agents has one home in the
+team and reaches each member from there, without being copied into any of
+them. A team gives knowledge only: no connection, key, capability or grant
+reaches an agent through it.
+
+A document is one instruction text of a team: a name and its versions. A
+version holds a one-line description, its load - `always` or `on-request` -
+and the body, with who saved it, when, and why. One version is active; a save
+adds a new version and never changes an old one. Each document is switched on
+or off for its team, and only one that is on reaches a member.
+
+A team is in one of two modes:
+
+  ordinary  (the default) a member's context lists the team by its one line
+            and how to read it; the member reads its documents on request.
+  always    a member's context carries the team's enabled `always`
+            documents whole, each headed by the team's name, and lists its
+            enabled `on-request` documents by their line.
+
+The capabilities manager composes that part of every member's context at
+build, straight from the store, while teams is enabled for the member;
+nothing renders it ahead of time, and it carries nothing that changes from
+one session to the next. Disabling teams for an agent removes it and nothing
+else.
+
+Any agent reads every team and writes through the usual gates: teams enabled
+for it, and no read-only switch. Teams belong to the store, not to an agent.
+Agent-invoked: reads answer plain text by default and JSON with --json;
+writes answer JSON.
+
+Documents live in the PostgreSQL the project resolves (STORE). Without a
+store there are none: every verb that reads or writes them exits 6
+`store_not_configured`.
+
+NAMES
+  A team's name is lower-case letters, digits and '-', starting with a
+  letter or digit (`release-crew`). A document's name is letters, digits,
+  '.', '_' and '-', starting with a letter or digit (`style`, `deploy-rules`).
+  An agent is named by its declared id, as `capabilities agent show` gives
+  it.
+
+THE FILE FORM
+  A document is read and written as this text:
+
+    ---
+    description: <one line>
+    load: always|on-request
+    ---
+    <body>
+
+  The two keys, each once, in this order, each `key: value` on one line; the
+  body is every byte after the closing `---` line, kept exactly. Input that
+  does not read back byte for byte in this form is refused (exit 6
+  `not_canonical`, naming the line).
+
+SIZE
+  A size in tokens is an estimate: a quarter of the characters, rounded up.
+  Each document carries the size of its active body; a team carries `tokens`,
+  the size of its enabled documents together, and `always_tokens`, the size
+  of its enabled `always` documents, which is what the team adds to every
+  member's context in always mode.
+
+READING  (plain text by default; --json gives the structured answer)
+  teams list [--all] [--json]
+      The teams this agent is a member of, each with its mode and line.
+      With --all, every team in the store, each marked `member` or not.
+      An agent in no team is told so (exit 0).
+  teams show <team> [--json]
+      The team: its line, mode, members, size, and every document with its
+      load, whether it is on, its line and its size.
+  teams doc show <team> <doc> [--version ID] [--json]
+      The active version, or the version ID names, in the file form. --json
+      adds the version id, who saved it, when, its note and its size; the
+      version id is what `doc save --base` names.
+  teams doc history <team> <doc> [--json]
+      Every version, newest first: id, when, by whom, the note, its load and
+      size, and which one is active.
+
+  ID is a version's whole id or a prefix of six or more characters that names
+  one version of the document.
+
+WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
+  teams create <team> --description TEXT [--always]
+      Make a team with that line, in ordinary mode, or in always mode with
+      --always. Safe to repeat: the same line and mode answer `"changed":
+      false`; a team of that name with another line or mode is refused (exit
+      6 `team_exists`) - `teams mode` switches the mode.
+  teams mode <team> ordinary|always
+      Switch the team's mode. Safe to repeat.
+  teams members add <team> <agent>
+  teams members remove <team> <agent>
+      Make the agent a member of the team, or no longer one. Safe to repeat:
+      answers `"changed": false`.
+  teams doc save <team> <doc> --from FILE|- [--base ID] [--note TEXT]
+      Save the file form read from FILE, or stdin with `-`, as the document's
+      new active version; a name not in use starts a new document, switched
+      on. --base names the version the edit was made from: the save is
+      refused (exit 7 `stale_base`, naming the active version) when it is no
+      longer the active one, because another save came first. Without --base
+      the active version at the time of the save is the base. --note says
+      why. Safe to repeat: content equal to the active version's adds no
+      version and answers `"changed": false`.
+  teams doc on <team> <doc>
+  teams doc off <team> <doc>
+      Switch the document on or off for its team. Off, it reaches no member
+      and keeps every version. Safe to repeat: answers `"changed": false`.
+
+STORE
+  The tables are teams_teams (one row per team), teams_members (one row per
+  member of a team), teams_documents (one row per document of a team, with
+  its switch) and teams_versions (one row per version), in the schema the
+  project's store setting names, migrated under the `teams` ledger. One
+  version per document is active, which the store enforces; it refuses any
+  change to a version other than clearing `active`, and any delete.
+
+CONTRACT VERBS
+  teams help                  this text
+  teams doctor                the store, the tables, and this agent's teams
+  teams connections           none: teams reaches no system of its own
+  teams stub                  the one-line awareness text
+  teams manifest --json       the declaration, with `contribution`
+  teams guide [<topic>]       none
+  teams ids list|get|set|rm   this project's identifiers
+  teams refs                  this project's references
+  teams inventory [--network] empty: the teams are the store's (`teams list`)
+  teams migrate [status]      bring the tables up to this version / report
+
+I/O
+  Success is plain text or JSON on stdout; failure is
+  {"error": {"code", "message", "hint"?}} on stderr.
+
+EXIT CODES
+  0 success
+  3 not found - no team, document or version of that name
+  4 policy - teams not enabled, the read-only switch
+  5 store - unreachable or busy
+  6 input - a malformed argument or file, no store configured, no project or
+    project identity where the verb needs this agent, a team that exists
+    with another line or mode
+  7 stale - the base a save names is no longer the active version
+"""
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+NAME = "teams"
+SUMMARY = ("Teams of agents that carry shared instructions in the store - a team's line, "
+           "members and versioned documents, each always or on request and switched on or "
+           "off, composed into every member's context by the manager at build.")
+SCOPE = "project"
+CRED_KEYS: list = []
+# Every verb that changes the store's teams; each is refused under the
+# read-only switch. Nested verbs are named `<noun> <verb>`.
+WRITE_VERBS = {"create", "mode", "members add", "members remove", "doc save", "doc on",
+               "doc off"}
+WRITE_DEFAULT = True
+DOCS_BASE = ""
+STATE = False
+TABLES = True       # teams_* tables in the project's store, built by _tables()
+INVENTORY = None
+POST_INSTALL: list[dict] = []
+# The constant half of the block the manager composes after the stub line: how
+# to read a team. The manager adds this agent's own teams to it at build from
+# the store, so the declaration carries nothing that changes.
+BLOCK = "\n\n".join([
+    "Teams carry instructions shared by a group of agents. The teams this agent belongs "
+    "to are listed below, each by its line; a team in always mode has its standing "
+    "documents here whole.",
+    "`teams show <team>` lists a team's documents, `teams doc show <team> <doc>` reads "
+    "one, and `teams list --all` names every team; `teams help` gives every command.",
+]) + "\n"
+CONTRIBUTION = {"markdown": BLOCK}
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# The shared capability code is the capabilities-contract library's, bound here
+# into this script's namespace (SHEBANG.md, "The contract verbs").
+from capabilities_contract.capability import bind as _contract_bind
+
+_contract_bind(globals(), "core")
+
+_contract_bind(globals(), "store")
+
+
+def _cmd_connections() -> None:
+    """teams reaches no system of its own: the store is the project's,
+    resolved through the shared library, so there is nothing to resolve here."""
+    _emit({"default": None, "connections": {}})
+
+
+def _manifest() -> dict:
+    """The contract's manifest, with the context contribution this capability
+    declares."""
+    return {**_manifest_core(), "contribution": CONTRIBUTION}
+
+
+# ── the tables ──────────────────────────────────────────────────────────────
+
+# A team belongs to no agent: it is the store's, shared by its members, so
+# teams_teams, teams_documents and teams_versions carry no agent_id, and a
+# team is keyed by its name. A member row names its agent by declared id with
+# no foreign key, as every agent column does. A document is keyed by its team
+# and name; its versions reference it by a foreign key, and every key is
+# between this capability's own tables, none of which deletes a referenced
+# row, so a key refuses only an orphan.
+LEDGER_MAJOR, LEDGER_MINOR = 1, 0
+_TEAM_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
+_DOC_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+LEDGER_STEPS = [
+    ("0001-teams", f"""
+    CREATE TABLE teams_teams (
+        name         text PRIMARY KEY CHECK (name ~ '{_TEAM_PATTERN}' AND length(name) <= 64),
+        description  text NOT NULL CHECK (description <> '' AND description !~ '[\\n\\r]'),
+        always       boolean NOT NULL DEFAULT false,
+        created_at   timestamptz NOT NULL DEFAULT now(),
+        created_by   text NOT NULL CHECK (created_by <> '')
+    );
+    COMMENT ON TABLE teams_teams IS
+        'A team of agents: shared instructions with one home, reaching each member. It belongs to the store, not to an agent.';
+    COMMENT ON COLUMN teams_teams.description IS
+        'One line: what the team is for and when to turn to it. A member''s context lists the team by it.';
+    COMMENT ON COLUMN teams_teams.always IS
+        'The mode: false (ordinary) lists the team by its line; true composes its enabled always documents into every member''s context.';
+    COMMENT ON COLUMN teams_teams.created_by IS
+        'Who made the team: user@node.';
+    """),
+    ("0002-members", """
+    CREATE TABLE teams_members (
+        agent_id  text NOT NULL CHECK (agent_id <> ''),
+        team      text NOT NULL REFERENCES teams_teams (name),
+        added_at  timestamptz NOT NULL DEFAULT now(),
+        added_by  text NOT NULL CHECK (added_by <> ''),
+        PRIMARY KEY (agent_id, team)
+    );
+    CREATE INDEX teams_members_team ON teams_members (team);
+    COMMENT ON TABLE teams_members IS
+        'One member of a team. Removing the member deletes the row.';
+    COMMENT ON COLUMN teams_members.agent_id IS
+        'The member agent''s declared id.';
+    COMMENT ON COLUMN teams_members.added_by IS
+        'Who added the member: user@node.';
+    """),
+    ("0003-documents", f"""
+    CREATE TABLE teams_documents (
+        team        text NOT NULL REFERENCES teams_teams (name),
+        name        text NOT NULL CHECK (name ~ '{_DOC_PATTERN}' AND length(name) <= 128),
+        enabled     boolean NOT NULL DEFAULT true,
+        created_at  timestamptz NOT NULL DEFAULT now(),
+        created_by  text NOT NULL CHECK (created_by <> ''),
+        PRIMARY KEY (team, name)
+    );
+    COMMENT ON TABLE teams_documents IS
+        'One instruction document of a team: what never changes about it, and its switch. Its content is in teams_versions.';
+    COMMENT ON COLUMN teams_documents.enabled IS
+        'Whether the document is on for its team; off, it reaches no member and keeps its versions.';
+    """),
+    ("0004-versions", """
+    CREATE TABLE teams_versions (
+        id           uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        team         text NOT NULL,
+        document     text NOT NULL,
+        description  text NOT NULL CHECK (description <> '' AND description !~ '[\\n\\r]'),
+        load         text NOT NULL CHECK (load IN ('always', 'on-request')),
+        body         text NOT NULL,
+        active       boolean NOT NULL DEFAULT true,
+        created_at   timestamptz NOT NULL DEFAULT now(),
+        created_by   text NOT NULL CHECK (created_by <> ''),
+        note         text,
+        FOREIGN KEY (team, document) REFERENCES teams_documents (team, name)
+    );
+    CREATE UNIQUE INDEX teams_versions_active ON teams_versions (team, document) WHERE active;
+    CREATE INDEX teams_versions_document ON teams_versions (team, document, created_at DESC);
+    COMMENT ON TABLE teams_versions IS
+        'Every version of a team document; immutable but for active, which one save clears as it adds the next.';
+    COMMENT ON COLUMN teams_versions.description IS
+        'One line: what the document holds; an on-request document is listed by it.';
+    COMMENT ON COLUMN teams_versions.load IS
+        'always: composed whole into a member''s context when its team is in always mode; on-request: listed by its line and read on request.';
+    COMMENT ON COLUMN teams_versions.body IS
+        'Every byte after the closing front-matter line, kept exactly.';
+    COMMENT ON COLUMN teams_versions.active IS
+        'The version in force; at most one per document.';
+    COMMENT ON COLUMN teams_versions.created_by IS
+        'Who saved the version: user@node.';
+    COMMENT ON COLUMN teams_versions.note IS
+        'Why the version was saved.';
+    """),
+    ("0005-versions-guard", """
+    CREATE FUNCTION teams_versions_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'team document versions are never deleted: switch the document off instead'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF (to_jsonb(new) - 'active') IS DISTINCT FROM (to_jsonb(old) - 'active') THEN
+            RAISE EXCEPTION 'a team document version is immutable: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.active AND NOT old.active THEN
+            RAISE EXCEPTION 'a team document version is not made active again: save its content as a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $$;
+    CREATE TRIGGER teams_versions_guard BEFORE UPDATE OR DELETE ON teams_versions
+        FOR EACH ROW EXECUTE FUNCTION teams_versions_guard();
+    CREATE TRIGGER teams_versions_truncate BEFORE TRUNCATE ON teams_versions
+        FOR EACH STATEMENT EXECUTE FUNCTION teams_versions_guard();
+    """),
+]
+
+
+def _tables():
+    """The steps and version of teams' tables, for the contract's `migrate`."""
+    return LEDGER_STEPS, LEDGER_MAJOR, LEDGER_MINOR
+
+
+# ── names, the file form, size ──────────────────────────────────────────────
+
+LOADS = ("always", "on-request")
+FRONT_KEYS = ("description", "load")
+_TEAM_RE = re.compile(_TEAM_PATTERN)
+_DOC_RE = re.compile(_DOC_PATTERN)
+_AGENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
+
+
+class Unreadable(Exception):
+    """Input that does not read as the file form."""
+
+
+def _check_team(name: str) -> str:
+    if not _TEAM_RE.fullmatch(name) or len(name) > 64:
+        _die(6, "input", f"{name!r} is no team name",
+             "a team's name is lower-case letters, digits and '-', starting with a letter or "
+             "digit, at most 64 characters, such as release-crew")
+    return name
+
+
+def _check_doc(name: str) -> str:
+    if not _DOC_RE.fullmatch(name) or len(name) > 128:
+        _die(6, "input", f"{name!r} is no document name",
+             "a document's name is letters, digits, '.', '_' and '-', starting with a letter "
+             "or digit, at most 128 characters, such as deploy-rules")
+    return name
+
+
+def _check_agent(agent: str) -> str:
+    if not _AGENT_RE.fullmatch(agent):
+        _die(6, "input", f"{agent!r} is no agent id",
+             "name the agent by its declared id, as `capabilities agent show` gives it")
+    return agent
+
+
+def _check_line(text: str, what: str) -> str:
+    if not text.strip() or "\n" in text or "\r" in text or text != text.strip():
+        _die(6, "input", f"the {what} must be one line of text, not empty and with no "
+             "leading or trailing space")
+    return text
+
+
+def tokens(text: str) -> int:
+    """A size in tokens, estimated as a quarter of the characters, rounded up."""
+    return (len(text) + 3) // 4
+
+
+def render(version: dict) -> str:
+    """A version in the file form: the front matter, then the body as kept."""
+    return (f"---\ndescription: {version['description']}\nload: {version['load']}\n---\n"
+            f"{version['body']}")
+
+
+def parse(text: str) -> dict:
+    """The fields of the file form, refused unless they render back to `text`
+    byte for byte."""
+    if "\x00" in text:
+        raise Unreadable("it holds a NUL character")
+    if not text.startswith("---\n"):
+        raise Unreadable("line 1 is not `---`: the text opens with its front matter")
+    end = text.find("\n---\n", 3)
+    if end < 0:
+        raise Unreadable("the front matter has no closing `---` line")
+    fields: dict = {}
+    for number, line in enumerate(text[4:end].split("\n") if end > 3 else [], start=2):
+        key, sep, value = line.partition(": ")
+        if not sep or key not in FRONT_KEYS:
+            raise Unreadable(f"line {number} is not one of `{': ...`, `'.join(FRONT_KEYS)}: ...`")
+        if key in fields:
+            raise Unreadable(f"line {number} repeats `{key}`")
+        if value != value.strip():
+            raise Unreadable(f"line {number}: the value of `{key}` starts or ends with a space")
+        fields[key] = value
+    missing = [key for key in FRONT_KEYS if key not in fields]
+    if missing:
+        raise Unreadable(f"the front matter has no {', '.join(missing)}")
+    if not fields["description"].strip():
+        raise Unreadable("`description` is empty")
+    if fields["load"] not in LOADS:
+        raise Unreadable(f"`load` is {fields['load']!r}, not always or on-request")
+    version = {"description": fields["description"], "load": fields["load"],
+               "body": text[end + 5:]}
+    canonical = render(version)
+    if canonical != text:
+        for number, (got, want) in enumerate(zip(text.split("\n"), canonical.split("\n")),
+                                             start=1):
+            if got != want:
+                raise Unreadable(f"line {number} reads {got!r} where the file form writes "
+                                 f"{want!r}")
+        raise Unreadable("it does not read back as the file form")
+    return version
+
+
+def _same(a: dict, b: dict) -> bool:
+    return all(a[key] == b[key] for key in ("description", "load", "body"))
+
+
+# ── the agent, the store ────────────────────────────────────────────────────
+
+_SETTING_SLUGS = frozenset({
+    "store_not_configured", "store_not_postgres", "store_setting_unreadable",
+    "store_setting_too_new", "bad_store_setting", "sslmode_too_weak",
+    "bad_schema_name", "driver_missing", "transaction_pooler"})
+_STORE_HINT = ("set AGENTKIT_DB_URL (or AGENTKIT_DB_HOST, AGENTKIT_DB_NAME, AGENTKIT_DB_USER, "
+               "AGENTKIT_DB_PASSWORD) in the project's .env.local or the environment, or run "
+               "`capabilities store set`")
+
+
+def _me() -> str:
+    """This agent's declared id: the member `list` answers for."""
+    if _project_root() is None:
+        _die(6, "no_project", f"`{NAME} list` answers for the agent it runs in; run it inside "
+             "a project", "cd into the project, set CLAUDE_PROJECT_DIR, or pass --all")
+    agent = _project_id(write=False)
+    if not agent:
+        _die(6, "no_project_identity", "this project has no durable id",
+             "run `capabilities init` in the project, or pass --all")
+    return str(agent)
+
+
+def _maybe_me() -> str | None:
+    """This agent's declared id where there is one; none is needed to read."""
+    if _project_root() is None:
+        return None
+    agent = _project_id(write=False)
+    return str(agent) if agent else None
+
+
+def _actor() -> str:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME")
+    if not user:
+        with contextlib.suppress(Exception):
+            import pwd
+            user = pwd.getpwuid(os.getuid()).pw_name
+    return f"{user or 'unknown'}@{node_name()}"
+
+
+def _db():
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        _die(6, "driver_missing",
+             "the shared database library capabilities-contract is not installed",
+             f"run {NAME} through its own script header, which pins it")
+    return db
+
+
+def _db_refused(exc) -> NoReturn:
+    if exc.slug == "store_not_configured":
+        _die(6, "store_not_configured",
+             f"{NAME} keeps teams in a store, and none is configured here", _STORE_HINT)
+    _die(6 if exc.slug in _SETTING_SLUGS else 5, exc.slug, exc.message, exc.hint)
+
+
+def _open():
+    """The working connection to the project's store, its tables migrated."""
+    db = _db()
+    conn = None
+    try:
+        setting = db.resolve_setting(_project_root())
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+        db.migrate(conn, NAME, LEDGER_STEPS, major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+        conn.autocommit = True
+    except db.DbError as exc:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+        _db_refused(exc)
+    return conn
+
+
+@contextlib.contextmanager
+def _store():
+    """A connection for one command; a lost store or a store refusal becomes
+    the error envelope."""
+    import psycopg
+    conn = _open()
+    try:
+        yield conn
+    except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+        _die(5, "store_unreachable", f"the store stopped answering: {exc}",
+             f"`{NAME} doctor` proves the store")
+    except psycopg.errors.UniqueViolation:
+        _die(7, "stale_base", "another save changed this document at the same moment",
+             f"read it again with `{NAME} doc show` and save with its version as --base")
+    except psycopg.errors.CheckViolation as exc:
+        _die(6, "refused_by_store", str(exc).splitlines()[0])
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+def _rows(conn, sql: str, params=()) -> list[dict]:
+    from psycopg.rows import dict_row
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        return list(cur.fetchall()) if cur.description else []
+
+
+def _one(conn, sql: str, params=()) -> dict | None:
+    rows = _rows(conn, sql, params)
+    return rows[0] if rows else None
+
+
+def _moment(moment) -> str | None:
+    return moment.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z") if moment else None
+
+
+def _mode(always: bool) -> str:
+    return "always" if always else "ordinary"
+
+
+def _team(conn, team: str, lock: bool = False) -> dict:
+    found = _one(conn, "SELECT name, description, always, created_at, created_by "
+                 "FROM teams_teams WHERE name = %s" + (" FOR UPDATE" if lock else ""), (team,))
+    if found is None:
+        _die(3, "not_found", f"no team {team!r}", f"`{NAME} list --all` names every team")
+    return found
+
+
+def _document(conn, team: str, doc: str, lock: bool = False) -> dict | None:
+    return _one(conn, "SELECT team, name, enabled, created_at, created_by FROM teams_documents "
+                "WHERE team = %s AND name = %s" + (" FOR UPDATE" if lock else ""), (team, doc))
+
+
+def _need_document(conn, team: str, doc: str, lock: bool = False) -> dict:
+    found = _document(conn, team, doc, lock)
+    if found is None:
+        _die(3, "not_found", f"team {team!r} has no document {doc!r}",
+             f"`{NAME} show {team}` lists its documents")
+    return found
+
+
+_VERSION_COLUMNS = ("id, team, document, description, load, body, active, created_at, "
+                    "created_by, note")
+
+
+def _active(conn, team: str, doc: str) -> dict | None:
+    return _one(conn, f"SELECT {_VERSION_COLUMNS} FROM teams_versions "
+                "WHERE team = %s AND document = %s AND active", (team, doc))
+
+
+def _version(conn, team: str, doc: str, ref: str) -> dict:
+    """One version of the document by its whole id or a prefix of six or more."""
+    ref = ref.strip().lower()
+    if len(ref) < 6 or not re.fullmatch(r"[0-9a-f-]+", ref):
+        _die(6, "input", f"{ref!r} names no version",
+             "a version id is its whole id or a prefix of six or more characters")
+    found = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM teams_versions "
+                  "WHERE team = %s AND document = %s AND id::text LIKE %s ORDER BY created_at",
+                  (team, doc, ref + "%"))
+    if not found:
+        _die(3, "not_found", f"{team}/{doc} has no version {ref!r}",
+             f"`{NAME} doc history {team} {doc}` lists its versions")
+    if len(found) > 1:
+        _die(6, "ambiguous_version", f"{ref!r} names {len(found)} versions of {team}/{doc}",
+             "give more of the id")
+    return found[0]
+
+
+def _version_view(version: dict, with_body: bool = True) -> dict:
+    view = {"version": str(version["id"]), "active": version["active"],
+            "description": version["description"], "load": version["load"],
+            "tokens": tokens(version["body"]),
+            "created_at": _moment(version["created_at"]), "created_by": version["created_by"],
+            "note": version["note"]}
+    if with_body:
+        view["body"] = version["body"]
+        view["rendered"] = render(version)
+    return view
+
+
+def _team_view(conn, team: dict, me: str | None) -> dict:
+    """A team whole: its line, mode, members, documents and size."""
+    members = [row["agent_id"] for row in _rows(
+        conn, "SELECT agent_id FROM teams_members WHERE team = %s ORDER BY agent_id",
+        (team["name"],))]
+    documents = []
+    for row in _rows(conn, "SELECT d.name, d.enabled, v.id, v.description, v.load, v.body "
+                     "FROM teams_documents d JOIN teams_versions v ON v.team = d.team "
+                     "AND v.document = d.name AND v.active WHERE d.team = %s ORDER BY d.name",
+                     (team["name"],)):
+        documents.append({"name": row["name"], "enabled": row["enabled"],
+                          "load": row["load"], "description": row["description"],
+                          "version": str(row["id"]), "tokens": tokens(row["body"])})
+    view = {"name": team["name"], "description": team["description"],
+            "mode": _mode(team["always"]), "members": members,
+            "tokens": sum(d["tokens"] for d in documents if d["enabled"]),
+            "always_tokens": sum(d["tokens"] for d in documents
+                                 if d["enabled"] and d["load"] == "always"),
+            "documents": documents,
+            "created_at": _moment(team["created_at"]), "created_by": team["created_by"]}
+    if me is not None:
+        view["member"] = me in members
+    return view
+
+
+# ── reading ─────────────────────────────────────────────────────────────────
+
+def cmd_list(args) -> None:
+    me = _maybe_me() if args.all else _me()
+    with _store() as conn:
+        if args.all:
+            rows = _rows(conn, "SELECT t.name, t.description, t.always, "
+                         "EXISTS (SELECT 1 FROM teams_members m WHERE m.team = t.name "
+                         "AND m.agent_id = %s) AS member FROM teams_teams t ORDER BY t.name",
+                         (me or "",))
+        else:
+            rows = _rows(conn, "SELECT t.name, t.description, t.always, true AS member "
+                         "FROM teams_teams t JOIN teams_members m ON m.team = t.name "
+                         "WHERE m.agent_id = %s ORDER BY t.name", (me,))
+    teams = [{"name": row["name"], "description": row["description"],
+              "mode": _mode(row["always"]),
+              **({"member": row["member"]} if me is not None else {})} for row in rows]
+    if args.json:
+        _emit({"scope": "all" if args.all else "mine", "agent": me, "teams": teams})
+        return
+    if not teams:
+        print("The store holds no team." if args.all else
+              f"This agent ({me}) is a member of no team. `{NAME} list --all` names every team.")
+        return
+    for team in teams:
+        mark = "  member" if team.get("member") and args.all else ""
+        print(f"{team['name']}  {team['mode']}{mark}  {team['description']}")
+
+
+def cmd_show(args) -> None:
+    team = _check_team(args.team)
+    me = _maybe_me()
+    with _store() as conn:
+        view = _team_view(conn, _team(conn, team), me)
+    if args.json:
+        _emit(view)
+        return
+    lines = [f"team: {view['name']}", f"description: {view['description']}",
+             f"mode: {view['mode']}",
+             f"members: {', '.join(view['members']) if view['members'] else 'none'}",
+             f"tokens: {view['tokens']} (enabled documents), always: {view['always_tokens']}",
+             "documents:" if view["documents"] else "documents: none"]
+    for doc in view["documents"]:
+        lines.append(f"  {doc['name']}  {doc['load']}  {'on' if doc['enabled'] else 'off'}  "
+                     f"~{doc['tokens']} tokens  {doc['description']}")
+    print("\n".join(lines))
+
+
+def cmd_doc_show(args) -> None:
+    team, doc = _check_team(args.team), _check_doc(args.doc)
+    with _store() as conn:
+        _team(conn, team)
+        document = _need_document(conn, team, doc)
+        version = (_version(conn, team, doc, args.version) if args.version
+                   else _active(conn, team, doc))
+    if args.json:
+        _emit({"team": team, "document": doc, "enabled": document["enabled"],
+               **_version_view(version)})
+        return
+    sys.stdout.write(render(version))
+
+
+def cmd_doc_history(args) -> None:
+    team, doc = _check_team(args.team), _check_doc(args.doc)
+    with _store() as conn:
+        _team(conn, team)
+        _need_document(conn, team, doc)
+        versions = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM teams_versions WHERE team = %s "
+                         "AND document = %s ORDER BY created_at DESC, id", (team, doc))
+    views = [_version_view(v, with_body=False) for v in versions]
+    if args.json:
+        _emit({"team": team, "document": doc, "versions": views})
+        return
+    for view in views:
+        mark = "  active" if view["active"] else ""
+        note = f"  {view['note']}" if view["note"] else ""
+        print(f"{view['version']}  {view['created_at']}  {view['created_by']}  "
+              f"{view['load']}  ~{view['tokens']} tokens{mark}{note}")
+
+
+# ── writing ─────────────────────────────────────────────────────────────────
+
+def cmd_create(args) -> None:
+    team = _check_team(args.team)
+    description = _check_line(args.description, "description")
+    with _store() as conn:
+        with conn.transaction():
+            made = _one(conn, "INSERT INTO teams_teams (name, description, always, created_by) "
+                        "VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO NOTHING RETURNING name",
+                        (team, description, args.always, _actor()))
+            if made is None:
+                found = _team(conn, team)
+                if found["description"] != description or found["always"] != args.always:
+                    _die(6, "team_exists", f"a team {team!r} exists already, with the line "
+                         f"{found['description']!r} in {_mode(found['always'])} mode",
+                         f"`{NAME} show {team}` shows it; `{NAME} mode {team}` switches its "
+                         "mode")
+    _emit({"team": team, "description": description, "mode": _mode(args.always),
+           "changed": made is not None})
+
+
+def cmd_mode(args) -> None:
+    team = _check_team(args.team)
+    always = args.mode == "always"
+    with _store() as conn:
+        with conn.transaction():
+            found = _team(conn, team, lock=True)
+            changed = found["always"] != always
+            if changed:
+                conn.execute("UPDATE teams_teams SET always = %s WHERE name = %s",
+                             (always, team))
+    _emit({"team": team, "mode": args.mode, "changed": changed})
+
+
+def cmd_members(args) -> None:
+    team, agent = _check_team(args.team), _check_agent(args.agent)
+    with _store() as conn:
+        with conn.transaction():
+            _team(conn, team, lock=True)
+            if args.action == "add":
+                changed = _one(conn, "INSERT INTO teams_members (agent_id, team, added_by) "
+                               "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING RETURNING team",
+                               (agent, team, _actor())) is not None
+            else:
+                changed = _one(conn, "DELETE FROM teams_members WHERE agent_id = %s AND "
+                               "team = %s RETURNING team", (agent, team)) is not None
+    _emit({"team": team, "agent": agent, "member": args.action == "add", "changed": changed})
+
+
+def _read_source(source: str) -> str:
+    try:
+        data = sys.stdin.buffer.read() if source == "-" else Path(source).read_bytes()
+    except OSError as exc:
+        _die(6, "input", f"cannot read {source}: {exc.strerror or exc}")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        _die(6, "not_canonical", f"{source} is not UTF-8 ({exc.reason} at byte {exc.start})")
+
+
+def cmd_doc_save(args) -> None:
+    team, doc = _check_team(args.team), _check_doc(args.doc)
+    text = _read_source(args.source)
+    try:
+        fields = parse(text)
+    except Unreadable as exc:
+        _die(6, "not_canonical", f"{args.source} does not read as the file form: {exc}",
+             f"`{NAME} help` shows the file form")
+    actor = _actor()
+    with _store() as conn:
+        with conn.transaction():
+            _team(conn, team)
+            document = _document(conn, team, doc, lock=True)
+            created = document is None
+            if created:
+                if args.base:
+                    _die(3, "not_found", f"team {team!r} has no document {doc!r} to be the "
+                         "base of this save", "save without --base to start the document")
+                conn.execute("INSERT INTO teams_documents (team, name, created_by) "
+                             "VALUES (%s, %s, %s)", (team, doc, actor))
+                active = None
+            else:
+                active = _active(conn, team, doc)
+                if args.base:
+                    base = _version(conn, team, doc, args.base)
+                    if not base["active"]:
+                        _die(7, "stale_base", f"{team}/{doc} was saved after {args.base}: its "
+                             f"active version is {active['id']}",
+                             f"read it with `{NAME} doc show {team} {doc}`, carry the edit "
+                             "over, and save with that version as --base")
+                if _same(active, fields):
+                    _emit({"team": team, "document": doc, "version": str(active["id"]),
+                           "changed": False})
+                    return
+                conn.execute("UPDATE teams_versions SET active = false WHERE id = %s",
+                             (active["id"],))
+            made = _one(conn, "INSERT INTO teams_versions (team, document, description, load, "
+                        "body, created_by, note) VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                        "RETURNING id", (team, doc, fields["description"], fields["load"],
+                                         fields["body"], actor, args.note))
+    _emit({"team": team, "document": doc, "version": str(made["id"]),
+           "previous": str(active["id"]) if active else None, "created": created,
+           "tokens": tokens(fields["body"]), "changed": True})
+
+
+def cmd_doc_switch(args) -> None:
+    team, doc = _check_team(args.team), _check_doc(args.doc)
+    enabled = args.verb == "on"
+    with _store() as conn:
+        with conn.transaction():
+            _team(conn, team)
+            document = _need_document(conn, team, doc, lock=True)
+            changed = document["enabled"] != enabled
+            if changed:
+                conn.execute("UPDATE teams_documents SET enabled = %s WHERE team = %s "
+                             "AND name = %s", (enabled, team, doc))
+    _emit({"team": team, "document": doc, "enabled": enabled, "changed": changed})
+
+
+# ── doctor ──────────────────────────────────────────────────────────────────
+
+def cmd_doctor() -> None:
+    db = _db()
+    report: dict = {"ok": False}
+    root = _project_root()
+    agent = None
+    if root is not None:
+        state = _project_id_state()
+        agent = state.get("id") if state else None
+    report["agent"] = {"root": str(root) if root else None, "id": agent}
+    conn = None
+    try:
+        setting = db.resolve_setting(root)
+        report["store"] = {"level": setting.level, "schema": setting.schema}
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+        found = db.status(conn, NAME, LEDGER_STEPS, major=LEDGER_MAJOR, minor=LEDGER_MINOR)
+        report["tables"] = {"state": found.state, "pending": found.pending,
+                            "changed": found.changed, "warnings": found.warnings}
+        if found.state == "current":
+            conn.autocommit = True
+            counts = _one(conn, "SELECT (SELECT count(*) FROM teams_teams) AS teams, "
+                          "(SELECT count(*) FROM teams_members WHERE agent_id = %s) AS mine",
+                          (agent or "",))
+            report["teams"] = {"store": counts["teams"],
+                               "member_of": counts["mine"] if agent else None}
+    except db.DbError as exc:
+        report["store"] = {**report.get("store", {}), "error": {"code": exc.slug,
+                                                                "message": exc.message}}
+        _emit(report)
+        sys.exit(6 if exc.slug in _SETTING_SLUGS else 5)
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+    state = report["tables"]["state"]
+    report["ok"] = state in ("current", "pending")
+    if state == "pending":
+        report["hint"] = f"`{NAME} migrate` brings the tables to this version; any call does too"
+    elif state != "current":
+        report["hint"] = (f"the store's {NAME} tables do not match this version ({state}); "
+                          f"`{NAME} migrate status` says how")
+    _emit(report)
+    if not report["ok"]:
+        sys.exit(7)
+
+
+# ── the command line ────────────────────────────────────────────────────────
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=NAME, add_help=False, allow_abbrev=False)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    def verb(holder, name: str) -> argparse.ArgumentParser:
+        return holder.add_parser(name, add_help=False, allow_abbrev=False)
+
+    verb(sub, "help").add_argument("topic", nargs="*")
+    verb(sub, "doctor")
+    listing = verb(sub, "list")
+    listing.add_argument("--all", action="store_true")
+    listing.add_argument("--json", action="store_true")
+    show = verb(sub, "show")
+    show.add_argument("team")
+    show.add_argument("--json", action="store_true")
+    create = verb(sub, "create")
+    create.add_argument("team")
+    create.add_argument("--description", required=True)
+    create.add_argument("--always", action="store_true")
+    mode = verb(sub, "mode")
+    mode.add_argument("team")
+    mode.add_argument("mode", choices=("ordinary", "always"))
+
+    members = verb(sub, "members").add_subparsers(dest="action", required=True)
+    for action in ("add", "remove"):
+        one = verb(members, action)
+        one.add_argument("team")
+        one.add_argument("agent")
+
+    doc = verb(sub, "doc").add_subparsers(dest="verb", required=True)
+    doc_show = verb(doc, "show")
+    doc_show.add_argument("team")
+    doc_show.add_argument("doc")
+    doc_show.add_argument("--version")
+    doc_show.add_argument("--json", action="store_true")
+    history = verb(doc, "history")
+    history.add_argument("team")
+    history.add_argument("doc")
+    history.add_argument("--json", action="store_true")
+    save = verb(doc, "save")
+    save.add_argument("team")
+    save.add_argument("doc")
+    save.add_argument("--from", dest="source", required=True)
+    save.add_argument("--base")
+    save.add_argument("--note")
+    for switch in ("on", "off"):
+        one = verb(doc, switch)
+        one.add_argument("team")
+        one.add_argument("doc")
+    return parser
+
+
+def _parse(argv: list[str]):
+    parser = _parser()
+
+    def refuse(message: str) -> NoReturn:
+        _die(6, "input", message, f"`{NAME} help` shows every verb and its arguments")
+
+    def quiet(holder) -> None:
+        holder.error = refuse
+        for action in holder._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for one in action.choices.values():
+                    quiet(one)
+    quiet(parser)
+    return parser.parse_args(argv)
+
+
+def _verb_name(args) -> str:
+    if args.cmd == "members":
+        return f"members {args.action}"
+    if args.cmd == "doc":
+        return f"doc {args.verb}"
+    return args.cmd
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    if argv[:1] == ["manifest"]:
+        _emit(_manifest())
+        return
+    _contract(argv)
+    if not argv:
+        _cmd_help()
+        return
+    args = _parse(argv)
+    if args.cmd == "help":
+        _cmd_help()
+        return
+    verb = _verb_name(args)
+    if verb in WRITE_VERBS:
+        _read_only_gate(f"`{NAME} {verb}`")
+    if args.cmd == "doctor":
+        cmd_doctor()
+        return
+    {"list": cmd_list, "show": cmd_show, "create": cmd_create, "mode": cmd_mode,
+     "members add": cmd_members, "members remove": cmd_members,
+     "doc show": cmd_doc_show, "doc history": cmd_doc_history, "doc save": cmd_doc_save,
+     "doc on": cmd_doc_switch, "doc off": cmd_doc_switch}[verb](args)
+
+
+if __name__ == "__main__":
+    main()

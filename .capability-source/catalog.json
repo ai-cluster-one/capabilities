@@ -259,6 +259,13 @@
       "store_major": 3,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own."
     },
+    "teams": {
+      "icon": false,
+      "path": "capabilities/teams",
+      "payload_sha256": "1eaeb37f2a08488ebc11b90c33d23042c1439f10d1c7ff263484cfeb005bb467",
+      "store_major": 3,
+      "summary": "Teams of agents that carry shared instructions in the store - a team's line, members and versioned documents, each always or on request and switched on or off, composed into every member's context by the manager at build."
+    },
     "telegram": {
       "icon": true,
       "path": "capabilities/telegram",
