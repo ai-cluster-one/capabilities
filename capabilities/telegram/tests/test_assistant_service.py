@@ -8702,21 +8702,21 @@ class ReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
                 self.marker_logs(logs),
                 ["123: reply carried no === REPLY === marker"])
 
-    async def test_a_marker_with_nothing_under_it_delivers_the_whole_reply(self):
-        """A worker that mislabelled its own answer, not one that forgot.
+    async def test_a_marker_with_nothing_under_it_sends_nothing(self):
+        """A worker that declared an empty message chose to say nothing.
 
-        Delivering the empty half would turn a real answer into silence, which
-        is worse than the opening this exists to remove — and it is a different
-        fault from the omission above, so it says so in its own words."""
+        Delivering the reply whole would post the working-out above the marker,
+        which is what the marker exists to keep home — and it is a different
+        case from the omission above, so it says so in its own words."""
         with tempfile.TemporaryDirectory() as td:
             reply = "The answer is ready.\n\n=== REPLY ===\n   "
             sent, logs = await self.delivered(td, reply)
 
-            self.assertEqual(sent[0]["text"], reply)
+            self.assertEqual(sent, [])
             self.assertEqual(
                 self.marker_logs(logs),
                 ["123: reply put nothing under its === REPLY === marker; "
-                 "delivered whole"])
+                 "sent nothing (deliberate silence)"])
 
     def cut(self, td, text):
         return import_daemon(Path(td), settings()).cut_at_reply_marker(text)
@@ -8742,13 +8742,15 @@ class ReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
                 "=== reply ===\nwrong case, not the marker",
                 "a === REPLY === marker sharing its line with prose",
                 "===  REPLY  ===\nextra spacing is not the marker",
-                "Answer ready.\n\n=== REPLY ===\n \t \n",
                 "\n\n   \tleading and trailing whitespace kept   \n\n",
             ]
             for text in untouched:
                 cut, outcome = daemon.cut_at_reply_marker(text)
                 self.assertIs(cut, text, text)
-                self.assertIn(outcome, ("unmarked", "mislabelled"), text)
+                self.assertEqual(outcome, "unmarked", text)
+            for text in ("Answer ready.\n\n=== REPLY ===\n \t \n",
+                         "Working it out.\n\n=== REPLY ==="):
+                self.assertEqual(daemon.cut_at_reply_marker(text), ("", "silent"), text)
 
     def test_every_sink_reads_the_worker_table_through_one_dispatch(self):
         """The half of the rule that lives with the dispatchers.
@@ -8820,6 +8822,39 @@ class VoiceReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
                                             timeout=30)
 
             self.assertEqual(spoken, "The ledger comes to forty-two.")
+            client.disconnected.set()
+            await asyncio.wait_for(session_task, timeout=10)
+
+    async def test_a_voice_task_with_nothing_under_the_marker_speaks_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), self.voice_settings(),
+                                   voice_context="Answer briefly.",
+                                   project_env={"GOOGLE_API_KEY": "test-key"})
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                return successful_result(
+                    "Nothing to add; I stay quiet.\n\n=== REPLY ===")
+
+            daemon.WORKERS["stub"] = worker
+            captured = {}
+
+            def capture_runner(run_task, *_args, **_kwargs):
+                captured["run"] = run_task
+                return SimpleNamespace()
+
+            daemon.voice_agent.VoiceTaskRunner = capture_runner
+            daemon.voice_agent.VoiceCallSession = StubVoiceCallSession
+            client = FakeClient()
+            session_task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            calls = daemon.PyTgCalls.instances[-1]
+            await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+            await wait_until(lambda: "run" in captured, timeout=10)
+
+            spoken = await asyncio.wait_for(captured["run"]("the ledger total"),
+                                            timeout=30)
+
+            self.assertFalse(spoken)
             client.disconnected.set()
             await asyncio.wait_for(session_task, timeout=10)
 

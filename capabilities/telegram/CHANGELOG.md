@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — A reply that ends at its marker with nothing under it is silence
+
+A worker reply whose last `=== REPLY ===` line has nothing, or only whitespace, under it now sends nothing: a dialogue turn completes silently, a durable job finishes silent with no stored text, and a voice task speaks nothing - the path a turn that returned no answer already takes. Before, the whole reply was delivered, posting the working-out above the marker into the chat. The daemon logs it as `reply put nothing under its === REPLY === marker; sent nothing (deliberate silence)` where it logged `delivered whole`. A reply without the marker is still sent exactly as written, and a reply with words under the marker is still cut at it. No verb, flag, setting or output key changes.
+
 ## 2026-11-08 — A rich-formatted message reads as its words
 
 A message composed with Telegram's rich formatting - a paragraph followed by a numbered or bulleted list, as current Telegram apps send it - arrives with empty text and its words only in its rich blocks. It now reaches the worker's conversation tail as those words, and `read`, `search` and `export` print them as its text, where before the tail dropped it and the verbs showed it empty. Each paragraph reads as a line, an ordered item as `N. text`, a bulleted item as `- text`, a checklist item with `[ ]` or `[x]`, and formatting, links and other nested rich text read as their plain words. A message that carries text of its own reads exactly as before. No verb, flag, setting or output key changes.

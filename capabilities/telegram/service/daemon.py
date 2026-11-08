@@ -5798,18 +5798,21 @@ def cut_at_reply_marker(reply):
 
     `unmarked` — no marker, and `text` is `reply` itself, byte for byte.
 
-    `mislabelled` — a marker with nothing under it, and `text` is again `reply`
-    itself, byte for byte. Delivering the empty half would turn a real answer
-    into silence, which is worse than the opening this exists to remove.
+    `silent` — a marker with nothing under it, and `text` is empty. The worker
+    declared where its message begins and wrote none: that is a decision to say
+    nothing, and everything above the marker is working-out, which never reaches
+    the chat. Losing one answer a worker misplaced above its marker is the
+    smaller harm; delivering the reply whole posts the working-out the marker
+    exists to keep home.
 
-    Text is only ever dropped on the `marked` path, so no case this does not
-    understand comes out worse than it went in."""
+    Text is dropped only on the `marked` and `silent` paths, both of which the
+    worker declared; an unmarked reply comes back untouched."""
     matches = list(REPLY_MARKER.finditer(reply))
     if not matches:
         return reply, "unmarked"
     after = reply[matches[-1].end():].strip()
     if not after:
-        return reply, "mislabelled"
+        return "", "silent"
     return after, "marked"
 
 
@@ -5823,8 +5826,9 @@ def worker_turn(loop, worker, key, tail, state, procs):
     every decision a consumer makes about the text, including whether it
     duplicates a progress line and whether it is empty.
 
-    The cut can never empty a reply, so a consumer that reads emptiness as
-    silence reads exactly what it read before."""
+    A reply the cut empties comes back as the workers' own silent result, so
+    every consumer takes the path it already takes for a turn that returned
+    nothing."""
     run_worker = WORKERS.get(worker, worker_harness)
     if isinstance(state.get("profile"), BaseException):
         # A profile that does not resolve or fit ends the turn naming it,
@@ -5850,9 +5854,10 @@ def worker_turn(loop, worker, key, tail, state, procs):
                     # measure of whether it holds, and it should not have to be
                     # guessed at.
                     log(f"{key}: reply carried no {REPLY_MARKER_LINE} marker")
-                elif outcome == "mislabelled":
+                elif outcome == "silent":
+                    result["silent"] = True
                     log(f"{key}: reply put nothing under its {REPLY_MARKER_LINE} "
-                        f"marker; delivered whole")
+                        f"marker; sent nothing (deliberate silence)")
         return result
 
     return loop.run_in_executor(None, turn)

@@ -688,6 +688,33 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                              "The ledger is reconciled.")
             await self.stop_session(client, task)
 
+    async def test_a_stored_result_with_nothing_under_the_marker_is_silent(self):
+        """Working-out above an empty marker is not stored as the answer."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            register = daemon.job_register()
+            queued(register, channel_key="123", requested_by="777",
+                              description="reconcile the ledger", engine="stub")
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                return successful_result(
+                    "Nothing here asks anything of me, so I send nothing.\n\n"
+                    "=== REPLY ===\n")
+
+            daemon.WORKERS["stub"] = worker
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(lambda: any(row["outcome"] == daemon.jobs.SUCCEEDED
+                                         for row in register.list()), timeout=6)
+
+            row = register.list()[0]
+            self.assertFalse(row["result_text"])
+            self.assertTrue(row["result_silent"])
+            self.assertEqual(client.sent, [])
+            await self.stop_session(client, task)
+
     async def test_a_worker_that_answered_for_itself_is_not_answered_again(self):
         """One request, one delivery.
 
