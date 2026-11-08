@@ -21,6 +21,8 @@ empty document is a bot that answers nobody yet and records who wrote to it.
                      agent_dialogue, topics}}
   agent_dialogue     {max_turns}: turns in a row other bots may start in one chat
                      before a person writes; 4 by default, 0 for no limit
+  roles              {<role>: {profile}}: the profile a sender's turn runs on when
+                     their role names one, in place of the chat's or topic's
   control            {roles: {<role>: {commands}}}
   authority          {default, roles: {<role>: {allowed_capabilities}}}
   defaults           tail_size, history_requests, debounce, worker_timeout,
@@ -34,7 +36,8 @@ from __future__ import annotations
 import re
 
 TOP_LEVEL = {"assistant_name", "prompt_mode", "direct_messages", "allowed_users",
-             "allowed_groups", "agent_dialogue", "control", "authority", "defaults"}
+             "allowed_groups", "agent_dialogue", "roles", "control", "authority",
+             "defaults"}
 PROMPT_MODES = ("extend", "replace")
 DIRECT_MODES = ("allowed_users", "anyone", "off")
 MAY_ADDRESS = ("anyone", "members")
@@ -83,6 +86,7 @@ GROUP_KEYS = COMMON_KEYS | {"member_role", "members", "may_address", "aliases",
                             "require_reference", "triggers", "gate", "agent_dialogue",
                             "topics"}
 TOPIC_KEYS = {"name", "profile", "context", "context_prompt", "context_mode", "project"}
+ROLE_KEYS = {"profile"}
 GATE_KEYS = {"enabled", "mode", "brief", "context_messages", "context_chars", "max_batch",
              "model", "effort"}
 
@@ -350,6 +354,11 @@ def validate_settings(data) -> dict:
         _group(entry, f"settings.allowed_groups.{key}")
     if "agent_dialogue" in data:
         _agent_dialogue(data["agent_dialogue"], "settings.agent_dialogue")
+    for role, rule in _object(data.get("roles") or {}, "settings.roles").items():
+        rule = _object(rule, f"settings.roles.{role}")
+        _unknown(rule, ROLE_KEYS, f"settings.roles.{role}")
+        if "profile" in rule:
+            profile_name(rule["profile"], f"settings.roles.{role}.profile")
     if "control" in data:
         control = _object(data["control"], "settings.control")
         _unknown(control, {"roles"}, "settings.control")
@@ -388,6 +397,8 @@ def profile_names(settings: dict) -> dict[str, list[str]]:
         note((group or {}).get("profile"), f"allowed_groups.{key}.profile")
         for topic, entry in ((group or {}).get("topics") or {}).items():
             note((entry or {}).get("profile"), f"allowed_groups.{key}.topics.{topic}.profile")
+    for role, rule in (settings.get("roles") or {}).items():
+        note((rule or {}).get("profile"), f"roles.{role}.profile")
     return found
 
 

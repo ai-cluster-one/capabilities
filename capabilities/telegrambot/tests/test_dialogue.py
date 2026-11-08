@@ -519,6 +519,27 @@ def test_a_routed_chat_runs_in_its_project_and_a_missing_one_says_so(tmp_path):
     assert "is not a project folder here" in api.sent[-1]["text"] and len(runner.calls) == 1
 
 
+def test_a_role_that_names_a_profile_runs_its_senders_turns_on_it(tmp_path):
+    settings = {"allowed_users": {str(ANN): {"name": "Ann", "role": "supervisor"}},
+                "allowed_groups": {str(GROUP): {"aliases": ["Helper"],
+                                                "profile": "telegrambot-codex"}},
+                "roles": {"group_member": {"profile": "telegrambot-consult"}}}
+    dialogue, store, api, runner, clock = make(tmp_path, settings)
+    chat = dict(chat=GROUP)
+    assert dialogue.offer_update(update(1, "Helper, explain", sender=BOB, name="Bob",
+                                        **chat))["admit"]
+    drain(dialogue, clock)
+    assert dialogue.offer_update(update(2, "Helper, deploy", **chat))["admit"]
+    drain(dialogue, clock)
+    member, supervisor = (call["prompt"] for call in runner.calls)
+    assert "profile=telegrambot-consult" in member and "(role: group_member)" in member
+    assert "profile=telegrambot-codex" in supervisor and "(role: supervisor)" in supervisor
+    # A chat's /set profile moves the supervisor, never the member off its role's profile.
+    store.set_override("prj_test", "helper", GROUP, 0, "profile", "telegrambot-claude")
+    assert dialogue.channel_settings(GROUP, None, BOB)["profile"] == "telegrambot-consult"
+    assert dialogue.channel_settings(GROUP, None, ANN)["profile"] == "telegrambot-claude"
+
+
 def test_the_worker_is_handed_its_scope(tmp_path):
     dialogue, store, api, runner, clock = make(tmp_path)
     dialogue.offer_update(update(7, "hi"))

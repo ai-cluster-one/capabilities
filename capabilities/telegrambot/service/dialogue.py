@@ -292,9 +292,18 @@ class Policy:
                 return int(source["max_turns"])
         return _schema().DEFAULT_MAX_TURNS
 
+    def role_profile(self, chat_id, user_id) -> str | None:
+        """The profile the sender's role names under `roles`, or None."""
+        if user_id is None:
+            return None
+        rule = (self.settings.get("roles") or {}).get(self.role(chat_id, user_id)) or {}
+        return rule.get("profile") or None
+
     def channel(self, chat_id, topic_id, user_id, overrides=None) -> dict:
         """The effective settings of one channel: its `/set` overrides, then the
-        topic, the group or the direct sender, then the defaults."""
+        topic, the group or the direct sender, then the defaults. A profile the
+        sender's role names comes before all of them, so a member's turn stays
+        on its role's profile whatever the chat runs on."""
         overrides = overrides or {}
         entry = self.entry(chat_id, user_id)
         topic = self.topic(chat_id, topic_id)
@@ -313,6 +322,7 @@ class Policy:
                     "voice_transcription", "voice_echo"):
             if overrides.get(key) is not None:
                 out[key] = overrides[key]
+        out["profile"] = self.role_profile(chat_id, user_id) or out["profile"]
         return out
 
     def delegation(self, chat_id, user_id) -> bool:

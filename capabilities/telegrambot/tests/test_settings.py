@@ -25,6 +25,7 @@ def test_an_empty_document_and_a_full_one_hold():
             "agent_dialogue": {"max_turns": 0}, "context_prompt": "team",
             "topics": {"5": {"context": "API only", "context_mode": "exclusive"}}}},
         "agent_dialogue": {"max_turns": 4},
+        "roles": {"group_member": {"profile": "telegrambot-consult"}},
         "control": {"roles": {"supervisor": {"commands": "*"}}},
         "authority": {"roles": {"group_member": {"allowed_capabilities": {
             "telegrambot": {"verbs": ["history"]}}}}},
@@ -43,6 +44,8 @@ def test_an_empty_document_and_a_full_one_hold():
     ({"allowed_users": {"1": {"context_mode": "cut"}}}, "settings.allowed_users.1.context_mode"),
     ({"control": {"roles": {"x": {"commands": ["record"]}}}},
      "settings.control.roles.x.commands[0]"),
+    ({"roles": {"group_member": {"profile": "consult"}}}, "settings.roles.group_member.profile"),
+    ({"roles": {"group_member": {"commands": "*"}}}, "settings.roles.group_member.commands"),
 ])
 def test_a_wrong_key_is_refused_with_its_path(document, path):
     with pytest.raises(ValueError) as caught:
@@ -53,8 +56,10 @@ def test_a_wrong_key_is_refused_with_its_path(document, path):
 def test_profile_names_and_context_prompts_are_found():
     doc = {"defaults": {"profile": "telegrambot-a"},
            "allowed_groups": {"-1": {"profile": "telegrambot-b", "context_prompt": "team",
-                                     "topics": {"2": {"profile": "telegrambot-a"}}}}}
+                                     "topics": {"2": {"profile": "telegrambot-a"}}}},
+           "roles": {"group_member": {"profile": "telegrambot-c"}}}
     assert schema.profile_names(doc) == {
         "telegrambot-a": ["defaults.profile", "allowed_groups.-1.topics.2.profile"],
-        "telegrambot-b": ["allowed_groups.-1.profile"]}
+        "telegrambot-b": ["allowed_groups.-1.profile"],
+        "telegrambot-c": ["roles.group_member.profile"]}
     assert schema.context_prompts(doc) == ["context.team"]

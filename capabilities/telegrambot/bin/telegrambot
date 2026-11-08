@@ -226,7 +226,8 @@ SERVICE
   another bot's @suffix is not read at all. The bot's command menu is set at
   start. Roles come from allowed_users.<id>.role, a group member's role,
   member_role, direct_messages.default_role; authority.roles hands each turn
-  its CAPABILITIES_AUTH_CONTEXT.
+  its CAPABILITIES_AUTH_CONTEXT, and roles.<role>.profile names the profile
+  the sender's turn runs on, over the chat's, the topic's and /set profile.
 
   The reply gate (allowed_groups.<id>.gate {enabled, mode shadow|live,
   brief, context_messages, context_chars, max_batch, model, effort}): in a
@@ -257,7 +258,8 @@ SETTINGS
       context_mode, project, delegation, agent_dialogue {max_turns},
       topics {<topic id>: {name, profile, context, context_prompt,
       context_mode, project}}}}
-    agent_dialogue {max_turns}, control {roles {<role>: {commands}}},
+    agent_dialogue {max_turns}, roles {<role>: {profile}},
+    control {roles {<role>: {commands}}},
     authority {default, roles {<role>: {allowed_capabilities}}}
     defaults {tail_size 40, history_requests 5, debounce 2, worker_timeout
       120, progress_after 15, progress_from_stream false, max_parallel_jobs

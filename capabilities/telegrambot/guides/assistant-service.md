@@ -58,7 +58,11 @@ telegrambot settings set allowed_groups '{"-100<chat id>": {"name": "<group>"}}'
 
 `direct_messages.mode` set to `anyone` lets anybody write to the bot directly. In a group the bot answers when it is mentioned, called by one of `aliases` (or `assistant_name`), or replied to; `require_reference: false` answers every message the bot sees, and the reply gate (`gate`) lets a light model decide when an unaddressed message deserves an answer, a reaction, or nothing, first in `shadow` mode, which only logs.
 
-Roles decide two things: which chat commands a person may run (`control.roles`) and which capabilities their turn may use (`authority.roles`). `supervisor` may run every command by default; everyone else may run `/status`, `/profiles` and `/help`.
+Roles decide three things: which chat commands a person may run (`control.roles`), which capabilities their turn may use (`authority.roles`), and which harness profile their turn runs on (`roles.<role>.profile`). `supervisor` may run every command by default; everyone else may run `/status`, `/profiles` and `/help`. A role that names a profile runs its senders' turns on it in place of the chat's or topic's profile, and a chat's `/set profile` does not move them off it; a role that names none runs on the chat's or topic's profile. What the turn may then read, write or run is the profile's own sandbox and tools, so a read-only profile kept for ordinary group members gives their turns read-only hands while the supervisor's turns keep their own:
+
+```sh
+telegrambot settings set roles '{"group_member": {"profile": "telegrambot-<read-only profile>"}}'
+```
 
 ## 5. Give the agent its voice
 
