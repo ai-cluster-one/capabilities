@@ -1298,7 +1298,7 @@ def store(monkeypatch):
     # version it holds.
     _cli.keep_served_workers_in_store(mod, monkeypatch, schema)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        _cli.make_tables(mod, schema)
+        _cli.make_tables(mod, schema, ("prj_elsewhere",))
         try:
             yield entry, schema, conn
         finally:

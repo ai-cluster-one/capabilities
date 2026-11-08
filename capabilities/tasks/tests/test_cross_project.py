@@ -157,6 +157,7 @@ def lab(tmp_path):
     lab = {name: _project(tmp_path / name, project) for name, project in ids.items()}
     lab.update(ids=ids, env=env, schema=schema, tmp=tmp_path)
     assert cli(lab, "migrate").returncode == 0
+    _cli.register(schema, ids.values())
     try:
         yield lab
     finally:

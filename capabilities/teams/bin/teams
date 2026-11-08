@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.45,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -223,9 +223,21 @@ def _manifest() -> dict:
 # and name; its versions reference it by a foreign key, and every key is
 # between this capability's own tables, none of which deletes a referenced
 # row, so a key refuses only an orphan.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 0
+LEDGER_MAJOR, LEDGER_MINOR = 1, 1
 _TEAM_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
 _DOC_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+from capabilities_contract.db import Step as _M9Step  # noqa: E402
+_M9_KEYS_SQL = r"""
+-- teams: every agent and node reference (and every key inside teams) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+SELECT store_state_keys('teams', ARRAY[
+    ARRAY['teams_members', 'agent_id', 'agents', 'cascade']]);
+"""
+
 LEDGER_STEPS = [
     ("0001-teams", f"""
     CREATE TABLE teams_teams (
@@ -327,6 +339,7 @@ LEDGER_STEPS = [
     CREATE TRIGGER teams_versions_truncate BEFORE TRUNCATE ON teams_versions
         FOR EACH STATEMENT EXECUTE FUNCTION teams_versions_guard();
     """),
+    _M9Step("0006-keys", _M9_KEYS_SQL, core=(4, 0)),
 ]
 
 

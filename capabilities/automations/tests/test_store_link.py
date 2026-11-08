@@ -78,6 +78,19 @@ def _setting(schema: str):
                       password=info.get("password"), sslmode=info.get("sslmode") or "disable")
 
 
+def _register(schema: str, agents=(), nodes=()) -> None:
+    """Register `agents` and `nodes` in the store's core tables in `schema`, as the
+    manager would: a row may only name an agent and a node the store holds."""
+    import psycopg
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        for agent in agents:
+            conn.execute(f'INSERT INTO "{schema}".agents (id, kind) VALUES '
+                         "(%s, 'agent') ON CONFLICT (id) DO NOTHING", (agent,))
+        for node in nodes:
+            conn.execute(f'INSERT INTO "{schema}".nodes (id, label, kind) VALUES '
+                         "(%s, %s, 'mac') ON CONFLICT (id) DO NOTHING", (node, node))
+
+
 @needs_store
 def test_no_link_listens_and_the_schedulers_follows_saved_definitions(runtime):
     import psycopg
@@ -97,6 +110,7 @@ def test_no_link_listens_and_the_schedulers_follows_saved_definitions(runtime):
                 link.conn.execute("LISTEN automations_changed")
             assert getattr(refused.value, "slug", None) == "session_state"
 
+        _register(schema, ("prj_a", "prj_b"))
         # What a scheduler of an earlier release does: listen on a session.
         with psycopg.connect(DSN, autocommit=True) as earlier:
             earlier.execute("LISTEN automations_changed")
@@ -165,6 +179,7 @@ def test_a_saved_definition_cuts_the_schedulers_sleep_short(runtime):
 
         def save() -> None:
             time.sleep(0.5)
+            _register(schema, ("prj_a",))
             with psycopg.connect(DSN, autocommit=True) as writer:
                 writer.execute(f'SET search_path TO "{schema}"')
                 writer.execute("INSERT INTO automations_definition_versions (agent_id, slug, "
@@ -205,14 +220,18 @@ def test_runs_from_before_the_label_left_the_table_keep_every_other_field(runtim
     schema = "automations_label_" + uuid.uuid4().hex[:8]
     setting = _setting(schema)
     earlier = [step for step in runtime.LEDGER_STEPS
-               if step[0] not in ("0008-runs-environment-retired", "0009-agent-names")]
-    assert len(earlier) == len(runtime.LEDGER_STEPS) - 2
+               if step[0] not in ("0008-runs-environment-retired", "0009-agent-names",
+                                  "0010-keys")]
+    assert len(earlier) == len(runtime.LEDGER_STEPS) - 3
     conn = db.connect(application_name=runtime.LEDGER_OWNER, setting=setting, transaction=True)
     try:
         db.migrate(conn, runtime.LEDGER_OWNER, earlier, major=1, minor=4)
         conn.commit()
     finally:
         conn.close()
+    from capabilities_contract.capability.tiers.store import node_id
+    # The node of the rows written below, and the node this process records a run on.
+    _register(schema, ("prj_a",), ("node-a", node_id()))
     columns = "SELECT is_nullable FROM information_schema.columns WHERE table_schema = %s " \
               "AND table_name = 'automations_runs' AND column_name = 'environment'"
     try:
@@ -276,6 +295,7 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(runtime, monke
     conn = db.connect(application_name="automations-test", setting=setting, transaction=True)
     try:
         db.migrate(conn, runtime.LEDGER_OWNER, runtime.LEDGER_STEPS[:7], major=1, minor=4)
+        _register(schema, ("prj_a",), ("n1",))
         with conn.transaction():
             conn.execute("INSERT INTO automations_definitions (id, project_id, slug, script_path, "
                          "active, created_by) VALUES "
@@ -309,7 +329,7 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(runtime, monke
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'SET search_path TO "{schema}"')
             assert admin.execute("SELECT major, minor FROM schema_version "
-                                 "WHERE owner = 'automations'").fetchone() == (2, 0)
+                                 "WHERE owner = 'automations'").fetchone() == (2, 1)
             assert admin.execute("SELECT to_regclass('automations_definitions')").fetchone() == (
                 None,)
             names = [r[0] for r in admin.execute(

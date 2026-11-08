@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — The register, jobs and prompts go with their agent, and a job's slots and amendments with their job, at telegram 3.1
+
+Step `0010-keys` (telegram 3.1, core 4.0) keys the channels, jobs, job slots, job amendments and prompt versions to their agent (`ON DELETE CASCADE`), and a job's slots and amendments to their job. The prompt versions' guard admits the cascade of a deliberate delete and nothing else. A reference to an agent the store no longer holds is settled when the step runs, kept in `telegram_premig_m9`. The service scripts run on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.
+
 ## 2026-11-08 — A reply that ends at its marker with nothing under it is silence
 
 A worker reply whose last `=== REPLY ===` line has nothing, or only whitespace, under it now sends nothing: a dialogue turn completes silently, a durable job finishes silent with no stored text, and a voice task speaks nothing - the path a turn that returned no answer already takes. Before, the whole reply was delivered, posting the working-out above the marker into the chat. The daemon logs it as `reply put nothing under its === REPLY === marker; sent nothing (deliberate silence)` where it logged `delivered whole`. A reply without the marker is still sent exactly as written, and a reply with words under the marker is still cut at it. No verb, flag, setting or output key changes.

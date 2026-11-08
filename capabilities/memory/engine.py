@@ -33,8 +33,116 @@ from typing import Any, Iterable
 
 LEDGER_OWNER = "memory"
 LEDGER_MAJOR = 2
-LEDGER_MINOR = 0
+LEDGER_MINOR = 1
 CHANNEL = "memory_changed"
+
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+try:
+    from capabilities_contract.db import Step as _M9Step
+except ImportError:  # the library's absence is reported where the store opens
+    _M9Step = None
+_M9_KEYS_SQL = r"""
+-- memory: every agent and node reference (and every key inside memory) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION memory_entries_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        IF tg_op = 'DELETE' THEN
+            IF current_setting('memory.purge', true) IS DISTINCT FROM old.id::text THEN
+                RAISE EXCEPTION 'memory entries are never deleted: `memory drop --purge` is the one hard delete'
+                    USING ERRCODE = 'check_violation';
+            END IF;
+            RETURN old;
+        END IF;
+        IF new.id <> old.id OR new.seq <> old.seq OR new.agent_id <> old.agent_id
+                OR new.scope IS DISTINCT FROM old.scope OR new.title <> old.title
+                OR new.body <> old.body OR new.created_at <> old.created_at
+                OR new.created_by <> old.created_by OR new.node IS DISTINCT FROM old.node
+                OR new.origin <> old.origin OR new.body_hash <> old.body_hash THEN
+            RAISE EXCEPTION 'a memory entry''s text is immutable: supersede it with a new entry'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.status <> old.status AND NOT (
+                (old.status = 'active' AND new.status IN ('superseded', 'dropped'))
+                OR (old.status IN ('superseded', 'dropped') AND new.status = 'active')) THEN
+            RAISE EXCEPTION 'a memory entry does not move from % to %', old.status, new.status
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $guard$;
+CREATE OR REPLACE FUNCTION memory_events_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        RAISE EXCEPTION 'the memory trail is append-only' USING ERRCODE = 'check_violation';
+    END $guard$;
+SELECT store_state_keys('memory', ARRAY[
+    ARRAY['memory_entries', 'agent_id', 'agents', 'cascade'],
+    ARRAY['memory_entries', 'node', 'nodes', 'set null'],
+    ARRAY['memory_entries', 'superseded_by', 'memory_entries', 'set null'],
+    ARRAY['memory_events', 'agent_id', 'agents', 'cascade'],
+    ARRAY['memory_events', 'node', 'nodes', 'set null'],
+    ARRAY['memory_groom_leases', 'agent_id', 'agents', 'cascade'],
+    ARRAY['memory_groom_leases', 'node', 'nodes', 'cascade']]);
+-- An entry is written with the node it was on, as before: only the removal of
+-- that node clears it, so an insert without one is refused as NOT NULL refused it.
+CREATE FUNCTION memory_entries_node_required() RETURNS trigger
+    LANGUAGE plpgsql AS $required$
+BEGIN
+    IF NEW.node IS NULL THEN
+        RAISE EXCEPTION 'null value in column "node" of relation "memory_entries" violates not-null constraint'
+            USING ERRCODE = 'not_null_violation', COLUMN = 'node', TABLE = 'memory_entries',
+                  HINT = 'write the node it is on; only the removal of that node clears it';
+    END IF;
+    RETURN NEW;
+END $required$;
+CREATE TRIGGER memory_entries_node_required BEFORE INSERT ON memory_entries
+    FOR EACH ROW EXECUTE FUNCTION memory_entries_node_required();
+-- An event is written with the node it was on, as before: only the removal of
+-- that node clears it, so an insert without one is refused as NOT NULL refused it.
+CREATE FUNCTION memory_events_node_required() RETURNS trigger
+    LANGUAGE plpgsql AS $required$
+BEGIN
+    IF NEW.node IS NULL THEN
+        RAISE EXCEPTION 'null value in column "node" of relation "memory_events" violates not-null constraint'
+            USING ERRCODE = 'not_null_violation', COLUMN = 'node', TABLE = 'memory_events',
+                  HINT = 'write the node it is on; only the removal of that node clears it';
+    END IF;
+    RETURN NEW;
+END $required$;
+CREATE TRIGGER memory_events_node_required BEFORE INSERT ON memory_events
+    FOR EACH ROW EXECUTE FUNCTION memory_events_node_required();
+"""
 
 LEDGER_STEPS = [
     ("0001-entries", """
@@ -248,6 +356,7 @@ LEDGER_STEPS = [
         'The grooming pass that holds an agent''s memory: one row while it runs, taken only '
         'when none is held or the one held has expired, and removed when the pass ends.';
     """),
+    *([_M9Step("0008-keys", _M9_KEYS_SQL, core=(4, 0))] if _M9Step else []),
 ]
 
 # How long a grooming pass's lease outlasts its model deadline: past the

@@ -257,6 +257,20 @@ class Machine:
             cursor = conn.execute(query, params)
             return cursor.fetchall() if cursor.description else None
 
+    def register(self) -> None:
+        """The project's agent registered in the store, its tables made first
+        as the manager makes them."""
+        from capabilities_contract import db
+        from capabilities_contract.capability import store as S
+        conn = db.connect(application_name="test", setting=db.resolve_setting(self.project))
+        try:
+            major, minor = S.STORE_TABLES_VERSION
+            db.migrate(conn, S.STORE_OWNER, S.record_table_steps(), major=major, minor=minor)
+        finally:
+            conn.close()
+        self.sql("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                 "ON CONFLICT (id) DO NOTHING", (PROJECT_ID,))
+
     def books(self):
         return (self.sql("SELECT owner, step, checksum, applied_at FROM schema_ledger "
                          "ORDER BY owner, step"),
@@ -965,6 +979,8 @@ def test_a_store_at_another_major_is_refused_with_the_commands_not_read_as_disab
     machine,
 ) -> None:
     machine.ok("install", "resend", "--from", str(REPO / "capabilities" / "resend"), "--allow")
+    # The store holds the gate's row only for an agent it has registered.
+    machine.register()
     machine.ok("enable", "resend", "--project")
     assert machine.ok("list")["installed"][0]["name"] == "resend"
     machine.cross(NEXT)

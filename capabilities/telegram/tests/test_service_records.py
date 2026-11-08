@@ -13,8 +13,11 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
+
+import psycopg
 from unittest import mock
 
+from _agents import register_agents
 from test_assistant_service import STORE_DSN, import_daemon
 from test_call_recorder_delivery import import_call_recorder
 
@@ -44,6 +47,10 @@ def seed_store(project: Path, config_home: Path, schema: str, cid: str, entry: d
         adapter = records.open_records(project / "capabilities", config_home, project)
         try:
             held = adapter.set("telegram", "connection", cid, entry)
+            # The grant names the agent, which the manager registered first.
+            with psycopg.connect(STORE_DSN, autocommit=True) as conn:
+                conn.execute(f'SET search_path TO "{schema}"')
+                register_agents(conn, adapter.project_id)
             adapter.set("telegram", "grant", cid, {"enabled": True, "allow_write": True})
         finally:
             adapter.close()

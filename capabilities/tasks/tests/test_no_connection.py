@@ -51,6 +51,7 @@ def _lab(tmp_path, connections: dict | None):
     if connections is not None:
         (envelope / "tasks" / "connections.json").write_text(json.dumps(connections))
     _cli.write_store_setting(tmp_path / "config", schema)
+    _cli.register_declared(project, schema)
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),

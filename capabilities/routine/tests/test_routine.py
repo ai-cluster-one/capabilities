@@ -139,7 +139,25 @@ class Lab:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(text.encode("utf-8"))
 
+    def register(self) -> None:
+        """Register the agents the tests write for, as the manager would, once, before
+        the first child runs: a row may only name an agent the store holds. Only the
+        core tables are made for it."""
+        if getattr(self, "_registered", False):
+            return
+        self._registered = True
+        import psycopg
+        from capabilities_contract import db
+        from capabilities_contract.db import _migrate as core
+        with psycopg.connect(self.cluster.url(self.database), autocommit=True) as conn:
+            db.migrate(conn, core.CORE_OWNER, core.CORE_STEPS, major=core.CORE_VERSION[0],
+                       minor=core.CORE_VERSION[1], schema=SCHEMA)
+            for agent in (PROJECT_ID, OTHER_ID):
+                conn.execute(f"INSERT INTO {SCHEMA}.agents (id, kind) VALUES (%s, 'agent') "
+                             "ON CONFLICT (id) DO NOTHING", (agent,))
+
     def env(self, **extra) -> dict:
+        self.register()
         env = {k: v for k, v in os.environ.items() if not k.startswith(CLEARED_PREFIXES)}
         env.update({
             "HOME": str(self.tmp / "home"),
@@ -234,7 +252,7 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'routine' ORDER BY step")]
     assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
-                     "0005-enablements", "0006-disabled", "0007-agent-names"]
+                     "0005-enablements", "0006-disabled", "0007-agent-names", "0008-keys"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["routine_versions_active"]
@@ -287,10 +305,14 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypa
     import psycopg
     from capabilities_contract import db
     cli = load_module()
-    old = [step for step in cli.LEDGER_STEPS if step[0] != "0007-agent-names"]
+    old = [step for step in cli.LEDGER_STEPS
+           if step[0] not in ("0007-agent-names", "0008-keys")]
     with psycopg.connect(lab.cluster.url(lab.database), autocommit=True) as conn:
         db.migrate(conn, "routine", old, major=1, minor=2, schema=SCHEMA)
         conn.execute(f"SET search_path TO {SCHEMA}")
+        for agent in (PROJECT_ID, OTHER_ID):
+            conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                         "ON CONFLICT (id) DO NOTHING", (agent,))
         insert = ("INSERT INTO routine_documents (project_id, name, created_by, author_project_id) "
                   "VALUES (%s, %s, 'u@n', %s) RETURNING id")
         own = conn.execute(insert, (PROJECT_ID, "own-routine", None)).fetchone()[0]
@@ -311,8 +333,8 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypa
         result = db.migrate(conn, "routine", cli.LEDGER_STEPS, major=cli.LEDGER_MAJOR,
                             minor=cli.LEDGER_MINOR, schema=SCHEMA)
         monkeypatch.delenv(db.UPGRADE_ENV)
-        assert result.applied == ["0007-agent-names"]
-        assert (result.major, result.minor) == (2, 0)
+        assert result.applied == ["0007-agent-names", "0008-keys"]
+        assert (result.major, result.minor) == (2, 1)
         conn.execute(f"SET search_path TO {SCHEMA}")
         assert conn.execute("SELECT name, agent_id, author_agent_id FROM routine_documents "
                             "ORDER BY name").fetchall() == [

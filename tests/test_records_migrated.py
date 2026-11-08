@@ -205,6 +205,16 @@ class Lab:
             cursor = conn.execute(query, params)
             return cursor.fetchall() if cursor.description else cursor.rowcount
 
+    def register(self, *, agents: tuple = (), nodes: tuple = ()) -> None:
+        """The store holds a row only for an agent and a node it has
+        registered."""
+        for agent in agents:
+            self.sql("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                     "ON CONFLICT (id) DO NOTHING", (agent,))
+        for node in nodes:
+            self.sql("INSERT INTO nodes (id, label, kind) VALUES (%s, %s, 'mac') "
+                     "ON CONFLICT (id) DO NOTHING", (node, LABELS.get(node, node)))
+
     def file(self, relative: str, body) -> None:
         path = self.project / relative if not relative.startswith("~/") \
             else self.config / relative[2:]
@@ -260,6 +270,7 @@ def test_the_ledger_applies_the_new_steps_on_a_fresh_store_and_on_one_at_p2(lab,
         _ledger_at_p2(lab)
         assert [r[0] for r in lab.sql("SELECT step FROM schema_ledger ORDER BY step")][-1] \
             == "0013-global"
+        lab.sql("INSERT INTO capabilities_agents (id) VALUES (%s)", (PROJECT_ID,))
         lab.sql("INSERT INTO capabilities_identifiers (agent_id, capability, label, value) "
                 "VALUES (%s, 'coolify', 'team', '\"kept\"')", (PROJECT_ID,))
         # The core's step crosses the store's major, which only the store
@@ -314,6 +325,7 @@ def test_the_settings_triggers_refuse_an_object_and_an_overlapping_path(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
+    lab.register(nodes=(SERVER,))
     insert = ("INSERT INTO settings (agent_id, capability, node, path, value, "
               "updated_by) VALUES (%s, 'memory', %s, %s, %s::jsonb, 'tester@mac1')")
     lab.sql(insert, (PROJECT_ID, None, ["a", "b"], "1"))
@@ -354,6 +366,7 @@ def test_grants_and_defaults_for_every_agent_cannot_duplicate(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
+    lab.register(nodes=(SERVER,))
     lab.sql("INSERT INTO connections (capability, label, spec) "
             "VALUES ('coolify', 'box', '{}'), ('coolify', 'two', '{}')")
     grant = ("INSERT INTO grants (agent_id, capability, connection_id, "
@@ -404,6 +417,8 @@ def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
     anonymous = "prj_" + "aaaaaaaaaaaa"
     lab.sql("INSERT INTO capabilities_agents (id, name) VALUES (%s, 'Ada'), "
             "(%s, 'Clinic Desk'), (%s, NULL)", (PROJECT_ID, OTHER, anonymous))
+    lab.sql("INSERT INTO capabilities_agent_nodes (agent_id, node, kind) "
+            "VALUES (%s, %s, 'server')", (PROJECT_ID, SERVER))
     lab.sql("INSERT INTO capabilities_connections (capability, name, spec) VALUES "
             "('agentrooms', 'ada', '{}'), ('telegram', '1000000001', '{\"name\": \"Ada\"}'), "
             "('rclonec', 'ada_documents', '{}'), ('agentrooms', 'clinic', '{}'), "
@@ -453,6 +468,7 @@ def test_an_agents_own_connection_is_granted_to_no_other_agent(lab):
     import psycopg
     lab.ok(MANAGER, "node", "add", MASTER, "--label", MASTER_LABEL, "--kind", "mac",
            "--master")
+    lab.register(agents=(OTHER,), nodes=(SERVER,))
     lab.sql("INSERT INTO connections (capability, label, spec, owner_agent_id) VALUES "
             "('telegram', 'mine', '{}', %s), ('telegram', 'ours', '{}', NULL)", (PROJECT_ID,))
     grant = ("INSERT INTO grants "
@@ -500,6 +516,7 @@ def test_a_moved_agent_adds_its_own_connection_with_its_grant_and_a_machine_one_
     assert [(g["agent"], g["enabled"], g["allow_write"]) for g in listed["mine"]["grants"]] \
         == [(PROJECT_ID, True, False)]
     # Another agent's own connection is neither changed nor removed from here.
+    lab.register(agents=(OTHER,))
     lab.sql("INSERT INTO connections (capability, label, spec, owner_agent_id) "
             "VALUES ('coolify', 'theirs', '{}', %s)", (OTHER,))
     _code, error = lab.refused(COOLIFY, "connection", "add", "theirs", "--project",
@@ -521,6 +538,7 @@ def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
             "('coolify', 'stray', '{\"base_url\": \"http://stray.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}')")
     stray = _cid(lab, "coolify", "stray")
+    lab.register(agents=(OTHER,))
     lab.sql("INSERT INTO grants "
             "(agent_id, capability, connection_id, enabled) VALUES (%s, 'coolify', %s, true)",
             (OTHER, stray))
@@ -547,6 +565,7 @@ def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
 def _rows_for_reads(lab: Lab) -> None:
     """Rows that say what the agent should read: its own, every agent's, this
     node's and every node's, each differing from the stale files."""
+    lab.register(nodes=(SERVER,))
     lab.sql("INSERT INTO connections (capability, label, spec) VALUES "
             "('coolify', 'box', '{\"base_url\": \"http://box.invalid\", "
             "\"secret_env\": \"COOLIFY_TOKEN\"}'), "

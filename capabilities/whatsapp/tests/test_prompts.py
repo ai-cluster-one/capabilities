@@ -31,6 +31,7 @@ class Prompts(td.DialogueCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.agent = f"prj_{uuid.uuid4().hex[:12]}"
+        _cli.register_agents(self.db, self.agent)
         for name, value in (("_service_project_root", self.root),
                             ("_service_project_id", self.agent)):
             patcher = mock.patch.object(wa, name, return_value=value)

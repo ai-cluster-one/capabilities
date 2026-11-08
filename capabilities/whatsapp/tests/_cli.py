@@ -110,6 +110,16 @@ def store_env() -> dict:
     return {**no_db_env(), "AGENTKIT_DB_URL": STORE_DSN or ""}
 
 
+def register_agents(db, *agent_ids: str) -> None:
+    """Register each of `agent_ids` in the store's `agents`, as the manager
+    registers an agent before any service of it runs: every row the capability
+    keeps names its agent, and the store refuses a row for one it never
+    registered. One already registered is left as it is."""
+    for agent_id in agent_ids:
+        db.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                   "ON CONFLICT (id) DO NOTHING", (agent_id,))
+
+
 def store_cfg(**extra) -> dict:
     """A connection whose home and account are this case's alone."""
     return {"id": "test", "home": tempfile.mkdtemp(),

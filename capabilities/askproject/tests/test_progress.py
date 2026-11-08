@@ -38,6 +38,7 @@ def _open_stdin_ask(lab, *extra):
     import subprocess
     import sys
     store_env(lab.env)
+    lab.register()
     read_fd, write_fd = os.pipe()
     try:
         return subprocess.run(
@@ -151,6 +152,7 @@ def test_a_database_in_the_project_env_wins_over_the_machine_file(lab):
     assert (report["store"]["level"], report["store"]["sources"]) == (
         "project", [str(lab.caller.resolve() / ".env")])
 
+    lab.register()
     proc = lab.run(str(lab.target), "what is here?", "--engine", "codex", "--quiet")
     assert proc.returncode == 0, proc.stderr
     [row] = _stored(lab)
@@ -306,6 +308,9 @@ def test_a_store_at_major_1_keeps_its_sessions_under_agent_id(lab, monkeypatch):
             "last_session_id, interactions) VALUES (%s, %s, %s, 'codex', 's-1', 3), "
             "('prj_000000000002', 'elsewhere', '/t/other', 'claude', 's-2', 1)",
             (caller, node, str(lab.target)))
+        conn.execute("INSERT INTO agents (id, kind) VALUES ('prj_000000000002', 'agent')")
+        conn.execute("INSERT INTO nodes (id, label, kind) VALUES (%s, 'lab', 'mac'), "
+                     "('elsewhere', 'elsewhere', 'mac')", (node,))
         conn.commit()
     finally:
         conn.close()
@@ -328,7 +333,7 @@ def test_a_store_at_major_1_keeps_its_sessions_under_agent_id(lab, monkeypatch):
                 (None, str(lab.caller.resolve()), node, str(lab.target), "s-1", 3),
                 ("prj_000000000002", None, "elsewhere", "/t/other", "s-2", 1)]
             assert conn.execute("SELECT major, minor FROM schema_version "
-                                "WHERE owner = 'askproject'").fetchone() == (3, 0)
+                                "WHERE owner = 'askproject'").fetchone() == (3, 1)
             names = [r[0] for r in conn.execute(
                 "SELECT attname::text FROM pg_attribute WHERE attrelid = "
                 "'askproject_sessions'::regclass AND attnum > 0 UNION ALL "
@@ -394,7 +399,7 @@ def test_a_store_at_2_0_crosses_to_node_id_and_minus_c_continues_for_both_caller
         with psycopg.connect(STORE_DSN) as conn:
             conn.execute(f'SET search_path TO "{schema}"')
             assert conn.execute("SELECT major, minor FROM schema_version "
-                                "WHERE owner = 'askproject'").fetchone() == (3, 0)
+                                "WHERE owner = 'askproject'").fetchone() == (3, 1)
             assert conn.execute(
                 "SELECT agent_id, host, target_path, last_session_id FROM "
                 "askproject_premig_m7 ORDER BY last_session_id").fetchall() == [
@@ -428,7 +433,8 @@ def test_a_store_at_2_0_crosses_to_node_id_and_minus_c_continues_for_both_caller
                 "SELECT target_agent_id FROM askproject_sessions WHERE node_id = "
                 "'6c61622d6e70'").fetchall() == [(None,)]
             conn.execute("INSERT INTO nodes (id, label, kind) VALUES "
-                         "('6c61622d6e70', 'lab2', 'server')")
+                         "('6c61622d6e70', 'lab2', 'server') ON CONFLICT (id) DO UPDATE "
+                         "SET label = EXCLUDED.label, kind = EXCLUDED.kind")
             conn.execute("INSERT INTO agent_nodes (agent_id, node, folder) VALUES "
                          "(%s, '6c61622d6e70', %s)", (target_agent, target))
             conn.commit()

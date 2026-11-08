@@ -31,7 +31,7 @@ def test_the_tables_have_the_planned_shape(world):  # noqa: F811
                 "AND table_name LIKE 'assets\\_%' ORDER BY table_name, ordinal_position"):
             columns.setdefault(table, []).append((column, kind, nullable, generated))
         assert set(columns) == {"assets_documents", "assets_versions", "assets_files",
-                                "assets_file_operations"}
+                                "assets_file_operations", "assets_premig_m9"}
         assert [c[0] for c in columns["assets_documents"]] == [
             "agent_id", "id", "kind", "name", "created_at", "created_by", "retired_at"]
         assert [c[0] for c in columns["assets_versions"]] == [
@@ -62,7 +62,8 @@ def test_the_tables_have_the_planned_shape(world):  # noqa: F811
         ledger = [row[0] for row in conn.execute(
             "SELECT step FROM schema_ledger WHERE owner = 'assets' ORDER BY applied_at, step")]
         assert ledger == ["0001-documents", "0002-versions", "0003-guards", "0004-files",
-                          "0005-files-guard", "0006-file-operations", "0007-agent-names"]
+                          "0005-files-guard", "0006-file-operations", "0007-agent-names",
+                          "0008-keys"]
 
 
 def test_the_store_refuses_what_a_column_does_not_mean(world):  # noqa: F811
@@ -126,6 +127,8 @@ SHA = "0" * 64
 
 def _file_row(conn, project="prj_a", name="research/x/crash.ips", **over):
     """Insert one assets_files row the way the CLI writes it; `over` replaces a column."""
+    conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') ON CONFLICT (id) DO NOTHING",
+                 (project,))
     row = conn.execute("SELECT gen_random_uuid()").fetchone()[0]
     values = {"agent_id": project, "id": row, "document_id": None, "name": name,
               "media_type": "application/octet-stream", "bytes": 3, "sha256": SHA,
@@ -160,7 +163,7 @@ def test_the_files_table_has_the_approved_shape(world):  # noqa: F811
         foreign = conn.execute(
             "SELECT confrelid::regclass::text FROM pg_constraint WHERE conrelid = "
             "'assets_files'::regclass AND contype = 'f'").fetchall()
-        assert foreign == [("assets_documents",)]
+        assert foreign == [("agents",), ("assets_documents",)]
 
 
 def test_the_store_refuses_what_a_file_column_does_not_mean(world):  # noqa: F811
@@ -238,7 +241,8 @@ def _load_cli():
 def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(world, monkeypatch):  # noqa: F811
     from capabilities_contract import db
     cli = _load_cli()
-    old = [step for step in cli.TABLE_STEPS if step[0] != "0007-agent-names"]
+    old = [step for step in cli.TABLE_STEPS
+           if step[0] not in ("0007-agent-names", "0008-keys")]
     pid = "prj_" + "0a0b0c0d0e0f"
     root = world.project(pid=pid)
     conn = connect(world.schema)
@@ -246,6 +250,8 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(world, monkey
         conn.execute(f'CREATE SCHEMA "{world.schema}"')
         db.migrate(conn, "assets", old, major=1, minor=2, schema=world.schema)
         conn.execute(f'SET search_path TO "{world.schema}"')
+        conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                     "ON CONFLICT (id) DO NOTHING", (pid,))
         document = conn.execute(
             "INSERT INTO assets_documents (project_id, kind, name, created_by) "
             "VALUES (%s, 'plan', 'plans/kept', 'tester') RETURNING id", (pid,)).fetchone()[0]
@@ -269,8 +275,8 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(world, monkey
         result = db.migrate(conn, "assets", cli.TABLE_STEPS, major=cli.TABLES_MAJOR,
                             minor=cli.TABLES_MINOR, schema=world.schema)
         monkeypatch.delenv(db.UPGRADE_ENV)
-        assert result.applied == ["0007-agent-names"]
-        assert (result.major, result.minor) == (2, 0)
+        assert result.applied == ["0007-agent-names", "0008-keys"]
+        assert (result.major, result.minor) == (2, 1)
         conn.execute(f'SET search_path TO "{world.schema}"')
         for table in ("assets_documents", "assets_files", "assets_file_operations"):
             assert conn.execute(f"SELECT agent_id FROM {table}").fetchall() == [(pid,)], table

@@ -150,6 +150,13 @@ class Farm:
             except runtime.StoreUnavailable:
                 return root          # a project whose own store is away on purpose
             with ledger:
+                # Registered as the manager would: a row may only name an agent and a
+                # node the store holds.
+                with ledger.transaction():
+                    ledger._execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                                    "ON CONFLICT (id) DO NOTHING", [project_id])
+                    ledger._execute("INSERT INTO nodes (id, label, kind) VALUES "
+                                    "(%s, %s, 'mac') ON CONFLICT (id) DO NOTHING", [HERE, HERE])
                 for automation, fields in {**DEFINITIONS, **(BEAT if beat else {})}.items():
                     checked = runtime.check_definition(
                         root, automation, {**fields, "node": HERE})

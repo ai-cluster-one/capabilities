@@ -61,7 +61,7 @@ def store(monkeypatch):
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        _cli.make_tables(mod, schema)
+        _cli.make_tables(mod, schema, (THERE,))
         try:
             yield entry, schema, conn
         finally:

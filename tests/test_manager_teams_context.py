@@ -123,6 +123,15 @@ class Lab:
         })
         return env
 
+    def register(self, *agents: str) -> None:
+        """The store holds a row only for an agent it has registered."""
+        import psycopg
+        with psycopg.connect(self.url, autocommit=True) as conn:
+            conn.execute(f"SET search_path TO {SCHEMA}")
+            for agent in agents:
+                conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                             "ON CONFLICT (id) DO NOTHING", (agent,))
+
     def _snapshot(self) -> None:
         """teams as install records it: its stub and its own manifest."""
         manifest = json.loads(self.teams("manifest", "--json"))
@@ -161,6 +170,7 @@ def _seed(lab: Lab) -> None:
     lab.teams("create", "crew", "--description", "The release crew: turn to it for releases.")
     lab.teams("create", "ops", "--description", "Operations: turn to it for the servers.")
     lab.teams("create", "far", "--description", "A team this agent is not in.", "--always")
+    lab.register(AGENT, OTHER)
     for team in ("crew", "ops"):
         lab.teams("members", "add", team, AGENT)
     lab.teams("members", "add", "far", OTHER)

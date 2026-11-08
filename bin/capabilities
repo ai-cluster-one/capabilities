@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.45,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -1405,9 +1405,11 @@ PROJECT VERBS (run inside a consuming project)
         add. Answers as add, changed false when nothing moved.
   node remove <node>
         Remove a registered node from this agent - its link, and its
-        registry row once no agent lives on it; answers {ok, project,
-        agent_id, removed, store}. Exit 6 node_unknown for a node not
-        registered.
+        registry row once no agent lives on it and no automation definition
+        is pinned to it, with what the node owns (its state, leases and
+        node-scoped records); a record of what ran there keeps its row and
+        loses the node. Answers {ok, project, agent_id, removed, store}.
+        Exit 6 node_unknown for a node not registered.
   node image [--json]
   node create <label> --project <uuid> --server <uuid> --environment <name>
               [--version <tag>] [--memory 2g] [--connection <id> | --coolify-stdin]
@@ -2782,8 +2784,8 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # newest major; when a newer one lands there, the last commit of the older
 # major is kept as branch STORE_LINE_REF, and a major is crossed only by
 # STORE_UPGRADE_COMMAND.
-STORE_MAJOR = 3
-STORE_LIBRARY: str | None = ">=0.44,<0.45"
+STORE_MAJOR = 4
+STORE_LIBRARY: str | None = None
 STORE_CANONICAL_REF = "main"
 STORE_LINE_REF = "store-major-{major}"
 STORE_UPGRADE_COMMAND = "capabilities store upgrade"
@@ -7802,6 +7804,29 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
             if not shared:
                 return 0
             names = sql.SQL(", ").join(sql.Identifier(c) for c in shared)
+            if table in ("agents", "nodes", "connections"):
+                # A parent row is brought up to the real one in place: deleting
+                # it would take the lane's own rows of it with it. One the real
+                # store no longer holds goes, named as deleted on purpose.
+                gone = [row[0] for row in conn.execute(
+                    sql.SQL("SELECT id FROM {}.{} WHERE ").format(
+                        sql.Identifier(schema), sql.Identifier(table)) + condition
+                    + sql.SQL(" AND id NOT IN (SELECT id FROM {}.{} WHERE ").format(
+                        sql.Identifier(real), sql.Identifier(table)) + condition
+                    + sql.SQL(")"), params + params).fetchall()]
+                if gone:
+                    _store_deleting(conn, table, *gone)
+                    conn.execute(sql.SQL("DELETE FROM {}.{} WHERE id = ANY (%s)").format(
+                        sql.Identifier(schema), sql.Identifier(table)), (gone,))
+                    _store_deleting(conn, table)
+                updates = sql.SQL(", ").join(
+                    sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c))
+                    for c in shared if c != "id")
+                return conn.execute(sql.SQL("INSERT INTO {}.{} ({}) SELECT {} FROM {}.{} WHERE ")
+                                    .format(sql.Identifier(schema), sql.Identifier(table), names,
+                                            names, sql.Identifier(real), sql.Identifier(table))
+                                    + condition + sql.SQL(" ON CONFLICT (id) DO UPDATE SET ")
+                                    + updates, params).rowcount
             conn.execute(sql.SQL("DELETE FROM {}.{} WHERE ").format(
                 sql.Identifier(schema), sql.Identifier(table)) + condition, params)
             return conn.execute(sql.SQL("INSERT INTO {}.{} ({}) SELECT {} FROM {}.{} WHERE ")
@@ -12461,15 +12486,47 @@ def _rekey_order(conn, schema: str, plan: list[dict]) -> list[dict]:
                                          hit["column"]))
 
 
+# The store's own guards on its parents: an id is never updated, and an agent,
+# a node or a connection is deleted only with its deleting setting naming it.
+# A rekey moves rows rather than ids and names what it deletes, so it holds
+# none of them off.
+REKEY_KEPT_TRIGGERS = ("agents_id", "agents_delete", "nodes_id", "nodes_delete",
+                       "connections_id", "connections_delete")
+
+
 def _rekey_triggers(conn, schema: str, tables: list[str]) -> list[dict]:
     """The triggers of `tables` that fire, each with the mode it fires in, so
-    the rekey can set it back exactly: its guards would refuse an id moving."""
+    the rekey can set it back exactly: its guards would refuse an id moving.
+    The store's own guards on its parents (REKEY_KEPT_TRIGGERS) stay on."""
     return [{"table": table, "trigger": name, "mode": mode} for table, name, mode in conn.execute(
         "SELECT c.relname, t.tgname, t.tgenabled FROM pg_trigger t "
         "JOIN pg_class c ON c.oid = t.tgrelid "
         "WHERE c.relnamespace = to_regnamespace(%s) AND c.relname = ANY (%s) "
-        "AND NOT t.tgisinternal AND t.tgenabled <> 'D' ORDER BY 1, 2",
-        (schema, sorted(set(tables)))).fetchall()]
+        "AND NOT t.tgisinternal AND t.tgenabled <> 'D' AND t.tgname <> ALL (%s) "
+        "ORDER BY 1, 2",
+        (schema, sorted(set(tables)), list(REKEY_KEPT_TRIGGERS))).fetchall()]
+
+
+def _store_deleting(conn, parent: str, *ids: str) -> None:
+    """Name `ids` of `parent` (agents, nodes or connections) as deleted on
+    purpose for the rest of the open transaction, which the store requires
+    before it deletes one of their rows and lets the cascade follow."""
+    setting = {"agents": "store.deleting_agent", "nodes": "store.deleting_node",
+               "connections": "store.deleting_connection"}[parent]
+    conn.execute("SELECT set_config(%s, %s, true)", (setting, ",".join(i for i in ids if i)))
+
+
+def _rekey_copy_parent(conn, schema: str, table: str, old: str, new: str) -> None:
+    """Make `table`'s row `old` again under the id `new`, every other column as
+    it was, so the rows that name it can move to `new` before `old` goes: an id
+    is never updated. A unique slug moves from the old row to the copy."""
+    qualified = f"{_rekey_ident(schema)}.{_rekey_ident(table)}"
+    row = conn.execute(f"SELECT to_jsonb(t) FROM {qualified} t WHERE id = %s",
+                       (old,)).fetchone()[0]
+    if row.get("slug") is not None:
+        conn.execute(f"UPDATE {qualified} SET slug = NULL WHERE id = %s", (old,))
+    conn.execute(f"INSERT INTO {qualified} SELECT (jsonb_populate_record(NULL::{qualified}, "
+                 "%s::jsonb)).*", (json.dumps({**row, "id": new}),))
 
 
 def _rekey_leases(conn, schema: str, plan: list[dict], ident: str) -> list[dict]:
@@ -12669,10 +12726,24 @@ def _agent_rekey(root: Path, given: str | None, dry_run: bool) -> dict:
                 for t in triggers:
                     conn.execute(f"ALTER TABLE {qualified(t['table'])} "
                                  f"DISABLE TRIGGER {_rekey_ident(t['trigger'])}")
+                # The agent's row is copied under the new id, every row that
+                # names the agent moves to it, and the old row goes last, named
+                # in store.deleting_agent: an id is never updated, and nothing
+                # names the old row by then, so its delete takes nothing with it.
+                parent = any(hit["table"] == "agents" and hit["column"] == "id"
+                             for hit in plan)
+                if parent:
+                    _rekey_copy_parent(conn, schema, "agents", old, new)
                 for hit in plan:
+                    if hit["table"] == "agents" and hit["column"] == "id":
+                        continue
                     conn.execute(f"UPDATE {qualified(hit['table'])} SET "
                                  f"{_rekey_ident(hit['column'])} = %s "
                                  f"WHERE {_rekey_ident(hit['column'])} = %s", (new, old))
+                if parent:
+                    _store_deleting(conn, "agents", old)
+                    conn.execute(f"DELETE FROM {qualified('agents')} WHERE id = %s", (old,))
+                    _store_deleting(conn, "agents")
                 for t in triggers:
                     conn.execute(f"ALTER TABLE {qualified(t['table'])} ENABLE "
                                  f"{modes.get(t['mode'], '')}TRIGGER "
@@ -12859,9 +12930,21 @@ def _ensure_node_row(conn, node: dict, kind: str | None = None) -> bool:
 
 
 def _drop_unlinked_node(conn, node: str) -> None:
-    """Remove a node's registry row once no agent lives on it."""
-    conn.execute("DELETE FROM nodes WHERE id = %s AND NOT EXISTS "
-                 "(SELECT 1 FROM agent_nodes WHERE node = %s)", (node, node))
+    """Remove a node's registry row once no agent lives on it, named in
+    store.deleting_node, so what the node owns goes with it and a record of
+    what ran there loses the pointer. A definition still pinned to the node
+    (ON DELETE RESTRICT) keeps the row, as an agent still living on it does."""
+    import psycopg
+    _store_deleting(conn, "nodes", node)
+    try:
+        with conn.transaction():
+            conn.execute("DELETE FROM nodes WHERE id = %s AND NOT EXISTS "
+                         "(SELECT 1 FROM agent_nodes WHERE node = %s)", (node, node))
+    except (psycopg.errors.ForeignKeyViolation, psycopg.errors.RestrictViolation) as exc:
+        # A key's refusal names its constraint; any other refusal is not a pin.
+        if not getattr(exc.diag, "constraint_name", None):
+            raise
+    _store_deleting(conn, "nodes")
 
 
 def _node_id_or(default: str | None) -> str | None:
@@ -12880,13 +12963,13 @@ class _KernelRefusal(Exception):
 
 
 # Every column of the store that names a node by its id, apart from the
-# links (agent_nodes), which follow the registry's id through
-# their foreign key: `node rekey` moves each in one transaction. `prefix` is a
-# column holding `<node>:<more>`, of which only the node part moves; `foreign
-# key` is a column that, as the links do, follows the registry's id by its
-# own foreign key, so the rekey counts and checks it and moves none of it
-# itself (a merge drops the old id's rows with its registry row). A
-# capability that adds a column naming a node adds it here.
+# links (agent_nodes): `node rekey` moves each in one transaction, and also
+# every other column a foreign key holds to the registry's id, which it reads
+# from the catalogue. `prefix` is a column holding `<node>:<more>`, of which
+# only the node part moves; `foreign key` is one of the node's own tables,
+# whose rows move to the new id and which a merge drops for the old id with
+# its registry row. A capability that adds a column naming a node adds it
+# here.
 NODE_REFERENCES = (
     ("agentrooms_leases", "node", "whole"),
     ("agentrooms_leases", "holder", "prefix"),
@@ -12917,6 +13000,10 @@ NODE_REFERENCES = (
     ("memory_events", "node", "whole"),
     ("tasks_executions", "node", "whole"),
     ("tasks_tasks", "node", "whole"),
+    ("tasks_presences", "node", "whole"),
+    ("memory_groom_leases", "node", "whole"),
+    ("inbox_items", "node", "whole"),
+    ("telegrambot_jobs", "node", "whole"),
 )
 # The tables that keep a lease - a node and an expiry - and the column naming
 # what holds it: a live one names a service that runs on the node.
@@ -15102,7 +15189,7 @@ SUPERVISE_UNLOCKED = object()
 # writes the lease's last_error any more; the column stays, since a released
 # manager still on another node, and that runner, name it.
 SUPERVISE_LEASE_OWNER = "deployment"
-SUPERVISE_LEASE_VERSION = (2, 0)
+SUPERVISE_LEASE_VERSION = (2, 1)
 SUPERVISE_LEASE_STEPS = [
     ("0001-service-leases",
      "CREATE TABLE deployment_service_leases ("
@@ -15139,6 +15226,16 @@ SUPERVISE_LEASE_STEPS = [
      " TO deployment_service_leases_agent_id_not_null;"
      " END IF;"
      " END $$"),
+    # The store's foreign keys: the lease goes with its agent and with the node it
+    # is held on. It calls the core's store_state_keys, which core 4.0 makes; the
+    # manager's library always migrates the core to it first.
+    ("0004-keys", r"""
+-- deployment: every agent and node reference (and every key inside deployment) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+SELECT store_state_keys('deployment', ARRAY[
+    ARRAY['deployment_service_leases', 'agent_id', 'agents', 'cascade'],
+    ARRAY['deployment_service_leases', 'node', 'nodes', 'cascade']]);
+"""),
 ]
 SUPERVISE_STORE_SETTING_SLUGS = frozenset({
     "store_not_configured", "store_not_postgres", "store_setting_unreadable",
@@ -20344,8 +20441,19 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                      f"{r['service']} ({r['lease']}, until {r['until']})" for r in running),
                  "stop them on that node and rekey it after: a lease a stopped service "
                  "held runs out at its time")
+        # Every column a foreign key holds to the registry's id, which the
+        # rekey moves to the new row before the old one goes.
+        keyed = [(t, c) for t, c in conn.execute(
+            "SELECT k.conrelid::regclass::text, a.attname FROM pg_constraint k "
+            "JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = k.conkey[1] "
+            "WHERE k.contype = 'f' AND k.confrelid = to_regclass(%s) "
+            "AND cardinality(k.conkey) = 1 ORDER BY 1, 2",
+            (qualified("nodes"),)).fetchall()]
+        keyed = [(t.rsplit(".", 1)[-1].strip('"'), c) for t, c in keyed]
+        node_own = {(t, c) for t, c, how in NODE_REFERENCES if how == "foreign key"}
+        merged = new in rows
         triggers = _rekey_triggers(conn, schema, [hit["table"] for hit in plan]
-                                   + ["nodes", "agent_nodes"])
+                                   + [t for t, _c in keyed] + ["nodes", "agent_nodes"])
     except psycopg.Error as exc:
         conn.close()
         _die(5, "store_unreachable", f"cannot read the store: {exc}",
@@ -20400,15 +20508,23 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                         "may_write = may_write OR %s, folder = coalesce(folder, %s) "
                         "WHERE agent_id = %s AND node = %s",
                         (master, may_write, folder, agent, new))
-                conn.execute("UPDATE agent_nodes SET node = %s WHERE node = %s",
-                             (new, old))
-                conn.execute("DELETE FROM nodes WHERE id = %s", (old,))
             else:
-                conn.execute("UPDATE nodes SET id = %s, updated_at = now() "
-                             "WHERE id = %s", (new, old))
+                # An id is never updated: the row is made again under the new
+                # id, and the old one goes once nothing names it.
+                _rekey_copy_parent(conn, schema, "nodes", old, new)
+                conn.execute("UPDATE nodes SET updated_at = now() WHERE id = %s", (new,))
+            conn.execute("UPDATE agent_nodes SET node = %s WHERE node = %s", (new, old))
+            # What follows the registry's id by a foreign key moves with it, as
+            # it did while the keys cascaded an update; on a merge the old id's
+            # own rows of the node tables go with its row, as they did then.
+            for table, column in keyed:
+                if table == "agent_nodes" or (merged and (table, column) in node_own):
+                    continue
+                conn.execute(f"UPDATE {qualified(table)} SET {_rekey_ident(column)} = %s "
+                             f"WHERE {_rekey_ident(column)} = %s", (new, old))
             for hit in plan:
                 column = _rekey_ident(hit["column"])
-                if hit["how"] == "foreign key":
+                if hit["how"] == "foreign key" or (hit["table"], hit["column"]) in keyed:
                     continue
                 if hit["how"] == "prefix":
                     conn.execute(f"UPDATE {qualified(hit['table'])} SET {column} = "
@@ -20417,6 +20533,9 @@ def _node_rekey(root: Path, old: str, given: str | None, dry_run: bool) -> dict:
                 else:
                     conn.execute(f"UPDATE {qualified(hit['table'])} SET {column} = %s "
                                  f"WHERE {column} = %s", (new, old))
+            _store_deleting(conn, "nodes", old)
+            conn.execute("DELETE FROM nodes WHERE id = %s", (old,))
+            _store_deleting(conn, "nodes")
             for t in triggers:
                 conn.execute(f"ALTER TABLE {qualified(t['table'])} ENABLE "
                              f"{modes.get(t['mode'], '')}TRIGGER "
@@ -30271,6 +30390,7 @@ class _Creation:
             with conn.transaction():
                 conn.execute("DELETE FROM policies WHERE agent_id = %s",
                              (self.agent_id,))
+                _store_deleting(conn, "agents", self.agent_id)
                 conn.execute("DELETE FROM agents WHERE id = %s", (self.agent_id,))
         except psycopg.Error:
             pass

@@ -1,5 +1,9 @@
 # inbox — change log
 
+## 2026-11-08 — An item goes with its agent, and keeps itself when the node it was put from goes, at inbox 1.3
+
+Step `0006-keys` (inbox 1.3, core 4.0) keys `inbox_items`: an item goes with its agent, and keeps itself, losing `node`, when the node it was put from is removed (`ON DELETE SET NULL`). The item guard admits that and the cascade of a deliberate delete and nothing else, and the change notice stays quiet under it. A reference to an agent or node the store no longer holds is settled when the step runs, kept in `inbox_premig_m9`. Runs on capabilities-contract 0.45. No verb, flag or JSON key changes.
+
 ## 2026-11-05 — An item links to the thing it came from, and an ask can be answered in words alone
 
 `inbox ask`, `inbox talk` and `inbox notify` take `--source-label L --source-ref R`, both or neither: the label the person reads for the thing the item came from and the asker's own reference to it, each one line of at most 200 characters. inbox reads neither; `show`, `status` and `list` return them as `"source": {"label", "ref"}`, null where the item names none, and the store keeps them among what an item asks, which never changes. An ask answered with `inbox answer <id> --reply TEXT` and neither yes nor no records the answer `other`, whose words are the whole answer; the on-answer command receives `INBOX_ANSWER=other` with the words in `INBOX_REPLY`, and the store refuses `other` without a reply. The word after `--reply` is the reply whatever it holds, a leading dash included. Ledger step `0005-source-other` (inbox tables 1.2) adds `source_label` and `source_ref` and admits `other` as an answer; items put before it name no source.

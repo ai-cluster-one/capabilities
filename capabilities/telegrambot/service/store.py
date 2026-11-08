@@ -28,7 +28,7 @@ from pathlib import Path
 
 OWNER = "telegrambot"
 MAJOR = 2
-MINOR = 0
+MINOR = 1
 
 STEPS: list[tuple[str, str]] = [
     ("0001-channels", """
@@ -201,6 +201,56 @@ class StoreUnavailable(Exception):
         self.slug, self.message, self.hint = slug, message, hint
 
 
+# The store's foreign keys (core 4.0): every agent and node column keyed by what
+# its parent takes with it, a job's slots and amendments by their job, and the
+# prompts guard admitting the cascade of a deliberate delete and nothing else.
+KEYS_STEPS: list[tuple[str, str]] = [
+    ("0008-keys", r"""
+-- telegrambot: every agent and node reference (and every key inside telegrambot) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION telegrambot_prompts_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'telegrambot_prompts keeps every version';
+  END IF;
+  IF new.id <> old.id OR new.agent_id <> old.agent_id OR new.key <> old.key
+     OR new.body <> old.body OR new.created_at <> old.created_at
+     OR new.created_by <> old.created_by OR new.note IS DISTINCT FROM old.note
+     OR (new.active AND NOT old.active) THEN
+    RAISE EXCEPTION 'a telegrambot_prompts version is immutable but for clearing active';
+  END IF;
+  RETURN new;
+END;
+$guard$;
+SELECT store_state_keys('telegrambot', ARRAY[
+    ARRAY['telegrambot_channels', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegrambot_seen', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegrambot_jobs', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegrambot_jobs', 'node', 'nodes', 'set null'],
+    ARRAY['telegrambot_job_slots', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegrambot_job_slots', 'job_id', 'telegrambot_jobs', 'cascade'],
+    ARRAY['telegrambot_job_amendments', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegrambot_job_amendments', 'job_id', 'telegrambot_jobs', 'cascade'],
+    ARRAY['telegrambot_prompts', 'agent_id', 'agents', 'cascade']]);
+"""),
+]
+
+
 def database():
     try:
         from capabilities_contract import db
@@ -230,7 +280,8 @@ def steps() -> list:
         spec.loader.exec_module(module)
         extra = list(getattr(module, "STEPS", []))
     step = database().Step
-    return STEPS + extra + [step(sid, sql, core=(3, 0)) for sid, sql in CUTOVER_STEPS]
+    return (STEPS + extra + [step(sid, sql, core=(3, 0)) for sid, sql in CUTOVER_STEPS]
+            + [step(sid, sql, core=(4, 0)) for sid, sql in KEYS_STEPS])
 
 
 class Store:

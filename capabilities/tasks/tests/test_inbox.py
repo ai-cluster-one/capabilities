@@ -163,6 +163,7 @@ def lab(tmp_path):
     lab = {"project": project, "env": env, "schema": schema, "ident": ident,
            "log": tmp_path / "inbox.log", "bare": f"{bare}{os.pathsep}{rest}"}
     assert tasks(lab, "migrate").returncode == 0
+    _cli.register(schema, (ident, "prj_elsewhere000"))
     try:
         yield lab
     finally:

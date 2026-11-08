@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-08 — Channels, jobs and prompts go with their agent, at telegrambot 2.1
+
+Step `0008-keys` (telegrambot 2.1, core 4.0) keys the channels, seen marks, jobs, job slots, job amendments and prompts to their agent (`ON DELETE CASCADE`), a job's slots and amendments to their job, and a job keeps its row and loses the node it ran on where that goes (`ON DELETE SET NULL`). The prompts guard admits the cascade of a deliberate delete and nothing else. A reference to an agent or node the store no longer holds is settled when the step runs, kept in `telegrambot_premig_m9`. Runs on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.
+
 ## 2026-11-08 — Replies reach Telegram formatted, not as raw Markdown
 
 What the service sends for a turn - the answer, its progress lines, what the turn or a job sends into the chat, a file's caption and a job's result - reached the chat as the model wrote it, `**` and backticks included. The transport now renders that Markdown into Telegram's message entities and sends them with no parse mode, so no character needs escaping: bold, italic, strikethrough, inline code, fenced code blocks (with their language), links, quotes and flat lists render; a heading becomes a bold line, a table a code block as written, and a list item a `•` line. Text that is not markup - `2*3*4`, `snake_case`, `<tag> &` - arrives whole, and a backslash keeps a marker literal. A reply is cut at 4096 UTF-16 units, as Telegram counts them, and an entity across a cut continues in the next part. A part whose formatting Telegram refuses is sent once more as the same text without it, so a reply is never lost to its formatting. The shipped turn and job mechanics name the forms Telegram renders and ask for no headings, tables or nested lists. The voice echo and the `send` verb still send text as written. No verb, flag, environment variable or output key changes.

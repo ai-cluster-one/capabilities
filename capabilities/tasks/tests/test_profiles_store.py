@@ -121,6 +121,7 @@ def lab(tmp_path):
     lab = {"here": _project(tmp_path / "here", here), "there": _project(tmp_path / "there", there),
            "ids": {"here": here, "there": there}, "env": env, "schema": schema, "tmp": tmp_path}
     assert cli(lab, "migrate").returncode == 0
+    _cli.register(schema, (here, there))
     try:
         yield lab
     finally:
@@ -172,7 +173,7 @@ def test_the_librarys_table_is_migrated_first_under_its_own_ledger(lab):
     doctor = ok(cli(lab, "doctor"))
     assert doctor["profile_tables"]["owner"] == "harness"
     assert doctor["profile_tables"]["state"] == "current"
-    assert doctor["tables"]["code"] == {"major": 2, "minor": 0}
+    assert doctor["tables"]["code"] == {"major": 2, "minor": 1}
 
 
 @needs_store

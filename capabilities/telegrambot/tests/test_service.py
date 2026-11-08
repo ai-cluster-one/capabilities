@@ -20,6 +20,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from _agents import register_agents, register_nodes
 from _cli import CAPABILITY_DIR, load_cli, load_service
 
 DSN = os.environ.get("TELEGRAMBOT_TEST_DSN")
@@ -116,7 +117,7 @@ def make_project(tmp_path, name, token, settings, schema):
     (root / ".env.local").write_text(
         f"CAPABILITIES_PROJECT_ID={project_id}\nTELEGRAMBOT_BOT_BOT_TOKEN={token}\n"
         f"AGENTKIT_DB_URL={DSN}\nAGENTKIT_DB_SCHEMA={schema}\n")
-    migrate_schema(schema)
+    migrate_schema(schema, project_id)
     return root, project_id
 
 
@@ -130,7 +131,7 @@ def _setting(schema):
                       password=info.get("password"), sslmode="disable")
 
 
-def migrate_schema(schema):
+def migrate_schema(schema, project_id):
     """Bring a project's tables up before its service starts, as `telegrambot
     migrate` does where the payload is installed. The shared database library
     judges a migration step by a snapshot of the whole database, so a step that
@@ -138,7 +139,13 @@ def migrate_schema(schema):
     service retries its admission later; migrating first keeps serving free of
     DDL and these cases free of that timing."""
     store = load_service("store")
-    store.Store(_setting(schema)).open().close()
+    opened = store.Store(_setting(schema)).open()
+    # The project's agent and the node it runs on, which the manager registers
+    # before its service runs.
+    from capabilities_contract.capability.store import node_id
+    register_agents(opened, project_id)
+    register_nodes(opened, node_id())
+    opened.close()
 
 
 def drop_schema(schema):

@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-11-08 — An agent's documents and files go with it, at assets 2.1
+
+Step `0008-keys` (assets 2.1, core 4.0) keys every agent column of the assets tables to `agents` with `ON DELETE CASCADE`, and moves the keys inside assets - a version to its document, a file to its document, an operation to its file - from no action to `ON DELETE CASCADE`. The documents, versions, files and operations guards still refuse every delete and edit but one: the cascade of a deliberate delete of their agent. A reference to an agent the store no longer holds is settled when the step runs, kept in `assets_premig_m9`. Bucket objects are not touched. Runs on capabilities-contract 0.45. No verb, flag or JSON key changes.
+
 ## 2026-11-08 — `assets` ships the `authoring` guide
 
 `assets guide` lists `assets guide authoring`, where it answered that no guides ship: what belongs in assets, how a record is named, why evidence keeps its versions rather than being rewritten, and how a settled conclusion is promoted on purpose to a doctrine document, a routine or a memory entry. `assets manifest --json` names the guides' address under `docs.base`. No verb, flag or other output key changes.

@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from _peer import fake_source, store_env
+from _peer import fake_source, register, store_env
 
 CAPABILITY = Path(__file__).resolve().parents[1]
 SCRIPT = next((path for path in (
@@ -58,6 +58,7 @@ def _run(tmp_path: Path, cwd: Path, target: str, *extra: str):
     env["PEER_MARKER"] = str(marker)
     env.pop("CLAUDE_PROJECT_DIR", None)
     store_env(env)
+    register(cwd, env)
 
     proc = subprocess.run(
         [sys.executable, str(SCRIPT), target, "what is here?", "--quiet", *extra],

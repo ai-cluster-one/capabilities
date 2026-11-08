@@ -31,6 +31,7 @@ TELEGRAM_DIR = Path(__file__).resolve().parents[1]
 DAEMON_PATH = TELEGRAM_DIR / "service" / "daemon.py"
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _agents import register_project  # noqa: E402
 from _cli import CLI_PATH  # noqa: E402
 from _harness import (  # noqa: E402
     CLAUDE_KNOBS,
@@ -378,6 +379,7 @@ def import_daemon(tmp: Path, service_settings: dict, *,
         if store:
             module.STORE_SETTING = dataclasses.replace(
                 module.STORE_SETTING, schema=f"tgtest_{uuid.uuid4().hex}")
+            register_project(module)
         else:
             # The register is a table in the store. A case without one keeps
             # it in memory instead, apart from the daemon's own copy as the

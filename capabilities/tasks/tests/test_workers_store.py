@@ -127,6 +127,7 @@ def lab(tmp_path):
     lab = {"here": _project(tmp_path / "here", here), "there": _project(tmp_path / "there", there),
            "ids": {"here": here, "there": there}, "env": env, "schema": schema, "tmp": tmp_path}
     assert cli(lab, "migrate").returncode == 0
+    _cli.register(schema, (here, there))
     for where in ("here", "there"):
         ok(cli(lab, "profiles", "save", "plain", "-", where=where, stdin=PROFILE))
     try:
@@ -465,6 +466,7 @@ def test_doctor_warns_while_an_earlier_release_serves_by_the_presence_lock_alone
     import psycopg
     here, schema = lab["ids"]["here"], lab["schema"]
     rows_ = f"{schema}.tasks_presences"
+    _cli.register(schema, (), ("node-a", "node-b", "node-c"))
     assert "earlier tasks release" not in ok(cli(lab, "doctor")).get("warning", "")
     with psycopg.connect(DSN, autocommit=True, application_name="tasks-earlier") as held:
         pid = held.execute("select pg_backend_pid()").fetchone()[0]

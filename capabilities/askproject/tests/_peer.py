@@ -94,6 +94,42 @@ def project(path: Path, git: bool = False) -> Path:
     return path
 
 
+# Run in the caller's folder with an ask's environment: the store the ask resolves,
+# opened and migrated as the ask opens it, and the node the ask runs as (minted in its
+# config home as the ask would) and its caller's agent id, if any, registered in it.
+# A store the ask cannot open is left for the ask to report.
+REGISTER = """
+import os, sys
+from importlib.machinery import SourceFileLoader
+from capabilities_contract.capability.tiers.store import this_node
+cli = SourceFileLoader("askproject_cli", sys.argv[1]).load_module()
+try:
+    conn = cli.SessionMap._connect()
+except cli.SessionStoreError:
+    sys.exit(0)
+try:
+    node = this_node()
+    conn.execute("INSERT INTO nodes (id, label, kind) VALUES (%s, %s, 'mac') "
+                 "ON CONFLICT (id) DO NOTHING", (node["id"], node["label"]))
+    agent = os.environ.get("CAPABILITIES_PROJECT_ID")
+    if agent:
+        conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                     "ON CONFLICT (id) DO NOTHING", (agent,))
+    conn.commit()
+finally:
+    conn.close()
+"""
+
+
+def register(caller: Path, env: dict) -> None:
+    """Register the node an ask from `caller` runs as with `env`, and its caller's
+    agent where it has an id, in the store the ask resolves, as the manager would: a
+    session may only name a node and an agent the store holds."""
+    done = subprocess.run([sys.executable, "-c", REGISTER, str(SCRIPT)], cwd=caller,
+                          env=env, text=True, capture_output=True, timeout=60)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
 class Lab:
     """A caller project, a git target, both fakes on PATH, and isolated homes."""
 
@@ -141,10 +177,14 @@ class Lab:
             env={**self.env, **(env or {})}, text=True, capture_output=True,
             timeout=timeout)
 
+    def register(self, env: dict | None = None) -> None:
+        register(self.caller, {**self.env, **(env or {})})
+
     def ask(self, *extra: str, env: dict | None = None, quiet: bool = True,
             timeout: int = 60):
         """One ask of the target; returns (process, parsed stdout or None, launch or None)."""
         store_env(self.env)
+        self.register(env)
         self.record.unlink(missing_ok=True)
         args = [str(self.target), "what is here?", *extra]
         if quiet:

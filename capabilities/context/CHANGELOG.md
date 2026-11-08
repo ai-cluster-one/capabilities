@@ -1,5 +1,9 @@
 # context — change log
 
+## 2026-11-08 — An agent's documents go with it, at context 2.1
+
+Step `0007-keys` (context 2.1, core 4.0) keys `context_documents`, `context_versions` and `context_enablements`: an agent's documents, their versions and its enablements go with it, a global document's author keeps the document and loses the pointer (`author_agent_id`, `ON DELETE SET NULL`), and a version and an enablement go with their document. The versions guard admits the cascade of a deliberate delete and nothing else. A reference to an agent the store no longer holds is settled when the step runs, kept in `context_premig_m9`. Runs on capabilities-contract 0.45. No verb, flag or JSON key changes.
+
 ## 2026-11-08 — `context` ships the `authoring` and `groom` guides
 
 `context guide` lists two guides, where it answered that none ship: `context guide authoring` for writing a doctrine document in the store - one fact in one live home, the altitude a fact belongs at (inline, stub, a capability guide, a routine, an asset, a memory entry), routing a stub by its name and description, the present tense, one line per paragraph, and saving with `context save --base` followed by `capabilities build` - and `context guide groom` for reviewing the documents against it. No verb, flag or output key changes.

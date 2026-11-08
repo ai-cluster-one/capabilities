@@ -166,6 +166,11 @@ class Lab:
             cur = conn.execute(query, params)
             return cur.fetchall() if cur.description else None
 
+    def register(self, *agents: str) -> None:
+        for agent in agents:
+            self.sql(f"INSERT INTO {SCHEMA}.agents (id, kind) VALUES (%s, 'agent')"
+                     " ON CONFLICT (id) DO NOTHING", (agent,))
+
     def team(self, name: str = "crew", *flags: str) -> dict:
         return self.ok("create", name, "--description", f"The {name}: turn to it for releases.",
                        *flags)
@@ -204,7 +209,7 @@ def test_the_ledger_creates_the_tables_with_their_comments_and_guard(lab):
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'teams' ORDER BY step")]
     assert steps == ["0001-teams", "0002-members", "0003-documents", "0004-versions",
-                     "0005-versions-guard"]
+                     "0005-versions-guard", "0006-keys"]
     for table in ("teams_teams", "teams_members", "teams_documents", "teams_versions"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
         assert comment
@@ -233,6 +238,7 @@ def test_a_team_is_made_once_and_a_repeat_with_the_same_line_changes_nothing(lab
 def test_list_answers_this_agents_teams_and_says_when_there_is_none(lab):
     lab.team("crew")
     lab.team("ops", "--always")
+    lab.register(AGENT, OTHER)
     assert "is a member of no team" in lab.ok("list")
     assert lab.ok("members", "add", "ops", AGENT)["changed"] is True
     assert lab.ok("members", "add", "ops", AGENT)["changed"] is False

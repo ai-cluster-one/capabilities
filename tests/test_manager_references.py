@@ -193,7 +193,11 @@ class Lab:
 
 @pytest.fixture()
 def lab(tmp_path, cluster):
-    return Lab(tmp_path, cluster)
+    found = Lab(tmp_path, cluster)
+    # The store holds a row only for an agent it has registered, and init is
+    # what registers this project's agent.
+    found.ok(MANAGER, "init")
+    return found
 
 
 def test_a_folder_imported_and_exported_is_the_same_bytes(lab):

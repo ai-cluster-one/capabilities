@@ -11,6 +11,7 @@ directory, so nothing reaches the real home.
 
 from __future__ import annotations
 
+import functools
 import importlib.util
 import json
 import os
@@ -89,6 +90,57 @@ def drop_schema(schema: str) -> None:
         conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
 
+def register(schema: str, agents=(), nodes=()) -> None:
+    """Register `agents` and `nodes` in `schema`, as the manager would, making only the
+    core tables when they are missing: a row may only name an agent and a node the
+    store holds."""
+    import psycopg
+    from capabilities_contract import db
+    from capabilities_contract.db import _migrate as core
+    with psycopg.connect(dsn_url(), autocommit=True) as conn:
+        db.migrate(conn, core.CORE_OWNER, core.CORE_STEPS, major=core.CORE_VERSION[0],
+                   minor=core.CORE_VERSION[1], schema=schema)
+        for agent in agents:
+            conn.execute(f'INSERT INTO "{schema}".agents (id, kind) VALUES '
+                         "(%s, 'agent') ON CONFLICT (id) DO NOTHING", (agent,))
+        for node in nodes:
+            conn.execute(f'INSERT INTO "{schema}".nodes (id, label, kind) VALUES '
+                         "(%s, %s, 'mac') ON CONFLICT (id) DO NOTHING", (node, node))
+
+
+# `register` for a child: the core tables, the agents and the node the child runs as
+# (minted in its config home as the child would), made by the interpreter the
+# executable runs on, whose library may not be this process's. argv is the URL, the
+# schema and the agents' ids; the environment is the child's.
+REGISTER = """
+import sys
+import psycopg
+from capabilities_contract import db
+from capabilities_contract.db import _migrate as core
+from capabilities_contract.capability.tiers.store import this_node
+url, schema, agents = sys.argv[1], sys.argv[2], sys.argv[3:]
+with psycopg.connect(url, autocommit=True) as conn:
+    db.migrate(conn, core.CORE_OWNER, core.CORE_STEPS, major=core.CORE_VERSION[0],
+               minor=core.CORE_VERSION[1], schema=schema)
+    for agent in agents:
+        conn.execute(f'INSERT INTO "{schema}".agents (id, kind) VALUES (%s, %s) '
+                     "ON CONFLICT (id) DO NOTHING", (agent, "agent"))
+    node = this_node()
+    conn.execute(f'INSERT INTO "{schema}".nodes (id, label, kind) VALUES (%s, %s, %s) '
+                 "ON CONFLICT (id) DO NOTHING", (node["id"], node["label"], "mac"))
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def cli_python() -> str:
+    """The interpreter of the environment uv runs the executable in."""
+    for argv in (["uv", "sync", "--script", str(CLI_PATH)],
+                 ["uv", "python", "find", "--script", str(CLI_PATH)]):
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+        assert done.returncode == 0, done.stdout + done.stderr
+    return done.stdout.strip()
+
+
 def manager_bin() -> str | None:
     repo_manager = CAPABILITY_DIR.parents[1] / "bin" / "capabilities"
     return str(repo_manager) if repo_manager.is_file() else None
@@ -104,8 +156,24 @@ class World:
         self.home.mkdir(parents=True, exist_ok=True)
         self.config = tmp / "config"
         self.state = tmp / "state"
+        self.agents: list[str] = []
+        self.registered: set[str] = set()
 
     def env(self, **extra) -> dict:
+        env = self._env(**extra)
+        # The agents of the projects made so far and the node a child runs as here, each
+        # registered once before a child names it.
+        node = (env.get("XDG_CONFIG_HOME"), env.get("AGENT_NODE_ID"))
+        pending = [agent for agent in self.agents if agent not in self.registered]
+        if (pending or node not in self.registered) and self.schema and DSN:
+            done = subprocess.run([cli_python(), "-I", "-c", REGISTER, dsn_url(), self.schema,
+                                   *pending], env=env, capture_output=True, text=True,
+                                  timeout=180)
+            assert done.returncode == 0, done.stdout + done.stderr
+            self.registered.update([*pending, node])
+        return env
+
+    def _env(self, **extra) -> dict:
         env = {k: v for k, v in os.environ.items() if k not in CLEARED}
         env.update({"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.config),
                     "XDG_STATE_HOME": str(self.state),
@@ -134,8 +202,9 @@ class World:
         (root / ".git").mkdir(exist_ok=True)
         (envelope / "project.json").write_text(json.dumps({
             "schema": "capabilities.project.v2", "slug": name}))
-        (root / ".env.local").write_text(
-            f"CAPABILITIES_PROJECT_ID={pid or 'prj_' + uuid.uuid4().hex[:12]}\n")
+        pid = pid or "prj_" + uuid.uuid4().hex[:12]
+        self.agents.append(pid)
+        (root / ".env.local").write_text(f"CAPABILITIES_PROJECT_ID={pid}\n")
         gate = {"capabilities": {}}
         if enabled is not None:
             gate["capabilities"]["memory"] = {"enabled": enabled}

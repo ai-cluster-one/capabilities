@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.45,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -310,8 +310,80 @@ def _manifest() -> dict:
 # and its delivery are facts of that row written once each. An item is
 # withdrawn rather than deleted, so its row stays as the record of what was
 # asked; nothing refuses a delete, which no verb makes.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 2
+LEDGER_MAJOR, LEDGER_MINOR = 1, 3
 CHANNEL = "inbox_changed"
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+from capabilities_contract.db import Step as _M9Step  # noqa: E402
+_M9_KEYS_SQL = r"""
+-- inbox: every agent and node reference (and every key inside inbox) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION inbox_items_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        IF (new.agent_id, new.id, new.kind, new.key, new.title, new.text, new.yes_label,
+            new.no_label, new.recommend, new.session, new.on_answer, new.created_at,
+            new.created_by, new.node, new.source_label, new.source_ref)
+           IS DISTINCT FROM
+           (old.agent_id, old.id, old.kind, old.key, old.title, old.text, old.yes_label,
+            old.no_label, old.recommend, old.session, old.on_answer, old.created_at,
+            old.created_by, old.node, old.source_label, old.source_ref) THEN
+            RAISE EXCEPTION 'what an inbox item asks is never changed: withdraw it and ask again'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF old.answered_at IS NOT NULL
+           AND (new.answered_at, new.answered_by, new.answer, new.reply)
+               IS DISTINCT FROM (old.answered_at, old.answered_by, old.answer, old.reply) THEN
+            RAISE EXCEPTION 'the first answer to an inbox item is final'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF old.withdrawn_at IS NOT NULL AND new.withdrawn_at IS DISTINCT FROM old.withdrawn_at THEN
+            RAISE EXCEPTION 'a withdrawn inbox item stays withdrawn'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $guard$;
+CREATE OR REPLACE FUNCTION inbox_items_changed() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    BEGIN
+    IF coalesce(current_setting('store.deleting_agent', true), '')
+       || coalesce(current_setting('store.deleting_node', true), '')
+       || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        RETURN NULL;
+    END IF;
+        IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN
+            EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                           'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                           'DO UPDATE SET version = c.version + 1',
+                           tg_table_schema, 'inbox_changed')
+                USING new.agent_id;
+        END IF;
+        PERFORM pg_notify('inbox_changed', json_build_object(
+            'schema', tg_table_schema, 'agent_id', new.agent_id, 'id', new.id)::text);
+        RETURN NULL;
+    END $guard$;
+SELECT store_state_keys('inbox', ARRAY[
+    ARRAY['inbox_items', 'agent_id', 'agents', 'cascade'],
+    ARRAY['inbox_items', 'node', 'nodes', 'set null']]);
+"""
+
 LEDGER_STEPS = [
     ("0001-items", """
     CREATE TABLE inbox_items (
@@ -522,6 +594,7 @@ LEDGER_STEPS = [
     COMMENT ON COLUMN inbox_items.answer IS
         'For an ask, yes, no, or other where the person answered in words alone, the reply being the whole answer; NULL for a talk, whose answer is the reply.';
     """),
+    _M9Step("0006-keys", _M9_KEYS_SQL, core=(4, 0)),
 ]
 
 

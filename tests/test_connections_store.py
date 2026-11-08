@@ -345,7 +345,28 @@ def _text(result: subprocess.CompletedProcess) -> str:
     return result.stdout.strip()
 
 
+def _register(lab) -> None:
+    """The store holds a row only for an agent it has registered, and init is
+    what registers this project's agent."""
+    _ok(_manager(lab, "init"))
+
+
+def _register_rows(lab, *, agents: tuple = (), nodes: tuple = ()) -> None:
+    """Register in the store the other agents and the nodes a test writes
+    rows for, as the store holds a row only for those it has registered."""
+    labels = {NODE: "lab-node", BOX: "box-node"}
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        for agent in agents:
+            conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                         "ON CONFLICT (id) DO NOTHING", (agent,))
+        for node in nodes:
+            conn.execute("INSERT INTO nodes (id, label, kind) VALUES (%s, %s, 'mac') "
+                         "ON CONFLICT (id) DO NOTHING", (node, labels.get(node, node)))
+
+
 def _import(lab) -> dict:
+    _register(lab)
     return _ok(_manager(lab, "connections", "import"))
 
 
@@ -701,6 +722,7 @@ def test_an_ungranted_store_connection_is_refused_until_granted(lab):
 def test_a_store_connection_another_project_is_granted_is_not_removed(lab):
     _import(lab)
     other = "prj_" + "9f8e7d6c5b4a"
+    _register_rows(lab, agents=(other,), nodes=("elsewhere",))
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("SET search_path TO lab")
         conn.execute("INSERT INTO grants "
@@ -769,6 +791,7 @@ def _peer(lab) -> dict:
     (envelope / "settings.json").write_text(
         json.dumps({"capabilities": {"coolify": {"enabled": True}}}))
     (project / ".env").write_text((lab["project"] / ".env").read_text())
+    _register_rows(lab, agents=(peer_id,))
     return {**lab, "project": project, "envelope": envelope, "id": peer_id,
             "env": {**lab["env"], "CLAUDE_PROJECT_DIR": str(project)}}
 
@@ -854,6 +877,7 @@ def test_a_read_only_grant_refuses_a_write_verb(lab):
 def test_a_grant_naming_this_node_is_used_before_the_grant_for_every_node(lab):
     _import(lab)
     node = _here(lab)
+    _register_rows(lab, nodes=("another-node", node))
     _ok(_manager(lab, "set", "coolify", "grant", "box", '{"allow_write": false}'))
     _ok(_manager(lab, "set", "coolify", "grant", "box",
                  json.dumps({"node": "another-node", "allow_write": True})))
@@ -874,6 +898,8 @@ def test_a_grant_naming_this_node_is_used_before_the_grant_for_every_node(lab):
 
 def test_a_node_handed_its_id_is_matched_by_it_and_not_the_one_it_resolves(lab):
     declared = {"AGENT_NODE_ID": NODE}
+    _register(lab)
+    _register_rows(lab, nodes=(NODE,))
     result = _ok(_manager(lab, "connections", "import", extra=declared))
     assert result["node"] == NODE != _here(lab)
     _ok(_manager(lab, "set", "coolify", "grant", "box", '{"allow_write": false}'))
@@ -920,11 +946,16 @@ def _doctor(lab) -> dict:
 def test_doctor_reports_unknown_agents_as_information_only(lab):
     _import(lab)
     with lab["cluster"].admin(lab["database"]) as conn:
+        # The store's keys refuse a grant naming an agent it does not hold, so
+        # one is left as an older store could hold it, with the keys not checked.
+        conn.execute("SET session_replication_role = replica")
         conn.execute("INSERT INTO lab.grants "
                      "(agent_id, capability, connection_id, enabled) "
                      "VALUES ('prj_999999999999', 'coolify', (SELECT id FROM lab.connections "
                      "WHERE label = 'spare'), true)")
-        conn.execute("INSERT INTO lab.agents (id) VALUES (%s)", (PROJECT_ID,))
+        conn.execute("SET session_replication_role = DEFAULT")
+        conn.execute("INSERT INTO lab.agents (id) VALUES (%s) ON CONFLICT (id) DO NOTHING",
+                     (PROJECT_ID,))
     first = _doctor(lab)
     assert first["information"] == [{
         "code": "grant_agent_unknown", "agent_id": "prj_999999999999", "grants": 1,
@@ -1018,6 +1049,7 @@ def test_the_gate_is_written_to_and_read_from_the_store(lab):
                       "FROM policies") == [(None, "coolify", None, True)]
     _ok(_coolify(lab, "deploy", "x"))
     # A row naming this node is read before the row for every node.
+    _register_rows(lab, nodes=(NODE, "another-node"))
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("INSERT INTO lab.policies (agent_id, capability, node, "
                      "enabled) VALUES (NULL, 'coolify', %s, false)", (NODE,))
@@ -1038,6 +1070,7 @@ def test_a_policy_row_is_written_and_removed_for_one_node(lab):
     refused = _manager(lab, "enable", "coolify", "--project", "--node", NODE)
     assert refused.returncode == 6 and _error(refused)["code"] == "node_requires_store"
     _import(lab)
+    _register_rows(lab, nodes=(NODE, "another-node"))
     declared = {"AGENT_NODE_ID": NODE}
     disabled = _ok(_manager(lab, "disable", "coolify", "--project", "--node", NODE))
     assert {k: disabled[k] for k in ("disabled", "scope", "node", "gate")} == {
@@ -1066,6 +1099,7 @@ def test_a_service_moves_between_nodes_and_its_capability_stays_usable_on_both(l
     # The defect: moving a service off a node turned its capability off there.
     # Placing the service and making the capability usable are answers apart.
     _import(lab)
+    _register_rows(lab, nodes=(NODE, BOX))
     registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
     registry.mkdir(parents=True)
     (registry / "coolify").write_text("#!/bin/sh\n")
@@ -1255,6 +1289,7 @@ def test_placing_a_service_on_another_node_warns_of_a_connection_at_loopback(lab
     # The defect: a service placed on another node kept a connection whose
     # address is loopback, which on that node reaches the node itself.
     _import(lab)
+    _register_rows(lab, nodes=(NODE, BOX))
     registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
     registry.mkdir(parents=True)
     (registry / "coolify").write_text("#!/bin/sh\n")
@@ -1308,6 +1343,7 @@ def test_a_writer_that_predates_the_service_column_places_where_it_enables(lab):
     # A manager on an older library writes enabled alone, meaning what
     # enable --node and disable --node always meant: the service follows.
     _import(lab)
+    _register_rows(lab, nodes=(NODE,))
 
     def write(node: str, enabled: bool) -> tuple:
         return _rows(lab, (
@@ -1329,6 +1365,7 @@ def test_a_store_mode_project_marked_only_by_project_json_gets_no_file_gate(lab)
     # A project whose records are in the store keeps its gate in the store, so
     # project.json alone marks it and no write brings back a file gate.
     _import(lab)
+    _register_rows(lab, nodes=(NODE,))
     (lab["envelope"] / "settings.json").unlink()
     gate = lab["envelope"] / "settings.json"
     enabled = _ok(_manager(lab, "enable", "coolify", "--project"))
@@ -1564,6 +1601,7 @@ def test_outside_a_project_an_agents_own_connection_is_not_the_machines(lab):
     _global_rows_in_force(lab)
     _add_machine(lab, "mach")
     other = "prj_" + "9f8e7d6c5b4a"
+    _register_rows(lab, agents=(other,))
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("INSERT INTO lab.connections (capability, label, spec, owner_agent_id) "
                      "VALUES ('coolify', 'theirs', %s::jsonb, %s)",
@@ -1576,6 +1614,7 @@ def test_a_machine_connection_an_agent_is_granted_is_not_removed(lab):
     _global_rows_in_force(lab)
     _add_machine(lab, "mach")
     other = "prj_" + "9f8e7d6c5b4a"
+    _register_rows(lab, agents=(other,))
     with lab["cluster"].admin(lab["database"]) as conn:
         conn.execute("INSERT INTO lab.grants "
                      "(agent_id, capability, connection_id, enabled) "

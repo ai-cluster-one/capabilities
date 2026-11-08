@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.45,<1",
 #     "httpx>=0.27",
 #     "psycopg[binary]>=3.2",
 # ]
@@ -677,7 +677,139 @@ class _Bucket:
 # the step is applied: what happened to a file before then is not known, so
 # nothing is backfilled. The executable writes it, not the store, so an older
 # assets writing to a migrated store leaves no record; the help says so.
-TABLES_MAJOR, TABLES_MINOR = 2, 0
+TABLES_MAJOR, TABLES_MINOR = 2, 1
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+from capabilities_contract.db import Step as _M9Step  # noqa: E402
+_M9_KEYS_SQL = r"""
+-- assets: every agent and node reference (and every key inside assets) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION assets_documents_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'asset documents are never deleted: retire them'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.id <> old.id OR new.agent_id <> old.agent_id OR new.kind <> old.kind
+                OR new.name <> old.name OR new.created_at <> old.created_at
+                OR new.created_by <> old.created_by
+                OR old.retired_at IS NOT NULL
+                   AND new.retired_at IS DISTINCT FROM old.retired_at THEN
+            RAISE EXCEPTION 'an asset document changes only by being retired, once'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $guard$;
+CREATE OR REPLACE FUNCTION assets_file_operations_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        RAISE EXCEPTION 'the file operations log is append-only: it is never edited or deleted'
+            USING ERRCODE = 'check_violation';
+    END $guard$;
+CREATE OR REPLACE FUNCTION assets_files_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'asset files are never deleted: retire them'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.id <> old.id OR new.agent_id <> old.agent_id
+                OR new.document_id IS DISTINCT FROM old.document_id
+                OR new.name <> old.name OR new.media_type <> old.media_type
+                OR new.bytes <> old.bytes OR new.sha256 <> old.sha256
+                OR new.storage_key <> old.storage_key OR new.created_at <> old.created_at
+                OR new.created_by <> old.created_by
+                OR old.retired_at IS NOT NULL
+                   AND new.retired_at IS DISTINCT FROM old.retired_at THEN
+            RAISE EXCEPTION 'an asset file changes only by being retired, once: keep the new bytes as a new file'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $guard$;
+CREATE OR REPLACE FUNCTION assets_versions_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'asset versions are never deleted: retire the document instead'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.id <> old.id OR new.document_id <> old.document_id OR new.title <> old.title
+                OR new.body <> old.body OR new.created_at <> old.created_at
+                OR new.created_by <> old.created_by OR new.note IS DISTINCT FROM old.note
+                OR new.active AND NOT old.active THEN
+            RAISE EXCEPTION 'an asset version is immutable: save a new version; clearing active on supersession is the only change'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $guard$;
+SELECT store_state_keys('assets', ARRAY[
+    ARRAY['assets_documents', 'agent_id', 'agents', 'cascade'],
+    ARRAY['assets_versions', 'document_id', 'assets_documents', 'cascade'],
+    ARRAY['assets_files', 'agent_id', 'agents', 'cascade'],
+    ARRAY['assets_files', 'document_id', 'assets_documents', 'cascade'],
+    ARRAY['assets_file_operations', 'agent_id', 'agents', 'cascade'],
+    ARRAY['assets_file_operations', 'file_id', 'assets_files', 'cascade']]);
+"""
+
 TABLE_STEPS = [
     ("0001-documents", """
     CREATE TABLE assets_documents (
@@ -934,6 +1066,7 @@ TABLE_STEPS = [
     COMMENT ON TABLE assets_file_operations IS
         'Every write to an agent''s file records, one row each, written in the transaction of the write. Append-only: never edited or deleted.';
     """),
+    _M9Step("0008-keys", _M9_KEYS_SQL, core=(4, 0)),
 ]
 
 

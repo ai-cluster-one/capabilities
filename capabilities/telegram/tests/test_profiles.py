@@ -23,6 +23,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _agents import register_agents  # noqa: E402
 from _cli import CLI_PATH  # noqa: E402
 from test_job_register import STORE_DSN, jobs, project_id, store_setting  # noqa: E402
 from test_outbound_actions import import_cli  # noqa: E402
@@ -286,8 +287,11 @@ class Store(unittest.TestCase):
         migrate(self.conn, steps["owner"], [tuple(s) for s in steps["steps"]],
                 major=steps["major"], minor=steps["minor"])
         self.project = project_id()
+        register_agents(self.conn, self.project)
 
     def save(self, name, spec, scope="project", scope_id=None):
+        if scope == "project" and scope_id:
+            register_agents(self.conn, scope_id)
         version, _created = lib.save_profile(
             self.conn, name, spec, scope=scope, schema=self.setting.schema,
             scope_id=(scope_id or self.project) if scope == "project" else None)
@@ -687,6 +691,7 @@ class MigrateProfiles(unittest.TestCase):
             self.envelope, project_id=self.project, setting=self.setting,
             profile_tables=False)
         self.addCleanup(self.store.close)
+        register_agents(self.store.conn, self.project)
         self.conn = connect(application_name="telegram", setting=self.setting)
         self.addCleanup(self.conn.close)
         waiting = self.reg.submit(self.reg.register(
@@ -1025,6 +1030,7 @@ class ServiceHarness(unittest.TestCase):
         store, reg = jobs_module.open_register(root / "capabilities",
                                                project_id=project, setting=setting)
         self.addCleanup(store.close)
+        register_agents(store.conn, project)
         conn = connect(application_name="telegram", setting=setting)
         self.addCleanup(conn.close)
         lib.save_profile(conn, "telegram-fast", CODEX, scope="project",

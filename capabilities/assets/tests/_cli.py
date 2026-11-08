@@ -11,6 +11,7 @@ project is cleared, so nothing reaches the real home or the real store.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import subprocess
@@ -69,8 +70,23 @@ class World:
         self.schema = schema
         self.home = tmp / "home"
         self.home.mkdir(parents=True, exist_ok=True)
+        self.agents: list[str] = []
+        self.registered: set[str] = set()
+
+    def register(self) -> None:
+        """Register the projects' agents, as the manager would, before a child runs: a
+        row may only name an agent the store holds. Only the core tables are made for
+        it, by the library the executable runs on."""
+        pending = [agent for agent in self.agents if agent not in self.registered]
+        if not pending or not DSN:
+            return
+        done = subprocess.run([cli_python(), "-I", "-c", REGISTER, dsn_url(), self.schema,
+                               *pending], capture_output=True, text=True, timeout=180)
+        assert done.returncode == 0, done.stdout + done.stderr
+        self.registered.update(pending)
 
     def env(self, **extra) -> dict:
+        self.register()
         env = {k: v for k, v in os.environ.items() if k not in CLEARED}
         env.update({"HOME": str(self.home), "XDG_CONFIG_HOME": str(self.home / "config"),
                     "XDG_STATE_HOME": str(self.home / "state"),
@@ -86,8 +102,10 @@ class World:
         envelope = root / "capabilities"
         envelope.mkdir(parents=True, exist_ok=True)
         (root / ".git").mkdir(exist_ok=True)
+        pid = pid or "prj_" + uuid.uuid4().hex[:12]
+        self.agents.append(pid)
         (envelope / "project.json").write_text(json.dumps({
-            "id": pid or "prj_" + uuid.uuid4().hex[:12], "schema": "capabilities.project.v1",
+            "id": pid, "schema": "capabilities.project.v1",
             "slug": name}))
         (envelope / "settings.json").write_text(json.dumps(
             {"capabilities": {"assets": {"enabled": True}}}))
@@ -103,6 +121,33 @@ class World:
         done = self.run(cwd, *args, **kw)
         assert done.returncode == 0, done.stdout.decode() + done.stderr.decode()
         return json.loads(done.stdout)
+
+
+# Make the core tables in a schema and register agents in it, run by the interpreter
+# the executable runs on: argv is the URL, the schema and the agents' ids.
+REGISTER = """
+import sys
+import psycopg
+from capabilities_contract import db
+from capabilities_contract.db import _migrate as core
+url, schema, agents = sys.argv[1], sys.argv[2], sys.argv[3:]
+with psycopg.connect(url, autocommit=True) as conn:
+    db.migrate(conn, core.CORE_OWNER, core.CORE_STEPS, major=core.CORE_VERSION[0],
+               minor=core.CORE_VERSION[1], schema=schema)
+    for agent in agents:
+        conn.execute(f'INSERT INTO "{schema}".agents (id, kind) VALUES (%s, %s) '
+                     "ON CONFLICT (id) DO NOTHING", (agent, "agent"))
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def cli_python() -> str:
+    """The interpreter of the environment uv runs the executable in."""
+    for argv in (["uv", "sync", "--script", str(CLI_PATH)],
+                 ["uv", "python", "find", "--script", str(CLI_PATH)]):
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+        assert done.returncode == 0, done.stdout + done.stderr
+    return done.stdout.strip()
 
 
 def error(done: subprocess.CompletedProcess) -> dict:

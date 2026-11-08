@@ -172,7 +172,7 @@ def pair(machine, monkeypatch):
     found = Pair(machine)
     _cli.bind_store(mod, monkeypatch, found.schema)
     if DSN:
-        _cli.make_tables(mod, found.schema)
+        _cli.make_tables(mod, found.schema, (found.ids["kiln"] + "-other",))
         # Each project's worker documents as its workers in the store.
         for root in found.roots.values():
             _cli.save_declared_workers(mod, root, found.schema)

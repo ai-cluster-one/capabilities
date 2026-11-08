@@ -109,9 +109,46 @@ def bind_store(mod, monkeypatch, schema: str, **where):
     return setting
 
 
-def make_tables(mod, schema: str) -> None:
+# The node every case runs on, named to the module and to every child through
+# AGENT_NODE_ID (conftest.py), so the node a run records is one `register` puts
+# in the store.
+TEST_NODE = "7e5700000001"
+
+
+def register(schema: str, agents=(), nodes=()) -> None:
+    """Register `agents` and `nodes` in the store's registry in `schema`, as the
+    manager does before a capability writes for them: every agent and node a row
+    names is a key the store holds. The node this process runs as is always
+    registered. The store's core is migrated first, alone, so a schema a case
+    leaves for a capability to migrate stays otherwise empty."""
+    from capabilities_contract import db
+    from capabilities_contract.db import _migrate
+
+    nodes = (TEST_NODE, os.environ.get("AGENT_NODE_ID", "").strip(), *nodes)
+
+    conn = db.connect(application_name="tasks-test", setting=store_setting(schema))
+    try:
+        db.migrate(conn, _migrate.CORE_OWNER, _migrate.CORE_STEPS,
+                   major=_migrate.CORE_VERSION[0], minor=_migrate.CORE_VERSION[1])
+        with conn.cursor() as cur:
+            for agent in agents:
+                if agent:
+                    cur.execute(f'insert into "{schema}".agents (id, kind) '
+                                "values (%s, 'agent') on conflict (id) do nothing", (agent,))
+            for node in nodes:
+                if node:
+                    cur.execute(f'insert into "{schema}".nodes (id, label, kind) '
+                                "values (%s, %s, 'mac') on conflict (id) do nothing",
+                                (node, node))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def make_tables(mod, schema: str, agents=()) -> None:
     """Create the capability's tables in `schema`, through its own steps, after
-    the harness library's profile table they reference, through the library's."""
+    the harness library's profile table they reference, through the library's;
+    and register `agents` and the project the module stands in."""
     from capabilities_contract import db
 
     steps, major, minor = mod._tables()
@@ -122,13 +159,19 @@ def make_tables(mod, schema: str) -> None:
         db.migrate(conn, mod.NAME, steps, major=major, minor=minor)
     finally:
         conn.close()
+    register(schema, (getattr(mod, "PROJECT", None), *agents))
 
 
 def write_store_setting(config_home: Path | str, schema: str, *, database: str | None = None,
                         **where) -> Path:
     """The machine's store setting in `config_home`, naming `schema` of the
     throwaway database - or of `database` on the same server - as `capabilities
-    store set` writes it."""
+    store set` writes it. The machine's node id beside it is TEST_NODE, the node
+    `register` puts in every store, for a child started without AGENT_NODE_ID."""
+    node = Path(config_home) / "capabilities" / "node-id"
+    if not node.exists():
+        node.parent.mkdir(parents=True, exist_ok=True)
+        node.write_text(TEST_NODE + "\n")
     path = Path(config_home) / "agentkit" / "store.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     found = _where(**where)
@@ -205,7 +248,7 @@ def save_profiles(mod, root: Path | str, schema: str, project: str) -> dict:
     and see how it is read. Answers each name's active version id."""
     from capabilities_contract import db
 
-    make_tables(mod, schema)
+    make_tables(mod, schema, (project,))
     docs = {name: spec for name, spec, _text in _profiles(mod, root)}
     conn = db.connect(application_name="tasks-test", setting=store_setting(schema))
     try:
@@ -285,7 +328,7 @@ def save_workers(mod, root: Path | str, schema: str, project: str) -> dict:
     active worker version id."""
     from capabilities_contract import db
 
-    make_tables(mod, schema)
+    make_tables(mod, schema, (project,))
     save_profiles(mod, root, schema, project)
     docs = {name: (spec, body) for name, spec, body, _text in _documents(mod, root)}
     conn = db.connect(application_name="tasks-test", setting=store_setting(schema))
@@ -347,11 +390,10 @@ def _saved_rows(mod, root, schema: str, fresh: bool, **how) -> list[dict]:
     return mod._REAL_STORED_WORKERS(fresh=fresh or saved, **how)
 
 
-def save_declared_workers(mod, project: Path | str, schema: str) -> dict:
-    """`save_workers` for the project at `project`, as the id it is bound to -
-    its .env.local's CAPABILITIES_PROJECT_ID, or the id a project.json not yet
-    moved still carries; nothing when it declares none, or when the documents
-    are the ones this process last saved there."""
+def declared_id(project: Path | str) -> str | None:
+    """The id the project at `project` is bound to: its .env.local's
+    CAPABILITIES_PROJECT_ID, or the id a project.json not yet moved still
+    carries; None when it declares none."""
     found = None
     try:
         for line in (Path(project) / ".env.local").read_text().splitlines():
@@ -365,6 +407,21 @@ def save_declared_workers(mod, project: Path | str, schema: str) -> dict:
                                .read_text()).get("id")
         except (OSError, ValueError):
             found = None
+    return found or None
+
+
+def register_declared(project: Path | str, schema: str, agents=(), nodes=()) -> None:
+    """`register` the id the project at `project` is bound to, with `agents`
+    and `nodes`."""
+    register(schema, (declared_id(project), *agents), nodes)
+
+
+def save_declared_workers(mod, project: Path | str, schema: str) -> dict:
+    """`save_workers` for the project at `project`, as the id it is bound to -
+    its .env.local's CAPABILITIES_PROJECT_ID, or the id a project.json not yet
+    moved still carries; nothing when it declares none, or when the documents
+    are the ones this process last saved there."""
+    found = declared_id(project)
     if not found:
         return {}
     texts = _texts(mod, project)

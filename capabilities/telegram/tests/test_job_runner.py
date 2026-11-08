@@ -24,6 +24,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _agents import register_project  # noqa: E402
 from _harness import CLAUDE_KNOBS, CODEX_EVENTS, CODEX_KNOBS, FakeHarness, held, lib  # noqa: E402
 from test_assistant_service import (  # noqa: E402
     CODEX_MODEL_REFUSAL,
@@ -155,6 +156,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                 ("project", (str(daemon.PROJECT_ROOT / ".env.local"),)))
             daemon.STORE_SETTING = dataclasses.replace(
                 daemon.STORE_SETTING, schema=f"tgtest_{time.time_ns()}")
+            register_project(daemon)
             self.addCleanup(daemon.close_job_register)
             row = queued(daemon.job_register(), channel_key="123",
                          requested_by="777", description="on the project's database",

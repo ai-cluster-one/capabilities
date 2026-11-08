@@ -56,7 +56,79 @@ from capabilities_contract.db import Step
 
 LEDGER_OWNER = "agentrooms"
 LEDGER_MAJOR = 3
-LEDGER_MINOR = 0
+LEDGER_MINOR = 1
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+_M9_KEYS_SQL = r"""
+-- agentrooms: every agent and node reference (and every key inside agentrooms) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION agentrooms_worker_versions_keep_history() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+      IF tg_op = 'UPDATE' AND (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') THEN
+        RETURN new;
+      END IF;
+      RAISE EXCEPTION 'a worker version is never edited or deleted: % on agentrooms_worker_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+        USING errcode = 'restrict_violation', constraint = 'agentrooms_worker_versions_history';
+    END;
+    $guard$;
+CREATE OR REPLACE FUNCTION agentrooms_wakes_held_notify() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+        changed record;
+    BEGIN
+    IF coalesce(current_setting('store.deleting_agent', true), '')
+       || coalesce(current_setting('store.deleting_node', true), '')
+       || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        RETURN NULL;
+    END IF;
+        IF tg_op = 'INSERT' AND new.held_at IS NULL
+           OR tg_op = 'DELETE' AND old.held_at IS NULL
+           OR tg_op = 'UPDATE' AND old.held_at IS NOT DISTINCT FROM new.held_at THEN
+            RETURN NULL;
+        END IF;
+        IF tg_op = 'DELETE' THEN changed := old; ELSE changed := new; END IF;
+        PERFORM pg_notify('agentrooms_held', json_build_object(
+            'schema', tg_table_schema, 'agent_id', changed.agent_id,
+            'agent', coalesce(changed.connection_id, changed.file_connection),
+            'room', changed.room_id)::text);
+        EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                       'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                       'DO UPDATE SET version = c.version + 1',
+                       tg_table_schema, 'agentrooms_held')
+            USING changed.agent_id || '/' || coalesce(changed.connection_id, changed.file_connection);
+        RETURN NULL;
+    END $guard$;
+SELECT store_state_keys('agentrooms', ARRAY[
+    ARRAY['agentrooms_leases', 'agent_id', 'agents', 'cascade'],
+    ARRAY['agentrooms_leases', 'node', 'nodes', 'cascade'],
+    ARRAY['agentrooms_pauses', 'agent_id', 'agents', 'cascade'],
+    ARRAY['agentrooms_sessions', 'agent_id', 'agents', 'cascade'],
+    ARRAY['agentrooms_sessions', 'node', 'nodes', 'cascade'],
+    ARRAY['agentrooms_sync', 'agent_id', 'agents', 'cascade'],
+    ARRAY['agentrooms_turns', 'agent_id', 'agents', 'cascade'],
+    ARRAY['agentrooms_turns', 'node', 'nodes', 'set null'],
+    ARRAY['agentrooms_wakes', 'agent_id', 'agents', 'cascade'],
+    ARRAY['agentrooms_worker_versions', 'agent_id', 'agents', 'cascade']]);
+"""
+
 LEDGER_STEPS = [
     ("0001-sync", """
     CREATE TABLE agentrooms_sync (
@@ -452,6 +524,7 @@ LEDGER_STEPS = [
     CREATE INDEX agentrooms_turns_room_idx ON agentrooms_turns
         (agent_id, (coalesce(connection_id, file_connection)), room_id, started_at);
     """, core=(3, 0)),
+    Step("0014-keys", _M9_KEYS_SQL, core=(4, 0)),
 ]
 # The channel a change to an agent's held wakes is announced on: its version
 # for the agent's held_scope in the store's change versions, which `watch`

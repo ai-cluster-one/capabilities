@@ -52,6 +52,20 @@ LAB_NODE = "6c61622d6e6f"
 NODE_B = "6e6f64652d62"
 ELSEWHERE = "656c73657768"
 PRODUCTION = "70726f647563"
+# Every node the tests write a definition or a run for.
+NODES = (HERE, LAB_NODE, NODE_B, ELSEWHERE, PRODUCTION, "node-a")
+
+
+def register(ledger, *agents: str) -> None:
+    """Register `agents` and the tests' nodes in the ledger's store, as the manager
+    would: a row may only name an agent and a node the store holds."""
+    with ledger.transaction():
+        for agent in agents:
+            ledger._execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                            "ON CONFLICT (id) DO NOTHING", [agent])
+        for node in NODES:
+            ledger._execute("INSERT INTO nodes (id, label, kind) VALUES (%s, %s, 'mac') "
+                            "ON CONFLICT (id) DO NOTHING", [node, node])
 
 
 class AutomationsTests(unittest.TestCase):
@@ -132,6 +146,8 @@ environment = "test"
         # the CLI runs as here: the id the fixture hands it.
         self.node = HERE
         if DSN:
+            with RUNTIME.RunLedger(self.project_id, root=self.root).open() as ledger:
+                register(ledger, self.project_id)
             for slug, script, timeout, retries in (
                     ("job", "job.py", 5, 0), ("agentbin", "agentbin.py", 5, 0),
                     ("slow", "slow.py", 60, 0), ("timeout", "slow.py", 1, 0),
@@ -1812,6 +1828,7 @@ def ledger_env(tmp_path, monkeypatch):
         monkeypatch.setenv("AUTOMATIONS_NODE_NAME", node)
         led = RUNTIME.RunLedger(project_id or f"prj_{uuid.uuid4().hex[:12]}").open()
         opened.append(led)
+        register(led, led.project_id)
         return led
 
     yield ledger

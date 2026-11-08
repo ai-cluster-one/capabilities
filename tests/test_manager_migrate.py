@@ -211,6 +211,28 @@ class World:
             cursor = conn.execute(query, params)
             return cursor.fetchall() if cursor.description else cursor.rowcount
 
+    def register(self, *agents: str) -> None:
+        """Agents registered in the store by their id alone, as the manager
+        registers one before it writes for it, the store's tables made first
+        as the manager makes them."""
+        from capabilities_contract import db
+        saved = dict(os.environ)
+        os.environ.update({"AGENTKIT_DB_URL": self.url(), "AGENTKIT_DB_SCHEMA": SCHEMA})
+        try:
+            conn = db.connect(application_name="test",
+                              setting=db.resolve_setting(None, config_home=self.config))
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+        try:
+            major, minor = S.STORE_TABLES_VERSION
+            db.migrate(conn, S.STORE_OWNER, S.record_table_steps(), major=major, minor=minor)
+        finally:
+            conn.close()
+        for agent in agents:
+            self.sql("INSERT INTO agents (id) VALUES (%s) ON CONFLICT (id) DO NOTHING",
+                     (agent,))
+
     def tables(self) -> dict[str, str]:
         """Every table of the store, by a digest of its rows."""
         out = {}
@@ -536,6 +558,7 @@ def build_agents(w: World) -> None:
         "{env}/coolify/identifiers.json": {"app": {"value": "kept-app", "note": ""}},
         "{env}/memory/service/settings.json": {"window_days": 21},
     })
+    w.register(IDS["kept"])
     w.answer(w.manager(kept, "connections", "import"))
     w.write(kept / "capabilities" / "coolify" / "connections.json", {"connections": {"kept": {
         "base_url": "https://stale.example.org", "token_env": "KEPT_TOKEN"}}})

@@ -14,6 +14,7 @@ from urllib.parse import unquote
 import httpx
 import pytest
 
+from _agents import register_agents, register_nodes
 from _cli import load_cli
 
 HS = "https://matrix.example.org"
@@ -684,12 +685,21 @@ needs_store = pytest.mark.skipif(not DSN, reason="AGENTROOMS_TEST_DSN is not set
 
 
 @pytest.fixture()
-def stored(project, monkeypatch):
+def stored(cli, project, monkeypatch):
     import uuid as _uuid
     schema = f"ar_cli_{_uuid.uuid4().hex[:8]}"
     url = DSN if "sslmode=" in DSN else DSN + ("&" if "?" in DSN else "?") + "sslmode=disable"
     monkeypatch.setenv("AGENTKIT_DB_URL", url)
     monkeypatch.setenv("AGENTKIT_DB_SCHEMA", schema)
+    # The project's agent and the nodes its rows name, which the manager
+    # registers before the agent's service runs.
+    engine = cli._engine()
+    store = engine.Store(engine.resolve_store(project)).open()
+    try:
+        register_agents(store, "prj_test")
+        register_nodes(store, "n1")
+    finally:
+        store.close()
     yield schema
     import psycopg
     with psycopg.connect(DSN, autocommit=True) as conn:

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.45,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -230,8 +230,55 @@ def _cmd_connections() -> None:
 # versions reference their document by a foreign key: both tables are this
 # capability's own and a document is retired rather than deleted, so the key
 # never blocks a write and refuses only a version of no document.
-LEDGER_MAJOR, LEDGER_MINOR = 2, 0
+LEDGER_MAJOR, LEDGER_MINOR = 2, 1
 _NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+from capabilities_contract.db import Step as _M9Step  # noqa: E402
+_M9_KEYS_SQL = r"""
+-- context: every agent and node reference (and every key inside context) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION context_versions_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'context versions are never deleted: retire the document instead'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF (to_jsonb(new) - 'active') IS DISTINCT FROM (to_jsonb(old) - 'active') THEN
+            RAISE EXCEPTION 'a context version is immutable: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.active AND NOT old.active THEN
+            RAISE EXCEPTION 'a context version is not made active again: save its content as a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $guard$;
+SELECT store_state_keys('context', ARRAY[
+    ARRAY['context_documents', 'agent_id', 'agents', 'cascade'],
+    ARRAY['context_documents', 'author_agent_id', 'agents', 'set null'],
+    ARRAY['context_versions', 'document_id', 'context_documents', 'cascade'],
+    ARRAY['context_enablements', 'agent_id', 'agents', 'cascade'],
+    ARRAY['context_enablements', 'document_id', 'context_documents', 'cascade']]);
+"""
+
 LEDGER_STEPS = [
     ("0001-documents", f"""
     CREATE TABLE context_documents (
@@ -376,6 +423,7 @@ LEDGER_STEPS = [
     COMMENT ON COLUMN context_enablements.document_id IS
         'The global document enabled: a context_documents row with no agent.';
     """),
+    _M9Step("0007-keys", _M9_KEYS_SQL, core=(4, 0)),
 ]
 
 

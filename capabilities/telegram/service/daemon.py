@@ -8,8 +8,8 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.44,<1",
-#     "callva-harness-runner==0.11.0",
+#     "capabilities-contract>=0.45,<1",
+#     "callva-harness-runner==0.12.0",
 # ]
 # ///
 # callva-harness-runner launches every worker turn - dialogue, durable job,

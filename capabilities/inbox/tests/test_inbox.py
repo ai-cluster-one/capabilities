@@ -146,7 +146,27 @@ class Lab:
             self.sessions[where] = self.session(where)
         return self.sessions[where]
 
+    def register(self) -> None:
+        """Register the agents and the node the tests write for, as the manager would,
+        once, before the first child runs: a row may only name an agent and a node the
+        store holds. Only the core tables are made for it."""
+        if getattr(self, "_registered", False):
+            return
+        self._registered = True
+        import psycopg
+        from capabilities_contract import db
+        from capabilities_contract.db import _migrate as core
+        with psycopg.connect(self.cluster.url(self.database), autocommit=True) as conn:
+            db.migrate(conn, core.CORE_OWNER, core.CORE_STEPS, major=core.CORE_VERSION[0],
+                       minor=core.CORE_VERSION[1], schema=SCHEMA)
+            for agent in (ALPHA, BETA):
+                conn.execute(f"INSERT INTO {SCHEMA}.agents (id, kind) VALUES (%s, 'agent') "
+                             "ON CONFLICT (id) DO NOTHING", (agent,))
+            conn.execute(f"INSERT INTO {SCHEMA}.nodes (id, label, kind) VALUES (%s, 'test', "
+                         "'mac') ON CONFLICT (id) DO NOTHING", (TEST_NODE,))
+
     def env(self, **extra: str | None) -> dict:
+        self.register()
         env = {k: v for k, v in os.environ.items() if not k.startswith(CLEARED_PREFIXES)}
         env.update({
             "HOME": str(self.tmp / "home"),

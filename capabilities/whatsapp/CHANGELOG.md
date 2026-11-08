@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-11-08 — The register, jobs and prompts go with their agent, and a job's slots and amendments with their job, at whatsapp 2.3
+
+Step `0026-keys` (whatsapp 2.3, core 4.0) keys the register, jobs, job slots, job amendments and prompts to their agent (`ON DELETE CASCADE`), and a job's slots and amendments to their job. The prompts guard admits the cascade of a deliberate delete and nothing else. A reference to an agent the store no longer holds is settled when the step runs, kept in `whatsapp_premig_m9`. Runs on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.
+
 ## 2026-11-07 — A connection is named by its id
 
 A connection is keyed by the opaque id the store gives it, and called by its label; `--connection` takes either, as does the service setting `connection`, which `service init` writes as the id and `service reload` compares by id. Step `0025-connection-ids` (schema 2.2, additive, reading the core at 3.0) converts a role's grant of an account in the service settings, `authority.roles.<role>.allowed_capabilities.<cap>.connections.<conn>`, to the id of `<cap>`'s connection `<conn>` with the connection beside it; a grant naming no connection is kept in `whatsapp_premig_m4_settings` and removed. A home kept under a connection's former name - an unbound home, or one from before homes were named for the account - is moved to `<state>/<id>` the first time the connection is used, saying so on stderr, and adopted under the account as before, so a linked device is found again without a new link. A linked-by record or an export payload naming the former name is the same connection, and the linked-by record takes the id when its connection next opens the home. Declares `capabilities-contract>=0.44,<1`. No verb, flag, environment variable or output key changes; a `connection` key carries the id.

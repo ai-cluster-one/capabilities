@@ -280,7 +280,7 @@ def store(monkeypatch):
     monkeypatch.setattr(mod, "SCHEMA", schema)
     monkeypatch.setattr(mod, "PROJECT", HERE)
     with psycopg.connect(DSN, autocommit=True) as conn:
-        _cli.make_tables(mod, schema)
+        _cli.make_tables(mod, schema, (THERE,))
         try:
             yield _entry(), schema, conn
         finally:
@@ -468,6 +468,7 @@ def lab(tmp_path):
         env.pop(leaked, None)
     lab = {"project": project, "env": env, "schema": schema, "tmp": tmp_path}
     assert _tasks(lab, "migrate").returncode == 0
+    _cli.register_declared(project, schema)
     try:
         yield lab
     finally:

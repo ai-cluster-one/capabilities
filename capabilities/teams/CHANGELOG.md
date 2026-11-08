@@ -1,5 +1,9 @@
 # teams — change log
 
+## 2026-11-08 — A membership goes with its agent, at teams 1.1
+
+Step `0006-keys` (teams 1.1, core 4.0) keys `teams_members.agent_id` to `agents` with `ON DELETE CASCADE`. A membership of an agent the store no longer holds is settled when the step runs, kept in `teams_premig_m9`. Runs on capabilities-contract 0.45. No verb, flag or JSON key changes.
+
 ## 2026-11-08 — teams: teams of agents that carry shared instructions in the store
 
 A new core capability. A team is a store record: a name, one line saying what it is for and when to turn to it, its members (agents, by declared id), and versioned instruction documents, each marked `always` or `on-request` and each switched on or off for the team. A team is in ordinary mode (the default), where a member's context lists it by its line, or in always mode, where its enabled always documents are composed whole into every member's context under the team's name and its enabled on-request documents are listed by their line. The capabilities manager composes that part at build straight from the store; the manifest's `contribution` is the constant half and carries nothing that changes between sessions. A team gives knowledge only: no connection, key, capability or grant.

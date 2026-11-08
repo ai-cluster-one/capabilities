@@ -1,5 +1,9 @@
 # routine — change log
 
+## 2026-11-08 — An agent's routines go with it, at routine 2.1
+
+Step `0008-keys` (routine 2.1, core 4.0) keys `routine_documents`, `routine_versions` and `routine_enablements` as context does: an agent's routines, versions and enablements go with it, a global routine's author loses the pointer (`ON DELETE SET NULL`), and a version and an enablement go with their routine. The versions guard admits the cascade of a deliberate delete and nothing else. A reference to an agent the store no longer holds is settled when the step runs, kept in `routine_premig_m9`. Runs on capabilities-contract 0.45. No verb, flag or JSON key changes.
+
 ## 2026-11-08 — Help no longer names ContextKit
 
 `routine help` describes the routine file form, `titles` and `title` on their own terms, where it measured them against ContextKit, a retired tool no machine carries any more. Nothing they do changes: no verb, flag, output key or file form changes.

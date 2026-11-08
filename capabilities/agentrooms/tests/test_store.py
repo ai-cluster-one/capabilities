@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+from _agents import register_agents, register_nodes
 from _cli import load_engine
 
 DSN = os.environ.get("AGENTROOMS_TEST_DSN")
@@ -39,6 +40,8 @@ def store():
     opened.execute("INSERT INTO connections (id, capability, label, spec) VALUES "
                    "(%s, 'agentrooms', 'alpha', '{}'), (%s, 'agentrooms', 'beta', '{}')",
                    (ALPHA, BETA))
+    register_agents(opened, "p")
+    register_nodes(opened, "n1", "n2")
     yield opened
     opened.execute(f"DROP SCHEMA {schema} CASCADE")
     opened.close()
@@ -369,6 +372,8 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(monkeypatch):
     try:
         db.migrate(conn, engine.LEDGER_OWNER, engine.LEDGER_STEPS[:11], major=1, minor=5)
         with conn.transaction():
+            register_agents(conn, "p")
+            register_nodes(conn, "n1", "n2")
             for sql in (
                 # The agent's connection, under the label its rows name it by.
                 f"INSERT INTO connections (id, capability, label, spec) "
@@ -409,7 +414,7 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(monkeypatch):
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'SET search_path TO "{schema}"')
             assert admin.execute("SELECT major, minor FROM schema_version "
-                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 0)
+                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 1)
             assert admin.execute("SELECT agent_id, worker, outcome FROM agentrooms_turns"
                                  ).fetchall() == [("p", "lab", "answered")]
             names = [r[0] for r in admin.execute(
@@ -469,6 +474,8 @@ def test_a_store_at_major_2_names_every_row_and_binding_by_the_connection_id(mon
         try:
             db.migrate(conn, engine.LEDGER_OWNER, engine.LEDGER_STEPS[:12], major=2, minor=0)
             with conn.transaction():
+                register_agents(conn, "p")
+                register_nodes(conn, "n1", "n2")
                 for sql in (
                     "INSERT INTO connections (capability, name, spec) "
                     "VALUES ('agentrooms', 'work', '{}')",
@@ -498,7 +505,7 @@ def test_a_store_at_major_2_names_every_row_and_binding_by_the_connection_id(mon
             admin.execute(f'SET search_path TO "{schema}"')
             (cid,) = admin.execute("SELECT id FROM connections WHERE label = 'work'").fetchone()
             assert admin.execute("SELECT major, minor FROM schema_version "
-                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 0)
+                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 1)
             assert store.next_batch("p", cid, "@work:x") == "b1"
             assert [w["sender"] for w in store.held("p", cid)] == ["@b:x"]
             assert store.session("p", cid, "!r")["session_id"] == "s1"
@@ -522,7 +529,9 @@ def test_a_store_at_major_2_names_every_row_and_binding_by_the_connection_id(mon
             assert store.next_batch("p", "gone", "@gone:x") == "b9"
             assert admin.execute("SELECT to_regclass('agentrooms_premig_m4_rows')"
                                  ).fetchone() == (None,)
-            admin.execute("DELETE FROM connections WHERE id = %s", (cid,))
+            with admin.transaction():
+                db.deleting(admin, "connections", cid)
+                admin.execute("DELETE FROM connections WHERE id = %s", (cid,))
             for table in ("wakes", "sessions", "leases", "turns"):
                 assert admin.execute(f"SELECT count(*) FROM agentrooms_{table}").fetchone() == (0,)
             assert admin.execute("SELECT connection_id, file_connection, next_batch "

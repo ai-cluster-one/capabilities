@@ -9,11 +9,12 @@ import json
 import psycopg
 import pytest
 
-from _cli import drop_schema, dsn_url, engine, needs_store, new_schema, setting
+from _cli import drop_schema, dsn_url, engine, needs_store, new_schema, register, setting
 
 E = engine()
 P = "prj_000000000001"
 OTHER = "prj_000000000002"
+NODES = ("n", "node-a", "node-b")
 
 pytestmark = needs_store
 
@@ -22,6 +23,7 @@ pytestmark = needs_store
 def store():
     schema = new_schema()
     opened = E.Store(setting(schema)).open()
+    register(schema, (P, OTHER), NODES)
     try:
         yield opened
     finally:
@@ -367,11 +369,13 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(monkeypatch):
     takes the agent names in place: the rows read under them, the guard and the
     notification read the renamed column, and a major-1 release is refused."""
     from capabilities_contract import db
-    old = [step for step in E.LEDGER_STEPS if step[0] != "0007-agent-names"]
+    old = [step for step in E.LEDGER_STEPS
+           if step[0] not in ("0007-agent-names", "0008-keys")]
     schema = new_schema()
     try:
         with psycopg.connect(dsn_url(), autocommit=True) as conn:
             db.migrate(conn, "memory", old, major=1, minor=2, schema=schema)
+            register(schema, (P,), NODES)
             conn.execute(f'SET search_path TO "{schema}"')
             entry = conn.execute(
                 "INSERT INTO memory_entries (project_id, title, body, created_by, node, origin, "
@@ -392,8 +396,8 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(monkeypatch):
             result = db.migrate(conn, "memory", E.LEDGER_STEPS, major=E.LEDGER_MAJOR,
                                 minor=E.LEDGER_MINOR, schema=schema)
             monkeypatch.delenv(db.UPGRADE_ENV)
-            assert result.applied == ["0007-agent-names"]
-            assert (result.major, result.minor) == (2, 0)
+            assert result.applied == ["0007-agent-names", "0008-keys"]
+            assert (result.major, result.minor) == (2, 1)
             conn.execute(f'SET search_path TO "{schema}"')
             for table in ("memory_entries", "memory_events", "memory_groom_leases"):
                 assert conn.execute(f"SELECT agent_id FROM {table}").fetchall() == [(P,)], table

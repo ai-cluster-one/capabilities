@@ -773,11 +773,99 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
 # stays; a release of 1.x meets 2.0 as too new and refuses.
 LEDGER_OWNER = "automations"
 LEDGER_MAJOR = 2
-LEDGER_MINOR = 0
+LEDGER_MINOR = 1
 # The most a run may record: it is handed to the next run as one environment
 # variable, which the kernel caps at 128 KiB.
 RESULT_MAX_BYTES = 65536
 CHANGED_CHANNEL = "automations_changed"
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+try:
+    from capabilities_contract.db import Step as _M9Step
+except ImportError:  # the library's absence is reported where the store opens
+    _M9Step = None
+_M9_KEYS_SQL = r"""
+-- automations: every agent and node reference (and every key inside automations) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION automations_definition_versions_keep_history() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+      IF tg_op = 'UPDATE' AND (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') THEN
+        RETURN new;
+      END IF;
+      RAISE EXCEPTION 'an automation version is never edited or deleted: % on automations_definition_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+        USING errcode = 'restrict_violation', constraint = 'automations_definition_versions_history';
+    END;
+    $guard$;
+-- A definition pinned to a node the store no longer holds: an active one stops
+-- the step, named; an inactive one, which never runs, loses its pin and is kept
+-- in the pre-image.
+DO $pins$
+DECLARE pinned text;
+BEGIN
+    SELECT string_agg(format('%s (%s) on node %s', v.slug, v.agent_id, v.node), ', '
+                      ORDER BY v.agent_id, v.slug)
+      INTO pinned FROM automations_definition_versions v
+     WHERE v.active AND v.node IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = v.node);
+    IF pinned IS NOT NULL THEN
+        RAISE EXCEPTION 'active automation definitions are pinned to nodes the store does not hold: %', pinned
+            USING ERRCODE = 'foreign_key_violation',
+                  HINT = 'pin each to a registered node with `automations edit`, or register the node, then migrate again';
+    END IF;
+END
+$pins$;
+CREATE TABLE IF NOT EXISTS automations_premig_m9 (source text NOT NULL, op text NOT NULL
+  CONSTRAINT automations_premig_m9_op_check CHECK (op IN ('update', 'delete')), row jsonb NOT NULL,
+  saved_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO automations_premig_m9 (source, op, row)
+    SELECT 'automations_definition_versions', 'update', to_jsonb(v)
+      FROM automations_definition_versions v
+     WHERE NOT v.active AND v.node IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = v.node);
+ALTER TABLE automations_definition_versions DISABLE TRIGGER automations_definition_versions_keep_history_row;
+UPDATE automations_definition_versions v SET node = NULL
+ WHERE NOT v.active AND v.node IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = v.node);
+ALTER TABLE automations_definition_versions ENABLE TRIGGER automations_definition_versions_keep_history_row;
+SELECT store_state_keys('automations', ARRAY[
+    ARRAY['automations_definition_versions', 'agent_id', 'agents', 'cascade'],
+    ARRAY['automations_definition_versions', 'node', 'nodes', 'restrict'],
+    ARRAY['automations_runs', 'agent_id', 'agents', 'cascade'],
+    ARRAY['automations_runs', 'node', 'nodes', 'set null'],
+    ARRAY['automations_runs', 'definition_id', 'automations_definition_versions', 'set null']]);
+-- A run is written with the node it was on, as before: only the removal of
+-- that node clears it, so an insert without one is refused as NOT NULL refused it.
+CREATE FUNCTION automations_runs_node_required() RETURNS trigger
+    LANGUAGE plpgsql AS $required$
+BEGIN
+    IF NEW.node IS NULL THEN
+        RAISE EXCEPTION 'null value in column "node" of relation "automations_runs" violates not-null constraint'
+            USING ERRCODE = 'not_null_violation', COLUMN = 'node', TABLE = 'automations_runs',
+                  HINT = 'write the node it is on; only the removal of that node clears it';
+    END IF;
+    RETURN NEW;
+END $required$;
+CREATE TRIGGER automations_runs_node_required BEFORE INSERT ON automations_runs
+    FOR EACH ROW EXECUTE FUNCTION automations_runs_node_required();
+"""
+
 LEDGER_STEPS = [
     ("0001-runs", """
     CREATE TABLE automations_runs (
@@ -1025,6 +1113,7 @@ LEDGER_STEPS = [
         'The script as a file in the agent''s folder, relative to its root, on the node '
         'that runs it. Exactly one of script_path and script_body is set.';
     """),
+    *([_M9Step("0010-keys", _M9_KEYS_SQL, core=(4, 0))] if _M9Step else []),
 ]
 
 

@@ -207,6 +207,7 @@ def lab(tmp_path):
            "watches": []}
     migrated = _tasks(lab, "migrate")
     assert migrated.returncode == 0, migrated.stdout + migrated.stderr
+    _cli.register(schema, (here, OTHER))
     try:
         yield lab
     finally:

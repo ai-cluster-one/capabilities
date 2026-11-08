@@ -12,6 +12,7 @@ import uuid
 
 import pytest
 
+from _agents import register_agents
 from _cli import load_service
 
 DSN = os.environ.get("TELEGRAMBOT_TEST_DSN")
@@ -33,6 +34,7 @@ def store():
                          database=info.get("dbname"), user=info.get("user"),
                          password=info.get("password"), sslmode=info.get("sslmode") or "disable")
     opened = s.Store(setting).open()
+    register_agents(opened, A)
     yield opened
     opened.execute(f"DROP SCHEMA {schema} CASCADE")
     opened.close()
@@ -120,7 +122,8 @@ def test_a_store_at_major_1_takes_connection_ids_in_place_and_keeps_its_rows(mon
     schema = f"tgb_m1_{uuid.uuid4().hex[:8]}"
     setting = _setting(schema)
     old = [step for step in s.steps()
-           if (step.id if hasattr(step, "id") else step[0]) != "0007-connection-ids"]
+           if (step.id if hasattr(step, "id") else step[0])
+           not in ("0007-connection-ids", "0008-keys")]
     conn = db.connect(application_name="telegrambot", setting=setting)
     try:
         # The store as the release before the cutover left it: the core at 2.0.
@@ -128,6 +131,7 @@ def test_a_store_at_major_1_takes_connection_ids_in_place_and_keeps_its_rows(mon
             m.setattr(core_migrate, "CORE_STEPS", core_migrate.CORE_STEPS[:1])
             m.setattr(core_migrate, "CORE_VERSION", (2, 0))
             db.migrate(conn, s.OWNER, old, major=1, minor=0)
+        register_agents(conn, A)
         with conn.cursor() as cur:
             cur.execute("INSERT INTO connections (capability, name, spec) VALUES "
                         "('telegrambot', 'helper', '{}'::jsonb)")
@@ -158,7 +162,7 @@ def test_a_store_at_major_1_takes_connection_ids_in_place_and_keeps_its_rows(mon
     store = s.Store(setting).open()
     try:
         assert store.execute("SELECT major, minor FROM schema_version WHERE owner = %s",
-                             (s.OWNER,), fetch="one") == {"major": 2, "minor": 0}
+                             (s.OWNER,), fetch="one") == {"major": 2, "minor": 1}
         helper = store.execute("SELECT id FROM core_premig_connection_names "
                                "WHERE name = 'helper'", fetch="one")["id"]
         jobs = load_service("jobs")
@@ -181,7 +185,9 @@ def test_a_store_at_major_1_takes_connection_ids_in_place_and_keeps_its_rows(mon
             "AND column_name = 'connection'", fetch="one") == {"n": 0}
         # A new row of either kind lands in its own column.
         assert store.reserve(A, helper, 43, 0, 1, "h") and store.reserve(A, "filed", 43, 0, 1, "h")
-        store.execute("DELETE FROM connections WHERE id = %s", (helper,))
+        with store.transaction() as cur:
+            db.deleting(cur, "connections", helper)
+            cur.execute("DELETE FROM connections WHERE id = %s", (helper,))
         for table in tables:
             assert store.execute(
                 f"SELECT DISTINCT file_connection FROM telegrambot_{table}",

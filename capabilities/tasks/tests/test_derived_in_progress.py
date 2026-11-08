@@ -361,6 +361,7 @@ def test_a_running_raise_shows_its_model_and_turns_and_names_its_node(lab):
     lab["env"].update({"FAKE_ENGINE_SLEEP": "6", "FAKE_ENGINE_TURNS": "3",
                        "TASKS_STORE_RETRY_SECONDS": "3",    # a beat every 2s
                        "AGENT_NODE_ID": "6e6f64652d75"})
+    _cli.register(schema, (), ("6e6f64652d75",))
     service.answer_of(service.tasks_cli(lab, "add", "--type", "alpha", "--title", "t",
                                         "--key", "t-live", "--status", "todo"))
     turn = subprocess.Popen([str(_cli.CLI_PATH), "run", "alpha", "--apply"],

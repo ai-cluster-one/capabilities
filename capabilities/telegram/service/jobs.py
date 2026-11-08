@@ -140,7 +140,55 @@ def job_label(description: Any) -> str:
 # so every comparison and every reader below sees the values it always saw.
 STORE_OWNER = "telegram"
 STORE_SCHEMA_MAJOR = 3
-STORE_SCHEMA_MINOR = 0
+STORE_SCHEMA_MINOR = 1
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+_M9_KEYS_SQL = r"""
+-- telegram: every agent and node reference (and every key inside telegram) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION telegram_prompt_versions_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+    DECLARE
+    admitted boolean := false;
+    BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+        IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+            RAISE EXCEPTION 'telegram prompt versions are never deleted: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF (to_jsonb(new) - 'active') IS DISTINCT FROM (to_jsonb(old) - 'active') THEN
+            RAISE EXCEPTION 'a telegram prompt version is immutable: save a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.active AND NOT old.active THEN
+            RAISE EXCEPTION 'a telegram prompt version is not made active again: save its text as a new version'
+                USING ERRCODE = 'check_violation';
+        END IF;
+        RETURN new;
+    END $guard$;
+SELECT store_state_keys('telegram', ARRAY[
+    ARRAY['telegram_channels', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegram_jobs', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegram_job_slots', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegram_job_slots', 'job_id', 'telegram_jobs', 'cascade'],
+    ARRAY['telegram_job_amendments', 'agent_id', 'agents', 'cascade'],
+    ARRAY['telegram_job_amendments', 'job_id', 'telegram_jobs', 'cascade'],
+    ARRAY['telegram_prompt_versions', 'agent_id', 'agents', 'cascade']]);
+"""
+
 STORE_STEPS = (
     ("0001-jobs", """
     CREATE TABLE telegram_jobs (
@@ -574,6 +622,7 @@ STORE_STEPS = (
            connection_id = granted.cid
       FROM granted WHERE s.ctid = granted.at AND granted.cid IS NOT NULL;
     """, core=(3, 0)),
+    Step("0010-keys", _M9_KEYS_SQL, core=(4, 0)),
 )
 
 # The harness runner's profile table lives in the same store, under the

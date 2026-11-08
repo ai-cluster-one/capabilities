@@ -37,6 +37,13 @@ mod = hooks.mod
 needs_store = hooks.needs_store
 add, answer, shown = hooks.add, hooks.answer, hooks.shown
 HERE, THERE = hooks.HERE, "prj_elsewhere"
+
+
+@pytest.fixture(autouse=True)
+def _there_registered(request):
+    """The other project a case writes for is registered in the case's store."""
+    if "store" in request.fixturenames:
+        _cli.register(request.getfixturevalue("store")[1], (THERE,))
 NOWHERE = "00000000-0000-4000-8000-000000000000"
 
 

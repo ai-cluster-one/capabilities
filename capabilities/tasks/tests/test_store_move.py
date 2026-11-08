@@ -72,6 +72,12 @@ def raw():
     return psycopg.connect(DSN, autocommit=True)
 
 
+def register_old(bound: str) -> None:
+    """Register the two projects the previous store's rows name in `bound`, as
+    the manager holds them, so the move keeps their rows."""
+    _cli.register(bound, ("prj_one", "prj_two"))
+
+
 @pytest.fixture
 def old_store():
     """Schema `tasks` as the previous release left it, holding two projects'
@@ -214,10 +220,11 @@ def test_the_tables_are_declared_for_the_contracts_migrate():
                                                     "0004-profile-versions", "0005-workers-history",
                                                     "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names"]
+                            "0013-agent-names", "0014-keys"]
     owner, profile_steps, _major, _minor = mod._profile_tables()
     assert owner == "harness" and [one for one, _sql in profile_steps] == ["0001-profiles",
-                                                                         "0002-profile-versions"]
+                                                                         "0002-profile-versions",
+                                                                         "0003-agent-key"]
     assert (major, minor) == (mod.STORE_MAJOR, mod.STORE_MINOR)
     names = [key["key"] for key in mod.CRED_KEYS]
     assert names == ["timezone"]
@@ -231,12 +238,13 @@ def test_a_fresh_store_gets_every_table_under_the_tasks_prefix(fresh_schema):
     assert done.applied == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                             "0004-profile-versions", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names"]
+                            "0013-agent-names", "0014-keys"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == [
-            "harness_profile_versions", "schema_ledger", "schema_version", "tasks_activities",
-            "tasks_changes", "tasks_executions", "tasks_hook_versions", "tasks_line_states",
-            "tasks_line_versions", "tasks_presences", "tasks_tasks", "tasks_worker_versions"]
+            "harness_premig_m9", "harness_profile_versions", "schema_ledger", "schema_version",
+            "tasks_activities", "tasks_changes", "tasks_executions", "tasks_hook_versions",
+            "tasks_line_states", "tasks_line_versions", "tasks_premig_m9", "tasks_presences",
+            "tasks_tasks", "tasks_worker_versions"]
         assert conn.execute("select to_regnamespace('tasks')").fetchone()[0] is None
     assert migrate(fresh_schema).applied == []
 
@@ -245,6 +253,7 @@ def test_a_fresh_store_gets_every_table_under_the_tasks_prefix(fresh_schema):
 
 @needs_store
 def test_the_previous_store_is_moved_whole_into_the_bound_schema(old_store):
+    register_old(old_store)
     with raw() as conn:
         before = {table: rows(conn, "tasks", table) for table in TABLES}
     assert len(before["tasks"]) == 3 and len(before["task_executions"]) == 2
@@ -253,7 +262,7 @@ def test_the_previous_store_is_moved_whole_into_the_bound_schema(old_store):
     assert done.applied == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                             "0004-profile-versions", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names"]
+                            "0013-agent-names", "0014-keys"]
 
     with raw() as conn:
         for old, new in TABLES.items():
@@ -305,6 +314,7 @@ def test_a_moved_store_and_a_fresh_one_are_the_same_store(old_store, fresh_schem
 @needs_store
 def test_the_watch_and_claimable_notices_name_the_bound_schema(old_store):
     import psycopg
+    register_old(old_store)
     migrate(old_store)
     with psycopg.connect(DSN, autocommit=True) as listener, raw() as conn:
         listener.execute("listen tasks_watch")
@@ -352,8 +362,8 @@ def test_a_store_holding_the_new_tables_beside_the_old_is_refused_and_left_as_fo
         left_as_found(conn, old_store, before)
         # The harness library's table is its own, migrated under its own ledger
         # before the tasks steps are tried, and stands whatever they find.
-        assert tables_in(conn, old_store) == ["harness_profile_versions", "schema_ledger",
-                                              "schema_version", "tasks_tasks"]
+        assert tables_in(conn, old_store) == ["harness_premig_m9", "harness_profile_versions",
+                                              "schema_ledger", "schema_version", "tasks_tasks"]
 
 
 @pytest.mark.parametrize("behind, named", [
@@ -386,8 +396,8 @@ def test_a_store_not_at_the_previous_releases_shape_is_refused_and_left_as_found
     assert "previous release's `tasks migrate --apply`" in message
     with raw() as conn:
         left_as_found(conn, old_store, before)
-        assert tables_in(conn, old_store) == ["harness_profile_versions", "schema_ledger",
-                                              "schema_version"]
+        assert tables_in(conn, old_store) == ["harness_premig_m9", "harness_profile_versions",
+                                              "schema_ledger", "schema_version"]
 
 
 # --- Through the CLI -------------------------------------------------------------
@@ -471,7 +481,7 @@ def test_migrate_status_then_migrate_then_status(tmp_path, fresh_schema):
     assert first["pending"] == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                                 "0004-profile-versions", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names"]
+                            "0013-agent-names", "0014-keys"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == []
     done = cli(lab, "migrate")
@@ -481,14 +491,15 @@ def test_migrate_status_then_migrate_then_status(tmp_path, fresh_schema):
                                                   "0004-profile-versions", "0005-workers-history",
                                                   "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names"]
+                            "0013-agent-names", "0014-keys"]
     # The library's table went first, under its own ledger, and said so.
     assert json.loads(done.stderr.strip().splitlines()[0]) == {"migrated": {
-        "owner": "harness", "schema": fresh_schema, "applied": ["0001-profiles", "0002-profile-versions"]}}
+        "owner": "harness", "schema": fresh_schema, "applied": ["0001-profiles", "0002-profile-versions", "0003-agent-key"]}}
     then = json.loads(cli(lab, "migrate", "status").stdout)
     assert then["state"] == "current" and then["pending"] == []
     assert then["store"] == {"major": mod.STORE_MAJOR, "minor": mod.STORE_MINOR}
     # And the store answers the domain verbs, in the bound schema.
+    _cli.register_declared(lab["project"], fresh_schema)
     made = cli(lab, "add", "--type", "change", "--title", "t", "--key", "k-1")
     assert made.returncode == 0, made.stderr
     doctor = json.loads(cli(lab, "doctor").stdout)
@@ -503,13 +514,13 @@ def test_an_ordinary_call_brings_missing_tables_up_once(tmp_path, fresh_schema):
     assert done.returncode == 0, done.stderr
     said = [json.loads(line) for line in done.stderr.splitlines() if line.strip()]
     assert said == [{"migrated": {"owner": "harness", "schema": fresh_schema,
-                                  "applied": ["0001-profiles", "0002-profile-versions"]}},
+                                  "applied": ["0001-profiles", "0002-profile-versions", "0003-agent-key"]}},
                     {"migrated": {"schema": fresh_schema,
                                   "applied": ["0001-move-from-schema-tasks", "0002-tables",
                                               "0003-workers", "0004-profile-versions",
                                               "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names"]}}]
+                            "0013-agent-names", "0014-keys"]}}]
     again = cli(lab, "list")
     assert again.returncode == 0 and again.stderr == ""
 
@@ -569,6 +580,7 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(fresh_schema, 
             insert into {s}.tasks_executions (task_id, attempt, status, worker, worker_id,
                                               profile_id)
                  values ('{task}', 1, 'ok', 'alpha', '{worker}', '{profile}');""")
+    _cli.register(fresh_schema, (here, there), ("node-a",))
     # Outside the store upgrade the major is not crossed; inside it, it is.
     monkeypatch.delenv(db.UPGRADE_ENV, raising=False)
     with pytest.raises(db.DbError) as held:
@@ -578,8 +590,8 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(fresh_schema, 
     done = migrate(fresh_schema)
     monkeypatch.delenv(db.UPGRADE_ENV)
     # The step that stands in for 0004 finds its column and key and changes nothing.
-    assert done.applied == ["0004-profile-versions", "0012-task-node", "0013-agent-names"]
-    assert (done.major, done.minor) == (2, 0)
+    assert done.applied == ["0004-profile-versions", "0012-task-node", "0013-agent-names", "0014-keys"]
+    assert (done.major, done.minor) == (2, 1)
     with raw() as conn:
         def one(sql):
             return conn.execute(sql.replace("S.", f"{s}.")).fetchall()
@@ -667,7 +679,7 @@ def test_a_store_whose_harness_table_another_capability_took_to_2_0_takes_tasks(
     conn = db.connect(application_name="tasks-test", setting=_cli.store_setting(fresh_schema))
     try:
         assert db.migrate(conn, owner, profile_steps, major=major, minor=minor).applied == [
-            "0001-profiles", "0002-profile-versions"]
+            "0001-profiles", "0002-profile-versions", "0003-agent-key"]
     finally:
         conn.close()
     lab = project_at(tmp_path, schema=fresh_schema)
@@ -679,7 +691,8 @@ def test_a_store_whose_harness_table_another_capability_took_to_2_0_takes_tasks(
             "select pg_get_constraintdef(oid) from pg_constraint "
             "where conname = 'tasks_executions_profile_id_fkey' "
             "and connamespace = %s::regnamespace", (fresh_schema,)).fetchone()[0] == (
-            f"FOREIGN KEY (profile_id) REFERENCES {fresh_schema}.harness_profile_versions(id)")
+            f"FOREIGN KEY (profile_id) REFERENCES {fresh_schema}.harness_profile_versions(id)"
+            " ON DELETE SET NULL")
 
 
 @needs_store
@@ -704,4 +717,5 @@ def test_the_profile_key_names_the_harness_table_and_never_another_relation(fres
             "select pg_get_constraintdef(oid) from pg_constraint "
             "where conname = 'tasks_executions_profile_id_fkey' "
             "and connamespace = %s::regnamespace", (fresh_schema,)).fetchone()[0] == (
-            f"FOREIGN KEY (profile_id) REFERENCES {fresh_schema}.harness_profiles(id)")
+            f"FOREIGN KEY (profile_id) REFERENCES {fresh_schema}.harness_profiles(id) "
+            "ON DELETE SET NULL")

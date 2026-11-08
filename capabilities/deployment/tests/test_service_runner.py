@@ -14,6 +14,7 @@ child the test can observe: a Python process that prints and sleeps.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
@@ -293,12 +294,52 @@ def cluster():
         shutil.rmtree(root, ignore_errors=True)
 
 
+# The nodes the tests place a service on or run a runner as without adding them.
+REGISTERED_NODES = {"6e6f64652d61": "node-a", "6e6f64652d62": "node-b",
+                    "6e6f64652d66": "node-f", "node-a": "node-a"}
+# Make the core tables in schema `lab` and register the project's agent and the nodes
+# there, run by the interpreter the manager runs on: argv is the URL, the agent's id
+# and the nodes as id=label.
+REGISTER = """
+import sys
+import psycopg
+from capabilities_contract import db
+from capabilities_contract.db import _migrate as core
+with psycopg.connect(sys.argv[1], autocommit=True) as conn:
+    db.migrate(conn, core.CORE_OWNER, core.CORE_STEPS, major=core.CORE_VERSION[0],
+               minor=core.CORE_VERSION[1], schema="lab")
+    conn.execute("INSERT INTO lab.agents (id, kind) VALUES (%s, 'agent') "
+                 "ON CONFLICT (id) DO NOTHING", (sys.argv[2],))
+    for node in sys.argv[3:]:
+        conn.execute("INSERT INTO lab.nodes (id, label, kind) VALUES (%s, %s, 'mac') "
+                     "ON CONFLICT (id) DO NOTHING", tuple(node.split("=", 1)))
+"""
+
+
+@functools.lru_cache(maxsize=1)
+def _manager_python() -> str:
+    """The interpreter of the environment uv runs the manager in."""
+    for argv in (["uv", "sync", "--script", str(MANAGER)],
+                 ["uv", "python", "find", "--script", str(MANAGER)]):
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=600)
+        assert done.returncode == 0, done.stdout + done.stderr
+    return done.stdout.strip()
+
+
 def _database(port: int) -> tuple[str, object]:
     import psycopg
     name = "t_" + uuid.uuid4().hex[:12]
     with psycopg.connect(host="127.0.0.1", port=port, user=ADMIN, dbname="postgres",
                          autocommit=True) as conn:
         conn.execute(f"CREATE DATABASE {name} ENCODING 'UTF8' TEMPLATE template0")
+    # The project's agent and the nodes are registered, as the manager would: a row may
+    # only name an agent and a node the store holds.
+    done = subprocess.run([_manager_python(), "-I", "-c", REGISTER,
+                           f"postgresql://{ADMIN}@127.0.0.1:{port}/{name}?sslmode=disable",
+                           PROJECT_ID, *(f"{node}={label}" for node, label
+                                         in REGISTERED_NODES.items())],
+                          capture_output=True, text=True, timeout=180)
+    assert done.returncode == 0, done.stdout + done.stderr
     return name, lambda query: _rows(port, name, query)
 
 

@@ -195,6 +195,7 @@ class Migration(td.DialogueCase):
         self.addCleanup(conn.execute, f"DROP SCHEMA {name} CASCADE")
         wa.migrate(conn, "whatsapp", wa.STORE_STEPS[:13], major=1, minor=2, schema=name)
         conn.execute(f"SET search_path TO {name}")
+        _cli.register_agents(conn, "p")
         conn.execute("INSERT INTO whatsapp_messages (account, chat_id, id, text, ts)"
                      " VALUES ('a', 'c', 'm1', 'kept', now())")
         conn.execute("INSERT INTO whatsapp_register (project_id, environment, account,"
@@ -222,6 +223,7 @@ class Migration(td.DialogueCase):
         self.addCleanup(conn.execute, f"DROP SCHEMA {name} CASCADE")
         wa.migrate(conn, "whatsapp", old, major=1, minor=4, schema=name)
         conn.execute(f"SET search_path TO {name}")
+        _cli.register_agents(conn, "p")
         conn.execute("INSERT INTO whatsapp_register (project_id, environment, account,"
                      " chat_id, counters) VALUES ('p', 'e', 'a', 'c', '{\"answered\": 2}')")
         conn.execute("INSERT INTO whatsapp_jobs (id, project_id, environment, account, chat_id,"
@@ -245,8 +247,8 @@ class Migration(td.DialogueCase):
             result = wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
                                 minor=wa.STORE_SCHEMA_MINOR, schema=name)
         self.assertEqual(result.applied, ["0023-agent-names", "0024-prompts",
-                                          "0025-connection-ids"])
-        self.assertEqual((result.major, result.minor), (2, 2))
+                                          "0025-connection-ids", "0026-keys"])
+        self.assertEqual((result.major, result.minor), (2, 3))
         conn.execute(f"SET search_path TO {name}")
         for table in ("whatsapp_register", "whatsapp_jobs", "whatsapp_job_amendments",
                       "whatsapp_job_slots"):
@@ -273,7 +275,7 @@ class Migration(td.DialogueCase):
         a minor; the store upgrade crosses the core's major."""
         import psycopg
         import capabilities_contract.db._migrate as core_migrate
-        old = [s for s in wa.STORE_STEPS if s.id != "0025-connection-ids"]
+        old = [s for s in wa.STORE_STEPS if s.id not in ("0025-connection-ids", "0026-keys")]
         name = f"wa_m2_{uuid.uuid4().hex[:8]}"
         conn = psycopg.connect(_cli.STORE_DSN, autocommit=True)
         self.addCleanup(conn.close)
@@ -284,6 +286,7 @@ class Migration(td.DialogueCase):
                 mock.patch.object(core_migrate, "CORE_VERSION", (2, 0)):
             wa.migrate(conn, "whatsapp", old, major=2, minor=1, schema=name)
         conn.execute(f"SET search_path TO {name}")
+        _cli.register_agents(conn, "p")
         conn.execute("INSERT INTO connections (capability, name, spec) VALUES "
                      "('whatsapp', 'work', '{}'::jsonb), ('telegram', 'personal', '{}'::jsonb)")
         role = ["authority", "roles", "ops", "allowed_capabilities"]
@@ -304,8 +307,8 @@ class Migration(td.DialogueCase):
         with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
             result = wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
                                 minor=wa.STORE_SCHEMA_MINOR, schema=name)
-        self.assertEqual(result.applied, ["0025-connection-ids"])
-        self.assertEqual((result.major, result.minor), (2, 2))
+        self.assertEqual(result.applied, ["0025-connection-ids", "0026-keys"])
+        self.assertEqual((result.major, result.minor), (2, 3))
         conn.execute(f"SET search_path TO {name}")
         ids = dict(conn.execute("SELECT name, id FROM core_premig_connection_names"))
         self.assertEqual(
@@ -928,6 +931,7 @@ class ServiceHarness(td.DialogueCase):
                          {"harness": ["whatsapp", "service", "harness", "--json"]})
         self.assertIn("harness", wa.SERVICE["verbs"])
         project = f"prj_{uuid.uuid4().hex[:12]}"
+        _cli.register_agents(self.db, project)
         self.db.execute(
             "INSERT INTO whatsapp_register (agent_id, environment, account, chat_id,"
             " overrides) VALUES (%s, 'test', %s, %s, '{\"profile\": \"whatsapp-codex\"}')",

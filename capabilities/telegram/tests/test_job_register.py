@@ -25,6 +25,9 @@ SERVICE_DIR = TELEGRAM_DIR / "service"
 STORE_DSN = os.environ.get("TELEGRAM_TEST_DSN")
 # Every key the database cascade reads, so a case can hide each one it inherits.
 from capabilities_contract.db import KEYS as DB_KEYS  # noqa: E402
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _agents import register_agents  # noqa: E402
+sys.path.pop(0)
 
 
 def _module(name: str, path: Path):
@@ -112,9 +115,12 @@ class RegisterCase(unittest.TestCase):
         self.addCleanup(self.store.close)
 
     def open(self, envelope=None, **kwargs):
-        """Another connection to the same store, as another process opens it."""
-        return jobs.open_register(envelope or self.envelope,
-                                  setting=self.setting, **kwargs)
+        """Another connection to the same store, as another process opens it,
+        for an agent the store has registered."""
+        store, reg = jobs.open_register(envelope or self.envelope,
+                                        setting=self.setting, **kwargs)
+        register_agents(store.conn, reg.project_id)
+        return store, reg
 
     def register(self, reg=None, submit=True, **overrides):
         """A job most tests want in the queue. Registering opens a draft, so
@@ -176,7 +182,8 @@ class RegisterCase(unittest.TestCase):
             ("telegram\\_%",)).fetchall()}
         self.assertEqual(tables, {"telegram_jobs", "telegram_job_amendments",
                                   "telegram_job_slots", "telegram_prompt_versions",
-                                  "telegram_channels", "telegram_premig_m4_settings"})
+                                  "telegram_channels", "telegram_premig_m4_settings",
+                                  "telegram_premig_m9"})
 
     def test_the_profile_column_is_an_additive_fourth_step(self):
         """A job carries the profile it runs on in a nullable column of its own,
@@ -184,7 +191,7 @@ class RegisterCase(unittest.TestCase):
         registered without one keeps none, and a store at the earlier version
         takes the step without losing a row."""
         self.assertEqual([_step_id(step) for step in jobs.STORE_STEPS][3], "0004-job-profile")
-        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (3, 0))
+        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (3, 1))
         with_profile = self.register(engine="claude", profile="telegram-fast")
         without = self.register(engine="codex", model="gpt-5.5")
         self.assertEqual(self.reg.get(with_profile["id"])["profile"], "telegram-fast")
@@ -196,6 +203,7 @@ class RegisterCase(unittest.TestCase):
         conn = connect(application_name="telegram", setting=older)
         self.addCleanup(conn.close)
         migrate(conn, jobs.STORE_OWNER, jobs.STORE_STEPS[:3], major=1, minor=0)
+        register_agents(conn, self.project_id)
         with conn.cursor() as cur:
             cur.execute("INSERT INTO telegram_jobs (id, project_id, environment, surface, "
                         "channel_key, requested_by, description, engine, state, "
@@ -224,6 +232,7 @@ class RegisterCase(unittest.TestCase):
         self.addCleanup(conn.close)
         migrate(conn, jobs.STORE_OWNER, jobs.STORE_STEPS[:6], major=1, minor=3)
         pid = self.project_id
+        register_agents(conn, pid)
         lease = "2026-11-04T00:10:00+00:00"
 
         def job(job_id, env, created, state="waiting", origin=None):
@@ -335,12 +344,13 @@ class RegisterCase(unittest.TestCase):
         from capabilities_contract.db import DbError, connect, migrate
         old = [step for step in jobs.STORE_STEPS
                if _step_id(step) not in ("0007-one-register", "0008-agent-names",
-                                         "0009-connection-ids")]
+                                         "0009-connection-ids", "0010-keys")]
         older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m1")
         conn = connect(application_name="telegram", setting=older)
         self.addCleanup(conn.close)
         migrate(conn, jobs.STORE_OWNER, old, major=1, minor=3)
         pid = self.project_id
+        register_agents(conn, pid)
         with conn.cursor() as cur:
             cur.execute("INSERT INTO telegram_jobs (id, project_id, environment, surface, "
                         "channel_key, requested_by, description, engine, state, "
@@ -377,7 +387,7 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(reg.pending_amendment("old-1"), ["more"])
         version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
                                  (jobs.STORE_OWNER,)).fetchone()
-        self.assertEqual(tuple(version), (3, 0))
+        self.assertEqual(tuple(version), (3, 1))
         for table in ("telegram_jobs", "telegram_job_amendments", "telegram_job_slots",
                       "telegram_prompt_versions", "telegram_channels"):
             rows = store._execute(f"SELECT agent_id FROM {table}").fetchall()
@@ -414,9 +424,9 @@ class RegisterCase(unittest.TestCase):
         major 2 is refused."""
         import psycopg
         import capabilities_contract.db._migrate as core_migrate
-        from capabilities_contract.db import DbError, connect, migrate
+        from capabilities_contract.db import DbError, connect, deleting, migrate
         old = [step for step in jobs.STORE_STEPS
-               if _step_id(step) != "0009-connection-ids"]
+               if _step_id(step) not in ("0009-connection-ids", "0010-keys")]
         older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m2")
         conn = connect(application_name="telegram", setting=older)
         self.addCleanup(conn.close)
@@ -425,6 +435,7 @@ class RegisterCase(unittest.TestCase):
                 mock.patch.object(core_migrate, "CORE_VERSION", (2, 0)):
             migrate(conn, jobs.STORE_OWNER, old, major=2, minor=0)
         pid = self.project_id
+        register_agents(conn, pid)
         role = ["authority", "roles", "ops", "allowed_capabilities"]
         with conn.cursor() as cur:
             for capability, name in (("telegram", "work"), ("telegram", "personal"),
@@ -454,7 +465,7 @@ class RegisterCase(unittest.TestCase):
         self.addCleanup(store.close)
         version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
                                  (jobs.STORE_OWNER,)).fetchone()
-        self.assertEqual(tuple(version), (3, 0))
+        self.assertEqual(tuple(version), (3, 1))
         ids = dict(store._execute(
             "SELECT name, id FROM core_premig_connection_names").fetchall())
         self.assertEqual(set(ids), {"work", "personal", "tasks"})
@@ -495,7 +506,9 @@ class RegisterCase(unittest.TestCase):
         raw = psycopg.connect(STORE_DSN, autocommit=True)
         self.addCleanup(raw.close)
         raw.execute(f'SET search_path TO "{older.schema}"')
-        raw.execute("DELETE FROM connections WHERE id = %s", (ids["work"],))
+        with raw.transaction():
+            deleting(raw, "connections", ids["work"])
+            raw.execute("DELETE FROM connections WHERE id = %s", (ids["work"],))
         self.assertEqual(raw.execute(
             "SELECT file_connection, channel_key FROM telegram_channels ORDER BY 2").fetchall(),
             [("filed", "-100:8"), ("filed", "-100:9")])

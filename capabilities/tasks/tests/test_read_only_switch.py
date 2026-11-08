@@ -69,6 +69,7 @@ def lab(tmp_path):
         env.pop(leaked, None)
     lab = {"project": project, "env": env, "schema": schema, "tmp": tmp_path}
     assert _tasks(lab, "migrate").returncode == 0
+    _cli.register_declared(project, schema)
     try:
         yield lab
     finally:

@@ -2,9 +2,9 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.43,<1",
+#     "capabilities-contract>=0.45,<1",
 #     "psycopg[binary]>=3.2",
-#     "callva-harness-runner==0.11.0",
+#     "callva-harness-runner==0.12.0",
 #     "pyyaml>=6",
 # ]
 # ///
@@ -14543,7 +14543,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 2
-STORE_MINOR = 0
+STORE_MINOR = 1
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -15804,6 +15804,200 @@ comment on column tasks_presences.holder is
   'The service process serving the agent; only it renews or removes the row.';
 """
 
+# The store's foreign keys (core 4.0): every agent and node column of this
+# owner keyed by what its parent takes with it - owned rows go with it, a
+# record keeps itself and loses the pointer - and its guards admitting the
+# cascade of a deliberate delete and nothing else.
+from capabilities_contract.db import Step as _M9Step  # noqa: E402
+_M9_KEYS_SQL = r"""
+-- tasks: every agent and node reference (and every key inside tasks) a foreign key in its
+-- class; guards admit the cascade of a deliberate delete and nothing else.
+CREATE OR REPLACE FUNCTION tasks_hook_versions_keep_history() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+DECLARE
+    admitted boolean := false;
+    begin
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a hook version is never edited or deleted: % on tasks_hook_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_hook_versions_history';
+end;
+$guard$;
+CREATE OR REPLACE FUNCTION tasks_line_versions_keep_history() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+DECLARE
+    admitted boolean := false;
+    begin
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a line version is never edited or deleted: % on tasks_line_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_line_versions_history';
+end;
+$guard$;
+CREATE OR REPLACE FUNCTION tasks_worker_versions_keep_history() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+DECLARE
+    admitted boolean := false;
+    begin
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+  if tg_op = 'UPDATE' and (to_jsonb(new) - 'active') = (to_jsonb(old) - 'active') then
+    return new;
+  end if;
+  raise exception 'a worker version is never edited or deleted: % on tasks_worker_versions is refused, and only active may move; save a new version instead', lower(tg_op)
+    using errcode = 'restrict_violation', constraint = 'tasks_worker_versions_history';
+end;
+$guard$;
+CREATE OR REPLACE FUNCTION tasks_notify_watch() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+declare
+    task    uuid;
+    agent   text;
+    kind    text;
+begin
+    IF coalesce(current_setting('store.deleting_agent', true), '')
+       || coalesce(current_setting('store.deleting_node', true), '')
+       || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        RETURN NULL;
+    END IF;
+    if tg_table_name = 'tasks_tasks' then
+        task := new.id;
+        agent := new.agent_id;
+        kind := 'task_changed';
+    else
+        -- A hold episode's row is no raise: it records when a worker's before
+        -- hook first held the task back, and nothing a reader shows changed.
+        if tg_table_name = 'tasks_executions' then
+            if new.metrics ? 'hold' then
+                return null;
+            end if;
+        end if;
+        task := new.task_id;
+        execute format('select agent_id from %I.tasks_tasks where id = $1', tg_table_schema)
+           into agent using task;
+        if tg_table_name = 'tasks_activities' then
+            kind := 'activity_added';
+        elsif tg_op = 'INSERT' then
+            kind := 'run_started';
+        elsif old.ended_at is null and new.ended_at is not null then
+            kind := 'run_ended';
+        else
+            return null;
+        end if;
+    end if;
+    perform pg_notify('tasks_watch', json_build_object(
+        'schema', tg_table_schema, 'agent_id', agent,
+        'task', task, 'kind', kind)::text);
+    if agent is not null then
+        if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_watch')
+                using agent;
+        end if;
+    end if;
+    return null;
+end;
+$guard$;
+CREATE OR REPLACE FUNCTION tasks_notify_claimable() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+
+begin
+    IF coalesce(current_setting('store.deleting_agent', true), '')
+       || coalesce(current_setting('store.deleting_node', true), '')
+       || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        RETURN NULL;
+    END IF;
+    if new.status = 'todo' and (tg_op = 'INSERT'
+            or old.status is distinct from new.status
+            or old.pickup_at is distinct from new.pickup_at) then
+        perform pg_notify('tasks_claimable', json_build_object(
+            'schema', tg_table_schema, 'agent_id', new.agent_id,
+            'task', new.id, 'pickup_at', new.pickup_at)::text);
+        if to_regclass(format('%I.schema_channel', tg_table_schema)) is not null then
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_watch')
+                using new.agent_id;
+            execute format('insert into %I.schema_channel as c (channel, scope, version) '
+                           'values (%L, $1, 1) on conflict (channel, scope) '
+                           'do update set version = c.version + 1',
+                           tg_table_schema, 'tasks_claimable')
+                using new.agent_id;
+        end if;
+    end if;
+    return null;
+end;
+$guard$;
+SELECT store_state_keys('tasks', ARRAY[
+    ARRAY['tasks_tasks', 'agent_id', 'agents', 'cascade'],
+    ARRAY['tasks_tasks', 'node', 'nodes', 'set null'],
+    ARRAY['tasks_activities', 'origin_agent_id', 'agents', 'set null'],
+    ARRAY['tasks_changes', 'origin_agent_id', 'agents', 'set null'],
+    ARRAY['tasks_executions', 'node', 'nodes', 'set null'],
+    ARRAY['tasks_executions', 'worker_id', 'tasks_worker_versions', 'set null'],
+    ARRAY['tasks_hook_versions', 'agent_id', 'agents', 'cascade'],
+    ARRAY['tasks_line_states', 'agent_id', 'agents', 'cascade'],
+    ARRAY['tasks_line_versions', 'agent_id', 'agents', 'cascade'],
+    ARRAY['tasks_worker_versions', 'agent_id', 'agents', 'cascade'],
+    ARRAY['tasks_presences', 'agent_id', 'agents', 'cascade'],
+    ARRAY['tasks_presences', 'node', 'nodes', 'cascade']]);
+-- The harness profile an execution ran under, by whichever of the profile
+-- table's two names is a table, as 0004-profile-versions keys it.
+DO $profile$
+DECLARE parent text;
+BEGIN
+    SELECT c.relname INTO parent FROM pg_class c
+     WHERE c.relnamespace = current_schema()::regnamespace AND c.relkind IN ('r', 'p')
+       AND c.relname IN ('harness_profile_versions', 'harness_profiles')
+     ORDER BY c.relname = 'harness_profile_versions' DESC LIMIT 1;
+    IF parent IS NOT NULL THEN
+        PERFORM store_state_keys('tasks',
+            ARRAY[ARRAY['tasks_executions', 'profile_id', parent, 'set null']]);
+    END IF;
+END
+$profile$;
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
@@ -15818,6 +16012,7 @@ STORE_STEPS = [
     ("0011-lines", _LINES),
     ("0012-task-node", _TASK_NODE),
     ("0013-agent-names", _AGENT_NAMES),
+    _M9Step("0014-keys", _M9_KEYS_SQL, core=(4, 0)),
 ]
 
 

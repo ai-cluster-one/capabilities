@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-08 — Tasks, lanes and presences go with their agent; executions keep themselves when their node or version goes, at tasks 2.1
+
+Step `0014-keys` (tasks 2.1, core 4.0): tasks, worker, hook and line versions, line states and presences go with their agent, and a presence with its node; an execution keeps its row and loses the node it ran on, the worker version and the harness profile version it ran under where those go (`ON DELETE SET NULL`); a task pinned to a node keeps itself and loses the pin when that node is removed; an activity and a change written from another agent lose `origin_agent_id` when that agent goes. The versions' history guards admit the cascade of a deliberate delete and nothing else, and the watch and claimable notices stay quiet under it. A reference to an agent or node the store no longer holds is settled when the step runs, kept in `tasks_premig_m9`. Runs on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.
+
 ## 2026-11-08 — The service says when it cannot renew the lease of a raise still running
 
 When the service's renewal of its running turns reaches the store and leaves a raise unrenewed that is still `running` - the renewal matched no row for it - or that the store it asks does not hold, the service log says `cannot renew the lease of the raise <id> its turn on <task> holds, so it lapses: <why>`, at the first beat that finds it and once, naming the schema and the project it asked in; and `renews the lease of the raise <id> again` once it is renewed. Before, such a lease ran out with nothing said, and the turn ended as `lease_lost` with the service renewing it no longer. A raise already closed under its turn is not said. The service's renewal answer carries `unrenewed` beside `renewed` and `every`. Nothing else changes: what is renewed, how often, and to what lease, are as before.

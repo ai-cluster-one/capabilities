@@ -9,6 +9,7 @@ import uuid
 
 import pytest
 
+from _agents import register_agents, register_nodes
 from _cli import load_service
 
 DSN = os.environ.get("TELEGRAMBOT_TEST_DSN")
@@ -29,6 +30,8 @@ def register():
                          database=info.get("dbname"), user=info.get("user"),
                          password=info.get("password"), sslmode="disable")
     store = s.Store(setting).open()
+    register_agents(store, "prj_a")
+    register_nodes(store, "n")
     yield jobs.JobRegister(jobs.Db(store), "prj_a", "helper"), store
     store.execute(f"DROP SCHEMA {schema} CASCADE")
     store.close()

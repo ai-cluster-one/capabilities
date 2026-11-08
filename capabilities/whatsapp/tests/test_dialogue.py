@@ -365,6 +365,7 @@ class DialogueCase(unittest.TestCase):
         self.cfg = _cli.store_cfg(engine=wa.ENGINE_INHOUSE)
         self.db = wa._open_store(self.cfg)
         self.addCleanup(self.db.close)
+        _cli.register_agents(self.db, "prj_test")
         self.root = Path(tempfile.mkdtemp())
         self.logs: list[str] = []
         records = types.SimpleNamespace(
@@ -376,6 +377,7 @@ class DialogueCase(unittest.TestCase):
 
     def make(self, settings=None, run=None, project_id="prj_test"):
         self.run = run or FakeRun()
+        _cli.register_agents(self.db, project_id)
         made = dialogue.Dialogue(
             wa._CliFacade(), cfg=self.cfg, root=self.root,
             settings=settings or _settings(), project_id=project_id, db=self.db,
@@ -659,6 +661,7 @@ class Turn(DialogueCase):
 
     def test_a_project_version_in_the_store_shadows_the_bundles(self):
         project = f"prj_{uuid.uuid4().hex[:12]}"
+        _cli.register_agents(self.db, project)
         self.project_files(**{"whatsapp-claude": self.SONNET})
         with mock.patch.object(wa, "_service_project_id", return_value=project):
             wa._profiles_import(self.root, True)
@@ -681,6 +684,7 @@ class Turn(DialogueCase):
 
     def test_import_carries_the_files_into_the_store_all_or_none(self):
         project = f"prj_{uuid.uuid4().hex[:12]}"
+        _cli.register_agents(self.db, project)
         codex = profiles.bundled_file("whatsapp-codex").read_text()
         folder = self.project_files(**{"whatsapp-claude": self.SONNET, "mine": codex})
         with mock.patch.object(wa, "_service_project_id", return_value=project):
