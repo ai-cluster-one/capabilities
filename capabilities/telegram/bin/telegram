@@ -5003,13 +5003,31 @@ def _require_service_initialized(root: Path) -> None:
              "prompt each run class reads; missing: " + ", ".join(missing))
 
 
+def _daemon_base_env() -> dict:
+    """This process's environment without the CLI's own uv script environment.
+
+    `uv run --script` exports VIRTUAL_ENV and puts that environment's bin first
+    on PATH; the daemon's own `uv run --script` would take that as the active
+    environment and resolve onto the CLI's cached interpreter, whatever it is.
+    Dropping both lets uv resolve an interpreter for the daemon itself."""
+    env = dict(os.environ)
+    venv = env.pop("VIRTUAL_ENV", None)
+    if venv:
+        venv_bin = os.path.normcase(os.path.realpath(os.path.join(venv, "bin")))
+        env["PATH"] = os.pathsep.join(
+            entry for entry in env.get("PATH", "").split(os.pathsep)
+            if not entry
+            or os.path.normcase(os.path.realpath(entry)) != venv_bin)
+    return env
+
+
 def _service_env(root: Path, cfg: dict, paths: dict[str, Path],
                  *, launch_nonce: str | None = None) -> dict:
     """Build complete launch provenance, including non-overrideable ownership."""
     # Resolving the id a write may stamp hands it down in the environment the
     # daemon inherits, so the daemon registers under it without asking again.
     _project_id(write=True)
-    env = dict(os.environ)
+    env = _daemon_base_env()
     envelope = _project_capabilities_dir(root).resolve()
     layout = _resolve_project_layout(root)
     env["TELEGRAM_SERVICE_PROJECT_ROOT"] = str(root)
@@ -5083,7 +5101,8 @@ def _resolve_daemon_environment(daemon: Path) -> None:
         return
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         subprocess.run([uv, "sync", "--quiet", "--script", str(daemon)],
-                       stdin=subprocess.DEVNULL, capture_output=True, timeout=600)
+                       env=_daemon_base_env(), stdin=subprocess.DEVNULL,
+                       capture_output=True, timeout=600)
 
 
 def _service_start_result(connection_flag: str | None, session_flag: str | None) -> dict:
