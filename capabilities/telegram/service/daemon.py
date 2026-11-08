@@ -4426,6 +4426,54 @@ def _speaker(name, is_assistant):
     return f"{name}{SELF_MARKER}" if is_assistant else name
 
 
+# This account's own Telegram id, learned from get_me() when a session starts,
+# so a forward of the assistant's own earlier words is named as such.
+SELF_ACCOUNT_ID = None
+
+FORWARD_UNKNOWN_ORIGIN = "an unknown sender"
+
+
+def _forward_origin(message):
+    """Who wrote a forwarded message, named the way the tail names a speaker,
+    or None when the message is not a forward.
+
+    This account reads as the assistant with the self marker; a configured
+    person by their configured name; anyone else by the sender or channel
+    Telegram attached, a hidden account by the name it left, and an id when
+    that is all there is. Rendering must not fail a turn, so a header that
+    cannot be read names an unknown sender."""
+    try:
+        header = getattr(message, "fwd_from", None)
+    except Exception:
+        return None
+    if header is None:
+        return None
+    try:
+        forward = getattr(message, "forward", None)
+        peer = getattr(header, "from_id", None)
+        user_id = getattr(peer, "user_id", None)
+        own = SELF_ACCOUNT_ID if SELF_ACCOUNT_ID is not None else EXPECTED_ACCOUNT_ID
+        if user_id is not None and own is not None and int(user_id) == int(own):
+            name = _speaker(globals().get("ASSISTANT_NAME") or "this assistant", True)
+        else:
+            row = (globals().get("ALLOWED") or {}).get(str(user_id)) if user_id is not None else None
+            chat_id = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
+            name = ((row.get("name") if isinstance(row, dict) else None)
+                    or _entity_name(getattr(forward, "sender", None), None)
+                    or _entity_name(getattr(forward, "chat", None), None)
+                    or getattr(header, "from_name", None)
+                    or (f"user {user_id}" if user_id is not None else None)
+                    or (f"chat {chat_id}" if chat_id is not None else None))
+    except Exception:
+        name = None
+    # One line, whatever the name holds: it is spliced into a line of the tail.
+    return " ".join(str(name or "").split()) or FORWARD_UNKNOWN_ORIGIN
+
+
+def _forward_marked(text, origin):
+    return f"[forwarded from {origin}] {text}" if origin and text else text
+
+
 CONVERSATION_END = "--- END OF CONVERSATION ---"
 
 
@@ -4781,7 +4829,8 @@ def message_tail_text(m):
     media message never silently drops from the tail. The marker carries what the worker needs to
     fetch the file on demand (filename + msg id) via `telegram download` — the daemon does not
     download attachments; the file is pulled lazily by whoever actually needs it. Voice is excluded:
-    it is transcribed and echoed separately, so its echo already carries the words."""
+    it is transcribed and echoed separately, so its echo already carries the words. A forward opens
+    with `[forwarded from <origin>]`, so someone else's words never read as the forwarder's own."""
     text = m.text or ""
     if m.file and not m.voice:
         if m.file.name:
@@ -4792,6 +4841,8 @@ def message_tail_text(m):
             name = f"file-{m.id}"
         marker = f"[attachment: {name} | msg {m.id}]"
         text = f"{text}\n{marker}" if text else marker
+    if text:
+        text = _forward_marked(text, _forward_origin(m))
     return text or None
 
 
@@ -6569,6 +6620,11 @@ async def run_session(client):
         raise NotAuthorized(
             f"session not authorized — exec in and run: telegram login --connection {CONNECTION}")
     me = await client.get_me()
+    global SELF_ACCOUNT_ID
+    try:
+        SELF_ACCOUNT_ID = int(me.id)
+    except (TypeError, ValueError):
+        SELF_ACCOUNT_ID = None
     write_health(
         session_authorized=True,
         expected_account_id=EXPECTED_ACCOUNT_ID,
@@ -6925,9 +6981,13 @@ async def run_session(client):
         if _job_map(reg, key).get(_job_id(message.id)) is not job:
             return False
         profile = await _sender_profile(message, group_policy, direct=is_direct)
-        text = (text_override if text_override is not None else
-                message_tail_text(message) or _message_text(message)
-                or f"[{_message_kind(message)}]")
+        if text_override is not None:
+            # A transcript is the words of whoever spoke them, so a forwarded
+            # voice note's request says whose they are.
+            text = _forward_marked(text_override, _forward_origin(message))
+        else:
+            text = (message_tail_text(message) or _message_text(message)
+                    or f"[{_message_kind(message)}]")
         job.update({
             "sender_id": profile["id"],
             "sender_name": profile["name"],

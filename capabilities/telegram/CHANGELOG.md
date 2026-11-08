@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — A forwarded message says whose words it carries
+
+A forwarded message now opens with `[forwarded from <origin>]` wherever the worker reads it: in the conversation tail, in the current request, and in a forwarded voice note's transcribed request. Before, it read as the forwarder's own typed words. The origin is the assistant with ` (you)` when the forward carries this account's own words, a configured person by their configured name, otherwise the sender or channel Telegram names, the name a hidden account left, or its id, and `an unknown sender` when none of these can be read. A message that is not a forward renders exactly as before. A comment sent together with forwards is still answered as its own request, apart from them. No verb, flag, setting or output key changes.
+
 ## 2026-11-08 — A turn stopped at its ceiling says the work may or may not be done
 
 When a worker turn is stopped at its timeout - a dialogue turn, a durable job or a voice task - the supervisor told about it now reads, beside the ceiling, that the turn may or may not have finished its work and that nothing continues on its own, where before the notice read `Worker error:` and the ceiling alone, as if the stop were clean. A dialogue turn's notice drops the `Worker error:` heading for a timeout; a failed job's `Job failed:` result carries the sentence under its label; a voice task's result, spoken or sent after the call, carries it after the ceiling. A room without a supervisor keeps the generic line, and the dialogue log line and a job's recorded error keep the ceiling alone. No verb, flag, setting or output key changes.
