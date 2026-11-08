@@ -158,6 +158,7 @@ import prompts
 import records
 import voice_agent
 from forum import GENERAL_TOPIC_ID, message_topic_id
+from rich_text import rich_message_text
 from settings_schema import (
     VOICE_PROVIDER_INCUMBENT,
     document_key,
@@ -4830,8 +4831,10 @@ def message_tail_text(m):
     fetch the file on demand (filename + msg id) via `telegram download` — the daemon does not
     download attachments; the file is pulled lazily by whoever actually needs it. Voice is excluded:
     it is transcribed and echoed separately, so its echo already carries the words. A forward opens
-    with `[forwarded from <origin>]`, so someone else's words never read as the forwarder's own."""
-    text = m.text or ""
+    with `[forwarded from <origin>]`, so someone else's words never read as the forwarder's own. A
+    message composed with rich formatting carries its words only in its rich blocks, which read as
+    its text."""
+    text = m.text or rich_message_text(m)
     if m.file and not m.voice:
         if m.file.name:
             name = m.file.name

@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — A rich-formatted message reads as its words
+
+A message composed with Telegram's rich formatting - a paragraph followed by a numbered or bulleted list, as current Telegram apps send it - arrives with empty text and its words only in its rich blocks. It now reaches the worker's conversation tail as those words, and `read`, `search` and `export` print them as its text, where before the tail dropped it and the verbs showed it empty. Each paragraph reads as a line, an ordered item as `N. text`, a bulleted item as `- text`, a checklist item with `[ ]` or `[x]`, and formatting, links and other nested rich text read as their plain words. A message that carries text of its own reads exactly as before. No verb, flag, setting or output key changes.
+
 ## 2026-11-08 — A forwarded message says whose words it carries
 
 A forwarded message now opens with `[forwarded from <origin>]` wherever the worker reads it: in the conversation tail, in the current request, and in a forwarded voice note's transcribed request. Before, it read as the forwarder's own typed words. The origin is the assistant with ` (you)` when the forward carries this account's own words, a configured person by their configured name, otherwise the sender or channel Telegram names, the name a hidden account left, or its id, and `an unknown sender` when none of these can be read. A message that is not a forward renders exactly as before. A comment sent together with forwards is still answered as its own request, apart from them. No verb, flag, setting or output key changes.

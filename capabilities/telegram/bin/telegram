@@ -2170,13 +2170,46 @@ async def _iter_topic_scope(client, entity, topic_id: int | None, topic_of, *,
             return
 
 
+def _service_rich_text() -> Path:
+    return _service_bundle_dir() / "service" / "rich_text.py"
+
+
+_RICH_TEXT_MODULE = None
+
+
+def _rich_text_module():
+    """The bundle's rich-message flattening, shared with the assistant service."""
+    global _RICH_TEXT_MODULE
+    if _RICH_TEXT_MODULE is not None:
+        return _RICH_TEXT_MODULE
+    path = _service_rich_text()
+    _require_service_bundle_files(path)
+    spec = importlib.util.spec_from_file_location("telegram_service_rich_text", path)
+    if spec is None or spec.loader is None:
+        _die(3, "service_bundle_missing",
+             f"cannot load the bundled rich-message flattening: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _RICH_TEXT_MODULE = module
+    return module
+
+
+def message_text(m) -> str:
+    """A message's text, or the words of its rich blocks when Telegram sent
+    the message with rich formatting and left its text empty."""
+    text = getattr(m, "message", None)
+    if isinstance(text, str) and text:
+        return text
+    return _rich_text_module().rich_message_text(m)
+
+
 def msg_to_dict(m, topic_of) -> dict:
     return {
         "id": m.id,
         "date": m.date.astimezone(timezone.utc).isoformat() if m.date else None,
         "sender_id": m.sender_id,
         "sender": entity_label(m.sender) if m.sender else None,
-        "text": m.message or "",
+        "text": message_text(m),
         "reply_to": m.reply_to_msg_id,
         "topic_id": topic_of(m),
     }
@@ -2187,7 +2220,7 @@ def _render_transcript(header: str, messages: list) -> str:
     for m in messages:
         ts = m.date.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M") if m.date else "?"
         who = entity_label(m.sender) if m.sender else f"id={m.sender_id}"
-        text = (m.message or "").replace("\n", " ⏎ ")
+        text = message_text(m).replace("\n", " ⏎ ")
         lines.append(f"[{ts}] {who}: {text}")
     return "\n".join(lines)
 
@@ -2514,7 +2547,7 @@ def _export_message_entry(message, topic_of) -> dict:
         "topic_id": topic_of(message),
         "forward": forward,
         "type": kind,
-        "text": _json_text(getattr(message, "message", None)),
+        "text": _json_text(message_text(message) or getattr(message, "message", None)),
         "media": media_meta,
     }
 
