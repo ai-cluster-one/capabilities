@@ -2537,6 +2537,19 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             health = json.loads(daemon.HEALTH_FILE.read_text())
             self.assertEqual(health["settings_generation"], 2)
 
+    async def test_settings_line_states_the_job_slots_in_force_after_a_reload(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings(max_parallel_dialogue=2,
+                                                      max_parallel_jobs=1))
+            channel = {"max_parallel_dialogue": 2}
+            self.assertIn("dialogue=2, slots=1,", daemon._settings_summary(channel))
+
+            daemon.SETTINGS_FILE.write_text(
+                json.dumps(settings(max_parallel_dialogue=2, max_parallel_jobs=4)) + "\n")
+            self.assertTrue(daemon.reload_runtime_settings()["ok"])
+
+            self.assertIn("dialogue=2, slots=4,", daemon._settings_summary(channel))
+
     async def test_invalid_reload_keeps_the_previous_settings(self):
         with tempfile.TemporaryDirectory() as td:
             service_settings = settings()

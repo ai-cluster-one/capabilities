@@ -4541,6 +4541,9 @@ def _settings_summary(s):
         f"timeout={s.get('worker_timeout')}s",
         f"progress_after={s.get('progress_after')}s",
         f"dialogue={s.get('max_parallel_dialogue')}",
+        # Registered-job slots belong to the daemon, not the channel; the
+        # global is republished on every reload, so this is the value in force.
+        f"slots={MAX_PARALLEL_JOBS}",
         f"max_attempts={s.get('max_attempts')}",
     ]
     if s.get("worker") in ("claude", "codex"):
