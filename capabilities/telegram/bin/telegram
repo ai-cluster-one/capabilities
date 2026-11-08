@@ -937,6 +937,59 @@ def _account_key(account) -> str | None:
     return str(value) if value > 0 else None
 
 
+# What an account's own folder keeps (`_service_control_paths`, LINKED_BY),
+# which no connection's state takes with it.
+ACCOUNT_ENTRIES = ("control", LINKED_BY)
+
+_contract_connection_state_dir = _connection_state_dir
+
+
+def _connection_state_dir(base, cid: str) -> Path:
+    """The contract's folder for connection `cid` under `base`, which it first
+    moves there from the name the connection had before its id (deviations.md),
+    without the account's own records in it. A connection whose former name was
+    its account id kept its state in the account's own folder, beside the
+    service control folder and `linked-by.json`, which stay keyed by the
+    account: once the folder is the id's, each of them is moved back to the
+    account's folder - also where an earlier move already took them - and
+    never over one already there, which is left as it is and said on stderr."""
+    folder = _contract_connection_state_dir(base, cid)
+    former = _connection_former_name(cid)
+    if (not former or former == cid or _account_key(former) != former
+            or Path(base) != _STATE_HOME / NAME):
+        return folder
+    for entry in ACCOUNT_ENTRIES:
+        _return_account_entry(folder / entry, Path(base) / former / entry)
+    return folder
+
+
+def _return_account_entry(moved: Path, home: Path) -> None:
+    """Move `moved`, an account's record that a connection's folder took with
+    it, to `home`, its place in the account's folder: whole where nothing is
+    there, else what it holds that is not there, one entry at a time. Nothing
+    is written over; what is in both places stays in both, and stderr says so."""
+    if not (moved.exists() or moved.is_symlink()):
+        return
+    try:
+        if not (home.exists() or home.is_symlink()):
+            home.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.rename(moved, home)
+            _log(f"{NAME}: moved {moved} to {home}: it is account "
+                 f"{home.parent.name}'s, not its connection's")
+            return
+        if moved.is_dir() and not moved.is_symlink() and home.is_dir():
+            for child in sorted(moved.iterdir()):
+                _return_account_entry(child, home / child.name)
+            with contextlib.suppress(OSError):
+                moved.rmdir()
+            return
+    except OSError as exc:
+        _log(f"{NAME}: {moved} could not be moved to {home}: {exc}")
+        return
+    _log(f"{NAME}: {moved} is left as it is; account {home.parent.name} keeps "
+         f"its own {home}")
+
+
 def _connection_owner(cid: str, scope: str | None = None) -> str | None:
     """The project whose own connection `cid` is, as the records keep it, or
     None for one the machine shares. `scope` is where a connection about to be
@@ -1215,14 +1268,42 @@ def _connection_session(cid: str, entry: dict) -> str:
     it carries is the path of the machine that set it: it is kept where a session
     already lives there or where it lies under this machine's home, and anywhere
     else the session is this machine's own <state-dir>/<id>/session, where a
-    folder made under the connection's former name is moved first."""
+    folder made under the connection's former name is moved first. A recorded
+    path inside that former folder is read where the move took it
+    (`_recorded_session`)."""
     recorded = entry.get("session")
     if recorded:
+        moved = _recorded_session(_state_dir(), cid, recorded)
+        if moved is not None:
+            return str(moved)
         path = Path(str(recorded)).expanduser()
         if (not path.is_absolute() or _session_file(str(path)).exists()
                 or path.is_relative_to(Path.home())):
             return str(recorded)
     return str(_connection_state_dir(_state_dir(), cid) / "session")
+
+
+def _recorded_session(base, cid: str, recorded) -> Path | None:
+    """Where a session path recorded for connection `cid` lies now, where it
+    lay in the folder under `base` made under the connection's former name:
+    the same place in the folder `_connection_state_dir` moved that to, so a
+    process reading the record after the move neither misses the session nor
+    makes an empty one where it was. The recorded place is kept only where a
+    session is there and none is in the id's folder; None for a path that
+    never lay in that folder."""
+    path = Path(str(recorded)).expanduser()
+    former = _connection_former_name(cid)
+    if (not former or former == cid or former in (".", "..") or "/" in former
+            or not path.is_absolute()):
+        return None
+    try:
+        rest = path.relative_to(Path(base) / former)
+    except ValueError:
+        return None
+    moved = _connection_state_dir(base, cid) / rest
+    if _session_file(str(path)).exists() and not _session_file(str(moved)).exists():
+        return path
+    return moved
 
 
 def _require_account_connection(cfg: dict, *, allow_discovery: bool = False) -> None:

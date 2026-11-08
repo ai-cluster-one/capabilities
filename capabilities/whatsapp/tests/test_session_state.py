@@ -136,5 +136,31 @@ class FormerNameHome(unittest.TestCase):
 
 
 
+class FirstLinkLeavesALiveHome(unittest.TestCase):
+    """A link looks at the homes a connection may already have without moving
+    any: a live home under the account, whose folder name was the
+    connection's former name, stays where it is."""
+
+    def test_a_link_leaves_the_home_named_by_the_former_name_where_it_is(self):
+        wa = _cli.load()
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        root = tmp / "state" / "whatsapp"
+        cid, account = "a1b2c3d4e5f6", "15550003333"
+        session = link(root / account, account)
+        for events, entry in ((False, {"expected_account_id": account}),
+                              (True, {"expected_account_id": account}), (True, {})):
+            with mock.patch.object(wa, "_state_dir", lambda: root), \
+                    mock.patch.object(wa, "_connection_former_name",
+                                      lambda wanted: account if wanted == cid else None,
+                                      create=True), \
+                    mock.patch.object(wa, "_EVENTS_ON", [events]), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with wa._first_link(cid, entry):
+                    self.assertTrue(session.is_file())
+                    self.assertFalse((root / cid).exists())
+        self.assertEqual(sorted(p.name for p in root.iterdir()), [account])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -154,20 +154,37 @@ def resolve(registry: dict | None, word):
 
 def state_dir(adapter, base: Path, cid: str) -> Path:
     """`base/<cid>`, the folder a connection's state is kept in on this
-    machine: the library's own answer, asked of the CLI with the service's
-    own records `adapter`, which first moves a folder made under the
-    connection's former name to it. Where the map names no former name, or
-    nothing lies under it, the answer is `base/<cid>` and the CLI is not
-    loaded."""
-    former = former_name(adapter, cid)
-    made = Path(base) / former if former else None
-    if made is None or not (made.exists() or made.is_symlink()):
+    machine: the CLI's own answer (`_connection_state_dir`), asked with the
+    service's own records `adapter`, which first moves a folder made under the
+    connection's former name to it and keeps the account's own records at the
+    account. Where the map names no former name, the answer is `base/<cid>`
+    and the CLI is not loaded."""
+    if not former_name(adapter, cid):
         return Path(base) / cid
+    return _ask_cli(adapter, "_connection_state_dir", Path(base), cid)
+
+
+def session_path(adapter, base: Path, cid: str, recorded: Path) -> Path:
+    """Where the session path `recorded` for connection `cid` lies now: the
+    CLI's own answer (`_recorded_session`), asked with the service's own
+    records `adapter`, for a path that lay in the folder made under the
+    connection's former name, which the move took under the id; `recorded`
+    itself for any other, and the CLI is not loaded."""
+    former = former_name(adapter, cid)
+    if not former:
+        return Path(recorded)
+    moved = _ask_cli(adapter, "_recorded_session", Path(base), cid, recorded)
+    return Path(recorded) if moved is None else Path(moved)
+
+
+def _ask_cli(adapter, function: str, *args):
+    """Call the CLI's `function` with the service's records `adapter` standing
+    in for the CLI's own."""
     cli = _cli()
     held = cli.__dict__.get("_records")
     cli._records = lambda: adapter
     try:
-        return cli._connection_state_dir(Path(base), cid)
+        return getattr(cli, function)(*args)
     finally:
         cli._records = held
 

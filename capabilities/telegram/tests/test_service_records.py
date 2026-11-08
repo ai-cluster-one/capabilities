@@ -261,5 +261,36 @@ class RecorderConnections(unittest.TestCase):
         self.assertTrue(config["registry"].startswith(f"store:{schema}."))
 
 
+class FormerNameFolderInTheService(unittest.TestCase):
+    """The service asks the CLI where a connection's folder is and where the
+    session path its record carries lies, so a folder made under a former name
+    that was the account id is moved as the CLI moves it: the session under
+    the id, the account's control folder at the account, and the recorded
+    path read where the move took it."""
+
+    def test_the_session_is_read_under_the_id_and_the_account_keeps_its_control(self):
+        import contextlib
+        import io
+        import types
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        base, cid = tmp / "state" / "telegram", "a1b2c3d4e5f6"
+        old = base / "1001"
+        write_json(old / "control" / "ownership-v1.json", {"account_id": 1001})
+        (old / "session.session").write_text("signed in")
+        adapter = types.SimpleNamespace(
+            connection_former_name=lambda name, wanted: "1001" if wanted == cid else None)
+        with mock.patch.object(records._cli(), "_STATE_HOME", tmp / "state"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            home = records.state_dir(adapter, base, cid)
+            session = records.session_path(adapter, base, cid, old / "session")
+        self.assertEqual(home, base / cid)
+        self.assertEqual(session, base / cid / "session")
+        self.assertEqual((base / cid / "session.session").read_text(), "signed in")
+        self.assertTrue((old / "control" / "ownership-v1.json").is_file())
+        self.assertFalse((base / cid / "control").exists())
+        self.assertFalse((old / "session.session").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

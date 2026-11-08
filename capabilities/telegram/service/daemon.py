@@ -1054,7 +1054,12 @@ def _session_stem(cid, conn):
     if conn is None:
         return _project_path(_env_value("TELEGRAM_SESSION")) if _env_value("TELEGRAM_SESSION") else DEFAULT_SESSION
     if conn.get("session"):
-        return _project_path(conn["session"])
+        recorded = _project_path(conn["session"])
+        if CONNECTIONS_FROM_FILE or CONNECTIONS is None:
+            return recorded
+        # A recorded path in the folder made under the connection's former
+        # name lies where CONNECTION_HOME's move took it.
+        return records.session_path(_records(), STATE_HOME / "telegram", cid, recorded)
     return CONNECTION_HOME / "session"
 
 

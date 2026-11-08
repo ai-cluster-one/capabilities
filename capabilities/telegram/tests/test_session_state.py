@@ -253,5 +253,109 @@ class FormerNameSessionTests(unittest.TestCase):
 
 
 
+class AccountNamedFormerFolderTests(unittest.TestCase):
+    """A connection whose former name was its account id kept its session in
+    the same folder as the account's own records - the service control folder
+    and the record of which connection holds the account - which stay keyed
+    by the account. Moving the folder under the connection's id takes the
+    session and leaves the account's records at the account, on a first
+    resolve and on a machine where an earlier resolve moved them away."""
+
+    CID = "a1b2c3d4e5f6"
+    ACCOUNT = 1001
+
+    def setUp(self):
+        self.cli = import_cli()
+        self.addCleanup(restore_modules, self.cli)
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.state = self.tmp / "state" / "telegram"
+        self.old = self.state / str(self.ACCOUNT)
+        self.new = self.state / self.CID
+        self.entry = {"expected_account_id": self.ACCOUNT}
+        conns = {self.CID: self.entry}
+        reg = {"default": self.CID, "connections": conns,
+               "sources": {self.CID: str(self.tmp / "connections.json")}}
+        keys = {"TELEGRAM_API_ID": "12345", "TELEGRAM_API_HASH": "hash"}
+        for target, value in (("_connections_registry", lambda: (reg, None)),
+                              ("_state_dir", lambda: self.state),
+                              ("_STATE_HOME", self.tmp / "state"),
+                              ("_resolve_env_key", lambda key: (keys.get(key), None, None)),
+                              ("_connection_former_name",
+                               lambda cid: str(self.ACCOUNT) if cid == self.CID else None)):
+            patcher = mock.patch.object(self.cli, target, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def account_records(self, folder: Path) -> None:
+        (folder / "control").mkdir(parents=True, exist_ok=True)
+        (folder / "control" / "ownership-v1.json").write_text(json.dumps({
+            "schema": "telegram.ownership.v1", "account_id": self.ACCOUNT,
+            "protocol_version": 1}))
+        (folder / "linked-by.json").write_text(json.dumps(
+            {"connection": str(self.ACCOUNT), "owner": None}))
+
+    def resolve(self) -> str:
+        with __import__("contextlib").redirect_stderr(__import__("io").StringIO()):
+            return self.cli._load_config(self.CID, None)["session"]
+
+    def assert_account_records_at_the_account(self):
+        self.assertEqual(self.cli._require_ownership_marker(self.ACCOUNT)["account_id"],
+                         self.ACCOUNT)
+        self.assertIsNotNone(self.cli._linked_by(str(self.ACCOUNT)))
+        self.assertFalse((self.new / "control").exists())
+        self.assertFalse((self.new / "linked-by.json").exists())
+
+    def test_the_first_move_leaves_the_account_records_at_the_account(self):
+        write_session(self.old / "session", signed_in_as=self.ACCOUNT)
+        self.account_records(self.old)
+        self.assertEqual(self.resolve(), str(self.new / "session"))
+        self.assertTrue((self.new / "session.session").is_file())
+        self.assert_account_records_at_the_account()
+        self.assertEqual(self.cli._connections_report()["connections"][self.CID]["session"],
+                         {"live": True, "account": str(self.ACCOUNT)})
+
+    def test_a_recorded_session_path_under_the_former_folder_is_read_under_the_id(self):
+        self.entry["session"] = str(self.old / "session")
+        write_session(self.old / "session", signed_in_as=self.ACCOUNT)
+        self.account_records(self.old)
+        self.assertEqual(self.resolve(), str(self.new / "session"))
+        self.assertFalse((self.old / "session.session").exists())
+        self.assert_account_records_at_the_account()
+
+    def test_a_machine_that_already_moved_them_gets_them_back(self):
+        # What an earlier resolve left: everything under the id, and the
+        # former folder made again by a process that read the recorded path,
+        # with a session nobody signed in. That file is left as it is.
+        self.entry["session"] = str(self.old / "session")
+        write_session(self.new / "session", signed_in_as=self.ACCOUNT)
+        self.account_records(self.new)
+        (self.new / "service").mkdir()
+        stray = write_session(self.old / "session", auth_key=b"")
+        (self.old / "service").mkdir()
+        before = stray.read_bytes()
+        self.assertEqual(self.resolve(), str(self.new / "session"))
+        self.assert_account_records_at_the_account()
+        self.assertEqual(stray.read_bytes(), before)
+        self.assertEqual(self.cli._connections_report()["connections"][self.CID]["session"],
+                         {"live": True, "account": str(self.ACCOUNT)})
+
+    def test_records_already_at_the_account_are_not_written_over(self):
+        self.account_records(self.new)
+        (self.new / "control" / "owner.json").write_text('{"moved": true}')
+        write_session(self.new / "session", signed_in_as=self.ACCOUNT)
+        (self.old / "control").mkdir(parents=True)
+        (self.old / "control" / "owner.json").write_text("{}")
+        (self.old / "linked-by.json").write_text(json.dumps(
+            {"connection": "elsewhere", "owner": None}))
+        self.resolve()
+        self.assertEqual((self.old / "control" / "owner.json").read_text(), "{}")
+        self.assertEqual(self.cli._require_ownership_marker(self.ACCOUNT)["account_id"],
+                         self.ACCOUNT)
+        self.assertEqual(self.cli._linked_by(str(self.ACCOUNT))["connection"], "elsewhere")
+        self.assertEqual((self.new / "control" / "owner.json").read_text(), '{"moved": true}')
+        self.assertTrue((self.new / "linked-by.json").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

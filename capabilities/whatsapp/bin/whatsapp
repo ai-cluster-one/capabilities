@@ -6705,13 +6705,21 @@ def _first_link(cid: str, entry: dict | None):
     and without `--events` the verb is unchanged."""
     entry = entry if isinstance(entry, dict) else {}
     engine, _waha_engine, _stated = _entry_engine(entry)
+    if (not _EVENTS_ON[0] or engine != ENGINE_INHOUSE
+            or _digits(entry.get("expected_account_id"))):
+        yield
+        return
     root = _state_dir()
-    homes = {_connection_state_dir(root, cid)}
+    homes = {root / cid}
     if _digits(entry.get("number")):
         homes.add(root / _digits(entry.get("number")))
-    if (not _EVENTS_ON[0] or engine != ENGINE_INHOUSE
-            or _digits(entry.get("expected_account_id"))
-            or any(home.exists() for home in homes)):
+    # A home made under the connection's former name is looked at where it
+    # is, not moved: moving it is `_account_home`'s, once the link is bound.
+    former = _connection_former_name(cid)
+    made = (root / former if former and former not in (".", "..") and "/" not in former
+            else None)
+    if (any(home.exists() for home in homes)
+            or (made is not None and (made.exists() or made.is_symlink()))):
         yield
         return
     cancelling = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
