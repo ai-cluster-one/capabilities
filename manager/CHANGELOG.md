@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-08 — `store-major-3` is the release line of store schema major 3
+
+This branch keeps the last release of store major 3 after `main` moves to major 4. Its manager names `STORE_LIBRARY` `>=0.44,<0.45`, which `source index` stamps as `library` into the release manifest and the catalogue, so `self-update` and `update` on a machine whose store is still at major 3 take this line and hold the manager and every capability on capabilities-contract 0.44, the last library that reads major 3. It takes only fixes and what major 3 needs to reach `capabilities store upgrade`.
+
 ## 2026-11-08 — `teams` is core, and its block carries the agent's teams from the store
 
 `teams` joins `CORE_CAPABILITIES`, so its first install from the official catalogue arrives allowed and enabled at global scope as the other core capabilities do, `list` and `inventory` mark it `core`, and it is disabled per agent as any core capability is. While it is enabled, `capabilities context` (`--fragment` and the host modes) and `capabilities build` add, after its constant contribution, the agent's own teams as the store holds them at that composition: every team the agent is a member of by its line, and for a team in always mode its enabled always documents whole, each headed `### Team <team>: <document>`, and its enabled on-request documents by their line. The part reads nothing that changes between sessions; it is empty for an agent in no team or without a store, and is one line naming the failure where the store does not answer, costing no other block. Nothing else in composition changes.
