@@ -1,6 +1,6 @@
 """Carrying memory folders into the store: a dry run with every decision, an
-apply that enables, joins and renders, and a second apply that carries
-nothing twice."""
+apply that enables and carries, and a second apply that carries nothing
+twice."""
 
 from __future__ import annotations
 
@@ -57,15 +57,12 @@ def test_apply_enables_carries_and_is_idempotent(world, tmp_path):
     project = out["projects"][0]
     assert project["enabled"]["ok"], project
     assert project["counts"]["carried"] == 2
-    # A project in files mode cannot be placed on the machine service, and says so.
-    assert project["joined"]["joined"] is False and "store" in project["joined"]["why"]
-    assert project["context"]["rendered"]
+    assert "joined" not in project and "context" not in project
     gate = json.loads((root / "capabilities" / "settings.json").read_text())
     assert gate["capabilities"]["memory"] == {"enabled": True}
     entries = {e["title"]: e for e in world.ok(root, "list", "--json")["entries"]}
     assert entries["Owner decision on stores"]["pinned"] is True
     assert entries["What memory is for"]["created_at"] == "2026-09-14T00:01:00Z"
-    # The list is the node manager's, so adopt writes none.
     assert not (world.config / "memory" / "service" / "projects.json").exists()
 
     again = world.ok(tmp_path, "adopt", str(root), "--apply")["projects"][0]

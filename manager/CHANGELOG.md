@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-08 — A context contribution is the constant block its declaration carries
+
+A capability's manifest `contribution` is now `{"markdown": <block>}`: the block itself, non-empty, at most 32768 UTF-8 bytes, and any other key refused. `capabilities context` - `--fragment` and the host modes alike - and `capabilities build` compose it after the capability's stub line from the manifest snapshot recorded at install, reading no file in the project envelope and no store, so the composed block is the same in every session. The earlier form, `{"path", "max_bytes"}` naming a file the capability kept rendered under its `state/` folder, is no longer accepted: `capabilities audit`, `source check` and `install` refuse it with exit 6 `manifest_invalid`, and a snapshot that still carries it is replaced by one line saying the contribution is unavailable and pointing to `capabilities update <name>`, where it pointed to `<name> render`; every other part of the context is composed as before. DOCTRINE rule 2, SHEBANG.md's manifest table and TEMPLATE.md say so. `memory` is the one capability that declares a contribution, and its release that declares the new form ships with this one. Run `capabilities help` for the details.
+
 ## 2026-11-08 — The context `build` composes speaks only of the store and names no ContextKit
 
 The always-on runtime text `capabilities build` composes is short and store-era: the agent's layers are read and written through `context`, `assets`, `routine` and `memory`, with no folder-layer description, no `.contextkit/` binding line and no edit-source-files rule, and folder-held layers are still composed as before. The build no longer warns about a legacy memory folder, and composed context no longer carries the `<!-- contextkit:memory-contribution -->` line. The guide menu offers `context guide authoring`, `context guide groom` and `assets guide authoring` beside `routine guide authoring`.

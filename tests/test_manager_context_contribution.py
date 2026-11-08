@@ -1,12 +1,11 @@
 """A capability's declared context contribution in the composed project context.
 
-A manifest may declare `contribution`, a Markdown file inside the capability's
-own state folder in the project envelope and the most bytes to compose from
-it. Where the capability is enabled the manager places that file directly
-after its stub line, reading the file and nothing else; whatever stops the
-read costs that block alone, which one line pointing to `<name> render`
-replaces. The manager validates the declaration wherever it validates a
-manifest.
+A manifest may declare `contribution`, the constant Markdown block itself.
+Where the capability is enabled the manager places that block directly after
+its stub line, taken from the manifest snapshot and reading no file and no
+store; a declaration it does not accept costs that block alone, which one line
+pointing to `capabilities update <name>` replaces. The manager validates the
+declaration wherever it validates a manifest.
 """
 
 from __future__ import annotations
@@ -26,7 +25,8 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 MANAGER = REPO / "bin" / "capabilities"
 NAME = "contribfix"
-DECLARED = {"path": "state/context.md", "max_bytes": 200}
+DECLARED = {"markdown": "\n### Recent\n\n- the first entry\n- the second entry\n\n"}
+UNAVAILABLE = "The context contribution of `{name}` is unavailable: "
 
 
 def _manager_module():
@@ -106,15 +106,11 @@ def _project(tmp_path: Path, *enabled: str) -> Path:
     return root
 
 
-def _render(project: Path, name: str, text: str | bytes,
-            rel: str = "state/context.md") -> Path:
-    path = project / "capabilities" / name / rel
+def _stale_file(project: Path, name: str) -> None:
+    """The file an earlier release rendered, which composition no longer reads."""
+    path = project / "capabilities" / name / "state" / "context.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(text, bytes):
-        path.write_bytes(text)
-    else:
-        path.write_text(text)
-    return path
+    path.write_text("- read from a rendered file\n")
 
 
 def _ids(project: Path, name: str) -> None:
@@ -140,7 +136,6 @@ def test_a_declared_contribution_follows_its_stub_line(tmp_path):
     _snapshot(tmp_path, "demo", DECLARED)
     _snapshot(tmp_path, "plain")
     project = _project(tmp_path, "demo", "plain")
-    _render(project, "demo", "\n### Recent\n\n- the first entry\n- the second entry\n\n")
     _ids(project, "demo")
 
     sections = _sections(_fragment(tmp_path, project))
@@ -153,9 +148,8 @@ def test_a_declared_contribution_follows_its_stub_line(tmp_path):
 
 
 def test_the_host_modes_carry_the_contribution(tmp_path):
-    _snapshot(tmp_path, "demo", DECLARED)
+    _snapshot(tmp_path, "demo", {"markdown": "- remembered here\n"})
     project = _project(tmp_path, "demo")
-    _render(project, "demo", "- remembered here\n")
     env = _env(tmp_path)
     env["CLAUDE_PROJECT_DIR"] = str(project)
 
@@ -165,21 +159,23 @@ def test_the_host_modes_carry_the_contribution(tmp_path):
     assert "Run `demo help`.\n\n- remembered here\n" in placed
 
 
-def test_an_empty_contribution_adds_nothing(tmp_path):
+def test_the_block_is_the_declaration_and_no_file_is_read(tmp_path):
     _snapshot(tmp_path, "demo", DECLARED)
     project = _project(tmp_path, "demo")
-    _render(project, "demo", "\n  \n")
+    first = _fragment(tmp_path, project)
+    _stale_file(project, "demo")
 
-    section = _sections(_fragment(tmp_path, project))["demo"]
+    again = _fragment(tmp_path, project)
 
-    assert section.strip() == "Work with demo records. Run `demo help`."
+    assert again == first
+    assert "read from a rendered file" not in again
+    assert "- the first entry\n- the second entry\n" in _sections(again)["demo"]
 
 
 def test_a_disabled_capability_contributes_nothing(tmp_path):
-    _snapshot(tmp_path, "demo", DECLARED)
+    _snapshot(tmp_path, "demo", {"markdown": "- must not appear\n"})
     _snapshot(tmp_path, "plain")
     project = _project(tmp_path, "plain")
-    _render(project, "demo", "- must not appear\n")
 
     fragment = _fragment(tmp_path, project)
 
@@ -187,36 +183,35 @@ def test_a_disabled_capability_contributes_nothing(tmp_path):
     assert "demo" not in _sections(fragment)
 
 
-def _break(kind: str, tmp_path: Path, project: Path, name: str = "demo") -> None:
-    if kind == "missing":
-        return
-    if kind == "oversized":
-        _render(project, name, "x" * (DECLARED["max_bytes"] + 1))
-    elif kind == "not utf-8":
-        _render(project, name, b"\xff\xfe broken")
-    elif kind == "a directory":
-        (project / "capabilities" / name / "state" / "context.md").mkdir(parents=True)
-    elif kind == "outside the state folder":
-        outside = tmp_path / "elsewhere.md"
-        outside.write_text("- read from elsewhere\n")
-        link = project / "capabilities" / name / "state" / "context.md"
-        link.parent.mkdir(parents=True)
-        link.symlink_to(outside)
-    else:
-        raise AssertionError(kind)
+MALFORMED = {
+    "the earlier file form": {"path": "state/context.md", "max_bytes": 200},
+    "empty": {"markdown": ""},
+    "blank": {"markdown": "\n  \n"},
+    "not a string": {"markdown": 7},
+    "an unknown key": {"markdown": "- must not appear\n", "extra": True},
+    "over the ceiling": {"markdown": "- must not appear\n" + "x" * M.CONTRIBUTION_MAX_BYTES},
+    "not an object": "- must not appear",
+}
 
 
-FAILURES = ["missing", "oversized", "not utf-8", "a directory", "outside the state folder"]
+@pytest.mark.parametrize("shape", sorted(MALFORMED))
+def test_a_malformed_declaration_costs_only_its_own_block(tmp_path, shape):
+    _snapshot(tmp_path, "demo", MALFORMED[shape])
+    _snapshot(tmp_path, "other", {"markdown": "- kept by the other\n"})
+    project = _project(tmp_path, "demo", "other")
+    _stale_file(project, "demo")
+    _ids(project, "demo")
 
+    fragment = _fragment(tmp_path, project)
 
-def _assert_only_demo_degraded(fragment: str) -> None:
     sections = _sections(fragment)
     demo = sections["demo"]
     assert demo.startswith("\nWork with demo records. Run `demo help`.\n\n"
-                           "The context contribution of `demo` is unavailable: ")
+                           + UNAVAILABLE.format(name="demo"))
     unavailable = [line for line in demo.splitlines() if "unavailable" in line]
-    assert len(unavailable) == 1 and unavailable[0].endswith("`demo render` rebuilds it.")
-    assert "read from elsewhere" not in demo
+    assert len(unavailable) == 1 and "declaration is malformed" in unavailable[0]
+    assert unavailable[0].endswith("`capabilities update demo` installs one this manager reads.")
+    assert "must not appear" not in fragment and "read from a rendered file" not in fragment
     # The capability keeps the rest of its block, and the other keeps all of its own.
     assert "- Identifiers (1): run `capabilities ids demo`" in demo
     assert sections["other"].startswith(
@@ -224,51 +219,15 @@ def _assert_only_demo_degraded(fragment: str) -> None:
     assert "unavailable" not in sections["other"]
 
 
-@pytest.mark.parametrize("kind", FAILURES)
-def test_each_unreadable_contribution_costs_only_its_own_block(tmp_path, kind):
-    _snapshot(tmp_path, "demo", DECLARED)
-    _snapshot(tmp_path, "other", DECLARED)
-    project = _project(tmp_path, "demo", "other")
-    _render(project, "other", "- kept by the other\n")
-    _break(kind, tmp_path, project)
-    _ids(project, "demo")
-
-    _assert_only_demo_degraded(_fragment(tmp_path, project))
-
-
-@pytest.mark.parametrize("declared", [
-    {"path": "/etc/passwd", "max_bytes": 200},
-    {"path": "state/../identifiers.json", "max_bytes": 200},
-    {"path": "state/context.md", "max_bytes": 0},
-    {"path": "state/context.md", "max_bytes": 200, "extra": True},
-    "state/context.md",
-])
-def test_a_malformed_declaration_costs_only_its_own_block(tmp_path, declared):
-    _snapshot(tmp_path, "demo", declared)
-    _snapshot(tmp_path, "other", DECLARED)
-    project = _project(tmp_path, "demo", "other")
-    _render(project, "other", "- kept by the other\n")
-    _render(project, "demo", "- must not appear\n")
-    _ids(project, "demo")
-
-    fragment = _fragment(tmp_path, project)
-
-    _assert_only_demo_degraded(fragment)
-    assert "declaration is malformed" in _sections(fragment)["demo"]
-    assert "must not appear" not in fragment
-
-
 # --- the memory marker -----------------------------------------------------------
 
 # The line an earlier release composed above a memory contribution.
 MEMORY_MARKER = "<!-- contextkit:memory-contribution -->"
 
-def test_a_composed_memory_contribution_carries_the_marker_once(tmp_path):
-    _snapshot(tmp_path, "memory", DECLARED)
+def test_a_composed_memory_contribution_carries_no_marker(tmp_path):
+    _snapshot(tmp_path, "memory", {"markdown": "- remembered here\n"})
     _snapshot(tmp_path, "demo", DECLARED)
     project = _project(tmp_path, "memory", "demo")
-    _render(project, "memory", "- remembered here\n")
-    _render(project, "demo", "- kept by demo\n")
 
     fragment = _fragment(tmp_path, project)
     sections = _sections(fragment)
@@ -280,41 +239,16 @@ def test_a_composed_memory_contribution_carries_the_marker_once(tmp_path):
         "\nWork with memory records. Run `memory help`.\n\n- remembered here\n\n")
 
 
-@pytest.mark.parametrize("kind", ["empty", *FAILURES])
-def test_a_memory_contribution_not_composed_carries_no_marker(tmp_path, kind):
-    _snapshot(tmp_path, "memory", DECLARED)
+def test_a_memory_contribution_not_composed_carries_no_marker(tmp_path):
+    _snapshot(tmp_path, "memory", MALFORMED["the earlier file form"])
     project = _project(tmp_path, "memory")
-    if kind == "empty":
-        _render(project, "memory", "\n  \n")
-    else:
-        _break(kind, tmp_path, project, "memory")
+    _stale_file(project, "memory")
 
     fragment = _fragment(tmp_path, project)
 
     assert MEMORY_MARKER not in fragment
-    if kind != "empty":
-        assert "The context contribution of `memory` is unavailable: " in fragment
-
-
-def test_the_contribution_is_read_from_the_envelope_the_project_resolves(tmp_path):
-    """The envelope is asked for, never assumed at <root>/capabilities."""
-    _snapshot(tmp_path, "demo", DECLARED)
-    project = tmp_path / "project"
-    (project / ".git").mkdir(parents=True)
-    envelope = project / "body" / "capabilities"
-    envelope.mkdir(parents=True)
-    (envelope / "settings.json").write_text(json.dumps({
-        "capabilities": {"demo": {"enabled": True}}}))
-    (envelope / "demo" / "state").mkdir(parents=True)
-    (envelope / "demo" / "state" / "context.md").write_text("- from the moved envelope\n")
-    env = _env(tmp_path)
-    env.update({"CAPABILITIES_PROJECT_ENVELOPE": str(envelope),
-                "CAPABILITIES_PROJECT_ENVELOPE_ROOT": str(project)})
-
-    result = _manager(env, project, "context", "--fragment")
-
-    assert result.returncode == 0, result.stderr
-    assert "Run `demo help`.\n\n- from the moved envelope\n" in result.stdout
+    assert UNAVAILABLE.format(name="memory") in fragment
+    assert "read from a rendered file" not in fragment
 
 
 # --- the manifest declaration ----------------------------------------------------
@@ -327,29 +261,23 @@ def _manifest(**extra) -> dict:
 
 ACCEPTED = [
     DECLARED,
-    {"path": "state/context.md", "max_bytes": 1},
-    {"path": "state/render/block.md", "max_bytes": M.CONTRIBUTION_MAX_BYTES},
+    {"markdown": "x"},
+    # Exactly the ceiling, in two-byte characters.
+    {"markdown": "é" * (M.CONTRIBUTION_MAX_BYTES // 2)},
 ]
 
 REFUSED = {
-    "not an object": "state/context.md",
+    "not an object": "- a block",
     "null": None,
     "an unknown key": dict(DECLARED, extra="rides in"),
-    "path missing": {"max_bytes": 200},
-    "an absolute path": dict(DECLARED, path="/tmp/context.md"),
-    "a path outside state": dict(DECLARED, path="context.md"),
-    "a path escaping state": dict(DECLARED, path="state/../connections.json"),
-    "a dot segment": dict(DECLARED, path="state/./context.md"),
-    "an empty segment": dict(DECLARED, path="state//context.md"),
-    "a backslash": dict(DECLARED, path="state\\context.md"),
-    "not markdown": dict(DECLARED, path="state/context.txt"),
-    "the state folder itself": dict(DECLARED, path="state/"),
-    "max_bytes missing": {"path": "state/context.md"},
-    "max_bytes zero": dict(DECLARED, max_bytes=0),
-    "max_bytes negative": dict(DECLARED, max_bytes=-1),
-    "max_bytes a string": dict(DECLARED, max_bytes="200"),
-    "max_bytes a boolean": dict(DECLARED, max_bytes=True),
-    "max_bytes over the ceiling": dict(DECLARED, max_bytes=M.CONTRIBUTION_MAX_BYTES + 1),
+    "markdown missing": {},
+    "the earlier file form": {"path": "state/context.md", "max_bytes": 200},
+    "empty": {"markdown": ""},
+    "blank": {"markdown": " \n\t\n"},
+    "a number": {"markdown": 7},
+    "a list": {"markdown": ["- a block"]},
+    "over the ceiling in bytes": {"markdown": "é" * (M.CONTRIBUTION_MAX_BYTES // 2 + 1)},
+    "not encodable": {"markdown": "- a block \ud800"},
 }
 
 
@@ -417,15 +345,15 @@ def test_a_valid_declaration_passes_audit_source_check_and_install(tmp_path):
 
 
 def test_an_invalid_declaration_is_refused_at_audit_source_check_and_install(tmp_path):
-    results = _surfaces(tmp_path, REFUSED["a path escaping state"])
+    results = _surfaces(tmp_path, REFUSED["the earlier file form"])
     audit = results["audit"]
     assert audit.returncode == 7, audit.stdout + audit.stderr
-    assert any("contribution.path" in f for f in json.loads(audit.stdout)["failures"])
+    assert any("contribution.markdown" in f for f in json.loads(audit.stdout)["failures"])
     check = results["source check"]
     assert check.returncode == 7, check.stdout + check.stderr
-    assert "contribution.path" in json.dumps(json.loads(check.stdout)["failures"].get(NAME))
+    assert "contribution.markdown" in json.dumps(json.loads(check.stdout)["failures"].get(NAME))
     install = results["install"]
     assert install.returncode == 6, install.stdout + install.stderr
     error = _error(install)
-    assert error["code"] == "manifest_invalid" and "contribution.path" in error["hint"]
+    assert error["code"] == "manifest_invalid" and "contribution.markdown" in error["hint"]
     assert not (tmp_path / "registry" / NAME).exists()

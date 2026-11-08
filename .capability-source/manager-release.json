@@ -1,10 +1,10 @@
 {
   "assets": {
-    "DOCTRINE.md": "0cb4397b93a247270205a9b74db4ddb6d669e822ad1c5b23d658b28b79fea3df",
+    "DOCTRINE.md": "edb93690a75e01072cded36eb5342bdbf392040537f01861337f5b41fcfc87ad",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "136c4c4e5d819a80dbd0022be243e5c216b936087483779764608b9f3b1e45d1",
+    "SHEBANG.md": "7412bb57812bc9a5860e48ba2414c3c8a79a2728d866ff5364f549fa9794e9e9",
     "SOURCES.md": "2bddcf041b3c4175c36fa64cf26cc1aabf8b2defa0640ced302570f60c6444eb",
-    "TEMPLATE.md": "db10523526e15a6f06f5e4836e2e1aae27b56a4a70fe2883f4df9277a137ef16",
+    "TEMPLATE.md": "94d574fd3c53ab7bc5f101b40959b493a931b2371a799f4e51a23166257bef19",
     "contract/CHANGELOG.md": "b9e2a6b9b186694d6b141c3cd1e67ef996559032c1d8a253c190e34afbd88443",
     "guides/authoring.md": "1f557d6fc130a2efd1f8b93e7cb6b978b9f1590624cd7adaa12c817d6c6cfc4a",
     "guides/conforming.md": "d2724037c42aea0d0528b429be0eb14a16b558426ee3982b4a6f541a342e7361",
@@ -20,12 +20,12 @@
     "guides/store-upgrade.md": "9e80c17df03ccf584d08ebc287c7ec5b6c9b4df4ddeb39ce9ae1f8559c24073b",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "6ebd0975b55305985179d56bbb133efb8915dbd5cc3b585283d5ce235819b981",
+    "manager/CHANGELOG.md": "376cbd61e38483c2aa1690c56a9ffed43d27059efaf33afc8e644ef1a786753b",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "729a7ee8fcab96ecca4b421053af3aa7d22e283965be29ab06cac789e91b3383"
+    "sha256": "150a64423de95feae53f52a9a509a3d77d272bf0511e6b85f679bab34f1cadce"
   },
   "schema": "capabilities.manager-release.v1",
   "store_major": 3

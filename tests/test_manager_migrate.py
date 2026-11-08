@@ -551,7 +551,7 @@ def build_agents(w: World) -> None:
         "{env}/tasks/workers/reviewer.md": WORKER,
     })
     w.agent("later", IDS["later"], {
-        "{env}/settings.json": gate("memory"),
+        "{env}/settings.json": gate("memory", "automations"),
         "{env}/memory/service/settings.json": {"window_days": 3},
         "deployment/runtime.json": {"schema": "capabilities.deployment.runtime.v1",
                                     "name": "later", "profile": "container",
@@ -1119,7 +1119,7 @@ def test_finalize_waits_for_every_target_node(world):
     done = world.answer(world.manager(root, "migrate", "--apply", "--answers", answers))
     assert done["state"] == "migrated"
     assert world.sql("SELECT capability FROM policies WHERE agent_id = %s AND "
-                     "node = 'srv-later'", (IDS["later"],)) == [("memory",)]
+                     "node = 'srv-later'", (IDS["later"],)) == [("automations",)]
 
 
 # --- report and discard -----------------------------------------------------------------

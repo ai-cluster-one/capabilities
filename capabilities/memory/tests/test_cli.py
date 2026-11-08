@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -31,23 +32,28 @@ def tree(root: Path) -> str:
     return digest.hexdigest()
 
 
-def test_manifest_declares_the_contribution_and_the_service(tmp_path):
+def test_manifest_declares_the_constant_block_and_no_service(tmp_path):
     world = World(tmp_path, None)
     manifest = world.ok(tmp_path, "manifest", "--json")
-    assert manifest["contribution"] == {"path": "state/context.md", "max_bytes": 32768}
-    assert manifest["tables"] is True and manifest["state"] is True
-    machine = manifest["service"]["machine"]
-    assert machine["command"] == ["memory", "service", "run", "--machine"]
-    for verb in ("init", "doctor", "run", "start", "reload", "stop", "status", "logs"):
-        assert verb in manifest["service"]["verbs"]
-    assert not {"join", "leave"} & set(manifest["service"]["verbs"])
+    assert set(manifest["contribution"]) == {"markdown"}
+    block = manifest["contribution"]["markdown"]
+    marks = ["built-in memory", "`memory add \"", "`memory search \"<terms>\"`", "subagent",
+             "`memory show <id>`", "`memory help`"]
+    places = [block.index(mark) for mark in marks]
+    assert places == sorted(places)
+    assert not re.search(r"\d+ active entr", block)
+    for words in ("No entries yet", "--since", "newest written", "_Rendered", "memory render"):
+        assert words not in block
+    assert not any(line.startswith("#") for line in block.splitlines())
+    assert "service" not in manifest
+    assert manifest["tables"] is True and manifest["state"] is False
     assert manifest["docs"]["topics"] == sorted(manifest["docs"]["topics"])
 
 
 def test_without_a_store_every_store_verb_refuses(tmp_path):
     world = World(tmp_path, None)
     root = world.project("p")
-    for args in (("add", "x", "--title", "t"), ("list",), ("render",)):
+    for args in (("add", "x", "--title", "t"), ("list",), ("groom", "--if-due")):
         done = world.run(root, *args)
         assert done.returncode == 6, done.stderr
         assert error(done)["code"] == "store_not_configured"
@@ -58,7 +64,7 @@ def test_write_read_and_the_block(world):
     root = world.project("p")
     added = world.ok(root, "add", "Bare dates are UTC.", "--title", "Dates", "--pin")
     assert added["created"] and added["entry"]["pinned"]
-    assert added["context"]["rendered"] and added["context"]["fits"]
+    assert "context" not in added
     again = world.ok(root, "add", "Bare dates are UTC.", "--title", "Dates", "--pin")
     assert again["created"] is False
     world.ok(root, "add", "-", "--title", "From stdin", stdin="read from stdin\n")
@@ -80,21 +86,13 @@ def test_write_read_and_the_block(world):
     status = world.ok(root, "status")
     assert status["entries"]["active"] == 2 and status["entries"]["pinned"] == 1
     assert status["writes"]["last_7_days"] == 2
-    assert status["context"]["current"] is True
+    assert "context" not in status and "service" not in status
 
-    context = root / "capabilities" / "memory" / "state" / "context.md"
-    text = context.read_text()
-    assert "2 active entries" in text and "Dates" not in text and "From stdin" not in text
-    sidecar = json.loads(context.with_suffix(".json").read_text())
-    assert sidecar["last_event"] == status["last_event"]
-
-    before = tree(root)
-    fragment = world.run(root, "render", "--fragment")
-    assert fragment.returncode == 0 and "2 active entries" in fragment.stdout
-    assert tree(root) == before
+    # Nothing renders a block: no write leaves a file in the envelope's state.
+    assert not (root / "capabilities" / "memory" / "state").exists()
 
     doctor = world.ok(root, "doctor")
-    assert doctor["ok"] and doctor["context"]["current"]
+    assert doctor["ok"] and "context" not in doctor and "service" not in doctor
 
 
 @needs_store
@@ -144,7 +142,8 @@ def test_the_read_only_switch_refuses_writes_and_leaves_reads(world):
         assert done.returncode == 4, (args, done.stderr)
         assert error(done)["code"] == "read_only_switch"
     assert world.ok(root, "list", "--json", CAPABILITIES_READ_ONLY="1")["total"] == 1
-    assert world.ok(root, "render", CAPABILITIES_READ_ONLY="1")["active"] == 1
+    done = world.run(root, "groom", "--if-due", CAPABILITIES_READ_ONLY="1")
+    assert done.returncode == 4 and error(done)["code"] == "read_only_switch"
 
 
 @needs_store
@@ -157,18 +156,6 @@ def test_policy_and_identity(world):
     (root / ".env.local").unlink()
     done = world.run(root, "add", "x", "--title", "t")
     assert done.returncode == 6 and error(done)["code"] == "no_project_identity"
-
-
-@needs_store
-def test_doctor_finds_a_block_behind_the_store(world):
-    root = world.project("p")
-    world.ok(root, "add", "x", "--title", "t")
-    (root / "capabilities" / "memory" / "state" / "context.md").unlink()
-    done = world.run(root, "doctor")
-    assert done.returncode == 7
-    assert json.loads(done.stdout)["context"]["exists"] is False
-    world.ok(root, "render")
-    assert world.ok(root, "doctor")["ok"]
 
 
 @needs_store
@@ -203,40 +190,15 @@ def test_doctor_warns_of_an_earlier_release_grooming_against_the_store(world):
 
 
 @needs_store
-def test_a_render_that_changes_nothing_leaves_the_block_as_written(world):
-    root = world.project("p")
-    entry = world.ok(root, "add", "x", "--title", "t")["entry"]
-    context = root / "capabilities" / "memory" / "state" / "context.md"
-    head, _, stamp = context.read_text().rpartition("_Rendered ")
-    context.write_text(head + "_Rendered 2000-01-01 00:00" + stamp[len("2000-01-01 00:00"):])
-    written = context.read_bytes()
-    world.ok(root, "render")
-    assert context.read_bytes() == written
-    # A change in the store that leaves the block the same: the doctor finds the
-    # block behind the store, and a render brings it current without a rewrite.
-    from _cli import engine, setting
-    with engine().Store(setting(world.schema)).open() as store:
-        store.set_pin(project_id(root), entry["id"], True, actor="elsewhere",
-                      node="another-node")
-    assert world.run(root, "doctor").returncode == 7
-    assert world.ok(root, "render")["last_event"] == world.ok(root, "status")["last_event"]
-    assert context.read_bytes() == written
-    assert world.ok(root, "doctor")["context"]["current"]
-    world.ok(root, "add", "y", "--title", "u")
-    text = context.read_text()
-    assert "2 active entries" in text and "2000-01-01" not in text
-
-
-@needs_store
-def test_settings_shape_the_block_and_bad_ones_refuse(world):
+def test_settings_shape_the_window_and_bad_ones_refuse(world):
     root = world.project("p")
     settings = root / "capabilities" / "memory" / "service" / "settings.json"
     settings.parent.mkdir(parents=True)
     settings.write_text(json.dumps({"version": 1, "window_days": 1, "min_entries": 0}))
     world.ok(root, "add", "x", "--title", "t")
-    assert world.ok(root, "render")["window"] == 1
+    assert world.ok(root, "groom", "--if-due")["window"]["window"] == 1
     settings.write_text(json.dumps({"window_days": "a month"}))
-    done = world.run(root, "render")
+    done = world.run(root, "groom", "--if-due")
     assert done.returncode == 6 and error(done)["code"] == "settings_invalid"
 
 
@@ -252,15 +214,8 @@ def test_export_and_inventory(world, tmp_path):
     before = tree(root)
     inventory = world.ok(root, "inventory")
     assert inventory["metrics"] == [] and inventory["items"] == []
-    assert inventory["service"] == {"state": "stopped", "ok": True}
+    assert inventory["service"] is None
     assert tree(root) == before
-
-
-def test_inventory_names_a_missing_block(tmp_path):
-    world = World(tmp_path, None)
-    root = world.project("p")
-    service = world.ok(root, "inventory")["service"]
-    assert service["ok"] is False and "memory render" in service["problem"]
 
 
 @needs_store

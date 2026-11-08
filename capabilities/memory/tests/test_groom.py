@@ -90,12 +90,10 @@ def test_apply_then_undo(world, tmp_path):
                    FAKE_GROOM_PLAN=plan_file(tmp_path, good_plan(ids)))
     applied = out["applied"]
     assert len(applied["merges"]) == 1 and len(applied["drops"]) == 1
-    assert out["context"]["rendered"]
+    assert "context" not in out
     titles = {e["title"]: e for e in world.ok(root, "list", "--json")["entries"]}
     assert set(titles) == {"alpha and beta", "pinned"}
     assert titles["alpha and beta"]["merged"]["count"] == 2
-    block = (root / "capabilities" / "memory" / "state" / "context.md").read_text()
-    assert "2 active entries" in block and "alpha" not in block
     status = world.ok(root, "status")
     assert status["grooming"]["passes"] == 1
 
@@ -135,3 +133,72 @@ def test_nothing_to_groom_spends_no_turn(world, tmp_path):
     record = tmp_path / "turns.jsonl"
     out = world.ok(root, "groom", FAKE_ENGINE_RECORD=record)
     assert "nothing_to_do" in out and not record.exists()
+
+
+def crowded(world, root, tmp_path, **settings):
+    """A project whose window no longer fits, even after the pass the plan
+    answers, and that plan."""
+    path = root / "capabilities" / "memory" / "service" / "settings.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"version": 1, "block_chars": 2000, "entry_chars": 1000,
+                                "quiet_minutes": 0, **settings}))
+    ids = [world.ok(root, "add", f"entry {i} " + "z" * 700, "--title", f"e{i}")["entry"]["id"]
+           for i in range(6)]
+    return plan_file(tmp_path, {"merges": [{"sources": ids[:2], "title": "merged",
+                                            "body": "the first two, merged", "reason": "x"}],
+                                "drops": []})
+
+
+def test_if_due_runs_no_pass_while_the_window_fits(world, tmp_path):
+    root = world.project("p")
+    seed(world, root)
+    record = tmp_path / "turns.jsonl"
+    before = world.ok(root, "status")["last_event"]
+    out = world.ok(root, "groom", "--if-due", FAKE_ENGINE_RECORD=record)
+    assert out["due"] is False and out["why"].startswith("the window fits")
+    assert out["window"]["fits"] is True
+    assert not record.exists() and world.ok(root, "status")["last_event"] == before
+
+
+def test_if_due_applies_a_pass_once_and_then_waits_the_interval(world, tmp_path):
+    root = world.project("p")
+    plan = crowded(world, root, tmp_path)
+    out = world.ok(root, "groom", "--if-due", FAKE_GROOM_PLAN=plan)
+    assert out["due"] is True and out["mode"] == "apply"
+    assert len(out["applied"]["merges"]) == 1
+    groom = next(e for e in world.ok(root, "log", "--json")["events"] if e["kind"] == "groom")
+    assert groom["reason"] == "scheduled: the window no longer fits"
+    record = tmp_path / "turns.jsonl"
+    again = world.ok(root, "groom", "--if-due", FAKE_GROOM_PLAN=plan, FAKE_ENGINE_RECORD=record)
+    assert again["due"] is False and "groom_interval_hours" in again["why"]
+    assert not record.exists()
+
+
+@pytest.mark.parametrize("settings, env, words", [
+    ({"consolidate": False}, {}, "consolidate is false"),
+    ({"quiet_minutes": 60}, {}, "quiet_minutes"),
+    ({}, {"FAKE_LOGGED_IN": "0"}, "not logged in"),
+])
+def test_if_due_says_why_no_pass_is_due(world, tmp_path, settings, env, words):
+    root = world.project("p")
+    plan = crowded(world, root, tmp_path, **settings)
+    record = tmp_path / "turns.jsonl"
+    before = world.ok(root, "status")["last_event"]
+    out = world.ok(root, "groom", "--if-due", FAKE_GROOM_PLAN=plan, FAKE_ENGINE_RECORD=record,
+                   **env)
+    assert out["due"] is False and words in out["why"], out
+    assert not record.exists() and world.ok(root, "status")["last_event"] == before
+
+
+def test_if_due_is_not_due_while_another_pass_holds_the_lease(world, tmp_path):
+    import psycopg
+    from _cli import DSN, project_id
+    root = world.project("p")
+    plan = crowded(world, root, tmp_path)
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"INSERT INTO {world.schema}.memory_groom_leases "
+                     "(agent_id, holder, expires_at) "
+                     "VALUES (%s, gen_random_uuid(), now() + interval '1 hour')",
+                     (project_id(root),))
+    out = world.ok(root, "groom", "--if-due", FAKE_GROOM_PLAN=plan)
+    assert out["due"] is False and "another grooming pass" in out["why"]

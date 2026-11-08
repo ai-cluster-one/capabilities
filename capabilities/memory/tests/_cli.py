@@ -24,7 +24,7 @@ import pytest
 CAPABILITY_DIR = Path(__file__).resolve().parents[1]
 CLI_PATH = next((path for path in (CAPABILITY_DIR / "bin" / "memory", CAPABILITY_DIR / "memory")
                  if path.is_file()), CAPABILITY_DIR / "bin" / "memory")
-ENGINE_PATH = CAPABILITY_DIR / "service" / "engine.py"
+ENGINE_PATH = CAPABILITY_DIR / "engine.py"
 FAKES = Path(__file__).resolve().parent / "fakes"
 DSN = os.environ.get("MEMORY_TEST_DSN")
 

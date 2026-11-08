@@ -2027,11 +2027,11 @@ PROJECT VERBS (run inside a consuming project)
         replacing the manager's earlier fallback names and keeping others.
         Composition reads the active records backend and degradation is
         per-capability, never whole. A capability whose manifest declares a
-        `contribution` has that file, read from its own state folder in the
-        project envelope and held to its declared byte ceiling, composed after
-        its stub line; a contribution that is missing, unreadable, malformed
-        or over its ceiling is replaced by one line naming `<name> render`,
-        and costs nothing else. Run by hand, a
+        `contribution` has the constant Markdown block that declaration
+        carries composed after its stub line, from the manifest snapshot
+        taken at install, reading no file and no store; a declaration that is
+        malformed or over the manager's ceiling is replaced by one line naming
+        `capabilities update <name>`, and costs nothing else. Run by hand, a
         host mode prints the file it wrote and the enabled set. Run as the host's SessionStart hook (the
         harness pipes a payload whose hook_event_name is SessionStart), it
         prints nothing unless the session must be told: the file was just
@@ -4356,35 +4356,36 @@ def _validate_service_machine(name: str, machine: object, verbs: object) -> list
     return problems
 
 
-CONTRIBUTION_KEYS = ("path", "max_bytes")
+CONTRIBUTION_KEYS = ("markdown",)
 # The largest context contribution any capability may declare, in UTF-8 bytes:
 # the block is always loaded, so its ceiling is the manager's to hold.
 CONTRIBUTION_MAX_BYTES = 32768
 
 
 def _validate_contribution(contribution: object) -> list[str]:
-    """`contribution`: the bounded block a capability adds to the project
-    context after its stub line. As with `service.machine`, an unknown key is
-    refused, so a key nothing reads cannot ride in."""
+    """`contribution`: the constant Markdown block a capability adds to the
+    project context after its stub line, carried whole in the declaration. As
+    with `service.machine`, an unknown key is refused, so a key nothing reads
+    cannot ride in."""
     if not isinstance(contribution, dict):
         return ["contribution is not an object"]
     problems: list[str] = []
     unknown = sorted(set(contribution) - set(CONTRIBUTION_KEYS))
     if unknown:
         problems.append(f"contribution has unknown key(s): {', '.join(unknown)}")
-    path = contribution.get("path")
-    parts = path.split("/") if isinstance(path, str) else []
-    if (len(parts) < 2 or parts[0] != "state" or "\\" in path
-            or any(part in ("", ".", "..") for part in parts)
-            or not parts[-1].endswith(".md") or parts[-1] == ".md"):
-        problems.append(
-            "contribution.path must be a relative Markdown file under the "
-            "capability's state/ folder")
-    max_bytes = contribution.get("max_bytes")
-    if (isinstance(max_bytes, bool) or not isinstance(max_bytes, int)
-            or not 0 < max_bytes <= CONTRIBUTION_MAX_BYTES):
-        problems.append(
-            f"contribution.max_bytes must be an integer from 1 to {CONTRIBUTION_MAX_BYTES}")
+    markdown = contribution.get("markdown")
+    if not isinstance(markdown, str) or not markdown.strip():
+        problems.append("contribution.markdown must be a non-empty Markdown string")
+    else:
+        try:
+            size = len(markdown.encode("utf-8"))
+        except UnicodeEncodeError:
+            size = None
+        if size is None:
+            problems.append("contribution.markdown must be valid UTF-8 text")
+        elif size > CONTRIBUTION_MAX_BYTES:
+            problems.append(
+                f"contribution.markdown must be at most {CONTRIBUTION_MAX_BYTES} UTF-8 bytes")
     return problems
 
 
@@ -23531,41 +23532,22 @@ def _context_references(adapter, root: Path, name: str) -> list[str]:
     return refs
 
 
-def _context_contribution(root: Path, name: str, manifest: dict | None) -> list[str]:
+def _context_contribution(name: str, manifest: dict | None) -> list[str]:
     """The block a capability's manifest declares after its stub line.
 
-    Files only: the capability keeps the file rendered, so composing reads it
-    and never a store. Whatever stops the read costs this block alone, which
-    one line in its place names along with the verb that rebuilds it."""
+    The declaration carries the block itself, so composing takes it from the
+    manifest snapshot install recorded and reads no file and no store. A
+    declaration this manager does not accept - an earlier release's shape, or
+    one past the ceiling - costs this block alone, which one line in its place
+    names along with the update that replaces it."""
     if "contribution" not in (manifest or {}):
         return []
     contribution = manifest["contribution"]
-    problem = None
     if _validate_contribution(contribution):
-        problem = "its manifest declaration is malformed"
-    else:
-        state = _project_capabilities_dir(root) / name / "state"
-        path = state.parent / contribution["path"]
-        limit = contribution["max_bytes"]
-        try:
-            if not path.resolve().is_relative_to(state.resolve()):
-                problem = "its file resolves outside the capability's state folder"
-            else:
-                with path.open("rb") as handle:
-                    raw = handle.read(limit + 1)
-                if len(raw) > limit:
-                    problem = f"its file exceeds the declared {limit} bytes"
-                else:
-                    text = raw.decode("utf-8").strip("\n").rstrip()
-                    if not text.strip():
-                        return []
-                    return [text, ""]
-        except FileNotFoundError:
-            problem = "its file has not been rendered"
-        except (OSError, RuntimeError, UnicodeDecodeError, ValueError) as exc:
-            problem = f"its file is unreadable: {_md_escape(str(exc))}"
-    return [f"The context contribution of `{name}` is unavailable: {problem}. "
-            f"`{name} render` rebuilds it.", ""]
+        return [f"The context contribution of `{name}` is unavailable: its manifest "
+                f"declaration is malformed. `capabilities update {name}` installs one "
+                "this manager reads.", ""]
+    return [contribution["markdown"].strip("\n").rstrip(), ""]
 
 
 # Set by `init` alone: its offline part (envelope, identity, host wiring) never
@@ -23632,7 +23614,7 @@ def _compose_context(root: Path, build: bool = False) -> str:
                 lines += [f"Enabled but not installed — run `capabilities install {name}`.", ""]
                 continue
             lines += [_md_escape(stub), ""]
-            lines += _context_contribution(root, name, manifest)
+            lines += _context_contribution(name, manifest)
             try:
                 ids = adapter.resolve(name, "identifier")
                 refs = _context_references(adapter, root, name)

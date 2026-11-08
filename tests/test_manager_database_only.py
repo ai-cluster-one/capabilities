@@ -502,7 +502,7 @@ def test_conveyor_moves_into_the_tasks_settings_unless_they_carry_one(world):
 def test_memory_and_the_service_capabilities_read_as_rows(world):
     w = world
     out = {}
-    for capability, argv in (("memory", ("settings",)), ("memory", ("service", "init")),
+    for capability, argv in (("memory", ("settings",)),
                              ("telegram", ("settings",)), ("telegram", ("service", "status")),
                              ("whatsapp", ("settings",)), ("whatsapp", ("service", "status")),
                              ("agentrooms", ("settings",)),
@@ -513,9 +513,6 @@ def test_memory_and_the_service_capabilities_read_as_rows(world):
             "exit": result.returncode, "stdout": result.stdout[-4000:],
             "stderr": result.stderr[-4000:]}
     _say("service-capabilities-moved", out)
-    # memory's settings exist as rows, so init refuses naming the store.
-    init = out["memory service init"]
-    assert init["exit"] == 6 and "settings_exist" in init["stderr"] and "store:" in init["stderr"]
     for key, result in out.items():
         said = result["stdout"] + result["stderr"]
         for path in GARBAGE.values():
@@ -531,14 +528,13 @@ def test_service_init_in_a_moved_agent_writes_rows_and_no_file(world):
     out = {
         "automations": w.answer(run(w, "fresh", "automations", "service", "init")),
         "tasks": w.answer(run(w, "fresh", "tasks", "service", "init")),
-        "memory": w.answer(run(w, "fresh", "memory", "service", "init")),
         "slack": w.answer(run(w, "fresh", "slack", "service", "init")),
     }
     _say("service-init-fresh", out)
     assert before == [] and w.files_left(root) == []
     docs = {d for (d,) in w.sql("SELECT capability FROM settings_documents "
                                 "WHERE agent_id = %s", (IDS["fresh"],))}
-    assert {"automations", "tasks", "memory", "slack"} <= docs
+    assert {"automations", "tasks", "slack"} <= docs
     again = w.answer(run(w, "fresh", "automations", "service", "init"))
     assert again["skipped"][0].startswith("store:")
     assert not [p for p in again["written"] if p.startswith("store:")]
@@ -1018,7 +1014,7 @@ def test_the_machine_scheduler_serves_a_moved_agent(world):
         listing.unlink(missing_ok=True)
 
 
-@pytest.mark.parametrize("capability", ["tasks", "memory"])
+@pytest.mark.parametrize("capability", ["tasks"])
 def test_the_service_starts_and_stops_with_no_settings_file(world, capability):
     w = world
     started = run(w, "moved", capability, "service", "start")

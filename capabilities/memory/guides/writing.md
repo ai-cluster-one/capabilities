@@ -24,4 +24,4 @@ A secret never belongs in memory. If one lands there, drop the entry with its wh
 
 ## Reading back
 
-The block in context carries no entry: it says how to record and how to search, how many active entries there are and when the newest was written. Search is how an entry is reached, showing one gives its whole text and trail, and listing since the newest moment the block names shows what was recorded after the session began. When answering a question would take more than one lookup, hand the search to a subagent that returns only its conclusion, so the reading does not crowd the session. `memory help` states every verb and option.
+The block in context carries no entry, and nothing in it changes from one session to the next: it says how to record and how to search. Search is how an entry is reached, showing one gives its whole text and trail, and listing the newest entries shows what was recorded after the session began. When answering a question would take more than one lookup, hand the search to a subagent that returns only its conclusion, so the reading does not crowd the session. `memory help` states every verb and option.

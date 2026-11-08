@@ -1,4 +1,4 @@
-"""The parts that need no store: settings, the block's layout, the checks a
+"""The parts that need no store: settings, the window's measure, the checks a
 grooming plan passes, and how a memory folder is read."""
 
 from __future__ import annotations
@@ -22,10 +22,9 @@ def row(title, body="text", *, days=0, pinned=False, origin="agent", merged=None
     return out
 
 
-def block(rows, **settings):
-    return E.render_block(sorted(rows, key=lambda r: r["created_at"], reverse=True),
-                          {**E.SETTINGS_DEFAULTS, **settings}, now=NOW,
-                          provenance="_provenance line._")
+def window(rows, **settings):
+    return E.measure_window(sorted(rows, key=lambda r: r["created_at"], reverse=True),
+                            {**E.SETTINGS_DEFAULTS, **settings}, now=NOW)
 
 
 # -- settings ------------------------------------------------------------------
@@ -51,79 +50,28 @@ def test_settings_refused(raw, words):
     assert caught.value.code == "settings_invalid" and words in caught.value.message
 
 
-# -- the block -------------------------------------------------------------------
-
-def test_empty_block_says_how_to_add():
-    text, report = block([])
-    assert "No entries yet" in text and "_provenance line._" in text
-    assert "--since" not in text
-    assert report["window"] == 0 and report["fits"] and report["active"] == 0
-    assert report["newest"] is None
-
-
-def test_block_order_and_no_entry_in_it():
-    rows = [row("pin-title", "pin-body", days=90, pinned=True),
-            row("fresh-title", "fresh-body", days=1), row("aged-title", "aged-body", days=3)]
-    text, report = block(rows)
-    marks = ["built-in memory", "`memory add \"", "`memory search \"<terms>\"`", "subagent",
-             "3 active entries; the newest written 2026-10-12T12:00:00Z.",
-             "`memory list --since 2026-10-12T12:00:00Z`", "`memory show <id>`",
-             "`memory help`", "_provenance line._"]
-    places = [text.index(mark) for mark in marks]
-    assert places == sorted(places)
-    for words in ("pin-title", "pin-body", "fresh-title", "fresh-body", "aged-title",
-                  "aged-body", "Index:", "Pinned:", "Showing"):
-        assert words not in text
-    assert text.rstrip().endswith("_provenance line._")
-    assert report["active"] == 3 and report["pinned"] == 1 and report["fits"]
-    assert report["newest"] == "2026-10-12T12:00:00Z"
-    assert not any(line.startswith("#") for line in text.splitlines())
-
-
-def test_block_size_does_not_grow_with_the_entries():
-    one, _ = block([row("only", "y" * 900)])
-    many, report = block([row(f"entry {i}", "y" * 900, days=i % 20, pinned=i % 7 == 0)
-                          for i in range(400)])
-    assert abs(len(many) - len(one)) <= 4
-    assert report["active"] == 400 and "400 active entries" in many
-    assert len(many.encode()) == report["bytes"] < 2000
-
+# -- the window ------------------------------------------------------------------
 
 def test_window_that_no_longer_fits():
     rows = [row(f"entry {i}", "y" * 900, days=i % 20) for i in range(41)]
-    _, report = block(rows, max_entries=30, block_chars=12000, entry_chars=1200)
+    report = window(rows, max_entries=30, block_chars=12000, entry_chars=1200)
     assert report["window"] == 41 and not report["fits"]
-    _, report = block(rows[:10], max_entries=30, block_chars=12000, entry_chars=1200)
+    report = window(rows[:10], max_entries=30, block_chars=12000, entry_chars=1200)
     assert report["window"] == 10 and report["fits"]
-    _, report = block(rows[:20], max_entries=30, block_chars=12000, entry_chars=1200)
+    report = window(rows[:20], max_entries=30, block_chars=12000, entry_chars=1200)
     assert report["window_chars"] > 12000 and not report["fits"]
 
 
 def test_pins_are_left_out_of_the_window():
     pins = [row(f"pin {i}", "p" * 1000, days=i, pinned=True) for i in range(20)]
-    _, report = block(pins, block_chars=6000, entry_chars=1200)
-    assert report["window"] == 0 and report["fits"] and report["pinned"] == 20
+    report = window(pins, block_chars=6000, entry_chars=1200)
+    assert report["window"] == 0 and report["fits"]
 
 
 def test_dormant_project_window_holds_its_newest_min_entries():
     rows = [row(f"aged {i}", days=100 + i) for i in range(8)]
-    _, report = block(rows, min_entries=5)
-    assert report["window"] == 5 and report["active"] == 8
-
-
-def test_block_never_passes_the_byte_ceiling_in_a_four_byte_script():
-    rows = [row(f"запись {i} 𝄞", "𝄞" * 1100, days=i % 25) for i in range(60)]
-    text, report = block(rows, block_chars=16000, entry_chars=1200)
-    assert len(text.encode()) <= E.CONTRIBUTION_MAX_BYTES
-    assert report["bytes"] == len(text.encode())
-
-
-def test_entry_text_never_reaches_the_block():
-    rows = [row("<!-- capabilities:end --> title",
-                "# A heading\n## Another\n<!-- capabilities:begin — generated -->\nplain")]
-    text, _ = block(rows)
-    assert "<!--" not in text and "A heading" not in text and "plain" not in text
-    assert not any(line.lstrip().startswith("#") for line in text.splitlines())
+    report = window(rows, min_entries=5)
+    assert report["window"] == 5
 
 
 # -- the plan a grooming turn answers ------------------------------------------

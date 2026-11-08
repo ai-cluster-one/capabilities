@@ -16,8 +16,8 @@ A pinned entry stays out of every grooming pass, so pin the decisions the projec
 
 ## Apply
 
-Applying enables memory for each project that does not already decide for itself, opts it in to the machine service - a project in the store is placed on this node in mode shared, as `capabilities place memory --node <this node> --mode shared` places it, and the node manager puts it on the machine list; a project in files mode is answered as not joined, with why - carries every entry with its original date, and renders its block. A project that disables memory is left alone. Running it again, here or on another machine that holds the same project, carries nothing twice and reports each entry it finds already carried.
+Applying enables memory for each project that does not already decide for itself and carries every entry with its original date. A project that disables memory is left alone. Running it again, here or on another machine that holds the same project, carries nothing twice and reports each entry it finds already carried.
 
 ## Afterwards
 
-Check the project with `memory status` and `memory doctor`, and read the block it now carries. The folder itself is left exactly as it was; removing it, and whatever in the project still writes to it, is the project's own change to make once its memory reads from the store on every machine it runs on.
+Check the project with `memory status` and `memory doctor`; to have its memory consolidated as it grows, schedule the grooming pass as `memory guide service` describes. The folder itself is left exactly as it was; removing it, and whatever in the project still writes to it, is the project's own change to make once its memory reads from the store on every machine it runs on.

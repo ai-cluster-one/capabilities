@@ -171,9 +171,9 @@
     "memory": {
       "icon": true,
       "path": "capabilities/memory",
-      "payload_sha256": "c7f4f7360b6c8560cb2ba0731a459f37a9a4ff5ed1c6e5992adade75ed1f8dd5",
+      "payload_sha256": "e792ee744c357ab0c7e95c2dc0a1e8d77f069612bd54d09b9d57f11aab51758f",
       "store_major": 3,
-      "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
+      "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a constant block in every session's context that says how to record and search them, and a grooming pass, run on a schedule, that consolidates the entries."
     },
     "notion": {
       "icon": true,
