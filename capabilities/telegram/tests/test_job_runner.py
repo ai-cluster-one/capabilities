@@ -1075,6 +1075,38 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                                 for item in client.sent))
             await self.stop_session(client, task)
 
+    async def test_a_stated_reset_holds_the_queue_and_the_notice_goes_once(self):
+        """Issue #114: the pause lasts until the reset the engine announced,
+        and a job that meets the limit again does not tell the person again."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            daemon.QUOTA_RESET_MARGIN_SECONDS = 0.0
+            register = daemon.job_register()
+            row = queued(register, channel_key="123", requested_by="777",
+                         description="first", engine="codex")
+            fake = FakeHarness(ok=False, kind="quota", answer="",
+                               message="You've hit your usage limit. Try again in 1 second.")
+            daemon.harness_run = fake
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(lambda: len(fake.calls) >= 1
+                             and register.get(row["id"])["outcome"] == daemon.jobs.QUOTA,
+                             timeout=6)
+            resume_at = daemon.datetime.fromisoformat(
+                register.get(row["id"])["resume_at"]).timestamp()
+            self.assertLess(resume_at - time.time(), daemon.QUOTA_RETRY_SECONDS / 2,
+                            "a stated reset is used instead of the fixed retry")
+            await wait_until(lambda: len(fake.calls) >= 3, timeout=10)
+            await asyncio.sleep(0.4)
+            notices = [item.get("text") or "" for item in client.sent
+                       if "usage limit" in (item.get("text") or "")]
+            self.assertEqual(len(notices), 1, notices)
+            self.assertIsNone(daemon.quota_reset_at("You've hit your usage limit."),
+                              "no stated reset falls back to the fixed retry")
+            await self.stop_session(client, task)
+
     # -- a refused model ------------------------------------------------------
 
     async def run_refused_job(self, td, *, role):

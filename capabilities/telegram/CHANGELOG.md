@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — A quota stop waits for the stated reset and tells the person once per job
+
+When a job stops on a spent quota and the engine's sentence says when the limit lifts - an epoch after `|`, an ISO timestamp, `try again in` a duration, or `resets` / `try again at` a clock time with an optional date and `(Area/City)` zone - the queue stays paused until that moment plus a minute, never more than eight days, instead of retrying every five minutes into the same limit. A sentence that names no reset keeps the five-minute retry, and the daemon's log says `no reset stated`. The quota notice reaches the person on the first quota stop of a job; a later quota stop of the same job lands silently, until the job ends another way or takes an amendment. A daemon restart forgets which jobs were told, so one may be told once more. No verb, flag, setting, store column or output key changes.
+
 ## 2026-11-08 — A periodic sync that runs past the stale threshold says where it is
 
 When one periodic sync pass has been running longer than `SYNC_STALE_AFTER`, the time after which the service's health reads stale, the daemon logs one line naming the step in progress: `catch_up (getDifference)`, `get_messages <chat key>` for the chat whose history call is in flight, or `catch_up_known <chat key>` for the chat being reconciled. When that pass returns, completed or raised, it logs one line with the pass's total duration. A pass that finishes inside the threshold logs nothing new. Nothing times out, is cancelled or restarted, and health, `service status`, `doctor` and settings are unchanged.

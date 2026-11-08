@@ -1079,10 +1079,102 @@ LOG_FILE = SERVICE_STATE_DIR / "daemon.log"
 HEALTH_FILE = SERVICE_STATE_DIR / "health.json"
 PROGRESS_DIR = SERVICE_STATE_DIR / "progress"
 # How long a queue paused by an exhausted subscription waits before trying
-# again. The engine reports that the limit is reached, not when it lifts, so
-# this is a retry interval rather than a promise — and the dialogue worker says
-# it in those terms.
+# again when the engine's sentence does not say when the limit lifts. Where it
+# does, the pause lasts until that reset plus QUOTA_RESET_MARGIN_SECONDS, so
+# the queue is not resumed into the same limit; this interval is the fallback.
 QUOTA_RETRY_SECONDS = 300.0
+QUOTA_RESET_MARGIN_SECONDS = 60.0
+# The longest a stated reset holds the queue; a later one is held to this.
+QUOTA_RESET_HORIZON_SECONDS = 8 * 86400.0
+# The sentences are the engines' own, as Claude Code and Codex print them:
+#
+#   You've hit your session limit · resets 2:20am (Europe/Berlin)
+#   You've hit your weekly limit · resets Oct 9, 10am (Europe/Berlin)
+#   Claude AI usage limit reached|1790000000
+#   You've hit your usage limit. Try again in 2 hours 13 minutes.
+#   You've hit your usage limit. ... or try again at Sep 7th, 2026 9:06 AM.
+_QUOTA_RESET_EPOCH_RE = re.compile(
+    r"(?:limit reached|resets?(?:\s+at)?)\s*\|?\s*(\d{10})(?!\d)", re.I)
+_QUOTA_RESET_ISO_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?"
+    r"(?:Z|[+-]\d{2}:?\d{2})?")
+_QUOTA_RESET_UNIT = r"(?:days?|d|hours?|hrs?|hr|h|minutes?|mins?|min|m|seconds?|secs?|sec|s)\b"
+_QUOTA_RESET_IN_RE = re.compile(
+    r"\b(?:resets?|try again|retry)\s+in\s+((?:\d+\s*" + _QUOTA_RESET_UNIT
+    + r"[\s,]*(?:and\s+)?)+)", re.I)
+_QUOTA_RESET_UNIT_RE = re.compile(r"(\d+)\s*(" + _QUOTA_RESET_UNIT + ")", re.I)
+_QUOTA_RESET_AT_RE = re.compile(
+    r"(?:resets?(?:\s+at)?|reset at|try again (?:at|after))\s+"
+    r"(?:(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+"
+    r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+(?:(?P<year>\d{4}),?\s+)?(?:at\s+)?)?"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<half>[ap])\.?m\.?"
+    r"(?:\s*\((?P<zone>[A-Za-z_]+(?:/[A-Za-z0-9_+-]+)*)\))?", re.I)
+_QUOTA_RESET_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug",
+                       "sep", "oct", "nov", "dec")
+
+
+def quota_reset_at(reason, now=None):
+    """The moment the engine's quota sentence says the limit lifts, as epoch
+    seconds, or None when it states none that can be read or one already past.
+
+    A clock time with no date is its next occurrence; a date with no year is
+    this year's, or next year's once this year's is past. A time named without
+    a zone is this machine's, where the engine printed it."""
+    text = str(reason or "")
+    now = time.time() if now is None else now
+    found = None
+    match = _QUOTA_RESET_EPOCH_RE.search(text)
+    if match:
+        found = float(match.group(1))
+    if found is None:
+        match = _QUOTA_RESET_ISO_RE.search(text)
+        if match:
+            with contextlib.suppress(ValueError):
+                found = datetime.fromisoformat(
+                    match.group(0).replace("Z", "+00:00")).timestamp()
+    if found is None:
+        match = _QUOTA_RESET_IN_RE.search(text)
+        if match:
+            scale = {"d": 86400, "h": 3600, "m": 60, "s": 1}
+            seconds = sum(int(n) * scale[unit[0].lower()] for n, unit
+                          in _QUOTA_RESET_UNIT_RE.findall(match.group(1)))
+            if seconds:
+                found = now + seconds
+    if found is None:
+        found = _quota_reset_clock(_QUOTA_RESET_AT_RE.search(text), now)
+    if found is None or found <= now:
+        return None
+    return found
+
+
+def _quota_reset_clock(at, now):
+    if not at:
+        return None
+    zone = None
+    if at.group("zone"):
+        with contextlib.suppress(Exception):
+            from zoneinfo import ZoneInfo
+            zone = ZoneInfo(at.group("zone"))
+    hour = int(at.group("hour")) % 12 + (12 if at.group("half").lower() == "p" else 0)
+    minute = int(at.group("minute") or 0)
+    if minute > 59:
+        return None
+    here = (datetime.fromtimestamp(now, zone) if zone
+            else datetime.fromtimestamp(now).astimezone())
+    try:
+        if at.group("mon"):
+            month = _QUOTA_RESET_MONTHS.index(at.group("mon").lower()[:3]) + 1
+            year = int(at.group("year") or here.year)
+            moment = here.replace(year=year, month=month, day=int(at.group("day")),
+                                  hour=hour, minute=minute, second=0, microsecond=0)
+            if not at.group("year") and moment.timestamp() < now - 86400:
+                moment = moment.replace(year=year + 1)
+            return moment.timestamp()
+        moment = here.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except ValueError:
+        return None
+    found = moment.timestamp()
+    return found + 86400 if found <= now - 60 else found
 WORKER_SESSION_DIR = SERVICE_STATE_DIR / "worker-sessions"
 # The worker session each caller is carrying, by caller. Deliberately not under
 # worker-sessions/, which holds copies of the Telegram account session — a
@@ -7661,6 +7753,9 @@ async def run_session(client):
     # them is its business.
     voice_rows = {}
     quota = {"until": None, "reason": None}
+    # Jobs whose person has already been told, in this run, that the queue is
+    # paused on quota. A later quota stop of the same job lands silently.
+    quota_notified = set()
 
     def jobs_available():
         """Whether the register can be reached at all. A store that is not
@@ -7680,11 +7775,20 @@ async def run_session(client):
                 f"the wall; the queue resumes at {resumes:%H:%M}.")
 
     def enter_quota_pause(reason):
-        quota["until"] = time.time() + QUOTA_RETRY_SECONDS
+        now = time.time()
+        reset = quota_reset_at(reason, now)
+        if reset is None:
+            quota["until"] = now + QUOTA_RETRY_SECONDS
+            stated = (f"no reset stated; retrying in "
+                      f"{QUOTA_RETRY_SECONDS:.0f} s")
+        else:
+            quota["until"] = min(reset + QUOTA_RESET_MARGIN_SECONDS,
+                                 now + QUOTA_RESET_HORIZON_SECONDS)
+            stated = "until the stated reset"
         quota["reason"] = str(reason)[:200]
         log(f"jobs: queue paused until "
-               f"{datetime.fromtimestamp(quota['until'], timezone.utc):%H:%M:%S}Z — "
-               f"{quota['reason']}")
+               f"{datetime.fromtimestamp(quota['until'], timezone.utc):%H:%M:%S}Z "
+               f"({stated}) — {quota['reason']}")
         return datetime.fromtimestamp(quota["until"], timezone.utc).isoformat(
             timespec="microseconds")
 
@@ -7883,6 +7987,10 @@ async def run_session(client):
         amendment_rows = register.claim_amendments(
             job_id, attempt_token, JOB_OWNER_ID)
         amendments = [item["text"] for item in amendment_rows]
+        if amendments:
+            # New words from the person are a new request to be told about.
+            quota_notified.discard(job_id)
+        stopped_on_quota = False
         # The session is the checkpoint for every continuation, not only for an
         # amendment.  A manual resume and startup recovery must pick up the same
         # rollout too.
@@ -8133,10 +8241,18 @@ async def run_session(client):
                 log(f"{key}: job {job_id} stopped for an amendment")
             elif getattr(exc, "kind", None) == "quota":
                 resume_at = enter_quota_pause(reason)
+                # The person hears about the pause once per job; a job that
+                # meets the limit again after resuming waits without telling
+                # them the same thing again.
+                told = job_id in quota_notified
+                quota_notified.add(job_id)
+                stopped_on_quota = True
                 register.stop(job_id, jobs.QUOTA, error=reason,
                               attempt_token=attempt_token, owner_id=JOB_OWNER_ID,
                               resume_at=resume_at,
-                              result_text=quota_pause_notice() or reason)
+                              result_text=None if told else (
+                                  quota_pause_notice() or reason),
+                              result_silent=told)
             elif closing:
                 register.stop(job_id, jobs.INTERRUPTED, error=reason,
                               attempt_token=attempt_token, owner_id=JOB_OWNER_ID)
@@ -8164,6 +8280,8 @@ async def run_session(client):
                               result_text=failure_text)
                 log(f"{key}: job {job_id} failed: {detail}")
         finally:
+            if not stopped_on_quota:
+                quota_notified.discard(job_id)
             if progress_stop is not None:
                 progress_stop.set()
             if progress_task is not None:
