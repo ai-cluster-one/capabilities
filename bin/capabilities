@@ -2090,7 +2090,8 @@ PROJECT VERBS (run inside a consuming project)
         blocked; it answers {project, output, created, changed, links,
         foreign_instructions, warnings}. An output that is not generated
         context exits 6 output_not_generated; output an earlier release
-        generated is recognised as generated. No update notice is composed.
+        generated is recognised as generated and keeps its marker, so that
+        release can still rebuild it. No update notice is composed.
         A project with neither a .contextkit/config.toml binding nor a
         project id exits 6 not_contextkit_bound.
   session-start --host claude|codex
@@ -2115,7 +2116,8 @@ PROJECT VERBS (run inside a consuming project)
         `capabilities session-start --host codex`. For Codex it also sets
         project_doc_fallback_filenames to list .agent-context.md (dropping
         the .contextkit.md entry an earlier release wrote, and removing that
-        link where it is the manager's: codex.retired_link) and
+        link where it is the manager's: codex.retired_link; a
+        .contextkit/config.toml-bound folder keeps .contextkit.md) and
         project_doc_max_bytes to at least 524288 in .codex/config.toml, and
         records the folder and hook trust in $CODEX_HOME/config.toml (default
         ~/.codex). Every other key and hook is left as it is; a duplicate
@@ -28828,14 +28830,16 @@ def _ck_is_link(root: Path, link: Path, output: Path) -> bool:
 
 def _ck_codex_link(root: Path) -> Path:
     """The root link this agent's Codex loads the context through: the legacy
-    `.contextkit.md` where its project-doc fallbacks still name that and not
-    `.agent-context.md`, so an agent wired that way keeps working unchanged."""
+    `.contextkit.md` in a folder bound by `.contextkit/config.toml`, or where
+    its project-doc fallbacks still name that and not `.agent-context.md`, so
+    an agent wired that way keeps working unchanged."""
     try:
         fallback = _ck_toml(root / CODEX_CONFIG_REL).get("project_doc_fallback_filenames")
     except ValueError:
         fallback = None
-    if isinstance(fallback, list) and CK_LEGACY_CODEX_LINK.as_posix() in fallback \
-            and CK_HOST_LINKS["codex"].as_posix() not in fallback:
+    names = fallback if isinstance(fallback, list) else []
+    if CK_HOST_LINKS["codex"].as_posix() not in names \
+            and (CK_LEGACY_CODEX_LINK.as_posix() in names or _contextkit_managed(root)):
         return CK_LEGACY_CODEX_LINK
     return CK_HOST_LINKS["codex"]
 
@@ -29079,6 +29083,10 @@ def _ck_write(root: Path, text: str, warnings: list[str], binding: dict) -> dict
         previous = output.read_text(encoding="utf-8", errors="replace") if output.is_file() else None
     except OSError:
         previous = None
+    if previous is not None and CK_LEGACY_GENERATED_MARKER in previous[:4096]:
+        # A file an earlier release wrote keeps its marker, so a manager of
+        # that release, which knows no other, can still rebuild it.
+        text = text.replace(CK_GENERATED_MARKER, CK_LEGACY_GENERATED_MARKER, 1)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", delete=False, dir=str(output.parent)) as tmp:
         tmp.write(text)
@@ -29779,8 +29787,12 @@ def _hooks_install(root: Path, hosts: list[str], tolerate_build: bool = False) -
     fails is answered as `build: {error}` rather than ending the call."""
     # Every host file is read and planned before any of them is written.
     if "codex" in hosts:
+        # A folder bound by `.contextkit/config.toml` keeps the `.contextkit.md`
+        # link its own .gitignore already ignores; the manager writes no
+        # .gitignore block there.
+        link = CK_LEGACY_CODEX_LINK if _contextkit_managed(root) else None
         try:
-            plan = _ck_planned_codex_config(root / CODEX_CONFIG_REL)
+            plan = _ck_planned_codex_config(root / CODEX_CONFIG_REL, link)
         except ValueError as exc:
             _die(6, "codex_config_invalid", str(exc),
                  "repair .codex/config.toml, then rerun `capabilities hooks install`")
