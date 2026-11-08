@@ -7834,8 +7834,16 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
                                         names, sql.Identifier(real), sql.Identifier(table))
                                 + condition, params).rowcount
         with conn.transaction():
-            counts["agents"] = copy(
-                "agents", sql.SQL("id = %s"), (agent_id,))
+            # The agent, and every agent owning one of the capability's
+            # connections projected below: a connection names its owner.
+            owners = sql.SQL("id = %s")
+            owner_params: tuple = (agent_id,)
+            if "owner_agent_id" in set(columns("connections", real)):
+                owners = owners + sql.SQL(
+                    " OR id IN (SELECT owner_agent_id FROM {}.connections WHERE "
+                    "capability = %s)").format(sql.Identifier(real))
+                owner_params = (agent_id, capability)
+            counts["agents"] = copy("agents", owners, owner_params)
             # The agent's nodes before its links to them. A machine's store
             # from before the node registry keeps a node's fields on its links.
             nodes_of = sql.SQL("id IN (SELECT node FROM {}.agent_nodes "
@@ -7846,8 +7854,18 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
             # then, where the connection came with them.
             coolify_reference = ("coolify_connection_id",)
             if columns("nodes", real):
-                counts["nodes"] = copy("nodes", nodes_of,
-                                                    (agent_id,), coolify_reference)
+                # With them every node a projected row names.
+                named = nodes_of
+                named_params: tuple = (agent_id,)
+                for table, column in DEV_PROJECTED_TABLES:
+                    if {"node", "agent_id"} <= set(columns(table, real)):
+                        named = named + sql.SQL(
+                            " OR id IN (SELECT node FROM {}.{} WHERE {} = %s AND "
+                            "(agent_id IS NULL OR agent_id = %s))").format(
+                                sql.Identifier(real), sql.Identifier(table),
+                                sql.Identifier(column))
+                        named_params = (*named_params, capability, agent_id)
+                counts["nodes"] = copy("nodes", named, named_params, coolify_reference)
             else:
                 conn.execute(sql.SQL("DELETE FROM {}.nodes WHERE ").format(
                     sql.Identifier(schema)) + nodes_of, (agent_id,))
@@ -12513,6 +12531,10 @@ def _store_deleting(conn, parent: str, *ids: str) -> None:
     before it deletes one of their rows and lets the cascade follow."""
     setting = {"agents": "store.deleting_agent", "nodes": "store.deleting_node",
                "connections": "store.deleting_connection"}[parent]
+    # The store's deferred triggers (notifications) run at COMMIT and read the
+    # setting then: those of the statements before it run now, outside it, and
+    # those of the cascade run before it is cleared, inside it.
+    conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
     conn.execute("SELECT set_config(%s, %s, true)", (setting, ",".join(i for i in ids if i)))
 
 
