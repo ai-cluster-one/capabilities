@@ -114,11 +114,12 @@ COMMANDS
 
   Writes (allow_write on the connection)
     send <chat> <text|-> [--topic N] [--reply-to ID] [--file PATH]
-        Send text (- reads it from stdin), cut into messages of at most 4096
-        characters; with --file, the file as a document (at most 50 MB) with
-        the text as its caption. {message_ids}. Not idempotent: Telegram has
-        no dedup key. A send whose outcome is unknown (a timeout after it
-        left) exits 5 delivery_unknown: read the chat before sending again.
+        Send text (- reads it from stdin) as written, with no formatting, cut
+        into messages of at most 4096 characters; with --file, the file as a
+        document (at most 50 MB) with the text as its caption. {message_ids}.
+        Not idempotent: Telegram has no dedup key. A send whose outcome is
+        unknown (a timeout after it left) exits 5 delivery_unknown: read the
+        chat before sending again.
     react <chat> <message> [<emoji>]
         Set the bot's one reaction on a message; without an emoji, clear it.
         Repeating it is safe. The emoji must be one the chat allows.
@@ -196,7 +197,12 @@ SERVICE
   reads), climbs the reply chain of the first message, and runs in a fresh
   harness session on the channel's profile; its answer, cut at
   `=== REPLY ===`, is sent in parts of 4096, as a reply to the request in a
-  group. An empty answer is silence. A request ending in #external has
+  group. The answer, its progress lines, what it sends and a job's result
+  are rendered from Markdown into Telegram's own formatting (bold, italic,
+  strikethrough, code, code blocks, links, quotes, lists; a heading becomes
+  a bold line and a table a code block), sent as message entities with no
+  parse mode; a part whose formatting Telegram refuses is sent again as
+  plain text. An empty answer is silence. A request ending in #external has
   everything sent for it end in #noreply. In a group where the bot does not
   see every message (privacy on, not an admin) no history is read and the
   bot answers only when addressed; with no api_id and api_hash on the

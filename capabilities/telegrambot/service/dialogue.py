@@ -911,7 +911,8 @@ class Dialogue:
         if not text:
             return []
         return self.api.send_text(job["chat_id"], self.tagged(job, text),
-                                  topic_id=job["topic_id"], reply_to=self.reply_to_for(job))
+                                  topic_id=job["topic_id"], reply_to=self.reply_to_for(job),
+                                  markdown=True)
 
     # -- control commands ------------------------------------------------------------
 
@@ -1449,9 +1450,10 @@ class Dialogue:
             text = self.tagged(job, text) if text else text
             if file:
                 self.api.send_file(chat, Path(file), caption=text or None, topic_id=topic,
-                                   reply_to=reply_to)
+                                   reply_to=reply_to, markdown=True)
             else:
-                self.api.send_text(chat, text, topic_id=topic, reply_to=reply_to)
+                self.api.send_text(chat, text, topic_id=topic, reply_to=reply_to,
+                                   markdown=True)
 
         return Outbox(path, send, progress_after=progress_after)
 
@@ -1760,7 +1762,7 @@ class Dialogue:
             text = f"{text}\n{NO_REPLY}"
         return self.api.send_text(int(row["chat_id"]), text,
                                   topic_id=int(row["topic_id"] or 0) or None,
-                                  reply_to=row.get("origin_message_id"))
+                                  reply_to=row.get("origin_message_id"), markdown=True)
 
     def summary(self) -> dict:
         out = {"running": self.busy(), "queued": self.queued(), **dict(self.stats),

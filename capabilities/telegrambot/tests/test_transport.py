@@ -142,6 +142,121 @@ def test_a_reply_goes_to_its_topic_and_only_the_first_part_answers():
     assert "message_thread_id" not in sent[0]
 
 
+def spans(text, entities):
+    """Each entity as (type, the text it covers), reading offsets as UTF-16 units."""
+    raw = text.encode("utf-16-le")
+    return [(e["type"], raw[2 * e["offset"]:2 * (e["offset"] + e["length"])].decode(
+        "utf-16-le")) for e in entities]
+
+
+def test_markdown_becomes_text_and_entities():
+    text, entities = t.render_markdown(
+        "# Plan\n\n**bold**, *italic*, _also_, ~~gone~~, `x = 1` and "
+        "[docs](https://example.com/p)"
+        "\n- one\n- two\n  - under\n\n> said\n> twice\n\n```python\nprint(1)\n```")
+    assert text == ("Plan\n\nbold, italic, also, gone, x = 1 and docs\n• one\n• two\n"
+                    "  ◦ under\n\nsaid\ntwice\n\nprint(1)")
+    assert sorted(spans(text, entities)) == sorted([
+        ("bold", "Plan"), ("bold", "bold"), ("italic", "italic"), ("italic", "also"),
+        ("strikethrough", "gone"), ("code", "x = 1"), ("text_link", "docs"),
+        ("blockquote", "said\ntwice"), ("pre", "print(1)")])
+    link = [e for e in entities if e["type"] == "text_link"][0]
+    assert link["url"] == "https://example.com/p"
+    assert [e for e in entities if e["type"] == "pre"][0]["language"] == "python"
+
+
+def test_a_table_is_kept_as_written_in_a_pre_block():
+    text, entities = t.render_markdown("| a | b |\n|---|---|\n| 1 | 2 |")
+    assert text == "| a | b |\n|---|---|\n| 1 | 2 |"
+    assert spans(text, entities) == [("pre", text)]
+
+
+def test_text_that_is_not_markup_arrives_whole():
+    plain = ("2*3*4 snake_case_name a_b 2+2=4 <tag> & amp (x) [y] {z} #tag ! . - = | "
+             "**open and *open")
+    assert t.render_markdown(plain) == (plain, [])
+    assert t.render_markdown(r"\*kept\* and \_too\_") == ("*kept* and _too_", [])
+
+
+def test_entity_offsets_count_utf16_units():
+    text, entities = t.render_markdown("😀 **жирный** _курсив_")
+    assert text == "😀 жирный курсив"
+    assert entities[0]["offset"] == 3       # the emoji is two UTF-16 units
+    assert spans(text, entities) == [("bold", "жирный"), ("italic", "курсив")]
+
+
+def test_a_long_rendered_reply_splits_and_carries_the_entity_across_the_cut():
+    text, entities = t.render_markdown("😀" * 10 + " " + "**" + "word " * 1000 + "end**")
+    parts = t.split_rendered(text, entities, 4096)
+    assert len(parts) == 2
+    for part, found in parts:
+        assert len(part.encode("utf-16-le")) // 2 <= 4096
+        assert [e["type"] for e in found] == ["bold"]
+        end = found[0]["offset"] + found[0]["length"]
+        assert end <= len(part.encode("utf-16-le")) // 2
+    assert parts[0][1][0]["offset"] == 21 and parts[1][1][0]["offset"] == 0
+    assert parts[1][0].endswith("end")
+
+
+def test_a_rendered_reply_is_sent_with_entities_and_no_parse_mode():
+    sent = []
+
+    def handler(request):
+        sent.append(json.loads(request.content))
+        return ok({"message_id": 7})
+
+    bot(handler).send_text(42, "**hi** there", markdown=True)
+    assert sent[0]["text"] == "hi there" and "parse_mode" not in sent[0]
+    assert sent[0]["entities"] == [{"type": "bold", "offset": 0, "length": 2}]
+    assert sent[0]["link_preview_options"] == {"is_disabled": True}
+    sent.clear()
+    bot(handler).send_text(42, "**as written**")
+    assert sent[0]["text"] == "**as written**" and "entities" not in sent[0]
+
+
+def test_refused_entities_fall_back_to_plain_text_once():
+    sent = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        sent.append(body)
+        if "entities" in body:
+            return httpx.Response(400, json={"ok": False, "description":
+                                             "Bad Request: can't parse entities: bad"})
+        return ok({"message_id": 8})
+
+    assert bot(handler).send_text(42, "a [link](https://example.org) **b**", reply_to=3,
+                                  markdown=True) == [8]
+    assert len(sent) == 2 and "entities" not in sent[1]
+    assert sent[1]["text"] == "a link b" and sent[1]["reply_parameters"]["message_id"] == 3
+
+    def chat_gone(request):
+        sent.append(json.loads(request.content))
+        return httpx.Response(400, json={"ok": False, "description": "Bad Request: chat not found"})
+
+    sent.clear()
+    with pytest.raises(t.TelegramError):
+        bot(chat_gone).send_text(42, "**b**", markdown=True)
+    assert len(sent) == 1                   # a refusal that is not the formatting is not repeated
+
+
+def test_a_caption_is_rendered_and_falls_back_too(tmp_path):
+    seen = []
+    path = tmp_path / "r.txt"
+    path.write_text("x")
+
+    def handler(request):
+        body = request.content.decode("utf-8", "replace")
+        seen.append(body)
+        if "caption_entities" in body:
+            return httpx.Response(400, json={"ok": False, "description":
+                                             "Bad Request: wrong entity"})
+        return ok({"message_id": 9})
+
+    assert bot(handler).send_file(42, path, caption="the **report**", markdown=True) == 9
+    assert len(seen) == 2 and "caption_entities" in seen[0] and "the report" in seen[1]
+
+
 def test_a_reaction_is_one_emoji_or_none():
     sent = []
 

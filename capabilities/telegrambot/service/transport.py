@@ -358,36 +358,60 @@ class BotAPI:
                                      "message_thread_id": _thread(topic_id)})
 
     def send_text(self, chat_id: int, text: str, *, topic_id: int | None = None,
-                  reply_to: int | None = None) -> list[int]:
-        """Send `text`, cut into parts of at most MESSAGE_CHARS; the ids sent."""
+                  reply_to: int | None = None, markdown: bool = False) -> list[int]:
+        """Send `text`, cut into parts of at most MESSAGE_CHARS UTF-16 units; the ids
+        sent. With `markdown`, the text is rendered into Telegram entities first
+        (`render_markdown`), and a part whose entities Telegram refuses is sent
+        once more as the same text without them."""
         sent = []
-        for index, part in enumerate(split_text(text, MESSAGE_CHARS)):
+        for index, (part, entities) in enumerate(
+                split_rendered(*_rendered(text, markdown), MESSAGE_CHARS)):
             params = {"chat_id": chat_id, "text": part,
                       "message_thread_id": _thread(topic_id),
                       "link_preview_options": {"is_disabled": True}}
             if reply_to and index == 0:
                 params["reply_parameters"] = {"message_id": reply_to,
                                               "allow_sending_without_reply": True}
-            found = self.call("sendMessage", params)
+            found = self._formatted(lambda body: self.call("sendMessage", body), params,
+                                    "entities", entities)
             sent.append(int(found["message_id"]))
         return sent
 
     def send_file(self, chat_id: int, path: Path, *, caption: str | None = None,
-                  topic_id: int | None = None, reply_to: int | None = None) -> int:
+                  topic_id: int | None = None, reply_to: int | None = None,
+                  markdown: bool = False) -> int:
         size = path.stat().st_size
         if size > UPLOAD_HTTP_MAX:
             raise TelegramError(6, "file_too_large", f"{path} is {size} bytes; the Bot API "
                                 f"sends at most {UPLOAD_HTTP_MAX} bytes",
                                 "send a link to it instead")
-        params = {"chat_id": chat_id, "caption": (caption or "")[:CAPTION_CHARS] or None,
+        parts = split_rendered(*_rendered(caption, markdown), CAPTION_CHARS, cut=True)
+        text, entities = parts[0] if parts else ("", [])
+        params = {"chat_id": chat_id, "caption": text or None,
                   "message_thread_id": _thread(topic_id)}
         if reply_to:
             params["reply_parameters"] = {"message_id": reply_to,
                                           "allow_sending_without_reply": True}
-        with path.open("rb") as handle:
-            found = self.call("sendDocument", params,
-                              files={"document": (path.name, handle)}, timeout=300)
+
+        def upload(body):
+            with path.open("rb") as handle:
+                return self.call("sendDocument", body,
+                                 files={"document": (path.name, handle)}, timeout=300)
+
+        found = self._formatted(upload, params, "caption_entities", entities)
         return int(found["message_id"])
+
+    def _formatted(self, send, params: dict, key: str, entities: list) -> Any:
+        """Send with `entities` under `key`; when Telegram refuses them (a 400 about
+        the entities or the text), send the same text once more without them."""
+        if not entities:
+            return send(params)
+        try:
+            return send({**params, key: entities})
+        except TelegramError as exc:
+            if exc.status != 400 or not _ENTITY_REFUSAL.search(exc.message):
+                raise
+        return send(params)
 
     def react(self, chat_id: int, message_id: int, emoji: str | None) -> None:
         reaction = [{"type": "emoji", "emoji": emoji}] if emoji else []
@@ -425,21 +449,358 @@ def _thread(topic_id: int | None) -> int | None:
 
 
 def split_text(text: str, limit: int = MESSAGE_CHARS) -> list[str]:
-    """Cut a reply into messages of at most `limit` characters, at a paragraph,
-    then a line, then a space where one is near the end."""
+    """Cut a plain reply into messages of at most `limit` UTF-16 units."""
+    return [part for part, _ in split_rendered(text, [], limit)]
+
+
+# ── Markdown into Telegram entities ──────────────────────────────────────────
+#
+# A model writes Markdown; Telegram renders message entities. The reply is
+# rendered here into plain text plus entities, sent with no parse mode, so no
+# character of it needs escaping and none can make Telegram refuse the markup.
+# Offsets and lengths are UTF-16 code units, as the Bot API counts them.
+#
+#   **x** __x__ -> bold        *x* _x_ -> italic       ~~x~~ -> strikethrough
+#   `x`         -> code        ```lang fenced``` -> pre (language)
+#   [t](url)    -> text_link   > lines -> blockquote   # heading -> a bold line
+#   - * + items -> "• " lines  a | table | -> pre, as written
+#
+# `*` and `_` open only where no letter or digit stands before them and close
+# only where none follows, so 2*3*4 and snake_case stay as written; a backslash
+# before punctuation keeps that character literal.
+
+_ENTITY_REFUSAL = re.compile(r"entit|pars|url|text", re.I)
+_PUNCT = set("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+_DELIMS = (("**", "bold"), ("__", "bold"), ("~~", "strikethrough"),
+           ("*", "italic"), ("_", "italic"))
+_LINK_SCHEMES = ("http://", "https://", "tg://", "mailto:")
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})\s*([^\s`]*)")
+_HEADING = re.compile(r"^ {0,3}#{1,6}\s+(.*?)(?:\s+#+)?\s*$")
+_ITEM = re.compile(r"^(\s*)[-*+]\s+(.*)$")
+_QUOTE = re.compile(r"^ {0,3}> ?(.*)$")
+_TABLE_RULE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def _utf16(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _rendered(text: str | None, markdown: bool) -> tuple[str, list]:
+    """The text to send and its entities: rendered when asked for, and the text as
+    written when rendering fails, so a reply is never lost to its formatting."""
     text = (text or "").strip()
+    if markdown and text:
+        try:
+            found = render_markdown(text)
+            if found[0]:
+                return found
+        except Exception:
+            pass
+    return text, []
+
+
+class _Out:
+    """Rendered text being built, with entities at code-point offsets."""
+
+    def __init__(self):
+        self.chars: list[str] = []
+        self.entities: list[dict] = []
+        self.size = 0
+
+    def add(self, text: str) -> None:
+        self.chars.append(text)
+        self.size += len(text)
+
+    def mark(self, kind: str, start: int, **extra) -> None:
+        if self.size > start:
+            self.entities.append({"type": kind, "offset": start,
+                                  "length": self.size - start, **extra})
+
+
+def _inline(src: str, out: _Out) -> None:
+    """Render one line's inline Markdown into `out`."""
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "\\" and i + 1 < n and src[i + 1] in _PUNCT:
+            out.add(src[i + 1])
+            i += 2
+            continue
+        if c == "`":
+            run = len(src[i:]) - len(src[i:].lstrip("`"))
+            end = _code_close(src, i + run, run)
+            if end is None:
+                out.add(src[i:i + run])
+                i += run
+                continue
+            body = src[i + run:end]
+            if len(body) > 2 and body[0] == body[-1] == " ":
+                body = body[1:-1]
+            start = out.size
+            out.add(body)
+            out.mark("code", start)
+            i = end + run
+            continue
+        if c == "[":
+            link = _link(src, i)
+            if link:
+                label, url, i = link
+                start = out.size
+                _inline(label, out)
+                out.mark("text_link", start, url=url)
+                continue
+        matched = False
+        for delim, kind in _DELIMS:
+            if src.startswith(delim, i) and _opens(src, i, delim):
+                end = _close(src, i + len(delim), delim)
+                if end is None:
+                    continue
+                start = out.size
+                _inline(src[i + len(delim):end], out)
+                out.mark(kind, start)
+                i = end + len(delim)
+                matched = True
+                break
+        if matched:
+            continue
+        if c in "*_~":
+            run = len(src[i:]) - len(src[i:].lstrip(c))
+            out.add(src[i:i + run])
+            i += run
+            continue
+        out.add(c)
+        i += 1
+
+
+def _code_close(src: str, start: int, run: int) -> int | None:
+    j = start
+    while True:
+        j = src.find("`" * run, j)
+        if j < 0:
+            return None
+        k = j + run
+        if (j == 0 or src[j - 1] != "`") and (k >= len(src) or src[k] != "`"):
+            return j
+        j = k + len(src[k:]) - len(src[k:].lstrip("`"))
+
+
+def _word(ch: str) -> bool:
+    return ch.isalnum()
+
+
+def _opens(src: str, i: int, delim: str) -> bool:
+    after = i + len(delim)
+    if after >= len(src) or src[after].isspace():
+        return False
+    if delim in ("*", "_", "__") and i > 0 and _word(src[i - 1]):
+        return False
+    return True
+
+
+def _closes(src: str, j: int, delim: str) -> bool:
+    if src[j - 1].isspace():
+        return False
+    after = j + len(delim)
+    if delim in ("*", "_", "__") and after < len(src) and _word(src[after]):
+        return False
+    return True
+
+
+def _close(src: str, start: int, delim: str) -> int | None:
+    """Where `delim` closes a span opened just before `start`, skipping escapes and
+    code spans; in a longer run of the same character, its last `delim`."""
+    j, n, ch = start + 1, len(src), delim[0]
+    while j < n:
+        c = src[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == "`":
+            run = len(src[j:]) - len(src[j:].lstrip("`"))
+            end = _code_close(src, j + run, run)
+            j = (end + run) if end is not None else j + run
+            continue
+        if c == ch:
+            run = len(src[j:]) - len(src[j:].lstrip(ch))
+            if run >= len(delim):
+                at = j + run - len(delim)
+                if (len(delim) == 2 or run == 1 or run >= 3) and _closes(src, at, delim):
+                    return at
+            j += run
+            continue
+        j += 1
+    return None
+
+
+def _link(src: str, i: int):
+    depth, j, n = 0, i, len(src)
+    while j < n:
+        if src[j] == "\\":
+            j += 2
+            continue
+        if src[j] == "[":
+            depth += 1
+        elif src[j] == "]":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    if j >= n or not src.startswith("(", j + 1):
+        return None
+    k, depth = j + 2, 1
+    while k < n and depth:
+        if src[k] == "(":
+            depth += 1
+        elif src[k] == ")":
+            depth -= 1
+        elif src[k].isspace():
+            return None
+        k += 1
+    url = src[j + 2:k - 1]
+    if depth or not url.lower().startswith(_LINK_SCHEMES) or j == i + 1:
+        return None
+    return src[i + 1:j], url, k
+
+
+def render_markdown(text: str) -> tuple[str, list[dict]]:
+    """The model's Markdown as (text, entities) for a send with no parse mode."""
+    lines = (text or "").replace("\r\n", "\n").split("\n")
+    out = _Out()
+    i, first = 0, True
+
+    def newline():
+        nonlocal first
+        if not first:
+            out.add("\n")
+        first = False
+
+    while i < len(lines):
+        line = lines[i]
+        fence = _FENCE.match(line)
+        if fence:
+            mark, language = fence.group(1), fence.group(2)
+            body, i = [], i + 1
+            while i < len(lines) and not lines[i].strip().startswith(mark):
+                body.append(lines[i])
+                i += 1
+            i += 1
+            newline()
+            start = out.size
+            out.add("\n".join(body))
+            out.mark("pre", start, **({"language": language} if language else {}))
+            continue
+        if (line.lstrip().startswith("|") and i + 1 < len(lines)
+                and _TABLE_RULE.match(lines[i + 1])):
+            rows = []
+            while i < len(lines) and lines[i].lstrip().startswith("|"):
+                rows.append(lines[i].strip())
+                i += 1
+            newline()
+            start = out.size
+            out.add("\n".join(rows))
+            out.mark("pre", start)
+            continue
+        if _QUOTE.match(line):
+            newline()
+            start = out.size
+            quoted = True
+            while i < len(lines) and _QUOTE.match(lines[i]):
+                if not quoted:
+                    out.add("\n")
+                quoted = False
+                _inline(_QUOTE.match(lines[i]).group(1), out)
+                i += 1
+            out.mark("blockquote", start)
+            continue
+        newline()
+        heading = _HEADING.match(line)
+        item = _ITEM.match(line)
+        if heading:
+            start = out.size
+            inner = _Out()
+            _inline(heading.group(1), inner)
+            out.add("".join(inner.chars))
+            for entity in inner.entities:
+                if entity["type"] != "bold":
+                    out.entities.append({**entity, "offset": entity["offset"] + start})
+            out.mark("bold", start)
+        elif item and not _rule(line):
+            level = len(item.group(1).expandtabs(4)) // 2
+            out.add("  " * level + ("◦ " if level else "• "))
+            _inline(item.group(2), out)
+        else:
+            _inline(line, out)
+        i += 1
+    rendered = "".join(out.chars)
+    return _settle(rendered, out.entities)
+
+
+def _rule(line: str) -> bool:
+    return bool(re.match(r"^\s*([-*_])(\s*\1){2,}\s*$", line))
+
+
+def _settle(text: str, entities: list[dict]) -> tuple[str, list[dict]]:
+    """Trim the rendered text and convert entity offsets to UTF-16 units."""
+    lead = len(text) - len(text.lstrip())
+    text = text.strip()
+    units = _units(text)
+    settled = []
+    for e in entities:
+        a = max(e["offset"] - lead, 0)
+        b = min(e["offset"] + e["length"] - lead, len(text))
+        if b > a:
+            settled.append({**e, "offset": units[a], "length": units[b] - units[a]})
+    settled.sort(key=lambda e: (e["offset"], -e["length"]))
+    return text, settled
+
+
+def _units(text: str) -> list[int]:
+    """UTF-16 offset of every code-point position of `text`, and of its end."""
+    units, at = [0], 0
+    for ch in text:
+        at += 2 if ord(ch) > 0xFFFF else 1
+        units.append(at)
+    return units
+
+
+def split_rendered(text: str, entities: list[dict], limit: int = MESSAGE_CHARS, *,
+                   cut: bool = False) -> list[tuple[str, list[dict]]]:
+    """Cut rendered text into parts of at most `limit` UTF-16 units - at a
+    paragraph, then a line, then a space near the end - each with the entities
+    that fall in it; an entity across a cut continues in the next part. With
+    `cut`, only the first part is kept, ended at the limit."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    units = _units(text)
+    spans, start = [], 0
+    while start < len(text):
+        end = start
+        while end < len(text) and units[end + 1] - units[start] <= limit:
+            end += 1
+        if end < len(text) and not cut:
+            window = text[start:end]
+            at = max(window.rfind("\n\n"), window.rfind("\n"))
+            if at < (end - start) // 2:
+                at = window.rfind(" ")
+            if at >= (end - start) // 2:
+                end = start + at
+        piece = text[start:end].rstrip()
+        spans.append((start, start + len(piece)))
+        if cut:
+            break
+        start = end
+        while start < len(text) and text[start].isspace():
+            start += 1
     parts = []
-    while len(text) > limit:
-        window = text[:limit]
-        cut = max(window.rfind("\n\n"), window.rfind("\n"))
-        if cut < limit // 2:
-            cut = window.rfind(" ")
-        if cut < limit // 2:
-            cut = limit
-        parts.append(text[:cut].rstrip())
-        text = text[cut:].lstrip()
-    if text:
-        parts.append(text)
+    for a, b in spans:
+        ua, ub = units[a], units[b]
+        found = []
+        for e in entities:
+            lo, hi = max(e["offset"], ua), min(e["offset"] + e["length"], ub)
+            if hi > lo:
+                found.append({**e, "offset": lo - ua, "length": hi - lo})
+        parts.append((text[a:b], found))
     return parts
 
 

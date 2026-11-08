@@ -86,14 +86,18 @@ class Api:
         self.reactions: list = []
         self.status = "member"
         self.next_id = 1000
+        self.rendered: list[bool] = []   # each send's `markdown`, in order
 
-    def send_text(self, chat, text, *, topic_id=None, reply_to=None):
+    def send_text(self, chat, text, *, topic_id=None, reply_to=None, markdown=False):
         self.next_id += 1
         self.sent.append({"chat": chat, "text": text, "topic": topic_id, "reply_to": reply_to})
+        self.rendered.append(markdown)
         return [self.next_id]
 
-    def send_file(self, chat, path, *, caption=None, topic_id=None, reply_to=None):
+    def send_file(self, chat, path, *, caption=None, topic_id=None, reply_to=None,
+                  markdown=False):
         self.sent.append({"chat": chat, "file": str(path), "text": caption})
+        self.rendered.append(markdown)
         return 1
 
     def typing(self, chat, topic=None):
@@ -244,6 +248,7 @@ def test_one_persons_messages_in_the_debounce_are_one_turn(tmp_path):
     prompt = runner.calls[0]["prompt"]
     assert "Messages: #1, #2, #3" in prompt and "first part\nsecond part\nthird" in prompt
     assert api.sent == [{"chat": ANN, "text": "hello there", "topic": None, "reply_to": None}]
+    assert api.rendered == [True]       # the model's reply is rendered from Markdown
     assert store.channel("prj_test", "helper", ANN)["last_message_id"] == 3
     # A redelivered update is not acted on again.
     assert dialogue.offer_update(update(2, "second part"))["reason"] == "already_taken"
@@ -446,6 +451,7 @@ def test_voice_is_transcribed_echoed_and_read_as_text(tmp_path):
     drain(dialogue, clock)
     assert api.sent[0] == {"chat": ANN, "text": "> remind me tomorrow", "topic": None,
                            "reply_to": 1}
+    assert api.rendered[0] is False     # the person's own words are sent as spoken
     assert "[voice] remind me tomorrow" in runner.calls[0]["prompt"]
     assert json.loads(dialogue.transcript_path(ANN, 1).read_text())["text"] == \
         "remind me tomorrow"
@@ -568,6 +574,18 @@ def test_progress_lines_are_relayed_first_at_once_then_throttled(tmp_path):
         handle.write(json.dumps({"kind": "progress", "text": "found it"}) + "\n")
     box.relay()
     assert sent[-1] == ("progress", "found it")
+
+
+def test_what_a_worker_sends_and_a_job_result_are_rendered(tmp_path):
+    dialogue, store, api, runner, clock = make(tmp_path)
+    job = {"chat_id": ANN, "topic_id": None, "group": False, "external": False,
+           "message_id": 1, "msg": None}
+    box = dialogue.outbox_for(job, "turn", 15)
+    box.send("message", "**found** it", None)
+    box.send("message", "the *file*", str(tmp_path / "f.txt"))
+    dialogue.deliver_result({"result_text": "**done**", "chat_id": ANN, "topic_id": None,
+                             "origin_message_id": 1})
+    assert api.rendered == [True, True, True]
 
 
 def test_parse_command_and_quoting():

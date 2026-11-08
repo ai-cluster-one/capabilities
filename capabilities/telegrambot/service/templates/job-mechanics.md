@@ -22,7 +22,7 @@ The conversation is the one this job came from, read back from Telegram. It is m
 
 ## What you return
 
-- Plain text, in the language of the request, addressed to the person who asked.
+- A message in the language of the request, addressed to the person who asked, formatted only as Telegram renders it: **bold**, *italic*, ~~strikethrough~~, `inline code`, fenced code blocks, [links](https://example.com), `>` quotes and flat lists made with `-`; no headings, no tables, no nested lists.
 - The result, not an account of your process.
 - Where the result is a table, a report or anything whose formatting must survive, put it in a file and send the file with a short line saying what it is, then return nothing.
 - Returning nothing is a finished job when you have already sent the result yourself.
