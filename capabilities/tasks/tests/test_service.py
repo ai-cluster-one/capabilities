@@ -947,6 +947,44 @@ def test_the_service_keeps_a_live_turns_lease_and_lets_a_gone_ones_lapse(
 
 
 @needs_store
+def test_a_running_raise_the_service_cannot_renew_is_said_within_one_beat(
+        project, store, capsys, monkeypatch):
+    """The renewal reaches the store and matches no row for a raise that is
+    still running: the lease is left to lapse, and the log says so at the
+    first beat, once. A raise already closed under its turn is not a renewal
+    that failed and is not said."""
+    entry, schema, conn = store
+    monkeypatch.setattr(mod, "_beat_lease", lambda: (1, 3))
+    write_settings(project, "version = 1\npoll_seconds = 3600\nmax_parallel = 2\n")
+    h = Harness(project, entry)
+    execution, left = held_raise(entry, schema, conn, capsys, h, 3)
+    other = add(entry, capsys, "alpha", key="t-elsewhere")
+    # The turn reports its raise on a task that is not the raise's.
+    claim = json.loads((h.claims / "alpha.json").read_text())
+    (h.claims / "alpha.json").write_text(json.dumps({**claim, "task_id": other}))
+    tid = add(entry, capsys, "beta", key="t-closed")
+    closed = str(mod._claim(entry, {"key": "t-closed", "worker": "beta",
+                                    "lease": "60"})["execution"]["id"])
+    conn.execute(f"update {schema}.tasks_executions set status = 'abandoned', "
+                 "ended_at = now() where id = %s", (closed,))
+    (h.claims / "beta.json").write_text(json.dumps(
+        {"task": "t-closed", "task_id": tid, "execution": closed, "attempt": 1}))
+    log = h.daemon.state_dir / "daemon.log"
+    with h:
+        turns = [h.daemon.spawn("alpha", "work"), h.daemon.spawn("beta", "work")]
+        h.steps(lambda: all(turn.phase == "working" for turn in turns))
+        took = h.steps(lambda: f"cannot renew the lease of the raise {execution}"
+                       in log.read_text(), seconds=3)
+        assert took < 2
+        h.settle(3)
+        said = log.read_text()
+        assert said.count(f"cannot renew the lease of the raise {execution}") == 1
+        assert "not on the task the turn reported" in said
+        assert closed not in said
+        assert left() < 0
+
+
+@needs_store
 def test_the_service_renews_before_it_starts_a_turn_whose_claim_would_sweep(
         project, store, capsys, monkeypatch):
     entry, schema, conn = store

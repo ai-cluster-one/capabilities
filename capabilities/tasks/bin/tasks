@@ -12416,9 +12416,11 @@ def _service_renew_leases(conn, held: list) -> dict:
     `held` is (worker, receipt) for each turn whose process is alive, the
     receipt the turn wrote when it claimed. Only a raise still running, opened
     by that execution on the task its receipt names, is renewed, so a closed
-    raise is never revived. Answers the executions renewed and `every`, how
-    many seconds until the next renewal is due. Written on the service's
-    connection, `conn`."""
+    raise is never revived. Answers the executions renewed, `unrenewed` - each
+    execution asked for whose raise is still running or not in this store, and
+    so lapses unless something changes, with why - and `every`, how many
+    seconds until the next renewal is due. Written on the service's connection,
+    `conn`."""
     every, short = _beat_lease()
     project = _writing_project()
     declared = None
@@ -12437,7 +12439,7 @@ def _service_renew_leases(conn, held: list) -> dict:
         executions.append(str(receipt["execution"]))
         tasks.append(str(receipt["task_id"]))
         caps.append(cap)
-    renewed = []
+    renewed, unrenewed = [], {}
     if executions:
         with conn.cursor() as cur:
             cur.execute(f"""update {SCHEMA}.tasks_executions e
@@ -12454,7 +12456,22 @@ def _service_renew_leases(conn, held: list) -> dict:
                                                         where w.agent_id = %s))
                          returning e.id""", (short, executions, tasks, caps, project, project))
             renewed = [str(row["id"]) for row in _rows(cur)]
-    return {"renewed": renewed, "every": every}
+            missed = [execution for execution in executions if execution not in renewed]
+            if missed:
+                # A raise that is no longer running is the turn's to settle and
+                # no failure of the renewal; one still running, or not in this
+                # store at all, is a lease left to lapse, and is answered why.
+                cur.execute(f"""select id::text as id, status from {SCHEMA}.tasks_executions
+                                 where id::text = any(%s)""", (missed,))
+                status = {row["id"]: row["status"] for row in _rows(cur)}
+                for execution in missed:
+                    if execution not in status:
+                        unrenewed[execution] = f"no raise {execution} in {SCHEMA}"
+                    elif status[execution] == "running":
+                        unrenewed[execution] = (
+                            f"the raise is running in {SCHEMA}, but not on the task the "
+                            f"turn reported or not in project {project}")
+    return {"renewed": renewed, "unrenewed": unrenewed, "every": every}
 
 
 def _settle_cut_off(conn, execution: str) -> list[str]:

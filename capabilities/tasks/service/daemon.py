@@ -646,10 +646,12 @@ class ProjectSlot:
         self.notification_installed: bool | None = None
         self.next_poll = 0.0
         self.next_moment: float | None = None
-        # When the leases of its running turns are next renewed, and why the
-        # last renewal failed.
+        # When the leases of its running turns are next renewed, why the last
+        # renewal failed, and the raises the last one answered it left running
+        # unrenewed, each said once.
         self.next_renew = 0.0
         self.renew_error: str | None = None
+        self.unrenewed: set[str] = set()
         self.wakes: set[str] = {"start"}
         # Set when the store announces a change to the declaration, or a lost
         # listener is opened again and an announcement may have been missed.
@@ -1172,6 +1174,18 @@ class ProjectSlot:
         if self.renew_error is not None:
             self.log("renews the leases of its running turns again")
         self.renew_error = None
+        # A raise still running that the renewal did not reach lapses within
+        # its lease: said the first time, and again once it is renewed.
+        missed = answer.get("unrenewed") or {}
+        tasks = {claim.get("execution"): claim.get("task") for _worker, claim in held}
+        for execution, why in missed.items():
+            if execution not in self.unrenewed:
+                self.log(f"cannot renew the lease of the raise {execution} its turn on "
+                         f"{tasks.get(execution)} holds, so it lapses: {why}")
+        for execution in self.unrenewed - set(missed):
+            if execution in answer.get("renewed", ()):
+                self.log(f"renews the lease of the raise {execution} again")
+        self.unrenewed = set(missed)
         self.next_renew = now + float(answer["every"])
 
     def spawn(self, worker: str, reason: str, exclude: tuple = ()) -> Turn | None:
