@@ -88,10 +88,12 @@ else:
 '''
 
 FAKE_MANAGER = r'''
-import json, os, sys
+import json, os, sys, time
 if os.environ.get("FAKE_MANAGER_MODE") == "fail":
     sys.exit(1)
 args = sys.argv[1:]
+if os.environ.get("FAKE_MANAGER_MODE") == "slow" and args == ["agent", "list"]:
+    time.sleep(13)
 if args == ["agent", "list"]:
     print(json.dumps({"ok": True, "agents": [
         {"id": "agt0000aaaa", "slug": "helper-agent", "name": "Robin", "nodes": []}]}))
@@ -325,6 +327,17 @@ def test_a_move_to_a_worker_an_agent_or_a_capability_puts_nothing(lab, monkeypat
     ok(tasks(lab, "set", tid, "--status", "todo", FAKE_MANAGER_MODE="fail"))
     assert calls(lab) == []
 
+
+def test_a_slow_but_answering_manager_still_judges_a_person(lab):
+    # A machine whose manager takes longer than an Inbox call to list its agents
+    # still puts the wait before the person, and takes the question with it.
+    tid = add(lab, "t-slow", "--status", "todo")
+    task = ok(tasks(lab, "set", tid, "--status", "waiting", "--assignee", PERSON,
+                    "--question", "Go?", "--yes", "Go", "--no", "Stop", "--recommend", "no",
+                    FAKE_MANAGER_MODE="slow"))["task"]
+    assert task["metadata"]["question"]["text"] == "Go?"
+    [call] = calls(lab)
+    assert call["argv"][0] == "ask"
 
 # --- The answer coming back ---------------------------------------------------
 

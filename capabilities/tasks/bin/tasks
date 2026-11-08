@@ -3923,6 +3923,9 @@ def _created_on_line(lookup, given: str | None, named: str | None) -> str | None
 # Without `inbox` on PATH none of it runs.
 _INBOX_MOVES: list[dict] = []
 _INBOX_SECONDS = 10
+# The manager lists every agent of the machine's store to answer whether a name
+# is a person, which takes longer than an Inbox call on a store with many agents.
+_MANAGER_SECONDS = 60
 _QUESTION = "question"
 _QUESTION_FLAGS = ("question", "yes", "no", "recommend")
 
@@ -3997,7 +4000,7 @@ def _manager_names(name: str, seen: dict) -> bool | None:
              lambda a: [one.get("name") for one in a.get("matches") or []]))
     for label, argv, names in asks:
         if label not in seen:
-            answer = _command([manager, *argv])
+            answer = _command([manager, *argv], _MANAGER_SECONDS)
             try:
                 seen[label] = (None if answer is None else
                                {str(one).strip() for one in names(answer) if one})
