@@ -260,6 +260,9 @@ def test_a_malformed_declaration_costs_only_its_own_block(tmp_path, declared):
 
 # --- the memory marker -----------------------------------------------------------
 
+# The line an earlier release composed above a memory contribution.
+MEMORY_MARKER = "<!-- contextkit:memory-contribution -->"
+
 def test_a_composed_memory_contribution_carries_the_marker_once(tmp_path):
     _snapshot(tmp_path, "memory", DECLARED)
     _snapshot(tmp_path, "demo", DECLARED)
@@ -270,11 +273,11 @@ def test_a_composed_memory_contribution_carries_the_marker_once(tmp_path):
     fragment = _fragment(tmp_path, project)
     sections = _sections(fragment)
 
-    assert fragment.count(M.MEMORY_CONTRIBUTION_MARKER) == 1
+    # The manager writes no marker line above it: the contribution follows
+    # the stub line as any other capability's does.
+    assert MEMORY_MARKER not in fragment
     assert sections["memory"].startswith(
-        "\nWork with memory records. Run `memory help`.\n\n"
-        f"{M.MEMORY_CONTRIBUTION_MARKER}\n- remembered here\n\n")
-    assert M.MEMORY_CONTRIBUTION_MARKER not in sections["demo"]
+        "\nWork with memory records. Run `memory help`.\n\n- remembered here\n\n")
 
 
 @pytest.mark.parametrize("kind", ["empty", *FAILURES])
@@ -288,7 +291,7 @@ def test_a_memory_contribution_not_composed_carries_no_marker(tmp_path, kind):
 
     fragment = _fragment(tmp_path, project)
 
-    assert M.MEMORY_CONTRIBUTION_MARKER not in fragment
+    assert MEMORY_MARKER not in fragment
     if kind != "empty":
         assert "The context contribution of `memory` is unavailable: " in fragment
 

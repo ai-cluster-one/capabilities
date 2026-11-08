@@ -144,8 +144,8 @@ MOVING IN AND OUT
       Carry existing memory folders into the store. ROOTs are project roots;
       with none, the project roots named by the machine service opt-in lists
       under $XDG_CONFIG_HOME/*/service/projects.{json,toml}. A root's memory
-      folder is `memory` inside the body root `contextkit path --json` names
-      in a ContextKit-bound project, else <root>/memory. Every file is one day of
+      folder is `memory` inside the body root `capabilities path --json` names
+      in a folder with a legacy binding, else <root>/memory. Every file is one day of
       `## [HH:MM — ]title` sections. The day and the HH:MM are read in the
       machine's local zone, or in the IANA zone --timezone names (each date
       taking that zone's offset on it), and every entry's dated_from says which.
@@ -1147,22 +1147,23 @@ def _manager_bin() -> str:
 
 
 def _memory_folder(root: Path) -> tuple[Path, str]:
-    """A project's memory folder: `memory` in the body root its context owner
-    names, else <root>/memory."""
+    """A project's memory folder: in a folder with a legacy binding, `memory`
+    in the body root the manager's `path --json` names for it, else
+    <root>/memory."""
     if (root / ".contextkit" / "config.toml").is_file():
         env = {k: v for k, v in os.environ.items() if k not in _PROJECT_POINTERS}
         try:
-            done = subprocess.run(["contextkit", "path", "--json"], cwd=root, env=env,
-                                  capture_output=True, text=True, timeout=10,
+            done = subprocess.run([_manager_bin(), "path", "--json"], cwd=root, env=env,
+                                  capture_output=True, text=True, timeout=30,
                                   stdin=subprocess.DEVNULL)
             body = json.loads(done.stdout).get("body_root") if done.returncode == 0 else None
             if isinstance(body, str) and body.strip():
                 folder = root / body.strip() / "memory"
                 folder.resolve().relative_to(root.resolve())
-                return folder, "the body root named by `contextkit path --json`"
+                return folder, "the body root named by `capabilities path --json`"
         except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
             pass
-        return root / "memory", "<root>/memory; `contextkit path --json` named no body root"
+        return root / "memory", "<root>/memory; `capabilities path --json` named no body root"
     return root / "memory", "<root>/memory"
 
 

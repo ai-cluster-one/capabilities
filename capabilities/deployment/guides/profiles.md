@@ -23,7 +23,7 @@ arrives at run time on a volume. Everything else about it - the Compose file,
 the embedded services, the Supervisor configuration, the mounts - is what
 `agent-box` produces.
 
-`agent-box-shell` compiles the same container with no body at all, for an agent that lives wholly in the store. The image carries tools and the boot path; nothing arrives from Git, there is no body volume and no body sync, and no ContextKit is installed or run. On every boot the entrypoint binds the empty `compiler.container.project_root` to the agent the store holds under `CAPABILITIES_PROJECT_ID` with `capabilities init --id`, which binds it by the id alone with no ContextKit binding, wires the agent CLIs' session hooks with `capabilities hooks install --claude --codex`, composes the context from the store with `capabilities build`, and then starts the compiled services under the node's service manager, where the gate places them. The Compose file sets `CAPABILITIES_PROJECT_ID` as the deploying folder resolves it at sync - a folder bound with `capabilities init --id <id>` that holds the `deployment/` declarations - and passes it through from the server's environment when that folder resolves none; a box started without it stops at boot. Whatever the box writes in its project root lasts only as long as the container: what has to outlive a redeploy lives in the store or on a service's declared volume.
+`agent-box-shell` compiles the same container with no body at all, for an agent that lives wholly in the store. The image carries tools and the boot path; nothing arrives from Git, and there is no body volume and no body sync. On every boot the entrypoint binds the empty `compiler.container.project_root` to the agent the store holds under `CAPABILITIES_PROJECT_ID` with `capabilities init --id`, which binds it by the id alone, wires the agent CLIs' session hooks with `capabilities hooks install --claude --codex`, composes the context from the store with `capabilities build`, and then starts the compiled services under the node's service manager, where the gate places them. The Compose file sets `CAPABILITIES_PROJECT_ID` as the deploying folder resolves it at sync - a folder bound with `capabilities init --id <id>` that holds the `deployment/` declarations - and passes it through from the server's environment when that folder resolves none; a box started without it stops at boot. Whatever the box writes in its project root lasts only as long as the container: what has to outlive a redeploy lives in the store or on a service's declared volume.
 
 `host-agents` declares the project's services for a Mac, where they run as processes on the machine itself. There is no image and no Compose file, and no agent is compiled for a service: the Mac's node manager runs each one the gate places on that node, as a launchd job of its own (see **On a Mac** below). What `sync` still writes into `compiler.host.agents_dir` (default `deployment/launchd/`) is one interval agent per Coolify target that carries the body to its node, and `deployment next` prints the `launchctl` steps that hand those over.
 
@@ -126,9 +126,9 @@ keeps its own volume. The option changes nothing while it is unset.
 context are build artifacts of a checkout. `agent-box` makes them at build time
 against the copy it holds. `agent-box-checkout` has nothing to make them against
 until the volume is mounted, so its entrypoint runs `capabilities init`, and
-where ContextKit is bound `capabilities hooks install --claude --codex` and
-`capabilities build`, on every boot; ContextKit itself is neither installed nor
-run. Each body sync rebuilds the context with `capabilities build`. That costs boot time and needs the network at start; in exchange the
+where the checkout carries a legacy `.contextkit/config.toml` binding
+`capabilities hooks install --claude --codex` and `capabilities build`, on
+every boot. Each body sync rebuilds the context with `capabilities build`. That costs boot time and needs the network at start; in exchange the
 bindings always describe the checkout actually running. It also writes into the
 checkout, which is now a working tree the profile itself commits and pushes: a
 project on this profile has to ignore its generated host bindings, or every boot

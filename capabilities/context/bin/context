@@ -156,7 +156,7 @@ CONTRACT VERBS
   context connections           none: context reaches no system of its own
   context stub                  the one-line awareness text
   context manifest --json       the declaration
-  context guide [<topic>]       how-to guides (none ship)
+  context guide [<topic>]       how-to guides: authoring, groom
   context ids list|get|set|rm   this project's identifiers
   context refs                  this project's references
   context inventory [--network] empty: the documents are the store's (`context list`)

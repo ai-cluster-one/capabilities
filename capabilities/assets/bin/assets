@@ -206,7 +206,7 @@ CONTRACT
       Write or remove a file store connection from its declared fields; the
       two keys only in the JSON object on stdin.
   assets stub | assets manifest --json | assets help
-  assets guide [topic]          no guides ship
+  assets guide [topic]          how-to guides: authoring
   assets ids list|get|set|rm    the project identifiers envelope
   assets refs                   the project's reference menu
   assets inventory              empty: what assets holds is the store's
@@ -260,7 +260,8 @@ CRED_KEYS = [       # a file store connection names its own keys; only the file 
 ]
 WRITE_VERBS = {"save", "retire", "import", "files add", "files link", "files rm"}
 WRITE_DEFAULT = True    # the bucket, like the store, is the consumer's own
-DOCS_BASE = ""
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/assets/guides/")
 STATE = False
 TABLES = True       # the four assets_* tables, built by _tables()
 INVENTORY = None    # what assets holds is in the store; reading it is `assets list`

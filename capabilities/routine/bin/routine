@@ -71,11 +71,11 @@ Routines in the store:
   is every byte after the closing `---` line, kept exactly. Values are taken
   as written: a quoted value keeps its quotes. `name` must equal the routine's
   name. Input that does not read back byte for byte is refused (exit 6
-  `not_canonical`, naming the line), with one exception ContextKit makes too:
-  front matter whose keys stand in another order, or that carries keys other
-  than these three, is read for name, title and description, the other keys
-  dropped; the answer marks that routine `normalised` and says what changed,
-  because its export is the canonical form rather than the file read.
+  `not_canonical`, naming the line), with one exception: front matter
+  whose keys stand in another order, or that carries keys other than these
+  three, is read for name, title and description, the other keys dropped;
+  the answer marks that routine `normalised` and says what changed, because
+  its export is the canonical form rather than the file read.
 
   routine list --store [--json]
       Every routine of the project in the store with its active version:
@@ -195,12 +195,12 @@ The agent's routines and their titles:
       a global routine the project has enabled). A routine without
       a title is titled by its name; title_source says which (`front_matter`
       or `name`). The answer names the source, and warns of each folder file
-      it skips. For a folder it is what `contextkit routines --json` lists.
+      it skips.
   routine title <name> <title>
   routine title <name> --clear
       Set the routine's display title, one line of at most 120 characters, or
       remove it so the name titles it. In the folder the file's `title:` line
-      is written as ContextKit writes it, after `name:` as a JSON string; in
+      is written after `name:` as a JSON string; in
       the store a new version holds that same title and the active version's
       description and body. Answers the routine as `titles` lists it and
       `changed` (`["title"]`, or `[]` when it already held that title). Exit 3

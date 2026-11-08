@@ -10,7 +10,7 @@
     "agenttemplates": {
       "icon": true,
       "path": "capabilities/agenttemplates",
-      "payload_sha256": "583c60ce910349d656b04a8829004c959ba81e5040d97e4085c43c20889ec80e",
+      "payload_sha256": "aef8e3d8288c04d52972afafda1987efb46315885d3bfb7fb74287a5cc764160",
       "store_major": 3,
       "summary": "The agent templates a new agent is made from - the starter context files and each agent template (its manifest, icon, context, routines) - carried as files in this capability's bundle; list them and show one, and the manager's `templates` and `init --template` read them from here."
     },
@@ -31,7 +31,7 @@
     "assets": {
       "icon": true,
       "path": "capabilities/assets",
-      "payload_sha256": "b4883c3c94204389b9613cc21102bf176075362a7960b55116ab3cf6c9ff2925",
+      "payload_sha256": "ae3221ed4559c8857fdf790985653037d2adb666ea69192348babd9e27873b09",
       "store_major": 3,
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder."
     },
@@ -80,7 +80,7 @@
     "context": {
       "icon": true,
       "path": "capabilities/context",
-      "payload_sha256": "d4e42e86db4e70e454c5f4fd403cc5250fbf4d7e8acdfb93b0d8ad41e8c9cc14",
+      "payload_sha256": "e8dd4878b56b6f900b02250d2376da576b921b39cd2287727772f491d4e7a7f6",
       "store_major": 3,
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte."
     },
@@ -94,7 +94,7 @@
     "deployment": {
       "icon": true,
       "path": "capabilities/deployment",
-      "payload_sha256": "9f59360780b839df6f03bae4f936229497b5b12f7ce0bbe40061940d5659f1a5",
+      "payload_sha256": "2b517bdd7ba892924d93bbf6fde664dffecd498cacc7675366a70967ddf2f6e3",
       "store_major": 3,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to."
     },
@@ -171,7 +171,7 @@
     "memory": {
       "icon": true,
       "path": "capabilities/memory",
-      "payload_sha256": "87c251e63fe315f168d90db5fb538ea8712900309d52d855dee8427261c8bb5e",
+      "payload_sha256": "c7f4f7360b6c8560cb2ba0731a459f37a9a4ff5ed1c6e5992adade75ed1f8dd5",
       "store_major": 3,
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a block in every session's context that says how to record and search them and how many there are, and a service that keeps the block current and consolidates the entries."
     },
@@ -206,7 +206,7 @@
     "routine": {
       "icon": true,
       "path": "capabilities/routine",
-      "payload_sha256": "94548ad6a4cf882294d808d7f462846a11e77cbc718ee676e6fdc0107984755a",
+      "payload_sha256": "4f4f232cabc3bd83ea5ddaa60a5e46532acbc2f30d9acd46b8b420331c8057d6",
       "store_major": 3,
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte."
     },
@@ -262,7 +262,7 @@
     "telegram": {
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "914846a5b6054bb7b33b03ce0c1cdbdd22f23f2657a0437acd5e0dba4c15ee5e",
+      "payload_sha256": "f17265d21fa8729440ace92474399bb6425e3994b4896503bb7db093d9be1513",
       "store_major": 3,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },

@@ -93,9 +93,9 @@ PROJECT PATH VERB
         Resolve the current project root and capability envelope once, returning
         project_root, project_envelope, and provider. Plain projects use
         <root>/<body root>/capabilities, the body root their agent's row
-        names (see THE PROJECT ENVELOPE). ContextKit-bound projects must
-        return a usable absolute in-project path; a broken binding is an
-        error, never a fallback.
+        names (see THE PROJECT ENVELOPE). Projects bound by
+        .contextkit/config.toml must return a usable absolute in-project
+        path; a broken binding is an error, never a fallback.
         body_root and layers name the agent's body: each of context, assets,
         routines and capabilities as the absolute path of its folder, except
         a layer the agent keeps in its store, decided as `build` decides it,
@@ -1048,8 +1048,10 @@ PROJECT VERBS (run inside a consuming project)
         pass --codex. Host wiring is manager-owned: each init brings the hook
         entries and Codex config keys it owns to their current form, and
         refuses a host settings file it cannot parse rather than replace it.
-        Idempotent. When `.contextkit/config.toml` is present, init keeps the
-        envelope and skill setup but skips host wiring: ContextKit owns it.
+        Idempotent. When a legacy `.contextkit/config.toml` is present, init
+        keeps the envelope and skill setup, skips host wiring and answers
+        context {owner, config, capabilities_host_wiring: skipped, targets,
+        refresh: "capabilities build"}: `hooks install` wires such an agent.
         Without one, init --id wires the agent's hosts as `hooks install`
         does - the hosts its flags name, Claude when none - instead of the
         standalone wiring, and answers the result as `hooks`, a build that
@@ -1114,7 +1116,7 @@ PROJECT VERBS (run inside a consuming project)
         and no CAPABILITIES_CONTEXT_PROMPT. The answer's agent carries kind.
         Idempotent; --template, --with-template and --id are refused with it.
   templates [--json]
-        What `contextkit templates --json` answers: {source, starter [{path,
+        The starter context files and agent templates: {source, starter [{path,
         title, description}], agents [{id, name, description, icon,
         capabilities, routines, onboarding, agent_names, path}]}. Templates
         are read from the agenttemplates capability's installed bundle
@@ -1124,11 +1126,12 @@ PROJECT VERBS (run inside a consuming project)
         and `init --template` read the same folder.
   identity set [--name <n>] [--description <d>] [--icon <png>] [--project <dir>]
         Write the agent's name, description or icon to its row as `agent
-        set` does, checked as ContextKit checks them (one line; name 120,
+        set` does, checked as `agent set` checks them (one line; name 120,
         description 500 characters; a square PNG of 64-1024 pixels). The
-        icon is kept in the row alone; a ContextKit-bound project also keeps
-        it as .contextkit/icon-<sha>.png, other such icons removed. Exit 6
-        no_project_identity where the folder is bound to no agent.
+        icon is kept in the row alone; a project bound by
+        .contextkit/config.toml also keeps it as .contextkit/icon-<sha>.png,
+        other such icons removed. Exit 6 no_project_identity where the folder
+        is bound to no agent.
   bootstrap [--target claude|codex]... [--yes]
         Bind the project: a Git repository (where the folder holds files and
         none, a checkpoint commit of them first, which needs --yes, with the
@@ -1155,7 +1158,8 @@ PROJECT VERBS (run inside a consuming project)
         system, see init --system), name, description, icon_sha, icon_bytes, onboarding_status, onboarding_routine,
         body_root, collaboration_mode, migrating_since, migrated_at,
         created_at, updated_at}: body_root is the folder holding the body of
-        an agent without a ContextKit binding (null: the project root),
+        an agent without a .contextkit/config.toml binding (null: the
+        project root),
         collaboration_mode ask or direct (null: ask). --icon-out
         writes the icon's PNG bytes to PATH (exit 6 no_icon without one).
   agent set [--name TEXT] [--description TEXT] [--icon PNG | --no-icon]
@@ -1165,7 +1169,7 @@ PROJECT VERBS (run inside a consuming project)
         fields given; an empty TEXT or NAME, `none` and --no-icon clear a
         field. --icon takes a PNG file and stores it with its SHA-256.
         --collaboration-mode is what `build` composes for an agent without
-        a ContextKit binding (ask: the Collaboration Mode text).
+        a .contextkit/config.toml binding (ask: the Collaboration Mode text).
         Answers {ok, project, agent_id, created, changed, agent, store};
         writing the values a row already holds changes nothing.
   agent list
@@ -1231,8 +1235,8 @@ PROJECT VERBS (run inside a consuming project)
         `capabilities node remove <node>` in the folder removes the node
         again; the folder's files stay. Exit 4 under the read-only switch.
   agent convert [--dry-run]
-        Turn a ContextKit-bound agent into one bound by its id alone, as one
-        change. It first checks, writing nothing when it refuses: the id
+        Turn an agent bound by .contextkit/config.toml into one bound by its
+        id alone, as one change. It first checks, writing nothing when it refuses: the id
         resolves (an [identity] id is moved into .env.local; an id in the
         older form, prj_ and twelve hex characters, is the agent the store
         holds under the twelve alone where it holds that one and none under
@@ -1246,7 +1250,7 @@ PROJECT VERBS (run inside a consuming project)
         and this agent enables each document it uses), and .contextkit/
         holds only config.toml,
         README.md, generated/ with generated context alone, icon-*.png,
-        and audits/ with ContextKit audit records (*.md) and .gitkeep alone
+        and audits/ with audit records (*.md) and .gitkeep alone
         (exit 6 contextkit_folder_not_empty, naming the rest, or a record
         whose place in the assets folder holds another file;
         icon_ambiguous for more than one icon the row would take and none
@@ -1290,8 +1294,8 @@ PROJECT VERBS (run inside a consuming project)
         dry_run, changed: false, fill, differs, evidence}: fill the fields a
         real run would fill, with the values it would write (the icon as
         icon_sha), evidence where a real run would keep each audit record.
-        Run where no ContextKit binding is left, it changes nothing and
-        answers changed false with a message. Exit 4 under the read-only
+        Run where no .contextkit/config.toml binding is left, it changes
+        nothing and answers changed false with a message. Exit 4 under the read-only
         switch, except --dry-run.
   agent rekey [<new id>] [--dry-run]
         Move this project's agent from the id it is bound to to a new one:
@@ -2014,9 +2018,8 @@ PROJECT VERBS (run inside a consuming project)
   context --claude|--codex|--fragment
         Compose the session injection from the gate + snapshots + project
         envelopes. --fragment prints the manager-owned Markdown block without
-        writing host files; context owners such as ContextKit insert this output
-        verbatim. The host modes place the same block where the host reads it
-        (--claude: .claude/rules/CAPABILITIES.md; --codex:
+        writing host files, for a context owner that inserts it verbatim.
+        The host modes place the same block where the host reads it (--claude: .claude/rules/CAPABILITIES.md; --codex:
         .codex/generated/capabilities.md, which Codex loads through the root
         .capabilities.md link named by project_doc_fallback_filenames in
         .codex/config.toml) and replace the file whole. In a Codex-wired
@@ -2028,10 +2031,7 @@ PROJECT VERBS (run inside a consuming project)
         project envelope and held to its declared byte ceiling, composed after
         its stub line; a contribution that is missing, unreadable, malformed
         or over its ceiling is replaced by one line naming `<name> render`,
-        and costs nothing else. Directly above a composed contribution of
-        `memory`, and nowhere else, the block carries the line
-        `<!-- contextkit:memory-contribution -->`, on which ContextKit leaves
-        out its own projection of the project's memory folder. Run by hand, a
+        and costs nothing else. Run by hand, a
         host mode prints the file it wrote and the enabled set. Run as the host's SessionStart hook (the
         harness pipes a payload whose hook_event_name is SessionStart), it
         prints nothing unless the session must be told: the file was just
@@ -2043,19 +2043,19 @@ PROJECT VERBS (run inside a consuming project)
         defaults to identifier persistence guidance and can be overridden with
         CAPABILITIES_CONTEXT_PROMPT in the project's .env/.env.local.
         Do not create or edit generated context files by hand; rerun this
-        command after manual envelope changes. In a ContextKit-managed project
-        (`.contextkit/config.toml`), ContextKit owns both host bindings and
-        the combined context; the host modes delegate without writing and
-        point to `contextkit build`, while --fragment remains the read-only
-        provider surface ContextKit calls.
+        command after manual envelope changes. In a project bound by a legacy
+        `.contextkit/config.toml`, `build` composes the combined context and
+        `hooks install` wires both hosts; the host modes write nothing and
+        answer {owner, config, capabilities_host_wiring: skipped, targets,
+        refresh: "capabilities build", skipped: true}, while --fragment
+        remains the read-only block.
   build [--print] [--json]
-        Compose an agent's generated host context - a ContextKit-bound
-        agent's, or one bound by its project id alone - in the
-        shape `contextkit build` gives it: runtime and collaboration texts
-        that route the agent to this manager and to the `context`, `assets`
-        and `routine` capabilities, a guide menu of only the guides those
-        own, onboarding, foreign instruction files, inline and stub context
-        (global context included), routine index and this manager's own
+        Compose an agent's generated host context - one bound by its project
+        id, or by a legacy .contextkit/config.toml: runtime and collaboration
+        texts that route the agent to this manager and to the `context`,
+        `assets`, `routine` and `memory` capabilities, a guide menu of only
+        the guides those own, onboarding, foreign instruction files, inline
+        and stub context (global context included), routine index and this manager's own
         capabilities block, whose refresh line names `build`, composed in
         this process. When the agent keeps
         context documents in its store (the `context` capability's tables),
@@ -2074,54 +2074,60 @@ PROJECT VERBS (run inside a consuming project)
         the routines folder, and the onboarding block points at its routine
         the same way, with a warning while the folder is still there; a
         store that does not answer leaves the folder in use with a warning.
-        An agent without a ContextKit binding reads its body root,
-        collaboration mode and onboarding from its row (`agent show`), keeps
+        An agent without a .contextkit/config.toml binding reads its body
+        root, collaboration mode and onboarding from its row (`agent show`), keeps
         its layers at their own names in that body root, and has no global
         context folder. --print writes the text
         to stdout and writes nothing; with --json it answers {project, output,
         text, warnings}. Without --print it replaces the output - for a
-        ContextKit-bound agent the configured one (`[output] context`,
+        .contextkit/config.toml-bound agent the configured one (`[output] context`,
         default .contextkit/generated/context.md), otherwise
         .capabilities-generated/context.md - whole
-        and points each host that has a hook for it at it (.contextkit.md,
+        and points each host that has a hook for it at it (.agent-context.md,
+        or .contextkit.md where an earlier release wired Codex through it
+        and its project_doc_fallback_filenames still names that alone;
         .claude/rules/CONTEXT.md), leaving a path that holds something else
         blocked; it answers {project, output, created, changed, links,
         foreign_instructions, warnings}. An output that is not generated
-        context exits 6 output_not_generated. No update notice is composed.
-        A project with neither a ContextKit binding nor a project id exits 6
-        not_contextkit_bound.
+        context exits 6 output_not_generated; output an earlier release
+        generated is recognised as generated. No update notice is composed.
+        A project with neither a .contextkit/config.toml binding nor a
+        project id exits 6 not_contextkit_bound.
   session-start --host claude|codex
         What an agent's SessionStart hook runs: rebuilds the
         generated context as `build` does and prints a notice to the host only
         when the session must be told - the context was just created or its
         host link just made, it changed since the session loaded it, it could
         not be rebuilt, or the host cannot load it (Codex: a root AGENTS.md or
-        AGENTS.override.md, or .contextkit.md not linked; Claude:
+        AGENTS.override.md, or its root link not linked; Claude:
         .claude/rules/CONTEXT.md not linked). It always exits 0 and the
         context reaches the agent through the host's own file loading. In a
-        project with neither a ContextKit binding nor a project id it gives
-        the notice `context` gives as a hook.
+        project with neither a .contextkit/config.toml binding nor a project
+        id it gives the notice `context` gives as a hook.
   hooks install [--claude] [--codex]
-        In an agent's project - ContextKit-bound, or bound by its project id
-        alone - point the SessionStart hooks at
+        In an agent's project - bound by its project id, or by a legacy
+        .contextkit/config.toml - point the SessionStart hooks at
         `capabilities session-start`: the Claude hook in .claude/settings.json
         becomes `/bin/bash -lc 'capabilities session-start --host claude'`
         (a new settings file also gets autoMemoryEnabled false), and the Codex
         hook keeps its entry in .codex/hooks.json - the one Codex trusts by
         hash - while its script .codex/hooks/build-context.sh runs
         `capabilities session-start --host codex`. For Codex it also sets
-        project_doc_fallback_filenames to list .contextkit.md and
+        project_doc_fallback_filenames to list .agent-context.md (dropping
+        the .contextkit.md entry an earlier release wrote, and removing that
+        link where it is the manager's: codex.retired_link) and
         project_doc_max_bytes to at least 524288 in .codex/config.toml, and
         records the folder and hook trust in $CODEX_HOME/config.toml (default
         ~/.codex). Every other key and hook is left as it is; a duplicate
-        session-start hook is dropped. Without a ContextKit binding it also
+        session-start hook is dropped. Without a .contextkit/config.toml binding it also
         retires the standalone capabilities wiring of the hosts it wires
         (the `capabilities context` hooks, .claude/rules/CAPABILITIES.md, the
         .capabilities.md link and its generated file) and writes the
         manager's block naming the host files it writes
-        (.capabilities-generated/, .contextkit.md, .claude/settings.json,
+        (.capabilities-generated/, .agent-context.md, .claude/settings.json,
         .claude/rules/CONTEXT.md, .codex/config.toml, .codex/hooks.json,
-        .codex/hooks/) into the root .gitignore where it is missing. It then
+        .codex/hooks/, and .contextkit.md while that is there) into the root
+        .gitignore where it is missing. It then
         builds the context and links
         the hosts. Without a flag it takes over the hosts already wired (exit
         6 no_host_wired when none is). Rerunning changes nothing. Answers
@@ -2133,7 +2139,7 @@ PROJECT VERBS (run inside a consuming project)
         safely.
   hooks check
         Report, as JSON, whether each wired host of an agent's project
-        delivers its context, wired by ContextKit or by `hooks install`:
+        delivers its context, wired by `hooks install` or by an earlier tool:
         {ok, project, output, hosts, foreign_instructions, problems}. Per
         host: the hook present once and running a program found on PATH
         (`runs`, `program`), the host link resolving to the generated context,
@@ -2432,7 +2438,7 @@ PROJECT VERBS (run inside a consuming project)
         On a node that is not the global master: delete the config home's
         record and settings files without reading them. The roots it weighs
         are the ones --report finds plus every root holding an envelope or a
-        ContextKit binding below the folders those sit in and below each
+        .contextkit/config.toml binding below the folders those sit in and below each
         --root. Refused where this machine resolves no node id
         (node_unidentified), on the master
         node of any of those agents (master_node), before global_migrated_at
@@ -2677,12 +2683,11 @@ CODEX_SESSION_MATCHER = "startup|resume|clear"
 CODEX_ROOT_DOCS = ("AGENTS.override.md", "AGENTS.md")
 # How long a host mode waits for a harness hook's payload on stdin.
 HOOK_PAYLOAD_WAIT_SECONDS = 0.5
-# Where the default prompt sends an agent to refresh its context. The fragment
-# ContextKit reads keeps this route; `build` names itself instead.
+# Where the default prompt sends an agent to refresh its context; the block
+# `build` composes names `build` alone instead.
 CONTEXT_PROMPT_REFRESH = (
-    "through its project context owner: `contextkit build` in a ContextKit-bound "
-    "project, otherwise `capabilities context --claude` or `capabilities context "
-    "--codex`"
+    "with `capabilities build` in an agent's project, otherwise `capabilities "
+    "context --claude` or `capabilities context --codex`"
 )
 DEFAULT_CONTEXT_PROMPT = (
     "Identifiers are durable, non-secret project lookups discovered while using "
@@ -3461,7 +3466,7 @@ def _contextkit_envelope(root: Path) -> Path:
     if override:
         return _validated_envelope(root, override, "environment handoff")
     return _validated_envelope(root, str(_project_body(root)["layers"]["capabilities"]),
-                               "the ContextKit binding")
+                               "the .contextkit/config.toml binding")
 
 
 def _envelope_home(root: Path) -> Path:
@@ -3869,18 +3874,22 @@ def _context_prompt(root: Path, build: bool = False, system: bool = False) -> st
 
 
 def _contextkit_managed(root: Path) -> bool:
-    """True when ContextKit has bound this project and owns host injection."""
+    """True when the project carries a legacy `.contextkit/config.toml`
+    binding, whose host context `build` composes and `hooks install` wires."""
     return (root / CONTEXTKIT_CONFIG_REL).is_file()
 
 
 def _contextkit_handoff(root: Path, targets: list[str]) -> dict:
-    target = "all" if len(targets) > 1 else targets[0]
+    """What a verb that writes no host file in a project bound by
+    `.contextkit/config.toml` answers: the agent's context is refreshed by
+    `capabilities build`, as an agent bound by its id refreshes it. `owner`
+    keeps the value it has always had, for readers that key on it."""
     return {
         "owner": "contextkit",
         "config": str(root / CONTEXTKIT_CONFIG_REL),
         "capabilities_host_wiring": "skipped",
         "targets": targets,
-        "refresh": f"contextkit build --target {target}",
+        "refresh": "capabilities build",
     }
 
 
@@ -4050,8 +4059,9 @@ def _project_visibility_hint(name: str | None = None) -> list[str]:
         "assumed. Do not create or edit generated capabilities context by hand; "
         "the manager owns .codex/generated/capabilities.md, its root "
         ".capabilities.md link, and .claude/rules/CAPABILITIES.md.",
-        "ContextKit exception: when .contextkit/config.toml is present, ContextKit "
-        "owns both host bindings and the combined context; use `contextkit build`.",
+        "In an agent's project - bound by its project id, or by a legacy "
+        ".contextkit/config.toml - `capabilities hooks install` wires the hosts and "
+        "`capabilities build` composes the combined context.",
     ]
 
 
@@ -4348,13 +4358,6 @@ CONTRIBUTION_KEYS = ("path", "max_bytes")
 # The largest context contribution any capability may declare, in UTF-8 bytes:
 # the block is always loaded, so its ceiling is the manager's to hold.
 CONTRIBUTION_MAX_BYTES = 32768
-# The capability whose contribution is the project's memory, and the line
-# ContextKit looks for in this block before it leaves out its own projection of
-# the project's memory folder. The line is ContextKit's; it is composed only
-# above a contribution that was composed, so an unavailable or empty one leaves
-# ContextKit's projection in place and the session never goes without memory.
-MEMORY_CAPABILITY = "memory"
-MEMORY_CONTRIBUTION_MARKER = "<!-- contextkit:memory-contribution -->"
 
 
 def _validate_contribution(contribution: object) -> list[str]:
@@ -11877,7 +11880,7 @@ def _convert_preflight_store(root: Path, agent_id: str) -> dict:
     try:
         setting = db.resolve_setting(root)
     except db.DbError as exc:
-        hint = ("an agent without a ContextKit binding keeps its settings in its row in "
+        hint = ("an agent bound by its id alone keeps its settings in its row in "
                 "the store: configure one with `capabilities store set`, then convert"
                 if exc.slug == "store_not_configured" else exc.hint)
         _die(6 if exc.slug == "store_not_configured" else _store_error_exit(exc),
@@ -11910,7 +11913,7 @@ def _convert_preflight_store(root: Path, agent_id: str) -> dict:
 def _convert_touched() -> tuple[Path, ...]:
     """What `agent convert` can change on disk once its checks pass, kept so a
     refusal while it builds puts every one of them back as it found it."""
-    return (*CK_HOST_LINKS.values(), CODEX_CONFIG_REL, CODEX_HOOKS_REL,
+    return (*CK_ALL_HOST_LINKS, CODEX_CONFIG_REL, CODEX_HOOKS_REL,
             CK_CODEX_ADAPTER_REL, Path(".claude") / "settings.json",
             Path(".claude") / "rules" / "CAPABILITIES.md", CODEX_CAPABILITIES_REL,
             CODEX_ROOT_LINK_REL, Path(".codex") / "generated" / "context.md",
@@ -12104,11 +12107,11 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
     if not _contextkit_managed(root):
         if _project_id_state(root)["id"]:
             return {"ok": True, "project": str(root), "changed": False,
-                    "message": "this agent has no ContextKit binding to convert; nothing changed",
+                    "message": "this agent has no .contextkit/config.toml binding to convert; nothing changed",
                     "carried": {}, "fill": {}, "differs": [], "removed": [], "untracked": [],
                     "wrote": [], "evidence": [], **({"dry_run": True} if dry_run else {})}
         _die(6, "not_contextkit_bound",
-             f"{root} has neither a ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
+             f"{root} has neither a legacy binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
              f"nor a project id ({PROJECT_ID_ENV}), so there is no agent to convert",
              "run `capabilities init` to make one")
     config_file = root / CONTEXTKIT_CONFIG_REL
@@ -12123,7 +12126,7 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
         named = ", ".join(f"sources.{key}" for key in sorted(sources)) \
             if isinstance(sources, dict) else "sources"
         _die(6, "setting_retired",
-             f"{config_file} sets {named}, which an agent without a ContextKit binding "
+             f"{config_file} sets {named}, which an agent bound by its id alone "
              "has no home for: its layers keep their own names in its body root, and "
              "global context lives in the store through the `context` capability",
              "move global context into the store first: in the project that will author "
@@ -12274,9 +12277,10 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
     try:
         # A host link to the old output is pointed at the new one before the
         # context is composed, which would otherwise list it as foreign.
-        relinked = [str(root / link) for host, link in CK_HOST_LINKS.items()
+        relinked = [str(root / link) for host, link in (*CK_HOST_LINKS.items(),
+                                                         ("codex", CK_LEGACY_CODEX_LINK))
                     if (root / link).is_symlink() and (root / link).resolve() == old_target
-                    and _ck_link_host(root, host, AGENT_OUTPUT_REL) == "linked"]
+                    and _ck_link_host(root, host, AGENT_OUTPUT_REL, link) == "linked"]
         hooks = _hooks_install(root, hosts) if hosts else None
         build = hooks["build"] if hooks else _ck_write(root, *_ck_compose(root))
         gitignore = hooks["gitignore"] if hooks else _write_agent_gitignore(root)
@@ -12297,15 +12301,18 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
         removed.append(_ck_rel(root, old_output))
     if hooks and hooks.get("retired_capabilities_wiring"):
         removed += hooks["retired_capabilities_wiring"]
+    if hooks and (hooks.get("codex") or {}).get("retired_link"):
+        removed.append(_ck_rel(root, Path(hooks["codex"]["retired_link"])))
     untracked: list[str] = []
     if git:
         listed = _ck_git(root, "ls-files", "-z", "--", *AGENT_HOST_FILES,
-                         f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/")
+                         *AGENT_LEGACY_HOST_FILES, f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/")
         untracked = [path for path in listed.stdout.split("\0") if path] \
             if listed.returncode == 0 else []
         if untracked:
             dropped = _ck_git(root, "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--",
-                              *AGENT_HOST_FILES, f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/")
+                              *AGENT_HOST_FILES, *AGENT_LEGACY_HOST_FILES,
+                              f"{CONTEXTKIT_CONFIG_REL.parent.as_posix()}/")
             if dropped.returncode != 0:
                 _die(1, "git_untrack_failed", _ck_manager_message(dropped),
                      "the agent is converted; untrack its host files with `git rm --cached`")
@@ -12321,8 +12328,10 @@ def _agent_convert(root: Path, dry_run: bool = False) -> dict:
                 _ck_git(root, "add", "--", str(item["target"].relative_to(root)))
     shutil.rmtree(aside)
     wrote = [build["output"]]
-    wrote += relinked + [str(root / CK_HOST_LINKS[host]) for host, status in build["links"].items()
-                         if status == "linked" and str(root / CK_HOST_LINKS[host]) not in relinked]
+    wrote += relinked + [str(root / _ck_host_link(root, host)) for host, status in build["links"].items()
+                         if status == "linked" and str(root / _ck_host_link(root, host)) not in relinked]
+    # A link pointed at the new output and then retired by `hooks install`.
+    wrote = [path for path in wrote if Path(path).is_symlink() or Path(path).exists()]
     if hooks and "codex" in hooks:
         codex = hooks["codex"]
         wrote += [path for path, changed in ((codex["adapter"], codex["adapter_changed"]),
@@ -12535,7 +12544,7 @@ def _rekey_folder(folder: Path, old: str, new: str, write: bool) -> dict:
                      do=f"{folder} does not bind {old} in its env files")
     if _contextkit_config_id(folder) == old:
         entry["left"] = (f"{CONTEXTKIT_CONFIG_REL} still names {old} under [identity]; "
-                         "ContextKit owns that file")
+                         "that legacy binding is left as it is")
     return entry
 
 
@@ -23548,9 +23557,7 @@ def _context_contribution(root: Path, name: str, manifest: dict | None) -> list[
                     text = raw.decode("utf-8").strip("\n").rstrip()
                     if not text.strip():
                         return []
-                    marker = ([MEMORY_CONTRIBUTION_MARKER] if name == MEMORY_CAPABILITY
-                              else [])
-                    return [*marker, text, ""]
+                    return [text, ""]
         except FileNotFoundError:
             problem = "its file has not been rendered"
         except (OSError, RuntimeError, UnicodeDecodeError, ValueError) as exc:
@@ -28126,19 +28133,24 @@ def cmd_context(host: str) -> None:
 
 # ---------------------------------------------------------------- build: an agent's generated context
 
-# `build` composes a ContextKit-bound agent's generated host context in the
-# shape `contextkit build` gives it - runtime and collaboration texts, guide
-# menu, inline and stub context, routines and this manager's own capabilities
-# block - and writes it with the host links ContextKit makes. The texts below
-# route the agent to the surfaces that own each part today: this manager, and
-# the `context`, `assets` and `routine` capabilities. The marker stays
-# ContextKit's, since it is what either builder recognises as its own output.
-CK_GENERATED_MARKER = "<!-- Generated by ContextKit. Do not edit by hand. -->"
+# `build` composes an agent's generated host context - runtime and
+# collaboration texts, guide menu, inline and stub context, routines and this
+# manager's own capabilities block - and writes it with the host links. The
+# texts below route the agent to the surfaces that own each part: this
+# manager, and the `context`, `assets`, `routine` and `memory` capabilities.
+# Output that carries the marker an earlier release wrote is recognised as
+# this manager's own as well, so it is replaced, relinked and removed as before.
+CK_GENERATED_MARKER = "<!-- Generated by the capabilities manager. Do not edit by hand. -->"
+CK_LEGACY_GENERATED_MARKER = "<!-- Generated by ContextKit. Do not edit by hand. -->"
 CK_DEFAULT_OUTPUT = Path(".contextkit") / "generated" / "context.md"
 CK_HOST_LINKS = {
-    "codex": Path(".contextkit.md"),
+    "codex": Path(".agent-context.md"),
     "claude": Path(".claude") / "rules" / "CONTEXT.md",
 }
+# The root link Codex loaded the context through before `.agent-context.md`:
+# an agent still wired through it keeps it until `hooks install` rewires it.
+CK_LEGACY_CODEX_LINK = Path(".contextkit.md")
+CK_ALL_HOST_LINKS = (*CK_HOST_LINKS.values(), CK_LEGACY_CODEX_LINK)
 CK_FOREIGN_INSTRUCTION_NAMES = ("AGENTS.md", "AGENTS.override.md", "CLAUDE.md", "CLAUDE.local.md")
 CK_CLAUDE_HOOK_NEEDLES = ("contextkit session-start --host claude", "contextkit build --target claude")
 # The command a hook runs once `capabilities hooks install` has taken it over.
@@ -28151,12 +28163,9 @@ CK_RUNTIME_TEXT = """\
 
 You are operating inside a project whose agent context the capabilities manager composes.
 
-The project has a visible source body, generated host runtime context, on-demand guides, routines, and capability awareness. Source truth lives in the project body and owning tools. Generated host files are delivery output.
-
 ## Operating Rules
 
 - Identify the owner before editing a durable fact.
-- Edit source files, not generated output.
 - Keep one durable fact in one live home.
 - Use always-on context for orientation, law, routing, and safety.
 - Load stub context, guides, routines, assets, capabilities, and tools only when the task calls for them.
@@ -28166,29 +28175,13 @@ The project has a visible source body, generated host runtime context, on-demand
 - Prove tool readiness at use time with the owning tool.
 - Stop for human approval before destructive, external, publishing, credential, access, or product-direction consequences.
 
-## Source Body
+## Agent Layers
 
-`.contextkit/` is technical binding, config, and generated output. It is not project doctrine.
-
-Layer names below are canonical. A project may hold them under a configured visible body root, so resolve a layer's actual location with `capabilities path --json` (its `layers`) before assuming it sits at the project root.
-
-The context, assets and routines layers live either as folders or in the project's store as versioned documents. Where the store holds a layer, read it through the capability that owns it rather than the folder.
-
-`context/` is live project doctrine. In the store, `context list` and `context show <name>` read it.
-
-Configured global context is shared live doctrine outside the project that compiles through the same context-file contract. In the store, the `context` verbs reach it with `--global`.
-
-`assets/` is historical evidence: sessions, plans, research, and raw records. In the store, `assets list`, `assets search <terms>` and `assets show <name>` read it.
-
-`routines/` is repeatable procedure. Use `routine guide authoring`. In the store, `routine list --store` and `routine show <name>` read it.
-
-`capabilities/` is the project envelope for enabled tools. The capabilities manager composes its own context block below; capability awareness and internals remain tool-owned. Use `capabilities help` and the tool's own help or doctor surface.
+The agent's layers are read and written through the capabilities that own them: doctrine through `context` (global context with `--global`), evidence - sessions, plans, research, and raw records - through `assets`, repeatable procedure through `routine`, and recorded conclusions through `memory`. Each one's `help` names its verbs.
 
 ## Discovery
 
-Use `capabilities help` for exact command syntax.
-
-Use the generated Guide Menu to choose on-demand rule-source guides.
+Use `capabilities help` for exact command syntax, and the Guide Menu below to choose an on-demand guide.
 
 Command outputs name their rule sources. Load the named guide before repairing the source.
 
@@ -28196,23 +28189,19 @@ Command outputs name their rule sources. Load the named guide before repairing t
 
 Before editing, search for the existing owner.
 
-When changing project body, routines, hooks, or capability envelopes, rerun `capabilities build` and read its warnings, and prove the host wiring with `capabilities hooks check`.
+After changing the agent's layers, hooks, or capability envelope, rerun `capabilities build` and read its warnings, and prove the host wiring with `capabilities hooks check`.
 
 Repair the owning source or tool surface, then rerun the command that exposed the problem."""
-# The Source Body line that names the binding: an agent without a ContextKit
-# binding has only generated output in a folder of the manager's.
-CK_BINDING_LINE = ("`.contextkit/` is technical binding, config, and generated output. "
-                   "It is not project doctrine.")
-AGENT_BINDING_LINE = (f"`{AGENT_OUTPUT_REL.parent.as_posix()}/` is generated output. "
-                      "It is not project doctrine.")
 CK_COLLABORATION_TEXT = """\
 ## Collaboration Mode
 
 Before non-trivial work that changes behavior or durable project material, spans multiple files or surfaces, or requires substantive judgment, offer the user Direct or Agent Team mode once unless the user has already selected a mode. In Agent Team mode, remain the task setter and orchestrator, give execution to one subagent, and give independent review to another subagent."""
-# (command, title, summary) of each guide the menu offers. Only a guide that
-# has a home in this manager or in the capability that owns its layer is
-# offered; ContextKit's other topics have none yet and are left out.
+# (command, title, summary) of each guide the menu offers: only a guide that
+# has a home in this manager or in the capability that owns its layer.
 CK_GUIDE_MENU = (
+    ('context guide authoring', 'Doctrine Authoring Guide', 'Use this guide when writing or changing the agent\'s doctrine as versioned documents in the store; the `context` capability owns it.'),
+    ('context guide groom', 'Doctrine Grooming Guide', 'Use this guide when reviewing the agent\'s doctrine for stale, duplicated, or misplaced facts and settling each in one live home; the `context` capability owns it.'),
+    ('assets guide authoring', 'Evidence Guide', 'Use this guide when keeping evidence - sessions, plans, research, reports, and raw records - as assets; the `assets` capability owns it.'),
     ('routine guide authoring', 'Routines Guide', 'Use this guide when writing repeatable procedures, in `routines/` or in the store; the `routine` capability owns it.'),
 )
 
@@ -28319,7 +28308,7 @@ def _ck_binding(root: Path) -> dict:
         if body["body_root"] != Path("."):
             inside.append(body["body_root"])
         if output.is_absolute() or ".." in output.parts or output.suffix != ".md" \
-                or output in CK_HOST_LINKS.values() \
+                or output in CK_ALL_HOST_LINKS \
                 or any(output == layer or layer in output.parents for layer in inside):
             _die(6, "contextkit_config_invalid", f"invalid output.context: {value}",
                  "the generated context is a Markdown file inside the project, outside "
@@ -28828,13 +28817,42 @@ def _ck_onboarding_block(root: Path, binding: dict, onboarding: dict, warnings: 
         "At the start of each session, tell the owner what onboarding still needs. "
         "When the owner asks for other work first, say that onboarding is unfinished, then follow the owner's choice.",
         "",
-        "The routine checks what remains from the live state and ends with `contextkit onboarding complete`, which removes this block.",
+        "The routine checks what remains from the live state and ends with `capabilities agent set --onboarding-status complete`, which removes this block.",
     ])
 
 
 def _ck_is_link(root: Path, link: Path, output: Path) -> bool:
     path = root / link
     return path.is_symlink() and path.resolve() == (root / output).resolve()
+
+
+def _ck_codex_link(root: Path) -> Path:
+    """The root link this agent's Codex loads the context through: the legacy
+    `.contextkit.md` where its project-doc fallbacks still name that and not
+    `.agent-context.md`, so an agent wired that way keeps working unchanged."""
+    try:
+        fallback = _ck_toml(root / CODEX_CONFIG_REL).get("project_doc_fallback_filenames")
+    except ValueError:
+        fallback = None
+    if isinstance(fallback, list) and CK_LEGACY_CODEX_LINK.as_posix() in fallback \
+            and CK_HOST_LINKS["codex"].as_posix() not in fallback:
+        return CK_LEGACY_CODEX_LINK
+    return CK_HOST_LINKS["codex"]
+
+
+def _ck_host_link(root: Path, host: str) -> Path:
+    return _ck_codex_link(root) if host == "codex" else CK_HOST_LINKS[host]
+
+
+def _ck_owned_link(root: Path, link: Path, output: Path) -> bool:
+    """Whether `link` holds what this manager made: a link to the output or
+    to generated context, or generated context itself."""
+    path = root / link
+    if _ck_is_link(root, link, output):
+        return True
+    if path.is_symlink():
+        return _ck_generated(path.resolve())
+    return _ck_generated(path)
 
 
 def _ck_generated(path: Path) -> bool:
@@ -28845,7 +28863,7 @@ def _ck_generated(path: Path) -> bool:
             head = handle.read(4096)
     except OSError:
         return False
-    return CK_GENERATED_MARKER in head
+    return CK_GENERATED_MARKER in head or CK_LEGACY_GENERATED_MARKER in head
 
 
 def _ck_foreign_instruction_files(root: Path, output: Path) -> list[str]:
@@ -28867,15 +28885,15 @@ def _ck_foreign_instruction_files(root: Path, output: Path) -> list[str]:
         path = root / rel
         if not (path.is_file() or path.is_symlink()):
             continue
-        if rel in CK_HOST_LINKS.values() and (_ck_is_link(root, rel, output) or _ck_generated(path)):
+        if rel in CK_ALL_HOST_LINKS and (_ck_is_link(root, rel, output) or _ck_generated(path)):
             continue
         found.add(rel.as_posix())
     return sorted(found)
 
 
 def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
-    """The generated context ContextKit's build composes for this agent,
-    without its update notice, with the warnings it carries."""
+    """The generated context `build` composes for this agent, with the
+    warnings it carries."""
     binding = _ck_binding(root)
     layers = binding["layers"]
     context_dir, routines_dir = layers["context"], layers["routines"]
@@ -28884,11 +28902,6 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     stored_routines = _ck_stored_routines(root, routines_dir, warnings, store)
     routine_index = _ck_routine_index(root, routines_dir, warnings, stored_routines)
     capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store)
-    memory_rel = binding["body_root"] / "memory"
-    if (root / memory_rel).is_dir() or (root / memory_rel).is_symlink():
-        warnings.append(f"legacy memory folder `{memory_rel.as_posix()}/`: the generated context does "
-                        "not compile project memory; run `memory adopt` to carry it into the "
-                        "`memory` capability")
     onboarding = _ck_onboarding(root, binding, warnings, store)
     onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings, stored_routines)
                         if onboarding and onboarding["status"] == "pending" else "")
@@ -28935,9 +28948,7 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
         out += ["Generation warnings:", ""]
         out += [f"- {warning}" for warning in warnings]
         out.append("")
-    runtime = (CK_RUNTIME_TEXT if binding["bound"]
-               else CK_RUNTIME_TEXT.replace(CK_BINDING_LINE, AGENT_BINDING_LINE))
-    out += ["---", "", runtime, ""]
+    out += ["---", "", CK_RUNTIME_TEXT, ""]
     if binding["collaboration_mode"] == "ask":
         out += [CK_COLLABORATION_TEXT, ""]
     if binding["body_root"] != Path("."):
@@ -29014,20 +29025,20 @@ def _ck_installed_hosts(root: Path) -> list[str]:
     return hosts
 
 
-def _ck_link_host(root: Path, host: str, output: Path) -> str:
+def _ck_link_host(root: Path, host: str, output: Path, link: Path | None = None) -> str:
     """Point one host's instruction path at the generated context: `linked`,
     `kept`, or `blocked: ...` where the path holds something else."""
-    link = CK_HOST_LINKS[host]
+    link = link or _ck_host_link(root, host)
     path = root / link
     if _ck_is_link(root, link, output):
         return "kept"
     if path.is_symlink():
         target = path.resolve()
         if target.exists() and not _ck_generated(target):
-            return f"blocked: {link.as_posix()} links to {target}, which ContextKit does not own"
+            return f"blocked: {link.as_posix()} links to {target}, which is not generated context"
     elif path.exists():
         if not _ck_generated(path):
-            return f"blocked: {link.as_posix()} exists and is not ContextKit-generated context"
+            return f"blocked: {link.as_posix()} exists and is not generated context"
     path.parent.mkdir(parents=True, exist_ok=True)
     relative = os.path.relpath((root / output).resolve(strict=False), path.parent.resolve())
     temp = path.parent / f".{path.name}.{os.getpid()}.contextkit-link"
@@ -29041,7 +29052,7 @@ def cmd_build(print_only: bool, json_output: bool) -> None:
     root = _require_project().resolve()
     if not _agent_project(root):
         _die(6, "not_contextkit_bound",
-             f"{root} has neither a ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
+             f"{root} has neither a legacy binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
              f"nor a project id ({PROJECT_ID_ENV}), so it has no generated agent context to build",
              "run `capabilities context --claude` or `--codex` for a project without one")
     text, warnings, binding = _ck_compose(root)
@@ -29061,7 +29072,7 @@ def _ck_write(root: Path, text: str, warnings: list[str], binding: dict) -> dict
     output = root / binding["output"]
     if output.is_symlink() or (output.exists() and not _ck_generated(output)):
         _die(6, "output_not_generated",
-             f"{output} exists and is not ContextKit-generated context; it is left as it is",
+             f"{output} exists and is not generated context; it is left as it is",
              "move it, or point `[output] context` at a free path" if binding["bound"]
              else "move it, then build again")
     try:
@@ -29106,7 +29117,7 @@ SESSION_START_ADAPTER = """#!/usr/bin/env bash
 set -uo pipefail
 
 # Generated by `capabilities hooks install`; do not edit by hand.
-# Codex loads the generated context itself through `.contextkit.md`; this hook
+# Codex loads the generated context itself through its root link; this hook
 # refreshes it and prints a notice only when the session needs one.
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
@@ -29115,6 +29126,9 @@ cd "$ROOT"
 
 exec capabilities session-start --host codex
 """
+# The adapter as an earlier release wrote it, which runs the same command.
+SESSION_START_ADAPTERS = (SESSION_START_ADAPTER, SESSION_START_ADAPTER.replace(
+    "through its root link;", "through `.contextkit.md`;"))
 CK_CODEX_ADAPTER_NEEDLE = "contextkit session-start --host codex"
 
 
@@ -29136,14 +29150,15 @@ def _hook_failure_reason(exc: BaseException, stderr_text: str) -> str:
 def _ck_codex_delivery_blockers(root: Path, output: Path) -> list[str]:
     """Name what keeps Codex from loading the generated context through its link."""
     blockers: list[str] = []
+    link = _ck_codex_link(root)
     for name in ("AGENTS.override.md", "AGENTS.md"):
         if (root / name).exists():
             blockers.append(
-                f"Codex loads the root `{name}` instead of `{CK_HOST_LINKS['codex'].as_posix()}`; "
-                "move its content into the ContextKit body or remove it")
+                f"Codex loads the root `{name}` instead of `{link.as_posix()}`; "
+                "move its content into the agent's context or remove it")
             break
-    if not _ck_is_link(root, CK_HOST_LINKS["codex"], output):
-        blockers.append(f"`{CK_HOST_LINKS['codex'].as_posix()}` does not link to the generated "
+    if not _ck_is_link(root, link, output):
+        blockers.append(f"`{link.as_posix()}` does not link to the generated "
                         f"context; {_hooks_repair('codex')}")
     return blockers
 
@@ -29159,8 +29174,8 @@ def _ck_session_notice(root: Path, host: str) -> str:
             build = _ck_write(root, text, warnings, binding)
     except (SystemExit, Exception) as exc:
         reason = _hook_failure_reason(exc, errors.getvalue())
-        return ("# ContextKit Session Notice\n\n"
-                f"ContextKit could not rebuild the generated context: {_ck_one_line(reason)}\n\n"
+        return ("# Project Context Session Notice\n\n"
+                f"The capabilities manager could not rebuild the generated context: {_ck_one_line(reason)}\n\n"
                 "This session may carry a stale or missing copy. Tell the user; "
                 "`capabilities hooks check` names the repair.\n")
     output = binding["output"]
@@ -29171,18 +29186,18 @@ def _ck_session_notice(root: Path, host: str) -> str:
         blockers = ([] if _ck_is_link(root, link, output)
                     else [f"`{link.as_posix()}` does not link to the generated context"])
     if blockers:
-        notice = ("The ContextKit project context did not load in this session: "
+        notice = ("The project context did not load in this session: "
                   + "; ".join(blockers)
                   + ". Tell the user; `capabilities hooks check` names the repair.")
     elif build["created"] or build["links"].get(host) == "linked":
-        notice = ("ContextKit created the project context after this session started, so this "
+        notice = ("The capabilities manager created the project context after this session started, so this "
                   "session has none loaded. Tell the user; a new or resumed session loads it.")
     elif build["changed"]:
         notice = ("The project context changed after this session loaded it, so the loaded copy "
                   "is stale. Tell the user; a new or resumed session loads the update.")
     else:
         return ""
-    return "# ContextKit Session Notice\n\n" + notice + "\n"
+    return "# Project Context Session Notice\n\n" + notice + "\n"
 
 
 def cmd_session_start(host: str) -> None:
@@ -29324,22 +29339,27 @@ def _ck_toml_top_level_assignments(text: str) -> tuple[dict, bool]:
     return assignments, True
 
 
-def _ck_planned_codex_config(path: Path) -> dict:
+def _ck_planned_codex_config(path: Path, link: Path | None = None) -> dict:
     """Plan the Codex project-doc settings that load the generated context: list
-    the `.contextkit.md` link as a fallback filename, drop the path entry an
-    earlier release left, and raise a smaller byte budget, touching nothing else.
-    An assignment that cannot be located confidently blocks the plan."""
+    the root link (`.agent-context.md` unless `link` names another) as a
+    fallback filename, drop the path entry an earlier release left and, for
+    `.agent-context.md`, the `.contextkit.md` entry it replaces, and raise a
+    smaller byte budget, touching nothing else. An assignment that cannot be
+    located confidently blocks the plan."""
     import tomllib
     config_text = path.read_text() if path.exists() else ""
     config_raw = _ck_toml(path)
     plan: dict = {"text": config_text, "changed": False, "blocked": None}
-    link = CK_HOST_LINKS["codex"].as_posix()
-    legacy = CK_LEGACY_CODEX_OUTPUT.as_posix()
+    link = (link or CK_HOST_LINKS["codex"]).as_posix()
+    retired = [name for name in (CK_LEGACY_CODEX_OUTPUT.as_posix(), CK_LEGACY_CODEX_LINK.as_posix())
+               if name != link]
     fallback = config_raw.get("project_doc_fallback_filenames")
     max_bytes = config_raw.get("project_doc_max_bytes")
     wanted: dict = {}
-    if not isinstance(fallback, list) or link not in fallback or legacy in fallback:
-        current = [item for item in fallback if item != legacy] if isinstance(fallback, list) else []
+    if not isinstance(fallback, list) or link not in fallback \
+            or any(name in fallback for name in retired):
+        current = ([item for item in fallback if item not in retired]
+                   if isinstance(fallback, list) else [])
         wanted["project_doc_fallback_filenames"] = current if link in current else [*current, link]
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) \
             or max_bytes < CK_CODEX_DOC_MAX_BYTES:
@@ -29688,7 +29708,7 @@ def _hooks_install_codex(root: Path, plan: dict, hooks: dict) -> dict:
     else:
         session.append({"matcher": CODEX_SESSION_MATCHER, "hooks": [{
             "type": "command", "command": CK_CODEX_HOOK_COMMAND, "timeout": 30,
-            "statusMessage": "Regenerating ContextKit context"}]})
+            "statusMessage": "Regenerating the project context"}]})
     if hook_changed or not managed:
         _write_json(root / CODEX_HOOKS_REL, hooks)
     return {"adapter": str(adapter), "adapter_changed": existing != SESSION_START_ADAPTER,
@@ -29714,11 +29734,24 @@ def _hooks_install_claude(root: Path, settings: dict, existed: bool) -> dict:
             "auto_memory_disabled": auto_memory_disabled}
 
 
+def _ck_retire_legacy_codex_link(root: Path) -> str | None:
+    """Remove the `.contextkit.md` link once Codex loads `.agent-context.md`
+    instead, where it is this manager's; the path removed, else None."""
+    if _ck_codex_link(root) == CK_LEGACY_CODEX_LINK:
+        return None
+    path = root / CK_LEGACY_CODEX_LINK
+    if not (path.is_symlink() or path.exists()) \
+            or not _ck_owned_link(root, CK_LEGACY_CODEX_LINK, _ck_binding(root)["output"]):
+        return None
+    path.unlink()
+    return str(path)
+
+
 def _require_bound(verb: str) -> Path:
     root = _require_project().resolve()
     if not _agent_project(root):
         _die(6, "not_contextkit_bound",
-             f"{root} has neither a ContextKit binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
+             f"{root} has neither a legacy binding ({CONTEXTKIT_CONFIG_REL.as_posix()}) "
              f"nor a project id ({PROJECT_ID_ENV}), so it has no agent hooks to {verb}",
              "run `capabilities init --claude` or `--codex` for a project without one")
     return root
@@ -29760,6 +29793,7 @@ def _hooks_install(root: Path, hosts: list[str], tolerate_build: bool = False) -
     result: dict = {"project": str(root), "hosts": hosts}
     if "codex" in hosts:
         result["codex"] = _hooks_install_codex(root, plan, codex_hooks)
+        result["codex"]["retired_link"] = _ck_retire_legacy_codex_link(root)
     if "claude" in hosts:
         result["claude"] = _hooks_install_claude(root, settings, existed)
     if not _contextkit_managed(root):
@@ -29785,9 +29819,12 @@ def _hooks_install(root: Path, hosts: list[str], tolerate_build: bool = False) -
 # The host files the manager writes for an agent, which are generated and so
 # ignored rather than committed: the root .gitignore carries them in a block
 # of the manager's own.
-AGENT_HOST_FILES = (f"{AGENT_OUTPUT_REL.parent.as_posix()}/", ".contextkit.md",
+AGENT_HOST_FILES = (f"{AGENT_OUTPUT_REL.parent.as_posix()}/", CK_HOST_LINKS["codex"].as_posix(),
                     ".claude/settings.json", ".claude/rules/CONTEXT.md",
                     ".codex/config.toml", ".codex/hooks.json", ".codex/hooks/")
+# The host file an agent wired by an earlier release may still carry: named
+# in the block while it is there, and untracked by `agent convert`.
+AGENT_LEGACY_HOST_FILES = (CK_LEGACY_CODEX_LINK.as_posix(),)
 AGENT_GITIGNORE_BEGIN = "# >>> capabilities: generated host files (managed; do not edit)"
 AGENT_GITIGNORE_END = "# <<< capabilities"
 
@@ -29797,7 +29834,10 @@ def _write_agent_gitignore(root: Path) -> dict:
     files where it does not carry it as the manager writes it; every other
     line is kept as it is."""
     path = root / ".gitignore"
-    block = "\n".join([AGENT_GITIGNORE_BEGIN, *AGENT_HOST_FILES, AGENT_GITIGNORE_END]) + "\n"
+    legacy = [name for name in AGENT_LEGACY_HOST_FILES
+              if (root / name).is_symlink() or (root / name).exists()]
+    block = "\n".join([AGENT_GITIGNORE_BEGIN, *AGENT_HOST_FILES, *legacy,
+                       AGENT_GITIGNORE_END]) + "\n"
     try:
         text = path.read_text() if path.exists() else ""
     except OSError as exc:
@@ -29837,7 +29877,7 @@ def _hooks_codex_report(root: Path, output: Path) -> dict:
     hooks = _read_json(hooks_path) if hooks_path.exists() else None
     delivering = _ck_codex_session_hooks(hooks)
     report: dict = {"hooks": str(hooks_path), "adapter": str(adapter),
-                    "link": str(root / CK_HOST_LINKS["codex"])}
+                    "link": str(root / _ck_codex_link(root))}
     problems: list[str] = []
     if hooks_path.exists() and not isinstance(hooks, dict):
         problems.append(f"Codex hooks file is not a readable JSON object: {hooks_path}; {repair}")
@@ -29875,24 +29915,24 @@ def _hooks_codex_report(root: Path, output: Path) -> dict:
             problems.append(f"cannot read Codex build adapter {adapter}: "
                             f"{_ck_one_line(str(exc))}; {repair}")
         else:
-            if body == SESSION_START_ADAPTER:
+            if body in SESSION_START_ADAPTERS:
                 runs = "capabilities"
             elif CK_CODEX_ADAPTER_NEEDLE in body:
                 runs = "contextkit"
             else:
-                problems.append(f"Codex build adapter runs neither `capabilities session-start` "
-                                f"nor ContextKit: {adapter}; {repair}")
+                problems.append(f"Codex build adapter does not run `capabilities session-start`: "
+                                f"{adapter}; {repair}")
     report.update(_hooks_program(root, runs))
     if runs and report["program"] is None:
         problems.append(f"the Codex hook runs `{runs}`, which is not on PATH")
     config = root / CODEX_CONFIG_REL
     try:
-        plan = _ck_planned_codex_config(config)
+        plan = _ck_planned_codex_config(config, _ck_codex_link(root))
         raw = _ck_toml(config)
     except ValueError as exc:
         problems.append(str(exc))
     else:
-        link = CK_HOST_LINKS["codex"].as_posix()
+        link = _ck_codex_link(root).as_posix()
         fallback = raw.get("project_doc_fallback_filenames")
         if plan["blocked"]:
             problems.append(plan["blocked"])
@@ -30007,7 +30047,7 @@ def _agent_wired_hosts(root: Path) -> list[str]:
     session-start`, as `hooks install` wires them."""
     hosts = []
     try:
-        if (root / CK_CODEX_ADAPTER_REL).read_text() == SESSION_START_ADAPTER:
+        if (root / CK_CODEX_ADAPTER_REL).read_text() in SESSION_START_ADAPTERS:
             hosts.append("codex")
     except OSError:
         pass
@@ -30566,7 +30606,8 @@ def _ck_agent_template(path: Path) -> dict:
 
     def invalid(detail: str) -> NoReturn:
         _die(6, "template_invalid", f"invalid {owner}: {detail}",
-             "run `contextkit guide bootstrap` for the agent template format")
+             "compare it with a template the agenttemplates capability ships "
+             "(`capabilities templates`)")
 
     try:
         raw = tomllib.loads(manifest.read_text())

@@ -213,14 +213,14 @@ Generated agent-box images install Codex from the complete pinned release
 package rather than the legacy single-binary archive, so the CLI,
 `codex-code-mode-host`, and its runtime resources stay version-aligned.
 
-For ContextKit projects, Docker builds neither install nor call ContextKit. After
-copying the project body and installing capabilities, the build runs
+For a project whose folder still carries a legacy `.contextkit/config.toml`
+binding, after copying the project body and installing capabilities, the build runs
 `capabilities init --codex --claude` to create target-local bindings and
 initialize project contexts, `capabilities doctor` to verify the capability set,
 `capabilities hooks install --claude --codex` to point both hosts' session hooks
 at `capabilities session-start`, and `capabilities build` to generate host
 bindings and compile context. Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`),
-the ContextKit manager binary (`.contextkit/manager/`), and machine-local bindings
+the legacy binding's installed files (`.contextkit/manager/` and the like), and machine-local bindings
 (`.env.local`) are excluded from the build context via the target's
 `Dockerfile.dockerignore`. These are
 target-local build artifacts, not deployment inputs shipped from the repo.

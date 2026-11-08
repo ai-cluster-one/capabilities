@@ -13,8 +13,9 @@ init --with-template` lays into a project, and `agents/<id>/` each agent
 template that `capabilities init --template <id>` creates a ready agent from -
 its `template.toml`, its icon, and the files of its body layers (`context/`,
 `assets/`, `routines/`). The manager reads them from here when this capability
-is installed; the template format is ContextKit's (`contextkit guide
-bootstrap`). Nothing is written: both verbs only read the bundle.
+is installed: `capabilities help` describes `init --with-template`, `init
+--template` and `templates`. Nothing is written: both verbs only read the
+bundle.
 
 USAGE
   agenttemplates <command> [options]

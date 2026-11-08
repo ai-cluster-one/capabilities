@@ -3001,36 +3001,28 @@ def _layout_path(root: Path, value: str, owner: str) -> str:
     return str(resolved)
 
 
-def _contextkit_layer(root: Path, name: str) -> str | None:
-    try:
-        proc = subprocess.run(
-            ["contextkit", "path", name], cwd=root, capture_output=True,
-            text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
-    if not lines:
-        return None
-    if len(lines) != 1:
-        _die(6, "project_layout_invalid",
-             f"ContextKit returned a malformed path for {name}")
-    return _layout_path(root, lines[0], f"ContextKit {name}")
-
-
-def _contextkit_memory(root: Path) -> str | None:
-    """The memory folder: `memory` in the body root ContextKit names."""
-    try:
-        proc = subprocess.run(
-            ["contextkit", "path", "--json"], cwd=root, capture_output=True,
-            text=True, timeout=10)
-        body = json.loads(proc.stdout).get("body_root") if proc.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
-        return None
-    if not isinstance(body, str) or not body.strip():
-        return None
-    return _layout_path(root, str(root / body.strip() / "memory"), "ContextKit memory")
+def _manager_layers(root: Path) -> dict:
+    """The body layers of a folder with a legacy binding, as the manager's
+    `path --json` names them: each of context, routines and assets as the
+    folder the binding places it in (a layer the store holds as the folder
+    its import and export default to), and memory as `memory` in the body
+    root. {} when the manager does not answer."""
+    answer, error = _ask_manager(root)
+    if error or not isinstance(answer, dict):
+        return {}
+    found: dict = {}
+    layers = answer.get("layers") if isinstance(answer.get("layers"), dict) else {}
+    for name in ("context", "routines", "assets"):
+        value = layers.get(name)
+        if isinstance(value, dict):
+            value = value.get("folder")
+        if isinstance(value, str) and value.strip():
+            found[name] = _layout_path(root, value.strip(), f"the capabilities manager's {name}")
+    body = answer.get("body_root")
+    if isinstance(body, str) and body.strip():
+        found["memory"] = _layout_path(root, str(root / body.strip() / "memory"),
+                                       "the capabilities manager's memory")
+    return found
 
 
 def _resolve_project_layout(root: Path) -> dict:
@@ -3043,9 +3035,9 @@ def _resolve_project_layout(root: Path) -> dict:
     }
     layer_names = ("context", "routines", "assets", "memory")
     if layout["provider"] == "contextkit":
+        named = _manager_layers(root)
         for name in layer_names:
-            value = (_contextkit_memory(root) if name == "memory"
-                     else _contextkit_layer(root, name))
+            value = named.get(name)
             if value and Path(value).exists():
                 layout[name] = value
     else:
@@ -3054,7 +3046,7 @@ def _resolve_project_layout(root: Path) -> dict:
             if candidate.exists():
                 layout[name] = str(candidate)
     # The deployment capability keeps its folder at the project root whatever
-    # body layout ContextKit names, so it is read there for every provider.
+    # body layout the binding names, so it is read there for every provider.
     deployment = (root / "deployment").resolve()
     if deployment.exists():
         layout["deployment"] = str(deployment)

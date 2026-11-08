@@ -1,5 +1,9 @@
 # context — change log
 
+## 2026-11-08 — `context` ships the `authoring` and `groom` guides
+
+`context guide` lists two guides, where it answered that none ship: `context guide authoring` for writing a doctrine document in the store - one fact in one live home, the altitude a fact belongs at (inline, stub, a capability guide, a routine, an asset, a memory entry), routing a stub by its name and description, the present tense, one line per paragraph, and saving with `context save --base` followed by `capabilities build` - and `context guide groom` for reviewing the documents against it. No verb, flag or output key changes.
+
 ## 2026-11-05 — The store names the agent: context's tables go to schema major 2
 
 `context`'s tables name an agent where they named a project: `context_documents.project_id` is `agent_id`, `context_documents.author_project_id` is `author_agent_id` and `context_enablements.project_id` is `agent_id`, and every constraint and comment named for them moves with them. Step `0006-agent-names` renames them in place with every row kept and takes the ledger to 2.0. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of context 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first context call makes them at 2.0. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. No verb, flag, environment variable or output key changes.

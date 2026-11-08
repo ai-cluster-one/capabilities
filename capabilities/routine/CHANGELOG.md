@@ -1,5 +1,9 @@
 # routine — change log
 
+## 2026-11-08 — Help no longer names ContextKit
+
+`routine help` describes the routine file form, `titles` and `title` on their own terms, where it measured them against ContextKit, a retired tool no machine carries any more. Nothing they do changes: no verb, flag, output key or file form changes.
+
 ## 2026-11-05 — The store names the agent: routine's tables go to schema major 2
 
 `routine`'s tables name an agent where they named a project: `routine_documents.project_id` is `agent_id`, `routine_documents.author_project_id` is `author_agent_id` and `routine_enablements.project_id` is `agent_id`, and every constraint and comment named for them moves with them. Step `0007-agent-names` renames them in place with every row kept and takes the ledger to 2.0. The move crosses only through `capabilities store upgrade`: outside it, this release refuses a store still at schema major 1 with `store_upgrade_needed`, naming that command, and a release of routine 1.x refuses a store that crossed rather than misreading it. On an empty store, or one that crossed, a first routine call makes them at 2.0. Declares `capabilities-contract>=0.43,<1`, the library that reads the store's core tables by their new names. No verb, flag, environment variable or output key changes.

@@ -47,20 +47,12 @@ def _project(tmp_path: Path, contextkit: bool = True) -> tuple[Path, dict[str, s
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
     }
     if contextkit:
-        # The checkout profile asks ContextKit for the body root that holds
-        # memory to write the union-merge attribute; a stand-in answers for
-        # the real one.
+        # A folder with a legacy binding: the checkout profile asks the
+        # capabilities manager on PATH for the body root that holds memory, to
+        # write the union-merge attribute.
         (root / ".contextkit").mkdir()
         (root / ".contextkit" / "config.toml").write_text("[project]\n")
         (root / "memory").mkdir()
-        fake = tmp_path / "bin" / "contextkit"
-        fake.parent.mkdir()
-        fake.write_text("#!/bin/sh\n"
-                        f'[ "$1 $2" = "path --json" ] && exec echo \'{{"body_root": "."}}\'\n'
-                        f'[ "$1 $2" = "path capabilities" ] && exec echo {root / "capabilities"}\n'
-                        "exit 1\n")
-        fake.chmod(0o755)
-        env["PATH"] = str(fake.parent) + os.pathsep + env["PATH"]
     return root, env
 
 

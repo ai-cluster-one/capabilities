@@ -45,10 +45,11 @@ which files were created, which secrets must be entered, local validation
 commands, provider steps, and first-login commands for Codex, Claude, and
 Telegram when present.
 
-## ContextKit Projects
+## Projects With A Legacy Binding
 
-For projects with `.contextkit/config.toml`, the generated Dockerfile neither
-installs nor calls ContextKit; the capabilities manager does the whole setup:
+For a project whose folder still carries a legacy `.contextkit/config.toml`
+binding, the capabilities manager does the whole setup in the generated
+Dockerfile:
 
 1. Copies the project body.
 2. Installs the capabilities manager and every capability in the catalogue.
@@ -60,8 +61,8 @@ installs nor calls ContextKit; the capabilities manager does the whole setup:
 6. Runs `capabilities build` to generate host bindings and compile context.
 
 Generated host bindings (`.codex/generated/`, `.claude/rules/CONTEXT.md`),
-the ContextKit manager binary (`.contextkit/manager/`), and machine-local
-bindings (`.env.local`) are excluded from the Docker build context via the
+the legacy binding's installed files (`.contextkit/manager/` and the like), and
+machine-local bindings (`.env.local`) are excluded from the Docker build context via the
 target's `Dockerfile.dockerignore`. These are target-local build artifacts, not
 deployment inputs shipped from the repo.
 

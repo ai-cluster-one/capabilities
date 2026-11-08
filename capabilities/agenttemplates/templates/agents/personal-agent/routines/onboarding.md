@@ -6,7 +6,7 @@ description: Run while this agent's onboarding is pending, to get to know the su
 
 # Onboarding
 
-Run this routine while the generated context carries the Onboarding block. It gets you up to speed on the supervisor: first by reading the supervisor's own data, second, and only for what the data cannot answer, by talking with the supervisor. It is done when the supervisor has confirmed what you wrote, has answered the offer of a daily brief, and `contextkit onboarding complete` has run.
+Run this routine while the generated context carries the Onboarding block. It gets you up to speed on the supervisor: first by reading the supervisor's own data, second, and only for what the data cannot answer, by talking with the supervisor. It is done when the supervisor has confirmed what you wrote, has answered the offer of a daily brief, and `capabilities agent set --onboarding-status complete` has run.
 
 Nothing here is stored as progress. Each run checks what remains from the live state: the grants each capability reports and the files in this project. The routine can stop at any step and resume later.
 
@@ -28,7 +28,7 @@ Write what you learn while you read, so nothing has to be reread:
 - the People file: every person who matters, family included and closest first, with how the supervisor relates to them and every contact detail found, such as an email or phone number, written the moment you find it with where you found it;
 - a file for each project you find, with its goal, the people involved by name only, its state, promises, and next step, and the project in the Projects index by priority.
 
-Then run `contextkit build`, and `contextkit audit` to check the files you added.
+Then run `capabilities build` and read its warnings about what you added.
 
 ## 4. Ask Second
 
@@ -44,4 +44,4 @@ Offer a daily brief: each morning, what waits on the supervisor, the promises co
 
 ## 7. Close Onboarding
 
-Run `contextkit onboarding complete`. Then tell the supervisor that onboarding is finished, that you send or change nothing until the supervisor grants write access for specific work, and that you can be reshaped into another role at any time. Offer one useful first piece of work from what you read, such as the messages that have waited longest.
+Run `capabilities agent set --onboarding-status complete`. Then tell the supervisor that onboarding is finished, that you send or change nothing until the supervisor grants write access for specific work, and that you can be reshaped into another role at any time. Offer one useful first piece of work from what you read, such as the messages that have waited longest.
