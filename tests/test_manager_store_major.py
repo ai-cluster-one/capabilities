@@ -220,6 +220,31 @@ def test_the_manifest_and_the_catalogue_carry_the_store_major() -> None:
     assert "library" not in manifest and "library" not in catalog
 
 
+def test_a_kept_lines_scripts_declare_its_library_in_their_own_headers() -> None:
+    """uv builds a script's environment from its header wherever nothing holds
+    it - a new link path, a cleared cache, a manager install.sh has just placed
+    - so on a kept line the manager and every capability script that runs as
+    its own uv script admit only the library the line names."""
+    if M["STORE_LIBRARY"] is None:
+        pytest.skip("this tree is not a kept line")
+    from packaging.requirements import Requirement
+    from packaging.specifiers import SpecifierSet
+    wrong = {}
+    for path in [MANAGER, *sorted((REPO / "capabilities").glob("*/**/*"))]:
+        if not path.is_file() or (path != MANAGER and "tests" in path.relative_to(
+                REPO / "capabilities").parts):
+            continue
+        try:
+            deps = M["_script_dependencies"](path.read_text())
+        except (UnicodeDecodeError, OSError):
+            continue
+        specs = [Requirement(dep).specifier for dep in deps or ()
+                 if Requirement(dep).name == "capabilities-contract"]
+        if specs and specs != [SpecifierSet(M["STORE_LIBRARY"])]:
+            wrong[str(path.relative_to(REPO))] = [str(s) for s in specs]
+    assert wrong == {}
+
+
 def test_a_kept_line_names_its_library_and_an_older_tree_names_nothing(tmp_path: Path) -> None:
     line = tmp_path / "line"
     (line / "bin").mkdir(parents=True)

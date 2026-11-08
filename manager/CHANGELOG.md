@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-08 — a capability environment rebuilt on `store-major-2` stays on the library its line names
+
+The line's manager and every capability script on this line that uv runs as its own script - each capability's executable and telegram's `service/daemon.py`, `service/profiles.py` and `service/call_recorder.py` - declare `capabilities-contract>=0.43,<0.44` in their own headers, the range `STORE_LIBRARY` names, rather than `<1`. The range was applied only inside the sync `update` runs, so an environment uv built from the header anywhere else - a new link path, a cleared uv cache, a redeploy that keeps no environments - resolved the newest library, 0.44 or later, which reads store major 3, and the capability refused with `store_upgrade_needed` on the major-2 store it was installed against; a manager placed by `install.sh` before `self-update` held it ran that newer library the same way. Every environment built from this line now resolves capabilities-contract 0.43, however it is started, and a test binds each of these headers to `STORE_LIBRARY` on a kept line.
+
 ## 2026-11-07 — `store-major-2` is the release line of store schema major 2
 
 This branch keeps the last release of store major 2 after `main` moves to major 3. Its manager names `STORE_LIBRARY` `>=0.43,<0.44`, which `source index` stamps as `library` into the release manifest and the catalogue, so `self-update` and `update` on a machine whose store is still at major 2 take this line and hold the manager and every capability on capabilities-contract 0.43, the last library that reads major 2. It takes only fixes and what major 2 needs to reach `capabilities store upgrade`.
