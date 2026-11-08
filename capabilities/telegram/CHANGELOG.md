@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — A periodic sync that runs past the stale threshold says where it is
+
+When one periodic sync pass has been running longer than `SYNC_STALE_AFTER`, the time after which the service's health reads stale, the daemon logs one line naming the step in progress: `catch_up (getDifference)`, `get_messages <chat key>` for the chat whose history call is in flight, or `catch_up_known <chat key>` for the chat being reconciled. When that pass returns, completed or raised, it logs one line with the pass's total duration. A pass that finishes inside the threshold logs nothing new. Nothing times out, is cancelled or restarted, and health, `service status`, `doctor` and settings are unchanged.
+
 ## 2026-11-08 — The service's project layout comes from the manager in a legacy-bound folder
 
 In a project that still carries a legacy `.contextkit/config.toml` binding, the layout snapshot the service launcher hands the daemon takes the context, routines and assets layers and the body root that holds `memory` from `capabilities path --json`, where it asked `contextkit path`; the manager reads the same binding, so the layers are the same folders, and `contextkit` is no longer needed on the machine. The snapshot's `provider` value is unchanged. The `assistant-service` guide no longer names ContextKit. No verb, flag, setting or output key changes.

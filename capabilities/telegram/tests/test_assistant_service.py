@@ -3219,6 +3219,80 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health["state"], "unhealthy")
             self.assertIn("TL decode failed", health["last_error"])
 
+    async def _held_periodic_pass(self, client_class, step):
+        """Hold one periodic pass past SYNC_STALE_AFTER and return the log."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td),
+                settings(sync_interval=0.02, sync_stale_after=0.1),
+            )
+            daemon.save_register({"123": {"last_processed_message_id": 320}})
+            client = client_class([])
+            lines = []
+            with mock.patch.object(daemon, "log", lines.append):
+                task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                await client.held.wait()
+                await wait_until(lambda: any(
+                    "periodic sync: still running" in line for line in lines))
+                client.release.set()
+                await wait_until(lambda: any(
+                    "periodic sync: pass completed after" in line for line in lines))
+                await self.stop_session(client, task)
+            stuck = [line for line in lines if "periodic sync: still running" in line]
+            done = [line for line in lines if "periodic sync: pass" in line]
+            self.assertEqual(len(stuck), 1, lines)
+            self.assertIn(f"in progress: {step}", stuck[0])
+            self.assertEqual(len(done), 1, lines)
+            self.assertRegex(done[0], r"pass completed after \d+\.\ds$")
+
+    async def test_a_periodic_pass_held_in_catch_up_logs_the_step_and_its_duration(self):
+        class SlowCatchUp(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.held, self.release = asyncio.Event(), asyncio.Event()
+
+            async def catch_up(self):
+                await super().catch_up()
+                if self.catch_up_calls == 1:
+                    self.held.set()
+                    await self.release.wait()
+
+        await self._held_periodic_pass(SlowCatchUp, "catch_up (getDifference)")
+
+    async def test_a_periodic_pass_held_in_get_messages_names_the_chat(self):
+        class SlowHistory(FakeClient):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.held, self.release = asyncio.Event(), asyncio.Event()
+
+            async def get_messages(self, chat, limit=None):
+                result = await super().get_messages(chat, limit=limit)
+                if self.get_messages_calls == 2:   # the first periodic pass
+                    self.held.set()
+                    await self.release.wait()
+                return result
+
+        await self._held_periodic_pass(SlowHistory, "get_messages 123")
+
+    async def test_a_periodic_pass_inside_the_stale_threshold_logs_nothing_new(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(
+                Path(td),
+                settings(sync_interval=0.02, sync_stale_after=0.1),
+            )
+            daemon.save_register({"123": {"last_processed_message_id": 320}})
+            client = FakeClient([])
+            lines = []
+            with mock.patch.object(daemon, "log", lines.append):
+                task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                await wait_until(lambda: client.catch_up_calls >= 5)
+                await asyncio.sleep(0.15)
+                await self.stop_session(client, task)
+            self.assertEqual(
+                [line for line in lines if "periodic sync:" in line], [])
+
     async def test_a_vanished_interpreter_ends_the_session_for_a_restart(self):
         """A uv cache prune deletes the environment under the running daemon;
         every turn it launches would then die on the missing interpreter, so

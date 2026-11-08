@@ -8299,6 +8299,10 @@ async def run_session(client):
             log(f"{key}: dialog lookup failed: {_short_error(e)}")
         return cid
 
+    # The step a sync pass is on, read by the periodic pass's stale watcher so a
+    # pass that runs past SYNC_STALE_AFTER can say where it is.
+    sync_step = {"name": None}
+
     async def catch_up_known(reason):
         # Reconcile allowed chats against their durable message-id watermarks. Startup
         # recovers downtime; the periodic pass closes gaps left by a silently dropped
@@ -8308,6 +8312,7 @@ async def run_session(client):
         failures = 0
         total_enqueued = 0
         for key in list(reg.keys()):
+            sync_step["name"] = f"catch_up_known {key}"
             ent = await registered_chat_ref(key)
             if ent is None:
                 continue
@@ -8322,6 +8327,7 @@ async def run_session(client):
             try:
                 checked += 1
                 limit = channel_settings(reg, key)["tail_size"]
+                sync_step["name"] = f"get_messages {key}"
                 if topic_id is None:
                     raw = await client.get_messages(ent, limit=limit)
                 else:
@@ -8329,6 +8335,7 @@ async def run_session(client):
                         raw = await client.get_messages(ent, limit=limit, reply_to=topic_id)
                     except TypeError:
                         raw = await client.get_messages(ent, limit=limit * 4)
+                sync_step["name"] = f"catch_up_known {key}"
             except Exception as e:
                 log(f"{key}: catch-up skipped; cannot resolve chat: {_short_error(e)}")
                 failures += 1
@@ -8591,38 +8598,64 @@ async def run_session(client):
             if vanished is not None:
                 write_health("unhealthy", last_error=f"runtime file gone: {vanished}")
                 raise RuntimeVanished(vanished)
+            # A pass that outlives SYNC_STALE_AFTER says once where it is, and
+            # says how long it took when it returns; a pass inside it says nothing.
+            started = time.monotonic()
+            sync_step["name"] = None
+            stale = {"logged": False}
+            outcome = "raised"
+
+            async def watch_stale():
+                await asyncio.sleep(SYNC_STALE_AFTER)
+                stale["logged"] = True
+                log(f"periodic sync: still running after {time.monotonic() - started:.0f}s "
+                    f"(stale after {SYNC_STALE_AFTER:g}s); in progress: "
+                    f"{sync_step['name'] or 'starting'}")
+
+            watcher = asyncio.create_task(watch_stale())
             try:
-                # Ask Telethon to run the protocol-native getDifference path, then
-                # reconcile bounded recent history by our durable watermarks. The
-                # second pass remains authoritative if Telethon dropped an undecodable
-                # update packet without disconnecting the socket.
-                catch_up = getattr(client, "catch_up", None)
-                if catch_up is not None:
-                    await catch_up()
-                    await asyncio.sleep(0)
-                stats = await catch_up_known("periodic")
-                state = "degraded" if stats["failures"] else "healthy"
-                write_health(
-                    state,
-                    last_sync_at=now(),
-                    last_catch_up_reason="periodic",
-                    last_sync_stats=stats,
-                    last_error=(
-                        f"{stats['failures']} chat sync failure(s)"
-                        if stats["failures"] else None
-                    ),
-                )
-            except asyncio.CancelledError:
+                await periodic_pass()
+                outcome = "completed"
+            finally:
+                watcher.cancel()
+                if stale["logged"]:
+                    log(f"periodic sync: pass {outcome} after "
+                        f"{time.monotonic() - started:.1f}s")
+
+    async def periodic_pass():
+        try:
+            # Ask Telethon to run the protocol-native getDifference path, then
+            # reconcile bounded recent history by our durable watermarks. The
+            # second pass remains authoritative if Telethon dropped an undecodable
+            # update packet without disconnecting the socket.
+            catch_up = getattr(client, "catch_up", None)
+            if catch_up is not None:
+                sync_step["name"] = "catch_up (getDifference)"
+                await catch_up()
+                await asyncio.sleep(0)
+            stats = await catch_up_known("periodic")
+            state = "degraded" if stats["failures"] else "healthy"
+            write_health(
+                state,
+                last_sync_at=now(),
+                last_catch_up_reason="periodic",
+                last_sync_stats=stats,
+                last_error=(
+                    f"{stats['failures']} chat sync failure(s)"
+                    if stats["failures"] else None
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            write_health(
+                "unhealthy",
+                last_error=_short_error(exc),
+            )
+            if isinstance(exc, SessionUnhealthy):
                 raise
-            except Exception as exc:
-                write_health(
-                    "unhealthy",
-                    last_error=_short_error(exc),
-                )
-                if isinstance(exc, SessionUnhealthy):
-                    raise
-                raise SessionUnhealthy(
-                    f"periodic Telegram sync failed: {_short_error(exc)}") from exc
+            raise SessionUnhealthy(
+                f"periodic Telegram sync failed: {_short_error(exc)}") from exc
 
     # Catch up over known rooms (register keys are chat_ids) since the watermark.
     startup_stats = await catch_up_known("startup")
