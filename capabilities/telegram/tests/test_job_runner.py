@@ -873,6 +873,95 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(after["outcome"], daemon.jobs.SUCCEEDED)
             await self.stop_session(client, task)
 
+    async def run_amended_claude_job(self, td, later):
+        """A claude job whose first attempt runs until an amendment stops it,
+        with one addition staged before it starts. `later` answers each later
+        harness call. Returns the row as it landed, the harness calls, and the
+        session the first attempt checkpointed while it ran."""
+        daemon = self.daemon_with_store(td)
+        self.addCleanup(daemon.close_job_register)
+        register = daemon.job_register()
+        row = queued(register, channel_key="123", requested_by="777",
+                     description="reconcile the ledger", engine="claude")
+        register.stage_amendment(row["id"], "use the March export")
+        first = FakeHarness(session_id="sess-claude", seconds=30)
+        self.addCleanup(end_children, first.children)
+        calls = []
+
+        def harness(prompt, profile, cwd, **kwargs):
+            calls.append({"prompt": prompt, "session": kwargs.get("session")})
+            if len(calls) == 1:
+                return first(prompt, profile, cwd, **kwargs)
+            return later(prompt, profile, cwd, **kwargs)
+
+        daemon.harness_run = harness
+        client = FakeClient([])
+        task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        await wait_until(lambda: register.get(row["id"])["session_id"] is not None,
+                         timeout=8)
+        checkpoint = register.get(row["id"])["session_id"]
+        store, cli = self.as_cli(daemon)
+        try:
+            cli.amend(row["id"], "not that account, the other one")
+        finally:
+            store.close()
+        await wait_until(lambda: register.get(row["id"])["outcome"] is not None,
+                         timeout=10)
+        landed = register.get(row["id"])
+        pending = register.pending_amendment(row["id"])
+        await self.stop_session(client, task)
+        return landed, calls, checkpoint, pending
+
+    async def test_an_amendment_to_a_running_claude_job_continues_its_session(self):
+        """The id the runner pins before launch is the attempt's checkpoint
+        from its start, so an amendment returns the job to the queue and the
+        next attempt resumes that session with the addition."""
+        with tempfile.TemporaryDirectory() as td:
+            later = FakeHarness(answer="the ledger is reconciled")
+            self.addCleanup(end_children, later.children)
+            landed, calls, checkpoint, pending = await self.run_amended_claude_job(
+                td, later)
+        self.assertEqual(checkpoint, "sess-claude")
+        self.assertEqual(landed["outcome"], "succeeded", landed["error"])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual((calls[1]["session"].kind, calls[1]["session"].id),
+                         ("resume", "sess-claude"))
+        self.assertIn("not that account, the other one", calls[1]["prompt"])
+        self.assertEqual(landed["session_id"], "sess-claude")
+        self.assertEqual(pending, [])
+
+    async def test_a_resume_onto_a_claude_session_never_written_starts_it_again(self):
+        """An attempt killed before claude wrote its transcript leaves an id
+        that resumes onto nothing. The job does not end: the attempt starts
+        that session under the same id, with the full prompt and every
+        addition, the one the killed attempt took included."""
+        missing = ("Claude Code returned an error result: No conversation found "
+                   "with session ID: sess-claude (exit code: 1)")
+        resumed = FakeHarness(ok=False, kind="crash", message=missing, answer="")
+        # A pinned run reports the id it was pinned to, as the runner does.
+        fresh = FakeHarness(answer="the ledger is reconciled", session_id="sess-claude")
+        self.addCleanup(end_children, resumed.children)
+        self.addCleanup(end_children, fresh.children)
+
+        def later(prompt, profile, cwd, **kwargs):
+            session = kwargs.get("session")
+            target = resumed if session is not None and session.kind == "resume" else fresh
+            return target(prompt, profile, cwd, **kwargs)
+
+        with tempfile.TemporaryDirectory() as td:
+            landed, calls, _, pending = await self.run_amended_claude_job(td, later)
+        self.assertEqual(landed["outcome"], "succeeded", landed["error"])
+        self.assertEqual([(c["session"].kind, c["session"].id) for c in calls[1:]],
+                         [("resume", "sess-claude"), ("pinned", "sess-claude")])
+        restart = calls[2]["prompt"]
+        self.assertIn("reconcile the ledger", restart)
+        self.assertIn("use the March export", restart)
+        self.assertIn("not that account, the other one", restart)
+        self.assertNotIn("use the March export", calls[1]["prompt"])
+        self.assertEqual(landed["session_id"], "sess-claude")
+        self.assertEqual(pending, [])
+
     # -- cancellation ---------------------------------------------------------
 
     async def test_stop_between_claim_and_popen_lands_cancelled(self):

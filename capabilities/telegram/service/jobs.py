@@ -1391,6 +1391,10 @@ class JobRegister:
         return [row["text"] for row in self._amendment_rows(
             job_id, ("pending", "claimed"))]
 
+    def acked_amendment(self, job_id: str) -> list[str]:
+        """The additions an earlier attempt already handed to the session."""
+        return [row["text"] for row in self._amendment_rows(job_id, ("acked",))]
+
     def has_pending_amendment(self, job_id: str) -> bool:
         return bool(self._amendment_rows(job_id, ("pending",)))
 

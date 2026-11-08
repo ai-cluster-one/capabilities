@@ -5574,6 +5574,17 @@ def gate_sender_role(sender_id, group_policy):
             or "unknown")
 
 
+def _claude_session_unwritten(result):
+    """True when a claude resume failed because the session was never written.
+
+    Claude Code answers a resume onto an id it holds no transcript for with
+    "No conversation found with session ID: <id>" before any turn runs; the
+    runner reports it as a failed result carrying that text."""
+    failure = None if result.ok else result.failure
+    return (failure is not None
+            and "no conversation found with session id" in (failure.message or "").lower())
+
+
 def worker_harness(chat, tail, state=None, procs=None):
     """One headless turn on claude or codex, through the harness runner.
 
@@ -5599,6 +5610,7 @@ def worker_harness(chat, tail, state=None, procs=None):
     environ, extra_env = worker_env_parts(st)
     session = (lib.Session.resume(str(st["resume_session"])) if st.get("resume_session")
                else lib.Session.fresh())
+    cwd = str(st.get("project_dir") or PROJECT_ROOT)
     refused = {}
     on_worker_start = st.get("on_worker_start")
 
@@ -5614,11 +5626,27 @@ def worker_harness(chat, tail, state=None, procs=None):
             refused["error"] = exc
             run.cancel.set()
 
-    try:
-        result = harness_run(
-            build_prompt(tail, st), profile, str(st.get("project_dir") or PROJECT_ROOT),
-            session=session, environ=environ, extra_env=extra_env,
+    def attempt(session, prompt):
+        return harness_run(
+            prompt, profile, cwd, session=session, environ=environ, extra_env=extra_env,
             on_event=st.get("on_worker_event"), cancel=run.cancel, on_start=on_start)
+
+    try:
+        result = attempt(session, build_prompt(tail, st))
+        if (not refused and not run.cancel.is_set() and harness == "claude"
+                and session.kind == "resume" and st.get("registered_job")
+                and _claude_session_unwritten(result)):
+            # A job attempt checkpoints the id the runner pinned before launch,
+            # so one killed before claude wrote its transcript leaves an id that
+            # resumes onto nothing. That resume executed nothing, so the attempt
+            # runs again in a session started under the same id, with the full
+            # prompt and every addition: the resumed one carries only what
+            # moved on.
+            log(f"{proc_key}: claude session {session.id} was never written; "
+                "starting it under the same id")
+            result = attempt(lib.Session.pinned(session.id), build_prompt(tail, {
+                **st, "resume_reanchor": True,
+                "current_request": st.get("fresh_request") or st.get("current_request")}))
     finally:
         run.ended = True
     if refused:
@@ -8054,6 +8082,12 @@ async def run_session(client):
                              "channel when the job finishes, as a reply to the "
                              "request; return nothing and nothing is posted"),
             }
+            # What the request is to a session that has to start over: the
+            # additions earlier attempts already handed to the session as well,
+            # for a resume that finds the session was never written.
+            fresh_request = ({**current_request, "text": "\n\n".join(
+                [row["description"], *register.acked_amendment(job_id), *amendments])}
+                if resume_session else current_request)
             progress_outbox = prepare_progress_outbox(
                 f"job-{_safe_file_part(job_id)}")
             worker_session = prepare_worker_session(key, f"job-{job_id}")
@@ -8078,17 +8112,20 @@ async def run_session(client):
             def remember_worker_process(started):
                 """Record the harness the moment it runs: its pid, which leads
                 its own session and process group, so a daemon that restarts
-                after a crash can end the orphaned tree; and, for codex, the
-                thread it opened. A start the register refuses ends the run."""
+                after a crash can end the orphaned tree; and the session it
+                runs in - the thread codex opened, or the id the runner pinned
+                for claude before launch - so an amendment to a running attempt
+                has a checkpoint to continue. A start the register refuses ends
+                the run."""
                 accepted = asyncio.run_coroutine_threadsafe(
                     persist_process(started.pid, started.pid), loop).result(timeout=5)
                 if not accepted:
                     raise RuntimeError("job attempt lost ownership before process start")
-                if started.harness == "codex" and started.session_id:
+                if started.session_id:
                     remember_worker_session(started.session_id)
 
             def remember_worker_session(thread_id):
-                """Persist a Codex rollout as soon as it opens.
+                """Persist a session as soon as the harness runs in it.
 
                 The run reports its start from the executor thread while the
                 store connection belongs to this event loop.  Schedule the
@@ -8133,6 +8170,7 @@ async def run_session(client):
                      "channel_context": channel_context,
                      "context_exclusive": context_exclusive,
                      "current_request": current_request,
+                     "fresh_request": fresh_request,
                      "registered_job": {"id": job_id,
                                         "description": row["description"],
                                         "amendments": row["amendments"],
