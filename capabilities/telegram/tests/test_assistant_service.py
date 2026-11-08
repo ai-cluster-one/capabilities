@@ -7519,7 +7519,8 @@ class RecordingAttemptLifecycleTests(unittest.IsolatedAsyncioTestCase):
             stall = self.watchdogs()["watch_capture_stall"]
             metadata_path = slot["metadata_path"]
 
-            await recording.finalize_call_recording("call_closed")
+            await recording.finalize_call_recording(
+                "call_closed", attempt=slot["attempt"])
 
             self.assertEqual(sent, [(4242, metadata_path.with_suffix(".ogg"))])
             self.assertEqual(calls.left, [])
@@ -7552,7 +7553,8 @@ class RecordingAttemptLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(set(self.watchdogs()), self.WATCHDOGS)
             spawned = list(self.watchdogs().values())
 
-            await recording.finalize_call_recording("call_deserted")
+            await recording.finalize_call_recording(
+                "call_deserted", attempt=slot["attempt"])
 
             self.assertEqual(calls.left, [4242])
             self.assertEqual([chat for chat, _ in sent], [4242])
@@ -7608,6 +7610,260 @@ class RecordingAttemptLifecycleTests(unittest.IsolatedAsyncioTestCase):
             for task in spawned:
                 task.cancel()
             await asyncio.gather(*spawned, return_exceptions=True)
+
+class StaleWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    """A watchdog belongs to the attempt it was spawned for, not to its caller.
+
+    One caller can hold the slot twice in a row - the first call ends, the same
+    person rings again - and every watchdog of the first attempt is still
+    asleep when the second one starts. Each case parks the first attempt's
+    watchdogs at the await they resume from, lets the second attempt take the
+    slot under the same caller id, and then wakes them with the answer that
+    would make them act. A guard on the caller id passes there; only the
+    attempt tells the two apart."""
+
+    WATCHDOGS = RecordingAttemptLifecycleTests.WATCHDOGS
+    Calls = RecordingAttemptLifecycleTests.Calls
+    Client = RecordingAttemptLifecycleTests.Client
+    watchdogs = RecordingAttemptLifecycleTests.watchdogs
+    deliverable = RecordingAttemptLifecycleTests.deliverable
+
+    class Parked:
+        """Hold the named watchdogs at an await until released, once each, and
+        let every other task through."""
+
+        def __init__(self, names):
+            self.names = set(names)
+            self.armed = True
+            self.parked = set()
+            self.release = asyncio.Event()
+
+        async def park(self):
+            task = asyncio.current_task()
+            if (not self.armed or task in self.parked
+                    or task.get_coro().__name__ not in self.names):
+                return False
+            # Parked once: a guard that fails afterwards loops on real waits
+            # rather than spinning on an event that is already set.
+            self.parked.add(task)
+            await self.release.wait()
+            return True
+
+        async def settled(self, count):
+            for _ in range(500):
+                if len(self.parked) >= count:
+                    return
+                await asyncio.sleep(0.01)
+            raise AssertionError(f"{len(self.parked)} of {count} parked")
+
+    def fast(self, daemon):
+        """Every watchdog acts at its first chance, so a guard that lets a stale
+        one through shows up as an action rather than as a wait."""
+        daemon.CONFERENCE_AUDIO_MAP_RETRIES = (0.01,)
+        daemon.CONFERENCE_AUDIO_MAP_INTERVAL = 0.01
+        daemon.CONFERENCE_ROSTER_INTERVAL = 0.01
+        daemon.CONFERENCE_ROSTER_GRACE = 0.0
+        daemon.CONFERENCE_ROSTER_STRIKES = 1
+        daemon.CONFERENCE_PEER_INTERVAL = 0.01
+        daemon.CONFERENCE_JOIN_GRACE = 0.0
+        daemon.CONFERENCE_QUIET_BEFORE_CHECK = 0.0
+        daemon.CONFERENCE_EMPTY_ANSWERS = 1
+        daemon.CAPTURE_STALL_INTERVAL = 0.01
+        daemon.CAPTURE_STALL_TIMEOUT = 0.01
+
+    def acting_lifecycle(self, daemon, td, calls, client, asks, refreshed):
+        """The lifecycle with every outside answer set to the one that acts:
+        the peer watchdog hears nobody left, the coverage watchdog hears a
+        participant nothing decodes, and the stall watchdog hears that this
+        account is no longer in the call."""
+        folder = Path(td) / "recordings"
+
+        async def require_conference_chain(caller_id, invite_msg_id):
+            return None
+
+        async def refresh_conference_audio_map(chat_id, reason):
+            refreshed.append(chat_id)
+
+        async def conference_others(chat_id):
+            await asks.park()
+            if asyncio.current_task().get_coro().__name__ == "watch_conference_peers":
+                return []
+            return [SimpleNamespace(user_id=99, source=123)]
+
+        async def conference_holds_me(chat_id):
+            await asks.park()
+            return False
+
+        return daemon.call_recording_lifecycle(
+            calls=calls, client=client,
+            recording_output=lambda caller_id, mode: folder / f"{mode}-{caller_id}.ogg",
+            require_conference_chain=require_conference_chain,
+            conference_audio_map=lambda chat_id: {},
+            refresh_conference_audio_map=refresh_conference_audio_map,
+            conference_others=conference_others,
+            conference_holds_me=conference_holds_me,
+            voice_call_busy=lambda: False)
+
+    async def second_attempt_takes_the_slot(self, daemon, recording):
+        """End the first attempt the way a hangup does and ring again from the
+        same caller, which leaves the first attempt's watchdogs asleep."""
+        slot = recording.active_recording
+        await recording.finalize_call_recording(
+            "call_closed", attempt=slot["attempt"])
+        await recording.start_call_recording(
+            4242, "p2p", daemon.CallConfig(timeout=60))
+        await slot["task"]
+        return slot["attempt"]
+
+    def assert_second_attempt_untouched(self, slot, second, calls, client,
+                                        sent, refreshed, refreshed_before):
+        self.assertEqual(slot["attempt"], second)
+        self.assertEqual(slot["caller_id"], 4242)
+        self.assertEqual(slot["mode"], "p2p")
+        self.assertIsNotNone(slot["task"])
+        self.assertEqual(calls.left, [])
+        self.assertEqual(client.messages, [])
+        self.assertEqual(len(sent), 1, "only the first attempt was delivered")
+        self.assertEqual(refreshed, refreshed_before)
+
+    async def test_no_watchdog_acts_on_a_later_attempt_after_its_sleep(self):
+        import asyncio as real_asyncio
+
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.fast(daemon)
+            sent = self.deliverable(daemon)
+            sleeps, asks, refreshed = self.Parked(self.WATCHDOGS), self.Parked(()), []
+
+            class ParkingAsyncio:
+                def __getattr__(self, name):
+                    return getattr(real_asyncio, name)
+
+                async def sleep(self, delay, *args, **kwargs):
+                    if not await sleeps.park():
+                        await real_asyncio.sleep(delay, *args, **kwargs)
+
+            daemon.asyncio = ParkingAsyncio()
+            calls, client = self.Calls(), self.Client()
+            recording = self.acting_lifecycle(daemon, td, calls, client,
+                                              asks, refreshed)
+            slot = recording.active_recording
+
+            await recording.start_call_recording(
+                4242, "conference", daemon.CallConfig(conference=77))
+            await slot["task"]
+            first = slot["attempt"]
+            stale = dict(self.watchdogs())
+            self.assertEqual(set(stale), self.WATCHDOGS)
+            slot["capture"].write_bytes(b"x" * 4096)
+            await sleeps.settled(len(self.WATCHDOGS))
+            self.assertEqual(sleeps.parked, set(stale.values()))
+            sleeps.armed = False
+
+            second = await self.second_attempt_takes_the_slot(daemon, recording)
+            self.assertNotEqual(second, first)
+            current = [task for task in self.watchdogs().values()
+                       if task not in stale.values()]
+
+            sleeps.release.set()
+            # Each one returns: the attempt it was spawned for is gone.
+            await asyncio.wait_for(
+                asyncio.gather(*stale.values()), 2)
+            self.assert_second_attempt_untouched(
+                slot, second, calls, client, sent, refreshed, [])
+
+            # And a finalize named for the first attempt closes nothing.
+            await recording.finalize_call_recording("call_deserted", attempt=first)
+            self.assert_second_attempt_untouched(
+                slot, second, calls, client, sent, refreshed, [])
+            for task in current:
+                task.cancel()
+            await asyncio.gather(*current, return_exceptions=True)
+
+    async def test_no_watchdog_acts_on_a_later_attempt_after_its_question(self):
+        # The stall, peer and coverage watchdogs also wait on Telegram before
+        # acting, and that answer can arrive after the attempt has changed.
+        asking = {"watch_capture_stall", "watch_conference_peers",
+                  "watch_conference_coverage"}
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            self.fast(daemon)
+            sent = self.deliverable(daemon)
+            asks, refreshed = self.Parked(asking), []
+            calls, client = self.Calls(), self.Client()
+            recording = self.acting_lifecycle(daemon, td, calls, client,
+                                              asks, refreshed)
+            slot = recording.active_recording
+
+            await recording.start_call_recording(
+                4242, "conference", daemon.CallConfig(conference=77))
+            await slot["task"]
+            stale = {name: task for name, task in self.watchdogs().items()
+                     if name in asking}
+            self.assertEqual(set(stale), asking)
+            slot["capture"].write_bytes(b"x" * 4096)
+            await asks.settled(len(asking))
+            self.assertEqual(asks.parked, set(stale.values()))
+            asks.armed = False
+            refreshed_before = list(refreshed)
+
+            second = await self.second_attempt_takes_the_slot(daemon, recording)
+            current = [task for task in self.watchdogs().values()
+                       if task not in stale.values()]
+
+            asks.release.set()
+            await asyncio.wait_for(asyncio.gather(*stale.values()), 2)
+            self.assert_second_attempt_untouched(
+                slot, second, calls, client, sent, refreshed, refreshed_before)
+            for task in current:
+                task.cancel()
+            await asyncio.gather(*current, return_exceptions=True)
+
+    def test_every_path_into_finalize_names_its_attempt(self):
+        """The class, not the instance: the slot carries the attempt, finalize
+        cannot be reached without naming one, and no watchdog decides it still
+        owns the slot by its caller id."""
+        tree = ast.parse(DAEMON_PATH.read_text())
+        factory = next(node for node in ast.walk(tree)
+                       if isinstance(node, ast.FunctionDef)
+                       and node.name == "call_recording_lifecycle")
+        finalize = next(node for node in ast.walk(factory)
+                        if isinstance(node, ast.AsyncFunctionDef)
+                        and node.name == "finalize_call_recording")
+        self.assertEqual([arg.arg for arg in finalize.args.kwonlyargs], ["attempt"])
+        self.assertEqual(finalize.args.kw_defaults, [None],
+                         "an attempt with a default lets a path name none")
+
+        calls = [node for node in ast.walk(tree)
+                 if isinstance(node, ast.Call)
+                 and getattr(node.func, "id", getattr(node.func, "attr", None))
+                 == "finalize_call_recording"]
+        self.assertGreaterEqual(len(calls), 4)
+        for call in calls:
+            self.assertIn("attempt", [kw.arg for kw in call.keywords],
+                          f"finalize at line {call.lineno} names no attempt")
+
+        def reads_slot(node, key):
+            return (isinstance(node, ast.Subscript)
+                    and getattr(node.value, "id", None) == "active_recording"
+                    and getattr(node.slice, "value", None) == key)
+
+        self.assertTrue(any(reads_slot(node, "attempt")
+                            for node in ast.walk(finalize)
+                            if isinstance(node, ast.Compare)
+                            for node in ast.walk(node)))
+        for node in ast.walk(factory):
+            if not (isinstance(node, ast.AsyncFunctionDef)
+                    and node.name in self.WATCHDOGS):
+                continue
+            guards = [part for compare in ast.walk(node)
+                      if isinstance(compare, ast.Compare)
+                      for part in ast.walk(compare)]
+            self.assertFalse(any(reads_slot(part, "caller_id") for part in guards),
+                             f"{node.name} still guards on the caller id")
+            self.assertTrue(any(reads_slot(part, "attempt") for part in guards),
+                            f"{node.name} never compares its attempt")
+
 
 class StitchedRecordingTests(unittest.IsolatedAsyncioTestCase):
     """A call split by a crash is one conversation, and is delivered as one."""

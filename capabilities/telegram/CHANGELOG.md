@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — A recording is closed only by the watchdogs of its own attempt
+
+Each call recording attempt now carries a generation of its own, and the five watchdogs it starts - the capture stall, the conference peer and coverage watchdogs, and the two audio-map watchdogs - end with that attempt, not with whatever recording later holds the slot. Every path that closes a recording names the attempt it means to close, and a close aimed at an attempt that has already left the slot does nothing. Before this, the watchdogs recognised their recording by the caller alone and acted on it after they woke without looking again, so a watchdog left over from a call that had ended could close, or report a shortfall in, the next recording mid-conversation - one from the same person at any time, and one from anybody when the watchdog woke just as the slot changed hands - and that recording then arrived cut short. No verb, flag, setting or output key changes.
+
 ## 2026-11-08 — `chats` and title resolution read the archive as well as the main list
 
 `telegram chats` and resolving a chat by title walk the main list and the archive one folder at a time and merge them, where each made one folder-less walk that the server can end early on a large account with no error, so `chats` came back with a fraction of the dialogs and a title in the archive answered `chat_not_found`. The merged order is the folder-less one: the main list's pinned dialogs first, then both folders by the date of their last message, a dialog that appears in both listed once. `--limit N` is still the N most recent dialogs across everything, and an ambiguous title still resolves to the match nearest the top of that listing, not to the main list ahead of the archive. No verb, flag or output key changes.
