@@ -3377,6 +3377,39 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                                 for line in daemon._test_logs))
             await self.stop_session(client, task)
 
+    async def test_a_timed_out_turn_tells_a_supervisor_the_work_is_unknown(self):
+        """A turn stopped at its ceiling may have done all, some or none of its
+        work, and the supervisor reads that, not a clean error; a room without
+        one keeps the generic line, and the log keeps the ceiling alone - the
+        same text the finished row is given."""
+        for role, told in (("supervisor", True), ("direct_user", False)):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as td:
+                base = settings(profile="telegram-codex", worker_timeout=0.3)
+                base["direct_messages"] = {"mode": "anyone", "default_role": role}
+                daemon = import_daemon(Path(td), base)
+                daemon.harness_run = FakeHarness(seconds=30)
+                client = FakeClient([Message(11)])
+                task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                await client.handler(Event(client.messages[0]))
+                await wait_until(lambda: bool(client.sent))
+
+                sent = client.sent[-1]["text"]
+                if told:
+                    self.assertIn("codex worker timed out after 0.3s", sent)
+                    self.assertIn("may or may not have finished its work", sent)
+                    self.assertIn("nothing continues on its own", sent)
+                    self.assertNotIn("Worker error", sent)
+                else:
+                    self.assertEqual(
+                        sent, "Something went wrong while processing this. "
+                              "Please tell an administrator.")
+                logged = [line for line in daemon._test_logs if "worker error job" in line]
+                self.assertTrue(logged)
+                self.assertTrue(all(line.endswith(": codex worker timed out after 0.3s")
+                                    for line in logged), logged)
+                await self.stop_session(client, task)
+
     async def test_disappeared_process_and_failed_final_send_cannot_orphan_running_job(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(profile="telegram-codex"))
@@ -8543,6 +8576,8 @@ class StoppedVoiceTaskTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.wait_for(run_task("look something up"), timeout=30)
 
             self.assertIn("timed out", str(caught.exception))
+            # What the caller is handed says the work may or may not be done.
+            self.assertIn("may or may not have finished its work", str(caught.exception))
             # Two runs, the second one its own: the lost session was run again
             # from a clean slate, and only then was the failure the caller's.
             self.assertEqual(len(fake.calls), 2)

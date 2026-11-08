@@ -179,8 +179,10 @@ from workers import (
     _kill_process_group,
     model_refusal_notice,
     scrub_worker_env,
+    timeout_notice,
     worker_diagnosis,
     worker_failure,
+    worker_timed_out,
 )
 sys.path.pop(0)
 
@@ -7290,7 +7292,8 @@ async def run_session(client):
         except WorkerTimedOut:
             await terminate_worker(
                 proc_key, future, cancel_event, f"timeout after {s['worker_timeout']}s")
-            e = RuntimeError(f"{s['worker']} worker timed out after {s['worker_timeout']}s")
+            e = WorkerFailed(f"{s['worker']} worker timed out after {s['worker_timeout']}s",
+                             "timeout")
             if closing:
                 retry_job(key, job, e)
                 log(f"{key}: worker timed out during session close; job requeued")
@@ -7351,8 +7354,12 @@ async def run_session(client):
             job.get("sender_role") == "supervisor"
             or any(p.get("role") == "supervisor" for p in participants)
         )
-        notice = (f"Worker error:\n{detail}" if is_supervisor
-                  else "Something went wrong while processing this. Please tell an administrator.")
+        if not is_supervisor:
+            notice = "Something went wrong while processing this. Please tell an administrator."
+        elif worker_timed_out(error):
+            notice = timeout_notice(detail)
+        else:
+            notice = f"Worker error:\n{detail}"
         try:
             _, group_policy = _group_policy(job.get("chat_id") or _channel_identity(key)[0])
             reply_to = _reply_target(
@@ -8333,7 +8340,8 @@ async def run_session(client):
                 # that is worth trying again.
                 refused = isinstance(exc, WorkerModelRefused)
                 detail = worker_diagnosis(exc, reason)
-                failure_text = (f"Job failed: «{jobs.job_label(row['description'])}»\n{detail}"
+                told = timeout_notice(detail) if worker_timed_out(exc) else detail
+                failure_text = (f"Job failed: «{jobs.job_label(row['description'])}»\n{told}"
                                 if any(p.get("role") == "supervisor"
                                        for p in participants)
                                 else f"«{jobs.job_label(row['description'])}» could not be completed. "
@@ -9328,8 +9336,9 @@ async def run_session(client):
                         await terminate_worker(
                             proc_key, future, cancel_event,
                             f"voice task timeout after {s['worker_timeout']}s")
-                        raise RuntimeError(
-                            f"{s['worker']} worker timed out after {s['worker_timeout']}s")
+                        raise WorkerFailed(timeout_notice(
+                            f"{s['worker']} worker timed out after {s['worker_timeout']}s"),
+                            "timeout")
                     return await future
                 except Exception:
                     # Asked here, before the run is released and the record with

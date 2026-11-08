@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-08 — A turn stopped at its ceiling says the work may or may not be done
+
+When a worker turn is stopped at its timeout - a dialogue turn, a durable job or a voice task - the supervisor told about it now reads, beside the ceiling, that the turn may or may not have finished its work and that nothing continues on its own, where before the notice read `Worker error:` and the ceiling alone, as if the stop were clean. A dialogue turn's notice drops the `Worker error:` heading for a timeout; a failed job's `Job failed:` result carries the sentence under its label; a voice task's result, spoken or sent after the call, carries it after the ceiling. A room without a supervisor keeps the generic line, and the dialogue log line and a job's recorded error keep the ceiling alone. No verb, flag, setting or output key changes.
+
 ## 2026-11-08 — A recording is closed only by the watchdogs of its own attempt
 
 Each call recording attempt now carries a generation of its own, and the five watchdogs it starts - the capture stall, the conference peer and coverage watchdogs, and the two audio-map watchdogs - end with that attempt, not with whatever recording later holds the slot. Every path that closes a recording names the attempt it means to close, and a close aimed at an attempt that has already left the slot does nothing. Before this, the watchdogs recognised their recording by the caller alone and acted on it after they woke without looking again, so a watchdog left over from a call that had ended could close, or report a shortfall in, the next recording mid-conversation - one from the same person at any time, and one from anybody when the watchdog woke just as the slot changed hands - and that recording then arrived cut short. No verb, flag, setting or output key changes.

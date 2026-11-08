@@ -123,6 +123,24 @@ def worker_failure(binary, model, kind, reason):
                         reason)
 
 
+def timeout_notice(detail):
+    """What a person is told about a turn stopped at its ceiling.
+
+    The ceiling is all the daemon knows. The turn may have done everything and
+    been cut off before it answered, done half of it, or done nothing, and the
+    daemon has checked none of that, so the notice says so rather than reading
+    as a clean stop; and since the stop ends the turn, it says that nothing
+    picks the work up again by itself.
+    """
+    return (f"{detail}. It was stopped at that ceiling and may or may not have "
+            "finished its work; nothing continues on its own.")
+
+
+def worker_timed_out(exc):
+    """Whether a worker ended at its ceiling, by whichever wait reached it."""
+    return isinstance(exc, WorkerFailed) and exc.kind == "timeout"
+
+
 def worker_diagnosis(exc, fallback):
     """What an operator is told about a worker that ended badly.
 
