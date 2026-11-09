@@ -1152,6 +1152,35 @@ def test_a_service_moves_between_nodes_and_its_capability_stays_usable_on_both(l
     assert _error(_manager(lab, "place", "coolify", "--node", NODE))["code"] == "no_service"
 
 
+def test_unplace_takes_off_a_placement_of_a_capability_that_bundles_no_service(lab):
+    """A placement left from before its capability stopped bundling a service
+    is taken off by unplace, whatever mode it records, leaving the capability
+    enabled on the node; place still refuses it."""
+    here = _service_lab(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+
+    def rows() -> list[tuple]:
+        return _rows(lab, "SELECT node, enabled, service FROM policies "
+                          "WHERE capability = 'coolify' AND node IS NOT NULL")
+
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    assert rows() == [(NODE, True, True)]
+    (registry / "manifest.json").write_text(json.dumps({"name": "coolify"}))
+    # Placed in mode own: an unplace naming shared takes it off all the same.
+    off = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, "--mode", "shared",
+                       extra=here))
+    assert {k: off[k] for k in ("unplaced", "node", "placement", "changed",
+                                "placed_on")} == {
+        "unplaced": "coolify", "node": NODE, "placement": None, "changed": True,
+        "placed_on": []}
+    assert rows() == [(NODE, True, False)]
+    again = _ok(_manager(lab, "unplace", "coolify", "--node", NODE, extra=here))
+    assert again["changed"] is False and rows() == [(NODE, True, False)]
+    refused = _manager(lab, "place", "coolify", "--node", NODE, extra=here)
+    assert refused.returncode == 6 and _error(refused)["code"] == "no_service"
+    assert rows() == [(NODE, True, False)]
+
+
 def test_a_shared_service_is_placed_on_every_node_and_a_move_shows_until_the_lease_follows(
         lab):
     _import(lab)
@@ -2224,6 +2253,83 @@ def test_node_run_records_a_placed_service_it_will_not_run_and_keeps_a_listed_ma
         node_run.terminate()
         _out, err = node_run.communicate(timeout=60)
     assert node_run.returncode == 0, err
+
+
+def test_node_run_takes_off_a_placement_whose_capability_here_declares_no_service(
+        lab, tmp_path):
+    """A capability installed on this node, after its placement was written,
+    that declares no service loses its placement on this node's row, even
+    where the node is not the master and may not write, and stays enabled;
+    its service_instances row goes, though an earlier process wrote it. A
+    capability not installed here, one still declaring a service, and one
+    whose placement was written after its install here - a release with the
+    service this node has not taken yet - stay placed."""
+    import time
+    here = _service_lab(lab)
+    cap_home = Path(lab["env"]["CAPABILITIES_HOME"])
+    an_hour_ago = time.time() - 3600
+    for capability in ("quiet", "fresh"):
+        (cap_home / capability).mkdir()
+        (cap_home / capability / capability).write_text("#!/bin/sh\n")
+        (cap_home / capability / "manifest.json").write_text(
+            json.dumps({"name": capability}))
+    # fresh was installed an hour ago and placed now, by a master whose
+    # release declares the service; quiet was placed two hours ago.
+    os.utime(cap_home / "fresh" / "fresh", (an_hour_ago, an_hour_ago))
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        for capability in ("quiet", "ghost", "fresh"):
+            conn.execute("INSERT INTO policies (agent_id, capability, node, enabled, "
+                         "service, mode) VALUES (%s, %s, %s, true, true, 'shared')",
+                         (PROJECT_ID, capability, NODE))
+        conn.execute("UPDATE policies SET updated_at = now() - interval '2 hours' "
+                     "WHERE capability = 'quiet'")
+        # What an earlier node manager left: quiet's row, unusable.
+        conn.execute("INSERT INTO service_instances (agent_id, capability, node, state, "
+                     "problem, problem_code) VALUES (%s, 'quiet', %s, 'unusable', "
+                     "'it declares no machine command', 'service_not_runnable')",
+                     (PROJECT_ID, NODE))
+    _ok(_manager(lab, "node", "add", BOX, "--label", "box-node", "--kind", "mac",
+                 extra=here))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.agent_nodes SET is_master = (node = %s), "
+                     "may_write = false", (BOX,))
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+
+    def placements() -> list[tuple]:
+        return _rows(lab, "SELECT capability, enabled, service FROM policies "
+                          "WHERE node = '" + NODE + "' ORDER BY capability")
+
+    def instances() -> list[tuple]:
+        return _rows(lab, "SELECT capability, problem_code FROM service_instances "
+                          "WHERE node = '" + NODE + "' ORDER BY capability")
+
+    jobs = tmp_path / "jobs"
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor", str(jobs)],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(lambda: ("quiet", True, False) in placements(), 15)
+        assert placements() == [("coolify", True, True), ("fresh", True, True),
+                                ("ghost", True, True), ("quiet", True, False)]
+        assert _wait_for(lambda: [c for c, _p in instances()] == ["fresh", "ghost"], 15)
+        assert instances() == [("fresh", "service_not_runnable"),
+                               ("ghost", "service_not_runnable")]
+        assert (jobs / f"coolify.{PROJECT_ID}.conf").exists()
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+    assert "quiet is installed here and declares no service" in err
+    assert "fresh is installed here and declares no service" not in err
+    assert placements() == [("coolify", True, True), ("fresh", True, True),
+                            ("ghost", True, True), ("quiet", True, False)]
 
 
 def test_a_machine_service_runs_once_per_node_for_the_agents_placing_it(lab, tmp_path):

@@ -1006,8 +1006,10 @@ POLICY VERBS
         itself; the placement is written all the same.
         JSON {placed|unplaced, node, placement, changed, placed_on [nodes],
         unplaced_from?, enabled_on_node?, warning?, gate, mode, note?,
-        placed_before? (place only)}. Exit 3 when <name> is not installed, 6
-        no_service when it bundles none.
+        placed_before? (place only)}. Exit 3 when <name> is not installed;
+        place exits 6 no_service when it bundles none, and unplace takes a
+        placement of a capability that bundles none off the node whatever mode
+        it records, changing nothing where none is placed (placement null).
   place <name> --all [--mode shared|own]
         Put a shared service on every node of this project's agent (`node
         list`) that is not disabled, each node's placement recording its mode
@@ -1868,7 +1870,17 @@ PROJECT VERBS (run inside a consuming project)
         this node's row in service_instances, unusable, its
         problem saying why and its code service_not_runnable, quarantined,
         not_carried or agent_folder_unbound; the row goes once it runs or is
-        no longer placed here, and when node run stops. Exit 6 supervisor_required,
+        no longer placed here, and when node run stops. A placement here whose
+        capability was installed here after the placement was written and
+        declares no service names a service that no longer exists, so node
+        run takes it off this node's own row - whatever this node's link lets
+        it write, but not while the agent's records are being moved into the
+        store - leaving the capability enabled here, and drops this node's row
+        in service_instances for it, whichever process wrote it. A placement
+        written after that install stays, since it may name a service of a
+        release this node has not taken yet, as does one whose capability is
+        not installed here or is left to what runs it here (--services).
+        Exit 6 supervisor_required,
         supervisor_unreachable or node_run_running.
   node run --launchd [--every N] [--services <name,...>]
         The same on a Mac, where each job is a launchd agent of this OS user
@@ -14357,6 +14369,10 @@ class _NodeManager:
         # whose rows in service_instances this process wrote.
         self.unrun: dict[tuple[str, str], tuple[str, str]] = {}
         self.unrun_now: dict[tuple[str, str], tuple[str, str]] = {}
+        # The placements on this node whose capability, installed here after
+        # the placement was written, declares no service: each is taken off
+        # this node's own row, by the moment that install was made.
+        self.retire_now: dict[tuple[str, str], datetime] = {}
         # This node's state, written on its own beat and right after a
         # reconcile that changed a job; the tools' sign-ins and the agents'
         # sessions, each a process to ask, on the slower probe cadence, in a
@@ -14430,9 +14446,9 @@ class _NodeManager:
 
     def read_store(self) -> tuple[list[tuple], list[tuple]] | None:
         """(agents [(agent_id, folder, slug)], placed [(agent_id, capability,
-        mode)]) as the store holds them for this node, reporting the node seen,
-        placed empty while the node is disabled; None where the store cannot be
-        read, said once."""
+        mode, updated_at)]) as the store holds them for this node, reporting
+        the node seen, placed empty while the node is disabled; None where the
+        store cannot be read, said once."""
         try:
             conn = self._connect()
         except Exception as exc:
@@ -14449,7 +14465,7 @@ class _NodeManager:
                     "LEFT JOIN agents a ON a.id = l.agent_id "
                     "WHERE l.node = %s ORDER BY l.agent_id", (self.here,)).fetchall()
                 placed = conn.execute(
-                    "SELECT p.agent_id, p.capability, p.mode FROM policies p "
+                    "SELECT p.agent_id, p.capability, p.mode, p.updated_at FROM policies p "
                     "JOIN agent_nodes l ON l.agent_id = p.agent_id "
                     "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
                     "ORDER BY p.agent_id, p.capability", (self.here,)).fetchall()
@@ -14495,7 +14511,19 @@ class _NodeManager:
         self.folders = folders
         jobs: dict[str, dict] = {}
         unrun: dict[tuple[str, str], tuple[str, str]] = {}
-        for agent_id, capability, recorded in placed:
+        retire: dict[tuple[str, str], datetime] = {}
+        for agent_id, capability, recorded, placed_at in placed:
+            installed_at = _installed_at(capability)
+            if (installed_at is not None and _installed_service(capability) is None
+                    and (self.only is None or capability in self.only)
+                    and placed_at is not None and placed_at < installed_at):
+                # Installed here after the placement was written and declaring
+                # no service: the placement names a service that no longer
+                # exists, so it leaves. One written after this install may name
+                # a service of a release this node has not taken yet, and one
+                # left to what runs it here (--services) is judged there.
+                retire[(agent_id, capability)] = installed_at
+                continue
             if agent_id not in folders:
                 unrun[(agent_id, capability)] = (
                     "agent_folder_unbound",
@@ -14546,7 +14574,65 @@ class _NodeManager:
             jobs[name] = {"name": name, "agent_id": agent_id, "capability": capability,
                           "folder": str(folders[agent_id])}
         self.unrun_now = unrun
+        self.retire_now = retire
         return jobs
+
+    def retire(self, retired: dict[tuple[str, str], datetime]) -> None:
+        """Take each placement in `retired` - its capability installed here,
+        at the moment it maps to, after the placement was written, and
+        declaring no service - off this node's own row, leaving the capability
+        enabled here, and drop this node's row in service_instances for it,
+        whichever process wrote it. A node writes this one row of an agent
+        whatever its link lets it write, and only while the agent's records
+        are not being moved into the store (SHEBANG.md, Connections in the
+        store); a placement it could not take off is tried again next
+        reconcile."""
+        if not retired:
+            return
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            self.say_once("retire", type(exc).__name__,
+                          "cannot take off the placements of capabilities that declare "
+                          f"no service: {getattr(exc, 'message', exc)}")
+            return
+        took: list[tuple[str, str]] = []
+        try:
+            with conn.transaction():
+                for agent_id, capability in sorted(retired):
+                    if conn.execute(
+                            "UPDATE policies SET service = false, updated_at = now() "
+                            "WHERE agent_id = %s AND capability = %s AND node = %s "
+                            "AND service AND updated_at < %s AND NOT EXISTS "
+                            "(SELECT 1 FROM agents "
+                            "WHERE id = %s AND migrating_since IS NOT NULL)",
+                            (agent_id, capability, self.here,
+                             retired[(agent_id, capability)], agent_id)).rowcount:
+                        took.append((agent_id, capability))
+                    self.store.service_instance_drop(conn, agent_id, capability, self.here)
+                for agent_id in sorted({agent_id for agent_id, _c in took}):
+                    self.db.announce(conn, NODE_PLACEMENT_CHANNEL, agent_id)
+        except Exception as exc:
+            self.say_once("retire", type(exc).__name__,
+                          "cannot take off the placements of capabilities that declare "
+                          "no service: "
+                          + " ".join(f"{type(exc).__name__}: {exc}".split())[:300])
+            return
+        finally:
+            conn.close()
+        self.said.pop("retire", None)
+        for agent_id, capability in sorted(retired):
+            key = f"retire:{agent_id}/{capability}"
+            if (agent_id, capability) in took:
+                self.said.pop(key, None)
+                self.say(f"{capability} is installed here and declares no service, so "
+                         f"its placement here for {agent_id} is taken off; {capability} "
+                         "stays enabled here")
+            else:
+                self.say_once(key, "migrating",
+                              f"{capability} is installed here and declares no service, "
+                              f"and its placement here for {agent_id} stays until that "
+                              "agent's records are no longer being moved into the store")
 
     def record_unrun(self, unrun: dict[tuple[str, str], tuple[str, str]]) -> None:
         """Keep a row in service_instances for each placed
@@ -14625,9 +14711,10 @@ class _NodeManager:
         agents, placed = answer
         self.moved = False
         self.agents = [row[0] for row in agents]
-        self.placed = [(agent_id, capability) for agent_id, capability, _mode in placed]
+        self.placed = [(agent_id, capability) for agent_id, capability, *_rest in placed]
         desired = self.desired(agents, placed)
         self.record_unrun(self.unrun_now)
+        self.retire(self.retire_now)
         present = self.written()
         for name, job in desired.items():
             path = self.job_path(name)
@@ -23824,6 +23911,21 @@ def _core_reconcile(arriving: set[str] = frozenset(),
 SERVICE_PLACEMENTS = ("exclusive", "shared")
 
 
+def _installed_at(name: str) -> datetime | None:
+    """When the payload of `name` installed here was put in place - its
+    meta.json, written with each install and update, or else its script - or
+    None where it is not installed (no script, as `_installed()` reads it)."""
+    from datetime import datetime, timezone
+    if not (CAP_HOME / name / name).is_file():
+        return None
+    for path in (CAP_HOME / name / "meta.json", CAP_HOME / name / name):
+        try:
+            return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+        except OSError:
+            continue
+    return None
+
+
 def _installed_service(name: str) -> dict | None:
     """The bundled service an installed capability declares, or None."""
     manifest = _read_json(CAP_HOME / name / "manifest.json")
@@ -23951,8 +24053,13 @@ def _place_service(name: str, placed: bool, node: str | None,
         _die(3, "not_installed", f"{name} is not installed",
              f"run `capabilities install {name}`")
     service = _installed_service(name)
-    if service is None:
+    if service is None and (placed or node is None):
         _die(6, "no_service", f"{name} bundles no service, so there is nothing to {verb}")
+    if service is None:
+        # Bundling no service, it is taken off a node it is still placed on.
+        _emit(_service_place(name, False, node))
+        _announce_placement(root)
+        return
     mode = _service_placement(service)
     if every and mode == "exclusive":
         _die(6, "placement_exclusive",
@@ -24011,9 +24118,13 @@ def _service_place(name: str, placed: bool, node: str, serving: str | None = Non
         _die(3, "not_installed", f"{name} is not installed",
              f"run `capabilities install {name}`")
     service = _installed_service(name)
-    if service is None:
+    if service is None and placed:
         _die(6, "no_service", f"{name} bundles no service, so there is nothing to {verb}")
-    mode = _service_placement(service)
+    if service is None:
+        # A placement left from before the capability stopped declaring a
+        # service is taken off in whatever mode it records.
+        serving = None
+    mode = _service_placement(service) if service is not None else None
     if placed:
         _placement_mode_check(name, serving)
     adapter = _records_for(root)
