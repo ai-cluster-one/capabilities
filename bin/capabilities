@@ -214,7 +214,9 @@ MACHINE VERBS
         {installed, available}; so a release of the shared code reaches an
         installed capability without an edit to it once the package records
         it. Where the range does not admit it, or uv cannot move to it, a
-        warning says so and the capability runs on the library it has.
+        warning says so and the capability runs on the library it has. A
+        store's kept line, whose catalogue names the library range it reads
+        and no release, is brought to the newest release inside that range.
         Install, update and the release that reconciles this machine run
         `<name> migrate` once the payload is in place, when its manifest
         declares tables in the machine's store, and report it as `migrate`
@@ -236,6 +238,8 @@ MACHINE VERBS
         running process uses, and that were not made or touched in the last
         ten minutes, answered as pruned_environments [folder] where it removed
         any; uv makes an environment again on the next run from its path.
+        Only the default home of a HOME whose uv cache lies under that HOME
+        removes any, since uv does not record whose an environment is.
         deployment is updated first. Where its installed payload has `deployment
         runner` and the one it would be replaced by does not, the machine is
         moved off the runner before anything is replaced: on a Mac whose node
@@ -321,7 +325,8 @@ MACHINE VERBS
         Every self-update then removes the manager releases nothing runs any
         more, keeping the active one, the one it replaced, the one staged
         last before the oldest manager process still running here started and
-        each staged after it, answered as pruned_releases [release] where it
+        each staged after it, a release switched to again dated by that
+        switch, answered as pruned_releases [release] where it
         removed any; one that switched releases also removes environments as
         update does, answered as pruned_environments.
   self-update --check [--from <checkout>] [--json]
@@ -5492,15 +5497,30 @@ def _live_script_paths() -> dict[str, list[Path]]:
     return paths
 
 
+def _owns_uv_cache(environments: Path) -> bool:
+    """Whether this capabilities home is the one uv's cache serves: the home
+    is the default one for this HOME and the cache lies under that HOME. uv
+    records no script path in an environment, so where another home - an
+    isolated run's, or one named by CAPABILITIES_HOME - may share the cache,
+    which environment is whose cannot be told."""
+    try:
+        home = Path.home().resolve()
+        return (CAP_HOME.resolve() == (home / ".capabilities").resolve()
+                and environments.resolve().is_relative_to(home))
+    except (OSError, RuntimeError):
+        return False
+
+
 def _prune_environments() -> list[str]:
     """Remove the script environments uv keeps for an installed capability or
     the manager that nothing runs from any more: kept is the environment of
     every path one is run from (`_live_script_paths`), each a running process
     uses, and each made or touched in the last ENVIRONMENT_PRUNE_GRACE_SECONDS.
     An environment is uv's cache, made again on the next run from its path.
-    Answers the folders removed."""
+    Only a home that owns the cache prunes it (`_owns_uv_cache`). Answers the
+    folders removed."""
     environments = _uv_environments()
-    if environments is None or not environments.is_dir():
+    if environments is None or not environments.is_dir() or not _owns_uv_cache(environments):
         return []
     live = _live_script_paths()
     keep = _running_environments(environments)
@@ -5718,6 +5738,18 @@ def _bring_contract_library(script: Path, release: str | None,
             continue
         moved.append(Version(held))
     return {"installed": str(min(moved)), "available": release} if moved else None
+
+
+def _update_contract_library(script: Path, release: str | None,
+                             library: str | None = None) -> dict | None:
+    """The library step of `update`: to the release the catalogue names
+    (`_bring_contract_library`), or, where the catalogue is a kept line's
+    that names the library range it reads and no release, to the newest
+    release inside that range, as before the catalogue named one."""
+    if release is None and library:
+        _refresh_contract_library(script, library)
+        return None
+    return _bring_contract_library(script, release, library)
 
 
 def _payload_sha256(reg: Path, script: str | None = None) -> str:
@@ -6269,7 +6301,7 @@ def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None
         if ((here["store"] is None or release == here["store"])
                 and available == _payload_sha256(_registry_dir(n), n)):
             entry = {"name": n, "changed": False}
-            moved = _bring_contract_library(_script_path(n), target, range_)
+            moved = _update_contract_library(_script_path(n), target, range_)
             if moved is not None:
                 entry["contract_library"] = moved
             return entry
@@ -6315,7 +6347,7 @@ def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None
         _refresh_contract_library(script, library)
         library_moved = None
     else:
-        library_moved = _bring_contract_library(script, target, library)
+        library_moved = _update_contract_library(script, target, library)
     entry = {"name": n, "changed": before != after}
     if library_moved is not None:
         entry["contract_library"] = library_moved
@@ -7247,6 +7279,13 @@ def _activate_manager_release(
                 temporary_link.unlink(missing_ok=True)
             except OSError:
                 pass
+    if link_changed:
+        # A release staged earlier and switched to again is dated by this
+        # switch, so the order the pruning reads is the order releases ran in.
+        try:
+            os.utime(release)
+        except OSError:
+            pass
     pruned = _prune_manager_releases(releases, release, previous_release)
     if pruned:
         result["pruned_releases"] = pruned
