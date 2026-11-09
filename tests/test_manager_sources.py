@@ -254,6 +254,10 @@ def test_remote_source_catalog_search_and_install(tmp_path):
 
     consumer_env = _env(tmp_path / "consumer")
     _run(consumer_env, "source", "add", "shared", str(workspace))
+    # A registry folder without its script - state a capability left behind,
+    # or an install that never landed - is not an installed capability.
+    leftover = Path(consumer_env["CAPABILITIES_HOME"]) / "demo"
+    (leftover / "state").mkdir(parents=True)
     search = json.loads(_run(
         consumer_env, "search", "demo", "--source", "shared").stdout)
     assert search["matches"] == [{
@@ -263,6 +267,7 @@ def test_remote_source_catalog_search_and_install(tmp_path):
         "installed": False,
         "icon": False,
     }]
+    shutil.rmtree(leftover)
     installed = json.loads(_run(
         consumer_env, "install", "demo", "--source", "shared").stdout)
     meta = json.loads((Path(installed["registry"]) / "meta.json").read_text())

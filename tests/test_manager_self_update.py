@@ -237,3 +237,42 @@ def test_repository_manager_release_manifest_matches_the_source_tree() -> None:
 
     assert problems == []
     assert json.loads((REPO / MANIFEST_REL).read_text()) == expected
+
+
+def _manager_module():
+    import importlib.machinery
+    import importlib.util
+    loader = importlib.machinery.SourceFileLoader(
+        "capabilities_manager_self_update", str(MANAGER))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def test_old_manager_releases_are_pruned_and_the_ones_a_running_manager_may_use_are_kept(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    m = _manager_module()
+    releases = tmp_path / "releases"
+    staged = {}
+    for index, at in enumerate((100, 200, 300, 400, 500)):
+        release = releases / (f"{index:x}" * 64)
+        release.mkdir(parents=True)
+        os.utime(release, (at, at))
+        staged[at] = release
+    staging = releases / ".manager-release-x"
+    staging.mkdir()
+
+    # A manager process started at 350 may run the release staged at 300.
+    monkeypatch.setattr(m, "_manager_process_start", lambda: 350)
+    removed = m._prune_manager_releases(releases, staged[500], staged[400])
+    assert removed == [staged[100].name, staged[200].name]
+    assert sorted(p.name for p in releases.iterdir()) == sorted(
+        [staged[300].name, staged[400].name, staged[500].name, staging.name])
+
+    # With no manager running, only the active release and the one it replaced stay.
+    monkeypatch.setattr(m, "_manager_process_start", lambda: None)
+    assert m._prune_manager_releases(releases, staged[500], staged[400]) == [staged[300].name]
+    assert sorted(p.name for p in releases.iterdir()) == sorted(
+        [staged[400].name, staged[500].name, staging.name])

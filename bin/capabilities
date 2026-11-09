@@ -213,6 +213,16 @@ MACHINE VERBS
         $CAPABILITIES_HOME/.update-failed/<name>.json {name, at, error}, which
         that capability's doctor raises as its one supervisor line; the next
         install or update of it that lands removes the record.
+        The staged copy is run for its snapshots in the environment the
+        installed copy already has, where both declare the same script
+        metadata, and otherwise in one uv makes for it and removes again, so
+        an update leaves no new environment. An update that changed a payload
+        then removes the script environments uv keeps for an installed
+        capability or the manager that no path they are run from here - the
+        registry, the PATH links, an open dev session - still names, that no
+        running process uses, and that were not made or touched in the last
+        ten minutes, answered as pruned_environments [folder] where it removed
+        any; uv makes an environment again on the next run from its path.
         deployment is updated first. Where its installed payload has `deployment
         runner` and the one it would be replaced by does not, the machine is
         moved off the runner before anything is replaced: on a Mac whose node
@@ -293,6 +303,12 @@ MACHINE VERBS
         (library) holds the manager's own environment inside that range, as
         update holds each capability's, before anything runs it; the answer
         then names it as library.
+        Every self-update then removes the manager releases nothing runs any
+        more, keeping the active one, the one it replaced, the one staged
+        last before the oldest manager process still running here started and
+        each staged after it, answered as pruned_releases [release] where it
+        removed any; one that switched releases also removes environments as
+        update does, answered as pruned_environments.
   self-update --check [--from <checkout>] [--json]
         Report whether the canonical source (or --from) carries a manager
         release other than the one the PATH symlink selects. Reads only the
@@ -375,8 +391,9 @@ MACHINE VERBS
         Listing never executes catalogue capability code. JSON {matches [{name,
         source, summary, installed, icon}], unavailable_sources [{source,
         hint}]}. Every row carries installed: true when a capability of that
-        name is in the machine registry, false when it is a catalogue
-        capability not yet installed here; and icon, what the source's
+        name is in the machine registry with its script, false when it is a
+        catalogue capability not installed here (a registry folder without
+        its script is not installed); and icon, what the source's
         catalogue says of the capability's icon (false where it says nothing).
   icon <name> [--json]
         The installed capability's icon: one file, icon.png at the root of its
@@ -429,6 +446,10 @@ MACHINE VERBS
         Deterministically rebuild the generated catalogue. --staged derives it
         from the Git index and stages the result, so ignored, unstaged, and
         temporary files cannot influence the candidate commit. It never audits.
+        The catalogue (.capability-source/catalog.json) answers alone what a
+        source holds and what is newest: each capability's entry carries path,
+        summary, icon, tier (core or standard), version (the newest heading of
+        its change log, null without one), payload_sha256 and store_major.
   source verify ID --ref REF [--base REF]
         Verify one immutable Git tree. With --base, derive the direct manager and
         capability checks from the diff; without it, use the full safe fallback.
@@ -1477,7 +1498,10 @@ PROJECT VERBS (run inside a consuming project)
         setting last with the node's own `store set`, and waits up to --wait
         seconds for its agent to run (exit 5 node_not_raised). Secrets travel
         on standard input and are never printed; the answer names what was
-        written, held in the vault, skipped and why, and environment_only.
+        written, held in the vault, skipped and why, and environment_only. A
+        capability whose `<name> connections` exits non-zero, cannot be run
+        or does not finish in 120 seconds is skipped and named with the
+        reason; the other capabilities' secrets still travel.
         add <label> --server: project (--project, else the one named after
         the agent, made when missing), environment (made when missing),
         create, container (until it runs, exit 5 node_not_running), then
@@ -4179,12 +4203,19 @@ def _snapshot_env() -> dict:
     return env
 
 
+# A staged payload run in the environment its installed copy already has,
+# script path -> that environment's interpreter (`_prepare_payload`).
+_STAGED_PYTHON: dict[str, str] = {}
+
+
 def _run_script(script: Path, args: list[str], cwd: Path | None = None,
                 env: dict | None = None, timeout: int = 60,
                 input: str | None = None) -> tuple[int, str, str]:
+    python = _STAGED_PYTHON.get(str(script))
     try:
         proc = subprocess.run(
-            [str(script), *args], capture_output=True, text=True,
+            [*([python] if python else []), str(script), *args],
+            capture_output=True, text=True,
             cwd=str(cwd or script.parent), env=env or _snapshot_env(), timeout=timeout,
             start_new_session=True, input=input)
     except subprocess.TimeoutExpired:
@@ -5165,8 +5196,20 @@ def _prepare_payload(name: str, content: bytes, bundle_dir: Path | None,
                 f"{name} from {source} does not bind a supported contract library",
                 "; ".join(problems),
             )
-        manifest = _snapshot(name, script, stage)
-        _validate_installed_payload(name, manifest, stage)
+        # uv keys a script's environment by the path it is run from, so the
+        # staged copy, run through its own header, would leave one more
+        # environment on every install and update. Where the installed copy
+        # declares the same script metadata, the staged one runs in that
+        # copy's environment; otherwise the one uv makes for it is removed.
+        python = _same_metadata_python(name, script)
+        if python is not None:
+            _STAGED_PYTHON[str(script)] = python
+        try:
+            manifest = _snapshot(name, script, stage)
+            _validate_installed_payload(name, manifest, stage)
+        finally:
+            if _STAGED_PYTHON.pop(str(script), None) is None:
+                _remove_script_environment(script)
         return stage, manifest
     except BaseException:
         shutil.rmtree(stage, ignore_errors=True)
@@ -5220,6 +5263,168 @@ def _activate_payload(name: str, stage: Path) -> Path:
         MANAGER_MUTATION_LOCK.chmod(0o600)
         fcntl.flock(mutation, fcntl.LOCK_EX)
         return activate()
+
+
+def _uv_environments() -> Path | None:
+    """The folder uv keeps script environments in, or None without uv."""
+    uv = shutil.which("uv")
+    if uv is None:
+        return None
+    try:
+        proc = subprocess.run([uv, "cache", "dir"], capture_output=True, text=True,
+                              timeout=30, env=_snapshot_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return Path(proc.stdout.strip()) / "environments-v2"
+
+
+def _uv_script_environment(path: Path, environments: Path | None = None) -> Path | None:
+    """The environment uv runs the script at `path` in, as uv answers it,
+    where one exists: a folder of uv's script environments named for the
+    script. None where none has been made yet or uv cannot answer."""
+    uv = shutil.which("uv")
+    environments = environments or _uv_environments()
+    if uv is None or environments is None:
+        return None
+    env = {k: v for k, v in _snapshot_env().items() if k not in ("VIRTUAL_ENV", "UV_PYTHON")}
+    try:
+        proc = subprocess.run([uv, "python", "find", "--offline", "--no-python-downloads",
+                               "--script", str(path)],
+                              capture_output=True, text=True, timeout=30, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    # The interpreter uv names sits at <environment>/bin/python; a script
+    # with no environment yet is answered with some other interpreter.
+    found = Path(proc.stdout.strip())
+    folder = found.parent.parent
+    if folder.parent != environments or not folder.name.startswith(f"{path.name}-"):
+        return None
+    return folder
+
+
+def _script_metadata_block(path: Path) -> str | None:
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
+        return None
+    blocks = [m.group(0) for m in _SCRIPT_METADATA_RE.finditer(text)
+              if m.group("type") == "script"]
+    return blocks[0] if len(blocks) == 1 else None
+
+
+def _same_metadata_python(name: str, staged: Path) -> str | None:
+    """The interpreter of the installed copy's environment, where the staged
+    copy declares the same script metadata, so its dependencies are the ones
+    that environment already holds; else None."""
+    installed = _script_path(name)
+    block = _script_metadata_block(staged)
+    if block is None or not installed.is_file() or _script_metadata_block(installed) != block:
+        return None
+    folder = _uv_script_environment(installed)
+    python = folder / "bin" / "python" if folder is not None else None
+    return str(python) if python is not None and python.exists() else None
+
+
+def _remove_script_environment(path: Path) -> None:
+    """Remove the environment uv made for a script run once from a path that
+    is about to go, such as a staged payload."""
+    folder = _uv_script_environment(path)
+    if folder is not None:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+# An environment made or touched this recently may belong to a run that is
+# still making it, which no process list names yet.
+ENVIRONMENT_PRUNE_GRACE_SECONDS = 600
+
+
+def _running_environments(environments: Path) -> set[str]:
+    """The script environments a running process uses: the folder of each
+    process's interpreter, as the process list names it."""
+    try:
+        done = subprocess.run(["ps", "-eo", "args="], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    if done.returncode != 0:
+        return set()
+    prefix = str(environments) + os.sep
+    used = set()
+    for line in done.stdout.splitlines():
+        program = line.strip().split(" ", 1)[0]
+        if program.startswith(prefix):
+            used.add(program[len(prefix):].split(os.sep, 1)[0])
+    return used
+
+
+def _live_script_paths() -> dict[str, list[Path]]:
+    """name -> every path an installed capability, the manager, or an open dev
+    session's copy of either is run from on this machine."""
+    paths: dict[str, list[Path]] = {}
+    for name in _installed():
+        paths.setdefault(name, []).extend(_contract_library_paths(_script_path(name)))
+    manager = paths.setdefault("capabilities", [])
+    for directory in _manager_link_dirs():
+        manager.append(directory / "capabilities")
+    for candidate in (_bin_dir() / "capabilities", Path(sys.argv[0]).absolute(),
+                      Path(__file__)):
+        manager.append(candidate)
+        try:
+            manager.append(candidate.resolve())
+        except OSError:
+            pass
+    dev = DEV_STATE_ROOT
+    for session in sorted(dev.iterdir()) if dev.is_dir() else []:
+        for link in sorted((session / "bin").glob("*")) if (session / "bin").is_dir() else []:
+            paths.setdefault(link.name, []).append(link)
+            try:
+                paths[link.name].append(link.resolve())
+            except OSError:
+                pass
+        registry = session / "registry"
+        for entry in sorted(registry.iterdir()) if registry.is_dir() else []:
+            if (entry / entry.name).is_file():
+                paths.setdefault(entry.name, []).append(entry / entry.name)
+    return paths
+
+
+def _prune_environments() -> list[str]:
+    """Remove the script environments uv keeps for an installed capability or
+    the manager that nothing runs from any more: kept is the environment of
+    every path one is run from (`_live_script_paths`), each a running process
+    uses, and each made or touched in the last ENVIRONMENT_PRUNE_GRACE_SECONDS.
+    An environment is uv's cache, made again on the next run from its path.
+    Answers the folders removed."""
+    environments = _uv_environments()
+    if environments is None or not environments.is_dir():
+        return []
+    live = _live_script_paths()
+    keep = _running_environments(environments)
+    for paths in live.values():
+        for path in paths:
+            folder = _uv_script_environment(path, environments)
+            if folder is not None:
+                keep.add(folder.name)
+    pattern = re.compile(r"^(?P<stem>.+)-[0-9a-f]{16}$")
+    recent = time.time() - ENVIRONMENT_PRUNE_GRACE_SECONDS
+    removed = []
+    for folder in sorted(environments.iterdir()):
+        m = pattern.match(folder.name)
+        if m is None or m.group("stem") not in live or folder.name in keep:
+            continue
+        try:
+            if not folder.is_dir() or folder.is_symlink() or folder.stat().st_mtime > recent:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(folder, ignore_errors=True)
+        if not folder.exists():
+            removed.append(folder.name)
+    return removed
 
 
 def _contract_library_paths(script: Path) -> list[Path]:
@@ -5742,6 +5947,10 @@ def cmd_update(name: str | None) -> None:
     reconciled = _core_reconcile()
     if reconciled["written"]:
         answer["core_enabled"] = reconciled["written"]
+    if any(entry.get("changed") for entry in results):
+        pruned = _prune_environments()
+        if pruned:
+            answer["pruned_environments"] = pruned
     _emit(answer)
 
 
@@ -6449,34 +6658,16 @@ def _validate_manager_release_manifest(manifest: object) -> list[str]:
     return problems
 
 
-def _tree_store_line(root: Path) -> dict:
+def _tree_store_line(root: Path, declared: dict | None = None) -> dict:
     """{store_major, library?} a source tree's release line names: the
     STORE_MAJOR and STORE_LIBRARY its own manager declares, read from that
     manager rather than the running one, so any manager indexes and verifies a
     tree as the tree declares it. A tree whose manager predates the
     declaration names nothing; a tree that carries no manager, as a
     capability source of its own does, names the running manager's line."""
-    import ast as _ast
-    manager = root / MANAGER_EXECUTABLE_REL
-    if not manager.is_file():
-        declared = {"STORE_MAJOR": STORE_MAJOR, "STORE_LIBRARY": STORE_LIBRARY}
-    else:
-        try:
-            module = _ast.parse(manager.read_text())
-        except (OSError, SyntaxError):
-            return {}
-        declared = {}
-        for node in module.body:
-            target = node.target if isinstance(node, _ast.AnnAssign) else (
-                node.targets[0] if isinstance(node, _ast.Assign) and len(node.targets) == 1
-                else None)
-            if (isinstance(target, _ast.Name)
-                    and target.id in ("STORE_MAJOR", "STORE_LIBRARY")
-                    and node.value is not None):
-                try:
-                    declared[target.id] = _ast.literal_eval(node.value)
-                except ValueError:
-                    pass
+    declared = declared if declared is not None else _tree_declared(root)
+    if declared is None:
+        return {}
     if "STORE_MAJOR" not in declared:
         return {}
     line: dict = {"store_major": declared["STORE_MAJOR"]}
@@ -6485,14 +6676,51 @@ def _tree_store_line(root: Path) -> dict:
     return line
 
 
+# The literals a source tree's own manager declares that its catalogue and
+# release manifest are stamped from, read once per tree.
+_TREE_DECLARED_NAMES = ("STORE_MAJOR", "STORE_LIBRARY", "CORE_CAPABILITIES")
+
+
+def _tree_declared(root: Path) -> dict | None:
+    """{name: value} of each of _TREE_DECLARED_NAMES the tree's own manager
+    declares as a literal, read from that manager rather than the running
+    one; the running manager's where the tree carries no manager, as a
+    capability source of its own does; None where its manager cannot be read."""
+    import ast as _ast
+    manager = root / MANAGER_EXECUTABLE_REL
+    if not manager.is_file():
+        return {"STORE_MAJOR": STORE_MAJOR, "STORE_LIBRARY": STORE_LIBRARY,
+                "CORE_CAPABILITIES": CORE_CAPABILITIES}
+    try:
+        module = _ast.parse(manager.read_text())
+    except (OSError, SyntaxError):
+        return None
+    declared = {}
+    for node in module.body:
+        target = node.target if isinstance(node, _ast.AnnAssign) else (
+            node.targets[0] if isinstance(node, _ast.Assign) and len(node.targets) == 1
+            else None)
+        if (isinstance(target, _ast.Name) and target.id in _TREE_DECLARED_NAMES
+                and node.value is not None):
+            try:
+                declared[target.id] = _ast.literal_eval(node.value)
+            except ValueError:
+                pass
+    return declared
+
+
 def _stamp_catalog(root: Path, entries: dict) -> dict:
     """The catalogue of a tree: its entries, each and the whole stamped with
     the store major the tree's line reads, and the library range a kept line
-    names (`_tree_store_line`)."""
-    line = _tree_store_line(root)
-    if "store_major" in line:
-        entries = {name: {**entry, "store_major": line["store_major"]}
-                   for name, entry in entries.items()}
+    names (`_tree_store_line`); each entry also with its tier, core where the
+    tree's own manager declares it core, else standard."""
+    declared = _tree_declared(root)
+    line = _tree_store_line(root, declared) if declared is not None else {}
+    core = (declared or {}).get("CORE_CAPABILITIES") or ()
+    entries = {name: {**entry, "tier": "core" if name in core else "standard",
+                      **({"store_major": line["store_major"]}
+                         if "store_major" in line else {})}
+               for name, entry in entries.items()}
     return {"capabilities": entries, **line}
 
 
@@ -6736,6 +6964,7 @@ def _activate_manager_release(
     }
     if stale_links:
         result["also_relinked"] = [str(other) for other in stale_links]
+    previous_release = previous.parent.parent if previous is not None else None
     for target_link in ([link] if link_changed else []) + stale_links:
         temporary_link = target_link.with_name(
             f".{target_link.name}.manager-release-{secrets.token_hex(8)}")
@@ -6752,7 +6981,76 @@ def _activate_manager_release(
                 temporary_link.unlink(missing_ok=True)
             except OSError:
                 pass
+    pruned = _prune_manager_releases(releases, release, previous_release)
+    if pruned:
+        result["pruned_releases"] = pruned
+    if changed:
+        environments = _prune_environments()
+        if environments:
+            result["pruned_environments"] = environments
     return result
+
+
+def _manager_process_start() -> float | None:
+    """When the oldest manager process still running here started, as the
+    process list's elapsed times answer it; None where none runs or the list
+    cannot be read."""
+    try:
+        done = subprocess.run(["ps", "-eo", "etime=,args="], stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if done.returncode != 0:
+        return None
+    now, oldest = time.time(), None
+    for line in done.stdout.splitlines():
+        elapsed, _sep, args = line.strip().partition(" ")
+        words = args.split()
+        if not any(Path(word).name == "capabilities" for word in words[:2]):
+            continue
+        days, _sep, clock = elapsed.rpartition("-")
+        try:
+            parts = [int(part) for part in clock.split(":")]
+            seconds = int(days or 0) * 86400 + sum(
+                value * 60 ** index for index, value in enumerate(reversed(parts)))
+        except ValueError:
+            continue
+        started = now - seconds
+        oldest = started if oldest is None else min(oldest, started)
+    return oldest
+
+
+def _prune_manager_releases(releases: Path, active: Path,
+                            previous: Path | None) -> list[str]:
+    """Remove the manager releases nothing runs any more. Kept are the active
+    release, the one it replaced, and every release a manager process still
+    running here may have started from: the one staged last before the oldest
+    such process started, and each staged after it. Answers the release ids
+    removed."""
+    try:
+        staged = [(path.stat().st_mtime, path) for path in releases.iterdir()
+                  if path.is_dir() and not path.is_symlink()
+                  and re.fullmatch(r"[0-9a-f]{64}", path.name)]
+    except OSError:
+        return []
+    def resolved(path: Path | None) -> Path | None:
+        try:
+            return path.resolve() if path is not None else None
+        except OSError:
+            return path
+    kept = {resolved(active), resolved(previous)}
+    started = _manager_process_start()
+    cutoff = started if started is not None else time.time()
+    before = [mtime for mtime, _path in staged if mtime <= cutoff]
+    floor = max(before) if before else None
+    removed = []
+    for mtime, path in sorted(staged):
+        if resolved(path) in kept or floor is None or mtime >= floor:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if not path.exists():
+            removed.append(path.name)
+    return removed
 
 
 def cmd_self_update(from_ref: str | None = None) -> None:
@@ -18795,9 +19093,16 @@ def _agent_node_secrets(root, capabilities, withheld=None):
     out, skipped, environment_only = {}, [], {}
     database_keys = _db_module().KEYS
     for name in capabilities:
-        p = _agent_node_run([name, "connections"], root, check=False, timeout=120)
         try:
-            listed = json.loads(p.stdout) if p.returncode == 0 else None
+            p = _agent_node_run([name, "connections"], root, check=False, timeout=120)
+        except NodeFailure:
+            # A probe that cannot be started or does not finish is skipped and
+            # named as one that exits non-zero is, not the whole node.
+            p, failed = None, "it could not run or did not finish in 120 s"
+        else:
+            failed = None
+        try:
+            listed = json.loads(p.stdout) if p is not None and p.returncode == 0 else None
         except ValueError:
             listed = None
         if not isinstance(listed, dict):
@@ -18805,7 +19110,7 @@ def _agent_node_secrets(root, capabilities, withheld=None):
             # is why it has no connection to report: its service's keys are
             # still named below, as reported by none.
             skipped.append({"capability": name, "reason": f"`{name} connections` gave no "
-                            f"report (exit {p.returncode})"})
+                            f"report ({failed or f'exit {p.returncode}'})"})
             listed = {}
         keys, reported = {}, set()
         for cid, connection in (listed.get("connections") or {}).items():
@@ -32995,13 +33300,22 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
         if problems:
             failures[name] = sorted(set(problems))
             continue
-        entries[name] = {
-            "path": f"capabilities/{name}",
-            "summary": manifest.get("summary", ""),
-            "payload_sha256": _payload_sha256(capdir),
-            "icon": _has_icon(capdir),
-        }
+        entries[name] = _catalog_entry_of(capdir, manifest.get("summary", ""))
     return _stamp_catalog(root, entries), failures
+
+
+def _catalog_entry_of(capdir: Path, summary: str) -> dict:
+    """One capability's catalogue entry: what a reader needs to list it and
+    to know whether a copy is current, with nothing installed - its summary,
+    whether it has an icon, the newest heading of its change log (null where
+    it has none) and the hash of its payload; `_stamp_catalog` adds its tier."""
+    return {
+        "path": f"capabilities/{capdir.name}",
+        "summary": summary,
+        "payload_sha256": _payload_sha256(capdir),
+        "icon": _has_icon(capdir),
+        "version": _changelog_version_at(capdir / CHANGELOG_NAME),
+    }
 
 
 def _catalog_payload_scoped(
@@ -33056,12 +33370,7 @@ def _catalog_payload_scoped(
                 failures[name] = ["unchanged capability has no verified catalogue entry"]
                 continue
             summary = previous.get("summary", "")
-        entries[name] = {
-            "path": f"capabilities/{name}",
-            "summary": summary,
-            "payload_sha256": _payload_sha256(capdir),
-            "icon": _has_icon(capdir),
-        }
+        entries[name] = _catalog_entry_of(capdir, summary)
     return _stamp_catalog(root, entries), failures
 
 
@@ -34023,7 +34332,7 @@ def cmd_search(query: str | None, source_id: str | None) -> None:
             if needle and needle not in name.lower() and needle not in summary.lower():
                 continue
             matches.append({"name": name, "source": sid, "summary": summary,
-                            "installed": _registry_dir(name).is_dir(),
+                            "installed": _script_path(name).is_file(),
                             "icon": bool((entry or {}).get("icon"))})
     _emit({"matches": matches, "unavailable_sources": unavailable})
 

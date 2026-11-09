@@ -227,7 +227,8 @@ def test_a_kept_line_names_its_library_and_an_older_tree_names_nothing(tmp_path:
         'STORE_MAJOR = 1\nSTORE_LIBRARY: str | None = ">=0.42,<0.50"\n')
     assert M["_tree_store_line"](line) == {"store_major": 1, "library": ">=0.42,<0.50"}
     assert M["_stamp_catalog"](line, {"x": {"path": "capabilities/x"}}) == {
-        "capabilities": {"x": {"path": "capabilities/x", "store_major": 1}},
+        "capabilities": {"x": {"path": "capabilities/x", "tier": "standard",
+                               "store_major": 1}},
         "store_major": 1, "library": ">=0.42,<0.50"}
     older = tmp_path / "older"
     (older / "bin").mkdir(parents=True)

@@ -476,6 +476,31 @@ def test_enrol_names_the_secrets_of_a_capability_with_no_connection_to_report(
     assert "gave no report (exit 6)" in answer["secrets_skipped"][0]["reason"]
 
 
+def test_enrol_skips_and_names_a_capability_whose_connections_cannot_run_or_time_out(
+        lab, monkeypatch, capsys):
+    monkeypatch.setattr(lab.m, "_usable_capabilities",
+                        lambda root: ["inbox", "slack", "telegram"])
+    fake = lab.fake
+
+    def probe(argv, root, **kw):
+        if argv == ["inbox", "connections"]:
+            raise lab.m.NodeFailure("node_command_failed",
+                                    "`inbox connections` could not complete")
+        return fake(argv, root, **kw)
+    monkeypatch.setattr(lab.m, "_agent_node_run", probe)
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    answer = json.loads(capsys.readouterr().out)
+    skipped = {row["capability"]: row["reason"] for row in answer["secrets_skipped"]
+               if "key" not in row}
+    assert skipped["inbox"] == ("`inbox connections` gave no report (it could not run "
+                                "or did not finish in 120 s)")
+    assert "gave no report (exit 6)" in skipped["slack"]
+    # The other capabilities' secrets still reached the node.
+    assert any(c["stdin"] and "bot-secret" in c["stdin"] for c in fake.calls)
+
+
 def test_a_gate_the_store_cannot_answer_refuses_enrol_as_input(lab, monkeypatch):
     def unreachable():
         raise lab.m._store_module().StoreError("store_unreachable", "fixture", None)
