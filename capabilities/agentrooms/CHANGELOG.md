@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
+
+Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-08 — agentrooms' rows go with their agent and node, at agentrooms 3.1
 
 Step `0014-keys` (agentrooms 3.1, needs the store's core at 4.0, crossed through `capabilities store upgrade`) gives every agent and node column of agentrooms' tables a foreign key: the leases, pauses, sessions, sync cursors, wakes, turns and worker versions go with their agent; a lease and a session go with the node they are held on, and a turn keeps its row and loses the node it ran on (`ON DELETE SET NULL`). The worker versions' history guard admits the cascade of a deliberate delete and nothing else, and the held-wakes notice stays quiet under it. A reference to an agent or node the store no longer holds is settled by the same class when the step runs, each changed row kept in `agentrooms_premig_m9`. Runs on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.

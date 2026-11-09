@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
+
+Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-08 — The register, jobs and prompts go with their agent, and a job's slots and amendments with their job, at telegram 3.1
 
 Step `0010-keys` (telegram 3.1, core 4.0) keys the channels, jobs, job slots, job amendments and prompt versions to their agent (`ON DELETE CASCADE`), and a job's slots and amendments to their job. The prompt versions' guard admits the cascade of a deliberate delete and nothing else. A reference to an agent the store no longer holds is settled when the step runs, kept in `telegram_premig_m9`. The service scripts run on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.

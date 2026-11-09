@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
+
+Turns run on callva-harness-runner 0.12.1, in place of 0.10.2: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. The runner releases between 0.10.2 and 0.12.1 move only its profile store, which memory does not open; memory now runs on the same runner as every other capability. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-08 — Entries and events go with their agent and keep themselves when their node goes, at memory 2.1
 
 Step `0008-keys` (memory 2.1, core 4.0): entries, events and the groom lease go with their agent; the groom lease goes with the node it is held on; an entry and an event keep themselves and lose the node they were written on (`ON DELETE SET NULL`, both columns become nullable), and an entry loses `superseded_by` where the entry it pointed to goes. The entries and events guards admit that and the cascade of a deliberate delete and nothing else; the entry guard also refuses setting `node` to null outside it, which its comparison let through. A reference to an agent or node the store no longer holds is settled when the step runs, kept in `memory_premig_m9`. Runs on capabilities-contract 0.45. An entry and an event are still written with their node (a trigger refuses an insert without one, as NOT NULL did); only a node's removal clears it. No verb, flag or JSON key changes; an entry's or event's `node` may now be null.

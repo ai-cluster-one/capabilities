@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract>=0.8,<1",
-#                 "callva-harness-runner==0.10.2", "pyyaml>=6"]
+#                 "callva-harness-runner==0.12.1", "pyyaml>=6"]
 # ///
 """A task waiting on a person, put before them in the Inbox.
 

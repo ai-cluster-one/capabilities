@@ -4,7 +4,7 @@
 # dependencies = [
 #     "capabilities-contract>=0.45,<1",
 #     "psycopg[binary]>=3.2",
-#     "callva-harness-runner==0.12.0",
+#     "callva-harness-runner==0.12.1",
 #     "pyyaml>=6",
 # ]
 # ///

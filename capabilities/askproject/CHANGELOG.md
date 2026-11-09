@@ -1,5 +1,9 @@
 # askproject — change log
 
+## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
+
+Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-08 — A session goes with its agent and its node, at askproject 3.1
 
 Step `0004-keys` (askproject 3.1, core 4.0) keys `askproject_sessions`: a session goes with the agent that holds it and the node whose store holds the peer session, and a target agent's removal leaves the session, kept by its target folder, without `target_agent_id` (`ON DELETE SET NULL`). A reference to an agent or node the store no longer holds is settled by the same class when the step runs, kept in `askproject_premig_m9`. Runs on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.

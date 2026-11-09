@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
+
+Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-08 — Channels, jobs and prompts go with their agent, at telegrambot 2.1
 
 Step `0008-keys` (telegrambot 2.1, core 4.0) keys the channels, seen marks, jobs, job slots, job amendments and prompts to their agent (`ON DELETE CASCADE`), a job's slots and amendments to their job, and a job keeps its row and loses the node it ran on where that goes (`ON DELETE SET NULL`). The prompts guard admits the cascade of a deliberate delete and nothing else. A reference to an agent or node the store no longer holds is settled when the step runs, kept in `telegrambot_premig_m9`. Runs on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.

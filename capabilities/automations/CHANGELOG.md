@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
+
+Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-08 — Definitions and runs are keyed to their agent and node, and a node a definition is pinned to stays until it is pinned elsewhere, at automations 2.1
 
 Step `0010-keys` (automations 2.1, core 4.0): definitions and runs go with their agent; a definition version's `node` is a pin (`ON DELETE RESTRICT`), so a node an automation is pinned to cannot be removed; a run keeps its row and loses the node it ran on and the definition version it ran under where those go (`ON DELETE SET NULL`, `automations_runs.node` becomes nullable). When the step runs, an active definition pinned to a node the store no longer holds stops it, naming the definition and the node; an inactive one, which never runs, loses its pin; runs and every other reference to a missing agent or node are settled by their class; each changed row is kept in `automations_premig_m9`. The definitions' history guard admits the cascade of a deliberate delete and nothing else. Runs on capabilities-contract 0.45 and callva-harness-runner 0.12.0. A run is still written with its node (a trigger refuses an insert without one, as NOT NULL did); only a node's removal clears it. No verb, flag or JSON key changes; a run's `node` may now be null.

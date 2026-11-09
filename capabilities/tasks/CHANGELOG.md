@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
+
+Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-08 — Tasks, lanes and presences go with their agent; executions keep themselves when their node or version goes, at tasks 2.1
 
 Step `0014-keys` (tasks 2.1, core 4.0): tasks, worker, hook and line versions, line states and presences go with their agent, and a presence with its node; an execution keeps its row and loses the node it ran on, the worker version and the harness profile version it ran under where those go (`ON DELETE SET NULL`); a task pinned to a node keeps itself and loses the pin when that node is removed; an activity and a change written from another agent lose `origin_agent_id` when that agent goes. The versions' history guards admit the cascade of a deliberate delete and nothing else, and the watch and claimable notices stay quiet under it. A reference to an agent or node the store no longer holds is settled when the step runs, kept in `tasks_premig_m9`. Runs on capabilities-contract 0.45 and callva-harness-runner 0.12.0. No verb, flag or JSON key changes.

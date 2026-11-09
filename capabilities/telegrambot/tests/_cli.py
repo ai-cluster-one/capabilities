@@ -6,7 +6,7 @@ installed bundle at the bundle root, so the path is resolved rather than named.
 Run inside the session's lane with:
   uv run --no-project --with pytest --with httpx --with "psycopg[binary]" \
       --with 'capabilities-contract>=0.42,<1' --with telethon==1.45.0 \
-      --with callva-harness-runner==0.10.2 pytest capabilities/telegrambot/tests -q
+      --with callva-harness-runner==0.12.1 pytest capabilities/telegrambot/tests -q
 
 The store-backed cases read TELEGRAMBOT_TEST_DSN, a libpq URL for a throwaway
 database, and are skipped without it. Nothing here reaches Telegram: the HTTP

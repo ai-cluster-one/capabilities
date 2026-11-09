@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = ["pytest>=8", "psycopg[binary]>=3.2", "capabilities-contract>=0.8,<1",
-#                 "callva-harness-runner==0.10.2",
+#                 "callva-harness-runner==0.12.1",
 #                 "pyyaml>=6"]
 # ///
 """Escalation: a task its worker's claim cannot move goes over to the next name
@@ -17,7 +17,7 @@ TASKS_TEST_DSN and skip when it is unset.
 
     uv run --with pytest --with 'psycopg[binary]>=3.2' --with 'pyyaml>=6' \\
         --with 'capabilities-contract>=0.8,<1' \\
-        --with 'callva-harness-runner==0.10.2' python -m pytest capabilities/tasks/tests -q
+        --with 'callva-harness-runner==0.12.1' python -m pytest capabilities/tasks/tests -q
 """
 
 from __future__ import annotations
