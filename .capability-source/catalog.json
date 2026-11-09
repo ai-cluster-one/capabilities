@@ -941,11 +941,11 @@
       ],
       "icon": false,
       "path": "capabilities/teams",
-      "payload_sha256": "bb111954b1e1f5be54f3a3e9c3784a9971e9804f12eca9a8094ad45ad529bdd4",
+      "payload_sha256": "c42d6d58e20157bcfa3ef0257a3330be4a132bfd66443c4308ab211a6ce6f6b8",
       "store_major": 4,
       "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
       "tier": "core",
-      "version": "2026-11-09 — The capability-list entry says what teams is and which commands read a team"
+      "version": "2026-11-09 — `teams section` prints an agent's Teams section, and the declaration names it"
     },
     "telegram": {
       "executable": [

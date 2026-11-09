@@ -1,5 +1,9 @@
 # teams — change log
 
+## 2026-11-09 — `teams section` prints an agent's Teams section, and the declaration names it
+
+The new verb `teams section` prints the Teams section of the context of the agent it runs in, as Markdown: a level-1 `Teams` heading, the lines that say the teams bind the agent and that its own doctrine wins on conflict, and each team it is a member of under a level-2 heading with its line, with how to read an ordinary team's instructions and an always team's enabled always documents whole under level-3 headings, their own headings shifted two levels deeper outside code, and its enabled on-request documents as one level-3 group. It reads the store read-only and migrates nothing, carries nothing that changes from one session to the next, and prints nothing for an agent in no team, with no project identity or no store, or where the store has no teams tables. The manifest's `contribution` adds `"command": ["section"]` and `"place": "standing"`, so a capabilities manager of this release composes the section from it, ahead of the agent's own doctrine; a manager of an earlier release refuses this declaration at install, as it refuses any key it does not know, and keeps the teams payload it has. No other verb, flag, JSON key or table changes.
+
 ## 2026-11-09 — The capability-list entry says what teams is and which commands read a team
 
 The summary and the manifest's `contribution` are written for the agent reading its context: what teams is, and that `teams list`, `teams list --all`, `teams show` and `teams doc show` read the teams and their documents. The agent's own teams are no longer announced in the contribution, since the manager composes them in a Teams section of their own. No verb, flag, JSON key or table changes.

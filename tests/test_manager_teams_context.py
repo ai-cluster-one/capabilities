@@ -1,7 +1,10 @@
 """The Teams section of the composed context, read from the store at composition.
 
-While `teams` is enabled and the agent is in a team, the manager composes a
-top-level Teams section ahead of the agent's own doctrine: the lines that say
+While `teams` is enabled and the agent is in a team, a top-level Teams section
+stands ahead of the agent's own doctrine. `teams section` prints it and the
+teams declaration names that command for the standing place, so the manager
+runs it and knows nothing of what it says; for a teams payload installed before
+it declared the command, the manager composes the same section itself. It is: the lines that say
 the teams bind it and its own doctrine wins on conflict, each team under a
 level-2 heading with its line, and for a team in always mode its enabled
 always documents whole under level-3 headings, their own headings shifted
@@ -135,12 +138,17 @@ class Lab:
                 conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
                              "ON CONFLICT (id) DO NOTHING", (agent,))
 
-    def _snapshot(self) -> None:
-        """teams as install records it: its stub and its own manifest."""
+    def _snapshot(self, legacy: bool = False) -> None:
+        """teams as install records it: its stub, its own manifest, and an
+        executable that runs this tree's teams. With `legacy`, the manifest a
+        teams payload carried before it declared its command."""
         manifest = json.loads(self.teams("manifest", "--json"))
+        if legacy:
+            manifest["contribution"] = {"markdown": manifest["contribution"]["markdown"]}
         entry = self.tmp / "registry" / "teams"
-        entry.mkdir(parents=True)
-        (entry / "teams").write_text("#!/bin/sh\n")
+        entry.mkdir(parents=True, exist_ok=True)
+        (entry / "teams").write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TEAMS}" "$@"\n')
+        (entry / "teams").chmod(0o755)
         (entry / "stub").write_text(f"{manifest['summary']} Run `teams help`.\n")
         (entry / "manifest.json").write_text(json.dumps(manifest))
 
@@ -333,6 +341,41 @@ def test_build_places_the_teams_section_before_the_agents_own_doctrine(lab):
     assert style == STYLE
     lab.enable(False)
     assert "# Teams" not in lab.build()
+
+
+def test_teams_declares_its_section_as_a_standing_command(lab):
+    contribution = json.loads(lab.teams("manifest", "--json"))["contribution"]
+    assert contribution["command"] == ["section"] and contribution["place"] == "standing"
+    assert M._validate_manifest("teams", json.loads(lab.teams("manifest", "--json"))) == []
+    assert lab.teams("section") == ""
+    _seed(lab)
+    section = lab.teams("section")
+    assert section.startswith("# Teams\n\n")
+    assert lab.fragment().startswith(section + "\n# Capabilities\n")
+
+
+def test_a_teams_payload_that_declares_no_command_keeps_its_section(lab):
+    # A manager carrying this change beside a teams installed before it: the
+    # manager composes the section itself, the same in both forms.
+    _seed(lab)
+    lab.teams("mode", "ops", "always")
+    lab.teams("doc", "save", "ops", "runbook", "--from", "-",
+              stdin="---\ndescription: How we run.\nload: always\n---\nRun.\n\n## Steps\n")
+    declared_fragment, declared_build = lab.fragment(), lab.build()
+    lab._snapshot(legacy=True)
+    assert lab.fragment() == declared_fragment
+    assert lab.build() == declared_build
+    assert "# Teams\n" in declared_build
+
+
+def test_a_teams_section_that_fails_costs_one_line_in_its_place(lab):
+    _seed(lab)
+    entry = lab.tmp / "registry" / "teams" / "teams"
+    entry.write_text("#!/bin/sh\nexit 5\n")
+    built = lab.build()
+    assert ("---\n\nThe context contribution of `teams` is unavailable: `teams section` "
+            "exited 5; `teams doctor` names the repair.\n\n---\n\n# Inline Context") in built
+    assert "## crew" not in built and "## teams\n" in built
 
 
 def test_shifting_moves_headings_and_never_code():

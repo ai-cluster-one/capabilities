@@ -29,11 +29,12 @@ A team is in one of two modes:
             documents whole, each headed by the team's name, and lists its
             enabled `on-request` documents by their line.
 
-The capabilities manager composes that part of every member's context at
-build, straight from the store, while teams is enabled for the member;
-nothing renders it ahead of time, and it carries nothing that changes from
-one session to the next. Disabling teams for an agent removes it and nothing
-else.
+`teams section` prints that part, the Teams section, for the agent it runs
+in, and the manifest's `contribution` names it as the command whose block
+stands ahead of the agent's own doctrine, so the capabilities manager runs it
+at every composition while teams is enabled for the member; nothing renders
+it ahead of time, and it carries nothing that changes from one session to
+the next. Disabling teams for an agent removes it and nothing else.
 
 Any agent reads every team and writes through the usual gates: teams enabled
 for it, and no read-only switch. Teams belong to the store, not to an agent.
@@ -95,6 +96,20 @@ READING  (plain text by default; --json gives the structured answer)
   teams doc history <team> <doc> [--json]
       Every version, newest first: id, when, by whom, the note, its load and
       size, and which one is active.
+  teams section
+      The Teams section of this agent's context, as Markdown: a level-1
+      `Teams` heading, the lines that say these teams bind the agent and that
+      its own doctrine wins on conflict, then each team it is a member of
+      under a level-2 heading with its line. A team in ordinary mode adds how
+      to read its instructions; one in always mode adds its enabled always
+      documents whole, each under a level-3 heading - its own title where the
+      document opens with one, else its name - with its headings shifted two
+      levels deeper (never inside code), and its enabled on-request
+      documents as one level-3 group by their line. It carries nothing that
+      changes from one session to the next. Nothing at all (exit 0) for an
+      agent in no team, with no project identity or no store, or where the
+      store has no teams tables. The capabilities manager runs it when it
+      composes the agent's context (`manifest --json`, `contribution`).
 
   ID is a version's whole id or a prefix of six or more characters that names
   one version of the document.
@@ -188,6 +203,7 @@ import contextlib
 import json
 import os
 import re
+import shlex
 import sys
 from pathlib import Path
 from typing import NoReturn
@@ -209,12 +225,13 @@ TABLES = True       # teams_* tables in the project's store, built by _tables()
 INVENTORY = None
 POST_INSTALL: list[dict] = []
 # The block the manager composes after the stub line: which commands read a
-# team. The agent's own teams stand in their own section, which the manager
-# composes from the store, so the declaration carries nothing that changes.
+# team. The agent's own teams stand in their own section ahead of its
+# doctrine, which `teams section` prints and the declaration names, so the
+# declared block itself carries nothing that changes.
 BLOCK = ("`teams list` names the teams you are in and `teams list --all` every team; "
          "`teams show <team>` lists a team's documents and `teams doc show <team> <doc>` "
          "reads one; `teams help` gives every command.\n")
-CONTRIBUTION = {"markdown": BLOCK}
+CONTRIBUTION = {"markdown": BLOCK, "command": ["section"], "place": "standing"}
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
@@ -1210,6 +1227,151 @@ def cmd_doc_retire(args) -> None:
            "retired": True, "changed": True})
 
 
+# ── the Teams section ───────────────────────────────────────────────────────
+
+_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+_ATX_HEADING = re.compile(r"^( {0,3})(#{1,6})([ \t].*)?$")
+_SETEXT_UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+_THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+_BLOCK_START = re.compile(r"^ {0,3}(?:[-+*][ \t]|\d{1,9}[.)][ \t]|>|<|\|)")
+
+
+def _shift_headings(text: str, by: int) -> str:
+    """`text` with every Markdown heading `by` levels deeper, never past
+    level 6: an ATX heading gains `by` marks, and a setext one is written as
+    the ATX heading of its new level. Nothing inside a fenced or indented code
+    block moves, and the stored text stays as it was written."""
+    out: list[str] = []
+    fence = None
+    paragraph = None  # where in `out` the open paragraph starts
+    block = False     # inside a list, quote, html, table or code run until a blank line
+    for line in text.split("\n"):
+        mark = _FENCE.match(line)
+        if fence:
+            out.append(line)
+            if mark and not mark.group(2).strip() and mark.group(1)[0] == fence[0] \
+                    and len(mark.group(1)) >= len(fence):
+                fence = None
+            continue
+        if mark and not (mark.group(1)[0] == "`" and "`" in mark.group(2)):
+            fence = mark.group(1)
+            out.append(line)
+            paragraph, block = None, False
+            continue
+        if not line.strip():
+            out.append(line)
+            paragraph, block = None, False
+            continue
+        heading = _ATX_HEADING.match(line)
+        if heading:
+            level = min(len(heading.group(2)) + by, 6)
+            out.append(f"{heading.group(1)}{'#' * level}{heading.group(3) or ''}")
+            paragraph, block = None, False
+            continue
+        underline = _SETEXT_UNDERLINE.match(line)
+        if underline and paragraph is not None:
+            level = min((1 if underline.group(1)[0] == "=" else 2) + by, 6)
+            title = " ".join(part.strip() for part in out[paragraph:])
+            out[paragraph:] = [f"{'#' * level} {title}"]
+            paragraph = None
+            continue
+        out.append(line)
+        if _THEMATIC_BREAK.match(line):
+            paragraph = None
+        elif _BLOCK_START.match(line) or paragraph is None and line.startswith(("    ", "\t")):
+            paragraph, block = None, True
+        elif paragraph is None and not block:
+            paragraph = len(out) - 1
+    return "\n".join(out)
+
+
+def _one_line(text: str) -> str:
+    return text.replace("\n", " ").strip()
+
+
+def _section_document(name: str, body: str) -> list[str]:
+    """One always document under its team: a level-3 heading, then its text
+    shifted two levels. A document that opens with its own title keeps that
+    title as the heading; one that does not is headed by its name."""
+    shifted = _shift_headings(body.strip(), 2)
+    if re.match(r"^### ", shifted):
+        return [shifted, ""]
+    return [f"### {_one_line(name)}", "", shifted, ""]
+
+
+def _section_rows(agent: str) -> tuple[list[dict], list[dict]] | None:
+    """The teams `agent` is a member of and the active version of every
+    enabled document of those in always mode, read in a read-only transaction
+    that migrates nothing; None where there is no store or no teams tables."""
+    import psycopg
+    db = _db()
+    try:
+        setting = db.resolve_setting(_project_root())
+    except db.DbError as exc:
+        if exc.slug == "store_not_configured":
+            return None
+        _db_refused(exc)
+    try:
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+    except db.DbError as exc:
+        _db_refused(exc)
+    try:
+        conn.read_only = True
+        teams = _rows(conn, "SELECT t.id, t.name, t.description, t.always FROM teams_teams t "
+                      "JOIN teams_members m ON m.team_id = t.id WHERE m.agent_id = %s "
+                      "AND t.retired_at IS NULL ORDER BY t.name", (agent,))
+        always = [team["id"] for team in teams if team["always"]]
+        documents = _rows(conn, "SELECT d.team_id, d.name, v.load, v.description, v.body "
+                          "FROM teams_documents d JOIN teams_versions v "
+                          "ON v.document_id = d.id AND v.active "
+                          "WHERE d.enabled AND d.retired_at IS NULL AND d.team_id = ANY(%s) "
+                          "ORDER BY d.team_id, d.name", (always,)) if always else []
+        return teams, documents
+    except psycopg.errors.UndefinedTable:
+        return None
+    except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+        _die(5, "store_unreachable", f"the store stopped answering: {exc}",
+             f"`{NAME} doctor` proves the store")
+    finally:
+        with contextlib.suppress(Exception):
+            conn.close()
+
+
+def section(agent: str | None) -> str:
+    """The Teams section for `agent`, as `teams section` prints it; empty
+    where it is in no team or there is nothing to read."""
+    read = _section_rows(agent) if agent else None
+    if not read or not read[0]:
+        return ""
+    teams, documents = read
+    lines = ["# Teams", "",
+             "You are a member of the teams below, and their rules bind you. Where a team's "
+             "rule conflicts with your own doctrine further down, your own doctrine wins.", ""]
+    for team in teams:
+        name = team["name"]
+        lines += [f"## {_one_line(name)}", ""]
+        if not team["always"]:
+            lines += [f"{_one_line(team['description'])} Read its instructions on request: "
+                      f"`{NAME} show {shlex.quote(name)}`.", ""]
+            continue
+        lines += [_one_line(team["description"]), ""]
+        own = [doc for doc in documents if doc["team_id"] == team["id"]]
+        for doc in own:
+            if doc["load"] == "always":
+                lines += _section_document(doc["name"], doc["body"])
+        on_request = [doc for doc in own if doc["load"] == "on-request"]
+        if on_request:
+            lines += ["### On request", ""]
+            lines += [f"- `{NAME} doc show {shlex.quote(name)} {shlex.quote(doc['name'])}` "
+                      f"- {_one_line(doc['description'])}" for doc in on_request]
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def cmd_section(args) -> None:
+    sys.stdout.write(section(_maybe_me()))
+
+
 # ── doctor ──────────────────────────────────────────────────────────────────
 
 def cmd_doctor() -> None:
@@ -1268,6 +1430,7 @@ def _parser() -> argparse.ArgumentParser:
 
     verb(sub, "help").add_argument("topic", nargs="*")
     verb(sub, "doctor")
+    verb(sub, "section")
     listing = verb(sub, "list")
     listing.add_argument("--all", action="store_true")
     listing.add_argument("--json", action="store_true")
@@ -1366,7 +1529,7 @@ def main() -> None:
     if args.cmd == "doctor":
         cmd_doctor()
         return
-    {"list": cmd_list, "show": cmd_show, "create": cmd_create, "mode": cmd_mode,
+    {"list": cmd_list, "show": cmd_show, "section": cmd_section, "create": cmd_create, "mode": cmd_mode,
      "rename": cmd_rename, "describe": cmd_describe, "retire": cmd_retire,
      "members add": cmd_members, "members remove": cmd_members,
      "doc show": cmd_doc_show, "doc history": cmd_doc_history, "doc save": cmd_doc_save,

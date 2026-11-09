@@ -2103,13 +2103,17 @@ PROJECT VERBS (run inside a consuming project)
         carries composed after its stub line, from the manifest snapshot
         taken at install, reading no file and no store; a declaration that is
         malformed or over the manager's ceiling is replaced by one line naming
-        `capabilities update <name>`, and costs nothing else. While `teams`
-        is enabled, its block goes on with the agent's own teams, read from
-        the store at each composition: every team the agent is a member of
-        by its line, and for a team in always mode its enabled always
-        documents whole, each headed by the team's name, and its enabled
-        on-request documents by their line; nothing for an agent in no team,
-        and one line naming the failure where the store does not answer. Run by hand, a
+        `capabilities update <name>`, and costs nothing else. A declaration
+        that also names a `command` has it run, at each composition, through
+        the capability's own executable in the agent's folder, side by side
+        with the others and for at most 30 seconds, and its Markdown placed
+        after that block - or, under `place: standing`, which only a core
+        capability may declare, as a top-level section ahead of the
+        capability list here and ahead of the agent's own doctrine in
+        `build`; a command that fails, does not answer in time, or prints
+        more than the ceiling or text that is not UTF-8 is replaced by one
+        line naming it, and costs nothing else. The manager knows nothing of
+        what any block says (SHEBANG.md, the manifest's `contribution`). Run by hand, a
         host mode prints the file it wrote and the enabled set. Run as the host's SessionStart hook (the
         harness pipes a payload whose hook_event_name is SessionStart), it
         prints nothing unless the session must be told: the file was just
@@ -4447,17 +4451,31 @@ def _validate_service_machine(name: str, machine: object, verbs: object) -> list
     return problems
 
 
-CONTRIBUTION_KEYS = ("markdown",)
+CONTRIBUTION_KEYS = ("markdown", "command", "place")
 # The largest context contribution any capability may declare, in UTF-8 bytes:
-# the block is always loaded, so its ceiling is the manager's to hold.
+# the block is always loaded, so its ceiling is the manager's to hold. It bounds
+# the declared block and, apart, what a declared command prints.
 CONTRIBUTION_MAX_BYTES = 32768
+# Where a declared command's block stands: `entry`, after the capability's own
+# stub and block under its heading, or `standing`, a top-level section ahead of
+# the agent's own doctrine, which only a core capability may take.
+CONTRIBUTION_PLACES = ("entry", "standing")
+CONTRIBUTION_STANDING_TIERS = ("core",)
+# How long a declared command may take. The installed script's first run after
+# an install or update makes its environment from uv's cache, the cold case,
+# which a fresh node meets at its first build.
+CONTRIBUTION_TIMEOUT_SECONDS = 30
+CONTRIBUTION_COMMAND_MAX_ARGS = 8
 
 
-def _validate_contribution(contribution: object) -> list[str]:
-    """`contribution`: the constant Markdown block a capability adds to the
-    project context after its stub line, carried whole in the declaration. As
-    with `service.machine`, an unknown key is refused, so a key nothing reads
-    cannot ride in."""
+def _validate_contribution(contribution: object, name: str | None = None) -> list[str]:
+    """`contribution`: what a capability gives the composed agent context,
+    after its stub line - the constant Markdown block the declaration carries,
+    and, where it declares one, a command the manager runs in the agent's folder
+    for the block that agent reads, and the place that block stands. As with
+    `service.machine`, an unknown key is refused, so a key nothing reads cannot
+    ride in. With `name`, the standing place is refused to a capability outside
+    the tiers that may take it."""
     if not isinstance(contribution, dict):
         return ["contribution is not an object"]
     problems: list[str] = []
@@ -4477,6 +4495,30 @@ def _validate_contribution(contribution: object) -> list[str]:
         elif size > CONTRIBUTION_MAX_BYTES:
             problems.append(
                 f"contribution.markdown must be at most {CONTRIBUTION_MAX_BYTES} UTF-8 bytes")
+    if "command" in contribution:
+        command = contribution["command"]
+        if (not isinstance(command, list) or not command
+                or len(command) > CONTRIBUTION_COMMAND_MAX_ARGS
+                or not all(isinstance(arg, str) and arg and "\x00" not in arg
+                           for arg in command)):
+            problems.append(
+                "contribution.command must be a list of 1 to "
+                f"{CONTRIBUTION_COMMAND_MAX_ARGS} non-empty strings, the arguments "
+                "the capability's own executable is run with")
+        elif not re.fullmatch(r"[a-z][a-z0-9-]*", command[0]):
+            problems.append("contribution.command must open with one of the "
+                            "capability's own verbs")
+    if "place" in contribution:
+        place = contribution["place"]
+        if "command" not in contribution:
+            problems.append("contribution.place places a command's block and needs "
+                            "contribution.command")
+        if place not in CONTRIBUTION_PLACES:
+            problems.append(f"contribution.place must be one of {'|'.join(CONTRIBUTION_PLACES)}")
+        elif (place == "standing" and name is not None
+              and _capability_tier(name) not in CONTRIBUTION_STANDING_TIERS):
+            problems.append("contribution.place standing is kept for core capabilities; "
+                            "declare entry, or none")
     return problems
 
 
@@ -4835,7 +4877,7 @@ def _validate_manifest(name: str, manifest) -> list[str]:
                 problems.extend(_validate_service_machine(
                     name, service["machine"], verbs))
     if "contribution" in manifest:
-        problems.extend(_validate_contribution(manifest["contribution"]))
+        problems.extend(_validate_contribution(manifest["contribution"], name))
     if "programs" in manifest:
         problems.extend(_validate_programs(manifest["programs"]))
     if "connections" in manifest:
@@ -24473,22 +24515,95 @@ def _context_references(adapter, root: Path, name: str) -> list[str]:
     return refs
 
 
+def _contribution_unavailable(name: str, why: str) -> list[str]:
+    return [f"The context contribution of `{name}` is unavailable: {why}.", ""]
+
+
 def _context_contribution(name: str, manifest: dict | None) -> list[str]:
-    """The block a capability's manifest declares after its stub line.
+    """The constant block a capability's manifest declares after its stub line.
 
     The declaration carries the block itself, so composing takes it from the
     manifest snapshot install recorded and reads no file and no store. A
-    declaration this manager does not accept - an earlier release's shape, or
-    one past the ceiling - costs this block alone, which one line in its place
-    names along with the update that replaces it."""
+    declaration this manager does not accept - an earlier release's shape, one
+    past the ceiling, or one taking a place its tier may not - costs this block
+    alone, which one line in its place names along with the update that
+    replaces it."""
     if "contribution" not in (manifest or {}):
         return []
     contribution = manifest["contribution"]
-    if _validate_contribution(contribution):
-        return [f"The context contribution of `{name}` is unavailable: its manifest "
-                f"declaration is malformed. `capabilities update {name}` installs one "
-                "this manager reads.", ""]
+    if _validate_contribution(contribution, name):
+        return _contribution_unavailable(
+            name, "its manifest declaration is malformed. "
+                  f"`capabilities update {name}` installs one this manager reads")
     return [contribution["markdown"].strip("\n").rstrip(), ""]
+
+
+def _contribution_command(name: str, manifest: dict | None) -> tuple[list[str], str] | None:
+    """(arguments, place) of the command a capability's accepted declaration
+    names, or None where it declares none or the declaration is refused."""
+    contribution = (manifest or {}).get("contribution")
+    if (not isinstance(contribution, dict) or "command" not in contribution
+            or _validate_contribution(contribution, name)):
+        return None
+    return list(contribution["command"]), contribution.get("place", "entry")
+
+
+def _run_contribution(root: Path, name: str, command: list[str]) -> tuple[str | None, str]:
+    """(Markdown, "") a capability's declared command printed for the agent at
+    `root`, run there as that agent, or (None, why it gave none). It answers
+    within the timeout or is ended with everything it started, so a command
+    that hangs, or a child that holds its output open, costs this block alone."""
+    import signal
+    shown = " ".join(shlex.quote(arg) for arg in [name, *command])
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root)}
+    try:
+        proc = subprocess.Popen([str(_script_path(name)), *command], cwd=str(root), env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return None, f"`{shown}` could not be started"
+    try:
+        out, _ = proc.communicate(timeout=CONTRIBUTION_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.communicate()
+        return None, f"`{shown}` did not answer within {CONTRIBUTION_TIMEOUT_SECONDS} seconds"
+    if proc.returncode != 0:
+        return None, f"`{shown}` exited {proc.returncode}; `{name} doctor` names the repair"
+    if len(out) > CONTRIBUTION_MAX_BYTES:
+        return None, f"`{shown}` printed more than {CONTRIBUTION_MAX_BYTES} bytes"
+    try:
+        return out.decode("utf-8"), ""
+    except UnicodeDecodeError:
+        return None, f"`{shown}` printed text that is not UTF-8"
+
+
+def _declared_blocks(root: Path, declared: dict[str, tuple[list[str], str]]
+                     ) -> dict[str, list[str]]:
+    """The block each declared command gives this agent, as composed lines, by
+    capability: its Markdown shifted to the place it stands in - as written in
+    the standing place, two levels deeper under the capability's entry - or
+    one line where it gave none, and nothing where it printed nothing. The
+    commands run side by side, so a build waits for the slowest, not the sum."""
+    if not declared:
+        return {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(declared))) as pool:
+        runs = {name: pool.submit(_run_contribution, root, name, command)
+                for name, (command, _place) in declared.items()}
+    blocks: dict[str, list[str]] = {}
+    for name, run in runs.items():
+        text, why = run.result()
+        if text is None:
+            blocks[name] = _contribution_unavailable(name, why)
+            continue
+        text = text.strip("\n").rstrip()
+        if text.strip():
+            by = 0 if declared[name][1] == "standing" else 2
+            blocks[name] = [_shift_headings(text, by), ""]
+    return blocks
 
 
 TEAMS_CAPABILITY = "teams"
@@ -24645,20 +24760,17 @@ def _teams_context(root: Path) -> list[str]:
     return lines
 
 
-def _teams_section(root: Path, enabled: list[str] | None = None) -> list[str]:
-    """The top-level Teams section, which stands before the agent's own
-    doctrine: present only while `teams` is enabled and installed for the
-    agent and it is in a team, or its teams cannot be read; and nothing where
-    `init` writes the context without the store it keeps its gate in."""
-    if enabled is None:
-        if _CONTEXT_WITHOUT_STORE:
-            try:
-                _policy_scopes(root)
-            except _store_module().StoreError as exc:
-                if _store_absent(exc):
-                    return []
-        enabled = _context_enabled(root)
-    if TEAMS_CAPABILITY not in enabled or _load_snapshots(TEAMS_CAPABILITY)[0] is None:
+def _teams_section(root: Path, enabled: list[str]) -> list[str]:
+    """The Teams section this manager composes from the store itself, for a
+    `teams` payload whose declaration names no command - one installed before
+    `teams` declared its own - so no agent loses its teams between a manager
+    update and the capability update that follows it. Nothing where `teams`
+    is not enabled and installed for the agent, where its declaration names a
+    command, or where the agent is in no team."""
+    if TEAMS_CAPABILITY not in enabled:
+        return []
+    stub, manifest = _load_snapshots(TEAMS_CAPABILITY)
+    if stub is None or _contribution_command(TEAMS_CAPABILITY, manifest) is not None:
         return []
     body = _teams_context(root)
     return ["# Teams", "", *body] if body else []
@@ -24695,9 +24807,13 @@ def _context_enabled(root: Path, system: bool | None = None) -> list[str]:
         == "enabled")
 
 
-def _compose_context(root: Path, build: bool = False) -> str:
+def _compose_context(root: Path, build: bool = False,
+                     standing: list[str] | None = None) -> str:
     """Deterministic injection body: gate, snapshots, and resolved records;
-    with build, the block `build` composes, whose refresh route is itself."""
+    with build, the block `build` composes, whose refresh route is itself.
+    The blocks enabled capabilities declare for the standing place lead it,
+    or, given `standing`, are added to that list, one text per block, for the
+    caller to place ahead of the agent's own doctrine."""
     if _CONTEXT_WITHOUT_STORE:
         try:
             _policy_scopes(root)
@@ -24712,9 +24828,24 @@ def _compose_context(root: Path, build: bool = False) -> str:
                 CONTEXT_END]) + "\n"
     system = _is_system_agent(root)
     enabled = _context_enabled(root, system)
-    # `build` places the Teams section itself, before the agent's own
-    # doctrine; a capability context on its own carries it first.
-    lines: list[str] = [] if build else _teams_section(root, enabled)
+    snapshots = {name: _load_snapshots(name) for name in enabled}
+    declared = {}
+    for name, (stub, manifest) in snapshots.items():
+        found = _contribution_command(name, manifest) if stub is not None else None
+        if found is not None:
+            declared[name] = found
+    blocks = _declared_blocks(root, declared)
+    top = ["\n".join(blocks[name]).strip() for name, (_command, place) in declared.items()
+           if place == "standing" and name in blocks]
+    bridge = _teams_section(root, enabled)
+    if bridge:
+        top.append("\n".join(bridge).strip())
+    lines: list[str] = []
+    if standing is not None:
+        standing.extend(top)
+    else:
+        for block in top:
+            lines += [block, ""]
     lines += [
         "# Capabilities", "", CONTEXT_BEGIN, "",
         CAPABILITIES_CONTEXT_INTRO, "",
@@ -24729,7 +24860,7 @@ def _compose_context(root: Path, build: bool = False) -> str:
     adapter = _records_for(root)
     try:
         for name in enabled:
-            stub, manifest = _load_snapshots(name)
+            stub, manifest = snapshots[name]
             lines.append(f"## {name}")
             lines.append("")
             if stub is None:
@@ -24737,6 +24868,8 @@ def _compose_context(root: Path, build: bool = False) -> str:
                 continue
             lines += [_md_escape(stub), ""]
             lines += _context_contribution(name, manifest)
+            if declared.get(name, ((), ""))[1] == "entry":
+                lines += blocks.get(name, [])
             try:
                 ids = adapter.resolve(name, "identifier")
                 refs = _context_references(adapter, root, name)
@@ -29763,7 +29896,7 @@ def _ck_in_process(work):
 
 
 def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[str],
-                           store: dict) -> str:
+                           store: dict, standing: list[str] | None = None) -> str:
     if not (root / capabilities_dir).is_dir():
         warnings.append(f"capability layer not present; add `{capabilities_dir.as_posix()}/` "
                         "or run `capabilities help`")
@@ -29771,7 +29904,8 @@ def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[st
     held = os.environ.get("CLAUDE_PROJECT_DIR")
     os.environ["CLAUDE_PROJECT_DIR"] = str(root)
     try:
-        code, text, err = _ck_in_process(lambda: _compose_context(root, build=True))
+        code, text, err = _ck_in_process(
+            lambda: _compose_context(root, build=True, standing=standing))
     finally:
         if held is None:
             os.environ.pop("CLAUDE_PROJECT_DIR", None)
@@ -29789,26 +29923,6 @@ def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[st
                         "returned an empty block")
         return ""
     return text
-
-
-def _ck_teams_section(root: Path, capabilities_dir: Path, warnings: list[str]) -> str:
-    """The Teams section `build` places before the agent's own doctrine, or
-    nothing, with a warning where composing it failed."""
-    held = os.environ.get("CLAUDE_PROJECT_DIR")
-    os.environ["CLAUDE_PROJECT_DIR"] = str(root)
-    try:
-        code, lines, err = _ck_in_process(lambda: _teams_section(root))
-    finally:
-        if held is None:
-            os.environ.pop("CLAUDE_PROJECT_DIR", None)
-        else:
-            os.environ["CLAUDE_PROJECT_DIR"] = held
-    if code != 0:
-        detail = _ck_one_line(err)[:300]
-        warnings.append(f"teams section omitted: composing it exited {code}"
-                        + (f": {detail}" if detail else ""))
-        return ""
-    return "\n".join(lines)
 
 
 def _ck_registry_onboarding(root: Path, with_mode: bool = False):
@@ -30034,8 +30148,11 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     store = {"failed": False}
     stored_routines = _ck_stored_routines(root, routines_dir, warnings, store)
     routine_index = _ck_routine_index(root, routines_dir, warnings, stored_routines)
-    capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store)
-    teams = _ck_teams_section(root, layers["capabilities"], warnings) if capability_context else ""
+    standing: list[str] = []
+    capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store,
+                                                standing)
+    if not capability_context:
+        standing.clear()
     onboarding = _ck_onboarding(root, binding, warnings, store)
     onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings, stored_routines)
                         if onboarding and onboarding["status"] == "pending" else "")
@@ -30108,8 +30225,8 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
                 "At the start of the session, tell the user these files were found and may affect how you work. "
                 "Keeping, migrating, or removing them is the user's decision; do not change them on your own.",
                 "", "---", ""]
-    if teams:
-        out += [teams.rstrip(), "", "---", ""]
+    for block in standing:
+        out += [block.rstrip(), "", "---", ""]
     out += ["# Inline Context", ""]
     if inline:
         for item in inline:

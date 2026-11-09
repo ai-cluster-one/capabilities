@@ -4,8 +4,13 @@ A manifest may declare `contribution`, the constant Markdown block itself.
 Where the capability is enabled the manager places that block directly after
 its stub line, taken from the manifest snapshot and reading no file and no
 store; a declaration it does not accept costs that block alone, which one line
-pointing to `capabilities update <name>` replaces. The manager validates the
-declaration wherever it validates a manifest.
+pointing to `capabilities update <name>` replaces. The declaration may add a
+command, run through the capability's own executable in the agent's folder,
+whose Markdown stands in the capability's entry or, for a core capability, in
+the standing place ahead of the agent's doctrine; a command that fails, does
+not answer in time or prints what the manager cannot take costs its block
+alone, one line in its place. The manager validates the declaration wherever
+it validates a manifest.
 """
 
 from __future__ import annotations
@@ -85,11 +90,14 @@ def _error(result: subprocess.CompletedProcess) -> dict:
 
 # --- composition -----------------------------------------------------------------
 
-def _snapshot(tmp_path: Path, name: str, contribution: object = None) -> None:
-    """A registry entry as composition reads it: the stub and the manifest."""
+def _snapshot(tmp_path: Path, name: str, contribution: object = None,
+              script: str = "") -> None:
+    """A registry entry as composition reads it: the stub and the manifest,
+    and the executable a declared command runs, `script` its shell body."""
     entry = tmp_path / "registry" / name
     entry.mkdir(parents=True)
-    (entry / name).write_text("#!/bin/sh\n")
+    (entry / name).write_text("#!/bin/sh\n" + script)
+    (entry / name).chmod(0o755)
     (entry / "stub").write_text(f"Work with {name} records. Run `{name} help`.\n")
     manifest = {"name": name, "docs": {"topics": []}}
     if contribution is not None:
@@ -219,6 +227,111 @@ def test_a_malformed_declaration_costs_only_its_own_block(tmp_path, shape):
     assert "unavailable" not in sections["other"]
 
 
+# --- a declared command ----------------------------------------------------------
+
+COMMAND = {"markdown": "- the constant part\n", "command": ["block"]}
+
+
+def test_a_declared_command_gives_its_block_after_the_constant_one(tmp_path):
+    # Run as the agent: in its folder, with the arguments the declaration names.
+    _snapshot(tmp_path, "demo", COMMAND,
+              'test "$1" = block || exit 9\n'
+              'printf "# For this agent\\n\\nIn %s.\\n\\n## Detail\\n" "$(basename "$PWD")"\n')
+    project = _project(tmp_path, "demo")
+
+    fragment = _fragment(tmp_path, project)
+
+    assert fragment.startswith("# Capabilities\n")
+    assert _sections(fragment)["demo"].startswith(
+        "\nWork with demo records. Run `demo help`.\n\n- the constant part\n\n"
+        "### For this agent\n\nIn project.\n\n#### Detail\n\n")
+    assert _fragment(tmp_path, project) == fragment
+
+
+def test_a_core_capability_may_stand_ahead_of_the_capability_list(tmp_path):
+    _snapshot(tmp_path, "inbox", dict(COMMAND, place="standing"),
+              'printf "# Waiting\\n\\nTwo answers wait.\\n"\n')
+    project = _project(tmp_path, "inbox")
+
+    fragment = _fragment(tmp_path, project)
+
+    assert fragment.startswith("# Waiting\n\nTwo answers wait.\n\n# Capabilities\n")
+    assert "Two answers wait" not in _sections(fragment)["inbox"]
+
+
+def test_the_standing_place_is_kept_for_the_core_tier(tmp_path):
+    standing = dict(COMMAND, place="standing")
+    assert M._validate_manifest(NAME, _manifest(contribution=standing)) == [
+        "contribution.place standing is kept for core capabilities; declare entry, or none"]
+    assert M._validate_manifest("memory", dict(_manifest(contribution=standing),
+                                               name="memory")) == []
+    marker = tmp_path / "ran"
+    _snapshot(tmp_path, "demo", standing, f'touch "{marker}"\nprintf "# Up front\\n"\n')
+    project = _project(tmp_path, "demo")
+
+    fragment = _fragment(tmp_path, project)
+
+    assert fragment.startswith("# Capabilities\n") and "Up front" not in fragment
+    assert "declaration is malformed" in _sections(fragment)["demo"]
+    assert not marker.exists()
+
+
+FAILING = {
+    "exits non-zero": ('printf "# Half\\n"\nexit 3\n', "`demo block` exited 3; "
+                       "`demo doctor` names the repair."),
+    "past the ceiling": (f'head -c {M.CONTRIBUTION_MAX_BYTES + 1} /dev/zero | tr "\\0" x\n',
+                         f"`demo block` printed more than {M.CONTRIBUTION_MAX_BYTES} bytes."),
+    "not UTF-8": ("printf '\\377\\376 Half\\n'\n", "`demo block` printed text that is not UTF-8."),
+}
+
+
+@pytest.mark.parametrize("case", sorted(FAILING))
+def test_a_failing_command_costs_its_block_alone(tmp_path, case):
+    script, why = FAILING[case]
+    _snapshot(tmp_path, "demo", COMMAND, script)
+    _snapshot(tmp_path, "other", COMMAND, 'printf "Kept.\\n"\n')
+    project = _project(tmp_path, "demo", "other")
+    _ids(project, "demo")
+
+    sections = _sections(_fragment(tmp_path, project))
+
+    demo = sections["demo"]
+    assert demo.startswith("\nWork with demo records. Run `demo help`.\n\n- the constant part\n\n"
+                           + UNAVAILABLE.format(name="demo") + why + "\n\n")
+    assert "Half" not in demo and "xxxx" not in demo
+    assert "- Identifiers (1): run `capabilities ids demo`" in demo
+    assert sections["other"].startswith(
+        "\nWork with other records. Run `other help`.\n\n- the constant part\n\nKept.\n\n")
+
+
+def test_a_command_that_does_not_answer_is_ended_within_the_timeout(tmp_path, monkeypatch):
+    # A child that keeps the output open is ended with the command.
+    script = tmp_path / "slow"
+    script.write_text("#!/bin/sh\nsleep 60 &\nsleep 60\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(M, "CONTRIBUTION_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(M, "_script_path", lambda name: script)
+    import time
+    started = time.monotonic()
+    assert M._run_contribution(tmp_path, "demo", ["block"]) == (
+        None, "`demo block` did not answer within 2 seconds")
+    assert time.monotonic() - started < 15
+
+
+def test_a_capability_not_enabled_or_not_installed_runs_nothing(tmp_path):
+    marker = tmp_path / "ran"
+    _snapshot(tmp_path, "demo", COMMAND, f'touch "{marker}"\nprintf "Never.\\n"\n')
+    project = _project(tmp_path, "plain")
+    _snapshot(tmp_path, "plain")
+    (project / "capabilities" / "settings.json").write_text(json.dumps({"capabilities": {
+        "demo": {"enabled": False}, "plain": {"enabled": True}, "absent": {"enabled": True}}}))
+
+    fragment = _fragment(tmp_path, project)
+
+    assert "Never." not in fragment and not marker.exists()
+    assert "Enabled but not installed" in _sections(fragment)["absent"]
+
+
 # --- the memory marker -----------------------------------------------------------
 
 # The line an earlier release composed above a memory contribution.
@@ -262,6 +375,8 @@ def _manifest(**extra) -> dict:
 ACCEPTED = [
     DECLARED,
     {"markdown": "x"},
+    {"markdown": "x", "command": ["block"]},
+    {"markdown": "x", "command": ["block", "--plain"], "place": "entry"},
     # Exactly the ceiling, in two-byte characters.
     {"markdown": "é" * (M.CONTRIBUTION_MAX_BYTES // 2)},
 ]
@@ -278,6 +393,15 @@ REFUSED = {
     "a list": {"markdown": ["- a block"]},
     "over the ceiling in bytes": {"markdown": "é" * (M.CONTRIBUTION_MAX_BYTES // 2 + 1)},
     "not encodable": {"markdown": "- a block \ud800"},
+    "a command that is not a list": {"markdown": "x", "command": "context"},
+    "an empty command": {"markdown": "x", "command": []},
+    "a command with a blank argument": {"markdown": "x", "command": ["block", ""]},
+    "a command with a number": {"markdown": "x", "command": ["block", 7]},
+    "a command opening with no verb": {"markdown": "x", "command": ["--plain"]},
+    "a command past the argument limit": {"markdown": "x", "command": ["block"] * 9},
+    "a command without markdown": {"command": ["block"]},
+    "an unknown place": {"markdown": "x", "command": ["block"], "place": "top"},
+    "a place without a command": {"markdown": "x", "place": "entry"},
 }
 
 
