@@ -7167,14 +7167,53 @@ def _manager_release_from_root(
     return content, assets, manifest
 
 
+def _commit_base(httpx, base: str) -> str:
+    """`base` read at one exact commit, so the files one release fetch takes
+    from it are of one generation. raw.githubusercontent.com caches each file
+    of a branch for minutes and refreshes each on its own, so right after a
+    release a branch read can mix two releases; a commit URL never changes.
+
+    A GitHub raw URL's branch is resolved through the repository's git ref
+    advertisement - one request to github.com, which git itself reads for
+    `ls-remote`, outside the REST API and its rate limit, and needing no git
+    binary. Any other source, a ref that is already a commit, and a branch
+    that cannot be resolved are read as given, as before; the release hashes
+    still guard what is read."""
+    m = re.match(r"^https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/(.+)$",
+                 base.rstrip("/"))
+    if m is None or re.fullmatch(r"[0-9a-f]{40}", m.group(3)):
+        return base
+    owner, repo, ref = m.groups()
+    try:
+        response = httpx.get(
+            f"https://github.com/{owner}/{repo}.git/info/refs?service=git-upload-pack",
+            follow_redirects=True, timeout=30.0)
+        body = response.content if response.status_code == 200 else b""
+        # pkt-lines: four hex digits of length, then "<sha> <ref>[\0caps]\n".
+        pos = 0
+        while pos + 4 <= len(body):
+            size = int(body[pos:pos + 4], 16)
+            line = body[pos + 4:pos + size].split(b"\0", 1)[0].decode().rstrip("\n")
+            pos += size if size >= 4 else 4
+            sha, _sep, name = line.partition(" ")
+            if name == f"refs/heads/{ref}" and re.fullmatch(r"[0-9a-f]{40}", sha):
+                return f"https://raw.githubusercontent.com/{owner}/{repo}/{sha}"
+    except Exception:  # noqa: BLE001 - unresolved reads by branch, as before
+        pass
+    return base
+
+
 def _manager_release_from_remote(httpx, base: str | None = None,
-                                 parsed: dict | None = None
+                                 parsed: dict | None = None,
+                                 pinned: str | None = None
                                  ) -> tuple[bytes, dict[str, bytes], dict, str]:
     """The release the canonical source (or `base`, a line of it) carries,
-    every file verified against its manifest - `parsed`, where it was already
-    fetched to choose the release, else fetched first."""
+    every file read at one commit (`_commit_base`, or `pinned`, the commit
+    `parsed` was read at) and verified against its manifest - `parsed`, where
+    it was already fetched to choose the release, else fetched first."""
     base = (base or SOURCE).rstrip("/")
     manifest_url = f"{base}/{MANAGER_RELEASE_MANIFEST_REL}"
+    pinned = pinned or _commit_base(httpx, base)
 
     def fetch(url: str, label: str) -> bytes:
         try:
@@ -7187,7 +7226,8 @@ def _manager_release_from_remote(httpx, base: str | None = None,
         return response.content
 
     if parsed is None:
-        raw_manifest = fetch(manifest_url, "manager release manifest")
+        raw_manifest = fetch(f"{pinned}/{MANAGER_RELEASE_MANIFEST_REL}",
+                             "manager release manifest")
         try:
             parsed = json.loads(raw_manifest)
         except ValueError as exc:
@@ -7195,9 +7235,9 @@ def _manager_release_from_remote(httpx, base: str | None = None,
                  f"incoming manager release manifest is not JSON: {exc}", manifest_url)
     manifest, manager_rel, asset_hashes = _manager_release_parts(
         parsed, manifest_url)
-    content = fetch(f"{base}/{manager_rel}", "manager executable")
+    content = fetch(f"{pinned}/{manager_rel}", "manager executable")
     assets = {
-        rel: fetch(f"{base}/{rel}", f"manager asset {rel}")
+        rel: fetch(f"{pinned}/{rel}", f"manager asset {rel}")
         for rel in asset_hashes
     }
     _verify_manager_release_bytes(manifest, content, assets, manifest_url)
@@ -7458,7 +7498,7 @@ def cmd_self_update(from_ref: str | None = None) -> None:
             _emit(result)
             return
         content, assets, manifest, source = _manager_release_from_remote(
-            httpx, choice["base"], choice["manifest"])
+            httpx, choice["base"], choice["manifest"], choice["pinned"])
         result = _activate_manager_release(content, assets, source, manifest)
         result["store_major"] = choice["store_major"]
         _hold_manager_library(result, manifest)
@@ -7516,7 +7556,8 @@ def cmd_self_update_check(from_ref: str | None = None) -> None:
 def _manager_release_choice(from_ref: str | None) -> dict:
     """The manager release `self-update` takes for the store this folder
     resolves, reading only release manifests: {manifest, source, root (--from)
-    | base (a URL), store_major, kept}.
+    | base (a URL) and pinned (the commit its manifest was read at,
+    `_commit_base`), store_major, kept}.
 
     A release that reads the store's major is taken, as is the newest where
     the store's major is unknown (no store, one that does not answer, or one
@@ -7541,9 +7582,12 @@ def _manager_release_choice(from_ref: str | None) -> dict:
     else:
         base = SOURCE.rstrip("/")
         source = f"{base}/{MANAGER_RELEASE_MANIFEST_REL}"
+        pinned = _commit_base(_httpx(), base)
         manifest, _rel, _assets = _manager_release_parts(
-            _fetch_json(source, "manager release manifest"), source)
-        choice = {"manifest": manifest, "source": source, "root": None, "base": base}
+            _fetch_json(f"{pinned}/{MANAGER_RELEASE_MANIFEST_REL}",
+                        "manager release manifest"), source)
+        choice = {"manifest": manifest, "source": source, "root": None, "base": base,
+                  "pinned": pinned}
     release = _release_store_major(manifest.get("store_major"))
     store = here["store"]
     if store is None or release == store:
@@ -7552,11 +7596,13 @@ def _manager_release_choice(from_ref: str | None) -> dict:
     line = _store_line_source(choice["base"], store)
     if line is not None:
         url = f"{line}/{MANAGER_RELEASE_MANIFEST_REL}"
-        found, _error = _captured(_fetch_json, url, "manager release manifest")
+        pinned = _commit_base(_httpx(), line)
+        found, _error = _captured(_fetch_json, f"{pinned}/{MANAGER_RELEASE_MANIFEST_REL}",
+                                  "manager release manifest")
         if (found is not None and not _validate_manager_release_manifest(found)
                 and _release_store_major(found.get("store_major")) == store):
             return {"manifest": found, "source": url, "root": None, "base": line,
-                    "kept": False,
+                    "pinned": pinned, "kept": False,
                     "store_major": _store_major_field(here, release, "line", line)}
     return {**choice, "kept": True,
             "store_major": _store_major_field(here, release, "installed", line)}
@@ -7587,9 +7633,9 @@ def _self_update_check_answer(from_ref: str | None = None) -> dict:
         root = choice["root"]
         read_version = lambda: _changelog_version_at(root / MANAGER_CHANGELOG_REL)
     else:
-        base = choice["base"]
+        pinned = choice["pinned"]
         read_version = lambda: _changelog_version_from_url(
-            f"{base}/{MANAGER_CHANGELOG_REL}")
+            f"{pinned}/{MANAGER_CHANGELOG_REL}")
     available_release = hashlib.sha256(
         _manager_release_manifest_bytes(manifest)).hexdigest()
 

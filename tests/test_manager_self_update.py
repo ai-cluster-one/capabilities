@@ -11,6 +11,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 REPO = Path(__file__).resolve().parents[1]
 MANAGER = REPO / "bin" / "capabilities"
@@ -205,6 +207,99 @@ def test_remote_update_fetches_the_incoming_manifest_before_its_files(
     assert set(assets) == set(manifest["assets"])
     assert loaded == manifest
     assert source == requested[0]
+
+
+RAW = "https://raw.githubusercontent.com/owner/repo"
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+REFS = "https://github.com/owner/repo.git/info/refs?service=git-upload-pack"
+
+
+def _pkt(line: str) -> bytes:
+    body = line.encode()
+    return f"{len(body) + 4:04x}".encode() + body
+
+
+@pytest.mark.parametrize("path", ["self-update", "store upgrade"])
+@pytest.mark.parametrize("world", ["stale branch asset", "true mismatch", "unresolved"])
+def test_a_github_release_is_read_at_one_commit(
+    tmp_path: Path, monkeypatch, path: str, world: str,
+) -> None:
+    """raw.githubusercontent.com refreshes each file of a branch on its own,
+    so right after a release the branch can serve the new manifest beside an
+    old asset; the release is read at the commit the branch names instead."""
+    release, manifest = _write_release(tmp_path)
+    stale = "contract/CHANGELOG.md"
+    at_branch = {stale: b"the release before\n"}
+    at_commit = {stale: b"tampered\n"} if world == "true mismatch" else {}
+    advertised = (_pkt("# service=git-upload-pack\n") + b"0000"
+                  + _pkt(f"{'f' * 40} HEAD\0multi_ack symref=HEAD:refs/heads/main\n")
+                  + _pkt(f"{'e' * 40} refs/heads/dev/other\n")
+                  + _pkt(f"{COMMIT} refs/heads/main\n") + b"0000")
+    requested: list[str] = []
+
+    class Response:
+        def __init__(self, content: bytes | None):
+            self.status_code = 404 if content is None else 200
+            self.content = content or b""
+
+    class FakeHttpx:
+        class HTTPError(Exception):
+            pass
+
+        @staticmethod
+        def get(url: str, **_kwargs) -> Response:
+            requested.append(url)
+            if url == REFS:
+                return Response(None if world == "unresolved" else advertised)
+            for ref, override in (("main", at_branch), (COMMIT, at_commit)):
+                rel = url.removeprefix(f"{RAW}/{ref}/")
+                if rel != url:
+                    body = override.get(rel)
+                    return Response(body if body is not None else (release / rel).read_bytes())
+            return Response(None)
+
+    m = _manager_module()
+    monkeypatch.setattr(m, "SOURCE", f"{RAW}/main")
+    monkeypatch.setattr(m, "_httpx", lambda: FakeHttpx)
+    monkeypatch.setattr(m, "_store_major_here", lambda: {"store": None, "reason": "none"})
+    activated: list[tuple] = []
+    if path == "self-update":
+        import contextlib
+        monkeypatch.setattr(m, "_manager_mutation_guard", contextlib.nullcontext)
+        monkeypatch.setattr(m, "_marked_checkout", lambda _path: None)
+        monkeypatch.setattr(m, "_install_carried_capabilities", lambda _manager: [])
+        monkeypatch.setattr(m, "_emit", lambda _answer: None)
+        monkeypatch.setattr(m, "_activate_manager_release", lambda *args: (
+            activated.append(args) or {"manager": "x", "release": "x"}))
+        fetched, error = m._captured(m.cmd_self_update, None)
+    else:
+        fetched, error = m._captured(m._manager_release_from_remote, FakeHttpx)
+        if fetched is not None:
+            content, assets, loaded, source = fetched
+            activated.append((content, assets, source, loaded))
+
+    if world == "true mismatch":
+        assert error == {
+            "code": "manager_release_hash_mismatch",
+            "message": f"incoming manager asset failed its release hash: {stale}",
+            "hint": f"{RAW}/main/{MANIFEST_REL.as_posix()}: expected "
+                    f"{manifest['assets'][stale]}, got "
+                    f"{hashlib.sha256(at_commit[stale]).hexdigest()}"}
+        return
+    if world == "unresolved":
+        # Without the commit the branch is read as given, as before, and the
+        # release hashes still guard it.
+        assert error is not None and error["code"] == "manager_release_hash_mismatch"
+        assert not any(url.startswith(f"{RAW}/{COMMIT}/") for url in requested)
+        return
+    assert error is None, error
+    content, assets, loaded = activated[0][0], activated[0][1], activated[0][-1]
+    assert loaded == manifest
+    assert hashlib.sha256(content).hexdigest() == manifest["manager"]["sha256"]
+    assert assets[stale] == (release / stale).read_bytes()
+    files = [url for url in requested if url != REFS]
+    assert files and all(url.startswith(f"{RAW}/{COMMIT}/") for url in files)
+    assert requested.count(REFS) == 1
 
 
 def test_manifest_rejects_conflicting_release_paths() -> None:
