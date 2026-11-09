@@ -1273,7 +1273,7 @@ def _connection_session(cid: str, entry: dict) -> str:
     (`_recorded_session`)."""
     recorded = entry.get("session")
     if recorded:
-        moved = _recorded_session(_state_dir(), cid, recorded)
+        moved = _recorded_session(_state_dir(), cid, recorded, entry)
         if moved is not None:
             return str(moved)
         path = Path(str(recorded)).expanduser()
@@ -1283,13 +1283,16 @@ def _connection_session(cid: str, entry: dict) -> str:
     return str(_connection_state_dir(_state_dir(), cid) / "session")
 
 
-def _recorded_session(base, cid: str, recorded) -> Path | None:
+def _recorded_session(base, cid: str, recorded, entry: dict | None = None) -> Path | None:
     """Where a session path recorded for connection `cid` lies now, where it
     lay in the folder under `base` made under the connection's former name:
     the same place in the folder `_connection_state_dir` moved that to, so a
     process reading the record after the move neither misses the session nor
-    makes an empty one where it was. The recorded place is kept only where a
-    session is there and none is in the id's folder; None for a path that
+    makes an empty one where it was. The recorded place is kept where a
+    session is there and none is in the id's folder, and where both are and
+    the recorded one is live as `connections` reads it (`_session_live`, with
+    the connection's record `entry`): a login made there after the move is
+    the one in use, and is not traded for the older one. None for a path that
     never lay in that folder."""
     path = Path(str(recorded)).expanduser()
     former = _connection_former_name(cid)
@@ -1301,7 +1304,9 @@ def _recorded_session(base, cid: str, recorded) -> Path | None:
     except ValueError:
         return None
     moved = _connection_state_dir(base, cid) / rest
-    if _session_file(str(path)).exists() and not _session_file(str(moved)).exists():
+    held = _session_file(str(path))
+    if held.exists() and (not _session_file(str(moved)).exists()
+                          or _session_live(held, entry)):
         return path
     return moved
 
@@ -1451,13 +1456,20 @@ def _session_state(session: str, entry: dict | None) -> dict:
     session_missing where no session file is here, else not_signed_in.
     Local reads only, no network."""
     path = _session_file(session)
-    stem = path.with_name(path.name[:-len(".session")])
-    live = _session_signed_in(path) and not _service_says_unauthorized(stem, entry)
+    live = _session_live(path, entry)
     identity = _connection_identity(entry) if entry is not None else None
     state = {"live": live, "account": identity["id"] if identity else None}
     if not live:
         state["reason"] = "not_signed_in" if path.is_file() else "session_missing"
     return state
+
+
+def _session_live(path: Path, entry: dict | None) -> bool:
+    """Whether the session file `path` of the connection whose record is
+    `entry` holds a signed-in login that no service here recorded
+    unauthorized. Local reads only, no network."""
+    stem = path.with_name(path.name[:-len(".session")])
+    return _session_signed_in(path) and not _service_says_unauthorized(stem, entry)
 
 
 def _session_file(session: str) -> Path:

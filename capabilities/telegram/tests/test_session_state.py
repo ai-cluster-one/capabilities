@@ -340,6 +340,23 @@ class AccountNamedFormerFolderTests(unittest.TestCase):
         self.assertEqual(self.cli._connections_report()["connections"][self.CID]["session"],
                          {"live": True, "account": str(self.ACCOUNT)})
 
+    def test_a_login_made_again_in_the_former_folder_stays_the_one_read(self):
+        # An already-crossed machine where the stray session was signed in
+        # again by hand: both files hold a login, and the one in use today,
+        # in the former folder, stays the one read. Neither file is touched.
+        import hashlib
+        self.entry["session"] = str(self.old / "session")
+        moved = write_session(self.new / "session", signed_in_as=self.ACCOUNT)
+        self.account_records(self.new)
+        again = write_session(self.old / "session", auth_key=b"\x02" * 256,
+                              signed_in_as=self.ACCOUNT)
+        sums = {f: hashlib.sha256(f.read_bytes()).hexdigest() for f in (moved, again)}
+        self.assertEqual(self.resolve(), str(self.old / "session"))
+        self.assert_account_records_at_the_account()
+        self.assertEqual(self.cli._connections_report()["connections"][self.CID]["session"],
+                         {"live": True, "account": str(self.ACCOUNT)})
+        self.assertEqual({f: hashlib.sha256(f.read_bytes()).hexdigest() for f in sums}, sums)
+
     def test_records_already_at_the_account_are_not_written_over(self):
         self.account_records(self.new)
         (self.new / "control" / "owner.json").write_text('{"moved": true}')

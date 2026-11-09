@@ -164,16 +164,17 @@ def state_dir(adapter, base: Path, cid: str) -> Path:
     return _ask_cli(adapter, "_connection_state_dir", Path(base), cid)
 
 
-def session_path(adapter, base: Path, cid: str, recorded: Path) -> Path:
-    """Where the session path `recorded` for connection `cid` lies now: the
-    CLI's own answer (`_recorded_session`), asked with the service's own
-    records `adapter`, for a path that lay in the folder made under the
-    connection's former name, which the move took under the id; `recorded`
-    itself for any other, and the CLI is not loaded."""
+def session_path(adapter, base: Path, cid: str, recorded: Path,
+                 entry: dict | None = None) -> Path:
+    """Where the session path `recorded` for connection `cid`, whose record is
+    `entry`, lies now: the CLI's own answer (`_recorded_session`), asked with
+    the service's own records `adapter`, for a path that lay in the folder
+    made under the connection's former name, which the move took under the
+    id; `recorded` itself for any other, and the CLI is not loaded."""
     former = former_name(adapter, cid)
     if not former:
         return Path(recorded)
-    moved = _ask_cli(adapter, "_recorded_session", Path(base), cid, recorded)
+    moved = _ask_cli(adapter, "_recorded_session", Path(base), cid, recorded, entry)
     return Path(recorded) if moved is None else Path(moved)
 
 

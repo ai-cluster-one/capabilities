@@ -269,7 +269,7 @@
     "telegram": {
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "14b54d74ad589457164b7a20ab3bc59929d032166830dbaf7aaa7da8946fb9e8",
+      "payload_sha256": "d12b9a1a50c2bdfdeef8364cb8f86d88aa653ccb45cf8fea701a5717340d9c82",
       "store_major": 3,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first."
     },

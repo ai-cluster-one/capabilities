@@ -292,5 +292,30 @@ class FormerNameFolderInTheService(unittest.TestCase):
         self.assertFalse((old / "session.session").exists())
 
 
+    def test_a_login_made_again_in_the_former_folder_stays_the_one_read(self):
+        import contextlib
+        import io
+        import sqlite3
+        import types
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        base, cid = tmp / "state" / "telegram", "a1b2c3d4e5f6"
+        old = base / "1001"
+        for folder, key in ((base / cid, b"\x01"), (old, b"\x02")):
+            folder.mkdir(parents=True)
+            with contextlib.closing(sqlite3.connect(folder / "session.session")) as db, db:
+                db.execute("create table sessions (dc_id integer, auth_key blob)")
+                db.execute("create table entities (id integer, hash integer)")
+                db.execute("insert into sessions values (2, ?)", (key * 256,))
+                db.execute("insert into entities values (0, 1001)")
+        adapter = types.SimpleNamespace(
+            connection_former_name=lambda name, wanted: "1001" if wanted == cid else None)
+        with mock.patch.object(records._cli(), "_STATE_HOME", tmp / "state"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            session = records.session_path(adapter, base, cid, old / "session",
+                                           {"expected_account_id": 1001})
+        self.assertEqual(session, old / "session")
+
+
 if __name__ == "__main__":
     unittest.main()

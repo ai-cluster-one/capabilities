@@ -1059,7 +1059,7 @@ def _session_stem(cid, conn):
             return recorded
         # A recorded path in the folder made under the connection's former
         # name lies where CONNECTION_HOME's move took it.
-        return records.session_path(_records(), STATE_HOME / "telegram", cid, recorded)
+        return records.session_path(_records(), STATE_HOME / "telegram", cid, recorded, conn)
     return CONNECTION_HOME / "session"
 
 
