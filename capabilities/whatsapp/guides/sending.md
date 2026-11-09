@@ -18,7 +18,7 @@ That is a choice about where disclosure lives, not an argument against it. A sen
 
 WhatsApp has a protocol node — `<bot biz_bot="1"/>` — that a client can attach to an outgoing message. The recipient's app renders it as a small **AI** label under the message, and the sending account's traffic counts as automated from then on.
 
-The engine appends it to messages addressed to a person, never to groups. Upstream does this by default. **The build this capability pins does not**: the node is opt-in, and `NEONIZE_BOT_TAG=on` restores it.
+The engine appends it to messages addressed to a person, never to groups. neonize did this by default up to 0.5.2. **The release this capability pins does not**: from 0.6.0 the node is opt-in, and `NEONIZE_BOT_TAG=on` restores it.
 
 Two things follow, and both matter more than they look:
 

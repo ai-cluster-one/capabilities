@@ -3,23 +3,6 @@
 Deliberate departures from the executable standard, kept here so an audit reads
 them as choices rather than as drift to correct.
 
-## The engine is a pinned wheel from a release asset, not an index package
-
-The PEP 723 header resolves the engine from a GitHub release URL rather than
-from a package index. The engine binds two calls the published package does not
-expose — the on-demand history request and the generic peer message — and
-without them a read can only ever return what one pairing burst happened to
-hand over. The URL pins one immutable artifact, the same guarantee a pinned index version
-gives. The compiled library travels inside the wheel rather than being fetched
-at run time, so no other build can be substituted for it. One `any`-tagged wheel
-carries the compiled library for every host the capability supports — macOS on
-arm64, Linux on amd64 and arm64 — so one pinned URL serves a workstation and a
-deployed container alike and the tag claims no more than it delivers. A host
-outside that set is refused at first use rather than at install, naming the
-engine; a read served from an existing store is unaffected, because the engine
-is imported only by what reaches the account. When the change lands upstream
-this becomes an ordinary pinned dependency.
-
 ## `messages --json` emits the capability's own envelope
 
 The standard asks a capability not to change a published output shape as a side
@@ -28,12 +11,9 @@ the bridge's own wire objects, and no engine but that bridge can produce them.
 The envelope replacing it is the one the export already publishes, so the two
 read surfaces now agree, and the export's `schema_version` carries the change.
 
-## The engine is pinned to a build that does not announce itself
+## The engine is pinned to a release that does not announce itself
 
-Upstream neonize appends a `<bot biz_bot="1"/>` node to every message addressed
-to a person, which the recipient's WhatsApp renders as an "AI" badge and which
-marks the sending account's traffic as automated. The pinned build turns that
-node off by default and takes `NEONIZE_BOT_TAG=on` to restore it.
+neonize up to 0.5.2 appended a `<bot biz_bot="1"/>` node to every message addressed to a person, which the recipient's WhatsApp renders as an "AI" badge and which marks the sending account's traffic as automated. From 0.6.0 the engine leaves that node off by default and takes `NEONIZE_BOT_TAG=on` to restore it, and the pinned 0.10.0 does the same. A pin moved to a release that brings the default back would undo this choice, so that is checked before the pin moves.
 
 The choice is not about hiding what the sender is. It is about where that is
 said: a sentence in the message is answerable and belongs to the conversation,
@@ -41,10 +21,7 @@ while the protocol flag is a standing claim about the account, made on every
 message, on accounts that also carry a person's own correspondence. Saying who
 is writing is left to what gets written.
 
-The flag could not be set from here. A Go runtime inside a shared library reads
-the environment its process started with, so a value exported after the
-interpreter is running never reaches it — which is why this lives in the build
-rather than in a line of Python before the import.
+The flag could not be set from here. A Go runtime inside a shared library reads the environment its process started with, so a value exported after the interpreter is running never reaches it - which is why the default has to live in the engine rather than in a line of Python before the import.
 
 ## The process ends itself
 

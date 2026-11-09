@@ -4,7 +4,7 @@
 # dependencies = [
 #     "capabilities-contract>=0.8,<1",
 #     "puremagic>=1.28",
-#     "neonize @ https://github.com/ai-cluster-one/neonize/releases/download/v0.5.2-histsync.1/neonize-0.5.2-py3-none-any.whl",
+#     "neonize==0.10.0",
 # ]
 # ///
 """How a history chunk becomes rows, checked against the protocol's own message
