@@ -1065,3 +1065,133 @@ def test_tasks_declares_the_harness_tables_so_a_store_holding_them_is_not_blocke
     owners = {entry["owner"]: entry for entry in checked["owners"]}
     assert owners["harness"]["capability"] == "tasks" and owners["harness"]["further"]
     assert owners["harness"]["reads"]["major"] == owners["harness"]["store"]["major"]
+
+
+# --- a press that stopped part way, and one that meets a writer --------------------
+
+# The crossing's own step of an owner, as the store's foreign key steps are: it
+# needs the core at the store's major and raises no major of its owner.
+CROSSING_STEP = f'''STEPS.append(Step("0002-keys", "CREATE TABLE probe_keys (id bigint)",
+                  core=({STORE}, 0)))'''
+
+
+def _part_crossed(machine) -> Path:
+    """A press across the store's major, stopped once the core had crossed and
+    before probe took its step of the crossing; the stop file it ran under."""
+    source = _probe(machine.tmp / "src" / "capabilities" / "probe", second=False)
+    machine.ok("install", "probe", "--from", str(source), "--allow")
+    machine.cross(STORE - 1)
+    _probe(source, second=False, extra=CROSSING_STEP)
+    stop = machine.tmp / "stop"
+    stop.write_text("")
+    first = machine.run("store", "upgrade", PROBE_STOP_FILE=str(stop))
+    assert first.returncode == 5, first.stdout + first.stderr
+    assert machine.sql("SELECT major FROM schema_version WHERE owner = 'core'") == [(STORE,)]
+    assert machine.sql("SELECT step FROM schema_ledger WHERE owner = 'probe' "
+                       "AND step = '0002-keys'") == []
+    return stop
+
+
+def _progress(machine) -> dict:
+    found = list((machine.state / "capabilities" / "store-upgrade").glob("*.json"))
+    assert len(found) == 1, found
+    return json.loads(found[0].read_text())
+
+
+def test_a_press_stopped_after_the_core_crossed_is_not_current_and_resumes(machine) -> None:
+    stop = _part_crossed(machine)
+    checked = machine.ok("store", "upgrade", "--check")
+    assert checked["state"] == "upgrade_available" and checked["upgrade_needed"] is True
+    probe = next(entry for entry in checked["owners"] if entry["owner"] == "probe")
+    assert probe["crosses"] is True
+    assert checked["progress"]["target_major"] == STORE
+    assert _progress(machine)["finished_at"] is None
+    stop.unlink()
+    second = machine.run("store", "upgrade", "--events")
+    assert second.returncode == 0, second.stdout + second.stderr
+    events = _events(second.stdout)
+    assert ("migrate", "probe", "done") in _steps(events)
+    answer = events[-1]["result"]
+    assert answer["upgraded"] is True and answer["resumed"] is True
+    assert machine.sql("SELECT step FROM schema_ledger WHERE owner = 'probe' "
+                       "AND step = '0002-keys'") == [("0002-keys",)]
+    assert _progress(machine)["finished_at"]
+    checked = machine.ok("store", "upgrade", "--check")
+    assert checked["state"] == "current" and checked["progress"] is None
+
+
+def test_a_press_finished_outside_it_is_closed_by_the_next_press(machine) -> None:
+    stop = _part_crossed(machine)
+    stop.unlink()
+    # The owner takes its step of the crossing on its own, as a service does.
+    owned = subprocess.run([str(machine.bin / "probe"), "migrate"], cwd=machine.project,
+                           env=machine.env(), text=True, capture_output=True, timeout=300)
+    assert owned.returncode == 0, owned.stdout + owned.stderr
+    assert machine.sql("SELECT step FROM schema_ledger WHERE owner = 'probe' "
+                       "AND step = '0002-keys'") == [("0002-keys",)]
+    assert machine.ok("store", "upgrade", "--check")["state"] == "current"
+    answer = machine.ok("store", "upgrade")
+    assert answer["upgraded"] is False and answer["state"] == "current"
+    assert _progress(machine)["finished_at"]
+    assert machine.ok("store", "upgrade", "--check")["progress"] is None
+
+
+# A step that takes the lock of one table and then another's, as the foreign key
+# step does across the schema, meets a writer that holds the second and wants
+# the first: the store ends the step as a deadlock.
+DEADLOCKING = '''STEPS.append(Step("0002-other", "CREATE TABLE probe_other (id bigint)"))
+STEPS.append(Step("0003-items-moved",
+                  "LOCK TABLE probe_other IN ACCESS EXCLUSIVE MODE; "
+                  "ALTER TABLE probe_items RENAME TO probe_entries", major=2))
+MAJOR = 2'''
+
+
+def test_a_press_that_meets_a_writer_waits_it_out_rather_than_failing(machine) -> None:
+    import psycopg
+    source = _probe(machine.tmp / "src" / "capabilities" / "probe", second=False)
+    machine.ok("install", "probe", "--from", str(source), "--allow")
+    _probe(source, second=False, extra=DEADLOCKING)
+    machine.ok("update", "probe")
+    machine.sql("INSERT INTO probe_items VALUES (1, 'kept')")
+    writer = psycopg.connect(machine.url)
+    writer.execute(f"SET search_path TO {SCHEMA}")
+    writer.execute("INSERT INTO probe_items VALUES (2, 'written')")
+    met = {}
+
+    def write_on() -> None:
+        watch = machine.cluster.connect(machine.database)
+        try:
+            for _ in range(1200):
+                waiting = watch.execute(
+                    "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+                    "WHERE NOT l.granted AND c.relname = 'probe_items'").fetchone()[0]
+                if waiting:
+                    break
+                threading.Event().wait(0.05)
+            met["waited"] = bool(waiting)
+            try:
+                writer.execute("SELECT count(*) FROM probe_other")
+                writer.commit()
+                met["writer"] = "committed"
+            except psycopg.Error as exc:
+                writer.rollback()
+                met["writer"] = str(exc)
+        finally:
+            watch.close()
+
+    thread = threading.Thread(target=write_on)
+    thread.start()
+    try:
+        result = machine.run("store", "upgrade")
+    finally:
+        thread.join(timeout=300)
+        writer.close()
+    assert met.get("waited") is True, met
+    assert result.returncode == 0, result.stdout + result.stderr
+    answer = json.loads(result.stdout)
+    owners = {entry["owner"]: entry for entry in answer["owners"]}
+    assert owners["probe"]["after"] == {"major": 2, "minor": 0}
+    assert met["writer"] == "committed", met
+    assert set(machine.sql("SELECT id, body FROM probe_entries")) == {(1, "kept"),
+                                                                      (2, "written")}
+    assert _progress(machine)["finished_at"]

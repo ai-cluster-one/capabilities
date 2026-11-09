@@ -630,7 +630,10 @@ STORE VERBS
         machine's releases read: next is self-update, then update),
         upgrade_available, blocked, unreachable or unconfigured. upgrade_needed
         is true where the newest line reads a newer major than the store's,
-        or an installed release crosses an owner's major. A blocker is each
+        or an installed release crosses an owner's major, or a press of this
+        store that has not finished took the core to its target and an owner
+        it has not migrated still has steps to take (that owner pending and
+        crossing), which the same press goes on with. A blocker is each
         thing that stops it: owner_not_installed (the store holds tables of an
         owner no release here declares; an owner it records with no tables
         left has nothing to move and stops nothing), owner_unreadable, pg_dump_missing
@@ -656,7 +659,9 @@ STORE VERBS
         runs the library's major steps (CAPABILITIES_STORE_UPGRADE=1 for its
         migrations alone). It runs the check above first: with nothing to
         cross it changes nothing and answers {upgraded: false, state,
-        message, store, owners, nodes, next}; with a blocker it exits 6
+        message, store, owners, nodes, next}, but for closing the kept
+        progress of a press that never finished whose target the store holds
+        (finished_at set, closed saying why); with a blocker it exits 6
         store_upgrade_blocked, the check as the error's detail. Otherwise, in
         phases: manager - where the newest line's manager reads a newer major
         than this one, it is fetched from the canonical source (main),
@@ -681,7 +686,10 @@ STORE VERBS
         and the manager's own owners the store holds, then each installed
         capability that keeps tables through its `<name> migrate`, once for
         every owner it declares (an owner it migrates for another, by), a
-        quarantined one included, which the flag lets move. Progress is kept
+        quarantined one included, which the flag lets move; an owner whose
+        migration meets another session's lock (a deadlock, a lock timeout,
+        store_busy), its step rolled back, is migrated again after pauses of
+        1, 2, 4, 8 and 15 seconds before the phase fails. Progress is kept
         per store in $XDG_STATE_HOME/capabilities/store-upgrade/<store
         key>.json: a rerun after an interruption skips each phase and owner
         done (a proven dump is kept and reused, not taken again) and goes on;
@@ -22334,6 +22342,16 @@ def _store_upgrade_judge(answer: dict, setting, key: str, available: dict | None
                                             [found.result() for found in identities])
     else:
         readers = _store_upgrade_readers(setting, survey, asked)
+    # A press that took the core to its target and stopped before every owner
+    # took its steps of that crossing has not crossed: an owner it has not
+    # migrated with steps still to take crosses, so the same press goes on.
+    if isinstance(progress, dict) and not progress.get("finished_at") \
+            and progress.get("target_major") == survey["major"]:
+        moved = (((progress.get("phases") or {}).get("migrate") or {}).get("owners")
+                 or {})
+        readers = [{**entry, "crosses": True}
+                   if entry["state"] == "pending" and entry["owner"] not in moved else entry
+                   for entry in readers]
     answer["available"] = available = available or fetched.result()
     target = max(available["major"] or STORE_MAJOR, STORE_MAJOR)
     answer["target_major"] = target
@@ -22541,7 +22559,38 @@ class _UpgradeFailed(Exception):
         self.hint, self.detail = hint, detail or {}
 
 
+# A migration that meets another session's lock - a deadlock the store ends it
+# with, a lock wait that timed out, the owner's own lock held elsewhere - had its
+# step rolled back whole, so the owner is migrated again after each pause here
+# before the press fails on it: services still on the old code write on while
+# the press runs, and their transactions end.
+STORE_UPGRADE_LOCK_RETRY_SECONDS = (1, 2, 4, 8, 15)
+_LOCK_CONFLICT_TEXT = ("deadlock detected", "lock timeout", "could not obtain lock")
+
+
+def _store_lock_conflict(error: dict) -> bool:
+    """Whether a migration's error is another session's lock rather than the
+    step itself."""
+    if error.get("code") == "store_busy":
+        return True
+    message = str(error.get("message") or "").lower()
+    return any(text in message for text in _LOCK_CONFLICT_TEXT)
+
+
 def _store_upgrade_migrate_owner(setting, entry: dict) -> dict:
+    """`_store_upgrade_migrate_once`, run again after each pause of
+    STORE_UPGRADE_LOCK_RETRY_SECONDS while it fails on another session's lock."""
+    for pause in (*STORE_UPGRADE_LOCK_RETRY_SECONDS, None):
+        try:
+            return _store_upgrade_migrate_once(setting, entry)
+        except _UpgradeFailed as exc:
+            if pause is None or not _store_lock_conflict(exc.detail.get("error") or {}):
+                raise
+        time.sleep(pause)
+    raise AssertionError("unreachable")
+
+
+def _store_upgrade_migrate_once(setting, entry: dict) -> dict:
     """Migrate one owner under the upgrade's flag: the core and the manager's
     own owners here, a capability through its own `migrate`. Answers {owner,
     applied, version}; raises _UpgradeFailed."""
@@ -22603,6 +22652,29 @@ def _store_upgrade_migrate_owner(setting, entry: dict) -> dict:
             "version": {"major": done.major, "minor": done.minor}}
 
 
+def _store_upgrade_close(key: str, major: int | None) -> None:
+    """Close the kept progress of a press of this store that never finished,
+    once the store holds its target with nothing left to cross - every owner's
+    steps of it taken since, outside the press - so the record no longer reads
+    as a press under way. A press running now is left to close its own."""
+    import fcntl
+    path = _store_upgrade_state_path(key)
+    progress = _read_json(path)
+    if not isinstance(progress, dict) or progress.get("finished_at") or major is None \
+            or not isinstance(progress.get("target_major"), int) \
+            or progress["target_major"] > major:
+        return
+    with open(STORE_UPGRADE_DIR / f"{key}.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        progress["finished_at"] = _utc_now()
+        progress["closed"] = ("the store held its target with nothing left to cross when the "
+                              "press ran again")
+        _write_json(path, progress)
+
+
 def cmd_store_upgrade(events: bool) -> None:
     """`store upgrade`: the one procedure that crosses a schema major - the
     newest line's manager (handed over to, so it carries on), every installed
@@ -22628,6 +22700,7 @@ def cmd_store_upgrade(events: bool) -> None:
            check={k: check[k] for k in ("state", "upgrade_needed", "can_run", "target_major")})
     setting, survey, key = carried["setting"], carried["survey"], carried["key"]
     if not check["upgrade_needed"]:
+        _store_upgrade_close(key, survey["major"])
         _emit({"upgraded": False, "state": check["state"], "message": check.get("message"),
                "store": check["store"], "owners": check["owners"], "nodes": check["nodes"],
                "next": check["next"]})
