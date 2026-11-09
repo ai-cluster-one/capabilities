@@ -410,8 +410,8 @@ def test_update_takes_the_stores_line_and_keeps_its_library(tmp_path: Path, clus
         assert row["store_major"]["taken"] == "line"
         assert row["store_major"]["command"] == UPGRADE
         assert checked["store_major"] == {"store": 1}
-        asked = log.read_text().splitlines() if log.exists() else []
-        assert asked and all("capabilities-contract>=0.42,<0.50" in line for line in asked)
+        # The check asks uv nothing: the library held is read from disk.
+        assert not log.exists()
         updated = _run(env, tmp_path, "update", "resend")
     entry = updated["updated"][0]
     assert entry["changed"] is True
@@ -423,9 +423,10 @@ def test_update_takes_the_stores_line_and_keeps_its_library(tmp_path: Path, clus
     # Recorded against main, so the next update starts there again.
     assert json.loads(meta_path.read_text())["source"] == \
         f"{base}/main/capabilities/resend/bin/resend"
-    synced = log.read_text().splitlines()[len(asked):]
-    assert synced and all("--upgrade-package capabilities-contract>=0.42,<0.50" in line
-                          and "--dry-run" not in line for line in synced)
+    # The line's catalogue names no library release and the dependency block
+    # is unchanged, so the environments keep the library they hold: nothing
+    # outside the line's range is synced.
+    assert not log.exists()
 
 
 def test_update_takes_a_release_of_the_stores_major(tmp_path: Path, cluster) -> None:
@@ -441,7 +442,8 @@ def test_update_takes_a_release_of_the_stores_major(tmp_path: Path, cluster) -> 
     assert "store_major" not in entry
     assert updated["store_major"] == {"store": 2}
     assert _installed_tag(env) == "# main"
-    assert all(">=0.42,<0.50" not in line for line in log.read_text().splitlines())
+    assert all(">=0.42,<0.50" not in line
+               for line in (log.read_text().splitlines() if log.exists() else []))
 
 
 def test_update_keeps_what_is_installed_without_the_line(tmp_path: Path, cluster) -> None:

@@ -278,11 +278,12 @@ class Node:
             "CLAUDE_PROJECT_DIR": str(self.project),
             "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}"})
         # probe's source is a catalogue tree's, which names the store major
-        # its releases read, as `source index` stamps it.
+        # its releases read and the contract library release `update` brings
+        # its environments to, as `source index` stamps them.
         self.source = tmp / "src" / "capabilities" / "probe"
         (tmp / "src" / ".capability-source").mkdir(parents=True)
         (tmp / "src" / ".capability-source" / "catalog.json").write_text(
-            json.dumps({"store_major": _store_major()}))
+            json.dumps({"store_major": _store_major(), "contract_library": "0.32.0"}))
         # The node runs the outgoing release, linked as the manager on PATH,
         # and probe from its source, its service placed on this node.
         outgoing = _release(tmp / "outgoing", "outgoing", OUTGOING)

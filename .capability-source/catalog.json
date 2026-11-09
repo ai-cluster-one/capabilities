@@ -1,6 +1,27 @@
 {
   "capabilities": {
     "agentrooms": {
+      "executable": [
+        "bin/agentrooms"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/agentrooms",
+        "deviations.md",
+        "guides/service.md",
+        "icon.png",
+        "service/engine.py",
+        "service/profiles/agentrooms-claude.toml",
+        "service/profiles/agentrooms-codex.toml",
+        "service/templates/refusal.md",
+        "service/templates/room.md",
+        "service/workers/default.md",
+        "tests/_agents.py",
+        "tests/_cli.py",
+        "tests/test_cli.py",
+        "tests/test_engine.py",
+        "tests/test_store.py"
+      ],
       "icon": true,
       "path": "capabilities/agentrooms",
       "payload_sha256": "b88696286264d7f52e17ef3f22378fb65e3507b6e4908e4a998b43e410abae07",
@@ -10,6 +31,36 @@
       "version": "2026-11-08 — agentrooms' rows go with their agent and node, at agentrooms 3.1"
     },
     "agenttemplates": {
+      "executable": [
+        "bin/agenttemplates"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/agenttemplates",
+        "icon.png",
+        "templates/agents/personal-agent/context/guidelines/COMMS.md",
+        "templates/agents/personal-agent/context/guidelines/CONDUCT.md",
+        "templates/agents/personal-agent/context/guidelines/LIMITATIONS.md",
+        "templates/agents/personal-agent/context/identity/AGENT.md",
+        "templates/agents/personal-agent/context/identity/MISSION.md",
+        "templates/agents/personal-agent/context/identity/OWNER.md",
+        "templates/agents/personal-agent/context/identity/PEOPLE.md",
+        "templates/agents/personal-agent/context/projects/PROJECTS.md",
+        "templates/agents/personal-agent/icon.png",
+        "templates/agents/personal-agent/routines/daily-brief.md",
+        "templates/agents/personal-agent/routines/onboarding.md",
+        "templates/agents/personal-agent/template.toml",
+        "templates/context/architecture/RUNTIME.md",
+        "templates/context/architecture/SERVICES.md",
+        "templates/context/guidelines/ASSETS.md",
+        "templates/context/guidelines/CONSTITUTION.md",
+        "templates/context/guidelines/LIMITATIONS.md",
+        "templates/context/identity/AGENT.md",
+        "templates/context/identity/MISSION.md",
+        "templates/context/identity/OWNER.md",
+        "templates/context/identity/PEOPLE.md",
+        "tests/test_agenttemplates.py"
+      ],
       "icon": true,
       "path": "capabilities/agenttemplates",
       "payload_sha256": "aef8e3d8288c04d52972afafda1987efb46315885d3bfb7fb74287a5cc764160",
@@ -19,6 +70,14 @@
       "version": "2026-11-08 — The Personal Agent's onboarding runs the manager's commands"
     },
     "asana": {
+      "executable": [
+        "bin/asana"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/asana",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/asana",
       "payload_sha256": "fe5301ef37d43c62baf0d187725ef20c759de8edce04456bef43990c9c59f613",
@@ -28,6 +87,24 @@
       "version": "2026-10-31 — `asana` reads a connection's token from the agent's vault as well"
     },
     "askproject": {
+      "executable": [
+        "bin/askproject",
+        "tests/fakes/claude",
+        "tests/fakes/codex"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/askproject",
+        "icon.png",
+        "tests/_peer.py",
+        "tests/fakes/claude",
+        "tests/fakes/codex",
+        "tests/test_compiled_context.py",
+        "tests/test_profile.py",
+        "tests/test_progress.py",
+        "tests/test_read_only_switch.py",
+        "tests/test_self_target.py"
+      ],
       "icon": true,
       "path": "capabilities/askproject",
       "payload_sha256": "300ecc873caa2d3468df5ed8147de737050f83d783fe08b17396f7e27ad805f9",
@@ -37,6 +114,19 @@
       "version": "2026-11-08 — A session goes with its agent and its node, at askproject 3.1"
     },
     "assets": {
+      "executable": [
+        "bin/assets"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/assets",
+        "guides/authoring.md",
+        "icon.png",
+        "tests/_cli.py",
+        "tests/test_cli.py",
+        "tests/test_files.py",
+        "tests/test_store.py"
+      ],
       "icon": true,
       "path": "capabilities/assets",
       "payload_sha256": "b2e6cb235c2455039249b152dff6667a25efca9fcbf4d399ce66d6bcbeb592cb",
@@ -46,6 +136,26 @@
       "version": "2026-11-08 — An agent's documents and files go with it, at assets 2.1"
     },
     "automations": {
+      "executable": [
+        "bin/automations",
+        "service/templates/example.py",
+        "tests/test_automations.py"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/automations",
+        "guides/authoring.md",
+        "guides/monitors.md",
+        "guides/operations.md",
+        "icon.png",
+        "service/runtime.py",
+        "service/templates/config.toml",
+        "service/templates/example.py",
+        "service/templates/machine.toml",
+        "tests/test_automations.py",
+        "tests/test_machine.py",
+        "tests/test_store_link.py"
+      ],
       "icon": true,
       "path": "capabilities/automations",
       "payload_sha256": "9af60e1eef1753acdef23399cda0ea516368ef8bed960b7da12cc1272245d6e4",
@@ -55,6 +165,14 @@
       "version": "2026-11-08 — Definitions and runs are keyed to their agent and node, and a node a definition is pinned to stays until it is pinned elsewhere, at automations 2.1"
     },
     "calcomc": {
+      "executable": [
+        "bin/calcomc"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/calcomc",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/calcomc",
       "payload_sha256": "198fd7a809e29ba9bab85d9ab0b7816609d555f79f4b57a67c88e439552ad199",
@@ -64,6 +182,18 @@
       "version": "2026-10-31 — `calcomc help` names the agent's vault in the credential cascade"
     },
     "calendar": {
+      "executable": [
+        "bin/calendar"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/calendar",
+        "deviations.md",
+        "guides/conferencing.md",
+        "guides/endpoints.md",
+        "icon.png",
+        "tests/test_icalendar_roundtrip.py"
+      ],
       "icon": true,
       "path": "capabilities/calendar",
       "payload_sha256": "7e652ae0cddc2d17312380ae935ff11bb8352a3323bbe17cb4ca0567064c6563",
@@ -73,6 +203,26 @@
       "version": "2026-10-31 — `calendar` carries its own icon"
     },
     "callva": {
+      "executable": [
+        "bin/callva"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/callva",
+        "deviations.md",
+        "guides/automation-authoring.md",
+        "guides/batch-processing.md",
+        "guides/dry-run-pattern.md",
+        "guides/idempotency.md",
+        "guides/multi-phase-pipelines.md",
+        "guides/prompt-authoring.md",
+        "guides/resilience-and-retries.md",
+        "guides/timezone-handling.md",
+        "icon.png",
+        "tests/test_headless.py",
+        "tests/test_routes.py",
+        "tests/test_update_merge.py"
+      ],
       "icon": true,
       "path": "capabilities/callva",
       "payload_sha256": "f01b82b8786e88a6f59ec8c462144a56c36d1c2c23c59ba9d5935ee5b51d34b1",
@@ -82,6 +232,18 @@
       "version": "2026-11-04 — `callva issues` carries the optional `stack` field"
     },
     "callvatest": {
+      "executable": [
+        "bin/callvatest"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/callvatest",
+        "guides/exploring.md",
+        "guides/judging.md",
+        "guides/scenario-authoring.md",
+        "guides/sessions.md",
+        "tests/test_explore.py"
+      ],
       "icon": false,
       "path": "capabilities/callvatest",
       "payload_sha256": "6dd435e07ccdc51a69da8c9e05ccb82a25cde04625c3a8623770e74e30089388",
@@ -91,6 +253,15 @@
       "version": "2026-10-31 — `callvatest help` names the agent's vault in the credential cascade"
     },
     "clickup": {
+      "executable": [
+        "bin/clickup"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/clickup",
+        "icon.png",
+        "tests/test_find_exact_key.py"
+      ],
       "icon": true,
       "path": "capabilities/clickup",
       "payload_sha256": "a8ca309cfd43d6f8299e075589eb85bb6b06728752308b5c47b34e3e73569d06",
@@ -100,6 +271,17 @@
       "version": "2026-10-31 — `clickup` reads a connection's token from the agent's vault as well"
     },
     "context": {
+      "executable": [
+        "bin/context"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/context",
+        "guides/authoring.md",
+        "guides/groom.md",
+        "icon.png",
+        "tests/test_context.py"
+      ],
       "icon": true,
       "path": "capabilities/context",
       "payload_sha256": "b4afacdf02c0fbe3159a0f96f2e372b8d915700bffacea0b809ce0b0f017d228",
@@ -109,6 +291,58 @@
       "version": "2026-11-08 — An agent's documents go with it, at context 2.1"
     },
     "coolify": {
+      "executable": [
+        "bin/coolify"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/coolify",
+        "deviations.md",
+        "guides/bootstrap.md",
+        "guides/headless-apps.md",
+        "icon.png",
+        "tests/fixtures/c2/README.md",
+        "tests/fixtures/c2/app-create-instant.json",
+        "tests/fixtures/c2/app-create.json",
+        "tests/fixtures/c2/app-delete.json",
+        "tests/fixtures/c2/app-deploy.json",
+        "tests/fixtures/c2/app-wait.json",
+        "tests/fixtures/c2/database-delete.json",
+        "tests/fixtures/c2/deployment-get.json",
+        "tests/fixtures/c2/deployments-list.json",
+        "tests/fixtures/c2/project-create.json",
+        "tests/fixtures/c2/project-delete.json",
+        "tests/fixtures/c2/service-create.json",
+        "tests/fixtures/c2/service-delete.json",
+        "tests/fixtures/c2/service-deploy.json",
+        "tests/fixtures/c2/service-wait.json",
+        "tests/fixtures/c2/validation-422-secrets.json",
+        "tests/fixtures/c2/validation-422.json",
+        "tests/fixtures/c3/README.md",
+        "tests/fixtures/c3/app-rollback-422.json",
+        "tests/fixtures/c3/app-rollback-images-compose.json",
+        "tests/fixtures/c3/app-rollback-images.json",
+        "tests/fixtures/c3/app-rollback-skipped.json",
+        "tests/fixtures/c3/app-rollback.json",
+        "tests/fixtures/database_create_postgresql.json",
+        "tests/fixtures/database_get_postgresql.json",
+        "tests/fixtures/project_create.json",
+        "tests/test_app_management.py",
+        "tests/test_bootstrap_guide.py",
+        "tests/test_connect.py",
+        "tests/test_create_commands.py",
+        "tests/test_dashboard_url.py",
+        "tests/test_database_create.py",
+        "tests/test_deploy_loop.py",
+        "tests/test_env_commands.py",
+        "tests/test_lent_connection.py",
+        "tests/test_lifecycle_commands.py",
+        "tests/test_rollback_commands.py",
+        "tests/test_secret_hygiene.py",
+        "tests/test_server_memory.py",
+        "tests/test_service_set_compose.py",
+        "tests/test_service_set_image.py"
+      ],
       "icon": true,
       "path": "capabilities/coolify",
       "payload_sha256": "c9ae6d8a20ddde207d93a26750dddd41ac2bf32b42af9d58a3902e996ced846f",
@@ -118,6 +352,34 @@
       "version": "2026-11-07 — `coolify connect <name>` adds a connection labelled by the name, with an id from the store"
     },
     "deployment": {
+      "executable": [
+        "bin/deployment",
+        "tests/test_contextkit_installer.py"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/deployment",
+        "guides/agent-node.md",
+        "guides/bootstrap.md",
+        "guides/profiles.md",
+        "guides/standard.md",
+        "guides/targets.md",
+        "icon.png",
+        "tests/fixtures/node/README.md",
+        "tests/fixtures/node/provider.json",
+        "tests/test_agent_node.py",
+        "tests/test_automations_service.py",
+        "tests/test_checkout_profile.py",
+        "tests/test_contextkit_installer.py",
+        "tests/test_descriptor_sync.py",
+        "tests/test_host_agents.py",
+        "tests/test_machine_scope.py",
+        "tests/test_node.py",
+        "tests/test_persistent_manager.py",
+        "tests/test_service_runner.py",
+        "tests/test_shell_profile.py",
+        "tests/test_target_bundles.py"
+      ],
       "icon": true,
       "path": "capabilities/deployment",
       "payload_sha256": "ab856692edc619ead11be539b6a8a2dfd65afce0cfb7fc539f91a26e46d48bd9",
@@ -127,6 +389,15 @@
       "version": "2026-11-08 — A project with a legacy binding deploys with no `contextkit` on the machine"
     },
     "directo": {
+      "executable": [
+        "bin/directo"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/directo",
+        "deviations.md",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/directo",
       "payload_sha256": "fba562677b2ef99ab8a63bbed79ff6f59e8d7230bff36d133d75476a1ae0dd3d",
@@ -136,6 +407,16 @@
       "version": "2026-11-07 — A live session made under a connection's former name is found again under its id"
     },
     "emta": {
+      "executable": [
+        "bin/emta"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/emta",
+        "deviations.md",
+        "icon.png",
+        "tests/test_identifiers.py"
+      ],
       "icon": true,
       "path": "capabilities/emta",
       "payload_sha256": "17b09a27ea1ed2b220ad113d4c208b248cf280461efee782ab3b69696036a6d8",
@@ -145,6 +426,16 @@
       "version": "2026-11-07 — A stored session made under a connection's former name is found again under its id"
     },
     "fathom": {
+      "executable": [
+        "bin/fathom"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/fathom",
+        "guides/enrichment.md",
+        "guides/setup.md",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/fathom",
       "payload_sha256": "301111670c7b04116b757e9126dbcabf751196f4654f3e962aaa80c222abd139",
@@ -154,6 +445,19 @@
       "version": "2026-10-31 — `fathom help` names the agent's vault in the credential cascade"
     },
     "geminitalk": {
+      "executable": [
+        "bin/geminitalk"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/geminitalk",
+        "bin/geminitalk-audio.swift",
+        "guides/connections.md",
+        "guides/voice-session.md",
+        "icon.png",
+        "prompts/base.md",
+        "tests/test_project_overview.py"
+      ],
       "icon": true,
       "path": "capabilities/geminitalk",
       "payload_sha256": "ac0abe1d4957c0fad8bf4f371decf2f31539029e8264e29525ccf6d62ce3b5b5",
@@ -163,6 +467,16 @@
       "version": "2026-10-31 — `geminitalk help` names the agent's vault in the credential cascade"
     },
     "ical": {
+      "executable": [
+        "bin/ical"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/ical",
+        "deviations.md",
+        "icon.png",
+        "tests/test_eventkit_reliability.py"
+      ],
       "icon": true,
       "path": "capabilities/ical",
       "payload_sha256": "2f255cb110ddee998bfd4284e06baba18ca1c83eabe1ac4819d19999d82ba9b8",
@@ -172,6 +486,15 @@
       "version": "2026-10-31 — `ical` carries its own icon"
     },
     "inbox": {
+      "executable": [
+        "bin/inbox"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/inbox",
+        "service/engine.py",
+        "tests/test_inbox.py"
+      ],
       "icon": false,
       "path": "capabilities/inbox",
       "payload_sha256": "bb043a393a8604e35923356308153f85b43c2a8c7c88439d703e26831cfa35a0",
@@ -181,6 +504,16 @@
       "version": "2026-11-08 — An item goes with its agent, and keeps itself when the node it was put from goes, at inbox 1.3"
     },
     "instagram": {
+      "executable": [
+        "bin/instagram"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/instagram",
+        "deviations.md",
+        "icon.png",
+        "tests/test_instagram.py"
+      ],
       "icon": true,
       "path": "capabilities/instagram",
       "payload_sha256": "9024dfca9c3831371e249bd4df48d4cab7f225e28a9fad983319e3206cf88bec",
@@ -190,6 +523,16 @@
       "version": "2026-11-07 — A session made under a connection's former name is found again under its id"
     },
     "journal": {
+      "executable": [
+        "bin/journal"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/journal",
+        "guides/enrichment.md",
+        "guides/setup.md",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/journal",
       "payload_sha256": "f8ac6c03eec51f9cceb0ee3922240c5164e5c271776d06d2064ac9d0763d5d7f",
@@ -199,6 +542,16 @@
       "version": "2026-10-31 — `journal` carries its own icon"
     },
     "macmail": {
+      "executable": [
+        "bin/macmail"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/macmail",
+        "deviations.md",
+        "icon.png",
+        "tests/test_macmail_reliability.py"
+      ],
       "icon": true,
       "path": "capabilities/macmail",
       "payload_sha256": "3b33f4d81ac3b294474ad5ef19499720c7bc4433d23b6d041ce7e5b3af5af52b",
@@ -208,6 +561,17 @@
       "version": "2026-10-31 — `macmail` carries its own icon"
     },
     "mailbox": {
+      "executable": [
+        "bin/mailbox"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/mailbox",
+        "icon.png",
+        "tests/test_draft.py",
+        "tests/test_send_body.py",
+        "tests/test_sent_copy.py"
+      ],
       "icon": true,
       "path": "capabilities/mailbox",
       "payload_sha256": "cc37464b3f1b0fddce8eebb610645852ea64fe126328d781e8c3e38864d94dc6",
@@ -217,6 +581,28 @@
       "version": "2026-11-06 — `mailbox draft` saves a letter into Drafts without sending it"
     },
     "memory": {
+      "executable": [
+        "bin/memory",
+        "tests/fakes/claude"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/memory",
+        "deviations.md",
+        "engine.py",
+        "guides/adoption.md",
+        "guides/service.md",
+        "guides/writing.md",
+        "icon.png",
+        "tests/_cli.py",
+        "tests/fakes/claude",
+        "tests/test_adopt.py",
+        "tests/test_cli.py",
+        "tests/test_groom.py",
+        "tests/test_memory_folder.py",
+        "tests/test_pure.py",
+        "tests/test_store.py"
+      ],
       "icon": true,
       "path": "capabilities/memory",
       "payload_sha256": "5971b502e72b11d1023be15ed5aa66e20f9ec57084ada8d98978bb91d542a481",
@@ -226,6 +612,14 @@
       "version": "2026-11-08 — Entries and events go with their agent and keep themselves when their node goes, at memory 2.1"
     },
     "notion": {
+      "executable": [
+        "bin/notion"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/notion",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/notion",
       "payload_sha256": "a9812da1946218ca8ee2b9910a432c547e2e5dc49647a3e34dddc03ec93cdc3b",
@@ -235,6 +629,16 @@
       "version": "2026-10-31 — `notion` reads a connection's token from the agent's vault as well"
     },
     "railwayc": {
+      "executable": [
+        "bin/railwayc"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/railwayc",
+        "deviations.md",
+        "icon.png",
+        "tests/test_railwayc.py"
+      ],
       "icon": true,
       "path": "capabilities/railwayc",
       "payload_sha256": "a1747789b46ce23ee63a5ef2aea21183ee223564eac583a414d00f36007eab4d",
@@ -244,6 +648,19 @@
       "version": "2026-10-31 — `railwayc help` names the agent's vault in the credential cascade"
     },
     "rclonec": {
+      "executable": [
+        "bin/rclonec"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/rclonec",
+        "deviations.md",
+        "guides/google-drive.md",
+        "guides/install.md",
+        "guides/s3.md",
+        "icon.png",
+        "tests/test_rclonec.py"
+      ],
       "icon": true,
       "path": "capabilities/rclonec",
       "payload_sha256": "f429737040e07d15ef3a86cc2326ed85e165aed5a156956fc25765b9ffd08ab2",
@@ -253,6 +670,14 @@
       "version": "2026-11-07 — The remote is named for the connection's label, so `<label>:path` keeps working"
     },
     "resend": {
+      "executable": [
+        "bin/resend"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/resend",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/resend",
       "payload_sha256": "8514042d0218683b5c52f4f8d30f2b06a5753fb176f571c66f86abd4f6b02dd3",
@@ -262,6 +687,19 @@
       "version": "2026-10-31 — `resend help` names the agent's vault in the credential cascade"
     },
     "routine": {
+      "executable": [
+        "bin/routine"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/routine",
+        "guides/authoring.md",
+        "guides/groom.md",
+        "guides/harness-surfacing.md",
+        "guides/overview.md",
+        "icon.png",
+        "tests/test_routine.py"
+      ],
       "icon": true,
       "path": "capabilities/routine",
       "payload_sha256": "7d949d2848997529283ed28da14d7b5567c8fc85a805cea25a6faa4f3f1633b1",
@@ -271,6 +709,17 @@
       "version": "2026-11-08 — An agent's routines go with it, at routine 2.1"
     },
     "signoz": {
+      "executable": [
+        "bin/signoz"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/signoz",
+        "guides/connections.md",
+        "guides/queries.md",
+        "icon.png",
+        "tests/test_signoz.py"
+      ],
       "icon": true,
       "path": "capabilities/signoz",
       "payload_sha256": "a9ff53b4815cdc5e6cde493788613a8bdc7bd9f762a1dad17c52ae28f088897d",
@@ -280,6 +729,27 @@
       "version": "2026-10-30 — `signoz` carries its own icon"
     },
     "simplbooks": {
+      "executable": [
+        "bin/simplbooks"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/simplbooks",
+        "deviations.md",
+        "guides/id-spaces.md",
+        "guides/worklist.md",
+        "icon.png",
+        "tests/test_account_id_spaces.py",
+        "tests/test_bank_import.py",
+        "tests/test_clients_cache.py",
+        "tests/test_connection_label.py",
+        "tests/test_ledger_surface.py",
+        "tests/test_payment_sum_sign.py",
+        "tests/test_purchase_integrity.py",
+        "tests/test_read_back.py",
+        "tests/test_report_parsing.py",
+        "tests/test_session_recovery.py"
+      ],
       "icon": true,
       "path": "capabilities/simplbooks",
       "payload_sha256": "dcc3bd177ab4f0ee5d88da867b6b80d241e95c10b854043ee1917aabb33f054e",
@@ -289,6 +759,15 @@
       "version": "2026-11-07 — A named connection's session made under a connection's former name is found again under its id"
     },
     "skyscanner": {
+      "executable": [
+        "bin/skyscanner"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/skyscanner",
+        "guides/oxylabs.md",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/skyscanner",
       "payload_sha256": "d1a8d8320f9b22f8c89c1e2dc3cbfaf54278541b361dbb58971851f80412226d",
@@ -298,6 +777,43 @@
       "version": "2026-11-07 — The site rotation state made under a connection's former name is found again under its id"
     },
     "slack": {
+      "executable": [
+        "bin/slack",
+        "service/daemon.py",
+        "service/worker-bin/slack"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/slack",
+        "guides/service.md",
+        "icon.png",
+        "service/authority.py",
+        "service/daemon.py",
+        "service/dispatcher.py",
+        "service/policy.py",
+        "service/prompt.py",
+        "service/register.py",
+        "service/templates/context.md",
+        "service/templates/settings.json",
+        "service/validation.py",
+        "service/watermark.py",
+        "service/worker-bin/slack",
+        "service/workers.py",
+        "tests/conftest.py",
+        "tests/test_connection_state.py",
+        "tests/test_service_authority.py",
+        "tests/test_service_daemon_helpers.py",
+        "tests/test_service_dispatcher.py",
+        "tests/test_service_policy.py",
+        "tests/test_service_process.py",
+        "tests/test_service_prompt.py",
+        "tests/test_service_register.py",
+        "tests/test_service_shim.py",
+        "tests/test_service_validation.py",
+        "tests/test_service_watermark.py",
+        "tests/test_service_workers.py",
+        "tests/test_slack_cli.py"
+      ],
       "icon": true,
       "path": "capabilities/slack",
       "payload_sha256": "5048170a99d6d1258bae5f7ed01bf65c9fb0ac36abb3ec723a474444bd7e2cbd",
@@ -307,6 +823,23 @@
       "version": "2026-11-07 — A connection is named by its id"
     },
     "slacker": {
+      "executable": [
+        "bin/slacker"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/slacker",
+        "guides/linking.md",
+        "guides/operational-model.md",
+        "icon.png",
+        "service/settings.json",
+        "tests/_cli.py",
+        "tests/test_capture.py",
+        "tests/test_connection_state.py",
+        "tests/test_link.py",
+        "tests/test_parsing.py",
+        "tests/test_store.py"
+      ],
       "icon": true,
       "path": "capabilities/slacker",
       "payload_sha256": "e6fc7397a71622f655cab561f1b7e6f5d7e12867294123603362f6783a819465",
@@ -316,6 +849,14 @@
       "version": "2026-11-07 — A connection is named by its id"
     },
     "stripe": {
+      "executable": [
+        "bin/stripe"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/stripe",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/stripe",
       "payload_sha256": "4fbeb1d66eb9a0422b8d575b91e11da5f93fc255e5d1aa4df36128bd1712a34e",
@@ -325,6 +866,62 @@
       "version": "2026-10-31 — `stripe help` names the agent's vault in the credential cascade"
     },
     "tasks": {
+      "executable": [
+        "bin/tasks",
+        "tests/fakes/claude"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/tasks",
+        "guides/loops.md",
+        "guides/purpose.md",
+        "guides/workers.md",
+        "icon.png",
+        "service/daemon.py",
+        "service/templates/config.toml",
+        "service/templates/machine.toml",
+        "tests/_cli.py",
+        "tests/conftest.py",
+        "tests/fakes/claude",
+        "tests/fakes/schema_of_the_previous_release.sql",
+        "tests/test_actor.py",
+        "tests/test_assigned.py",
+        "tests/test_blocked_by.py",
+        "tests/test_conveyor.py",
+        "tests/test_cross_project.py",
+        "tests/test_derived_in_progress.py",
+        "tests/test_dispatcher.py",
+        "tests/test_escalation.py",
+        "tests/test_handlers.py",
+        "tests/test_hold_awake.py",
+        "tests/test_hooks.py",
+        "tests/test_inbox.py",
+        "tests/test_lines.py",
+        "tests/test_machine.py",
+        "tests/test_meta_set.py",
+        "tests/test_no_connection.py",
+        "tests/test_pause.py",
+        "tests/test_profiles_store.py",
+        "tests/test_project_scope.py",
+        "tests/test_read_only_switch.py",
+        "tests/test_runs_by_ref.py",
+        "tests/test_scan_rollup.py",
+        "tests/test_service.py",
+        "tests/test_store_handoff.py",
+        "tests/test_store_move.py",
+        "tests/test_store_outage.py",
+        "tests/test_structural.py",
+        "tests/test_survey_read.py",
+        "tests/test_task_node.py",
+        "tests/test_turns_outlive.py",
+        "tests/test_waiting.py",
+        "tests/test_watch.py",
+        "tests/test_worker_declared.py",
+        "tests/test_worker_scope.py",
+        "tests/test_workers_store.py",
+        "workers/default.md",
+        "workers/supervisor.md"
+      ],
       "icon": true,
       "path": "capabilities/tasks",
       "payload_sha256": "35d1c6f5575e81cf4703b5f5a099d5c046ce3de770c88677c821f1a65143e08d",
@@ -334,6 +931,14 @@
       "version": "2026-11-08 — Tasks, lanes and presences go with their agent; executions keep themselves when their node or version goes, at tasks 2.1"
     },
     "teams": {
+      "executable": [
+        "bin/teams"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/teams",
+        "tests/test_teams.py"
+      ],
       "icon": false,
       "path": "capabilities/teams",
       "payload_sha256": "b6f59c817e53c8f7af2aa8ca8313e04b8741d7b10b9f128df0de6d5b17920706",
@@ -343,6 +948,75 @@
       "version": "2026-11-08 — A membership goes with its agent, at teams 1.1"
     },
     "telegram": {
+      "executable": [
+        "bin/telegram",
+        "service/call_recorder.py",
+        "service/daemon.py",
+        "service/profiles.py",
+        "service/worker-bin/telegram"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/telegram",
+        "deviations.md",
+        "guides/assistant-service.md",
+        "guides/message-storage.md",
+        "icon.png",
+        "service/call_recorder.py",
+        "service/call_recording_helpers.py",
+        "service/channels.py",
+        "service/daemon.py",
+        "service/forum.py",
+        "service/gate.py",
+        "service/gemini/templates/voice-agent.md",
+        "service/gptlive/__init__.py",
+        "service/gptlive/prompts/delegation.md",
+        "service/gptlive/session.py",
+        "service/gptlive/templates/backend.md",
+        "service/gptlive/templates/delegation.md",
+        "service/gptlive/templates/voice-agent.md",
+        "service/jobs.py",
+        "service/profiles.py",
+        "service/profiles/telegram-claude.toml",
+        "service/profiles/telegram-codex.toml",
+        "service/profiles/telegram-gate-claude.toml",
+        "service/profiles/telegram-gate-codex.toml",
+        "service/prompts.py",
+        "service/records.py",
+        "service/rich_text.py",
+        "service/settings_schema.py",
+        "service/templates/context.md",
+        "service/templates/delegation.md",
+        "service/templates/job-worker.md",
+        "service/templates/settings.json",
+        "service/voice_agent.py",
+        "service/worker-bin/telegram",
+        "service/workers.py",
+        "tests/_agents.py",
+        "tests/_cli.py",
+        "tests/_harness.py",
+        "tests/codex-app-server-events.json",
+        "tests/test_account_linked.py",
+        "tests/test_app_check.py",
+        "tests/test_assistant_service.py",
+        "tests/test_call_recorder_delivery.py",
+        "tests/test_connections_keys.py",
+        "tests/test_daemon_launch_env.py",
+        "tests/test_forwarded_messages.py",
+        "tests/test_gptlive_voice_agent.py",
+        "tests/test_job_register.py",
+        "tests/test_job_runner.py",
+        "tests/test_outbound_actions.py",
+        "tests/test_profiles.py",
+        "tests/test_project_layout.py",
+        "tests/test_prompts.py",
+        "tests/test_reply_gate.py",
+        "tests/test_rich_messages.py",
+        "tests/test_service_records.py",
+        "tests/test_session_state.py",
+        "tests/test_settings_schema.py",
+        "tests/test_voice_agent.py"
+      ],
       "icon": true,
       "path": "capabilities/telegram",
       "payload_sha256": "f796a55244f98c2f436e6f529b3e3ee455204f4976da9269293f5996b209782f",
@@ -352,6 +1026,47 @@
       "version": "2026-11-08 — The register, jobs and prompts go with their agent, and a job's slots and amendments with their job, at telegram 3.1"
     },
     "telegrambot": {
+      "executable": [
+        "bin/telegrambot",
+        "service/worker-bin/telegrambot"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/telegrambot",
+        "deviations.md",
+        "guides/assistant-service.md",
+        "service/dialogue.py",
+        "service/engine.py",
+        "service/gate.py",
+        "service/jobs.py",
+        "service/profiles.py",
+        "service/profiles/telegrambot-claude.toml",
+        "service/profiles/telegrambot-codex.toml",
+        "service/profiles/telegrambot-gate-claude.toml",
+        "service/profiles/telegrambot-gate-codex.toml",
+        "service/profiles/telegrambot-job-claude.toml",
+        "service/profiles/telegrambot-job-codex.toml",
+        "service/settings_schema.py",
+        "service/store.py",
+        "service/templates/behaviour.md",
+        "service/templates/delegation.md",
+        "service/templates/job-behaviour.md",
+        "service/templates/job-mechanics.md",
+        "service/templates/mechanics.md",
+        "service/transport.py",
+        "service/worker-bin/telegrambot",
+        "tests/_agents.py",
+        "tests/_cli.py",
+        "tests/test_cli.py",
+        "tests/test_dialogue.py",
+        "tests/test_history.py",
+        "tests/test_jobs.py",
+        "tests/test_service.py",
+        "tests/test_settings.py",
+        "tests/test_store.py",
+        "tests/test_transport.py",
+        "tests/test_worker_bin.py"
+      ],
       "icon": false,
       "path": "capabilities/telegrambot",
       "payload_sha256": "d58f1bc88e86f2dd923b3c577ee3ebde563fa1f9945778b8f0ed331cacedc892",
@@ -361,6 +1076,18 @@
       "version": "2026-11-08 — Channels, jobs and prompts go with their agent, at telegrambot 2.1"
     },
     "vapic": {
+      "executable": [
+        "bin/vapic"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/vapic",
+        "deviations.md",
+        "guides/connections.md",
+        "guides/official-cli.md",
+        "icon.png",
+        "tests/test_resilience.py"
+      ],
       "icon": true,
       "path": "capabilities/vapic",
       "payload_sha256": "9abf20d15bd13fd87f20c181b0d3ef2aa65246abbc0318e430afffb90e693b63",
@@ -370,6 +1097,47 @@
       "version": "2026-10-31 — `vapic help` names the agent's vault in the credential cascade"
     },
     "whatsapp": {
+      "executable": [
+        "bin/whatsapp",
+        "service/worker-bin/whatsapp",
+        "tests/test_history_chunks.py"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/whatsapp",
+        "deviations.md",
+        "guides/assistant-service.md",
+        "guides/message-storage.md",
+        "guides/operational-model.md",
+        "guides/sending.md",
+        "icon.png",
+        "service/dialogue.py",
+        "service/jobs.py",
+        "service/profiles.py",
+        "service/profiles/whatsapp-claude.toml",
+        "service/profiles/whatsapp-codex.toml",
+        "service/profiles/whatsapp-job-claude.toml",
+        "service/profiles/whatsapp-job-codex.toml",
+        "service/settings_schema.py",
+        "service/templates/context.md",
+        "service/templates/delegation.md",
+        "service/templates/job-worker.md",
+        "service/templates/settings.json",
+        "service/worker-bin/whatsapp",
+        "tests/_cli.py",
+        "tests/test_dialogue.py",
+        "tests/test_history_chunks.py",
+        "tests/test_jobs.py",
+        "tests/test_legacy_import.py",
+        "tests/test_liveness.py",
+        "tests/test_outbound.py",
+        "tests/test_pair_link.py",
+        "tests/test_prompts.py",
+        "tests/test_service.py",
+        "tests/test_session_state.py",
+        "tests/test_store_and_reads.py",
+        "tests/test_voice.py"
+      ],
       "icon": true,
       "path": "capabilities/whatsapp",
       "payload_sha256": "a1cb30db1635e1c159f2ce44f7f86bb8e99ab812522709d5b20412aa2a638c70",
@@ -379,6 +1147,19 @@
       "version": "2026-11-08 — The register, jobs and prompts go with their agent, and a job's slots and amendments with their job, at whatsapp 2.3"
     },
     "windmill": {
+      "executable": [
+        "bin/windmill"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/windmill",
+        "guides/data-tables.md",
+        "guides/operational.md",
+        "guides/provisioning.md",
+        "guides/scheduled-orchestration.md",
+        "guides/script-authoring.md",
+        "icon.png"
+      ],
       "icon": true,
       "path": "capabilities/windmill",
       "payload_sha256": "15e29271b88c0c10837b3217fede66ebfcc8905e4b1f4fa1bb966c421ab10c2b",
@@ -388,6 +1169,16 @@
       "version": "2026-11-07 — `inventory` names a connection by its label"
     },
     "youtrack": {
+      "executable": [
+        "bin/youtrack"
+      ],
+      "files": [
+        "CHANGELOG.md",
+        "bin/youtrack",
+        "guides/articles.md",
+        "icon.png",
+        "tests/test_youtrack.py"
+      ],
       "icon": true,
       "path": "capabilities/youtrack",
       "payload_sha256": "2a285a36db57075523b4e011cb5dca640171c216bc061a5197220c7a3575e6c2",
@@ -397,5 +1188,6 @@
       "version": "2026-10-31 — `youtrack` reads a connection's token from the agent's vault as well"
     }
   },
+  "contract_library": "0.45.0",
   "store_major": 4
 }

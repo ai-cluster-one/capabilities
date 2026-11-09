@@ -196,12 +196,25 @@ MACHINE VERBS
   update [<name>]
         Re-fetch one capability (or all) from its recorded source; refresh
         snapshots; regenerate the skill.
-        Install, update and the release that reconciles this machine bring
+        A capability whose installed catalogue hash is the one its source's
+        catalogue names, under the store's major, is not fetched or replaced
+        and answers {name, changed: false}; its contract library alone may
+        move, as below. Otherwise a capability from a catalogue URL is fetched
+        alone, file by file as its catalogue entry lists them, and verified
+        against its payload_sha256, else from the source archive; the
+        catalogue is fetched once per run. Its dependencies are synced only
+        where the script's PEP 723 block changed.
+        Install and the release that reconciles this machine bring
         capabilities-contract in each capability's environment to the newest
-        release its declared range admits (uv sync --script), so a release of
-        the shared code reaches an installed capability without an edit to
-        it; where uv cannot, a warning says so and the capability runs on the
-        library it has.
+        release its declared range admits (uv sync --script). Update brings
+        each environment holding an older one to the release the catalogue
+        names (contract_library, the one the package ships with; the official
+        catalogue's where a source's names none), where the capability's
+        declared range admits it, and answers that row's contract_library
+        {installed, available}; so a release of the shared code reaches an
+        installed capability without an edit to it once the package records
+        it. Where the range does not admit it, or uv cannot move to it, a
+        warning says so and the capability runs on the library it has.
         Install, update and the release that reconciles this machine run
         `<name> migrate` once the payload is in place, when its manifest
         declares tables in the machine's store, and report it as `migrate`
@@ -254,16 +267,18 @@ MACHINE VERBS
         Report, for every installed capability or the one named, whether
         `update` would change it: its recorded source carries a different
         payload, or an environment it runs in holds an older capabilities-contract
-        than the release `update` would bring it to. Writes no registry entry,
-        snapshot, skill or environment; the only things it may bring forward are
-        a registered source's cache, the tree `search` reads, and uv's own
-        package cache. Payloads are compared
-        by their catalogue hash - the generated catalogue's payload_sha256,
-        recomputed for the installed copy - and versions are the newest heading
-        of each change log, null where none can be read. The contract library
-        is asked of uv as a dry run of the sync `update` runs, so a release its
-        resolver does not admit, an environment not made yet, or no uv on PATH
-        leaves it current. JSON {checked: [{name, source,
+        than the release its catalogue names, which `update` would bring it to.
+        Writes no registry entry, snapshot, skill or environment; the only
+        things it may bring forward are a registered source's cache and the
+        tree `search` reads. It looks only at installed capabilities and
+        fetches each catalogue once, asking no package index. Payloads are
+        compared by their catalogue hash - the generated catalogue's
+        payload_sha256, recomputed for the installed copy - and versions are
+        the newest heading of each change log, the catalogue entry's version
+        where it carries one, null where none can be read. The contract
+        library held is read from each environment on disk, so a release the
+        catalogue does not name, one the declared range does not admit, an
+        environment not made yet, or no uv on PATH leaves it current. JSON {checked: [{name, source,
         installed {catalog_sha256, version, source_commit?},
         available {catalog_sha256, version} | null,
         contract_library? {installed, available}, update_available,
@@ -449,7 +464,13 @@ MACHINE VERBS
         The catalogue (.capability-source/catalog.json) answers alone what a
         source holds and what is newest: each capability's entry carries path,
         summary, icon, tier (core or standard), version (the newest heading of
-        its change log, null without one), payload_sha256 and store_major.
+        its change log, null without one), payload_sha256, store_major, and
+        files and executable, the files its payload hash covers and which are
+        executable, by which `update` fetches it alone. The catalogue of a
+        tree carrying the manager also names contract_library, the
+        capabilities-contract release the package ships with
+        (CONTRACT_LIBRARY_RELEASE in that manager), the one `update` brings
+        installed capabilities to.
   source verify ID --ref REF [--base REF]
         Verify one immutable Git tree. With --base, derive the direct manager and
         capability checks from the diff; without it, use the full safe fallback.
@@ -2807,6 +2828,12 @@ _ASSET_ROOT = _REPO_ROOT if (_REPO_ROOT / "SHEBANG.md").is_file() \
 # that admits a version older than the first to carry the shared code.
 CONTRACT_LIBRARY = "capabilities-contract"
 CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
+# The capabilities-contract release this package ships with. `source index`
+# stamps it into the catalogue as contract_library, and `update` brings each
+# installed capability's environments to it where the capability's declared
+# range admits it, so a library release reaches installed capabilities once
+# the package records it here - and marks nothing behind before.
+CONTRACT_LIBRARY_RELEASE = "0.45.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -5098,6 +5125,79 @@ def _fetch_catalogue_bundle(name: str, script_url: str) -> tuple[bytes, Path, Pa
         raise
 
 
+def _fetch_listed_bundle(name: str, script_url: str, catalog: dict
+                         ) -> tuple[bytes, Path, Path] | None:
+    """Fetch one capability alone: each file its catalogue entry lists
+    (files, executable), from the tree its script URL is in, laid out as that
+    tree lays it out with the catalogue beside it, and verified against the
+    entry's payload_sha256. None where the entry lists no files or anything
+    fails or does not match, so the caller fetches the archive instead."""
+    import concurrent.futures
+    from urllib.parse import quote
+    entries = catalog.get("capabilities") if isinstance(catalog, dict) else None
+    entry = entries.get(name) if isinstance(entries, dict) else None
+    script_tail = f"/bin/{name}"
+    if not isinstance(entry, dict) or not script_url.endswith(f"/capabilities/{name}{script_tail}"):
+        return None
+    files, executable = entry.get("files"), entry.get("executable") or []
+    if (not isinstance(files, list) or f"bin/{name}" not in files
+            or not isinstance(executable, list) or not entry.get("payload_sha256")):
+        return None
+    for rel in files:
+        parts = rel.split("/") if isinstance(rel, str) else [""]
+        if (not rel or rel.startswith("/") or "\\" in rel
+                or any(part in ("", ".", "..") for part in parts)):
+            return None
+    base = script_url[:-len(script_tail)]
+    httpx = _httpx()
+    tmp_root = Path(tempfile.mkdtemp(prefix="capabilities-bundle-"))
+    bundle = tmp_root / "capabilities" / name
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0) as client:
+            def get(rel: str) -> tuple[str, bytes | None]:
+                try:
+                    resp = client.get(f"{base}/{quote(rel)}")
+                except httpx.HTTPError:
+                    return rel, None
+                return rel, resp.content if resp.status_code == 200 else None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+                fetched = list(pool.map(get, files))
+        for rel, body in fetched:
+            if body is None:
+                raise ValueError(rel)
+            target = bundle / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body)
+            os.chmod(target, 0o755 if rel in executable else 0o644)
+        if _payload_sha256(bundle) != entry["payload_sha256"]:
+            raise ValueError("payload_sha256")
+        (tmp_root / ".capability-source").mkdir()
+        _write_json(tmp_root / ".capability-source" / "catalog.json", catalog)
+        return (bundle / "bin" / name).read_bytes(), tmp_root, bundle
+    except Exception:  # noqa: BLE001 - any failure falls back to the archive
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        return None
+
+
+def _resolve_update_source(name: str, source: str, catalogues: dict
+                           ) -> tuple[bytes, str, Path | None, Path | None]:
+    """`_resolve_source` for what `update` takes: from a catalogue URL, the
+    capability alone by the files its entry in that catalogue (fetched once
+    per run) lists, else the archive as `_resolve_source` fetches it."""
+    script_rel = f"/capabilities/{name}/bin/{name}"
+    if re.match(r"^https?://", source) and source.endswith(script_rel):
+        base = source[:-len(script_rel)]
+        if base not in catalogues:
+            catalogues[base] = _captured(
+                _fetch_json, f"{base}/.capability-source/catalog.json", "catalogue")
+        catalog = catalogues[base][0]
+        listed = _fetch_listed_bundle(name, source, catalog) if catalog is not None else None
+        if listed is not None:
+            content, tmp_root, bundle = listed
+            return content, source, bundle, tmp_root
+    return _resolve_source(name, source)
+
+
 def _resolve_source(name: str, from_ref: str | None) -> tuple[bytes, str, Path | None, Path | None]:
     """Return (script bytes, recorded source string, bundle dir, temp root)."""
     if from_ref and not re.match(r"^https?://", from_ref):
@@ -5438,13 +5538,17 @@ def _contract_library_paths(script: Path) -> list[Path]:
     return paths
 
 
-def _contract_library_sync(uv: str, path: Path, library: str | None = None) -> list[str]:
+def _contract_library_sync(uv: str, path: Path, library: str | None = None,
+                           release: str | None = None) -> list[str]:
     """The uv call that brings one environment's contract library to the
     newest release the script's declared range admits - and, where the release
     line the payload came from names the library range it reads (`library`),
-    the newest inside that range too: uv takes a requirement given to
-    --upgrade-package as a constraint on the resolution."""
+    the newest inside that range too - or, given `release`, to that release:
+    uv takes a requirement given to --upgrade-package as a constraint on the
+    resolution."""
     upgrade = f"{CONTRACT_LIBRARY}{library}" if library else CONTRACT_LIBRARY
+    if release is not None:
+        upgrade = f"{CONTRACT_LIBRARY}=={release}"
     return [uv, "sync", "--quiet", "--script", str(path),
             "--upgrade-package", upgrade, "--refresh-package", CONTRACT_LIBRARY]
 
@@ -5474,37 +5578,146 @@ def _refresh_contract_library(script: Path, library: str | None = None) -> None:
             _warn(f"{path}: {CONTRACT_LIBRARY} was not refreshed: {detail}")
 
 
-def _contract_library_behind(script: Path, library: str | None = None) -> dict | None:
-    """What `_refresh_contract_library` would move, asked of uv as a dry run of
-    the same call.
-
-    {installed, available} for the oldest environment that holds an older
-    contract library than the release uv would bring it to; None where
-    `update` would leave every environment where it is - no uv, a resolver
-    that admits nothing newer, an environment not made yet - or where uv
-    cannot answer."""
+def _library_release_version(value: object) -> str | None:
+    """A capabilities-contract release as a catalogue or a manager names it,
+    where it names a valid version."""
     from packaging.version import InvalidVersion, Version
-    uv = shutil.which("uv")
-    if uv is None:
+    if not isinstance(value, str) or not value.strip():
         return None
-    behind = None
+    try:
+        return str(Version(value.strip()))
+    except InvalidVersion:
+        return None
+
+
+def _catalogue_library(catalog: object, catalogues: dict) -> str | None:
+    """The capabilities-contract release `update` brings a capability's
+    environments to: the one its catalogue names (contract_library), else the
+    one the official catalogue names, fetched once per run, unless its
+    catalogue is a kept line's that names a library range; None where neither
+    names one."""
+    own = _library_release_version(catalog.get("contract_library")) \
+        if isinstance(catalog, dict) else None
+    if own is not None:
+        return own
+    # A line kept for an older major reads the library through its own range,
+    # which the official catalogue's release is not judged against.
+    if isinstance(catalog, dict) and catalog.get("library"):
+        return None
+    if SOURCE not in catalogues:
+        catalogues[SOURCE] = _captured(
+            _fetch_json, f"{SOURCE}/.capability-source/catalog.json", "catalogue")
+    official = catalogues[SOURCE][0]
+    return _library_release_version(official.get("contract_library")) \
+        if isinstance(official, dict) else None
+
+
+def _contract_library_admits(script: Path, release: str, library: str | None) -> bool:
+    """Whether the capabilities-contract range the script declares - and the
+    range its release line names (`library`), where it names one - admit
+    `release`."""
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from packaging.utils import canonicalize_name
+    from packaging.version import Version
+    try:
+        deps = _script_dependencies(script.read_text())
+    except (OSError, UnicodeDecodeError):
+        return False
+    version = Version(release)
+    declared = False
+    for dep in deps or []:
+        try:
+            req = Requirement(dep)
+        except InvalidRequirement:
+            continue
+        if canonicalize_name(req.name) != CONTRACT_LIBRARY:
+            continue
+        declared = True
+        if not req.specifier.contains(version, prereleases=True):
+            return False
+    if not declared:
+        return False
+    if library:
+        try:
+            return SpecifierSet(library).contains(version, prereleases=True)
+        except InvalidSpecifier:
+            return False
+    return True
+
+
+def _contract_library_in(path: Path, environments: Path | None = None) -> str | None:
+    """The capabilities-contract version the environment uv runs `path` in
+    holds, read from that environment's installed distribution; None where uv
+    has made none yet or it holds none."""
+    from packaging.version import InvalidVersion, Version
+    folder = _uv_script_environment(path, environments)
+    if folder is None:
+        return None
+    prefix = CONTRACT_LIBRARY.replace("-", "_") + "-"
+    found = []
+    for dist in folder.glob(f"lib/python*/site-packages/{prefix}*.dist-info"):
+        try:
+            found.append(Version(dist.name[len(prefix):-len(".dist-info")]))
+        except InvalidVersion:
+            continue
+    return str(max(found)) if found else None
+
+
+def _contract_library_behind(script: Path, release: str | None, library: str | None = None,
+                             environments: Path | None = None) -> dict | None:
+    """What `update` would move: {installed, available} where an environment
+    the capability runs in holds an older capabilities-contract than
+    `release`, the one its catalogue names, and the capability's declared
+    range admits it (`_contract_library_admits`) - installed the oldest held,
+    available the release. None where nothing would move: no release named,
+    one outside the range, every environment at it or past it, or none made
+    yet. Reads the environments on disk and asks no index."""
+    from packaging.version import Version
+    if release is None or not _contract_library_admits(script, release, library):
+        return None
+    held = [_contract_library_in(path, environments) for path in _contract_library_paths(script)]
+    behind = [Version(v) for v in held if v is not None and Version(v) < Version(release)]
+    return {"installed": str(min(behind)), "available": release} if behind else None
+
+
+def _bring_contract_library(script: Path, release: str | None,
+                            library: str | None = None) -> dict | None:
+    """Bring each environment an installed capability runs in that holds an
+    older capabilities-contract than `release`, the one its catalogue names,
+    to that release; an environment at it or past it, or not made yet, is
+    left alone. Where the declared range does not admit it, or uv cannot move
+    to it, the environment keeps what it holds and a warning says so.
+    Answers {installed, available} where it moved one, installed the oldest
+    it held before; else None."""
+    from packaging.version import Version
+    uv = shutil.which("uv")
+    if uv is None or release is None:
+        return None
+    environments = _uv_environments()
+    admitted = _contract_library_admits(script, release, library)
+    moved = []
     for path in _contract_library_paths(script):
+        held = _contract_library_in(path, environments)
+        if held is None or Version(held) >= Version(release):
+            continue
+        if not admitted:
+            _warn(f"{path}: {CONTRACT_LIBRARY} {release}, the release the catalogue names, "
+                  f"is outside the range this capability declares, so it keeps {held}")
+            continue
         try:
             proc = subprocess.run(
-                [*_contract_library_sync(uv, path, library), "--dry-run",
-                 "--output-format", "json"],
+                _contract_library_sync(uv, path, library, release),
                 capture_output=True, text=True, timeout=300, env=_snapshot_env())
-            changes = json.loads(proc.stdout)["sync"]["changes"] if proc.returncode == 0 else []
-            moved = {change["action"]: Version(change["version"]) for change in changes
-                     if change.get("name") == CONTRACT_LIBRARY}
-        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError,
-                AttributeError, InvalidVersion):
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _warn(f"{path}: {CONTRACT_LIBRARY} was not brought to {release}: {exc}")
             continue
-        held, newest = moved.get("uninstalled"), moved.get("installed")
-        if held is not None and newest is not None and held < newest:
-            if behind is None or held < Version(behind["installed"]):
-                behind = {"installed": str(held), "available": str(newest)}
-    return behind
+        if proc.returncode != 0:
+            detail = (proc.stderr.strip().splitlines() or ["uv sync failed"])[-1]
+            _warn(f"{path}: {CONTRACT_LIBRARY} was not brought to {release}: {detail}")
+            continue
+        moved.append(Version(held))
+    return {"installed": str(min(moved)), "available": release} if moved else None
 
 
 def _payload_sha256(reg: Path, script: str | None = None) -> str:
@@ -5515,15 +5728,8 @@ def _payload_sha256(reg: Path, script: str | None = None) -> str:
     payload_sha256 the generated catalogue records for its source.
     """
     h = hashlib.sha256()
-    skip = {"meta.json", "stub", "manifest.json"}
-    cache_dirs = {"__pycache__", ".pytest_cache", ".ruff_cache"}
     files = []
-    for path in (p for p in reg.rglob("*") if p.is_file()):
-        if (path.name in skip or cache_dirs.intersection(path.parts)
-                or path.suffix in {".pyc", ".pyo", ".session"}
-                or path.name.endswith((".session-journal", ".session-wal", ".session-shm"))):
-            continue
-        rel = path.relative_to(reg).as_posix()
+    for rel, path in _payload_files(reg):
         if script is not None and rel == script:
             rel = f"bin/{script}"
         files.append((reg / rel, rel, path))
@@ -5532,6 +5738,20 @@ def _payload_sha256(reg: Path, script: str | None = None) -> str:
         h.update(path.read_bytes())
         h.update(b"\0")
     return h.hexdigest()
+
+
+def _payload_files(reg: Path) -> list[tuple[str, Path]]:
+    """(relative path, path) of every file a payload hash covers, in order."""
+    skip = {"meta.json", "stub", "manifest.json"}
+    cache_dirs = {"__pycache__", ".pytest_cache", ".ruff_cache"}
+    files = []
+    for path in (p for p in reg.rglob("*") if p.is_file()):
+        if (path.name in skip or cache_dirs.intersection(path.parts)
+                or path.suffix in {".pyc", ".pyo", ".session"}
+                or path.name.endswith((".session-journal", ".session-wal", ".session-shm"))):
+            continue
+        files.append((path.relative_to(reg).as_posix(), path))
+    return sorted(files)
 
 
 def _symlink(name: str, script: Path) -> Path:
@@ -5935,12 +6155,13 @@ def cmd_update(name: str | None) -> None:
     results = []
     here = _store_major_here()
     catalogues: dict = {}
+    refreshed: dict = {}
     # deployment goes first: where its new payload no longer has the runner,
     # the machine is moved off the runner's agents before anything is replaced.
     for n in sorted(targets, key=lambda name: name != "deployment"):
         _assert_payload_mutable(n)
         with _update_recorded(n):
-            results.append(_update_one(n, here, catalogues))
+            results.append(_update_one(n, here, catalogues, refreshed))
     _sync_skill()
     answer = {"updated": sorted(results, key=lambda entry: entry["name"]),
               "store_major": here}
@@ -6005,7 +6226,7 @@ def _update_source_choice(n: str, source: str, canonical: bool, here: dict,
     release reading the store's major - or any release where the store's
     major is unknown - is taken; from the canonical source, one reading
     another major gives way to the store's major's line, else nothing."""
-    fetched = _resolve_source(n, source)
+    fetched = _resolve_update_source(n, source, catalogues)
     release, library = _catalogue_release(
         _fetched_catalogue(n, fetched[1], fetched[2], catalogues), n)
     store = here["store"]
@@ -6017,7 +6238,7 @@ def _update_source_choice(n: str, source: str, canonical: bool, here: dict,
     line = _store_line_source(source[:-len(script_rel)], store) \
         if canonical and source.endswith(script_rel) else None
     if line is not None:
-        found, _error = _captured(_resolve_source, n, line + script_rel)
+        found, _error = _captured(_resolve_update_source, n, line + script_rel, catalogues)
         if found is not None:
             line_release, line_library = _catalogue_release(
                 _fetched_catalogue(n, found[1], found[2], catalogues), n)
@@ -6028,12 +6249,30 @@ def _update_source_choice(n: str, source: str, canonical: bool, here: dict,
     return None, _store_major_field(here, release, "installed", line), None
 
 
-def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None) -> dict:
+def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None,
+                refreshed: dict | None = None) -> dict:
     """Update one installed capability from its recorded source, taking only
-    a release that reads the store's major (`_update_source_choice`)."""
+    a release that reads the store's major (`_update_source_choice`).
+
+    Where the catalogue hash its source names is the installed copy's, under
+    the store's major, nothing is fetched or replaced: the only thing that
+    may move is the contract library, to the release the catalogue names
+    (`_bring_contract_library`). Otherwise the dependencies are synced only
+    where the script's PEP 723 block changed."""
     here = here if here is not None else _store_major_here()
     catalogues = catalogues if catalogues is not None else {}
+    refreshed = refreshed if refreshed is not None else {}
     meta = _read_json(_registry_dir(n) / "meta.json") or {}
+    found, _error = _captured(_available_payload, n, meta, refreshed, catalogues)
+    if found is not None:
+        _source, available, _reader, (release, range_), target = found
+        if ((here["store"] is None or release == here["store"])
+                and available == _payload_sha256(_registry_dir(n), n)):
+            entry = {"name": n, "changed": False}
+            moved = _bring_contract_library(_script_path(n), target, range_)
+            if moved is not None:
+                entry["contract_library"] = moved
+            return entry
     source_id = meta.get("source_id")
     provenance = {}
     if source_id:
@@ -6055,7 +6294,10 @@ def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None
     # canonical source, so the next update starts from main again.
     if store_major is None:
         source = fetched_from
+    target = _catalogue_library(
+        _fetched_catalogue(n, fetched_from, bundle_dir, catalogues), catalogues)
     stage, manifest = _prepare_payload(n, content, bundle_dir, temp_root, fetched_from)
+    lock_changed = _script_metadata_block(stage / n) != _script_metadata_block(_script_path(n))
     after = _payload_sha256(stage)
     _write_json(stage / "meta.json", {
         "name": n, "source": source, "source_type": "directory" if bundle_dir else "script",
@@ -6069,8 +6311,14 @@ def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None
             shutil.rmtree(stage, ignore_errors=True)
             return {"name": n, "changed": False, "kept": kept}
     script = _activate_payload(n, stage)
-    _refresh_contract_library(script, library)
+    if lock_changed:
+        _refresh_contract_library(script, library)
+        library_moved = None
+    else:
+        library_moved = _bring_contract_library(script, target, library)
     entry = {"name": n, "changed": before != after}
+    if library_moved is not None:
+        entry["contract_library"] = library_moved
     if store_major is not None:
         entry["store_major"] = store_major
     if moved is not None:
@@ -6279,13 +6527,16 @@ def _catalogue_entry(catalog: object, name: str, where: str) -> dict:
 
 
 def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
-                       ) -> tuple[str, str, Callable[[], str | None], tuple[int, str | None]]:
+                       ) -> tuple[str, str, Callable[[], str | None], tuple[int, str | None],
+                                  str | None]:
     """Where `update` would fetch `name` from, and the payload it would find.
 
     Returns (source, catalogue hash, version reader, (store major, library
-    range) its catalogue names, as `_catalogue_release`). A registered source is
-    brought forward exactly as `update` brings it forward, once per run; a
-    catalogue URL is answered from the catalogue it publishes, fetched once.
+    range) its catalogue names, as `_catalogue_release`, and the
+    capabilities-contract release `update` would bring it to, as
+    `_catalogue_library`). A registered source is brought forward exactly as
+    `update` brings it forward, once per run; a catalogue URL is answered from
+    the catalogue it publishes, fetched once, its version from the entry.
     """
     source_id = meta.get("source_id")
     if source_id:
@@ -6301,17 +6552,18 @@ def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
         entry = _catalogue_entry(catalog, name, f"source {source_id!r}")
         return source_id, entry["payload_sha256"], \
             lambda: _changelog_version_at(capdir / CHANGELOG_NAME), \
-            _catalogue_release(catalog, name)
+            _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues)
     recorded = meta.get("source") or f"{SOURCE}/capabilities/{name}/bin/{name}"
     if not re.match(r"^https?://", recorded):
         p = Path(recorded)
         if p.is_dir():
+            catalog = _fetched_catalogue(name, recorded, p, catalogues)
             return recorded, _payload_sha256(p, name), \
                 lambda: _changelog_version_at(p / CHANGELOG_NAME), \
-                _catalogue_release(_fetched_catalogue(name, recorded, p, catalogues), name)
+                _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues)
         if p.is_file():
             return recorded, _single_script_catalogue_sha256(name, p.read_bytes()), \
-                lambda: None, _catalogue_release(None, name)
+                lambda: None, _catalogue_release(None, name), _catalogue_library(None, catalogues)
         _die(3, "not_found", f"{name}'s recorded source no longer exists: {p}")
     script_rel = f"/capabilities/{name}/bin/{name}"
     if recorded.endswith(script_rel):
@@ -6324,8 +6576,14 @@ def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
             _die(5, error.get("code", "network_error"), error.get("message", ""),
                  error.get("hint"))
         entry = _catalogue_entry(catalog, name, f"the catalogue at {base}")
-        return recorded, entry["payload_sha256"], lambda: _changelog_version_from_url(
-            f"{base}/capabilities/{name}/{CHANGELOG_NAME}"), _catalogue_release(catalog, name)
+        if "version" in entry:
+            version = entry["version"] if isinstance(entry["version"], str) else None
+            reader = lambda: version
+        else:
+            reader = lambda: _changelog_version_from_url(
+                f"{base}/capabilities/{name}/{CHANGELOG_NAME}")
+        return recorded, entry["payload_sha256"], reader, \
+            _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues)
     httpx = _httpx()
     try:
         resp = httpx.get(recorded, follow_redirects=True, timeout=30.0)
@@ -6334,7 +6592,7 @@ def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
     if resp.status_code != 200:
         _die(5, "server_error", f"fetch returned {resp.status_code}", recorded)
     return recorded, _single_script_catalogue_sha256(name, resp.content), lambda: None, \
-        _catalogue_release(None, name)
+        _catalogue_release(None, name), _catalogue_library(None, catalogues)
 
 
 def _single_script_catalogue_sha256(name: str, content: bytes) -> str:
@@ -6364,6 +6622,7 @@ def _update_check_answer(name: str | None) -> dict:
     refreshed: dict = {}
     catalogues: dict = {}
     here = _store_major_here()
+    environments = _uv_environments()
     rows = []
     for n in targets:
         reg = _registry_dir(n)
@@ -6378,20 +6637,21 @@ def _update_check_answer(name: str | None) -> dict:
         if error is not None:
             row["error"] = error
         else:
-            source, available_sha, version_reader, (release, range_) = found
+            source, available_sha, version_reader, (release, range_), target = found
             kept = False
             if here["store"] is not None and release != here["store"]:
                 found, row["store_major"] = _available_line(
                     n, meta, release, here, refreshed, catalogues)
                 kept = found is None
                 if found is not None:
-                    source, available_sha, version_reader, (_release, range_) = found
+                    source, available_sha, version_reader, (_release, range_), target = found
             behind = available_sha != installed["catalog_sha256"]
             row["source"] = source
             row["available"] = {
                 "catalog_sha256": available_sha,
                 "version": version_reader() if behind else installed["version"]}
-            library = None if kept else _contract_library_behind(_script_path(n), range_)
+            library = None if kept else _contract_library_behind(
+                _script_path(n), target, range_, environments)
             if library is not None:
                 row["contract_library"] = library
             row["update_available"] = not kept and (behind or library is not None)
@@ -6678,7 +6938,8 @@ def _tree_store_line(root: Path, declared: dict | None = None) -> dict:
 
 # The literals a source tree's own manager declares that its catalogue and
 # release manifest are stamped from, read once per tree.
-_TREE_DECLARED_NAMES = ("STORE_MAJOR", "STORE_LIBRARY", "CORE_CAPABILITIES")
+_TREE_DECLARED_NAMES = ("STORE_MAJOR", "STORE_LIBRARY", "CORE_CAPABILITIES",
+                        "CONTRACT_LIBRARY_RELEASE")
 
 
 def _tree_declared(root: Path) -> dict | None:
@@ -6713,7 +6974,9 @@ def _stamp_catalog(root: Path, entries: dict) -> dict:
     """The catalogue of a tree: its entries, each and the whole stamped with
     the store major the tree's line reads, and the library range a kept line
     names (`_tree_store_line`); each entry also with its tier, core where the
-    tree's own manager declares it core, else standard."""
+    tree's own manager declares it core, else standard; the whole also with
+    the capabilities-contract release the tree's own manager ships with
+    (contract_library), where it declares one."""
     declared = _tree_declared(root)
     line = _tree_store_line(root, declared) if declared is not None else {}
     core = (declared or {}).get("CORE_CAPABILITIES") or ()
@@ -6721,7 +6984,10 @@ def _stamp_catalog(root: Path, entries: dict) -> dict:
                       **({"store_major": line["store_major"]}
                          if "store_major" in line else {})}
                for name, entry in entries.items()}
-    return {"capabilities": entries, **line}
+    release = _library_release_version((declared or {}).get("CONTRACT_LIBRARY_RELEASE")) \
+        if (root / MANAGER_EXECUTABLE_REL).is_file() else None
+    return {"capabilities": entries, **line,
+            **({"contract_library": release} if release else {})}
 
 
 def _manager_release_payload(root: Path) -> tuple[dict | None, list[str]]:
@@ -33308,13 +33574,18 @@ def _catalog_entry_of(capdir: Path, summary: str) -> dict:
     """One capability's catalogue entry: what a reader needs to list it and
     to know whether a copy is current, with nothing installed - its summary,
     whether it has an icon, the newest heading of its change log (null where
-    it has none) and the hash of its payload; `_stamp_catalog` adds its tier."""
+    it has none) and the hash of its payload; and what fetching it alone
+    takes - the files its payload hash covers and which of them are
+    executable. `_stamp_catalog` adds its tier."""
+    files = _payload_files(capdir)
     return {
         "path": f"capabilities/{capdir.name}",
         "summary": summary,
         "payload_sha256": _payload_sha256(capdir),
         "icon": _has_icon(capdir),
         "version": _changelog_version_at(capdir / CHANGELOG_NAME),
+        "files": [rel for rel, _path in files],
+        "executable": [rel for rel, path in files if path.stat().st_mode & 0o111],
     }
 
 

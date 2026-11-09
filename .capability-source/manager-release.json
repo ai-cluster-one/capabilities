@@ -8,7 +8,7 @@
     "contract/CHANGELOG.md": "b9e2a6b9b186694d6b141c3cd1e67ef996559032c1d8a253c190e34afbd88443",
     "guides/authoring.md": "1f557d6fc130a2efd1f8b93e7cb6b978b9f1590624cd7adaa12c817d6c6cfc4a",
     "guides/conforming.md": "d2724037c42aea0d0528b429be0eb14a16b558426ee3982b4a6f541a342e7361",
-    "guides/contract.md": "3f02f4e2bec1cd978fa0402a39018b99b544978c21408190c8a977f2e6f942aa",
+    "guides/contract.md": "04c88e2b5a66d6d999ec5c782c3cd30120bc8ff0c878ea00405569bad86b00fa",
     "guides/dev.md": "b4440aefeea80efb3d8e9502193d3a73168abcb9bcd9b75a2447af4a06ca9d27",
     "guides/grooming.md": "a3ed64a86c4c0efbd2232cb42521f556452ffb1d1211f9599203360916b317bc",
     "guides/migrate-to-database.md": "859d32fb6536b1a9ab74f2bd77f826b753a748d4e1fe16218c4d341e4fe2024a",
@@ -20,12 +20,12 @@
     "guides/store-upgrade.md": "9e80c17df03ccf584d08ebc287c7ec5b6c9b4df4ddeb39ce9ae1f8559c24073b",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "adbc11184c966c32f0a5380c35ae60cbdc61b4fdca7dc56d9667529c7466e51f",
+    "manager/CHANGELOG.md": "a30af36a30e85f9d02ada96f4e82623946730a3300b952c0739fc01a0f92a795",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "aa260eede822642e6668264f26d06b407e9d25069a3a88ac61f4560188472610"
+    "sha256": "7ce79f6663025b200ddd9c00ca98cd195b252f0f1beeff9d94570d3b7fc6fd97"
   },
   "schema": "capabilities.manager-release.v1",
   "store_major": 4
