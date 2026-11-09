@@ -353,7 +353,7 @@ def test_a_project_that_disables_teams_is_refused(lab):
 def test_the_manifest_carries_a_constant_contribution_and_no_connection(lab):
     manifest = lab.ok("manifest", "--json")
     assert manifest["name"] == "teams"
-    assert manifest["contribution"]["markdown"].startswith("Teams carry instructions")
+    assert manifest["contribution"]["markdown"].startswith("`teams list` names")
     assert manifest["credentials"]["keys"] == []
     answer = lab.ok("connections")
     assert (answer["default"], answer["connections"]) == (None, {})

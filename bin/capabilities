@@ -24532,16 +24532,85 @@ def _teams_rows(root: Path) -> tuple[list[tuple], list[tuple]] | None:
         conn.close()
 
 
+_FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+_ATX_HEADING = re.compile(r"^( {0,3})(#{1,6})([ \t].*)?$")
+_SETEXT_UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
+_THEMATIC_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+_BLOCK_START = re.compile(r"^ {0,3}(?:[-+*][ \t]|\d{1,9}[.)][ \t]|>|<|\|)")
+
+
+def _shift_headings(text: str, by: int) -> str:
+    """`text` with every Markdown heading `by` levels deeper, never past
+    level 6: an ATX heading gains `by` marks, and a setext one is written as
+    the ATX heading of its new level. Nothing inside a fenced or indented code
+    block moves. Composition shifts what it inlines this way so the file keeps
+    one heading hierarchy, while the stored text stays as it was written."""
+    out: list[str] = []
+    fence = None
+    paragraph = None  # where in `out` the open paragraph starts
+    block = False     # inside a list, quote, html, table or code run until a blank line
+    for line in text.split("\n"):
+        mark = _FENCE.match(line)
+        if fence:
+            out.append(line)
+            if mark and not mark.group(2).strip() and mark.group(1)[0] == fence[0] \
+                    and len(mark.group(1)) >= len(fence):
+                fence = None
+            continue
+        if mark and not (mark.group(1)[0] == "`" and "`" in mark.group(2)):
+            fence = mark.group(1)
+            out.append(line)
+            paragraph, block = None, False
+            continue
+        if not line.strip():
+            out.append(line)
+            paragraph, block = None, False
+            continue
+        heading = _ATX_HEADING.match(line)
+        if heading:
+            level = min(len(heading.group(2)) + by, 6)
+            out.append(f"{heading.group(1)}{'#' * level}{heading.group(3) or ''}")
+            paragraph, block = None, False
+            continue
+        underline = _SETEXT_UNDERLINE.match(line)
+        if underline and paragraph is not None:
+            level = min((1 if underline.group(1)[0] == "=" else 2) + by, 6)
+            title = " ".join(part.strip() for part in out[paragraph:])
+            out[paragraph:] = [f"{'#' * level} {title}"]
+            paragraph = None
+            continue
+        out.append(line)
+        if _THEMATIC_BREAK.match(line):
+            paragraph = None
+        elif _BLOCK_START.match(line) or paragraph is None and line.startswith(("    ", "\t")):
+            paragraph, block = None, True
+        elif paragraph is None and not block:
+            paragraph = len(out) - 1
+    return "\n".join(out)
+
+
+def _team_document(name: str, body: str) -> list[str]:
+    """One always document under its team: a level-3 heading, then its text
+    shifted two levels. A document that opens with its own title keeps that
+    title as the heading; one that does not is headed by its name."""
+    shifted = _shift_headings(body.strip(), 2)
+    if re.match(r"^### ", shifted):
+        return [shifted, ""]
+    return [f"### {_md_escape(name)}", "", shifted, ""]
+
+
 def _teams_context(root: Path) -> list[str]:
-    """The part of the `teams` block that is this agent's own, composed from
-    the store at each build: every team it is a member of by its line, and for
-    a team in always mode its enabled always documents whole, each headed by
-    the team's name, and its enabled on-request documents by their line. It
-    reads nothing that changes from one session to the next, so it changes
-    only when the teams do. A command it prints quotes each name as a shell
-    word, since a name is free text. Nothing where the agent is in no team or
-    has no store; one line naming the failure where the store does not
-    answer."""
+    """The body of the Teams section, composed from the store at each build:
+    the lines that say these teams bind the agent and that its own doctrine
+    wins on conflict, then each team it is a member of under a level-2 heading
+    with its line. A team in ordinary mode adds how to read its instructions;
+    one in always mode adds its enabled always documents whole, each under a
+    level-3 heading, and its enabled on-request documents as one level-3
+    group by their line. It reads nothing that changes from one session to
+    the next, so it changes only when the teams do. A command it prints
+    quotes each name as a shell word, since a name is free text. Nothing
+    where the agent is in no team or has no store; one line naming the
+    failure where the store does not answer."""
     import psycopg
     db = _db_module()
     try:
@@ -24553,27 +24622,46 @@ def _teams_context(root: Path) -> list[str]:
     if not read or not read[0]:
         return []
     teams, documents = read
-    lines = ["This agent is a member of these teams:", ""]
+    lines = ["You are a member of the teams below, and their rules bind you. Where a team's "
+             "rule conflicts with your own doctrine further down, your own doctrine wins.", ""]
     for name, description, always in teams:
-        how = ("always in context, below" if always
-               else f"its instructions: `{TEAMS_CAPABILITY} show {shlex.quote(name)}`")
-        lines.append(f"- **{name}** - {_md_escape(description)} ({how})")
-    lines.append("")
-    for name, _description, always in teams:
+        lines += [f"## {_md_escape(name)}", ""]
         if not always:
+            lines += [f"{_md_escape(description)} Read its instructions on request: "
+                      f"`{TEAMS_CAPABILITY} show {shlex.quote(name)}`.", ""]
             continue
+        lines += [_md_escape(description), ""]
         own = [doc for doc in documents if doc[0] == name]
         for _team, doc, load, _line, body in own:
             if load == "always":
-                lines += [f"### Team {name}: {doc}", "", body.strip(), ""]
+                lines += _team_document(doc, body)
         on_request = [doc for doc in own if doc[2] == "on-request"]
         if on_request:
-            lines += [f"### Team {name}: on request", ""]
+            lines += ["### On request", ""]
             lines += [f"- `{TEAMS_CAPABILITY} doc show {shlex.quote(name)} {shlex.quote(doc)}` "
                       f"- {_md_escape(line)}"
                       for _team, doc, _load, line, _body in on_request]
             lines.append("")
     return lines
+
+
+def _teams_section(root: Path, enabled: list[str] | None = None) -> list[str]:
+    """The top-level Teams section, which stands before the agent's own
+    doctrine: present only while `teams` is enabled and installed for the
+    agent and it is in a team, or its teams cannot be read; and nothing where
+    `init` writes the context without the store it keeps its gate in."""
+    if enabled is None:
+        if _CONTEXT_WITHOUT_STORE:
+            try:
+                _policy_scopes(root)
+            except _store_module().StoreError as exc:
+                if _store_absent(exc):
+                    return []
+        enabled = _context_enabled(root)
+    if TEAMS_CAPABILITY not in enabled or _load_snapshots(TEAMS_CAPABILITY)[0] is None:
+        return []
+    body = _teams_context(root)
+    return ["# Teams", "", *body] if body else []
 
 
 # Set by `init` alone: its offline part (envelope, identity, host wiring) never
@@ -24591,6 +24679,22 @@ def _store_absent(exc) -> bool:
         exc.slug in _store_module().STORE_ENVIRONMENT_SLUGS
 
 
+def _context_enabled(root: Path, system: bool | None = None) -> list[str]:
+    """The capabilities enabled for this project's context, by name: a system
+    agent is offered only what is enabled for it - none of the global scope's
+    capabilities, and no memory."""
+    project_caps, global_caps = _policy_views(root)
+    if _is_system_agent(root) if system is None else system:
+        global_caps = {}
+        project_caps = {name: entry for name, entry in project_caps.items()
+                        if name not in SYSTEM_AGENT_WITHHELD}
+    names = set(project_caps) | set(global_caps)
+    return sorted(
+        name for name in names
+        if _effective_gate_state(name, project_caps.get(name), global_caps.get(name))[0]
+        == "enabled")
+
+
 def _compose_context(root: Path, build: bool = False) -> str:
     """Deterministic injection body: gate, snapshots, and resolved records;
     with build, the block `build` composes, whose refresh route is itself."""
@@ -24606,20 +24710,12 @@ def _compose_context(root: Path, build: bool = False) -> str:
                 f"this file was written ({exc.slug}); `capabilities context` writes it "
                 "again where the store is, as the session-start hook does.", "",
                 CONTEXT_END]) + "\n"
-    project_caps, global_caps = _policy_views(root)
     system = _is_system_agent(root)
-    if system:
-        # A system agent is offered only what is enabled for it: none of the
-        # global scope's capabilities, and no memory.
-        global_caps = {}
-        project_caps = {name: entry for name, entry in project_caps.items()
-                        if name not in SYSTEM_AGENT_WITHHELD}
-    names = set(project_caps) | set(global_caps)
-    enabled = sorted(
-        name for name in names
-        if _effective_gate_state(name, project_caps.get(name), global_caps.get(name))[0]
-        == "enabled")
-    lines: list[str] = [
+    enabled = _context_enabled(root, system)
+    # `build` places the Teams section itself, before the agent's own
+    # doctrine; a capability context on its own carries it first.
+    lines: list[str] = [] if build else _teams_section(root, enabled)
+    lines += [
         "# Capabilities", "", CONTEXT_BEGIN, "",
         CAPABILITIES_CONTEXT_INTRO, "",
     ]
@@ -24641,8 +24737,6 @@ def _compose_context(root: Path, build: bool = False) -> str:
                 continue
             lines += [_md_escape(stub), ""]
             lines += _context_contribution(name, manifest)
-            if name == TEAMS_CAPABILITY:
-                lines += _teams_context(root)
             try:
                 ids = adapter.resolve(name, "identifier")
                 refs = _context_references(adapter, root, name)
@@ -29697,6 +29791,26 @@ def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[st
     return text
 
 
+def _ck_teams_section(root: Path, capabilities_dir: Path, warnings: list[str]) -> str:
+    """The Teams section `build` places before the agent's own doctrine, or
+    nothing, with a warning where composing it failed."""
+    held = os.environ.get("CLAUDE_PROJECT_DIR")
+    os.environ["CLAUDE_PROJECT_DIR"] = str(root)
+    try:
+        code, lines, err = _ck_in_process(lambda: _teams_section(root))
+    finally:
+        if held is None:
+            os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        else:
+            os.environ["CLAUDE_PROJECT_DIR"] = held
+    if code != 0:
+        detail = _ck_one_line(err)[:300]
+        warnings.append(f"teams section omitted: composing it exited {code}"
+                        + (f": {detail}" if detail else ""))
+        return ""
+    return "\n".join(lines)
+
+
 def _ck_registry_onboarding(root: Path, with_mode: bool = False):
     """This agent's registry row's onboarding columns, read without writing;
     None where the project keeps no registry row ContextKit would read. With
@@ -29921,6 +30035,7 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     stored_routines = _ck_stored_routines(root, routines_dir, warnings, store)
     routine_index = _ck_routine_index(root, routines_dir, warnings, stored_routines)
     capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store)
+    teams = _ck_teams_section(root, layers["capabilities"], warnings) if capability_context else ""
     onboarding = _ck_onboarding(root, binding, warnings, store)
     onboarding_block = (_ck_onboarding_block(root, binding, onboarding, warnings, stored_routines)
                         if onboarding and onboarding["status"] == "pending" else "")
@@ -29993,11 +30108,14 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
                 "At the start of the session, tell the user these files were found and may affect how you work. "
                 "Keeping, migrating, or removing them is the user's decision; do not change them on your own.",
                 "", "---", ""]
+    if teams:
+        out += [teams.rstrip(), "", "---", ""]
     out += ["# Inline Context", ""]
     if inline:
         for item in inline:
             label = "Global Source" if item["source"] == "global" else "Source"
-            out += ["---", "", f"## {label}: `{_ck_reference(item)}`", "", item["body"].strip(), ""]
+            out += ["---", "", f"## {label}: `{_ck_reference(item)}`", "",
+                    _shift_headings(item["body"].strip(), 2), ""]
     else:
         out += ["No inline context files.", ""]
     stored_stubs = sum(1 for item in stubs if item.get("stored"))

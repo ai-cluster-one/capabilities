@@ -193,9 +193,9 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = "teams"
-SUMMARY = ("Teams of agents that carry shared instructions in the store - a team's line, "
-           "members and versioned documents, each always or on request and switched on or "
-           "off, composed into every member's context by the manager at build.")
+SUMMARY = ("Teams of agents that share instructions kept in the store - list the teams "
+           "you are in, read their documents, and create teams, add members and save, "
+           "rename and retire their versioned documents.")
 SCOPE = "project"
 CRED_KEYS: list = []
 # Every verb that changes the store's teams; each is refused under the
@@ -208,16 +208,12 @@ STATE = False
 TABLES = True       # teams_* tables in the project's store, built by _tables()
 INVENTORY = None
 POST_INSTALL: list[dict] = []
-# The constant half of the block the manager composes after the stub line: how
-# to read a team. The manager adds this agent's own teams to it at build from
-# the store, so the declaration carries nothing that changes.
-BLOCK = "\n\n".join([
-    "Teams carry instructions shared by a group of agents. The teams this agent belongs "
-    "to are listed below, each by its line; a team in always mode has its standing "
-    "documents here whole.",
-    "`teams show <team>` lists a team's documents, `teams doc show <team> <doc>` reads "
-    "one, and `teams list --all` names every team; `teams help` gives every command.",
-]) + "\n"
+# The block the manager composes after the stub line: which commands read a
+# team. The agent's own teams stand in their own section, which the manager
+# composes from the store, so the declaration carries nothing that changes.
+BLOCK = ("`teams list` names the teams you are in and `teams list --all` every team; "
+         "`teams show <team>` lists a team's documents and `teams doc show <team> <doc>` "
+         "reads one; `teams help` gives every command.\n")
 CONTRIBUTION = {"markdown": BLOCK}
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))

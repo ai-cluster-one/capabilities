@@ -1,5 +1,9 @@
 # teams — change log
 
+## 2026-11-09 — The capability-list entry says what teams is and which commands read a team
+
+The summary and the manifest's `contribution` are written for the agent reading its context: what teams is, and that `teams list`, `teams list --all`, `teams show` and `teams doc show` read the teams and their documents. The agent's own teams are no longer announced in the contribution, since the manager composes them in a Teams section of their own. No verb, flag, JSON key or table changes.
+
 ## 2026-11-09 — A team and a document each have an id that never changes, and a name that can, at teams 1.2
 
 Step `0007-ids` (teams 1.2, a minor step every process on the library applies on its own) gives every team and every document an `id`, twelve lowercase hex characters minted once, which the store refuses to change. `teams_teams.id` and `teams_documents.id` are the primary keys; `teams_members.team_id` and `teams_documents.team_id` reference `teams_teams (id)` and `teams_versions.document_id` references `teams_documents (id)`; the keys on names are gone. A name is free text: one line, not empty, no space at either end, at most 128 characters, and not shaped like an id; a team's is unique in the store (`teams_teams_name_key`), a document's within its team. `teams_teams` and `teams_documents` gain `retired_at`. The text columns `teams_members.team`, `teams_documents.team`, `teams_versions.team` and `teams_versions.document` stay, with no key, as copies of the current name that the store fills on insert - also from a writer that gives only the name - and carries through a rename in the same transaction, so a reader or writer released before ids keeps working; teams 2.0 drops them. The versions guard admits changes to those copies and to `active` only. Every team, member, document and version a store holds survives the step.

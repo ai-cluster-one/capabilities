@@ -941,11 +941,11 @@
       ],
       "icon": false,
       "path": "capabilities/teams",
-      "payload_sha256": "67305081a7ab90bcbefd3799ceabb3c64750bd81056059cdb8e69fd3541c2060",
+      "payload_sha256": "bb111954b1e1f5be54f3a3e9c3784a9971e9804f12eca9a8094ad45ad529bdd4",
       "store_major": 4,
-      "summary": "Teams of agents that carry shared instructions in the store - a team's line, members and versioned documents, each always or on request and switched on or off, composed into every member's context by the manager at build.",
+      "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
       "tier": "core",
-      "version": "2026-11-09 — A team and a document each have an id that never changes, and a name that can, at teams 1.2"
+      "version": "2026-11-09 — The capability-list entry says what teams is and which commands read a team"
     },
     "telegram": {
       "executable": [

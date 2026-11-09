@@ -1760,14 +1760,14 @@ def test_build_composes_a_global_document_once_the_agent_enables_it(lab, tmp_pat
 
     for run in (lab.run, bare.run):
         before = build(run)
-        assert not {"# Shared", "# Unused", "# Theirs"} & set(before.splitlines())
+        assert not {"### Shared", "### Unused", "### Theirs"} & set(before.splitlines())
     for agent in (PROJECT_ID, BARE_ID):
         _enable_context_documents(lab, agent, ["SHARED", "identity/MISSION"])
     for run in (lab.run, bare.run):
         enabled = build(run)
         assert "## Global Source: `context show SHARED --global`" in enabled
-        assert "# Shared" in enabled.splitlines()
-        assert not {"# Unused", "# Theirs"} & set(enabled.splitlines())
+        assert "### Shared" in enabled.splitlines()
+        assert not {"### Unused", "### Theirs"} & set(enabled.splitlines())
 
 
 def test_a_document_that_does_not_read_leaves_the_build_on_the_folder(lab):

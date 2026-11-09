@@ -1,11 +1,14 @@
-"""The `teams` block in the composed context, read from the store at composition.
+"""The Teams section of the composed context, read from the store at composition.
 
-While `teams` is enabled the manager adds, after its constant contribution,
-the agent's own teams as the store holds them: each team it is a member of by
-its line, and for a team in always mode its enabled always documents whole
-under the team's name and its enabled on-request documents by their line.
-The block carries nothing that changes between sessions, and an agent with
-teams disabled gets none of it. The module starts a throwaway PostgreSQL when
+While `teams` is enabled and the agent is in a team, the manager composes a
+top-level Teams section ahead of the agent's own doctrine: the lines that say
+the teams bind it and its own doctrine wins on conflict, each team under a
+level-2 heading with its line, and for a team in always mode its enabled
+always documents whole under level-3 headings, their own headings shifted
+below them, and its enabled on-request documents as one level-3 group. The
+`teams` entry in the capability list keeps the ordinary form. The section
+carries nothing that changes between sessions, and an agent with teams
+disabled gets none of it. The module starts a throwaway PostgreSQL when
 `initdb` and `pg_ctl` are on PATH and psycopg is importable, and skips
 otherwise.
 """
@@ -149,7 +152,13 @@ class Lab:
         return done.stdout
 
     def fragment(self) -> str:
-        done = subprocess.run([sys.executable, str(MANAGER), "context", "--fragment"],
+        return self.manager("context", "--fragment")
+
+    def build(self) -> str:
+        return self.manager("build", "--print")
+
+    def manager(self, *args: str) -> str:
+        done = subprocess.run([sys.executable, str(MANAGER), *args],
                               cwd=self.project, env=self.env(), text=True,
                               capture_output=True, timeout=180, stdin=subprocess.DEVNULL)
         assert done.returncode == 0, done.stderr
@@ -162,8 +171,29 @@ def lab(tmp_path, cluster):
 
 
 def _section(fragment: str, name: str = "teams") -> str | None:
-    parts = re.split(r"(?m)^## (\S+)\n", fragment.split(M.CONTEXT_END, 1)[0])
+    """One capability's entry in the capability list."""
+    block = fragment.split(M.CONTEXT_BEGIN, 1)[1].split(M.CONTEXT_END, 1)[0]
+    parts = re.split(r"(?m)^## (\S+)\n", block)
     return {parts[i]: parts[i + 1] for i in range(1, len(parts), 2)}.get(name)
+
+
+def _teams(text: str) -> str | None:
+    """The Teams section, up to the top-level heading that follows it."""
+    if "# Teams\n" not in text:
+        return None
+    body = text.split("# Teams\n", 1)[1]
+    return re.split(r"(?m)^# (?:Inline Context|Capabilities)\n", body, maxsplit=1)[0]
+
+
+def _outline(text: str) -> list[str]:
+    """The heading lines of `text`, outside code fences."""
+    lines, fence = [], False
+    for line in text.split("\n"):
+        if line.startswith(("```", "~~~")):
+            fence = not fence
+        elif not fence and re.match(r"^#{1,6} ", line):
+            lines.append(line)
+    return lines
 
 
 def _seed(lab: Lab) -> None:
@@ -183,72 +213,158 @@ def test_teams_is_core():
     assert "teams" in M.CORE_CAPABILITIES
 
 
-def test_an_ordinary_team_is_one_line_and_its_documents_stay_on_request(lab):
+def test_the_teams_entry_in_the_capability_list_is_its_stub_and_its_commands(lab):
     _seed(lab)
-    section = _section(lab.fragment())
-    assert "Teams carry instructions shared by a group of agents." in section
-    assert ("- **crew** - The release crew: turn to it for releases. "
-            "(its instructions: `teams show crew`)") in section
-    assert "- **ops** - Operations: turn to it for the servers." in section
-    assert "far" not in section
-    assert "One line per paragraph." not in section
-    assert "### Team" not in section
+    entry = _section(lab.fragment())
+    manifest = json.loads(lab.teams("manifest", "--json"))
+    assert entry == f"\n{manifest['summary']} Run `teams help`.\n\n" \
+        f"{manifest['contribution']['markdown']}\n"
 
 
-def test_an_always_team_composes_its_enabled_always_documents_under_its_name(lab):
+def test_an_ordinary_team_is_its_line_and_how_to_read_it(lab):
+    _seed(lab)
+    fragment = lab.fragment()
+    teams = _teams(fragment)
+    assert fragment.startswith("# Teams\n\nYou are a member of the teams below, and their "
+                               "rules bind you. Where a team's rule conflicts with your own "
+                               "doctrine further down, your own doctrine wins.\n")
+    assert ("## crew\n\nThe release crew: turn to it for releases. Read its instructions on "
+            "request: `teams show crew`.\n") in teams
+    assert "## ops\n\nOperations: turn to it for the servers. Read its instructions" in teams
+    assert "far" not in fragment
+    assert "One line per paragraph." not in fragment
+    assert "###" not in teams
+
+
+def test_an_always_team_composes_its_documents_under_level_three_headings(lab):
     _seed(lab)
     lab.teams("mode", "ops", "always")
     lab.teams("doc", "save", "ops", "secrets-off", "--from", "-",
               stdin="---\ndescription: Switched off.\nload: always\n---\nNever shown.\n")
     lab.teams("doc", "off", "ops", "secrets-off")
-    section = _section(lab.fragment())
-    assert "- **ops** - Operations: turn to it for the servers. (always in context, below)" \
-        in section
-    assert "### Team ops: style\n\n# Style\n\nOne line per paragraph.\n" in section
-    assert ("### Team ops: on request\n\n"
-            "- `teams doc show ops deploy` - Read before a release.\n") in section
-    assert "Never shown." not in section and "secrets-off" not in section
-    assert "### Team crew" not in section
+    lab.teams("doc", "save", "ops", "runbook", "--from", "-",
+              stdin="---\ndescription: How we run.\nload: always\n---\nRun from main.\n\n"
+                    "## Steps\n\n```sh\n# not a heading\n```\n")
+    teams = _teams(lab.fragment())
+    assert ("## ops\n\nOperations: turn to it for the servers.\n\n"
+            "### runbook\n\nRun from main.\n\n#### Steps\n\n```sh\n# not a heading\n```\n\n"
+            "### Style\n\nOne line per paragraph.\n\n"
+            "### On request\n\n- `teams doc show ops deploy` - Read before a release.\n") in teams
+    assert "Never shown." not in teams and "secrets-off" not in teams
+    assert _outline(teams) == ["## crew", "## ops", "### runbook", "#### Steps", "### Style",
+                               "### On request"]
 
 
-def test_the_block_is_the_same_in_every_session_and_follows_the_store(lab):
+def test_the_section_is_the_same_in_every_session_and_follows_the_store(lab):
     _seed(lab)
     lab.teams("mode", "crew", "always")
     first = lab.fragment()
     assert lab.fragment() == first
-    assert not re.search(r"\b20\d\d-\d\d-\d\d|Rendered|tokens", _section(first))
+    assert not re.search(r"\b20\d\d-\d\d-\d\d|Rendered|tokens", _teams(first))
     lab.teams("doc", "save", "crew", "style", "--from", "-",
               stdin=STYLE.replace("One line", "Each line"))
-    assert "Each line per paragraph." in _section(lab.fragment())
+    assert "Each line per paragraph." in _teams(lab.fragment())
 
 
-def test_an_agent_in_no_team_carries_only_the_constant_block(lab):
+def test_an_agent_in_no_team_has_no_teams_section(lab):
     lab.teams("create", "crew", "--description", "The release crew.")
-    section = _section(lab.fragment())
-    assert section.strip().startswith("Teams of agents")
-    assert "is a member of these teams" not in section
-
-
-def test_teams_disabled_for_the_agent_composes_nothing_of_it(lab):
-    _seed(lab)
-    lab.enable(False)
     fragment = lab.fragment()
-    assert _section(fragment) is None
-    assert "The release crew" not in fragment
+    assert _teams(fragment) is None and "# Teams" not in fragment
+    assert _section(fragment).strip().startswith("Teams of agents")
 
 
-def test_a_command_the_block_prints_quotes_a_name_that_holds_a_space(lab):
+def test_teams_disabled_removes_its_section_and_entry_and_nothing_else(lab):
+    _seed(lab)
+    lab.teams("mode", "ops", "always")
+    other = lab.tmp / "registry" / "alpha"
+    other.mkdir(parents=True)
+    (other / "alpha").write_text("#!/bin/sh\n")
+    (other / "stub").write_text("Alpha does one thing. Run `alpha help`.\n")
+
+    def settings(teams: bool) -> None:
+        (lab.project / "capabilities" / "settings.json").write_text(json.dumps(
+            {"capabilities": {"teams": {"enabled": teams}, "alpha": {"enabled": True}}}))
+    settings(True)
+    on = lab.fragment()
+    settings(False)
+    off = lab.fragment()
+    assert "## alpha\n\nAlpha does one thing." in off
+    assert "The release crew" not in off and _section(off) is None
+    entry = "## teams\n" + _section(on)
+    section, rest = on.split("# Capabilities\n", 1)
+    assert section.startswith("# Teams\n")
+    assert off == "# Capabilities\n" + rest.replace(entry, "")
+
+
+def test_a_command_the_section_prints_quotes_a_name_that_holds_a_space(lab):
     lab.teams("create", "Release crew", "--description", "The release crew.", "--always")
     lab.register(AGENT)
     lab.teams("members", "add", "Release crew", AGENT)
     lab.teams("doc", "save", "Release crew", "deploy rules", "--from", "-", stdin=DEPLOY)
     lab.teams("create", "ops", "--description", "Operations.")
     lab.teams("members", "add", "ops", AGENT)
-    section = _section(lab.fragment())
-    assert "- `teams doc show 'Release crew' 'deploy rules'` - Read before a release." \
-        in section
-    assert "(its instructions: `teams show ops`)" in section
+    teams = _teams(lab.fragment())
+    assert "- `teams doc show 'Release crew' 'deploy rules'` - Read before a release." in teams
+    assert "Read its instructions on request: `teams show ops`." in teams
     lab.teams("rename", "Release crew", "Releases")
-    section = _section(lab.fragment())
-    assert "- **Releases** - The release crew. (always in context, below)" in section
-    assert "`teams doc show Releases 'deploy rules'`" in section
+    teams = _teams(lab.fragment())
+    assert "## Releases\n\nThe release crew.\n" in teams
+    assert "`teams doc show Releases 'deploy rules'`" in teams
+
+
+def test_build_places_the_teams_section_before_the_agents_own_doctrine(lab):
+    _seed(lab)
+    lab.teams("mode", "ops", "always")
+    mission = lab.project / "context" / "identity" / "MISSION.md"
+    mission.parent.mkdir(parents=True)
+    stored = ("---\ntitle: Mission\ndescription: Why.\nload: inline\norder: 1\n---\n"
+              "# Mission\n\nShip it.\n\n## Scope\n\n```md\n# kept\n```\n")
+    mission.write_text(stored)
+    built = lab.build()
+    order = ["# Guide Menu", "# Teams", "## crew", "## ops", "### Style", "### On request",
+             "# Inline Context", "## Source: `context/identity/MISSION.md`", "### Mission",
+             "#### Scope", "# Capabilities", "## teams"]
+    outline = _outline(built)
+    positions = [outline.index(heading) for heading in order]
+    assert positions == sorted(positions)
+    assert "```md\n# kept\n```" in built
+    assert mission.read_text() == stored
+    style = lab.teams("doc", "show", "ops", "style")
+    assert style == STYLE
+    lab.enable(False)
+    assert "# Teams" not in lab.build()
+
+
+def test_shifting_moves_headings_and_never_code():
+    text = ("Title\n=====\n\n# One\n\n## Two\n\n##### Five\n\n```sh\n# shell\n```\n\n"
+            "    # indented code\n\n- item\n---\n\nhash#tag")
+    assert M._shift_headings(text, 2) == (
+        "### Title\n\n### One\n\n#### Two\n\n###### Five\n\n```sh\n# shell\n```\n\n"
+        "    # indented code\n\n- item\n---\n\nhash#tag")
+
+
+def test_init_without_a_store_says_nothing_about_teams(tmp_path):
+    # The image-build path: a store-gated agent initialised where no database
+    # is configured writes its context offline, and teams has no part in it.
+    project = tmp_path / "agent"
+    (project / ".git").mkdir(parents=True)
+    (project / "capabilities").mkdir()
+    (project / "capabilities" / "project.json").write_text(json.dumps(
+        {"schema": "capabilities.project.v1", "slug": "agent", "id": AGENT,
+         "records": "store"}))
+    doc = project / "context" / "identity" / "AGENT.md"
+    doc.parent.mkdir(parents=True)
+    doc.write_text("---\ntitle: Agent\ndescription: Who.\nload: inline\norder: 10\n---\n"
+                   "# Agent\n\nBody.\n")
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(CLEARED)}
+    env.update({"HOME": str(tmp_path / "home"),
+                "XDG_CONFIG_HOME": str(tmp_path / "config"),
+                "XDG_STATE_HOME": str(tmp_path / "state"),
+                "XDG_DATA_HOME": str(tmp_path / "data"),
+                "XDG_CACHE_HOME": str(tmp_path / "cache")})
+    result = subprocess.run([sys.executable, str(MANAGER), "init", "--claude", "--id", AGENT],
+                            cwd=project, env=env, text=True, capture_output=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    warnings = json.loads(result.stdout)["hooks"]["build"]["warnings"]
+    assert not [warning for warning in warnings if "teams" in warning], warnings
