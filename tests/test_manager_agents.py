@@ -21,6 +21,7 @@ import sys
 import tempfile
 import uuid
 import zlib
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -636,6 +637,16 @@ def test_connections_list_names_each_connection_by_its_id_beside_its_label(lab):
     [listed] = lab.ok("connections", "list", "clickup")["capabilities"]["clickup"]
     assert (listed["connection"], listed["label"]) == (work, "work")
     assert [(g["agent"], g["enabled"]) for g in listed["grants"]] == [(None, True)]
+
+
+def test_connections_list_says_when_the_store_made_each_connection(lab):
+    work = _store_connection(lab, "clickup", "work")
+    [(made,)] = lab.sql(f"SELECT created_at FROM {SCHEMA}.connections WHERE id = %s", (work,))
+    lab.sql(f"UPDATE {SCHEMA}.connections SET label = 'renamed', spec = '{{\"a\": 1}}' "
+            "WHERE id = %s RETURNING id", (work,))
+    [listed] = lab.ok("connections", "list", "clickup")["capabilities"]["clickup"]
+    assert listed["label"] == "renamed"
+    assert datetime.fromisoformat(listed["created_at"]) == made
 
 
 def test_an_agent_has_one_master(lab):

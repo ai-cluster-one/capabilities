@@ -2838,7 +2838,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.45.0"
+CONTRACT_LIBRARY_RELEASE = "0.46.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -25431,7 +25431,8 @@ def _import_records_verify(files, stored, plan: dict) -> None:
 
 def cmd_connections_list(names: list[str]) -> None:
     """Every connection the store holds, per capability, with its owner -
-    shared, or one agent's own - and every grant on it."""
+    shared, or one agent's own - when the store made its row, and every grant
+    on it."""
     unknown = [n for n in names if n.startswith("-")]
     if unknown:
         _die(6, "input", f"unknown connections list option {unknown[0]!r}",
@@ -25449,8 +25450,11 @@ def cmd_connections_list(names: list[str]) -> None:
     only = " WHERE c.capability = ANY(%s)" if names else ""
     params = (names,) if names else ()
     try:
+        # When the store made the row is read through the row's JSON, so a
+        # store whose core predates it (4.1) answers null rather than failing.
         connections = conn.execute(
-            "SELECT c.capability, c.id, c.owner_agent_id, a.name, c.label "
+            "SELECT c.capability, c.id, c.owner_agent_id, a.name, c.label, "
+            "to_jsonb(c) ->> 'created_at' "
             "FROM connections c "
             "LEFT JOIN agents a ON a.id = c.owner_agent_id" + only
             + " ORDER BY c.capability, c.label", params).fetchall()
@@ -25479,11 +25483,12 @@ def cmd_connections_list(names: list[str]) -> None:
             "agent": agent, "agent_name": agent_name, "node": node, "enabled": enabled,
             "allow_write": allow_write, "is_default": bool(is_default)})
     out: dict = {}
-    for capability, connection, owner, owner_name, label in connections:
+    for capability, connection, owner, owner_name, label, created_at in connections:
         out.setdefault(capability, []).append({
             "connection": connection, "label": label or connection,
             "owner": owner, "owner_name": owner_name,
-            "shared": owner is None, "grants": held.get((capability, connection), [])})
+            "shared": owner is None, "created_at": created_at,
+            "grants": held.get((capability, connection), [])})
     _emit({"store": {"schema": setting.schema}, "capabilities": out})
 
 

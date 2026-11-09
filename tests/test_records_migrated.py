@@ -454,7 +454,7 @@ def test_a_store_made_before_owners_gives_each_row_its_owner_by_the_rule(lab):
     ada, clinic = listed["capabilities"]["agentrooms"]
     assert clinic == {
         "connection": _cid(lab, "agentrooms", "clinic"), "label": "clinic", "owner": OTHER,
-        "owner_name": "Clinic Desk",
+        "owner_name": "Clinic Desk", "created_at": None,
         "shared": False, "grants": [{"agent": OTHER, "agent_name": "Clinic Desk",
                                      "node": None, "enabled": True, "allow_write": None,
                                      "is_default": False}]}

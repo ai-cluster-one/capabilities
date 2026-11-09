@@ -1188,6 +1188,6 @@
       "version": "2026-10-31 — `youtrack` reads a connection's token from the agent's vault as well"
     }
   },
-  "contract_library": "0.45.0",
+  "contract_library": "0.46.0",
   "store_major": 4
 }

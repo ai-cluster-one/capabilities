@@ -325,7 +325,8 @@ def _ids(lab) -> dict:
 
 def _without_sources(report: dict) -> dict:
     """The report with the origin of each connection-tier value left out: a file
-    in files mode, the store's table in store mode, and nothing else differs.
+    in files mode, the store's table in store mode, and with it when the store
+    made the connection's row, which files do not record; nothing else differs.
     Each connection is keyed by what it is called, which is its key in files
     and its label in the store, which keys it by its id."""
     out = json.loads(json.dumps(report))
@@ -334,6 +335,7 @@ def _without_sources(report: dict) -> dict:
     if out.get("default") in labels:
         out["default"] = labels[out["default"]]
     for entry in out["connections"].values():
+        entry.pop("created_at", None)
         for key in entry["keys"]:
             if key["tier"] == "connection":
                 key["source"] = None
@@ -403,6 +405,9 @@ def test_import_moves_the_project_and_it_resolves_the_same_set(lab):
     assert _without_sources(after) == _without_sources(before)
     assert _labelled(after)["box"]["keys"][0]["source"] == \
         "store:lab.connections"
+    # Files record no creation moment; the imported row has the one it was made at.
+    assert _labelled(before)["box"]["created_at"] is None
+    assert _labelled(after)["box"]["created_at"] is not None
     assert _ok(_manager(lab, "get", "coolify", "connection", "box")) == connection_before
     assert _ok(_manager(lab, "get", "coolify", "grant", "box")) == {
         "enabled": True, "allow_write": True, "node": None, "is_default": True}
