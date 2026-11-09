@@ -8,14 +8,14 @@
 # ///
 """teams — teams of agents that carry shared instructions, in the store.
 
-A team is a store record: a name, one line saying what it is for and when to
-turn to it, its members (agents, by their declared id), and its instruction
-documents. Knowledge that applies to a group of agents has one home in the
+A team is a store record: an id, a name, one line saying what it is for and
+when to turn to it, its members (agents, by their declared id), and its
+instruction documents. Knowledge that applies to a group of agents has one home in the
 team and reaches each member from there, without being copied into any of
 them. A team gives knowledge only: no connection, key, capability or grant
 reaches an agent through it.
 
-A document is one instruction text of a team: a name and its versions. A
+A document is one instruction text of a team: an id, a name and its versions. A
 version holds a one-line description, its load - `always` or `on-request` -
 and the body, with who saved it, when, and why. One version is active; a save
 adds a new version and never changes an old one. Each document is switched on
@@ -44,12 +44,18 @@ Documents live in the PostgreSQL the project resolves (STORE). Without a
 store there are none: every verb that reads or writes them exits 6
 `store_not_configured`.
 
-NAMES
-  A team's name is lower-case letters, digits and '-', starting with a
-  letter or digit (`release-crew`). A document's name is letters, digits,
-  '.', '_' and '-', starting with a letter or digit (`style`, `deploy-rules`).
-  An agent is named by its declared id, as `capabilities agent show` gives
-  it.
+IDS AND NAMES
+  A team and a document each have an id: twelve lowercase hex characters,
+  given when it is made and never changed. Everything that belongs to a team
+  or a document holds its id. A name is free text to show and to type: one
+  line, not empty, no space at either end, at most 128 characters, and not
+  twelve lowercase hex characters, the shape of an id. A team's name is
+  unique in the store, a document's within its team; `rename` and
+  `doc rename` change it and nothing else.
+
+  Wherever a verb takes <team> or <doc>, give its id or its current name.
+  Quote a name that holds a space (`teams show "Release crew"`). An agent is
+  named by its declared id, as `capabilities agent show` gives it.
 
 THE FILE FORM
   A document is read and written as this text:
@@ -74,16 +80,18 @@ SIZE
 
 READING  (plain text by default; --json gives the structured answer)
   teams list [--all] [--json]
-      The teams this agent is a member of, each with its mode and line.
-      With --all, every team in the store, each marked `member` or not.
-      An agent in no team is told so (exit 0).
+      The teams this agent is a member of, each with its mode, line and id.
+      With --all, every team in the store but a retired one, each marked
+      `member` or not. An agent in no team is told so (exit 0).
   teams show <team> [--json]
-      The team: its line, mode, members, size, and every document with its
-      load, whether it is on, its line and its size.
+      The team: its id, line, mode, members, size, and every document but a
+      retired one with its load, whether it is on, its line, size and id. A
+      retired team answers to its id.
   teams doc show <team> <doc> [--version ID] [--json]
       The active version, or the version ID names, in the file form. --json
-      adds the version id, who saved it, when, its note and its size; the
-      version id is what `doc save --base` names.
+      adds the team and document ids, the version id, who saved it, when,
+      its note and its size; the version id is what `doc save --base` names.
+      A retired document answers to its id.
   teams doc history <team> <doc> [--json]
       Every version, newest first: id, when, by whom, the note, its load and
       size, and which one is active.
@@ -99,6 +107,15 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
       6 `team_exists`) - `teams mode` switches the mode.
   teams mode <team> ordinary|always
       Switch the team's mode. Safe to repeat.
+  teams rename <team> <name>
+      Give the team a new name; its id, members and documents stay. A name
+      another team holds is refused (exit 6 `name_taken`). Safe to repeat.
+  teams describe <team> --description TEXT
+      Give the team a new line. Safe to repeat.
+  teams retire <team>
+      Retire the team: its members are removed, it is listed no more, and
+      its name, which then carries its id, is free again; its documents and
+      every version stay, and `show <id>` still reads it.
   teams members add <team> <agent>
   teams members remove <team> <agent>
       Make the agent a member of the team, or no longer one. Safe to repeat:
@@ -116,14 +133,27 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
   teams doc off <team> <doc>
       Switch the document on or off for its team. Off, it reaches no member
       and keeps every version. Safe to repeat: answers `"changed": false`.
+  teams doc rename <team> <doc> <name>
+      Give the document a new name; its id and versions stay. A name another
+      document of the team holds is refused (exit 6 `name_taken`). Safe to
+      repeat.
+  teams doc retire <team> <doc>
+      Retire the document: it is switched off, listed no more, and its name,
+      which then carries its id, is free again; every version stays, and
+      `doc show <team> <id>` still reads it.
 
 STORE
-  The tables are teams_teams (one row per team), teams_members (one row per
-  member of a team), teams_documents (one row per document of a team, with
-  its switch) and teams_versions (one row per version), in the schema the
-  project's store setting names, migrated under the `teams` ledger. One
-  version per document is active, which the store enforces; it refuses any
-  change to a version other than clearing `active`, and any delete.
+  The tables are teams_teams (one row per team, keyed by its id),
+  teams_members (one row per member of a team, holding the team's id),
+  teams_documents (one row per document, keyed by its id, holding its team's
+  id, with its switch) and teams_versions (one row per version, holding its
+  document's id), in the schema the project's store setting names, migrated
+  under the `teams` ledger. The store refuses a change of an id. Members,
+  documents and versions also keep a copy of the current team and document
+  name, with no key, which the store keeps equal to the name, a rename
+  included, for readers that still join on names. One version per document is
+  active, which the store enforces; it refuses any change to a version other
+  than clearing `active` and those copies, and any delete.
 
 CONTRACT VERBS
   teams help                  this text
@@ -143,12 +173,13 @@ I/O
 
 EXIT CODES
   0 success
-  3 not found - no team, document or version of that name
+  3 not found - no team, document or version of that id or name, or a
+    retired one
   4 policy - teams not enabled, the read-only switch
   5 store - unreachable or busy
   6 input - a malformed argument or file, no store configured, no project or
     project identity where the verb needs this agent, a team that exists
-    with another line or mode
+    with another line or mode, a name another team or document holds
   7 stale - the base a save names is no longer the active version
 """
 
@@ -169,8 +200,8 @@ SCOPE = "project"
 CRED_KEYS: list = []
 # Every verb that changes the store's teams; each is refused under the
 # read-only switch. Nested verbs are named `<noun> <verb>`.
-WRITE_VERBS = {"create", "mode", "members add", "members remove", "doc save", "doc on",
-               "doc off"}
+WRITE_VERBS = {"create", "mode", "rename", "describe", "retire", "members add",
+               "members remove", "doc save", "doc on", "doc off", "doc rename", "doc retire"}
 WRITE_DEFAULT = True
 DOCS_BASE = ""
 STATE = False
@@ -217,13 +248,12 @@ def _manifest() -> dict:
 # ── the tables ──────────────────────────────────────────────────────────────
 
 # A team belongs to no agent: it is the store's, shared by its members, so
-# teams_teams, teams_documents and teams_versions carry no agent_id, and a
-# team is keyed by its name. A member row names its agent by declared id with
-# no foreign key, as every agent column does. A document is keyed by its team
-# and name; its versions reference it by a foreign key, and every key is
-# between this capability's own tables, none of which deletes a referenced
-# row, so a key refuses only an orphan.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 1
+# teams_teams, teams_documents and teams_versions carry no agent_id. From step
+# 0007 a team and a document are keyed by an id given once and never changed,
+# and members, documents and versions reference it by a foreign key; a name is
+# a display name only. Every key between this capability's own tables refuses
+# only an orphan, since none of them deletes a referenced row.
+LEDGER_MAJOR, LEDGER_MINOR = 1, 2
 _TEAM_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
 _DOC_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 # The store's foreign keys (core 4.0): every agent and node column of this
@@ -236,6 +266,199 @@ _M9_KEYS_SQL = r"""
 -- class; guards admit the cascade of a deliberate delete and nothing else.
 SELECT store_state_keys('teams', ARRAY[
     ARRAY['teams_members', 'agent_id', 'agents', 'cascade']]);
+"""
+
+
+# Step 0007 (teams 1.2): a team and a document each get an id, twelve lowercase
+# hex characters minted once and never changed, and members, documents and
+# versions link to them by it; the name becomes a free display name a rename
+# changes. The text columns that named the team and the document - members.team,
+# documents.team, versions.team and versions.document - stay as copies with no
+# key, filled on insert and followed on rename by the store in the same
+# transaction, so a reader or writer that still names a team or a document by
+# its name keeps working; teams 2.0 drops them once none is left.
+_ID_PATTERN = r"^[0-9a-f]{12}$"
+_IDS_SQL = r"""
+CREATE FUNCTION teams_new_id() RETURNS text LANGUAGE sql VOLATILE SET search_path FROM CURRENT AS $$
+    SELECT substr(replace(gen_random_uuid()::text, '-', ''), 1, 12)
+$$;
+
+-- teams: the id is the key, the name a unique free display name.
+ALTER TABLE teams_members DROP CONSTRAINT teams_members_team_fkey;
+ALTER TABLE teams_documents DROP CONSTRAINT teams_documents_team_fkey;
+ALTER TABLE teams_versions DROP CONSTRAINT teams_versions_team_document_fkey;
+ALTER TABLE teams_teams ADD COLUMN id text, ADD COLUMN retired_at timestamptz;
+UPDATE teams_teams SET id = teams_new_id();
+ALTER TABLE teams_teams
+    ALTER COLUMN id SET DEFAULT teams_new_id(),
+    ALTER COLUMN id SET NOT NULL,
+    ADD CONSTRAINT teams_teams_id_shape CHECK (id ~ '^[0-9a-f]{12}$'),
+    DROP CONSTRAINT teams_teams_pkey,
+    ADD PRIMARY KEY (id),
+    ADD CONSTRAINT teams_teams_name_key UNIQUE (name),
+    DROP CONSTRAINT teams_teams_name_check,
+    ADD CONSTRAINT teams_teams_name_check CHECK (
+        name <> '' AND name !~ '[\n\r]' AND name = btrim(name) AND length(name) <= 128);
+COMMENT ON COLUMN teams_teams.id IS
+    'The team''s id: twelve lowercase hex characters, minted when it is made and never changed. Every row of a team links to it by this.';
+COMMENT ON COLUMN teams_teams.name IS
+    'The team''s display name: free text, unique, renamable. A retired team''s name carries its id, which frees the name.';
+COMMENT ON COLUMN teams_teams.retired_at IS
+    'When the team was retired: it has no members and is listed no more; its documents and versions stay.';
+
+-- members: linked to their team by its id.
+ALTER TABLE teams_members ADD COLUMN team_id text;
+UPDATE teams_members m SET team_id = t.id FROM teams_teams t WHERE t.name = m.team;
+ALTER TABLE teams_members
+    ALTER COLUMN team_id SET NOT NULL,
+    ADD FOREIGN KEY (team_id) REFERENCES teams_teams (id),
+    DROP CONSTRAINT teams_members_pkey,
+    ADD PRIMARY KEY (agent_id, team_id);
+CREATE INDEX teams_members_team_id ON teams_members (team_id);
+COMMENT ON COLUMN teams_members.team_id IS
+    'The team''s id.';
+COMMENT ON COLUMN teams_members.team IS
+    'A copy of the team''s current name for readers that join on it, kept by the store; no key. Dropped at teams 2.0.';
+
+-- documents: an id of their own, linked to their team by its id, the name unique within the team.
+ALTER TABLE teams_documents ADD COLUMN id text, ADD COLUMN team_id text,
+    ADD COLUMN retired_at timestamptz;
+UPDATE teams_documents d SET id = teams_new_id(), team_id = t.id
+    FROM teams_teams t WHERE t.name = d.team;
+ALTER TABLE teams_documents
+    ALTER COLUMN id SET DEFAULT teams_new_id(),
+    ALTER COLUMN id SET NOT NULL,
+    ALTER COLUMN team_id SET NOT NULL,
+    ADD CONSTRAINT teams_documents_id_shape CHECK (id ~ '^[0-9a-f]{12}$'),
+    DROP CONSTRAINT teams_documents_pkey,
+    ADD PRIMARY KEY (id),
+    ADD FOREIGN KEY (team_id) REFERENCES teams_teams (id),
+    ADD CONSTRAINT teams_documents_team_id_name_key UNIQUE (team_id, name),
+    DROP CONSTRAINT teams_documents_name_check,
+    ADD CONSTRAINT teams_documents_name_check CHECK (
+        name <> '' AND name !~ '[\n\r]' AND name = btrim(name) AND length(name) <= 128);
+COMMENT ON COLUMN teams_documents.id IS
+    'The document''s id: twelve lowercase hex characters, minted when it is made and never changed. Its versions link to it by this.';
+COMMENT ON COLUMN teams_documents.team_id IS
+    'The id of the document''s team; never changes.';
+COMMENT ON COLUMN teams_documents.name IS
+    'The document''s display name: free text, unique within its team, renamable. A retired document''s name carries its id, which frees the name.';
+COMMENT ON COLUMN teams_documents.team IS
+    'A copy of the team''s current name for readers that join on it, kept by the store; no key. Dropped at teams 2.0.';
+COMMENT ON COLUMN teams_documents.retired_at IS
+    'When the document was retired: it is off and listed no more; its versions stay.';
+
+-- versions: linked to their document by its id.
+ALTER TABLE teams_versions ADD COLUMN document_id text;
+ALTER TABLE teams_versions DISABLE TRIGGER teams_versions_guard;
+UPDATE teams_versions v SET document_id = d.id
+    FROM teams_documents d WHERE d.team = v.team AND d.name = v.document;
+ALTER TABLE teams_versions ENABLE TRIGGER teams_versions_guard;
+ALTER TABLE teams_versions
+    ALTER COLUMN document_id SET NOT NULL,
+    ADD FOREIGN KEY (document_id) REFERENCES teams_documents (id);
+DROP INDEX teams_versions_active;
+DROP INDEX teams_versions_document;
+CREATE UNIQUE INDEX teams_versions_active ON teams_versions (document_id) WHERE active;
+CREATE INDEX teams_versions_document ON teams_versions (document_id, created_at DESC);
+COMMENT ON COLUMN teams_versions.document_id IS
+    'The id of the version''s document; never changes.';
+COMMENT ON COLUMN teams_versions.team IS
+    'A copy of the team''s current name for readers that join on it, kept by the store; no key. Dropped at teams 2.0.';
+COMMENT ON COLUMN teams_versions.document IS
+    'A copy of the document''s current name for readers that join on it, kept by the store; no key. Dropped at teams 2.0.';
+
+-- A version stays immutable but for active and the two name copies the store keeps.
+CREATE OR REPLACE FUNCTION teams_versions_guard() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+    IF tg_op IN ('DELETE', 'TRUNCATE') THEN
+        RAISE EXCEPTION 'team document versions are never deleted: switch the document off instead'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF (to_jsonb(new) - 'active' - 'team' - 'document')
+            IS DISTINCT FROM (to_jsonb(old) - 'active' - 'team' - 'document') THEN
+        RAISE EXCEPTION 'a team document version is immutable: save a new version'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF new.active AND NOT old.active THEN
+        RAISE EXCEPTION 'a team document version is not made active again: save its content as a new version'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN new;
+END $$;
+
+-- An id never changes, and a document stays with its team; a name is never shaped like an id.
+CREATE FUNCTION teams_ids_guard() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+    IF tg_op = 'UPDATE' THEN
+        IF new.id IS DISTINCT FROM old.id
+                OR (to_jsonb(new) -> 'team_id') IS DISTINCT FROM (to_jsonb(old) -> 'team_id') THEN
+            RAISE EXCEPTION 'an id in % never changes: rename instead', tg_table_name
+                USING ERRCODE = 'check_violation';
+        END IF;
+        IF new.name IS NOT DISTINCT FROM old.name THEN
+            RETURN new;
+        END IF;
+    END IF;
+    IF new.name ~ '^[0-9a-f]{12}$' THEN
+        RAISE EXCEPTION 'a name in % is not twelve lowercase hex characters, which is the shape of an id', tg_table_name
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN new;
+END $$;
+CREATE TRIGGER teams_teams_ids BEFORE INSERT OR UPDATE ON teams_teams
+    FOR EACH ROW EXECUTE FUNCTION teams_ids_guard();
+CREATE TRIGGER teams_documents_ids BEFORE INSERT OR UPDATE ON teams_documents
+    FOR EACH ROW EXECUTE FUNCTION teams_ids_guard();
+
+-- The name copies: a row written with a name gets its id, and every row's copy is the current name.
+CREATE FUNCTION teams_team_copy() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+    IF new.team_id IS NULL THEN
+        SELECT t.id INTO new.team_id FROM teams_teams t WHERE t.name = new.team;
+    END IF;
+    SELECT t.name INTO new.team FROM teams_teams t WHERE t.id = new.team_id;
+    RETURN new;
+END $$;
+CREATE TRIGGER teams_members_copy BEFORE INSERT OR UPDATE ON teams_members
+    FOR EACH ROW EXECUTE FUNCTION teams_team_copy();
+CREATE TRIGGER teams_documents_copy BEFORE INSERT OR UPDATE ON teams_documents
+    FOR EACH ROW EXECUTE FUNCTION teams_team_copy();
+
+CREATE FUNCTION teams_versions_copy() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+    IF new.document_id IS NULL THEN
+        SELECT d.id INTO new.document_id FROM teams_documents d
+            WHERE d.team = new.team AND d.name = new.document;
+    END IF;
+    SELECT d.team, d.name INTO new.team, new.document FROM teams_documents d
+        WHERE d.id = new.document_id;
+    RETURN new;
+END $$;
+CREATE TRIGGER teams_versions_copy BEFORE INSERT ON teams_versions
+    FOR EACH ROW EXECUTE FUNCTION teams_versions_copy();
+
+-- A rename carries the new name into every copy in the same transaction.
+CREATE FUNCTION teams_team_renamed() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+    UPDATE teams_members SET team = new.name WHERE team_id = new.id;
+    UPDATE teams_documents SET team = new.name WHERE team_id = new.id;
+    UPDATE teams_versions v SET team = new.name
+        FROM teams_documents d WHERE d.id = v.document_id AND d.team_id = new.id;
+    RETURN NULL;
+END $$;
+CREATE TRIGGER teams_teams_renamed AFTER UPDATE OF name ON teams_teams
+    FOR EACH ROW WHEN (new.name IS DISTINCT FROM old.name)
+    EXECUTE FUNCTION teams_team_renamed();
+
+CREATE FUNCTION teams_document_renamed() RETURNS trigger LANGUAGE plpgsql SET search_path FROM CURRENT AS $$
+BEGIN
+    UPDATE teams_versions SET document = new.name WHERE document_id = new.id;
+    RETURN NULL;
+END $$;
+CREATE TRIGGER teams_documents_renamed AFTER UPDATE OF name ON teams_documents
+    FOR EACH ROW WHEN (new.name IS DISTINCT FROM old.name)
+    EXECUTE FUNCTION teams_document_renamed();
 """
 
 LEDGER_STEPS = [
@@ -340,6 +563,7 @@ LEDGER_STEPS = [
         FOR EACH STATEMENT EXECUTE FUNCTION teams_versions_guard();
     """),
     _M9Step("0006-keys", _M9_KEYS_SQL, core=(4, 0)),
+    ("0007-ids", _IDS_SQL),
 ]
 
 
@@ -352,8 +576,7 @@ def _tables():
 
 LOADS = ("always", "on-request")
 FRONT_KEYS = ("description", "load")
-_TEAM_RE = re.compile(_TEAM_PATTERN)
-_DOC_RE = re.compile(_DOC_PATTERN)
+_ID_RE = re.compile(_ID_PATTERN)
 _AGENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$")
 
 
@@ -361,20 +584,25 @@ class Unreadable(Exception):
     """Input that does not read as the file form."""
 
 
-def _check_team(name: str) -> str:
-    if not _TEAM_RE.fullmatch(name) or len(name) > 64:
-        _die(6, "input", f"{name!r} is no team name",
-             "a team's name is lower-case letters, digits and '-', starting with a letter or "
-             "digit, at most 64 characters, such as release-crew")
+def _check_name(name: str, what: str) -> str:
+    """A new display name: one line of text, not empty, no space at either end,
+    at most 128 characters, and not shaped like an id, so that a word given to
+    a verb names one thing."""
+    if (not name.strip() or "\n" in name or "\r" in name or name != name.strip()
+            or len(name) > 128 or _ID_RE.fullmatch(name)):
+        _die(6, "input", f"{name!r} is no {what} name",
+             f"a {what}'s name is one line of text, not empty, with no space at either end, "
+             "at most 128 characters, and not twelve lowercase hex characters, which is "
+             "the shape of an id")
     return name
 
 
-def _check_doc(name: str) -> str:
-    if not _DOC_RE.fullmatch(name) or len(name) > 128:
-        _die(6, "input", f"{name!r} is no document name",
-             "a document's name is letters, digits, '.', '_' and '-', starting with a letter "
-             "or digit, at most 128 characters, such as deploy-rules")
-    return name
+def _check_ref(ref: str, what: str) -> str:
+    """A word naming a team or a document: its id or its current name."""
+    if not ref.strip() or "\n" in ref or "\r" in ref:
+        _die(6, "input", f"{ref!r} names no {what}",
+             f"name a {what} by its id or its current name")
+    return ref
 
 
 def _check_agent(agent: str) -> str:
@@ -531,7 +759,11 @@ def _store():
     except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
         _die(5, "store_unreachable", f"the store stopped answering: {exc}",
              f"`{NAME} doctor` proves the store")
-    except psycopg.errors.UniqueViolation:
+    except psycopg.errors.UniqueViolation as exc:
+        if exc.diag.constraint_name in ("teams_teams_name_key",
+                                        "teams_documents_team_id_name_key"):
+            _die(6, "name_taken", "another write took that name at the same moment",
+                 "choose another name")
         _die(7, "stale_base", "another save changed this document at the same moment",
              f"read it again with `{NAME} doc show` and save with its version as --base")
     except psycopg.errors.CheckViolation as exc:
@@ -561,50 +793,82 @@ def _mode(always: bool) -> str:
     return "always" if always else "ordinary"
 
 
-def _team(conn, team: str, lock: bool = False) -> dict:
-    found = _one(conn, "SELECT name, description, always, created_at, created_by "
-                 "FROM teams_teams WHERE name = %s" + (" FOR UPDATE" if lock else ""), (team,))
+_TEAM_COLUMNS = "id, name, description, always, created_at, created_by, retired_at"
+
+
+def _team(conn, ref: str, lock: bool = False, retired: bool = False) -> dict:
+    """The team a word names: its id, else its current name. A retired team
+    answers only to its id, and only where `retired` admits it."""
+    lock_sql = " FOR UPDATE" if lock else ""
+    found = None
+    if _ID_RE.fullmatch(ref):
+        found = _one(conn, f"SELECT {_TEAM_COLUMNS} FROM teams_teams WHERE id = %s"
+                     + lock_sql, (ref,))
     if found is None:
-        _die(3, "not_found", f"no team {team!r}", f"`{NAME} list --all` names every team")
+        found = _one(conn, f"SELECT {_TEAM_COLUMNS} FROM teams_teams WHERE name = %s "
+                     "AND retired_at IS NULL" + lock_sql, (ref,))
+    if found is None or (found["retired_at"] is not None and not retired):
+        state = "retired" if found is not None else "no"
+        _die(3, "not_found", f"{state} team {ref!r}" if state == "no"
+             else f"team {ref!r} is retired", f"`{NAME} list --all` names every team")
     return found
 
 
-def _document(conn, team: str, doc: str, lock: bool = False) -> dict | None:
-    return _one(conn, "SELECT team, name, enabled, created_at, created_by FROM teams_documents "
-                "WHERE team = %s AND name = %s" + (" FOR UPDATE" if lock else ""), (team, doc))
+_DOCUMENT_COLUMNS = "id, team_id, name, enabled, created_at, created_by, retired_at"
 
 
-def _need_document(conn, team: str, doc: str, lock: bool = False) -> dict:
-    found = _document(conn, team, doc, lock)
+def _document(conn, team: dict, ref: str, lock: bool = False,
+              retired: bool = False) -> dict | None:
+    """The document of the team a word names: its id, else its current name.
+    A retired document answers only to its id, and only where `retired`
+    admits it."""
+    lock_sql = " FOR UPDATE" if lock else ""
+    found = None
+    if _ID_RE.fullmatch(ref):
+        found = _one(conn, f"SELECT {_DOCUMENT_COLUMNS} FROM teams_documents WHERE id = %s "
+                     "AND team_id = %s" + lock_sql, (ref, team["id"]))
     if found is None:
-        _die(3, "not_found", f"team {team!r} has no document {doc!r}",
-             f"`{NAME} show {team}` lists its documents")
+        found = _one(conn, f"SELECT {_DOCUMENT_COLUMNS} FROM teams_documents WHERE "
+                     "team_id = %s AND name = %s AND retired_at IS NULL" + lock_sql,
+                     (team["id"], ref))
+    if found is not None and found["retired_at"] is not None and not retired:
+        return None
     return found
 
 
-_VERSION_COLUMNS = ("id, team, document, description, load, body, active, created_at, "
+def _need_document(conn, team: dict, ref: str, lock: bool = False,
+                   retired: bool = False) -> dict:
+    found = _document(conn, team, ref, lock, retired)
+    if found is None:
+        _die(3, "not_found", f"team {team['name']!r} has no document {ref!r}",
+             f"`{NAME} show {team['id']}` lists its documents")
+    return found
+
+
+_VERSION_COLUMNS = ("id, document_id, description, load, body, active, created_at, "
                     "created_by, note")
 
 
-def _active(conn, team: str, doc: str) -> dict | None:
+def _active(conn, document: dict) -> dict | None:
     return _one(conn, f"SELECT {_VERSION_COLUMNS} FROM teams_versions "
-                "WHERE team = %s AND document = %s AND active", (team, doc))
+                "WHERE document_id = %s AND active", (document["id"],))
 
 
-def _version(conn, team: str, doc: str, ref: str) -> dict:
+def _version(conn, team: dict, document: dict, ref: str) -> dict:
     """One version of the document by its whole id or a prefix of six or more."""
     ref = ref.strip().lower()
     if len(ref) < 6 or not re.fullmatch(r"[0-9a-f-]+", ref):
         _die(6, "input", f"{ref!r} names no version",
              "a version id is its whole id or a prefix of six or more characters")
     found = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM teams_versions "
-                  "WHERE team = %s AND document = %s AND id::text LIKE %s ORDER BY created_at",
-                  (team, doc, ref + "%"))
+                  "WHERE document_id = %s AND id::text LIKE %s ORDER BY created_at",
+                  (document["id"], ref + "%"))
+    where = f"{team['name']}/{document['name']}"
     if not found:
-        _die(3, "not_found", f"{team}/{doc} has no version {ref!r}",
-             f"`{NAME} doc history {team} {doc}` lists its versions")
+        _die(3, "not_found", f"{where} has no version {ref!r}",
+             f"`{NAME} doc history {team['id']} {document['id']}` lists its versions")
     if len(found) > 1:
-        _die(6, "ambiguous_version", f"{ref!r} names {len(found)} versions of {team}/{doc}",
+        _die(6, "ambiguous_version", f"{ref!r} names {len(found)} versions of {where}",
              "give more of the id")
     return found[0]
 
@@ -622,25 +886,28 @@ def _version_view(version: dict, with_body: bool = True) -> dict:
 
 
 def _team_view(conn, team: dict, me: str | None) -> dict:
-    """A team whole: its line, mode, members, documents and size."""
+    """A team whole: its id, line, mode, members, documents and size."""
     members = [row["agent_id"] for row in _rows(
-        conn, "SELECT agent_id FROM teams_members WHERE team = %s ORDER BY agent_id",
-        (team["name"],))]
+        conn, "SELECT agent_id FROM teams_members WHERE team_id = %s ORDER BY agent_id",
+        (team["id"],))]
     documents = []
-    for row in _rows(conn, "SELECT d.name, d.enabled, v.id, v.description, v.load, v.body "
-                     "FROM teams_documents d JOIN teams_versions v ON v.team = d.team "
-                     "AND v.document = d.name AND v.active WHERE d.team = %s ORDER BY d.name",
-                     (team["name"],)):
-        documents.append({"name": row["name"], "enabled": row["enabled"],
-                          "load": row["load"], "description": row["description"],
+    for row in _rows(conn, "SELECT d.id AS document_id, d.name, d.enabled, v.id, "
+                     "v.description, v.load, v.body FROM teams_documents d "
+                     "JOIN teams_versions v ON v.document_id = d.id AND v.active "
+                     "WHERE d.team_id = %s AND d.retired_at IS NULL ORDER BY d.name",
+                     (team["id"],)):
+        documents.append({"id": row["document_id"], "name": row["name"],
+                          "enabled": row["enabled"], "load": row["load"],
+                          "description": row["description"],
                           "version": str(row["id"]), "tokens": tokens(row["body"])})
-    view = {"name": team["name"], "description": team["description"],
+    view = {"id": team["id"], "name": team["name"], "description": team["description"],
             "mode": _mode(team["always"]), "members": members,
             "tokens": sum(d["tokens"] for d in documents if d["enabled"]),
             "always_tokens": sum(d["tokens"] for d in documents
                                  if d["enabled"] and d["load"] == "always"),
             "documents": documents,
-            "created_at": _moment(team["created_at"]), "created_by": team["created_by"]}
+            "created_at": _moment(team["created_at"]), "created_by": team["created_by"],
+            "retired_at": _moment(team["retired_at"])}
     if me is not None:
         view["member"] = me in members
     return view
@@ -652,15 +919,16 @@ def cmd_list(args) -> None:
     me = _maybe_me() if args.all else _me()
     with _store() as conn:
         if args.all:
-            rows = _rows(conn, "SELECT t.name, t.description, t.always, "
-                         "EXISTS (SELECT 1 FROM teams_members m WHERE m.team = t.name "
-                         "AND m.agent_id = %s) AS member FROM teams_teams t ORDER BY t.name",
-                         (me or "",))
+            rows = _rows(conn, "SELECT t.id, t.name, t.description, t.always, "
+                         "EXISTS (SELECT 1 FROM teams_members m WHERE m.team_id = t.id "
+                         "AND m.agent_id = %s) AS member FROM teams_teams t "
+                         "WHERE t.retired_at IS NULL ORDER BY t.name", (me or "",))
         else:
-            rows = _rows(conn, "SELECT t.name, t.description, t.always, true AS member "
-                         "FROM teams_teams t JOIN teams_members m ON m.team = t.name "
-                         "WHERE m.agent_id = %s ORDER BY t.name", (me,))
-    teams = [{"name": row["name"], "description": row["description"],
+            rows = _rows(conn, "SELECT t.id, t.name, t.description, t.always, true AS member "
+                         "FROM teams_teams t JOIN teams_members m ON m.team_id = t.id "
+                         "WHERE m.agent_id = %s AND t.retired_at IS NULL ORDER BY t.name",
+                         (me,))
+    teams = [{"id": row["id"], "name": row["name"], "description": row["description"],
               "mode": _mode(row["always"]),
               **({"member": row["member"]} if me is not None else {})} for row in rows]
     if args.json:
@@ -672,52 +940,58 @@ def cmd_list(args) -> None:
         return
     for team in teams:
         mark = "  member" if team.get("member") and args.all else ""
-        print(f"{team['name']}  {team['mode']}{mark}  {team['description']}")
+        print(f"{team['name']}  {team['mode']}{mark}  {team['description']}  [{team['id']}]")
 
 
 def cmd_show(args) -> None:
-    team = _check_team(args.team)
+    ref = _check_ref(args.team, "team")
     me = _maybe_me()
     with _store() as conn:
-        view = _team_view(conn, _team(conn, team), me)
+        view = _team_view(conn, _team(conn, ref, retired=True), me)
     if args.json:
         _emit(view)
         return
-    lines = [f"team: {view['name']}", f"description: {view['description']}",
+    lines = [f"team: {view['name']}", f"id: {view['id']}",
+             f"description: {view['description']}",
              f"mode: {view['mode']}",
              f"members: {', '.join(view['members']) if view['members'] else 'none'}",
              f"tokens: {view['tokens']} (enabled documents), always: {view['always_tokens']}",
              "documents:" if view["documents"] else "documents: none"]
+    if view["retired_at"]:
+        lines.insert(2, f"retired: {view['retired_at']}")
     for doc in view["documents"]:
         lines.append(f"  {doc['name']}  {doc['load']}  {'on' if doc['enabled'] else 'off'}  "
-                     f"~{doc['tokens']} tokens  {doc['description']}")
+                     f"~{doc['tokens']} tokens  {doc['description']}  [{doc['id']}]")
     print("\n".join(lines))
 
 
 def cmd_doc_show(args) -> None:
-    team, doc = _check_team(args.team), _check_doc(args.doc)
+    team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
     with _store() as conn:
-        _team(conn, team)
-        document = _need_document(conn, team, doc)
-        version = (_version(conn, team, doc, args.version) if args.version
-                   else _active(conn, team, doc))
+        team = _team(conn, team_ref, retired=True)
+        document = _need_document(conn, team, doc_ref, retired=True)
+        version = (_version(conn, team, document, args.version) if args.version
+                   else _active(conn, document))
     if args.json:
-        _emit({"team": team, "document": doc, "enabled": document["enabled"],
-               **_version_view(version)})
+        _emit({"team": team["name"], "document": document["name"], "team_id": team["id"],
+               "document_id": document["id"], "enabled": document["enabled"],
+               "retired_at": _moment(document["retired_at"]), **_version_view(version)})
         return
     sys.stdout.write(render(version))
 
 
 def cmd_doc_history(args) -> None:
-    team, doc = _check_team(args.team), _check_doc(args.doc)
+    team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
     with _store() as conn:
-        _team(conn, team)
-        _need_document(conn, team, doc)
-        versions = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM teams_versions WHERE team = %s "
-                         "AND document = %s ORDER BY created_at DESC, id", (team, doc))
+        team = _team(conn, team_ref, retired=True)
+        document = _need_document(conn, team, doc_ref, retired=True)
+        versions = _rows(conn, f"SELECT {_VERSION_COLUMNS} FROM teams_versions "
+                         "WHERE document_id = %s ORDER BY created_at DESC, id",
+                         (document["id"],))
     views = [_version_view(v, with_body=False) for v in versions]
     if args.json:
-        _emit({"team": team, "document": doc, "versions": views})
+        _emit({"team": team["name"], "document": document["name"], "team_id": team["id"],
+               "document_id": document["id"], "versions": views})
         return
     for view in views:
         mark = "  active" if view["active"] else ""
@@ -729,50 +1003,108 @@ def cmd_doc_history(args) -> None:
 # ── writing ─────────────────────────────────────────────────────────────────
 
 def cmd_create(args) -> None:
-    team = _check_team(args.team)
+    team = _check_name(args.team, "team")
     description = _check_line(args.description, "description")
     with _store() as conn:
         with conn.transaction():
             made = _one(conn, "INSERT INTO teams_teams (name, description, always, created_by) "
-                        "VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO NOTHING RETURNING name",
+                        "VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO NOTHING RETURNING id",
                         (team, description, args.always, _actor()))
-            if made is None:
-                found = _team(conn, team)
-                if found["description"] != description or found["always"] != args.always:
+            changed = made is not None
+            if not changed:
+                made = _team(conn, team)
+                if made["description"] != description or made["always"] != args.always:
                     _die(6, "team_exists", f"a team {team!r} exists already, with the line "
-                         f"{found['description']!r} in {_mode(found['always'])} mode",
-                         f"`{NAME} show {team}` shows it; `{NAME} mode {team}` switches its "
-                         "mode")
-    _emit({"team": team, "description": description, "mode": _mode(args.always),
-           "changed": made is not None})
+                         f"{made['description']!r} in {_mode(made['always'])} mode",
+                         f"`{NAME} show {made['id']}` shows it; `{NAME} mode {made['id']}` "
+                         "switches its mode")
+    _emit({"team": team, "id": made["id"], "description": description,
+           "mode": _mode(args.always), "changed": changed})
 
 
 def cmd_mode(args) -> None:
-    team = _check_team(args.team)
+    ref = _check_ref(args.team, "team")
     always = args.mode == "always"
     with _store() as conn:
         with conn.transaction():
-            found = _team(conn, team, lock=True)
+            found = _team(conn, ref, lock=True)
             changed = found["always"] != always
             if changed:
-                conn.execute("UPDATE teams_teams SET always = %s WHERE name = %s",
-                             (always, team))
-    _emit({"team": team, "mode": args.mode, "changed": changed})
+                conn.execute("UPDATE teams_teams SET always = %s WHERE id = %s",
+                             (always, found["id"]))
+    _emit({"team": found["name"], "mode": args.mode, "changed": changed})
+
+
+def _taken(kind: str, name: str) -> NoReturn:
+    _die(6, "name_taken", f"the name {name!r} is taken by another {kind}",
+         f"choose another name, or rename or retire the {kind} that holds it")
+
+
+def cmd_rename(args) -> None:
+    ref, name = _check_ref(args.team, "team"), _check_name(args.name, "team")
+    with _store() as conn:
+        with conn.transaction():
+            found = _team(conn, ref, lock=True)
+            changed = found["name"] != name
+            if changed:
+                if _one(conn, "SELECT 1 AS taken FROM teams_teams WHERE name = %s "
+                        "AND id <> %s", (name, found["id"])):
+                    _taken("team", name)
+                conn.execute("UPDATE teams_teams SET name = %s WHERE id = %s",
+                             (name, found["id"]))
+    _emit({"id": found["id"], "team": name, "previous": found["name"], "changed": changed})
+
+
+def cmd_describe(args) -> None:
+    ref = _check_ref(args.team, "team")
+    description = _check_line(args.description, "description")
+    with _store() as conn:
+        with conn.transaction():
+            found = _team(conn, ref, lock=True)
+            changed = found["description"] != description
+            if changed:
+                conn.execute("UPDATE teams_teams SET description = %s WHERE id = %s",
+                             (description, found["id"]))
+    _emit({"id": found["id"], "team": found["name"], "description": description,
+           "changed": changed})
+
+
+def _retired_name(name: str, ident: str) -> str:
+    """The name a retired record keeps: its own, cut to fit, with its id, which
+    frees the name it had."""
+    return f"{name[:128 - len(ident) - 1]}~{ident}"
+
+
+def cmd_retire(args) -> None:
+    ref = _check_ref(args.team, "team")
+    with _store() as conn:
+        with conn.transaction():
+            found = _team(conn, ref, lock=True)
+            members = [row["agent_id"] for row in _rows(
+                conn, "DELETE FROM teams_members WHERE team_id = %s RETURNING agent_id",
+                (found["id"],))]
+            conn.execute("UPDATE teams_teams SET retired_at = now(), name = %s WHERE id = %s",
+                         (_retired_name(found["name"], found["id"]), found["id"]))
+    _emit({"id": found["id"], "team": found["name"], "retired": True,
+           "members_removed": sorted(members), "changed": True})
 
 
 def cmd_members(args) -> None:
-    team, agent = _check_team(args.team), _check_agent(args.agent)
+    ref, agent = _check_ref(args.team, "team"), _check_agent(args.agent)
     with _store() as conn:
         with conn.transaction():
-            _team(conn, team, lock=True)
+            team = _team(conn, ref, lock=True)
             if args.action == "add":
-                changed = _one(conn, "INSERT INTO teams_members (agent_id, team, added_by) "
-                               "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING RETURNING team",
-                               (agent, team, _actor())) is not None
+                changed = _one(conn, "INSERT INTO teams_members (agent_id, team_id, team, "
+                               "added_by) VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING "
+                               "RETURNING team_id",
+                               (agent, team["id"], team["name"], _actor())) is not None
             else:
                 changed = _one(conn, "DELETE FROM teams_members WHERE agent_id = %s AND "
-                               "team = %s RETURNING team", (agent, team)) is not None
-    _emit({"team": team, "agent": agent, "member": args.action == "add", "changed": changed})
+                               "team_id = %s RETURNING team_id",
+                               (agent, team["id"])) is not None
+    _emit({"team": team["name"], "agent": agent, "member": args.action == "add",
+           "changed": changed})
 
 
 def _read_source(source: str) -> str:
@@ -787,7 +1119,7 @@ def _read_source(source: str) -> str:
 
 
 def cmd_doc_save(args) -> None:
-    team, doc = _check_team(args.team), _check_doc(args.doc)
+    team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
     text = _read_source(args.source)
     try:
         fields = parse(text)
@@ -797,52 +1129,89 @@ def cmd_doc_save(args) -> None:
     actor = _actor()
     with _store() as conn:
         with conn.transaction():
-            _team(conn, team)
-            document = _document(conn, team, doc, lock=True)
+            team = _team(conn, team_ref)
+            document = _document(conn, team, doc_ref, lock=True)
             created = document is None
             if created:
                 if args.base:
-                    _die(3, "not_found", f"team {team!r} has no document {doc!r} to be the "
-                         "base of this save", "save without --base to start the document")
-                conn.execute("INSERT INTO teams_documents (team, name, created_by) "
-                             "VALUES (%s, %s, %s)", (team, doc, actor))
+                    _die(3, "not_found", f"team {team['name']!r} has no document {doc_ref!r} "
+                         "to be the base of this save", "save without --base to start the "
+                         "document")
+                name = _check_name(doc_ref, "document")
+                document = _one(conn, "INSERT INTO teams_documents (team_id, team, name, "
+                                "created_by) VALUES (%s, %s, %s, %s) RETURNING id, name",
+                                (team["id"], team["name"], name, actor))
                 active = None
             else:
-                active = _active(conn, team, doc)
+                active = _active(conn, document)
                 if args.base:
-                    base = _version(conn, team, doc, args.base)
+                    base = _version(conn, team, document, args.base)
                     if not base["active"]:
-                        _die(7, "stale_base", f"{team}/{doc} was saved after {args.base}: its "
-                             f"active version is {active['id']}",
-                             f"read it with `{NAME} doc show {team} {doc}`, carry the edit "
-                             "over, and save with that version as --base")
+                        _die(7, "stale_base", f"{team['name']}/{document['name']} was saved "
+                             f"after {args.base}: its active version is {active['id']}",
+                             f"read it with `{NAME} doc show {team['id']} {document['id']}`, "
+                             "carry the edit over, and save with that version as --base")
                 if _same(active, fields):
-                    _emit({"team": team, "document": doc, "version": str(active["id"]),
-                           "changed": False})
+                    _emit({"team": team["name"], "document": document["name"],
+                           "version": str(active["id"]), "changed": False})
                     return
                 conn.execute("UPDATE teams_versions SET active = false WHERE id = %s",
                              (active["id"],))
-            made = _one(conn, "INSERT INTO teams_versions (team, document, description, load, "
-                        "body, created_by, note) VALUES (%s, %s, %s, %s, %s, %s, %s) "
-                        "RETURNING id", (team, doc, fields["description"], fields["load"],
-                                         fields["body"], actor, args.note))
-    _emit({"team": team, "document": doc, "version": str(made["id"]),
+            made = _one(conn, "INSERT INTO teams_versions (document_id, team, document, "
+                        "description, load, body, created_by, note) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        (document["id"], team["name"], document["name"],
+                         fields["description"], fields["load"], fields["body"], actor,
+                         args.note))
+    _emit({"team": team["name"], "document": document["name"], "version": str(made["id"]),
            "previous": str(active["id"]) if active else None, "created": created,
            "tokens": tokens(fields["body"]), "changed": True})
 
 
 def cmd_doc_switch(args) -> None:
-    team, doc = _check_team(args.team), _check_doc(args.doc)
+    team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
     enabled = args.verb == "on"
     with _store() as conn:
         with conn.transaction():
-            _team(conn, team)
-            document = _need_document(conn, team, doc, lock=True)
+            team = _team(conn, team_ref)
+            document = _need_document(conn, team, doc_ref, lock=True)
             changed = document["enabled"] != enabled
             if changed:
-                conn.execute("UPDATE teams_documents SET enabled = %s WHERE team = %s "
-                             "AND name = %s", (enabled, team, doc))
-    _emit({"team": team, "document": doc, "enabled": enabled, "changed": changed})
+                conn.execute("UPDATE teams_documents SET enabled = %s WHERE id = %s",
+                             (enabled, document["id"]))
+    _emit({"team": team["name"], "document": document["name"], "enabled": enabled,
+           "changed": changed})
+
+
+def cmd_doc_rename(args) -> None:
+    team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
+    name = _check_name(args.name, "document")
+    with _store() as conn:
+        with conn.transaction():
+            team = _team(conn, team_ref)
+            document = _need_document(conn, team, doc_ref, lock=True)
+            changed = document["name"] != name
+            if changed:
+                if _one(conn, "SELECT 1 AS taken FROM teams_documents WHERE team_id = %s "
+                        "AND name = %s AND id <> %s", (team["id"], name, document["id"])):
+                    _taken("document", name)
+                conn.execute("UPDATE teams_documents SET name = %s WHERE id = %s",
+                             (name, document["id"]))
+    _emit({"team": team["name"], "id": document["id"], "document": name,
+           "previous": document["name"], "changed": changed})
+
+
+def cmd_doc_retire(args) -> None:
+    team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
+    with _store() as conn:
+        with conn.transaction():
+            team = _team(conn, team_ref)
+            document = _need_document(conn, team, doc_ref, lock=True)
+            conn.execute("UPDATE teams_documents SET retired_at = now(), enabled = false, "
+                         "name = %s WHERE id = %s",
+                         (_retired_name(document["name"], document["id"]), document["id"]))
+    _emit({"team": team["name"], "id": document["id"], "document": document["name"],
+           "retired": True, "changed": True})
 
 
 # ── doctor ──────────────────────────────────────────────────────────────────
@@ -866,7 +1235,7 @@ def cmd_doctor() -> None:
                             "changed": found.changed, "warnings": found.warnings}
         if found.state == "current":
             conn.autocommit = True
-            counts = _one(conn, "SELECT (SELECT count(*) FROM teams_teams) AS teams, "
+            counts = _one(conn, "SELECT (SELECT count(*) FROM teams_teams WHERE retired_at IS NULL) AS teams, "
                           "(SELECT count(*) FROM teams_members WHERE agent_id = %s) AS mine",
                           (agent or "",))
             report["teams"] = {"store": counts["teams"],
@@ -916,6 +1285,13 @@ def _parser() -> argparse.ArgumentParser:
     mode = verb(sub, "mode")
     mode.add_argument("team")
     mode.add_argument("mode", choices=("ordinary", "always"))
+    rename = verb(sub, "rename")
+    rename.add_argument("team")
+    rename.add_argument("name")
+    describe = verb(sub, "describe")
+    describe.add_argument("team")
+    describe.add_argument("--description", required=True)
+    verb(sub, "retire").add_argument("team")
 
     members = verb(sub, "members").add_subparsers(dest="action", required=True)
     for action in ("add", "remove"):
@@ -939,10 +1315,14 @@ def _parser() -> argparse.ArgumentParser:
     save.add_argument("--from", dest="source", required=True)
     save.add_argument("--base")
     save.add_argument("--note")
-    for switch in ("on", "off"):
+    for switch in ("on", "off", "retire"):
         one = verb(doc, switch)
         one.add_argument("team")
         one.add_argument("doc")
+    doc_rename = verb(doc, "rename")
+    doc_rename.add_argument("team")
+    doc_rename.add_argument("doc")
+    doc_rename.add_argument("name")
     return parser
 
 
@@ -991,9 +1371,11 @@ def main() -> None:
         cmd_doctor()
         return
     {"list": cmd_list, "show": cmd_show, "create": cmd_create, "mode": cmd_mode,
+     "rename": cmd_rename, "describe": cmd_describe, "retire": cmd_retire,
      "members add": cmd_members, "members remove": cmd_members,
      "doc show": cmd_doc_show, "doc history": cmd_doc_history, "doc save": cmd_doc_save,
-     "doc on": cmd_doc_switch, "doc off": cmd_doc_switch}[verb](args)
+     "doc on": cmd_doc_switch, "doc off": cmd_doc_switch, "doc rename": cmd_doc_rename,
+     "doc retire": cmd_doc_retire}[verb](args)
 
 
 if __name__ == "__main__":

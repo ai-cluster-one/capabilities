@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -209,7 +210,7 @@ def test_the_ledger_creates_the_tables_with_their_comments_and_guard(lab):
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'teams' ORDER BY step")]
     assert steps == ["0001-teams", "0002-members", "0003-documents", "0004-versions",
-                     "0005-versions-guard", "0006-keys"]
+                     "0005-versions-guard", "0006-keys", "0007-ids"]
     for table in ("teams_teams", "teams_members", "teams_documents", "teams_versions"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
         assert comment
@@ -229,8 +230,9 @@ def test_a_team_is_made_once_and_a_repeat_with_the_same_line_changes_nothing(lab
     assert lab.team()["changed"] is False
     code, error = lab.refused("create", "crew", "--description", "Another line.")
     assert (code, error["code"]) == (6, "team_exists")
-    code, error = lab.refused("create", "Crew!", "--description", "x")
-    assert (code, error["code"]) == (6, "input")
+    for bad in ("0a1b2c3d4e5f", " crew", "", "a" * 129):
+        code, error = lab.refused("create", bad, "--description", "x")
+        assert (code, error["code"]) == (6, "input"), bad
     code, error = lab.refused("create", "two", "--description", "a\nb")
     assert (code, error["code"]) == (6, "input")
 
@@ -331,7 +333,10 @@ def test_every_write_is_refused_under_the_read_only_switch_and_reads_still_answe
     for argv in (("create", "two", "--description", "x"), ("mode", "crew", "always"),
                  ("members", "add", "crew", AGENT), ("members", "remove", "crew", AGENT),
                  ("doc", "save", "crew", "style", "--from", "-"),
-                 ("doc", "off", "crew", "style"), ("doc", "on", "crew", "style")):
+                 ("doc", "off", "crew", "style"), ("doc", "on", "crew", "style"),
+                 ("rename", "crew", "two"), ("describe", "crew", "--description", "x"),
+                 ("retire", "crew"), ("doc", "rename", "crew", "style", "two"),
+                 ("doc", "retire", "crew", "style")):
         code, error = lab.refused(*argv, stdin=STYLE, CAPABILITIES_READ_ONLY="1")
         assert (code, error["code"]) == (4, "read_only_switch"), argv
     assert lab.ok("doc", "show", "crew", "style", CAPABILITIES_READ_ONLY="1") == STYLE
@@ -352,3 +357,188 @@ def test_the_manifest_carries_a_constant_contribution_and_no_connection(lab):
     assert manifest["credentials"]["keys"] == []
     answer = lab.ok("connections")
     assert (answer["default"], answer["connections"]) == (None, {})
+
+
+# --- ids and names ---------------------------------------------------------------
+
+BASE_REF = os.environ.get("TEAMS_BASE_REF", "ccf7b821")
+
+
+def _released_cli(tmp: Path) -> Path:
+    """teams as released at teams 1.1, the writer and reader older than ids."""
+    source = subprocess.run(["git", "-C", str(CAPABILITY), "show",
+                             f"{BASE_REF}:capabilities/teams/bin/teams"],
+                            capture_output=True, text=True)
+    if source.returncode != 0:
+        pytest.skip(f"the released teams at {BASE_REF} is not in this checkout")
+    path = tmp / "teams-1.1"
+    path.write_text(source.stdout)
+    return path
+
+
+def _old(lab, cli: Path, *args: str, stdin: str | None = None):
+    done = subprocess.run([sys.executable, str(cli), *args], cwd=lab.project, env=lab.env(),
+                          input=stdin, text=True, capture_output=True, timeout=180)
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+# The joins a reader released before ids makes: the manager's and AgentKit's.
+OLD_READER = (f"SELECT t.name, d.name, v.body FROM {SCHEMA}.teams_teams t "
+              f"JOIN {SCHEMA}.teams_members m ON m.team = t.name "
+              f"JOIN {SCHEMA}.teams_documents d ON d.team = t.name "
+              f"JOIN {SCHEMA}.teams_versions v ON v.team = d.team AND v.document = d.name "
+              "AND v.active WHERE m.agent_id = %s AND d.enabled ORDER BY t.name, d.name")
+
+
+def _mirrors_hold(lab) -> None:
+    """Every copy of a name equals the current name of what its id points at."""
+    assert lab.sql(f"""
+        SELECT count(*) FROM {SCHEMA}.teams_members m JOIN {SCHEMA}.teams_teams t
+            ON t.id = m.team_id WHERE m.team <> t.name""") == [(0,)]
+    assert lab.sql(f"""
+        SELECT count(*) FROM {SCHEMA}.teams_documents d JOIN {SCHEMA}.teams_teams t
+            ON t.id = d.team_id WHERE d.team <> t.name""") == [(0,)]
+    assert lab.sql(f"""
+        SELECT count(*) FROM {SCHEMA}.teams_versions v JOIN {SCHEMA}.teams_documents d
+            ON d.id = v.document_id WHERE v.team <> d.team OR v.document <> d.name""") == [(0,)]
+
+
+def test_a_store_at_teams_1_1_keeps_every_team_member_and_document_through_the_ids(lab):
+    old = _released_cli(lab.tmp)
+    _old(lab, old, "create", "crew", "--description", "The crew.", "--always")
+    lab.register(AGENT, OTHER)
+    _old(lab, old, "create", "ops", "--description", "Operations.")
+    for agent in (AGENT, OTHER):
+        _old(lab, old, "members", "add", "crew", agent)
+    _old(lab, old, "members", "add", "ops", AGENT)
+    _old(lab, old, "doc", "save", "crew", "style", "--from", "-", stdin=STYLE)
+    _old(lab, old, "doc", "save", "crew", "style", "--from", "-",
+         stdin=STYLE.replace("One", "Each"))
+    _old(lab, old, "doc", "save", "crew", "deploy", "--from", "-", stdin=DEPLOY)
+    _old(lab, old, "doc", "off", "crew", "deploy")
+    before = lab.sql(OLD_READER, (AGENT,))
+    assert lab.sql(f"SELECT major, minor FROM {SCHEMA}.schema_version "
+                   "WHERE owner = 'teams'") == [(1, 1)]
+
+    view = lab.ok("show", "crew", "--json")
+    assert lab.sql(f"SELECT major, minor FROM {SCHEMA}.schema_version "
+                   "WHERE owner = 'teams'") == [(1, 2)]
+    assert re.fullmatch(r"[0-9a-f]{12}", view["id"])
+    assert sorted(view["members"]) == sorted([AGENT, OTHER])
+    assert [(d["name"], d["enabled"]) for d in view["documents"]] == [
+        ("deploy", False), ("style", True)]
+    assert all(re.fullmatch(r"[0-9a-f]{12}", d["id"]) for d in view["documents"])
+    style = next(d for d in view["documents"] if d["name"] == "style")
+    history = lab.ok("doc", "history", view["id"], style["id"], "--json")
+    assert len(history["versions"]) == 2 and history["document_id"] == style["id"]
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.teams_members") == [(3,)]
+    assert lab.sql(OLD_READER, (AGENT,)) == before
+    _mirrors_hold(lab)
+
+
+def test_a_writer_and_a_reader_released_before_ids_keep_working_on_ids(lab):
+    old = _released_cli(lab.tmp)
+    lab.team("crew")
+    lab.register(AGENT)
+    _old(lab, old, "create", "ops", "--description", "Operations.")
+    _old(lab, old, "members", "add", "ops", AGENT)
+    _old(lab, old, "doc", "save", "ops", "style", "--from", "-", stdin=STYLE)
+    _old(lab, old, "doc", "save", "ops", "style", "--from", "-",
+         stdin=STYLE.replace("One", "Each"))
+    _old(lab, old, "doc", "off", "ops", "style")
+    _old(lab, old, "doc", "on", "ops", "style")
+    _old(lab, old, "mode", "ops", "always")
+    view = lab.ok("show", "ops", "--json")
+    assert (view["mode"], view["members"]) == ("always", [AGENT])
+    [doc] = view["documents"]
+    assert (doc["name"], doc["enabled"]) == ("style", True)
+    assert lab.ok("doc", "show", "ops", doc["id"]) == STYLE.replace("One", "Each")
+    assert "Each line" in _old(lab, old, "doc", "show", "ops", "style")
+    assert "ops  always" in _old(lab, old, "list")
+    _mirrors_hold(lab)
+
+
+def test_a_rename_keeps_the_id_and_every_copy_of_the_name_moves_in_the_same_transaction(lab):
+    made = lab.team("crew")
+    lab.register(AGENT)
+    lab.ok("members", "add", "crew", AGENT)
+    lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=STYLE)
+    doc_id = lab.ok("show", "crew", "--json")["documents"][0]["id"]
+
+    renamed = lab.ok("rename", "crew", "Release crew")
+    assert (renamed["id"], renamed["previous"], renamed["changed"]) == (
+        made["id"], "crew", True)
+    assert lab.ok("rename", made["id"], "Release crew")["changed"] is False
+    assert lab.ok("show", "Release crew", "--json")["id"] == made["id"]
+    code, error = lab.refused("show", "crew")
+    assert (code, error["code"]) == (3, "not_found")
+    moved = lab.ok("doc", "rename", "Release crew", "style", "House style")
+    assert (moved["id"], moved["document"]) == (doc_id, "House style")
+    assert lab.ok("doc", "show", made["id"], "House style") == STYLE
+    _mirrors_hold(lab)
+    assert lab.sql(OLD_READER, (AGENT,)) == [("Release crew", "House style",
+                                              STYLE.split("---\n", 2)[2])]
+
+    # Inside one transaction, the copies already read the new name.
+    with lab.cluster.connect(lab.database) as conn:
+        conn.autocommit = False
+        conn.execute(f"UPDATE {SCHEMA}.teams_teams SET name = 'crew two' WHERE id = %s",
+                     (made["id"],))
+        conn.execute(f"UPDATE {SCHEMA}.teams_documents SET name = 'style two' WHERE id = %s",
+                     (doc_id,))
+        assert conn.execute(OLD_READER, (AGENT,)).fetchall() == [
+            ("crew two", "style two", STYLE.split("---\n", 2)[2])]
+        conn.rollback()
+
+    lab.team("ops")
+    code, error = lab.refused("rename", "ops", "Release crew")
+    assert (code, error["code"]) == (6, "name_taken")
+    code, error = lab.refused("rename", "ops", "0a1b2c3d4e5f")
+    assert (code, error["code"]) == (6, "input")
+    assert lab.ok("describe", "ops", "--description", "Operations.")["changed"] is True
+    assert lab.ok("show", "ops", "--json")["description"] == "Operations."
+    import psycopg
+    with pytest.raises(psycopg.errors.CheckViolation):
+        lab.sql(f"UPDATE {SCHEMA}.teams_teams SET id = '0123456789ab' WHERE id = %s",
+                (made["id"],))
+    with pytest.raises(psycopg.errors.CheckViolation):
+        lab.sql(f"UPDATE {SCHEMA}.teams_documents SET id = '0123456789ab' WHERE id = %s",
+                (doc_id,))
+    with pytest.raises(psycopg.errors.CheckViolation):
+        lab.sql(f"UPDATE {SCHEMA}.teams_teams SET name = '0123456789ab' WHERE id = %s",
+                (made["id"],))
+
+
+def test_retiring_frees_the_name_and_keeps_every_version(lab):
+    made = lab.team("crew")
+    lab.register(AGENT)
+    lab.ok("members", "add", "crew", AGENT)
+    lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=STYLE)
+    lab.ok("doc", "save", "crew", "deploy", "--from", "-", stdin=DEPLOY)
+    deploy = next(d for d in lab.ok("show", "crew", "--json")["documents"]
+                  if d["name"] == "deploy")
+
+    retired = lab.ok("doc", "retire", "crew", "deploy")
+    assert (retired["id"], retired["retired"]) == (deploy["id"], True)
+    assert [d["name"] for d in lab.ok("show", "crew", "--json")["documents"]] == ["style"]
+    assert lab.ok("doc", "show", "crew", deploy["id"]) == DEPLOY
+    code, error = lab.refused("doc", "show", "crew", "deploy")
+    assert (code, error["code"]) == (3, "not_found")
+    again = lab.ok("doc", "save", "crew", "deploy", "--from", "-", stdin=DEPLOY)
+    assert again["created"] is True
+    assert lab.sql(OLD_READER, (AGENT,)) == [("crew", "deploy", DEPLOY.split("---\n", 2)[2]),
+                                             ("crew", "style", STYLE.split("---\n", 2)[2])]
+
+    out = lab.ok("retire", "crew")
+    assert (out["id"], out["members_removed"]) == (made["id"], [AGENT])
+    assert lab.ok("list", "--all", "--json")["teams"] == []
+    assert lab.ok("list", "--json")["teams"] == []
+    assert lab.ok("show", made["id"], "--json")["retired_at"]
+    code, error = lab.refused("show", "crew")
+    assert (code, error["code"]) == (3, "not_found")
+    code, error = lab.refused("members", "add", made["id"], AGENT)
+    assert (code, error["code"]) == (3, "not_found")
+    assert lab.team("crew")["id"] != made["id"]
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.teams_versions") == [(3,)]
+    _mirrors_hold(lab)

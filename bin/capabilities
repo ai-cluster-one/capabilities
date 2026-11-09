@@ -24538,8 +24538,10 @@ def _teams_context(root: Path) -> list[str]:
     a team in always mode its enabled always documents whole, each headed by
     the team's name, and its enabled on-request documents by their line. It
     reads nothing that changes from one session to the next, so it changes
-    only when the teams do. Nothing where the agent is in no team or has no
-    store; one line naming the failure where the store does not answer."""
+    only when the teams do. A command it prints quotes each name as a shell
+    word, since a name is free text. Nothing where the agent is in no team or
+    has no store; one line naming the failure where the store does not
+    answer."""
     import psycopg
     db = _db_module()
     try:
@@ -24554,7 +24556,7 @@ def _teams_context(root: Path) -> list[str]:
     lines = ["This agent is a member of these teams:", ""]
     for name, description, always in teams:
         how = ("always in context, below" if always
-               else f"its instructions: `{TEAMS_CAPABILITY} show {name}`")
+               else f"its instructions: `{TEAMS_CAPABILITY} show {shlex.quote(name)}`")
         lines.append(f"- **{name}** - {_md_escape(description)} ({how})")
     lines.append("")
     for name, _description, always in teams:
@@ -24567,7 +24569,8 @@ def _teams_context(root: Path) -> list[str]:
         on_request = [doc for doc in own if doc[2] == "on-request"]
         if on_request:
             lines += [f"### Team {name}: on request", ""]
-            lines += [f"- `{TEAMS_CAPABILITY} doc show {name} {doc}` - {_md_escape(line)}"
+            lines += [f"- `{TEAMS_CAPABILITY} doc show {shlex.quote(name)} {shlex.quote(doc)}` "
+                      f"- {_md_escape(line)}"
                       for _team, doc, _load, line, _body in on_request]
             lines.append("")
     return lines

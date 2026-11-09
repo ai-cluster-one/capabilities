@@ -235,3 +235,20 @@ def test_teams_disabled_for_the_agent_composes_nothing_of_it(lab):
     fragment = lab.fragment()
     assert _section(fragment) is None
     assert "The release crew" not in fragment
+
+
+def test_a_command_the_block_prints_quotes_a_name_that_holds_a_space(lab):
+    lab.teams("create", "Release crew", "--description", "The release crew.", "--always")
+    lab.register(AGENT)
+    lab.teams("members", "add", "Release crew", AGENT)
+    lab.teams("doc", "save", "Release crew", "deploy rules", "--from", "-", stdin=DEPLOY)
+    lab.teams("create", "ops", "--description", "Operations.")
+    lab.teams("members", "add", "ops", AGENT)
+    section = _section(lab.fragment())
+    assert "- `teams doc show 'Release crew' 'deploy rules'` - Read before a release." \
+        in section
+    assert "(its instructions: `teams show ops`)" in section
+    lab.teams("rename", "Release crew", "Releases")
+    section = _section(lab.fragment())
+    assert "- **Releases** - The release crew. (always in context, below)" in section
+    assert "`teams doc show Releases 'deploy rules'`" in section
