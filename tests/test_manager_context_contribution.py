@@ -318,6 +318,23 @@ def test_a_command_that_does_not_answer_is_ended_within_the_timeout(tmp_path, mo
     assert time.monotonic() - started < 15
 
 
+def test_a_child_that_left_the_command_group_is_not_waited_for(tmp_path, monkeypatch):
+    # A child in a session of its own keeps the output open beyond the kill.
+    import sys
+    script = tmp_path / "detaching"
+    script.write_text(f"#!{sys.executable}\nimport subprocess\n"
+                      "subprocess.Popen(['sleep', '60'], start_new_session=True)\n"
+                      "print('# Half')\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(M, "CONTRIBUTION_TIMEOUT_SECONDS", 2)
+    monkeypatch.setattr(M, "_script_path", lambda name: script)
+    import time
+    started = time.monotonic()
+    assert M._run_contribution(tmp_path, "demo", ["block"]) == (
+        None, "`demo block` did not answer within 2 seconds")
+    assert time.monotonic() - started < 15
+
+
 def test_a_capability_not_enabled_or_not_installed_runs_nothing(tmp_path):
     marker = tmp_path / "ran"
     _snapshot(tmp_path, "demo", COMMAND, f'touch "{marker}"\nprintf "Never.\\n"\n')

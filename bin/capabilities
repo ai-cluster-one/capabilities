@@ -4465,6 +4465,9 @@ CONTRIBUTION_STANDING_TIERS = ("core",)
 # an install or update makes its environment from uv's cache, the cold case,
 # which a fresh node meets at its first build.
 CONTRIBUTION_TIMEOUT_SECONDS = 30
+# How long, after the timeout ends a command's process group, the manager waits
+# for its output to close before it gives the block up.
+CONTRIBUTION_REAP_SECONDS = 2
 CONTRIBUTION_COMMAND_MAX_ARGS = 8
 
 
@@ -24551,8 +24554,9 @@ def _contribution_command(name: str, manifest: dict | None) -> tuple[list[str], 
 def _run_contribution(root: Path, name: str, command: list[str]) -> tuple[str | None, str]:
     """(Markdown, "") a capability's declared command printed for the agent at
     `root`, run there as that agent, or (None, why it gave none). It answers
-    within the timeout or is ended with everything it started, so a command
-    that hangs, or a child that holds its output open, costs this block alone."""
+    within the timeout or its process group is ended, and a child that left
+    the group is not waited for, so a command that hangs, or a child that
+    holds its output open, costs this block alone and no longer than that."""
     import signal
     shown = " ".join(shlex.quote(arg) for arg in [name, *command])
     env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root)}
@@ -24569,7 +24573,16 @@ def _run_contribution(root: Path, name: str, command: list[str]) -> tuple[str | 
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
-        proc.communicate()
+        # A child that left the command's process group can still hold its
+        # output open and is beyond the kill: it is not waited for.
+        try:
+            proc.communicate(timeout=CONTRIBUTION_REAP_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.stdout.close()
+            try:
+                proc.wait(timeout=CONTRIBUTION_REAP_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
         return None, f"`{shown}` did not answer within {CONTRIBUTION_TIMEOUT_SECONDS} seconds"
     if proc.returncode != 0:
         return None, f"`{shown}` exited {proc.returncode}; `{name} doctor` names the repair"

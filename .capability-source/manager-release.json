@@ -2,7 +2,7 @@
   "assets": {
     "DOCTRINE.md": "ec97a3db62521c82d2103595883575b8822e69a54fb1abfce5ec96468352fd7d",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "24729959d874cae5f9c08722abc76d5b13cca7815c0d5e05d77520d2c6377471",
+    "SHEBANG.md": "6c3791dc9b4277a8976e57358c85716e2990af8b73b8506ae8a229788d1e6846",
     "SOURCES.md": "2bddcf041b3c4175c36fa64cf26cc1aabf8b2defa0640ced302570f60c6444eb",
     "TEMPLATE.md": "3d815f02a99716ee174cf512ede0951ade110a6cc0a8c91cf520bf63fc521f72",
     "contract/CHANGELOG.md": "b9e2a6b9b186694d6b141c3cd1e67ef996559032c1d8a253c190e34afbd88443",
@@ -25,7 +25,7 @@
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "58829ee86a75f25555521555c25f92b841265504525f758dcc93e12cb60d3904"
+    "sha256": "034af788552527c0ac3f267536d6d6cb77bfa33cb5dd2ba7ff270a8de153f73d"
   },
   "schema": "capabilities.manager-release.v1",
   "store_major": 4
