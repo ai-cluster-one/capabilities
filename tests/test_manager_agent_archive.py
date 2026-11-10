@@ -32,6 +32,9 @@ DB_KEYS = ("AGENTKIT_DB_URL", "AGENTKIT_DB_HOST", "AGENTKIT_DB_PORT", "AGENTKIT_
            "AGENTKIT_DB_USER", "AGENTKIT_DB_PASSWORD", "AGENTKIT_DB_SCHEMA",
            "AGENTKIT_DB_SSLMODE", "AGENTKIT_DB_SSLROOTCERT")
 PROJECT_ID = "prj_" + "0a1b2c3d4e5f"
+# The markers an agent harness or a conveyor turn sets in its commands'
+# environment; the lab strips them, so a run inside one tests the same.
+MARKERS = ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CODEX_THREAD_ID", "TASKS_EXECUTION")
 PLAIN, BOXED, PLACED, TURNING, SYSTEM = ("a1a1a1a1a1a1", "b2b2b2b2b2b2", "c3c3c3c3c3c3",
                                          "d4d4d4d4d4d4", "e5e5e5e5e5e5")
 
@@ -128,7 +131,7 @@ class Lab:
     def env(self, cwd: Path, **extra: str) -> dict:
         env = {k: v for k, v in os.environ.items()
                if k not in DB_KEYS and not k.startswith("CAPABILITIES_")
-               and k not in ("AGENT_NODE_ID", "AGENT_NODE_NAME")}
+               and k not in ("AGENT_NODE_ID", "AGENT_NODE_NAME") and k not in MARKERS}
         env.update({
             "HOME": str(self.tmp / "home"),
             "XDG_CONFIG_HOME": str(self.tmp / "config"),
@@ -431,3 +434,36 @@ def test_a_guarded_write_in_flight_holds_the_archive_back_and_is_then_seen(lab):
     assert [(r["kind"], r["capability"], r["state"]) for r in error["detail"]["blocking"]] == [
         ("service", "tasks", "lease_ending")]
     assert lab.sql("SELECT archived_at FROM agents WHERE id = %s", (PLAIN,)) == [(None,)]
+
+
+@pytest.mark.parametrize("marker", MARKERS)
+def test_inside_a_harness_another_agent_is_refused_and_its_own_is_not(lab, marker):
+    _seed(lab)
+    inside = {marker: "1"}
+    # From a folder of no agent, and from this agent's own folder, another agent
+    # is refused, and nothing is written.
+    for cwd in (lab.elsewhere, lab.project):
+        for args in (("agent", "archive", "plain"),
+                     ("service", "stop", "tasks", "--agent", "placed", "--wait", "0")):
+            code, error = lab.refused(*args, cwd=cwd, **inside)
+            assert (code, error["code"]) == (4, "harness_session"), (args, error)
+            assert marker in error["message"] and "Inbox" in error["hint"]
+    assert lab.sql("SELECT count(*) FROM agents WHERE archived_at IS NOT NULL") == [(0,)]
+    assert lab.sql("SELECT service FROM policies WHERE agent_id = %s", (PLACED,)) == [
+        (True,)]
+    # The check writes nothing and stays open.
+    assert _check(lab, "plain", **inside)["can_archive"] is True
+    # Its own agent: the services stop and the archive goes through, and
+    # restore stays open.
+    lab.ok("node", "add", nid("mac-me"), "--label", "mac-me", "--kind", "mac",
+           cwd=lab.project)
+    stopped = lab.ok("service", "stop", "tasks", "--agent", PROJECT_ID, "--wait", "0",
+                     cwd=lab.project, **inside)
+    assert stopped["agent_id"] == PROJECT_ID
+    assert lab.ok("agent", "archive", PROJECT_ID, cwd=lab.project, **inside)["changed"] is True
+    assert lab.ok("agent", "restore", PROJECT_ID, cwd=lab.project, **inside)["changed"] is True
+    # With no marker, another agent is archived and stopped as before.
+    assert lab.ok("agent", "archive", "plain")["changed"] is True
+    code, error = lab.refused("service", "stop", "tasks", "--agent", "placed", "--wait", "0")
+    assert (code, error["code"], error["detail"]["changed"]) == (
+        6, "service_still_running", True)

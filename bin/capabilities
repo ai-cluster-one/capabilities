@@ -1280,6 +1280,17 @@ PROJECT VERBS (run inside a consuming project)
         capability), and `agent materialize`, `place`, `service start|move`
         and `node add` exit 4 agent_archived; reading, stopping and
         unplacing stay open.
+        Inside an agent harness session or a conveyor turn - where the
+        command's environment sets CLAUDE_CODE_SESSION_ID or CLAUDECODE
+        (Claude Code), CODEX_THREAD_ID (Codex) or TASKS_EXECUTION (a tasks
+        turn) - archive, and `service stop --agent`, act only on the agent
+        of the folder the command runs in; any other agent is refused, exit
+        4 harness_session, writing nothing, and the agent asks the person
+        through the Inbox instead. --check stays open, and so does restore,
+        which starts nothing. A command with none of these set, AgentKit's
+        or a person's in a terminal, is not refused. This guards against a
+        mistake and injected text, not a security boundary: an agent that
+        strips the markers from its environment is not stopped.
   agent restore <id|slug>
         Clear an agent's archived mark, and nothing else: no service is
         placed or started, no node enabled and nothing queued changed:
@@ -2135,7 +2146,8 @@ PROJECT VERBS (run inside a consuming project)
         the node --node names, else every node it is placed on or running on,
         answering {stopped, agent_id, nodes, changed, placed_on,
         waited_seconds} (exit 6 agent_unknown; 4 system_agent for a system
-        agent). restart asks the
+        agent; 4 harness_session for another agent inside a harness session
+        or a conveyor turn, as `agent archive` says). restart asks the
         node's manager through the store to restart its program and waits
         for the row's started_at to move: {restarted, node, state, ready,
         instance, waited_seconds}; exit 6 service_not_running where the node
@@ -12827,6 +12839,7 @@ def _agent_archive(ref: str, check_only: bool) -> dict:
             agent_id = _agent_ref_id(conn, ref, here)
             if agent_id is None:
                 _agent_unknown(ref, setting)
+            _refuse_harness_for_other_agent(agent_id, "agent archive")
             # The lock every guard's FOR SHARE waits on; under read committed
             # the check below then reads whatever such a write committed.
             kind, stamped, actor = conn.execute(
@@ -12899,6 +12912,44 @@ def _agent_restore(ref: str) -> dict:
         _die(5, "store_write_failed", f"the store refused the change: {exc}")
     finally:
         conn.close()
+
+
+# The variables an agent harness or a conveyor turn sets in the environment of
+# every command it runs: Claude Code's session and its own flag, Codex's
+# thread, and the raise a tasks turn signs its writes with.
+HARNESS_MARKERS = ("CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CODEX_THREAD_ID",
+                   "TASKS_EXECUTION")
+
+
+def _harness_marker() -> str | None:
+    """The first harness marker this command's environment sets, else None."""
+    for var in HARNESS_MARKERS:
+        if os.environ.get(var, "").strip():
+            return var
+    return None
+
+
+def _refuse_harness_for_other_agent(agent_id: str, verb: str) -> None:
+    """Refuse `verb` on `agent_id` inside an agent harness session or a
+    conveyor turn, unless it is the agent of the folder the command runs in. A
+    guard against a mistake or injected text, not a security boundary: a
+    command whose environment carries no marker - AgentKit's, or a person's in
+    a terminal - is not refused."""
+    marker = _harness_marker()
+    if marker is None:
+        return
+    root = _project_root()
+    own = _project_id_state(root, move=False)["id"] if root is not None else None
+    if own:
+        old = OLD_FORM_ID_RE.match(own)
+        if agent_id in {own, old.group(1) if old else own}:
+            return
+    _die(4, "harness_session",
+         f"`capabilities {verb}` is refused: it runs inside an agent harness session or "
+         f"a conveyor turn ({marker} is set), and agent {agent_id} is not the agent of "
+         "the folder it runs in",
+         "Do not remove the marker yourself. Ask the person through the Inbox "
+         "(`inbox ask` or `inbox talk`) to do it from AgentKit or their own terminal.")
 
 
 def _agent_archived_mark(conn, agent_id: str) -> dict:
@@ -18670,6 +18721,7 @@ def _service_stop_agent(name: str, opts: dict) -> None:
             agent_id = _agent_ref_id(conn, ref, _node_id_or(None))
             if agent_id is None:
                 _agent_unknown(ref, setting)
+            _refuse_harness_for_other_agent(agent_id, "service stop --agent")
             _refuse_system_agent(conn, agent_id, "service stop")
             if node:
                 nodes = [node]
