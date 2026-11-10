@@ -66,6 +66,8 @@ CONN_FIELDS = [     # a connection entry's own fields; turns on `connection add|
 SETUP_FIELDS = []   # the machine's prerequisites, set once; turns on `setup`
 LINK_METHODS = []   # interactive ceremonies that link a connection, each with --events
 SETTINGS = None     # or {"homes": [...], "keys": [...]}; turns on `settings`
+LEVEL = 0           # optional literal: this release's level, raised only when it gains what another release will require
+REQUIRES_MANAGER = 0  # optional literal: the lowest manager level this release needs; both read without running the script
 ```
 
 ## Agent-first help is the surface

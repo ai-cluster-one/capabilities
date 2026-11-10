@@ -267,6 +267,15 @@ MACHINE VERBS
         carries store_major (store majors). A line that names the
         capabilities-contract range it reads (library) keeps each environment's
         sync inside that range.
+        Update and install take no payload this manager and it would leave
+        below each other's minimum (levels, under self-update --check): one
+        whose REQUIRES_MANAGER is above this manager's level, or whose LEVEL
+        is below the level this manager requires of it, keeps the installed
+        payload; install and `update <name>` exit 6 manager_too_old or
+        capability_below_manager_requirement, naming the capability, both
+        levels and the command that resolves it, and an update of all
+        answers that row {name, changed: false, refused {code, message,
+        hint}} and goes on with the rest.
   update --check [<name>] [--json]
         Report, for every installed capability or the one named, whether
         `update` would change it: its recorded source carries a different
@@ -297,7 +306,10 @@ MACHINE VERBS
         false and names it in error; the other rows are still answered. Exit 0
         when every row was answered, behind or current alike; 5 when any row
         carries an error; 3 when the named capability is not installed. Output
-        is always JSON, so --json changes nothing.
+        is always JSON, so --json changes nothing. A row whose available
+        payload `update` would refuse for its levels, as its catalogue entry
+        names them (level, requires_manager), carries refused {code, message,
+        hint} with update_available false.
   self-update [--from <checkout>]
         Refresh the manager itself and re-point its PATH symlink (install.sh is
         the first-install bootstrap). By default fetch the canonical source;
@@ -309,6 +321,17 @@ MACHINE VERBS
         capability that arrives with the manager (agenttemplates) where this
         machine does not have it, answered as carried_capabilities [{name,
         installed, error?}]; one that fails never fails the update.
+        A release whose manifest requires capability levels (levels, under
+        --check) reads the catalogue at the same commit, or the --from tree's,
+        before switching: where an installed capability is below a level it
+        requires and that catalogue does not offer the level, it exits 6
+        manager_requirement_unmet naming each one, its installed and required
+        level, and switches nothing. Otherwise it switches and the new manager
+        updates each such capability, answered as brought_capabilities [{name,
+        installed, required, level}]; where one cannot be brought to its level,
+        the capabilities it updated are put back, the manager's links point
+        where they did, and it exits 6 required_capability_failed saying what
+        failed. A required capability not installed here is not installed.
         It takes only a release that reads the store's schema major (store
         majors, below): the release manifest's store_major against the store this
         folder resolves. A release of the store's major is taken, as is the
@@ -345,7 +368,25 @@ MACHINE VERBS
         release it refuses, with update_available false. Exit 0 when the check
         answered, behind or current alike; 5 when the source cannot be reached
         or carries no valid release manifest. Output is always JSON, so --json
-        changes nothing.
+        changes nothing. compat (levels, below) is as doctor answers it, with
+        available {level, requires, brings [name]} for the release: the
+        installed capabilities self-update would bring along, or refused, the
+        message it would refuse it with, in place of brings.
+        Levels, for install, update, self-update, their --check and doctor:
+        a manager release declares its level (MANAGER_LEVEL) and the minimum
+        level it requires of each capability (MANAGER_REQUIRES), and a
+        capability its own LEVEL and the manager level it requires
+        (REQUIRES_MANAGER), module literals read from the script without
+        running it, 0 where absent; `source index` stamps them as level and
+        requires into the release manifest and level and requires_manager
+        into each catalogue entry, and refuses a tree whose manager and
+        catalogue do not meet each other's. A manifest or catalogue that
+        names none reads as level 0 requiring nothing. compat {manager_level,
+        unmet [{name, needs (capability | manager), installed, required,
+        required_by (capabilities | <capability>), command}], update_needed,
+        next [command]}: each pair installed here whose minimum the other
+        does not meet, read locally with no network; next lists the distinct
+        commands, `capabilities self-update` first.
         Store majors, for update, self-update and their --check: every
         manager release and capability names the store
         schema major it reads: STORE_MAJOR in the manager, stamped by `source
@@ -2669,6 +2710,8 @@ VERIFICATION VERBS
         $XDG_STATE_HOME/<name>/programs/ (program_missing: capability,
         program, feature, fetched_to, and a one-line message saying what
         stops working until the capability fetches it on first use).
+        compat (levels, under self-update --check) names each installed pair
+        whose minimum the other does not meet, and each is also drift.
         Exit 0 clean, 7 drift found.
   audit <name> [--from <path>]
         Contract conformance: call the contract verbs, validate output
@@ -2943,6 +2986,16 @@ STORE_LIBRARY: str | None = None
 STORE_CANONICAL_REF = "main"
 STORE_LINE_REF = "store-major-{major}"
 STORE_UPGRADE_COMMAND = "capabilities store upgrade"
+# The level of this manager release and the capability levels it requires,
+# {name: minimum LEVEL}. A capability declares its own `LEVEL` and the manager
+# level it needs as `REQUIRES_MANAGER`, read from its script without running
+# it; either absent is 0. `source index` stamps them into the release manifest
+# (level, requires) and the catalogue (level, requires_manager); `install`,
+# `update` and `self-update` never leave a manager and a capability below each
+# other's minimum. A level rises only when a release gains something another
+# release will require.
+MANAGER_LEVEL = 1
+MANAGER_REQUIRES: dict = {}
 _CONTRACT_TIERS = ("core", "store", "connections")
 _REQUIRED_CONTRACT_TIERS = ("core", "store")
 _AUTHORING_ASSETS = (
@@ -5023,6 +5076,118 @@ def _machine_reads_declared(text: str) -> tuple[tuple | None, str | None]:
     return value, None
 
 
+_LEVEL_NAMES = ("LEVEL", "REQUIRES_MANAGER")
+
+
+def _levels_declared(text: str) -> tuple[dict, list[str]]:
+    """A capability's `LEVEL` and `REQUIRES_MANAGER` as its source declares
+    them, read without running it: ({LEVEL, REQUIRES_MANAGER}, problems), each
+    0 where it is not declared, or is not a literal non-negative integer, which
+    is then a problem."""
+    import ast
+    found = {key: 0 for key in _LEVEL_NAMES}
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return found, []
+    problems: dict[str, str] = {}
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets = [stmt.target]
+        else:
+            continue
+        for key in _LEVEL_NAMES:
+            if not any(isinstance(t, ast.Name) and t.id == key for t in targets):
+                continue
+            try:
+                value = ast.literal_eval(stmt.value)
+            except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                value = None
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                found[key] = value
+                problems.pop(key, None)
+            else:
+                found[key] = 0
+                problems[key] = f"{key} must be a literal non-negative integer"
+    return found, list(problems.values())
+
+
+def _script_levels(script: Path) -> dict:
+    """{LEVEL, REQUIRES_MANAGER} the script at `script` declares, 0 each where
+    it declares none or cannot be read."""
+    try:
+        text = script.read_text()
+    except (OSError, UnicodeDecodeError):
+        return {key: 0 for key in _LEVEL_NAMES}
+    return _levels_declared(text)[0]
+
+
+def _levels_problems(script: Path) -> list[str]:
+    """The level declarations a capability fails, checked where it is
+    validated."""
+    try:
+        text = script.read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+    return _levels_declared(text)[1]
+
+
+def _level_refusal(name: str, levels: dict) -> dict | None:
+    """Why this manager does not take a payload of `name` declaring `levels`,
+    as an error {code, message, hint}, else None: it needs a newer manager
+    than this one, or it is below the level this manager requires of it."""
+    needs = levels.get("REQUIRES_MANAGER") or 0
+    if needs > MANAGER_LEVEL:
+        return {"code": "manager_too_old",
+                "message": f"{name} requires manager level {needs}, and this manager "
+                           f"is level {MANAGER_LEVEL}, so it is not taken and what is "
+                           "installed is kept",
+                "hint": f"run `capabilities self-update`, then `capabilities update {name}`"}
+    required = MANAGER_REQUIRES.get(name, 0)
+    level = levels.get("LEVEL") or 0
+    if level < required:
+        return {"code": "capability_below_manager_requirement",
+                "message": f"this manager requires {name} at level {required} or above, "
+                           f"and the release offered is level {level}, so it is not "
+                           "taken and what is installed is kept",
+                "hint": f"take {name} from a source that carries level {required}"}
+    return None
+
+
+class _LevelRefused(Exception):
+    """A payload `_prepare_payload` does not take for its levels."""
+
+    def __init__(self, error: dict):
+        super().__init__(error["message"])
+        self.error = error
+
+
+def _compat_answer() -> dict:
+    """`compat`: each pair installed here now whose minimum the other does not
+    meet - this manager's MANAGER_REQUIRES against each installed capability's
+    LEVEL, and each installed capability's REQUIRES_MANAGER against
+    MANAGER_LEVEL - read from the installed scripts, with no network."""
+    unmet = []
+    for name in sorted(_installed()):
+        levels = _script_levels(_script_path(name))
+        required = MANAGER_REQUIRES.get(name, 0)
+        if levels["LEVEL"] < required:
+            unmet.append({"name": name, "needs": "capability", "installed": levels["LEVEL"],
+                          "required": required, "required_by": "capabilities",
+                          "command": f"capabilities update {name}"})
+        if levels["REQUIRES_MANAGER"] > MANAGER_LEVEL:
+            unmet.append({"name": name, "needs": "manager", "installed": MANAGER_LEVEL,
+                          "required": levels["REQUIRES_MANAGER"], "required_by": name,
+                          "command": "capabilities self-update"})
+    commands = [row["command"] for row in unmet]
+    ordered = (["capabilities self-update"] if "capabilities self-update" in commands
+               else []) + [c for c in commands if c != "capabilities self-update"]
+    return {"manager_level": MANAGER_LEVEL, "unmet": unmet,
+            "update_needed": bool(unmet), "next": list(dict.fromkeys(ordered))}
+
+
 def _link_verbs_declared(text: str) -> tuple[list | None, str | None]:
     """The verbs a capability's `LINK_METHODS` ceremonies run, as its source
     declares them, read without running it: `([], None)` when it declares
@@ -5459,6 +5624,14 @@ def _prepare_payload(name: str, content: bytes, bundle_dir: Path | None,
                 f"{name} from {source} does not bind a supported contract library",
                 "; ".join(problems),
             )
+        levels, problems = _levels_declared(script.read_text())
+        if problems:
+            _die(7, "install_validation_failed",
+                 f"{name} from {source}: LEVEL or REQUIRES_MANAGER fails validation",
+                 "; ".join(problems))
+        refused = _level_refusal(name, levels)
+        if refused is not None:
+            raise _LevelRefused(refused)
         # uv keys a script's environment by the path it is run from, so the
         # staged copy, run through its own header, would leave one more
         # environment on every install and update. Where the installed copy
@@ -6064,7 +6237,10 @@ def cmd_install(name: str, from_ref: str | None, source_id: str | None,
     else:
         content, source, bundle_dir, temp_root = _resolve_source(name, from_ref)
         fetched_from = source
-    stage, manifest = _prepare_payload(name, content, bundle_dir, temp_root, fetched_from)
+    try:
+        stage, manifest = _prepare_payload(name, content, bundle_dir, temp_root, fetched_from)
+    except _LevelRefused as refused:
+        _die(6, refused.error["code"], refused.error["message"], refused.error["hint"])
     _write_json(stage / "meta.json", {
         "name": name, "source": source, "source_type": "directory" if bundle_dir else "script",
         "sha256": _sha256(stage / name), "payload_sha256": _payload_sha256(stage),
@@ -6353,6 +6529,9 @@ def cmd_update(name: str | None) -> None:
         with _update_recorded(n):
             results.append(_update_one(n, here, catalogues, refreshed))
     _sync_skill()
+    if name and "refused" in results[0]:
+        error = results[0]["refused"]
+        _die(6, error["code"], error["message"], error["hint"])
     answer = {"updated": sorted(results, key=lambda entry: entry["name"]),
               "store_major": here}
     reconciled = _core_reconcile()
@@ -6388,6 +6567,21 @@ def _catalogue_release(catalog: object, name: str) -> tuple[int, str | None]:
     if declared is None:
         declared = catalog.get("store_major")
     return _release_store_major(declared), _release_library(catalog.get("library"))
+
+
+def _catalogue_levels(catalog: object, name: str) -> dict:
+    """{LEVEL, REQUIRES_MANAGER} a catalogue names for `name` (its entry's
+    level and requires_manager); 0 each where it names none, as a catalogue
+    from before levels does."""
+    entries = catalog.get("capabilities") if isinstance(catalog, dict) else None
+    entry = entries.get(name) if isinstance(entries, dict) else None
+    entry = entry if isinstance(entry, dict) else {}
+
+    def level(value: object) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) \
+            and value >= 0 else 0
+    return {"LEVEL": level(entry.get("level")),
+            "REQUIRES_MANAGER": level(entry.get("requires_manager"))}
 
 
 def _fetched_catalogue(name: str, source: str, bundle_dir: Path | None,
@@ -6455,7 +6649,7 @@ def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None
     meta = _read_json(_registry_dir(n) / "meta.json") or {}
     found, _error = _captured(_available_payload, n, meta, refreshed, catalogues)
     if found is not None:
-        _source, available, _reader, (release, range_), target = found
+        _source, available, _reader, (release, range_), target, _levels = found
         if ((here["store"] is None or release == here["store"])
                 and available == _payload_sha256(_registry_dir(n), n)):
             entry = {"name": n, "changed": False}
@@ -6486,7 +6680,15 @@ def _update_one(n: str, here: dict | None = None, catalogues: dict | None = None
         source = fetched_from
     target = _catalogue_library(
         _fetched_catalogue(n, fetched_from, bundle_dir, catalogues), catalogues)
-    stage, manifest = _prepare_payload(n, content, bundle_dir, temp_root, fetched_from)
+    try:
+        stage, manifest = _prepare_payload(n, content, bundle_dir, temp_root, fetched_from)
+    except _LevelRefused as refused:
+        # The installed payload is kept; `cmd_update` refuses a named update,
+        # and an update of all goes on with the rest.
+        entry = {"name": n, "changed": False, "refused": refused.error}
+        if store_major is not None:
+            entry["store_major"] = store_major
+        return entry
     lock_changed = _script_metadata_block(stage / n) != _script_metadata_block(_script_path(n))
     after = _payload_sha256(stage)
     _write_json(stage / "meta.json", {
@@ -6718,13 +6920,15 @@ def _catalogue_entry(catalog: object, name: str, where: str) -> dict:
 
 def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
                        ) -> tuple[str, str, Callable[[], str | None], tuple[int, str | None],
-                                  str | None]:
+                                  str | None, dict]:
     """Where `update` would fetch `name` from, and the payload it would find.
 
     Returns (source, catalogue hash, version reader, (store major, library
     range) its catalogue names, as `_catalogue_release`, and the
     capabilities-contract release `update` would bring it to, as
-    `_catalogue_library`). A registered source is brought forward exactly as
+    `_catalogue_library`, and the {LEVEL, REQUIRES_MANAGER} the payload declares,
+    as its catalogue names them or, with no catalogue, its script). A
+    registered source is brought forward exactly as
     `update` brings it forward, once per run; a catalogue URL is answered from
     the catalogue it publishes, fetched once, its version from the entry.
     """
@@ -6742,18 +6946,22 @@ def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
         entry = _catalogue_entry(catalog, name, f"source {source_id!r}")
         return source_id, entry["payload_sha256"], \
             lambda: _changelog_version_at(capdir / CHANGELOG_NAME), \
-            _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues)
+            _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues), \
+            _catalogue_levels(catalog, name)
     recorded = meta.get("source") or f"{SOURCE}/capabilities/{name}/bin/{name}"
     if not re.match(r"^https?://", recorded):
         p = Path(recorded)
         if p.is_dir():
             catalog = _fetched_catalogue(name, recorded, p, catalogues)
+            script = _bundle_script(p, name)
             return recorded, _payload_sha256(p, name), \
                 lambda: _changelog_version_at(p / CHANGELOG_NAME), \
-                _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues)
+                _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues), \
+                _script_levels(script) if script is not None else _catalogue_levels(None, name)
         if p.is_file():
             return recorded, _single_script_catalogue_sha256(name, p.read_bytes()), \
-                lambda: None, _catalogue_release(None, name), _catalogue_library(None, catalogues)
+                lambda: None, _catalogue_release(None, name), \
+                _catalogue_library(None, catalogues), _script_levels(p)
         _die(3, "not_found", f"{name}'s recorded source no longer exists: {p}")
     script_rel = f"/capabilities/{name}/bin/{name}"
     if recorded.endswith(script_rel):
@@ -6773,7 +6981,8 @@ def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
             reader = lambda: _changelog_version_from_url(
                 f"{base}/capabilities/{name}/{CHANGELOG_NAME}")
         return recorded, entry["payload_sha256"], reader, \
-            _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues)
+            _catalogue_release(catalog, name), _catalogue_library(catalog, catalogues), \
+            _catalogue_levels(catalog, name)
     httpx = _httpx()
     try:
         resp = httpx.get(recorded, follow_redirects=True, timeout=30.0)
@@ -6782,7 +6991,8 @@ def _available_payload(name: str, meta: dict, refreshed: dict, catalogues: dict
     if resp.status_code != 200:
         _die(5, "server_error", f"fetch returned {resp.status_code}", recorded)
     return recorded, _single_script_catalogue_sha256(name, resp.content), lambda: None, \
-        _catalogue_release(None, name), _catalogue_library(None, catalogues)
+        _catalogue_release(None, name), _catalogue_library(None, catalogues), \
+        _levels_declared(resp.content.decode(errors="replace"))[0]
 
 
 def _single_script_catalogue_sha256(name: str, content: bytes) -> str:
@@ -6827,19 +7037,26 @@ def _update_check_answer(name: str | None) -> dict:
         if error is not None:
             row["error"] = error
         else:
-            source, available_sha, version_reader, (release, range_), target = found
+            source, available_sha, version_reader, (release, range_), target, levels = found
             kept = False
             if here["store"] is not None and release != here["store"]:
                 found, row["store_major"] = _available_line(
                     n, meta, release, here, refreshed, catalogues)
                 kept = found is None
                 if found is not None:
-                    source, available_sha, version_reader, (_release, range_), target = found
+                    source, available_sha, version_reader, (_release, range_), target, \
+                        levels = found
             behind = available_sha != installed["catalog_sha256"]
             row["source"] = source
             row["available"] = {
                 "catalog_sha256": available_sha,
                 "version": version_reader() if behind else installed["version"]}
+            # A payload `update` would refuse for its levels is reported and
+            # not offered: what is installed is kept.
+            refused = _level_refusal(n, levels) if behind and not kept else None
+            if refused is not None:
+                row["refused"] = refused
+                kept = True
             library = None if kept else _contract_library_behind(
                 _script_path(n), target, range_, environments)
             if library is not None:
@@ -7084,6 +7301,13 @@ def _validate_manager_release_manifest(manifest: object) -> list[str]:
         problems.append("release manifest store_major must be a positive integer")
     if "library" in manifest and _release_library(manifest["library"]) is None:
         problems.append("release manifest library must be a version range")
+    if "level" in manifest and (
+            not isinstance(manifest["level"], int)
+            or isinstance(manifest["level"], bool) or manifest["level"] < 1):
+        problems.append("release manifest level must be a positive integer")
+    if "requires" in manifest and _manager_requires(manifest["requires"]) is None:
+        problems.append("release manifest requires must map capability names "
+                        "to non-negative integer levels")
     assets = manifest.get("assets")
     if not isinstance(assets, dict) or not assets:
         problems.append("release manifest assets must be a non-empty object")
@@ -7108,6 +7332,74 @@ def _validate_manager_release_manifest(manifest: object) -> list[str]:
     return problems
 
 
+def _manager_requires(value: object) -> dict | None:
+    """A manager's capability requirements {name: minimum level} where `value`
+    is a valid one, else None."""
+    if not isinstance(value, dict) or not all(
+            isinstance(name, str) and name and isinstance(level, int)
+            and not isinstance(level, bool) and level >= 0
+            for name, level in value.items()):
+        return None
+    return dict(value)
+
+
+def _manifest_levels(manifest: object) -> tuple[int, dict]:
+    """(level, requires) a release manifest names; one from before levels
+    names none and reads as level 0 requiring nothing."""
+    manifest = manifest if isinstance(manifest, dict) else {}
+    level = manifest.get("level")
+    level = level if isinstance(level, int) and not isinstance(level, bool) else 0
+    return level, _manager_requires(manifest.get("requires")) or {}
+
+
+def _tree_manager_levels(declared: dict | None) -> dict:
+    """{level, requires} a source tree's own manager declares as
+    MANAGER_LEVEL and MANAGER_REQUIRES, for its release manifest; nothing for
+    a manager that predates levels."""
+    level = (declared or {}).get("MANAGER_LEVEL")
+    if not isinstance(level, int) or isinstance(level, bool) or level < 1:
+        return {}
+    return {"level": level,
+            "requires": _manager_requires(declared.get("MANAGER_REQUIRES", {})) or {}}
+
+
+def _level_declaration_failures(root: Path, catalog: dict) -> list[str]:
+    """A tree whose own manager requires a capability level its catalogue
+    does not offer, or whose catalogue carries a capability requiring a
+    manager level above the tree's MANAGER_LEVEL, cannot be released: each
+    such pair. Read from the tree's own manager (`_tree_declared`), or the
+    running manager's level for a tree that carries none."""
+    declared = _tree_declared(root)
+    if declared is None:
+        return []
+    failures = []
+    level = declared.get("MANAGER_LEVEL", 0)
+    if not isinstance(level, int) or isinstance(level, bool) or level < 0:
+        failures.append("MANAGER_LEVEL must be a literal non-negative integer")
+        level = 0
+    requires = _manager_requires(declared.get("MANAGER_REQUIRES", {}))
+    if requires is None:
+        failures.append("MANAGER_REQUIRES must be a literal dict of capability "
+                        "names to non-negative integer levels")
+        requires = {}
+    entries = catalog.get("capabilities") if isinstance(catalog, dict) else None
+    entries = entries if isinstance(entries, dict) else {}
+    for name, needed in sorted(requires.items()):
+        offered = _catalogue_levels(catalog, name)["LEVEL"] if name in entries else None
+        if offered is None:
+            failures.append(f"MANAGER_REQUIRES names {name} at level {needed}, "
+                            "which this catalogue does not carry")
+        elif offered < needed:
+            failures.append(f"MANAGER_REQUIRES names {name} at level {needed}, and "
+                            f"this catalogue offers level {offered}")
+    for name in sorted(entries):
+        needs = _catalogue_levels(catalog, name)["REQUIRES_MANAGER"]
+        if needs > level:
+            failures.append(f"{name} requires manager level {needs}, above this "
+                            f"tree's MANAGER_LEVEL {level}")
+    return failures
+
+
 def _tree_store_line(root: Path, declared: dict | None = None) -> dict:
     """{store_major, library?} a source tree's release line names: the
     STORE_MAJOR and STORE_LIBRARY its own manager declares, read from that
@@ -7129,7 +7421,7 @@ def _tree_store_line(root: Path, declared: dict | None = None) -> dict:
 # The literals a source tree's own manager declares that its catalogue and
 # release manifest are stamped from, read once per tree.
 _TREE_DECLARED_NAMES = ("STORE_MAJOR", "STORE_LIBRARY", "CORE_CAPABILITIES",
-                        "CONTRACT_LIBRARY_RELEASE")
+                        "CONTRACT_LIBRARY_RELEASE", "MANAGER_LEVEL", "MANAGER_REQUIRES")
 
 
 def _tree_declared(root: Path) -> dict | None:
@@ -7141,7 +7433,7 @@ def _tree_declared(root: Path) -> dict | None:
     manager = root / MANAGER_EXECUTABLE_REL
     if not manager.is_file():
         return {"STORE_MAJOR": STORE_MAJOR, "STORE_LIBRARY": STORE_LIBRARY,
-                "CORE_CAPABILITIES": CORE_CAPABILITIES}
+                "CORE_CAPABILITIES": CORE_CAPABILITIES, "MANAGER_LEVEL": MANAGER_LEVEL}
     try:
         module = _ast.parse(manager.read_text())
     except (OSError, SyntaxError):
@@ -7191,6 +7483,7 @@ def _manager_release_payload(root: Path) -> tuple[dict | None, list[str]]:
                if not (root / rel).is_file()]
     if missing:
         return None, ["manager release assets are missing: " + ", ".join(missing)]
+    declared = _tree_declared(root)
     payload = {
         "schema": MANAGER_RELEASE_SCHEMA,
         "manager": {
@@ -7200,7 +7493,8 @@ def _manager_release_payload(root: Path) -> tuple[dict | None, list[str]]:
         "assets": {
             rel: _sha256(root / rel) for rel in _MANAGER_RELEASE_ASSETS
         },
-        **_tree_store_line(root),
+        **_tree_store_line(root, declared),
+        **_tree_manager_levels(declared),
     }
     problems = _validate_manager_release_manifest(payload)
     if problems:
@@ -7566,12 +7860,17 @@ def cmd_self_update(from_ref: str | None = None) -> None:
     rather than a remembered curl one-liner. Idempotent when the complete
     release manifest already names the active target.
     """
-    with _manager_mutation_guard():
-        if from_ref:
+    # A release requiring capability levels has the new manager bring the
+    # installed ones below them along, after the mutation lock is released,
+    # since that manager takes it itself (`_bring_required_capabilities`).
+    if from_ref:
+        with _manager_mutation_guard():
             choice = _manager_release_choice(from_ref)
             if choice["kept"]:
                 _emit(_manager_release_kept(choice))
                 return
+            bring = _manager_requirements_plan(choice)
+            links = _manager_links_now()
             source_root = Path(from_ref).expanduser().resolve()
             content, assets, manifest = _manager_release_from_root(
                 choice["root"], f"local:{source_root}")
@@ -7579,8 +7878,10 @@ def cmd_self_update(from_ref: str | None = None) -> None:
                 content, assets, f"local:{source_root}", manifest)
             result["store_major"] = choice["store_major"]
             _hold_manager_library(result, manifest)
-            _emit(result)
-            return
+        _bring_required_capabilities(result, bring, links)
+        _emit(result)
+        return
+    with _manager_mutation_guard():
         httpx = _httpx()
         checkout_result = None
         checkout = _marked_checkout(Path.cwd())
@@ -7598,6 +7899,8 @@ def cmd_self_update(from_ref: str | None = None) -> None:
                 result["official_checkout"] = checkout_result
             _emit(result)
             return
+        bring = _manager_requirements_plan(choice)
+        links = _manager_links_now()
         content, assets, manifest, source = _manager_release_from_remote(
             httpx, choice["base"], choice["manifest"], choice["pinned"])
         result = _activate_manager_release(content, assets, source, manifest)
@@ -7605,10 +7908,143 @@ def cmd_self_update(from_ref: str | None = None) -> None:
         _hold_manager_library(result, manifest)
         if checkout_result is not None:
             result["official_checkout"] = checkout_result
+    _bring_required_capabilities(result, bring, links)
     carried = _install_carried_capabilities(Path(result["manager"]))
     if carried:
         result["carried_capabilities"] = carried
     _emit(result)
+
+
+def _release_catalogue(choice: dict) -> object:
+    """The catalogue beside the manager release `choice` names: the --from
+    tree's, else the one at the commit its manifest was read at."""
+    if choice.get("root") is not None:
+        return _read_json(choice["root"] / ".capability-source" / "catalog.json")
+    found, _error = _captured(_fetch_json,
+                              f"{choice['pinned']}/.capability-source/catalog.json",
+                              "catalogue")
+    return found
+
+
+def _manager_requirements_plan(choice: dict) -> list[dict]:
+    """The installed capabilities below a level the release `choice` names
+    requires, which `self-update` brings along: [{name, installed, required}].
+    Refuses, before anything is switched, as manager_requirement_unmet where
+    the catalogue at the release's commit does not carry one at the required
+    level, or carries it requiring a newer manager than the release. A
+    required capability that is not installed is not relied on. A release
+    naming no requirement reads no catalogue."""
+    level, requires = _manifest_levels(choice["manifest"])
+    installed = _installed()
+    below = []
+    for name, required in sorted(requires.items()):
+        if name not in installed:
+            continue
+        have = _script_levels(_script_path(name))["LEVEL"]
+        if have < required:
+            below.append({"name": name, "installed": have, "required": required})
+    if not below:
+        return []
+    catalog = _release_catalogue(choice)
+    entries = catalog.get("capabilities") if isinstance(catalog, dict) else None
+    entries = entries if isinstance(entries, dict) else {}
+    unmet = []
+    for item in below:
+        offered = _catalogue_levels(catalog, item["name"])
+        if item["name"] not in entries or offered["LEVEL"] < item["required"]:
+            unmet.append(f"{item['name']} is installed at level {item['installed']} "
+                         f"and the release requires level {item['required']}, which "
+                         "its catalogue does not offer"
+                         + (f" (it offers level {offered['LEVEL']})"
+                            if item["name"] in entries else ""))
+        elif offered["REQUIRES_MANAGER"] > level:
+            unmet.append(f"{item['name']} is installed at level {item['installed']} "
+                         f"and the release requires level {item['required']}, which "
+                         f"its catalogue offers only for manager level "
+                         f"{offered['REQUIRES_MANAGER']}, above the release's {level}")
+    if unmet:
+        _die(6, "manager_requirement_unmet",
+             "the manager release cannot be taken: " + "; ".join(unmet)
+             + "; nothing was switched",
+             "the installed manager stays; self-update again once the catalogue "
+             "carries the required levels")
+    return below
+
+
+def _manager_links_now() -> dict[Path, str | None]:
+    """Where each of the manager's own links points now - None where there is
+    none - so a self-update can put them back."""
+    links: dict[Path, str | None] = {}
+    for directory in [_bin_dir(), *_manager_link_dirs()]:
+        link = directory / "capabilities"
+        if link.is_symlink():
+            links[link] = os.readlink(link)
+        elif not link.exists():
+            links[link] = None
+    return links
+
+
+def _restore_manager_links(links: dict[Path, str | None]) -> None:
+    """Point each of the manager's links back where `_manager_links_now`
+    found it."""
+    for link, target in links.items():
+        try:
+            if target is None:
+                if link.is_symlink():
+                    link.unlink()
+                continue
+            temporary = link.with_name(f".{link.name}.manager-release-{secrets.token_hex(8)}")
+            temporary.symlink_to(target)
+            os.replace(temporary, link)
+        except OSError:
+            pass
+
+
+def _bring_required_capabilities(result: dict, bring: list[dict],
+                                 links: dict[Path, str | None]) -> None:
+    """Have the manager release just activated update each installed
+    capability below a level it requires (`_manager_requirements_plan`),
+    answered as brought_capabilities [{name, installed, level, required}].
+    Where one cannot be brought to its level, the payloads brought are put
+    back, the manager's links point where they did before, and self-update
+    refuses as required_capability_failed: the new manager is never left
+    with a capability below its requirement."""
+    if not bring:
+        return
+    manager = Path(result["manager"])
+    backup = Path(tempfile.mkdtemp(prefix=".manager-requirements-", dir=CAP_HOME))
+    try:
+        for item in bring:
+            shutil.copytree(_registry_dir(item["name"]), backup / item["name"],
+                            symlinks=True)
+        brought = []
+        for index, item in enumerate(bring):
+            name = item["name"]
+            proc = subprocess.CompletedProcess([], *_run_script(
+                manager, ["update", name], env=_snapshot_env(), timeout=600))
+            level = _script_levels(_script_path(name))["LEVEL"]
+            if proc.returncode == 0 and level >= item["required"]:
+                brought.append({**item, "level": level})
+                continue
+            failure = (_ck_manager_message(proc) if proc.returncode != 0
+                       else f"the update left it at level {level}")
+            with _manager_mutation_guard():
+                for kept in bring[:index + 1]:
+                    saved = backup / kept["name"]
+                    reg = _registry_dir(kept["name"])
+                    if saved.is_dir():
+                        shutil.rmtree(reg, ignore_errors=True)
+                        saved.rename(reg)
+                _restore_manager_links(links)
+            _die(6, "required_capability_failed",
+                 f"the new manager requires {name} at level {item['required']}, and it "
+                 f"could not be brought there: {failure}; the previous manager release "
+                 "is active again and the capabilities it updated are put back",
+                 f"run `capabilities update {name}` and `capabilities self-update` again "
+                 "once its source carries the required level")
+        result["brought_capabilities"] = brought
+    finally:
+        shutil.rmtree(backup, ignore_errors=True)
 
 
 def _hold_manager_library(result: dict, manifest: dict) -> None:
@@ -7769,7 +8205,23 @@ def _self_update_check_answer(from_ref: str | None = None) -> dict:
         },
         "update_available": behind and not choice["kept"],
         "store_major": choice["store_major"],
+        "compat": {**_compat_answer(), "available": _compat_available(choice)},
     }
+
+
+def _compat_available(choice: dict) -> dict:
+    """`compat.available` of `self-update --check`: the level the release
+    `choice` names, the capability levels it requires, and the installed
+    capabilities self-update would bring along (brings), or why it would
+    refuse the release (refused)."""
+    level, requires = _manifest_levels(choice["manifest"])
+    available: dict = {"level": level, "requires": requires}
+    bring, error = _captured(_manager_requirements_plan, choice)
+    if error is not None:
+        available["refused"] = error.get("message")
+    else:
+        available["brings"] = [item["name"] for item in bring]
+    return available
 
 
 def _capability_tier(name: str) -> str:
@@ -33408,8 +33860,17 @@ def cmd_doctor() -> None:
                         "context --codex` to repair")
                 for blocker in _codex_delivery_blockers(root):
                     findings.append(f"project: Codex capability context does not load — {blocker}")
+    # Each installed pair whose minimum the other does not meet is drift too.
+    compat = _compat_answer()
+    for row in compat["unmet"]:
+        whose = (f"this manager requires {row['name']} at level {row['required']}, and "
+                 f"it is installed at level {row['installed']}"
+                 if row["needs"] == "capability" else
+                 f"{row['name']} requires manager level {row['required']}, and this "
+                 f"manager is level {row['installed']}")
+        findings.append(f"{row['name']}: {whose} — run `{row['command']}`")
     information = information + _programs_missing()
-    report = {"ok": not findings, "findings": findings}
+    report = {"ok": not findings, "findings": findings, "compat": compat}
     if information:
         report["information"] = information
     if identity is not None:
@@ -33814,6 +34275,7 @@ def _audit_script(
                 failures.append(f"help: contract verb {verb!r} undocumented")
     failures += [f"connections/machine-reads: {p}" for p in _machine_reads_problems(
         script, out if rc == 0 else None, env=env)]
+    failures += [f"levels: {p}" for p in _levels_problems(script)]
 
     # The effective gate, exercised in a sandbox: project override, inherited
     # global enable, and default deny. Safe declaration verbs are intentionally
@@ -34735,6 +35197,7 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
                 problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
             problems += [f"connections/machine-reads: {p}"
                          for p in _machine_reads_problems(script)]
+            problems += [f"levels: {p}" for p in _levels_problems(script)]
         problems += _bundle_library_problems(capdir)
         problems += _bundle_icon_problems(capdir)
         if problems:
@@ -34742,7 +35205,7 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
             continue
         entries[name] = _catalog_entry_of(capdir, manifest.get("summary", ""), manifest)
     _catalog_title_failures(entries, failures)
-    return _stamp_catalog(root, entries), failures
+    return _stamp_catalog_levels(root, entries, failures)
 
 
 def _catalog_entry_of(capdir: Path, summary: str, declared: dict | None = None) -> dict:
@@ -34750,10 +35213,12 @@ def _catalog_entry_of(capdir: Path, summary: str, declared: dict | None = None) 
     to know whether a copy is current, with nothing installed - its summary,
     its title and the Lucide name of its line icon where its manifest
     declares them, whether it has an icon, the newest heading of its change
-    log (null where it has none) and the hash of its payload; and what
+    log (null where it has none) and the hash of its payload; its level and
+    the manager level it requires, as its script declares them; and what
     fetching it alone takes - the files its payload hash covers and which of
     them are executable. `_stamp_catalog` adds its tier."""
     files = _payload_files(capdir)
+    levels = _script_levels(capdir / "bin" / capdir.name)
     return {
         "path": f"capabilities/{capdir.name}",
         "summary": summary,
@@ -34762,6 +35227,8 @@ def _catalog_entry_of(capdir: Path, summary: str, declared: dict | None = None) 
         "payload_sha256": _payload_sha256(capdir),
         "icon": _has_icon(capdir),
         "version": _changelog_version_at(capdir / CHANGELOG_NAME),
+        "level": levels["LEVEL"],
+        "requires_manager": levels["REQUIRES_MANAGER"],
         "files": [rel for rel, _path in files],
         "executable": [rel for rel, path in files if path.stat().st_mode & 0o111],
     }
@@ -34807,6 +35274,7 @@ def _catalog_payload_scoped(
                     problems += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
                 problems += [f"connections/machine-reads: {p}"
                              for p in _machine_reads_problems(script)]
+                problems += [f"levels: {p}" for p in _levels_problems(script)]
             problems += _bundle_library_problems(capdir)
             problems += _bundle_icon_problems(capdir)
             if problems:
@@ -34821,7 +35289,19 @@ def _catalog_payload_scoped(
             summary, declared = previous.get("summary", ""), previous
         entries[name] = _catalog_entry_of(capdir, summary, declared)
     _catalog_title_failures(entries, failures)
-    return _stamp_catalog(root, entries), failures
+    return _stamp_catalog_levels(root, entries, failures)
+
+
+def _stamp_catalog_levels(root: Path, entries: dict, failures: dict[str, list[str]]
+                          ) -> tuple[dict, dict[str, list[str]]]:
+    """The stamped catalogue of a tree, with the level pairs its own manager
+    and its capabilities do not meet (`_level_declaration_failures`) added to
+    its failures as levels."""
+    catalog = _stamp_catalog(root, entries)
+    levels = _level_declaration_failures(root, catalog)
+    if levels:
+        failures.setdefault("levels", []).extend(levels)
+    return catalog, failures
 
 
 def _catalog_title_failures(entries: dict, failures: dict[str, list[str]]) -> None:
@@ -35350,9 +35830,12 @@ def _activate_released_capability(
     capdir = repo / "capabilities" / name
     script = capdir / "bin" / name
     old = _read_json(_registry_dir(name) / "meta.json") or {}
-    stage, manifest = _prepare_payload(
-        name, script.read_bytes(), capdir, None, str(capdir)
-    )
+    try:
+        stage, manifest = _prepare_payload(
+            name, script.read_bytes(), capdir, None, str(capdir)
+        )
+    except _LevelRefused as refused:
+        _die(6, refused.error["code"], refused.error["message"], refused.error["hint"])
     payload_hash = _payload_sha256(stage)
     provenance = {
         key: old[key]

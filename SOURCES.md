@@ -124,6 +124,12 @@ capabilities/
   manager-release.json  generated for the official manager source
 ```
 
-The executable manifest remains the source of truth. `catalog.json` is only a generated discovery index and is rejected when its summaries, payload hashes, icon flags or store majors are stale. In the official source, `manager-release.json` is also generated: it binds the incoming manager and its complete runtime/authoring asset set to SHA-256 hashes so `self-update` can stage the whole release before activation.
+The executable manifest remains the source of truth. `catalog.json` is only a generated discovery index and is rejected when its summaries, payload hashes, icon flags, store majors or levels are stale. In the official source, `manager-release.json` is also generated: it binds the incoming manager and its complete runtime/authoring asset set to SHA-256 hashes so `self-update` can stage the whole release before activation.
 
 Both name the store schema major the tree's release line reads as `store_major` - the catalogue at its top level and on every entry - taken from the `STORE_MAJOR` the tree's own manager declares, or the indexing manager's for a source that carries no manager; a line kept for an older major also names the capabilities-contract range it reads as `library`. `self-update` and `update` take only a release that reads the store's major; `capabilities help` says how.
+
+The release manifest also names the manager's `level` and the capability levels it `requires`, from the `MANAGER_LEVEL` and `MANAGER_REQUIRES` the tree's own manager declares, and every catalogue entry names the capability's `level` and the manager level it `requires_manager`, from the `LEVEL` and `REQUIRES_MANAGER` its script declares; a manifest or catalogue that names none reads as level 0 requiring nothing. The index refuses a tree whose manager and catalogue do not meet each other's minimum.
+
+A level rises only when a release gains something another release will require. `self-update` and `update` never leave a manager and a capability below each other's minimum: they refuse the release, or `self-update` brings the capability along, and `capabilities help` says how.
+
+A fallback, bridge or old path is removed only in a release that declares the requirement that makes it unnecessary, never on the evidence of which machines have caught up.
