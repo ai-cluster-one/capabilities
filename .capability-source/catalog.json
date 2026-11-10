@@ -1069,11 +1069,11 @@
       ],
       "icon": false,
       "path": "capabilities/telegrambot",
-      "payload_sha256": "6651fe6cc4ffed2a6e26090ea172c1ca47fbcc1acfc36d4ce98c1c1dbf13060b",
+      "payload_sha256": "1a53b5db610dc23d6741241d839d45326dcd60d6e0aeb2907f41d6f5bef10b0f",
       "store_major": 4,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation.",
       "tier": "standard",
-      "version": "2026-11-10 — No job is entered for an archived agent, at telegrambot 2.2"
+      "version": "2026-11-10 — Inside a turn the CLI reaches the turn's chat only, by whichever path it is called"
     },
     "vapic": {
       "executable": [

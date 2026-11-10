@@ -847,6 +847,32 @@ def _anchor(cfg: dict, chat_id: int, topic_id: int | None, before: int | None) -
     return top + 1
 
 
+def _turn_scope(chat_id: int, topic_id: int | None = None, *, topical: bool = True) -> None:
+    """Inside a turn the service started, the turn's chat and topic, whatever the call named.
+
+    The worker-bin wrapper pins these verbs to the turn; this holds the same line
+    for a call that reaches this CLI by its path. Outside a turn nothing changes.
+    """
+    if not os.environ.get("TELEGRAMBOT_TURN"):
+        return
+    env = os.environ
+    raw = (env.get("TELEGRAMBOT_AUTHORIZED_CHAT_ID") or "").strip()
+    if not raw:
+        _die(4, "worker_authority_missing", "this turn carries no chat it acts for",
+             "inside a telegrambot turn these verbs reach the turn's own chat only")
+    if chat_id != int(raw):
+        _die(4, "chat_scope_denied", f"this turn acts for chat {raw} only, not {chat_id}",
+             f"requested={chat_id}; authorized_chat_id={raw}")
+    if not topical:
+        return
+    allowed = int((env.get("TELEGRAMBOT_AUTHORIZED_TOPIC_ID") or "").strip() or 0) or None
+    t = _transport()
+    if (topic_id or t.GENERAL_TOPIC) != (allowed or t.GENERAL_TOPIC):
+        _die(4, "topic_scope_denied", f"this turn acts for topic {allowed or 'none'} of chat "
+             f"{raw} only, not {topic_id}",
+             f"requested_topic={topic_id}; authorized_topic_id={allowed or ''}")
+
+
 def cmd_history(cfg: dict, chat_raw: str, topic_id: int | None, before: int | None,
                 limit: int) -> dict:
     t = _transport()
@@ -855,6 +881,7 @@ def cmd_history(cfg: dict, chat_raw: str, topic_id: int | None, before: int | No
         chat_id = t.parse_chat_id(chat_raw)
     except t.TelegramError as exc:
         _fail(exc)
+    _turn_scope(chat_id, topic_id)
     info = _chat_info(cfg, chat_id)
     if not info["visible"]:
         _die(4, "group_not_visible", f"the bot does not see every message of chat {chat_id} "
@@ -881,6 +908,7 @@ def cmd_download(cfg: dict, chat_raw: str, message_id: int, out: str | None) -> 
         chat_id = t.parse_chat_id(chat_raw)
     except t.TelegramError as exc:
         _fail(exc)
+    _turn_scope(chat_id, topical=False)
     dest = Path(out).expanduser() if out else \
         _conn_state(cfg) / "files" / f"{chat_id}-{message_id}"
 
@@ -916,6 +944,7 @@ def cmd_send(cfg: dict, chat_raw: str, text: str, topic_id: int | None,
     t = _transport()
     try:
         chat_id = t.parse_chat_id(chat_raw)
+        _turn_scope(chat_id, topic_id)
         body = _text_arg(text).strip()
         with _bot(cfg) as bot:
             if file:
@@ -938,6 +967,7 @@ def cmd_react(cfg: dict, chat_raw: str, message_id: int, emoji: str | None) -> d
     t = _transport()
     try:
         chat_id = t.parse_chat_id(chat_raw)
+        _turn_scope(chat_id, topical=False)
         with _bot(cfg) as bot:
             bot.react(chat_id, message_id, emoji)
     except t.TelegramError as exc:

@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-10 — Inside a turn the CLI reaches the turn's chat only, by whichever path it is called
+
+Inside a turn the service started (`TELEGRAMBOT_TURN` set), `history`, `download`, `react` and `send` now hold the turn's chat whether they are called through the worker's `telegrambot` or by the CLI's own path: a call naming another chat exits 4 `chat_scope_denied`, and `history` or `send` naming another topic of the turn's chat exits 4 `topic_scope_denied`, before anything reaches Telegram. Before, only the worker's `telegrambot` held that line, and a turn calling the CLI by its path could read or write any chat the bot is in. A call for the turn's own chat and topic, and every call outside a turn, works as before. No verb, flag or output key changes.
+
 ## 2026-11-10 — No job is entered for an archived agent, at telegrambot 2.2
 
 Step `0009-unarchived` (telegrambot 2.2, a minor step needing the store's core at 4.2, capabilities-contract 0.47) has the store refuse every insert of `telegrambot_jobs` for an archived agent, through the core's one guard `agents_archived_refuse`, with SQLSTATE 23R01; moving and ending a job stay allowed. `jobs register` that meets it exits 4 `agent_archived`. A release of telegrambot 2.1 keeps working against a store at 2.2 for every agent that is not archived. Declares `capabilities-contract>=0.47,<1`. No verb, flag or JSON key changes.

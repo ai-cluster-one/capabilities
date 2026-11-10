@@ -257,6 +257,33 @@ def test_writes_need_a_grant(cli, project, capsys, telegram):
     assert sent["text"] == "hi there" and sent["reply_parameters"]["message_id"] == 7
 
 
+def test_inside_a_turn_the_real_cli_reaches_the_turns_chat_only(cli, project, capsys, telegram,
+                                                                 monkeypatch):
+    add(cli, capsys, secret_env=TOKEN, api_id_env="1", api_hash_env="h" * 32)
+    path = project / "capabilities" / "telegrambot" / "connections.json"
+    data = json.loads(path.read_text())
+    data["connections"]["helper"]["allow_write"] = True
+    path.write_text(json.dumps(data))
+    monkeypatch.setenv("TELEGRAMBOT_TURN", "1")
+    monkeypatch.setenv("TELEGRAMBOT_AUTHORIZED_CHAT_ID", "-1001")
+    monkeypatch.setenv("TELEGRAMBOT_AUTHORIZED_TOPIC_ID", "7")
+    for argv in (("history", "-1002", "--topic", "7", "--before", "10"),
+                 ("download", "-1002", "5"), ("react", "-1002", "5"),
+                 ("send", "-1002", "hi", "--topic", "7")):
+        code, _out, err = run(cli, capsys, *argv)
+        assert code == 4 and err["error"]["code"] == "chat_scope_denied", argv
+    for argv in (("history", "-1001", "--topic", "9", "--before", "10"),
+                 ("history", "-1001", "--before", "10"), ("send", "-1001", "hi")):
+        code, _out, err = run(cli, capsys, *argv)
+        assert code == 4 and err["error"]["code"] == "topic_scope_denied", argv
+    assert not [m for m, _b in telegram.requests if m in ("sendMessage", "getChat")]
+    code, out, err = run(cli, capsys, "send", "-1001", "hi", "--topic", "7")
+    assert code == 0 and out["chat"] == -1001, err
+    monkeypatch.delenv("TELEGRAMBOT_TURN")
+    code, out, err = run(cli, capsys, "send", "-1002", "hi")
+    assert code == 0 and out["chat"] == -1002, err
+
+
 def test_arguments_are_checked_before_anything_runs(cli, project, capsys):
     code, _out, err = run(cli, capsys, "history", "42", "--limit", "500")
     assert code == 6 and err["error"]["code"] == "invalid_arguments"
