@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """fathom — agent-first CLI for Fathom meeting recordings and transcripts.
@@ -166,6 +166,7 @@ from psycopg2.extras import Json
 # ── Declaration ────────────────────────────────────────────────────────────────
 
 NAME = "fathom"
+TITLE = "Fathom"
 SUMMARY = ("Fathom CLI over the External API + a PostgreSQL store — sync "
            "meetings and transcripts in one pass, read/update stored meetings, "
            "manage a vocabulary, and search the store at three levels.")

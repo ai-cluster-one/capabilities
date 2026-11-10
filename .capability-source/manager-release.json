@@ -2,10 +2,10 @@
   "assets": {
     "DOCTRINE.md": "ec97a3db62521c82d2103595883575b8822e69a54fb1abfce5ec96468352fd7d",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "6c3791dc9b4277a8976e57358c85716e2990af8b73b8506ae8a229788d1e6846",
+    "SHEBANG.md": "83d3329dad8d93482b0f60007c9b4a34075f56bd5054e61c092abd501bdc8df9",
     "SOURCES.md": "2bddcf041b3c4175c36fa64cf26cc1aabf8b2defa0640ced302570f60c6444eb",
     "TEMPLATE.md": "3d815f02a99716ee174cf512ede0951ade110a6cc0a8c91cf520bf63fc521f72",
-    "contract/CHANGELOG.md": "b9e2a6b9b186694d6b141c3cd1e67ef996559032c1d8a253c190e34afbd88443",
+    "contract/CHANGELOG.md": "7a3f2c1c03cad3f2934e2939372e9c6ace064e225ba15aa856fda73e4e0732c9",
     "guides/authoring.md": "1f557d6fc130a2efd1f8b93e7cb6b978b9f1590624cd7adaa12c817d6c6cfc4a",
     "guides/conforming.md": "d2724037c42aea0d0528b429be0eb14a16b558426ee3982b4a6f541a342e7361",
     "guides/contract.md": "04c88e2b5a66d6d999ec5c782c3cd30120bc8ff0c878ea00405569bad86b00fa",
@@ -20,12 +20,12 @@
     "guides/store-upgrade.md": "9e80c17df03ccf584d08ebc287c7ec5b6c9b4df4ddeb39ce9ae1f8559c24073b",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
     "guides/surfaces.md": "fa867edb98c83a808b0fb2977d214a16208f63e42ac071008a1fe8c4c1c4d544",
-    "manager/CHANGELOG.md": "4ad84da01bba2522c46a34b4795a4434115e7a928d587f0ad18049ca626c3006",
+    "manager/CHANGELOG.md": "5e77e59e6e903dff07a70f09001ac0e2e75f1218da960e61e4e8d388dfee648b",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "4efd6aa8d6cf274c30909d72a74784fee0410732c7ea650cf9ae52181524e07a"
+    "sha256": "49d5cea4ce66e13a762310d126a39b4b22d663f24a455a143ead11c05dc74065"
   },
   "schema": "capabilities.manager-release.v1",
   "store_major": 4

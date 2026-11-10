@@ -447,7 +447,7 @@ def _script(contribution: object) -> str:
         "Fixture readiness.")
     dispatch = (
         "    if argv[:1] == [\"manifest\"]:\n"
-        "        _emit({\"name\": NAME, \"summary\": SUMMARY,\n"
+        "        _emit({\"name\": NAME, \"title\": TITLE, \"summary\": SUMMARY,\n"
         "               \"credentials\": {\"scope\": SCOPE, \"keys\": CRED_KEYS},\n"
         "               \"docs\": {\"base\": DOCS_BASE, \"topics\": []},\n"
         "               \"state\": STATE, \"inventory\": _inventory_declaration(),\n"

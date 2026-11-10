@@ -404,7 +404,9 @@ MACHINE VERBS
         connections the store holds for it, with a config-home file counted
         only for one the store holds no row of; a quarantined row is
         effective "disabled" with source "machine". Every row carries `icon`,
-        true when the installed capability carries one (see icon).
+        true when the installed capability carries one (see icon), and
+        `title` and `lucide_icon` from its manifest: its human name and the
+        Lucide name of its line icon, null where it declares none.
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources;
         the official source is fetched first when it has no local copy yet.
@@ -2926,7 +2928,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.47.0"
+CONTRACT_LIBRARY_RELEASE = "0.48.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -4657,6 +4659,11 @@ def _programs_missing() -> list[dict]:
 
 
 INVENTORY_NETWORK_MODES = ("none", "optional", "required")
+# A capability's fixed human name (manifest `title`) is one line of at most
+# this many characters, and the Lucide name of its line icon (`lucide_icon`)
+# is lowercase words joined by hyphens (SHEBANG.md, the manifest table).
+TITLE_MAX_LENGTH = 40
+LUCIDE_ICON_PATTERN = r"^[a-z0-9]+(-[a-z0-9]+)*$"
 
 
 FIELD_TYPES = ("string", "integer", "number", "boolean", "url", "email",
@@ -4869,6 +4876,26 @@ def _validate_settings_declaration(declared) -> list[str]:
     return problems
 
 
+def _title_problems(manifest: dict) -> list[str]:
+    """The shape of `title` and `lucide_icon` where a manifest declares them.
+    Neither is required here, so a capability from before them still
+    installs; audit requires `title` and the catalogue keeps it unique."""
+    problems: list[str] = []
+    if "title" in manifest:
+        title = manifest["title"]
+        if not isinstance(title, str) or not title.strip():
+            problems.append("title is not a non-empty string")
+        elif title != title.strip() or "\n" in title or "\r" in title:
+            problems.append("title is not one line without surrounding space")
+        elif len(title) > TITLE_MAX_LENGTH:
+            problems.append(f"title is longer than {TITLE_MAX_LENGTH} characters")
+    if "lucide_icon" in manifest:
+        icon = manifest["lucide_icon"]
+        if not isinstance(icon, str) or not re.fullmatch(LUCIDE_ICON_PATTERN, icon):
+            problems.append(f"lucide_icon {icon!r} does not match {LUCIDE_ICON_PATTERN}")
+    return problems
+
+
 def _validate_manifest(name: str, manifest) -> list[str]:
     """Mechanical shape check; returns a list of problems (empty = conformant)."""
     problems: list[str] = []
@@ -4883,6 +4910,7 @@ def _validate_manifest(name: str, manifest) -> list[str]:
         problems.append(f"manifest name {manifest.get('name')!r} != {name!r}")
     if not isinstance(manifest.get("summary"), str) or not manifest.get("summary", "").strip():
         problems.append("manifest summary missing or empty")
+    problems += _title_problems(manifest)
     creds = manifest.get("credentials")
     if isinstance(creds, dict):
         if creds.get("scope") not in ("project", "user"):
@@ -7757,9 +7785,11 @@ def cmd_list() -> None:
     for name, meta in _installed().items():
         stub, manifest = _load_snapshots(name)
         entry: dict = {"name": name,
+                       "title": (manifest or {}).get("title"),
                        "summary": (manifest or {}).get("summary", ""),
                        "tier": _capability_tier(name),
-                       "icon": _has_icon(_registry_dir(name))}
+                       "icon": _has_icon(_registry_dir(name)),
+                       "lucide_icon": (manifest or {}).get("lucide_icon")}
         local = _gate_state(project_caps.get(name)) if root else "absent"
         global_state = _gate_state(global_caps.get(name))
         effective, source = _effective_gate_state(
@@ -33725,6 +33755,9 @@ def _audit_script(
         failures += [f"manifest: {p}" for p in _validate_manifest(name, manifest)]
         if str(manifest.get("summary", "")).startswith("TODO:"):
             failures.append("manifest: scaffold summary placeholder remains")
+        if "title" not in manifest:
+            failures.append("manifest: title missing - TITLE declares the capability's "
+                            "human name")
         bundle = script.parent.parent if script.parent.name == "bin" else script.parent
         guide_dir = bundle / "guides"
         shipped_topics = ({p.stem for p in guide_dir.glob("*.md")}
@@ -34707,21 +34740,25 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
         if problems:
             failures[name] = sorted(set(problems))
             continue
-        entries[name] = _catalog_entry_of(capdir, manifest.get("summary", ""))
+        entries[name] = _catalog_entry_of(capdir, manifest.get("summary", ""), manifest)
+    _catalog_title_failures(entries, failures)
     return _stamp_catalog(root, entries), failures
 
 
-def _catalog_entry_of(capdir: Path, summary: str) -> dict:
+def _catalog_entry_of(capdir: Path, summary: str, declared: dict | None = None) -> dict:
     """One capability's catalogue entry: what a reader needs to list it and
     to know whether a copy is current, with nothing installed - its summary,
-    whether it has an icon, the newest heading of its change log (null where
-    it has none) and the hash of its payload; and what fetching it alone
-    takes - the files its payload hash covers and which of them are
-    executable. `_stamp_catalog` adds its tier."""
+    its title and the Lucide name of its line icon where its manifest
+    declares them, whether it has an icon, the newest heading of its change
+    log (null where it has none) and the hash of its payload; and what
+    fetching it alone takes - the files its payload hash covers and which of
+    them are executable. `_stamp_catalog` adds its tier."""
     files = _payload_files(capdir)
     return {
         "path": f"capabilities/{capdir.name}",
         "summary": summary,
+        **{key: declared[key] for key in ("title", "lucide_icon")
+           if declared and declared.get(key)},
         "payload_sha256": _payload_sha256(capdir),
         "icon": _has_icon(capdir),
         "version": _changelog_version_at(capdir / CHANGELOG_NAME),
@@ -34775,15 +34812,32 @@ def _catalog_payload_scoped(
             if problems:
                 failures[name] = sorted(set(problems))
                 continue
-            summary = manifest.get("summary", "")
+            summary, declared = manifest.get("summary", ""), manifest
         else:
             previous = listed.get(name)
             if not isinstance(previous, dict):
                 failures[name] = ["unchanged capability has no verified catalogue entry"]
                 continue
-            summary = previous.get("summary", "")
-        entries[name] = _catalog_entry_of(capdir, summary)
+            summary, declared = previous.get("summary", ""), previous
+        entries[name] = _catalog_entry_of(capdir, summary, declared)
+    _catalog_title_failures(entries, failures)
     return _stamp_catalog(root, entries), failures
+
+
+def _catalog_title_failures(entries: dict, failures: dict[str, list[str]]) -> None:
+    """A title names one capability of the catalogue: each capability whose
+    title another entry also carries fails, and leaves the catalogue."""
+    holders: dict[str, list[str]] = {}
+    for name, entry in entries.items():
+        if entry.get("title"):
+            holders.setdefault(entry["title"].casefold(), []).append(name)
+    for names in holders.values():
+        if len(names) > 1:
+            for name in names:
+                others = ", ".join(n for n in names if n != name)
+                failures.setdefault(name, []).append(
+                    f"manifest: title {entries[name]['title']!r} is also the title of {others}")
+                entries.pop(name, None)
 
 
 def _source_contract_failures(root: Path) -> list[str]:
@@ -35834,6 +35888,8 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = {name!r}
+TITLE = {name.replace("-", " ").title()!r}  # its human name, fixed here and never renamed
+LUCIDE_ICON = None  # the Lucide name of its line icon, where it has one
 SUMMARY = "TODO: describe the capability's smallest useful surface."
 SCOPE = "project"
 CRED_KEYS = []  # Add credential declarations; never put secret values here.

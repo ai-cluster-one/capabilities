@@ -1,5 +1,9 @@
 # windmill — change log
 
+## 2026-11-10 — `windmill` declares its title, Windmill
+
+The manifest carries `title`, `Windmill`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `windmill`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-07 — `inventory` names a connection by its label
 
 At store schema major 3 a connection is keyed by an opaque id and called by its label. `inventory` names each connection item, and the `connection` attribute of each script and schedule it reads with `--network`, by that label, where it named the id. A connection kept in files is still named by its key. Nothing else changes.

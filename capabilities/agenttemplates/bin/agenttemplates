@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """agenttemplates — the agent templates a new agent is made from.
@@ -61,6 +61,8 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = 'agenttemplates'
+TITLE = "Agent Templates"
+LUCIDE_ICON = "layout-template"
 SUMMARY = ("The agent templates a new agent is made from - the starter context files and "
            "each agent template (its manifest, icon, context, routines) - carried as files "
            "in this capability's bundle; list them and show one, and the manager's "

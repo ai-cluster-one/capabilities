@@ -1,5 +1,9 @@
 # inbox — change log
 
+## 2026-11-10 — `inbox` declares its title, Inbox, and its Lucide icon, `inbox`
+
+The manifest carries `title`, `Inbox`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `inbox`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `inbox`. Nothing else changes.
+
 ## 2026-11-08 — An item goes with its agent, and keeps itself when the node it was put from goes, at inbox 1.3
 
 Step `0006-keys` (inbox 1.3, core 4.0) keys `inbox_items`: an item goes with its agent, and keeps itself, losing `node`, when the node it was put from is removed (`ON DELETE SET NULL`). The item guard admits that and the cascade of a deliberate delete and nothing else, and the change notice stays quiet under it. A reference to an agent or node the store no longer holds is settled when the step runs, kept in `inbox_premig_m9`. Runs on capabilities-contract 0.45. No verb, flag or JSON key changes.

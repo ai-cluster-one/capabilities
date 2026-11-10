@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """
@@ -200,6 +200,8 @@ function accountSenderString(acct) {
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "macmail"
+TITLE = "Apple Mail"
+LUCIDE_ICON = "mail"
 SUMMARY = ("Mail.app CLI over macOS Automation — read/search mail across "
            "configured accounts, show a message, save attachments, draft "
            "(never send), and export a mailbox to JSON.")

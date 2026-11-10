@@ -1,5 +1,9 @@
 # slacker — change log
 
+## 2026-11-10 — `slacker` declares its title, Slack Reader
+
+The manifest carries `title`, `Slack Reader`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `slacker`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-07 — A connection is named by its id
 
 A connection is keyed by the opaque id the store gives it, and called by its label; `--connection` takes either. `link` writes to the connection whose id or label it was given, else adds one labelled with the word it made from the workspace, filling the token and cookie keys from the label, and answers the connection's id under `connection`. A connection that binds no workspace keeps reading the rows it captured under the name it had before the cutover, and its service folder made under that name is moved to `<state>/slacker/<id>/service` the first time it is used, saying so on stderr. A connection that binds a workspace is keyed by its team id as before. Declares `capabilities-contract>=0.44,<1`. No verb, flag, environment variable or output key changes; a `connection` key carries the id.

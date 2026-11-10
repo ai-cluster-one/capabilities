@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "slack_sdk>=3.33",
 #     "websocket-client>=1.8",
 # ]
@@ -134,6 +134,7 @@ from typing import Any, NoReturn
 from capabilities_contract.db import DbError, Step, connect, migrate, resolve_setting
 
 NAME = 'slacker'
+TITLE = "Slack Reader"
 SUMMARY = ("Slack CLI that reads the linked user's own workspace over their web "
            "session (xoxc token + d cookie) — list conversations (DMs, group "
            "DMs, public and private channels), read message history and thread "

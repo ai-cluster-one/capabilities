@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -241,6 +241,8 @@ from typing import NoReturn
 # --- Capability declaration -------------------------------------------------
 
 NAME = "routine"
+TITLE = "Routines"
+LUCIDE_ICON = "list-ordered"
 SUMMARY = ("Routine CLI for project repeatable procedures — list, validate, "
            "and render `.routines` recipes, and keep routines as versioned documents "
            "in the project's store: show, save with a base, history, diff, retire, "

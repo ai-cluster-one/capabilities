@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """emta — agent-first CLI for the Estonian Tax Board (maasikas.emta.ee).
@@ -209,6 +209,7 @@ _ACTIVE_VERB: str = ""
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "emta"
+TITLE = "EMTA"
 SUMMARY = ("Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay "
            "balances, per-period balances, prepay ledger. Session is "
            "paste-fed from a logged-in browser. Stateful — run `emta "

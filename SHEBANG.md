@@ -103,6 +103,7 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 ```json
 {
   "name": "asana",
+  "title": "Asana",
   "summary": "Asana CLI over the REST API — list/read/create tasks, comment, complete.",
   "credentials": {
     "scope": "project",
@@ -154,6 +155,8 @@ The line is awareness, not a promise the tool is usable here — readiness is `d
 | Field | Meaning |
 |---|---|
 | `name`, `summary` | The constants, verbatim. |
+| `title` | The capability's human name, from the `TITLE` constant: short, English, in title case, fixed by its author and never renamed, one line of at most 40 characters, unique across the catalogue. `name` stays the code name a capability is addressed by; a title is never an argument. Audit requires it; install checks its shape where it is declared, so a capability from before it still installs. |
+| `lucide_icon` *(optional)* | For a capability whose icon is a Lucide line icon, the Lucide icon name from the `LUCIDE_ICON` constant (`list-checks`), matching `^[a-z0-9]+(-[a-z0-9]+)*$`, so a reader draws it as a vector at its own weight and size. A capability whose icon is a brand mark declares none. The catalogue entry and `capabilities list --json` carry `title` and `lucide_icon` beside `icon`. |
 | `credentials.scope` | `project` or `user` — where the secret lives (see [the credential cascade](#the-credential-cascade)). |
 | `credentials.keys[]` | Every key the cascade resolves: `key`, `secret`, `required`, `note`. Install scaffolding and `doctor`'s remediation both derive from this list. |
 | `docs.base` | The upstream guides base URL; `""` when no guides ship. Overridable through the cascade as `<NAME>_DOCS_BASE`, so storage can move without touching the contract. |

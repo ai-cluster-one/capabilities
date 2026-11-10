@@ -4,7 +4,7 @@
 # dependencies = [
 #     "google-genai>=1.36.0",
 #     "sounddevice>=0.5.1",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """geminitalk - Gemini Live voice companion for the current project.
@@ -185,6 +185,7 @@ from typing import NoReturn
 # --- Capability declaration -------------------------------------------------
 
 NAME = "geminitalk"
+TITLE = "Gemini Talk"
 SUMMARY = ("Gemini Live native-audio project companion with continuous duplex audio, "
            "bounded project tools, optional headless Codex delegation, and an active "
            "Codex-thread relay.")

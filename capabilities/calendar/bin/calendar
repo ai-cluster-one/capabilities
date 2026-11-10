@@ -5,7 +5,7 @@
 #     "httpx>=0.27",
 #     "python-dateutil>=2.9",   # RFC 5545 recurrence rules, evaluated here
 #     "tzdata>=2024.1",   # a slim host carries no system zone database
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """
@@ -238,6 +238,8 @@ from dateutil.rrule import rrulestr
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "calendar"
+TITLE = "Calendar"
+LUCIDE_ICON = "calendar"
 SUMMARY = ("CalDAV CLI for remote calendars — list calendars, read, search "
            "and check busy blocks, and book events on a principal.")
 SCOPE = "project"   # credential scope: "project" | "user"

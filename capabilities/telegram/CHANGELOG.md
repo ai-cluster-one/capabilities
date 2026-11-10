@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-10 — `telegram` declares its title, Telegram
+
+The manifest carries `title`, `Telegram`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `telegram`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-10 — No job is entered for an archived agent, at telegram 3.2
 
 Step `0011-unarchived` (telegram 3.2, a minor step needing the store's core at 4.2, capabilities-contract 0.47) has the store refuse every insert of `telegram_jobs` for an archived agent, through the core's one guard `agents_archived_refuse`, with SQLSTATE 23R01; moving and ending a job stay allowed. `jobs register` that meets it exits 4 `agent_archived`; a call's task that meets it is not started, where it ran unrecorded, and the daemon stops as on a shutdown and exits 4 `agent_archived`, which a supervisor does not restart. A release of telegram 3.1 keeps working against a store at 3.2 for every agent that is not archived. Declares `capabilities-contract>=0.47,<1`. No verb, flag or JSON key changes.

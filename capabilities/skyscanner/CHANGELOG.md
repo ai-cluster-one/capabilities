@@ -1,5 +1,9 @@
 # skyscanner — change log
 
+## 2026-11-10 — `skyscanner` declares its title, Skyscanner
+
+The manifest carries `title`, `Skyscanner`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `skyscanner`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-07 — The site rotation state made under a connection's former name is found again under its id
 
 The site rotation state (`domains.json`) is kept under `<state>/<connection id>/`. Where that does not exist and the store's map names the connection's former name, the folder made under that name is moved to the id once, saying so on stderr, so what each site last answered survives the store's move to connection ids. Declares `capabilities-contract>=0.44,<1`, the library that keeps the map and moves the folder.

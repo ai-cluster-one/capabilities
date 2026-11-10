@@ -5,7 +5,7 @@
 #     "httpx>=0.27",
 #     "click>=8.1",
 #     "beautifulsoup4>=4.12",
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """simplbooks — agent-first CLI for the SimpleBooks accounting app."""
@@ -44,6 +44,7 @@ UA = (
 # ─── Capability declaration — one home for every contract fact ───────────────
 
 NAME = "simplbooks"
+TITLE = "SimplBooks"
 SUMMARY = ("SimpleBooks accounting CLI over a browser session (no public "
            "API) — read clients/invoices/purchases/accounts/bank-transactions/"
            "financial_transactions, create invoices & purchase invoices, "

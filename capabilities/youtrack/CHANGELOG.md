@@ -1,5 +1,9 @@
 # youtrack — change log
 
+## 2026-11-10 — `youtrack` declares its title, YouTrack
+
+The manifest carries `title`, `YouTrack`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `youtrack`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-10-31 — `youtrack` reads a connection's token from the agent's vault as well
 
 Every verb resolves its token - a connection's `secret_env`, or `YOUTRACK_TOKEN` - through the contract's credential cascade, which asks the agent's vault last, after the project's .env files, ~/.config/youtrack/credentials.env and the process environment; it used to stop at the process environment, so a token `youtrack connection add` now seals into the vault by default would not have been found. A token a file or the environment holds resolves exactly as before. The help points to the contract-rendered `Where a secret resolves` section instead of listing the tiers by hand, and `missing_token` names the vault.

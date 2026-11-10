@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -209,6 +209,8 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = "teams"
+TITLE = "Teams"
+LUCIDE_ICON = "users"
 SUMMARY = ("Teams of agents that share instructions kept in the store - list the teams "
            "you are in, read their documents, and create teams, add members and save, "
            "rename and retire their versioned documents.")

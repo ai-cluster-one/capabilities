@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-10 — `tasks` declares its title, Tasks, and its Lucide icon, `list-checks`
+
+The manifest carries `title`, `Tasks`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `list-checks`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `tasks`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-10 — No raise for an archived agent, at tasks 2.2
 
 Step `0015-unarchived` (tasks 2.2, a minor step needing the store's core at 4.2, capabilities-contract 0.47) has the store refuse every insert of `tasks_executions` - a raise, a hold row - whose task's agent (`tasks_tasks.agent_id`) is archived, through the core's one guard `agents_archived_refuse`, with SQLSTATE 23R01; closing a raise stays allowed. A command that meets it, `claim` and `run` among them, exits 4 `agent_archived` where it said `store_error`. The service's check before every action refuses an archived agent through the contract's write gate, so the machine service says the project is refused, asks the store nothing and starts no turn for it while serving the others, and serves it again at the first wake after it is restored. A release of tasks 2.1 keeps working against a store at 2.2 for every agent that is not archived. Declares `capabilities-contract>=0.47,<1`. No verb, flag or JSON key changes.

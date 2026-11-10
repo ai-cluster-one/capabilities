@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-10 — `telegrambot` declares its title, Telegram Bot, and its Lucide icon, `bot-message-square`
+
+The manifest carries `title`, `Telegram Bot`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `bot-message-square`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `telegrambot`. Nothing else changes.
+
 ## 2026-11-10 — Inside a turn the CLI reaches the turn's chat only, by whichever path it is called
 
 Inside a turn the service started (`TELEGRAMBOT_TURN` set), `history`, `download`, `react` and `send` now hold the turn's chat whether they are called through the worker's `telegrambot` or by the CLI's own path: a call naming another chat exits 4 `chat_scope_denied`, and `history` or `send` naming another topic of the turn's chat exits 4 `topic_scope_denied`, before anything reaches Telegram. Before, only the worker's `telegrambot` held that line, and a turn calling the CLI by its path could read or write any chat the bot is in. A call for the turn's own chat and topic, and every call outside a turn, works as before. No verb, flag or output key changes.

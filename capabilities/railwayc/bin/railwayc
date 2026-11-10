@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """railwayc — a credential harness around the official `railway` CLI. It resolves a
@@ -204,6 +204,7 @@ import httpx
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "railwayc"
+TITLE = "Railway"
 SUMMARY = ("Credential harness around the official `railway` CLI — resolves "
            "a project-scoped Railway token, injects it, and forwards your "
            "command straight to `railway` (everything but railwayc's own "

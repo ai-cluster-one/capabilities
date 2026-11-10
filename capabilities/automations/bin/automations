@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.47,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "callva-harness-runner==0.12.1",
 # ]
 # ///
@@ -485,6 +485,8 @@ from typing import Any, NoReturn
 
 
 NAME = "automations"
+TITLE = "Automations"
+LUCIDE_ICON = "timer"
 SUMMARY = (
     "Project-local scheduler and subprocess runner with versioned config, "
     "store-backed run history, concurrency, retries, timeouts, and cancellation."

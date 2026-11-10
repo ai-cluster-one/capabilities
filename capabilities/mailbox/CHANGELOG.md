@@ -1,5 +1,9 @@
 # mailbox — change log
 
+## 2026-11-10 — `mailbox` declares its title, Mailbox, and its Lucide icon, `mail`
+
+The manifest carries `title`, `Mailbox`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `mail`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `mailbox`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-06 — `mailbox draft` saves a letter into Drafts without sending it
 
 `mailbox draft --to A --subject S` takes the body, `--cc`, `--attach` and `--in-reply-to` as `send` does and builds the same message, then saves it into the account's Drafts folder - the one the server marks `\Drafts`, else one named Drafts - with the `\Draft` flag. Nothing is sent. The answer names the folder, the new message's uid and its Message-ID; `--in-reply-to` writes `In-Reply-To` and `References`, so the draft threads under the message it answers. A draft is a write: on a connection without `allow_write` it exits 4 `read_only`, saying that writing drafts needs write access, and saves nothing. With no Drafts folder it exits 6 `drafts_folder_missing` and saves nothing. `help` and the stub line name the verb and its grant. `send` is unchanged.

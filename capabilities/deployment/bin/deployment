@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -451,6 +451,8 @@ from typing import NoReturn
 
 
 NAME = "deployment"
+TITLE = "Deployment"
+LUCIDE_ICON = "rocket"
 SUMMARY = ("Project deployment standard - declare the services a project runs, "
            "compile them into a container image, and describe the targets they "
            "deploy to.")

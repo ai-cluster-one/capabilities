@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """
@@ -146,6 +146,7 @@ MAX_RETRIES = 3
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "notion"
+TITLE = "Notion"
 SUMMARY = ("Notion CLI over the REST API — publish markdown to pages: list "
            "child pages, fetch a page as markdown, replace a page's body and "
            "title, create under a parent, and upsert by exact title.")

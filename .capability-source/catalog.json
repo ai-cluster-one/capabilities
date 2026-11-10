@@ -23,12 +23,14 @@
         "tests/test_store.py"
       ],
       "icon": true,
+      "lucide_icon": "messages-square",
       "path": "capabilities/agentrooms",
-      "payload_sha256": "d0976f6441a49dd866b7b35bbd7f683066c88039cdb8701c31e0105955e5827d",
+      "payload_sha256": "b932f0d6a9e4703c6cada81d81295287daeb2229f9b0322fdad437a85f1befad",
       "store_major": 4,
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room.",
       "tier": "standard",
-      "version": "2026-11-10 — Nothing starts for an archived agent, at agentrooms 3.2"
+      "title": "Agent Rooms",
+      "version": "2026-11-10 — `agentrooms` declares its title, Agent Rooms, and its Lucide icon, `messages-square`"
     },
     "agenttemplates": {
       "executable": [
@@ -62,12 +64,14 @@
         "tests/test_agenttemplates.py"
       ],
       "icon": true,
+      "lucide_icon": "layout-template",
       "path": "capabilities/agenttemplates",
-      "payload_sha256": "aef8e3d8288c04d52972afafda1987efb46315885d3bfb7fb74287a5cc764160",
+      "payload_sha256": "3244c7e50b6953a00ae16ce6dff404a129489e8ed9d0e4cb1225858fb3288d63",
       "store_major": 4,
       "summary": "The agent templates a new agent is made from - the starter context files and each agent template (its manifest, icon, context, routines) - carried as files in this capability's bundle; list them and show one, and the manager's `templates` and `init --template` read them from here.",
       "tier": "core",
-      "version": "2026-11-08 — The Personal Agent's onboarding runs the manager's commands"
+      "title": "Agent Templates",
+      "version": "2026-11-10 — `agenttemplates` declares its title, Agent Templates, and its Lucide icon, `layout-template`"
     },
     "asana": {
       "executable": [
@@ -80,11 +84,12 @@
       ],
       "icon": true,
       "path": "capabilities/asana",
-      "payload_sha256": "fe5301ef37d43c62baf0d187725ef20c759de8edce04456bef43990c9c59f613",
+      "payload_sha256": "db14b42108ee3f092da5f729e76a93925d9b2d569f930dee61b983cfdb2b6999",
       "store_major": 4,
       "summary": "Asana CLI over the REST API — read/create/comment-on tasks and subtasks, @mention, manage tags, board sections, dependencies, and the API-only machine-state field.",
       "tier": "standard",
-      "version": "2026-10-31 — `asana` reads a connection's token from the agent's vault as well"
+      "title": "Asana",
+      "version": "2026-11-10 — `asana` declares its title, Asana"
     },
     "askproject": {
       "executable": [
@@ -106,12 +111,14 @@
         "tests/test_self_target.py"
       ],
       "icon": true,
+      "lucide_icon": "message-circle-question-mark",
       "path": "capabilities/askproject",
-      "payload_sha256": "394dec8cd11e23fa0194e14d1d72d686c3852d649d96ddd632eb1e67d58207fe",
+      "payload_sha256": "671889b9ccb92137a5eb4093421a2e5de091c62f0ccbe5d517d528bf7858d1a0",
       "store_major": 4,
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability.",
       "tier": "core",
-      "version": "2026-11-10 — No session is recorded for an archived agent, at askproject 3.2"
+      "title": "Ask Project",
+      "version": "2026-11-10 — `askproject` declares its title, Ask Project, and its Lucide icon, `message-circle-question-mark`"
     },
     "assets": {
       "executable": [
@@ -128,12 +135,14 @@
         "tests/test_store.py"
       ],
       "icon": true,
+      "lucide_icon": "archive",
       "path": "capabilities/assets",
-      "payload_sha256": "b2e6cb235c2455039249b152dff6667a25efca9fcbf4d399ce66d6bcbeb592cb",
+      "payload_sha256": "0c6b9d9df89ccd710d99e44f7c16314f1a807182ae80946486cf299186ec09f8",
       "store_major": 4,
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder.",
       "tier": "core",
-      "version": "2026-11-08 — An agent's documents and files go with it, at assets 2.1"
+      "title": "Assets",
+      "version": "2026-11-10 — `assets` declares its title, Assets, and its Lucide icon, `archive`"
     },
     "automations": {
       "executable": [
@@ -157,12 +166,14 @@
         "tests/test_store_link.py"
       ],
       "icon": true,
+      "lucide_icon": "timer",
       "path": "capabilities/automations",
-      "payload_sha256": "90a8019a23ac6f11d3fc7ae6f1bd10c5ea11e173d7554e21a9a49efb91a10a7a",
+      "payload_sha256": "492b1a22364247b3d43a6e7b7c5532f84498bb48e45cb817e7da722acb884ebb",
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
       "tier": "core",
-      "version": "2026-11-10 — No run is queued for an archived agent, at automations 2.2"
+      "title": "Automations",
+      "version": "2026-11-10 — `automations` declares its title, Automations, and its Lucide icon, `timer`"
     },
     "calcomc": {
       "executable": [
@@ -175,11 +186,12 @@
       ],
       "icon": true,
       "path": "capabilities/calcomc",
-      "payload_sha256": "198fd7a809e29ba9bab85d9ab0b7816609d555f79f4b57a67c88e439552ad199",
+      "payload_sha256": "02e677e079a51268a938946fc59c9a089929c801fa25094d8c535d948dc3d30a",
       "store_major": 4,
       "summary": "Cal.com CLI over the Cal.com API v2 — list, read and cancel bookings, read event types, available slots, schedules, connected calendars and their busy times, and reach any other endpoint through `api`; writes are refused unless the connection grants them, and `doctor` proves the key and the account it resolves to.",
       "tier": "standard",
-      "version": "2026-10-31 — `calcomc help` names the agent's vault in the credential cascade"
+      "title": "Cal.com",
+      "version": "2026-11-10 — `calcomc` declares its title, Cal.com"
     },
     "calendar": {
       "executable": [
@@ -195,12 +207,14 @@
         "tests/test_icalendar_roundtrip.py"
       ],
       "icon": true,
+      "lucide_icon": "calendar",
       "path": "capabilities/calendar",
-      "payload_sha256": "7e652ae0cddc2d17312380ae935ff11bb8352a3323bbe17cb4ca0567064c6563",
+      "payload_sha256": "ef1d38344e04bd56d3374faf8b8702cc031a4ce2769c28996fe5de94057ef6b7",
       "store_major": 4,
       "summary": "CalDAV CLI for remote calendars — list calendars, read, search and check busy blocks, and book events on a principal.",
       "tier": "standard",
-      "version": "2026-10-31 — `calendar` carries its own icon"
+      "title": "Calendar",
+      "version": "2026-11-10 — `calendar` declares its title, Calendar, and its Lucide icon, `calendar`"
     },
     "callva": {
       "executable": [
@@ -225,11 +239,12 @@
       ],
       "icon": true,
       "path": "capabilities/callva",
-      "payload_sha256": "f01b82b8786e88a6f59ec8c462144a56c36d1c2c23c59ba9d5935ee5b51d34b1",
+      "payload_sha256": "4aaa3f675793e24664c31bb854f30841360a9f68068f99bde18f5d8d9bed22d8",
       "store_major": 4,
       "summary": "CallVA voice-AI platform CLI over the External API — read/create/update/delete agents, the speech-stack presets they run on and the tools they call, assets (prompts), calls, transcripts, recordings, call analytics, custom fields, webhook schedules, automations (Windmill scripts), webhook logs, record actions, saved calls-list views, issues, knowledge, variables, settings, projects, phone numbers, and providers.",
       "tier": "standard",
-      "version": "2026-11-04 — `callva issues` carries the optional `stack` field"
+      "title": "CallVA",
+      "version": "2026-11-10 — `callva` declares its title, CallVA"
     },
     "callvatest": {
       "executable": [
@@ -246,11 +261,12 @@
       ],
       "icon": false,
       "path": "capabilities/callvatest",
-      "payload_sha256": "6dd435e07ccdc51a69da8c9e05ccb82a25cde04625c3a8623770e74e30089388",
+      "payload_sha256": "f4824c921d2196d47b6c04b9a8de1e32cb05795e75e0d5f8c6f12a4ea428192e",
       "store_major": 4,
       "summary": "CallVA agent test harness — drives a deployed voice agent through a real LiveKit room over text, then asserts the transcript, the tools it called, the arguments it generated, the results it answered from, and the fields stored after the call.",
       "tier": "standard",
-      "version": "2026-10-31 — `callvatest help` names the agent's vault in the credential cascade"
+      "title": "CallVA Test",
+      "version": "2026-11-10 — `callvatest` declares its title, CallVA Test"
     },
     "clickup": {
       "executable": [
@@ -264,11 +280,12 @@
       ],
       "icon": true,
       "path": "capabilities/clickup",
-      "payload_sha256": "a8ca309cfd43d6f8299e075589eb85bb6b06728752308b5c47b34e3e73569d06",
+      "payload_sha256": "6a9b59fe06a678f215800d712783e5a538ada17b44625699ae89c72a29aa0e89",
       "store_major": 4,
       "summary": "ClickUp CLI over the REST API — read/create/update/comment-on tasks and subtasks, complete via status, manage assignees, tags, dependencies, custom fields, attachments, and webhooks across spaces and lists.",
       "tier": "standard",
-      "version": "2026-10-31 — `clickup` reads a connection's token from the agent's vault as well"
+      "title": "ClickUp",
+      "version": "2026-11-10 — `clickup` declares its title, ClickUp"
     },
     "context": {
       "executable": [
@@ -283,12 +300,14 @@
         "tests/test_context.py"
       ],
       "icon": true,
+      "lucide_icon": "book-open",
       "path": "capabilities/context",
-      "payload_sha256": "b4afacdf02c0fbe3159a0f96f2e372b8d915700bffacea0b809ce0b0f017d228",
+      "payload_sha256": "cbeca32583a8741f2b841148a27f512dc92a47810c2b94f35dd04b56e658a209",
       "store_major": 4,
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte.",
       "tier": "core",
-      "version": "2026-11-08 — An agent's documents go with it, at context 2.1"
+      "title": "Context",
+      "version": "2026-11-10 — `context` declares its title, Context, and its Lucide icon, `book-open`"
     },
     "coolify": {
       "executable": [
@@ -345,11 +364,12 @@
       ],
       "icon": true,
       "path": "capabilities/coolify",
-      "payload_sha256": "c9ae6d8a20ddde207d93a26750dddd41ac2bf32b42af9d58a3902e996ced846f",
+      "payload_sha256": "a2d8f31d394c3d187c09f97987240313e0268f6f05d9d7e150d3b57ed41355d2",
       "store_major": 4,
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance.",
       "tier": "standard",
-      "version": "2026-11-07 — `coolify connect <name>` adds a connection labelled by the name, with an id from the store"
+      "title": "Coolify",
+      "version": "2026-11-10 — `coolify` declares its title, Coolify"
     },
     "deployment": {
       "executable": [
@@ -381,12 +401,14 @@
         "tests/test_target_bundles.py"
       ],
       "icon": true,
+      "lucide_icon": "rocket",
       "path": "capabilities/deployment",
-      "payload_sha256": "ab856692edc619ead11be539b6a8a2dfd65afce0cfb7fc539f91a26e46d48bd9",
+      "payload_sha256": "74525b77e916d511874e857432db8de209c3bd9749573cee7bec473ca8110d78",
       "store_major": 4,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to.",
       "tier": "core",
-      "version": "2026-11-08 — A project with a legacy binding deploys with no `contextkit` on the machine"
+      "title": "Deployment",
+      "version": "2026-11-10 — `deployment` declares its title, Deployment, and its Lucide icon, `rocket`"
     },
     "directo": {
       "executable": [
@@ -400,11 +422,12 @@
       ],
       "icon": true,
       "path": "capabilities/directo",
-      "payload_sha256": "fba562677b2ef99ab8a63bbed79ff6f59e8d7230bff36d133d75476a1ae0dd3d",
+      "payload_sha256": "289f49d188c80853f825561232520f1eb565dc5daadb812ca33c4fb09cb838ab",
       "store_major": 4,
       "summary": "Directo ERP CLI over the browser-session endpoints its web UI uses — log in, select a location, and read the authed `*.asp` surface (sales, purchases, stock, ledger). Stateful — run `directo doctor` first.",
       "tier": "standard",
-      "version": "2026-11-07 — A live session made under a connection's former name is found again under its id"
+      "title": "Directo",
+      "version": "2026-11-10 — `directo` declares its title, Directo"
     },
     "emta": {
       "executable": [
@@ -419,11 +442,12 @@
       ],
       "icon": true,
       "path": "capabilities/emta",
-      "payload_sha256": "17b09a27ea1ed2b220ad113d4c208b248cf280461efee782ab3b69696036a6d8",
+      "payload_sha256": "4ae50e78b3f4755202b59079c1b62ecada4bfb5760c36a3316a59c0870b3f80e",
       "store_major": 4,
       "summary": "Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay balances, per-period balances, prepay ledger. Session is paste-fed from a logged-in browser. Stateful — run `emta doctor` first.",
       "tier": "standard",
-      "version": "2026-11-07 — A stored session made under a connection's former name is found again under its id"
+      "title": "EMTA",
+      "version": "2026-11-10 — `emta` declares its title, EMTA"
     },
     "fathom": {
       "executable": [
@@ -438,11 +462,12 @@
       ],
       "icon": true,
       "path": "capabilities/fathom",
-      "payload_sha256": "301111670c7b04116b757e9126dbcabf751196f4654f3e962aaa80c222abd139",
+      "payload_sha256": "fbba81d3e005ae0021a059eaceec01b7eb8164d4c1cc0ffd6b484296659d9070",
       "store_major": 4,
       "summary": "Fathom CLI over the External API + a PostgreSQL store — sync meetings and transcripts in one pass, read/update stored meetings, manage a vocabulary, and search the store at three levels.",
       "tier": "standard",
-      "version": "2026-10-31 — `fathom help` names the agent's vault in the credential cascade"
+      "title": "Fathom",
+      "version": "2026-11-10 — `fathom` declares its title, Fathom"
     },
     "geminitalk": {
       "executable": [
@@ -460,11 +485,12 @@
       ],
       "icon": true,
       "path": "capabilities/geminitalk",
-      "payload_sha256": "ac0abe1d4957c0fad8bf4f371decf2f31539029e8264e29525ccf6d62ce3b5b5",
+      "payload_sha256": "2e66b94fa3f8342d303530a5a4b9317a284e9092283aee9515b7cb51979dddc9",
       "store_major": 4,
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay.",
       "tier": "standard",
-      "version": "2026-10-31 — `geminitalk help` names the agent's vault in the credential cascade"
+      "title": "Gemini Talk",
+      "version": "2026-11-10 — `geminitalk` declares its title, Gemini Talk"
     },
     "ical": {
       "executable": [
@@ -478,12 +504,14 @@
         "tests/test_eventkit_reliability.py"
       ],
       "icon": true,
+      "lucide_icon": "calendar",
       "path": "capabilities/ical",
-      "payload_sha256": "2f255cb110ddee998bfd4284e06baba18ca1c83eabe1ac4819d19999d82ba9b8",
+      "payload_sha256": "6b96440878b7111ad16fb19ff0443410f830339dbd6ecc6e9fa9849cd2cf9fb5",
       "store_major": 4,
       "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk.",
       "tier": "standard",
-      "version": "2026-10-31 — `ical` carries its own icon"
+      "title": "Apple Calendar",
+      "version": "2026-11-10 — `ical` declares its title, Apple Calendar, and its Lucide icon, `calendar`"
     },
     "inbox": {
       "executable": [
@@ -496,12 +524,14 @@
         "tests/test_inbox.py"
       ],
       "icon": false,
+      "lucide_icon": "inbox",
       "path": "capabilities/inbox",
-      "payload_sha256": "bb043a393a8604e35923356308153f85b43c2a8c7c88439d703e26831cfa35a0",
+      "payload_sha256": "2c409470a86d38893bc66c58853a276d317d4b48c7ffc95c8b406201d0af8aa7",
       "store_major": 4,
       "summary": "A go-between to the person - an agent puts in a question to answer yes or no, a message to answer in words, or something to know, and leaves the command that takes the answer; the person lists, reads, answers and archives them, and the answer runs the asker's command in the asker's own folder. Whatever an agent puts before a person in the Inbox, itself or through another tool, is written for someone deciding, not someone reading code: say what this is, why it comes up now, what is needed from the person, and which answer you recommend and why, in plain language with no code, file paths, line numbers, commit or task ids, or internal names, under a title that says the matter itself.",
       "tier": "core",
-      "version": "2026-11-08 — An item goes with its agent, and keeps itself when the node it was put from goes, at inbox 1.3"
+      "title": "Inbox",
+      "version": "2026-11-10 — `inbox` declares its title, Inbox, and its Lucide icon, `inbox`"
     },
     "instagram": {
       "executable": [
@@ -516,11 +546,12 @@
       ],
       "icon": true,
       "path": "capabilities/instagram",
-      "payload_sha256": "9024dfca9c3831371e249bd4df48d4cab7f225e28a9fad983319e3206cf88bec",
+      "payload_sha256": "1527aa85462d07ba7f229974bf641e3c7bee2a1f8faa49f81a40d0c1d799e8f9",
       "store_major": 4,
       "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first.",
       "tier": "standard",
-      "version": "2026-11-07 — A session made under a connection's former name is found again under its id"
+      "title": "Instagram",
+      "version": "2026-11-10 — `instagram` declares its title, Instagram"
     },
     "journal": {
       "executable": [
@@ -534,12 +565,14 @@
         "icon.png"
       ],
       "icon": true,
+      "lucide_icon": "notebook",
       "path": "capabilities/journal",
-      "payload_sha256": "f8ac6c03eec51f9cceb0ee3922240c5164e5c271776d06d2064ac9d0763d5d7f",
+      "payload_sha256": "7f77965b97f8745a685898db377a33f4c619c231b47632467f542ca72390c4b4",
       "store_major": 4,
       "summary": "Journal CLI over a PostgreSQL store — list and read voice-journal entries, write enrichment back, chunk transcripts for embedding, and search the store at three levels.",
       "tier": "standard",
-      "version": "2026-10-31 — `journal` carries its own icon"
+      "title": "Journal",
+      "version": "2026-11-10 — `journal` declares its title, Journal, and its Lucide icon, `notebook`"
     },
     "macmail": {
       "executable": [
@@ -553,12 +586,14 @@
         "tests/test_macmail_reliability.py"
       ],
       "icon": true,
+      "lucide_icon": "mail",
       "path": "capabilities/macmail",
-      "payload_sha256": "3b33f4d81ac3b294474ad5ef19499720c7bc4433d23b6d041ce7e5b3af5af52b",
+      "payload_sha256": "edc2fe6abebb62162feff3b0e431e9c3c9694e4a3f4e8feb7bccdd43cafdcd94",
       "store_major": 4,
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON.",
       "tier": "standard",
-      "version": "2026-10-31 — `macmail` carries its own icon"
+      "title": "Apple Mail",
+      "version": "2026-11-10 — `macmail` declares its title, Apple Mail, and its Lucide icon, `mail`"
     },
     "mailbox": {
       "executable": [
@@ -573,12 +608,14 @@
         "tests/test_sent_copy.py"
       ],
       "icon": true,
+      "lucide_icon": "mail",
       "path": "capabilities/mailbox",
-      "payload_sha256": "cc37464b3f1b0fddce8eebb610645852ea64fe126328d781e8c3e38864d94dc6",
+      "payload_sha256": "2f6bea14cca146a45b4f3be39c7a88fad5389e406d0b83a338d0e08a8791fac7",
       "store_major": 4,
       "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, send, and save a draft into Drafts without sending it; send, draft, move and seen need a write grant.",
       "tier": "standard",
-      "version": "2026-11-06 — `mailbox draft` saves a letter into Drafts without sending it"
+      "title": "Mailbox",
+      "version": "2026-11-10 — `mailbox` declares its title, Mailbox, and its Lucide icon, `mail`"
     },
     "memory": {
       "executable": [
@@ -604,12 +641,14 @@
         "tests/test_store.py"
       ],
       "icon": true,
+      "lucide_icon": "brain",
       "path": "capabilities/memory",
-      "payload_sha256": "6b019ca47d32fa78fd21f77a93f349484f6bcdef9e4282751f6da44d3e099b9e",
+      "payload_sha256": "ed7547c8c7e1b15634bc5f479d688e172df06541dfabd1afb1e9912248140656",
       "store_major": 4,
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a constant block in every session's context that says how to record and search them, and a grooming pass, run on a schedule, that consolidates the entries.",
       "tier": "core",
-      "version": "2026-11-09 — Turns run on callva-harness-runner 0.12.1"
+      "title": "Memory",
+      "version": "2026-11-10 — `memory` declares its title, Memory, and its Lucide icon, `brain`"
     },
     "notion": {
       "executable": [
@@ -622,11 +661,12 @@
       ],
       "icon": true,
       "path": "capabilities/notion",
-      "payload_sha256": "a9812da1946218ca8ee2b9910a432c547e2e5dc49647a3e34dddc03ec93cdc3b",
+      "payload_sha256": "19ee0ec43e91d25b429c4ad58cad53c9da86c468aba7a7de9291b257baad4daa",
       "store_major": 4,
       "summary": "Notion CLI over the REST API — publish markdown to pages: list child pages, fetch a page as markdown, replace a page's body and title, create under a parent, and upsert by exact title.",
       "tier": "standard",
-      "version": "2026-10-31 — `notion` reads a connection's token from the agent's vault as well"
+      "title": "Notion",
+      "version": "2026-11-10 — `notion` declares its title, Notion"
     },
     "railwayc": {
       "executable": [
@@ -641,11 +681,12 @@
       ],
       "icon": true,
       "path": "capabilities/railwayc",
-      "payload_sha256": "a1747789b46ce23ee63a5ef2aea21183ee223564eac583a414d00f36007eab4d",
+      "payload_sha256": "f70289120109437f9d163b65a4cd1c6499d01932dfb79f2c9c5c9a931a1972d4",
       "store_major": 4,
       "summary": "Credential harness around the official `railway` CLI — resolves a project-scoped Railway token, injects it, and forwards your command straight to `railway` (everything but railwayc's own verbs passes through untouched); the command surface is `railway help`.",
       "tier": "standard",
-      "version": "2026-10-31 — `railwayc help` names the agent's vault in the credential cascade"
+      "title": "Railway",
+      "version": "2026-11-10 — `railwayc` declares its title, Railway"
     },
     "rclonec": {
       "executable": [
@@ -663,11 +704,12 @@
       ],
       "icon": true,
       "path": "capabilities/rclonec",
-      "payload_sha256": "f429737040e07d15ef3a86cc2326ed85e165aed5a156956fc25765b9ffd08ab2",
+      "payload_sha256": "f604417f03af22ec1b8f2c720fecfe739a2076abf1d49ca035bfa805a2935159",
       "store_major": 4,
       "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`.",
       "tier": "standard",
-      "version": "2026-11-07 — The remote is named for the connection's label, so `<label>:path` keeps working"
+      "title": "Rclone",
+      "version": "2026-11-10 — `rclonec` declares its title, Rclone"
     },
     "resend": {
       "executable": [
@@ -680,11 +722,12 @@
       ],
       "icon": true,
       "path": "capabilities/resend",
-      "payload_sha256": "8514042d0218683b5c52f4f8d30f2b06a5753fb176f571c66f86abd4f6b02dd3",
+      "payload_sha256": "2c080148fd25204245fd2cadb49022cd6245998428fc5c6792906bd407e31523",
       "store_major": 4,
       "summary": "Send-only email CLI over the Resend HTTP API — deliver mail from a verified sending domain (send, write-gated with an optional recipient allow-list), list sending domains and their verification status (domains), and prove key + reachability (doctor). One-way by construction: no read or receive surface.",
       "tier": "standard",
-      "version": "2026-10-31 — `resend help` names the agent's vault in the credential cascade"
+      "title": "Resend",
+      "version": "2026-11-10 — `resend` declares its title, Resend"
     },
     "routine": {
       "executable": [
@@ -701,12 +744,14 @@
         "tests/test_routine.py"
       ],
       "icon": true,
+      "lucide_icon": "list-ordered",
       "path": "capabilities/routine",
-      "payload_sha256": "7d949d2848997529283ed28da14d7b5567c8fc85a805cea25a6faa4f3f1633b1",
+      "payload_sha256": "ed37c9dcf11a00528349322a4371892965f71c5a6872f9939fb48c32a54c74c4",
       "store_major": 4,
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte.",
       "tier": "core",
-      "version": "2026-11-08 — An agent's routines go with it, at routine 2.1"
+      "title": "Routines",
+      "version": "2026-11-10 — `routine` declares its title, Routines, and its Lucide icon, `list-ordered`"
     },
     "signoz": {
       "executable": [
@@ -722,11 +767,12 @@
       ],
       "icon": true,
       "path": "capabilities/signoz",
-      "payload_sha256": "a9ff53b4815cdc5e6cde493788613a8bdc7bd9f762a1dad17c52ae28f088897d",
+      "payload_sha256": "32deba65926d5aee7da0283de5d55e8d2c99a8ad8dec3b88d62412ff2a09e671",
       "store_major": 4,
       "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances.",
       "tier": "standard",
-      "version": "2026-10-30 — `signoz` carries its own icon"
+      "title": "SigNoz",
+      "version": "2026-11-10 — `signoz` declares its title, SigNoz"
     },
     "simplbooks": {
       "executable": [
@@ -752,11 +798,12 @@
       ],
       "icon": true,
       "path": "capabilities/simplbooks",
-      "payload_sha256": "dcc3bd177ab4f0ee5d88da867b6b80d241e95c10b854043ee1917aabb33f054e",
+      "payload_sha256": "e2fa5377b18f0543e057da7be96b35bf44ab077963ed00250d6853f00a14c18f",
       "store_major": 4,
       "summary": "SimpleBooks accounting CLI over a browser session (no public API) — read clients/invoices/purchases/accounts/bank-transactions/financial_transactions, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist. Stateful — run `simplbooks doctor` first.",
       "tier": "standard",
-      "version": "2026-11-07 — A named connection's session made under a connection's former name is found again under its id"
+      "title": "SimplBooks",
+      "version": "2026-11-10 — `simplbooks` declares its title, SimplBooks"
     },
     "skyscanner": {
       "executable": [
@@ -770,11 +817,12 @@
       ],
       "icon": true,
       "path": "capabilities/skyscanner",
-      "payload_sha256": "d1a8d8320f9b22f8c89c1e2dc3cbfaf54278541b361dbb58971851f80412226d",
+      "payload_sha256": "c0f5ea40dbbb6db9c14901440574a219418656f2df40d9eaf836e578e1e053e8",
       "store_major": 4,
       "summary": "Skyscanner flight search over plain HTTP — resolve places, search live itineraries with prices, comfort facts (stops, layovers, self-transfer, airport changes) and booking links, and read the cached cheapest price per day; read-only, optionally through an Oxylabs residential proxy that keeps Skyscanner's bot protection from blocking the address.",
       "tier": "standard",
-      "version": "2026-11-07 — The site rotation state made under a connection's former name is found again under its id"
+      "title": "Skyscanner",
+      "version": "2026-11-10 — `skyscanner` declares its title, Skyscanner"
     },
     "slack": {
       "executable": [
@@ -816,11 +864,12 @@
       ],
       "icon": true,
       "path": "capabilities/slack",
-      "payload_sha256": "5048170a99d6d1258bae5f7ed01bf65c9fb0ac36abb3ec723a474444bd7e2cbd",
+      "payload_sha256": "276496d7ea9dc471bdbf5f3e36de0eb10e53261075385783beba19f02a29d0c0",
       "store_major": 4,
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy.",
       "tier": "standard",
-      "version": "2026-11-07 — A connection is named by its id"
+      "title": "Slack",
+      "version": "2026-11-10 — `slack` declares its title, Slack"
     },
     "slacker": {
       "executable": [
@@ -842,11 +891,12 @@
       ],
       "icon": true,
       "path": "capabilities/slacker",
-      "payload_sha256": "e6fc7397a71622f655cab561f1b7e6f5d7e12867294123603362f6783a819465",
+      "payload_sha256": "d96cf0a521d234da53f2fd43f8c4296b7faacab87a7a902e4aeee6e59eb922dc",
       "store_major": 4,
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live. Read-only: it never writes to Slack.",
       "tier": "standard",
-      "version": "2026-11-07 — A connection is named by its id"
+      "title": "Slack Reader",
+      "version": "2026-11-10 — `slacker` declares its title, Slack Reader"
     },
     "stripe": {
       "executable": [
@@ -859,11 +909,12 @@
       ],
       "icon": true,
       "path": "capabilities/stripe",
-      "payload_sha256": "4fbeb1d66eb9a0422b8d575b91e11da5f93fc255e5d1aa4df36128bd1712a34e",
+      "payload_sha256": "e7d732d8d2f1dec2555c8460a070cacf624cee808599c53a9b63eca653dd295c",
       "store_major": 4,
       "summary": "Read-only Stripe CLI over the REST API — emit a neutral JSON contract of account activity (sync-plan), check identity/reachability (doctor), list invoices and download their PDFs, and read balance-transactions and payouts.",
       "tier": "standard",
-      "version": "2026-10-31 — `stripe help` names the agent's vault in the credential cascade"
+      "title": "Stripe",
+      "version": "2026-11-10 — `stripe` declares its title, Stripe"
     },
     "tasks": {
       "executable": [
@@ -923,12 +974,14 @@
         "workers/supervisor.md"
       ],
       "icon": true,
+      "lucide_icon": "list-checks",
       "path": "capabilities/tasks",
-      "payload_sha256": "449c86ab9a9cb899ec7b56600484117a6203060f9b384bdba7769101dc6c939e",
+      "payload_sha256": "dd95b3670eeb76807d18d444844310f2685ceeb5d567a5e21cf075ddac3db514",
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
       "tier": "core",
-      "version": "2026-11-10 — No raise for an archived agent, at tasks 2.2"
+      "title": "Tasks",
+      "version": "2026-11-10 — `tasks` declares its title, Tasks, and its Lucide icon, `list-checks`"
     },
     "teams": {
       "executable": [
@@ -940,12 +993,14 @@
         "tests/test_teams.py"
       ],
       "icon": false,
+      "lucide_icon": "users",
       "path": "capabilities/teams",
-      "payload_sha256": "c42d6d58e20157bcfa3ef0257a3330be4a132bfd66443c4308ab211a6ce6f6b8",
+      "payload_sha256": "0b996562477d3669376e930e83bad3bea9b63f36079a501310c1f58106c89f72",
       "store_major": 4,
       "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
       "tier": "core",
-      "version": "2026-11-09 — `teams section` prints an agent's Teams section, and the declaration names it"
+      "title": "Teams",
+      "version": "2026-11-10 — `teams` declares its title, Teams, and its Lucide icon, `users`"
     },
     "telegram": {
       "executable": [
@@ -1019,11 +1074,12 @@
       ],
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "d9551acf6ac2a0108d57e1cdfb9f1988e480a91b59ab7b08a04eeda5a85d08b7",
+      "payload_sha256": "80a16449b833c0b9ec0f40f92f3a40e0fc14eda39a718e0b07666c2857695c9d",
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
       "tier": "standard",
-      "version": "2026-11-10 — No job is entered for an archived agent, at telegram 3.2"
+      "title": "Telegram",
+      "version": "2026-11-10 — `telegram` declares its title, Telegram"
     },
     "telegrambot": {
       "executable": [
@@ -1068,12 +1124,14 @@
         "tests/test_worker_bin.py"
       ],
       "icon": false,
+      "lucide_icon": "bot-message-square",
       "path": "capabilities/telegrambot",
-      "payload_sha256": "1a53b5db610dc23d6741241d839d45326dcd60d6e0aeb2907f41d6f5bef10b0f",
+      "payload_sha256": "953de4207a66996e08d26d7fafe68fa14e3ec2250ca00ceb322bdd517b9c0c8c",
       "store_major": 4,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation.",
       "tier": "standard",
-      "version": "2026-11-10 — Inside a turn the CLI reaches the turn's chat only, by whichever path it is called"
+      "title": "Telegram Bot",
+      "version": "2026-11-10 — `telegrambot` declares its title, Telegram Bot, and its Lucide icon, `bot-message-square`"
     },
     "vapic": {
       "executable": [
@@ -1090,11 +1148,12 @@
       ],
       "icon": true,
       "path": "capabilities/vapic",
-      "payload_sha256": "9abf20d15bd13fd87f20c181b0d3ef2aa65246abbc0318e430afffb90e693b63",
+      "payload_sha256": "3d886bf2820e4b3cdb69c0bfd23d26c59dd629f36fa16cee0e0363a557141e53",
       "store_major": 4,
       "summary": "Connection harness around the official `vapi` CLI - resolves a Vapi API key, injects it, and forwards commands to `vapi` with a narrow read-list fallback; the command surface is `vapi --help`.",
       "tier": "standard",
-      "version": "2026-10-31 — `vapic help` names the agent's vault in the credential cascade"
+      "title": "Vapi",
+      "version": "2026-11-10 — `vapic` declares its title, Vapi"
     },
     "whatsapp": {
       "executable": [
@@ -1140,11 +1199,12 @@
       ],
       "icon": true,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "6644ec48d1f1a21d518a5a48fa0566d62f1d53a426ca34143469cdd725c1ea73",
+      "payload_sha256": "02ec8d762641c0bc7d3d056e47385804f972fe97afdd8654f034a1d14d15a14b",
       "store_major": 4,
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON.",
       "tier": "standard",
-      "version": "2026-11-10 — No job is entered for an archived agent, at whatsapp 2.4"
+      "title": "WhatsApp",
+      "version": "2026-11-10 — `whatsapp` declares its title, WhatsApp"
     },
     "windmill": {
       "executable": [
@@ -1162,11 +1222,12 @@
       ],
       "icon": true,
       "path": "capabilities/windmill",
-      "payload_sha256": "15e29271b88c0c10837b3217fede66ebfcc8905e4b1f4fa1bb966c421ab10c2b",
+      "payload_sha256": "55d253455c21d4537ddfb59afdca8016397517d0b0169e73f6bc859fbba879b0",
       "store_major": 4,
       "summary": "Windmill CLI over the REST API — deploy scripts, attach cron schedules, run jobs, read run history/logs, and manage secret variables and folders.",
       "tier": "standard",
-      "version": "2026-11-07 — `inventory` names a connection by its label"
+      "title": "Windmill",
+      "version": "2026-11-10 — `windmill` declares its title, Windmill"
     },
     "youtrack": {
       "executable": [
@@ -1181,13 +1242,14 @@
       ],
       "icon": true,
       "path": "capabilities/youtrack",
-      "payload_sha256": "2a285a36db57075523b4e011cb5dca640171c216bc061a5197220c7a3575e6c2",
+      "payload_sha256": "3ef683dbe02f00a316395ec2c538727a659cff1c11b3b65571216206bf61f4f9",
       "store_major": 4,
       "summary": "YouTrack CLI for issues (read with links and tags, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, add/remove issue links by direction phrase, tag and untag by tag name, and log and list work items), user and group lookup, project reads and paged custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments).",
       "tier": "standard",
-      "version": "2026-10-31 — `youtrack` reads a connection's token from the agent's vault as well"
+      "title": "YouTrack",
+      "version": "2026-11-10 — `youtrack` declares its title, YouTrack"
     }
   },
-  "contract_library": "0.47.0",
+  "contract_library": "0.48.0",
   "store_major": 4
 }

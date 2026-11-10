@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """callva — agent-first CLI for the CallVA voice-AI platform.
@@ -467,6 +467,7 @@ MAX_RETRIES = 3
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "callva"
+TITLE = "CallVA"
 SUMMARY = ("CallVA voice-AI platform CLI over the External API — "
            "read/create/update/delete agents, the speech-stack presets "
            "they run on and the tools they call, assets (prompts), calls, "

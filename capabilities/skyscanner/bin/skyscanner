@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx[http2]>=0.27",
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """skyscanner — Skyscanner flight search over plain HTTP: resolve places, search
@@ -237,6 +237,7 @@ import httpx
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "skyscanner"
+TITLE = "Skyscanner"
 SUMMARY = ("Skyscanner flight search over plain HTTP — resolve places, search live "
            "itineraries with prices, comfort facts (stops, layovers, self-transfer, "
            "airport changes) and booking links, and read the cached cheapest price "

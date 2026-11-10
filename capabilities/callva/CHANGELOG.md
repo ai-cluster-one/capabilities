@@ -1,5 +1,9 @@
 # callva — change log
 
+## 2026-11-10 — `callva` declares its title, CallVA
+
+The manifest carries `title`, `CallVA`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `callva`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-04 — `callva issues` carries the optional `stack` field
 
 `issues create`, `update` and `put` send `stack` in their payload like any other field, `issues list -f stack=<value>` filters by it, and the list summary shows it where the platform returns it. The help for these verbs describes the standard: a plain string `preset/model/speech/worker`. No route changes.

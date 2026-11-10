@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """slack — managed capability scaffold.
@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = "slack"
+TITLE = "Slack"
 SUMMARY = (
     "Slack CLI over a bot token — post to and read channels, groups, "
     "threads and DMs, and resolve names to ids; conversation targets "

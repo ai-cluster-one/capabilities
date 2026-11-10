@@ -1,5 +1,9 @@
 # vapic — change log
 
+## 2026-11-10 — `vapic` declares its title, Vapi
+
+The manifest carries `title`, `Vapi`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `vapic`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-10-31 — `vapic help` names the agent's vault in the credential cascade
 
 Bare `vapic help` no longer lists where a secret resolves by hand, a list that stopped at the process environment and left out the agent's vault; it now points to the contract-rendered `Where a secret resolves` section at the end of the help, which names the vault as the cascade's last tier. Nothing else changes.

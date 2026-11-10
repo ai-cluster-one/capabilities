@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.42,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """resend — send-only email CLI over the Resend HTTP API (resend.com).
@@ -124,6 +124,7 @@ MAX_RETRIES = 3
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "resend"
+TITLE = "Resend"
 SUMMARY = ("Send-only email CLI over the Resend HTTP API — deliver mail from "
            "a verified sending domain (send, write-gated with an optional "
            "recipient allow-list), list sending domains and their "

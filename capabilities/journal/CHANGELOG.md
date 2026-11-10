@@ -1,5 +1,9 @@
 # journal — change log
 
+## 2026-11-10 — `journal` declares its title, Journal, and its Lucide icon, `notebook`
+
+The manifest carries `title`, `Journal`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `notebook`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `journal`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-10-31 — `journal` carries its own icon
 
 The bundle holds its icon as `icon.png`, a notebook: Lucide's `notebook` line icon from `lucide-static` 1.66.0, drawn in one colour (`#64748b`) on a transparent ground at 256 x 256. `capabilities icon journal` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

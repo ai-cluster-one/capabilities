@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """instagram — agent-first CLI over an authenticated Instagram web session.
@@ -44,6 +44,7 @@ from urllib.parse import parse_qsl, urlparse
 import httpx
 
 NAME = "instagram"
+TITLE = "Instagram"
 SUMMARY = (
     "Instagram CLI over a captured browser session — validate identity, read "
     "profiles, resolve Direct threads, and send text messages. Stateful — run "

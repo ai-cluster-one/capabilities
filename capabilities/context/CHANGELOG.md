@@ -1,5 +1,9 @@
 # context — change log
 
+## 2026-11-10 — `context` declares its title, Context, and its Lucide icon, `book-open`
+
+The manifest carries `title`, `Context`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `book-open`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `context`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-08 — An agent's documents go with it, at context 2.1
 
 Step `0007-keys` (context 2.1, core 4.0) keys `context_documents`, `context_versions` and `context_enablements`: an agent's documents, their versions and its enablements go with it, a global document's author keeps the document and loses the pointer (`author_agent_id`, `ON DELETE SET NULL`), and a version and an enablement go with their document. The versions guard admits the cascade of a deliberate delete and nothing else. A reference to an agent the store no longer holds is settled when the step runs, kept in `context_premig_m9`. Runs on capabilities-contract 0.45. No verb, flag or JSON key changes.

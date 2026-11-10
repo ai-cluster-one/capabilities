@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.47,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -587,6 +587,7 @@ DEFAULT_SESSION = "default"
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "whatsapp"
+TITLE = "WhatsApp"
 SUMMARY = ("WhatsApp CLI carrying its own engine — link a device, keep the "
            "account's chats and messages in a Postgres store, read and deepen them "
            "on demand, transcribe voice notes, and export a chat to JSON.")

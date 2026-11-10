@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "click>=8.1",
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """directo — agent-first CLI for a Directo ERP instance (login.directo.ee).
@@ -71,6 +71,7 @@ _SELECTED: tuple[str, dict | None] | None = None   # memoized (cid, entry)
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "directo"
+TITLE = "Directo"
 SUMMARY = ("Directo ERP CLI over the browser-session endpoints its web UI "
            "uses — log in, select a location, and read the authed `*.asp` "
            "surface (sales, purchases, stock, ledger). Stateful — run "

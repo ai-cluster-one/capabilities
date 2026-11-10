@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.44,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """coolify — Coolify CLI over the REST API. Drives a self-hosted Coolify
@@ -365,6 +365,7 @@ MAX_RETRIES = 3
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "coolify"
+TITLE = "Coolify"
 SUMMARY = ("Coolify CLI over the REST API — list projects/resources/servers, "
            "read application & service status and logs, and deploy/restart/"
            "stop/start them on a self-hosted Coolify instance.")

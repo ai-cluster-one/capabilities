@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "httpx>=0.27",
 #     "psycopg[binary]>=3.2",
 # ]
@@ -244,6 +244,8 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = 'assets'
+TITLE = "Assets"
+LUCIDE_ICON = "archive"
 SUMMARY = ("A project's assets: markdown as versioned documents in the project's PostgreSQL "
            "store - plans, research, sessions, meetings, journal, digests and reports saved "
            "one version at a time, searched in full text and diffed between versions - and "

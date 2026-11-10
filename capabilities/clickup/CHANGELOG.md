@@ -1,5 +1,9 @@
 # clickup — change log
 
+## 2026-11-10 — `clickup` declares its title, ClickUp
+
+The manifest carries `title`, `ClickUp`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `clickup`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-10-31 — `clickup` reads a connection's token from the agent's vault as well
 
 Every verb resolves its token - a connection's `secret_env`, `CLICKUP_API_TOKEN`, or the key `--token-env` names - through the contract's credential cascade, which asks the agent's vault last, after the project's .env files, ~/.config/clickup/credentials.env and the process environment; it used to stop at the process environment, so a token `clickup connection add` now seals into the vault by default would not have been found. A token a file or the environment holds resolves exactly as before. The help points to the contract-rendered `Where a secret resolves` section instead of listing the tiers by hand, and `missing_token` names the vault.

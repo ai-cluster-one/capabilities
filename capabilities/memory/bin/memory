@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.12.1",
 # ]
@@ -259,6 +259,8 @@ from typing import Any, NoReturn
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 NAME = "memory"
+TITLE = "Memory"
+LUCIDE_ICON = "brain"
 SUMMARY = ("Project memory over a PostgreSQL store - conclusions recorded one entry at a "
            "time and searched on demand, a constant block in every session's context that says "
            "how to record and search them, and a grooming pass, run on a schedule, that "

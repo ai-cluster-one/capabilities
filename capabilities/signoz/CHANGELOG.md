@@ -1,5 +1,9 @@
 # signoz — change log
 
+## 2026-11-10 — `signoz` declares its title, SigNoz
+
+The manifest carries `title`, `SigNoz`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `signoz`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-10-30 — `signoz` carries its own icon
 
 The bundle holds its icon as `icon.png`; `capabilities icon signoz` answers its path and size, and `capabilities list` and `inventory` mark it with `icon: true`. Nothing else changes.

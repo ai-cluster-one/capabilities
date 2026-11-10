@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.12.1",
-#     "capabilities-contract>=0.47,<1",
+#     "capabilities-contract>=0.48,<1",
 # ]
 # ///
 """
@@ -321,6 +321,8 @@ from typing import NoReturn
 # --- Capability declaration — one home for every contract fact ---------------
 
 NAME = "askproject"
+TITLE = "Ask Project"
+LUCIDE_ICON = "message-circle-question-mark"
 SUMMARY = ("Bridge to a coding agent in ANOTHER project — spawn a headless peer "
            "(claude or codex) in a target project under a read or act profile, and "
            "return its answer with cost, token, and files-changed traceability.")

@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-11-10 — `whatsapp` declares its title, WhatsApp
+
+The manifest carries `title`, `WhatsApp`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `whatsapp`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-10 — No job is entered for an archived agent, at whatsapp 2.4
 
 Step `0027-unarchived` (whatsapp 2.4, a minor step needing the store's core at 4.2, capabilities-contract 0.47) has the store refuse every insert of `whatsapp_jobs` for an archived agent, through the core's one guard `agents_archived_refuse`, with SQLSTATE 23R01; moving and ending a job stay allowed. A store statement refused that way is reported as exit 4 `agent_archived`, where it said exit 5 `store_failed`, so `jobs register` that meets it says the agent is archived. A release of whatsapp 2.3 keeps working against a store at 2.4 for every agent that is not archived. Declares `capabilities-contract>=0.47,<1`. No verb, flag or JSON key changes.

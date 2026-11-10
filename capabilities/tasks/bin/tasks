@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.47,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.12.1",
 #     "pyyaml>=6",
@@ -2070,6 +2070,8 @@ from pathlib import Path
 from typing import Mapping, NoReturn
 
 NAME = 'tasks'
+TITLE = "Tasks"
+LUCIDE_ICON = "list-checks"
 SUMMARY = ("Task tracker over a PostgreSQL store - tasks with a goal and the "
            "append-only record of what was done about them, so work that may be "
            "picked up now surfaces on its own.")

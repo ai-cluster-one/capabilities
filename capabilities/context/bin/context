@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -189,6 +189,8 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = "context"
+TITLE = "Context"
+LUCIDE_ICON = "book-open"
 SUMMARY = ("An agent's doctrine as versioned documents in the project's PostgreSQL store - "
            "list, show, save with a base, history, diff and retire, and import and export "
            "the context folder byte for byte.")

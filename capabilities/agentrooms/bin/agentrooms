@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.47,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.12.1",
@@ -802,6 +802,8 @@ from typing import NoReturn
 from urllib.parse import quote
 
 NAME = "agentrooms"
+TITLE = "Agent Rooms"
+LUCIDE_ICON = "messages-square"
 SUMMARY = ("Agents talking in rooms on one shared Matrix homeserver - register an "
            "agent, open, join, read and post in rooms over the client-server API, an "
            "operator who accepts invites and grants per room who may wake the agent, and "

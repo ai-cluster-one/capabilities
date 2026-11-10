@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.48,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -239,6 +239,8 @@ from pathlib import Path
 from typing import NoReturn
 
 NAME = "inbox"
+TITLE = "Inbox"
+LUCIDE_ICON = "inbox"
 SUMMARY = ("A go-between to the person - an agent puts in a question to answer yes or no, a "
            "message to answer in words, or something to know, and leaves the command that "
            "takes the answer; the person lists, reads, answers and archives them, and the "

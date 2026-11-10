@@ -83,7 +83,7 @@ def _script(service: dict | None) -> str:
         + (f"SERVICE = {service!r}\n" if service is not None else ""), 1)
     dispatch = (
         "    if argv[:1] == [\"manifest\"] and \"SERVICE\" in globals():\n"
-        "        _emit({\"name\": NAME, \"summary\": SUMMARY,\n"
+        "        _emit({\"name\": NAME, \"title\": TITLE, \"summary\": SUMMARY,\n"
         "               \"credentials\": {\"scope\": SCOPE, \"keys\": CRED_KEYS},\n"
         "               \"docs\": {\"base\": DOCS_BASE, \"topics\": []},\n"
         "               \"state\": STATE, \"inventory\": _inventory_declaration(),\n"

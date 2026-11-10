@@ -1,5 +1,9 @@
 # slack — change log
 
+## 2026-11-10 — `slack` declares its title, Slack
+
+The manifest carries `title`, `Slack`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `slack`, and its `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-07 — A connection is named by its id
 
 A connection is keyed by the opaque id the store gives it, and called by its label; `--connection` and the service setting `connection` take either, and `service init` writes the id. The service's state folder made under a connection's former name is moved to `<state>/slack/<id>/service` the first time the connection is used, saying so on stderr, so the service keeps its watermarks and register. Declares `capabilities-contract>=0.44,<1`. No verb, flag, environment variable or output key changes; a `connection` key carries the id.

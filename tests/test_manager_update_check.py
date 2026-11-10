@@ -191,7 +191,7 @@ def test_an_unreachable_source_is_one_rows_error_and_exit_5(tmp_path: Path) -> N
 
 
 def _uv_holding_an_older_contract_library(tmp: Path, env: dict[str, str]) -> Path:
-    """A uv whose script environments hold capabilities-contract 0.45.0: each
+    """A uv whose script environments hold capabilities-contract 0.48.0: each
     script path is answered with an environment of its own, made on first ask,
     and a contract-library sync moves that path's environment to the release
     it names, logging the call; every other call goes to the real uv."""
@@ -208,7 +208,7 @@ case " $* " in
   *" python find "*"--script "*)
     f=$(folder "$last")
     if [ ! -d "$f" ]; then
-      mkdir -p "$f/bin" "$f/lib/python3.12/site-packages/capabilities_contract-0.45.0.dist-info"
+      mkdir -p "$f/bin" "$f/lib/python3.12/site-packages/capabilities_contract-0.48.0.dist-info"
       ln -s "$(command -v python3)" "$f/bin/python"
     fi
     echo "$f/bin/python"; exit 0;;
@@ -263,12 +263,12 @@ def test_a_contract_library_release_is_an_update_only_once_the_catalogue_names_i
             {"name": "resend", "changed": False}]
         assert not log.exists()
 
-        _official_catalogue(official, "0.46.0")
+        _official_catalogue(official, "0.49.0")
         before = _tree(cap_home)
         behind = _ok(["update", "--check", "resend"], env, tmp_path)
         row = _row(behind, "resend")
         assert row["available"]["catalog_sha256"] == row["installed"]["catalog_sha256"]
-        assert row["contract_library"] == {"installed": "0.45.0", "available": "0.46.0"}
+        assert row["contract_library"] == {"installed": "0.48.0", "available": "0.49.0"}
         assert row["update_available"] is True
         assert behind["update_available"] is True
         assert _tree(cap_home) == before
@@ -277,10 +277,10 @@ def test_a_contract_library_release_is_an_update_only_once_the_catalogue_names_i
         updated = _ok(["update", "resend"], env, tmp_path)
         assert updated["updated"] == [{
             "name": "resend", "changed": False,
-            "contract_library": {"installed": "0.45.0", "available": "0.46.0"}}]
+            "contract_library": {"installed": "0.48.0", "available": "0.49.0"}}]
         synced = log.read_text().splitlines()
         assert len(synced) == 2
-        assert all("--upgrade-package capabilities-contract==0.46.0" in line
+        assert all("--upgrade-package capabilities-contract==0.49.0" in line
                    for line in synced)
         assert _tree(cap_home) == before
 
