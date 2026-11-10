@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.12.1",
@@ -4581,6 +4581,12 @@ def cmd_service_run(machine: bool) -> None:
     runner = engine.Engine(host, mode="machine" if machine else "project", state_dir=state)
     try:
         runner.run()
+    except engine.AgentArchived as exc:
+        _die(4, "agent_archived",
+             f"`{NAME} service run` ended, starting nothing: "
+             f"{str(exc).removeprefix('agent_archived: ')}",
+             "Do not restore it yourself — ask the user; `capabilities agent restore` "
+             "clears the mark. Reading, help, doctor and stopping a service still work.")
     except RuntimeError as exc:
         if str(exc) == "busy":
             _die(8, "service_running", f"another {NAME} service process holds {state}",

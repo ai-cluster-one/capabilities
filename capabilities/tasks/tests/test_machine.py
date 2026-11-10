@@ -1082,3 +1082,80 @@ def test_two_projects_on_two_stores_each_keep_their_tasks_in_their_own(farm):
         with psycopg.connect(DSN, autocommit=True) as conn:
             for schema in (own, decoy):
                 conn.execute(f"drop schema if exists {schema} cascade")
+
+
+# --- An archived agent ---------------------------------------------------------
+
+def _archive(farm: Farm, name: str, on: bool = True) -> None:
+    """Stamp or clear the agent's mark, as `capabilities agent archive|restore`
+    does."""
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"set search_path to {farm.schema}")
+        conn.execute("update agents set archived_at = case when %s then now() end, "
+                     "archived_by = case when %s then 'ops-person@n1' end where id = %s",
+                     (on, on, farm.ids[name]))
+
+
+@needs_store
+def test_an_archived_agent_gets_no_raise_and_the_machine_serves_the_others(farm, capsys):
+    """Step 0015 refuses a raise of an archived agent's task, SQLSTATE 23R01,
+    which a command reports as exit 4 `agent_archived`; the machine process
+    reads it as the project not placed - nothing started for it, no failure
+    tried again - and serves the other projects; restored, it is served."""
+    import psycopg
+
+    farm.join("orchard", "kiln")
+    farm.start()
+    farm.until("orchard", "served")
+    farm.until("kiln", "served")
+    _archive(farm, "orchard")
+    farm.add("kiln", "t-kiln")
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"set search_path to {farm.schema}")
+        conn.execute("insert into tasks_tasks (agent_id, title, type, status, unique_key) "
+                     "values (%s, 't-orchard', 'fruit', 'todo', 't-orchard')",
+                     (farm.ids["orchard"],))
+        (task,) = conn.execute("select id from tasks_tasks where unique_key = 't-orchard'"
+                               ).fetchone()
+        # The store's own refusal, whoever asks it.
+        with pytest.raises(psycopg.IntegrityError) as refused:
+            conn.execute("insert into tasks_executions (task_id, attempt) values (%s, 1)",
+                         (task,))
+        assert refused.value.sqlstate == "23R01"
+        assert str(refused.value).startswith("agent_archived:")
+    # A command that meets it says so, exit 4, never a store error.
+    def raise_one(_entry, _rest):
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f"set search_path to {farm.schema}")
+            conn.execute("insert into tasks_executions (task_id, attempt) values (%s, 1)",
+                         (task,))
+
+    with pytest.raises(SystemExit) as ended:
+        mod._guarded(raise_one, None, [])
+    assert ended.value.code == 4
+    assert json.loads(capsys.readouterr().err.strip().splitlines()[-1])["error"]["code"] == \
+        "agent_archived"
+    code, error = farm.refused("orchard", "claim", "--worker", "picker")
+    assert (code, error["code"]) == (4, "agent_archived")
+    # The machine process: the archived project is not served and nothing
+    # starts for it; the other's work is taken.
+    row = farm.until("orchard", "refused", 30)
+    assert "agent_archived" in row["reason"]
+    farm.complete("kiln", "t-kiln")
+    time.sleep(3)
+    assert farm.status_of("orchard", "t-orchard") == "todo"
+    assert "orchard" not in started_in(farm)
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f"set search_path to {farm.schema}")
+        assert conn.execute("select count(*) from tasks_executions where task_id = %s",
+                            (task,)).fetchone() == (0,)
+    assert farm.machine()["running"] is True
+    # Restored, nothing is started by the restore itself; the next wake finds
+    # it served, and its work is taken.
+    _archive(farm, "orchard", on=False)
+    farm.add("orchard", "t-orchard-2")
+    farm.until("orchard", "served", 60)
+    farm.complete("orchard", "t-orchard")
+    farm.complete("orchard", "t-orchard-2")

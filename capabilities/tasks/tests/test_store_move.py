@@ -169,7 +169,8 @@ def catalog(conn, schema: str) -> dict:
     """Everything a store's tasks tables are made of, with the schema's name taken
     out, so two schemas holding the same shape read the same."""
     def plain(text):
-        return None if text is None else text.replace(f"{schema}.", "S.")
+        return None if text is None else text.replace(f"{schema}.", "S.").replace(
+            f"'{schema}'", "'S'")
 
     found: dict = {}
     found["columns"] = sorted(conn.execute(
@@ -220,7 +221,7 @@ def test_the_tables_are_declared_for_the_contracts_migrate():
                                                     "0004-profile-versions", "0005-workers-history",
                                                     "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names", "0014-keys"]
+                            "0013-agent-names", "0014-keys", "0015-unarchived"]
     owner, profile_steps, _major, _minor = mod._profile_tables()
     assert owner == "harness" and [one for one, _sql in profile_steps] == ["0001-profiles",
                                                                          "0002-profile-versions",
@@ -238,7 +239,7 @@ def test_a_fresh_store_gets_every_table_under_the_tasks_prefix(fresh_schema):
     assert done.applied == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                             "0004-profile-versions", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names", "0014-keys"]
+                            "0013-agent-names", "0014-keys", "0015-unarchived"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == [
             "harness_premig_m9", "harness_profile_versions", "schema_ledger", "schema_version",
@@ -262,7 +263,7 @@ def test_the_previous_store_is_moved_whole_into_the_bound_schema(old_store):
     assert done.applied == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                             "0004-profile-versions", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names", "0014-keys"]
+                            "0013-agent-names", "0014-keys", "0015-unarchived"]
 
     with raw() as conn:
         for old, new in TABLES.items():
@@ -306,7 +307,8 @@ def test_a_moved_store_and_a_fresh_one_are_the_same_store(old_store, fresh_schem
         "tasks_worker_versions_keep_history", "tasks_hook_versions_keep_history",
         "tasks_hook_versions_notify_declaration", "tasks_worker_versions_notify_declaration",
         "tasks_line_versions_keep_history", "tasks_line_versions_one_line_per_worker",
-        "tasks_line_versions_notify_declaration", "tasks_line_states_notify"}
+        "tasks_line_versions_notify_declaration", "tasks_line_states_notify",
+        "tasks_executions_unarchived"}
     assert all(name.startswith("tasks_") for _table, name, _kind, _def in moved["constraints"])
     assert all(name.startswith("tasks_") for _table, name, _def in moved["triggers"])
 
@@ -481,7 +483,7 @@ def test_migrate_status_then_migrate_then_status(tmp_path, fresh_schema):
     assert first["pending"] == ["0001-move-from-schema-tasks", "0002-tables", "0003-workers",
                                 "0004-profile-versions", "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names", "0014-keys"]
+                            "0013-agent-names", "0014-keys", "0015-unarchived"]
     with raw() as conn:
         assert tables_in(conn, fresh_schema) == []
     done = cli(lab, "migrate")
@@ -491,7 +493,7 @@ def test_migrate_status_then_migrate_then_status(tmp_path, fresh_schema):
                                                   "0004-profile-versions", "0005-workers-history",
                                                   "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names", "0014-keys"]
+                            "0013-agent-names", "0014-keys", "0015-unarchived"]
     # The library's table went first, under its own ledger, and said so.
     assert json.loads(done.stderr.strip().splitlines()[0]) == {"migrated": {
         "owner": "harness", "schema": fresh_schema, "applied": ["0001-profiles", "0002-profile-versions", "0003-agent-key"]}}
@@ -520,7 +522,7 @@ def test_an_ordinary_call_brings_missing_tables_up_once(tmp_path, fresh_schema):
                                               "0003-workers", "0004-profile-versions",
                                               "0005-workers-history", "0006-execution-node", "0007-hooks", "0008-workers-announce",
                             "0009-change-versions", "0010-service-presence", "0011-lines", "0012-task-node",
-                            "0013-agent-names", "0014-keys"]}}]
+                            "0013-agent-names", "0014-keys", "0015-unarchived"]}}]
     again = cli(lab, "list")
     assert again.returncode == 0 and again.stderr == ""
 
@@ -590,8 +592,8 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(fresh_schema, 
     done = migrate(fresh_schema)
     monkeypatch.delenv(db.UPGRADE_ENV)
     # The step that stands in for 0004 finds its column and key and changes nothing.
-    assert done.applied == ["0004-profile-versions", "0012-task-node", "0013-agent-names", "0014-keys"]
-    assert (done.major, done.minor) == (2, 1)
+    assert done.applied == ["0004-profile-versions", "0012-task-node", "0013-agent-names", "0014-keys", "0015-unarchived"]
+    assert (done.major, done.minor) == (2, 2)
     with raw() as conn:
         def one(sql):
             return conn.execute(sql.replace("S.", f"{s}.")).fetchall()

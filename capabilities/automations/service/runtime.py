@@ -773,7 +773,7 @@ def legacy_definitions(root: Path, raw: dict[str, Any], here_environment: str,
 # stays; a release of 1.x meets 2.0 as too new and refuses.
 LEDGER_OWNER = "automations"
 LEDGER_MAJOR = 2
-LEDGER_MINOR = 1
+LEDGER_MINOR = 2
 # The most a run may record: it is handed to the next run as one environment
 # variable, which the kernel caps at 128 KiB.
 RESULT_MAX_BYTES = 65536
@@ -1114,7 +1114,63 @@ LEDGER_STEPS = [
         'that runs it. Exactly one of script_path and script_body is set.';
     """),
     *([_M9Step("0010-keys", _M9_KEYS_SQL, core=(4, 0))] if _M9Step else []),
+    # 2.2: nothing starts for an archived agent (core 4.2). The store refuses
+    # queueing a run of it - every insert of automations_runs, a manual run or
+    # a retry included - through the core's one guard, `agents_archived_refuse`,
+    # with SQLSTATE 23R01 (`agent_archived`, exit 4). Moving or ending a run
+    # stays allowed. A minor step: a release of 2.1 reads a store at 2.2 and
+    # keeps working for every agent that is not archived.
+    *([_M9Step("0011-unarchived", r"""
+    CREATE FUNCTION automations_runs_unarchived() RETURNS trigger
+     LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+    BEGIN
+     PERFORM agents_archived_refuse(NEW.agent_id);
+     RETURN NEW;
+    END $guard$;
+    CREATE TRIGGER automations_runs_unarchived BEFORE INSERT ON automations_runs
+     FOR EACH ROW EXECUTE FUNCTION automations_runs_unarchived();
+    COMMENT ON TRIGGER automations_runs_unarchived ON automations_runs IS
+        'Refuses queueing a run of an archived agent; moving or ending one stays allowed.';
+    """, core=(4, 2))] if _M9Step else []),
 ]
+
+# The SQLSTATE the store's guard raises for an archived agent
+# (capabilities_contract.db.AGENT_ARCHIVED_SQLSTATE).
+try:
+    from capabilities_contract.db import AGENT_ARCHIVED_SQLSTATE
+except ImportError:  # the library's absence is reported where the store opens
+    AGENT_ARCHIVED_SQLSTATE = None
+
+
+def archived(exc: BaseException | None) -> bool:
+    """Whether `exc`, or what it was raised from, is the store refusing to start
+    anything for an archived agent: that agent is not served and nothing is
+    queued or started for it, which is neither a crash nor a failure to try
+    again."""
+    seen = 0
+    while exc is not None and seen < 8:
+        if AGENT_ARCHIVED_SQLSTATE and getattr(exc, "sqlstate", None) == AGENT_ARCHIVED_SQLSTATE:
+            return True
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return False
+
+
+def archived_words(exc: BaseException | None) -> str:
+    """What the store said refusing an archived agent: its message and when and
+    by whom the agent was archived, on one line."""
+    seen = 0
+    while exc is not None and seen < 8:
+        diag = getattr(exc, "diag", None)
+        if getattr(exc, "sqlstate", None) and diag is not None and diag.message_primary:
+            words = diag.message_primary.removeprefix("agent_archived: ")
+            return words + (f" ({diag.message_detail})" if diag.message_detail else "")
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return "the agent is archived"
+
+
+class AgentArchived(Exception):
+    """The agent a project-mode scheduler serves is archived: the process ends,
+    exit 4 `agent_archived`, as the contract refuses starting its service."""
 
 
 def _row_names(cursor) -> list[str]:
@@ -1626,6 +1682,14 @@ class RunLedger:
         """The project's active definitions, one per slug."""
         return self._definition_rows("active", ())
 
+    def archived_at(self) -> str | None:
+        """When this project's agent was archived, or None while it is in use:
+        read through the row's JSON, so a store whose core predates the mark
+        answers None."""
+        row = self._execute("SELECT to_jsonb(a) ->> 'archived_at' FROM agents a WHERE a.id = %s",
+                            [self.project_id]).fetchone()
+        return row[0] if row else None
+
     def placed_nodes(self) -> list[str] | None:
         """The nodes this project's automations service is placed on, as the
         manager's placement rows in the store say (`capabilities place`,
@@ -1997,6 +2061,8 @@ class Daemon:
         self.reload_error: str | None = None
         self.pause: dict | None = None
         self.definition_problems: list[str] = []
+        # Why the store queues nothing for this project: its agent is archived.
+        self.archived: str | None = None
         self._generation = -1
         self._placement_read_at = 0.0
         # A lost store is asked for again on a doubling interval, not on every tick.
@@ -2071,7 +2137,18 @@ class Daemon:
         sys.stderr.flush()
 
     def _claim(self, slug: str, **kwargs) -> dict[str, Any] | None:
-        return self.runs.claim(slug, self.state_dir, **kwargs)
+        try:
+            return self.runs.claim(slug, self.state_dir, **kwargs)
+        except Exception as exc:
+            if not archived(exc):
+                raise
+            # Not a failure to try again: the agent is archived, so nothing is
+            # queued or started for it.
+            why = f"agent_archived: {archived_words(exc)}"
+            if self.archived is None:
+                self.log(f"{why}; registering and starting nothing for it")
+            self.archived = why
+            return None
 
     def recover(self) -> None:
         """Close what this node left starting or running. A pid is signalled
@@ -2556,8 +2633,14 @@ class Daemon:
         to the next tick, whose dedupe keys make a repeated firing harmless."""
         try:
             self.prepare()
+            if self.archived is not None:
+                # The project's own scheduler serves this agent alone: it ends,
+                # as the contract refuses starting it, and is not restarted.
+                raise AgentArchived(self.archived)
             if self.pause is None:
                 self.dispatch()
+        except AgentArchived:
+            raise
         except Exception as exc:
             if not self.runs.lost():
                 raise
@@ -2658,6 +2741,13 @@ class ProjectSlot:
         """The checks before every action for the project, asked again: that it
         still enables automations for itself and still stands where it joined."""
         refusal = self.host.check()
+        if refusal is None and self.daemon is not None and self.daemon.archived is not None:
+            # The store refused queueing a run because the agent is archived:
+            # not placed, nothing started, asked again by a read until restored.
+            if self.daemon.runs.archived_at():
+                refusal = ("refused", self.daemon.archived)
+            else:
+                self.daemon.archived = None
         if refusal != self.refusal:
             if refusal is not None:
                 self.log(f"{refusal[0]}: {refusal[1]}; registering and starting nothing "
@@ -2692,7 +2782,7 @@ class ProjectSlot:
     def can_start(self) -> bool:
         return (self.daemon is not None and self.recovered and not self.leaving
                 and self.refusal is None and self.tick_error is None
-                and self.daemon.pause is None)
+                and self.daemon.pause is None and self.daemon.archived is None)
 
     def fail(self, exc: BaseException) -> None:
         reason = _why(exc)
@@ -3281,6 +3371,16 @@ if __name__ == "__main__":
     _tag = _project_slug(Path(_root)) if _root else "unknown"
     try:
         run_from_env()
+    except AgentArchived as exc:
+        sys.stderr.write(log_line(_tag, f"stopped: {exc}"))
+        sys.stderr.write(json.dumps({"error": {
+            "code": "agent_archived",
+            "message": "the automations service ended, queueing and starting nothing: "
+                       + str(exc).removeprefix("agent_archived: "),
+            "hint": "Do not restore it yourself — ask the user; `capabilities agent restore` "
+                    "clears the mark. Reading, help, doctor and stopping a service still "
+                    "work."}}, ensure_ascii=False) + "\n")
+        raise SystemExit(4)
     except StoreUnavailable as exc:
         sys.stderr.write(log_line(_tag, f"{exc.slug}: {exc.message}"
                                   + (f"; {exc.hint}" if exc.hint else "")))

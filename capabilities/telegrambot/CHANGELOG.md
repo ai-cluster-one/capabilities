@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-10 — No job is entered for an archived agent, at telegrambot 2.2
+
+Step `0009-unarchived` (telegrambot 2.2, a minor step needing the store's core at 4.2, capabilities-contract 0.47) has the store refuse every insert of `telegrambot_jobs` for an archived agent, through the core's one guard `agents_archived_refuse`, with SQLSTATE 23R01; moving and ending a job stay allowed. `jobs register` that meets it exits 4 `agent_archived`. A release of telegrambot 2.1 keeps working against a store at 2.2 for every agent that is not archived. Declares `capabilities-contract>=0.47,<1`. No verb, flag or JSON key changes.
+
 ## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
 
 Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

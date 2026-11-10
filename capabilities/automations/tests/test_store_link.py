@@ -221,8 +221,8 @@ def test_runs_from_before_the_label_left_the_table_keep_every_other_field(runtim
     setting = _setting(schema)
     earlier = [step for step in runtime.LEDGER_STEPS
                if step[0] not in ("0008-runs-environment-retired", "0009-agent-names",
-                                  "0010-keys")]
-    assert len(earlier) == len(runtime.LEDGER_STEPS) - 3
+                                  "0010-keys", "0011-unarchived")]
+    assert len(earlier) == len(runtime.LEDGER_STEPS) - 4
     conn = db.connect(application_name=runtime.LEDGER_OWNER, setting=setting, transaction=True)
     try:
         db.migrate(conn, runtime.LEDGER_OWNER, earlier, major=1, minor=4)
@@ -329,7 +329,7 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(runtime, monke
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'SET search_path TO "{schema}"')
             assert admin.execute("SELECT major, minor FROM schema_version "
-                                 "WHERE owner = 'automations'").fetchone() == (2, 1)
+                                 "WHERE owner = 'automations'").fetchone() == (2, 2)
             assert admin.execute("SELECT to_regclass('automations_definitions')").fetchone() == (
                 None,)
             names = [r[0] for r in admin.execute(

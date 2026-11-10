@@ -8,7 +8,7 @@
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 #     "callva-harness-runner==0.12.1",
 # ]
 # ///
@@ -9204,6 +9204,11 @@ async def run_session(client):
                     register.discard(draft["id"])
                     raise RuntimeError(f"job {draft['id']} could not be started")
             except Exception as exc:
+                if jobs.archived(exc):
+                    # The agent is archived: the task is not started, and the
+                    # daemon ends as its service is refused, exit 4.
+                    stop_archived(exc)
+                    raise AgentArchived(jobs.archived_words(exc)) from exc
                 log(f"voice: task runs unrecorded — {_short_error(exc)}")
                 return None
             voice_rows[row["id"]] = {"proc_key": None}
@@ -10937,6 +10942,37 @@ async def supervise_call_recorder():
         await stop_call_recorder_process(process, "telegram daemon shutdown")
 
 
+class AgentArchived(Exception):
+    """The store started nothing for this daemon's agent: it is archived."""
+
+
+# Why the daemon ends because its agent is archived, once the store said so.
+ARCHIVED: dict = {"why": None}
+
+
+def stop_archived(exc: BaseException) -> None:
+    """The store refused to start anything for this daemon's agent because it is
+    archived: not a failure to try again. The daemon stops as a shutdown does,
+    and then exits 4 `agent_archived`, the contract's refusal of starting its
+    service, which a supervisor does not restart."""
+    if ARCHIVED["why"] is not None:
+        return
+    ARCHIVED["why"] = jobs.archived_words(exc)
+    log(f"agent_archived: {ARCHIVED['why']}; the daemon stops and starts nothing for it")
+    os.kill(os.getpid(), signal.SIGTERM)
+
+
+def archived_exit() -> None:
+    """End the process as the contract refuses an archived agent's service."""
+    sys.stderr.write(json.dumps({"error": {
+        "code": "agent_archived",
+        "message": f"the telegram daemon ended: {ARCHIVED['why']}",
+        "hint": "Do not restore it yourself — ask the user; `capabilities agent restore` "
+                "clears the mark. Reading, help, doctor and stopping a service still work."}},
+        ensure_ascii=False) + "\n")
+    sys.exit(4)
+
+
 async def main():
     """Supervise the session so neither a transient crash nor a missing login kills the
     daemon. Telegram's rolling MTProto schema can diverge from Telethon's generated
@@ -11074,3 +11110,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
+    if ARCHIVED["why"] is not None:
+        archived_exit()

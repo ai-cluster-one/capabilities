@@ -28,7 +28,7 @@ from pathlib import Path
 
 OWNER = "telegrambot"
 MAJOR = 2
-MINOR = 1
+MINOR = 2
 
 STEPS: list[tuple[str, str]] = [
     ("0001-channels", """
@@ -269,6 +269,53 @@ def resolve_store(root: Path | None):
         raise StoreUnavailable(exc.slug, exc.message, exc.hint) from exc
 
 
+# 2.2: nothing starts for an archived agent (core 4.2). The store refuses
+# entering a job of it - every insert of telegrambot_jobs - through the core's
+# one guard, `agents_archived_refuse`, with SQLSTATE 23R01 (`agent_archived`,
+# exit 4). Moving or ending a job stays allowed. A minor step: a release of 2.1
+# reads a store at 2.2 and keeps working for every agent that is not archived.
+UNARCHIVED_STEPS: list[tuple[str, str]] = [
+    ("0009-unarchived", r"""
+CREATE FUNCTION telegrambot_jobs_unarchived() RETURNS trigger
+ LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+BEGIN
+ PERFORM agents_archived_refuse(NEW.agent_id);
+ RETURN NEW;
+END $guard$;
+CREATE TRIGGER telegrambot_jobs_unarchived BEFORE INSERT ON telegrambot_jobs
+ FOR EACH ROW EXECUTE FUNCTION telegrambot_jobs_unarchived();
+COMMENT ON TRIGGER telegrambot_jobs_unarchived ON telegrambot_jobs IS
+  'Refuses entering a job of an archived agent; moving or ending one stays allowed.';
+"""),
+]
+
+
+def archived(exc: BaseException | None) -> bool:
+    """Whether `exc`, or what it was raised from, is the store refusing to start
+    anything for an archived agent (SQLSTATE 23R01): nothing is started for it,
+    which is neither a crash nor a failure to try again."""
+    sqlstate = database().AGENT_ARCHIVED_SQLSTATE
+    seen = 0
+    while exc is not None and seen < 8:
+        if getattr(exc, "sqlstate", None) == sqlstate:
+            return True
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return False
+
+
+def archived_words(exc: BaseException | None) -> str:
+    """What the store said refusing an archived agent: its message and when and
+    by whom the agent was archived, on one line."""
+    seen = 0
+    while exc is not None and seen < 8:
+        diag = getattr(exc, "diag", None)
+        if getattr(exc, "sqlstate", None) and diag is not None and diag.message_primary:
+            words = diag.message_primary.removeprefix("agent_archived: ")
+            return words + (f" ({diag.message_detail})" if diag.message_detail else "")
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return "the agent is archived"
+
+
 def steps() -> list:
     """Every step this capability migrates, the job tables included."""
     from importlib import util
@@ -281,7 +328,8 @@ def steps() -> list:
         extra = list(getattr(module, "STEPS", []))
     step = database().Step
     return (STEPS + extra + [step(sid, sql, core=(3, 0)) for sid, sql in CUTOVER_STEPS]
-            + [step(sid, sql, core=(4, 0)) for sid, sql in KEYS_STEPS])
+            + [step(sid, sql, core=(4, 0)) for sid, sql in KEYS_STEPS]
+            + [step(sid, sql, core=(4, 2)) for sid, sql in UNARCHIVED_STEPS])
 
 
 class Store:

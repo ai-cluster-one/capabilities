@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 #     "callva-harness-runner==0.12.1",
 # ]
 # ///
@@ -2576,6 +2576,18 @@ def _migrate_files_mover(action: str, mine: dict, answers: dict) -> dict[str, An
     return report
 
 
+def _archived_or_raise(runtime, exc: BaseException) -> None:
+    """A run the store refused to queue because the agent is archived is
+    refused here as the contract refuses it, exit 4 `agent_archived`; anything
+    else goes on as it was raised."""
+    if not runtime.archived(exc):
+        raise exc
+    _die(4, "agent_archived",
+         "the store queues no run for an archived agent: " + runtime.archived_words(exc),
+         "Do not restore it yourself — ask the user; `capabilities agent restore` clears "
+         "the mark. Reading, help, doctor and stopping a service still work.")
+
+
 def cmd_run(automation_id: str) -> dict[str, Any]:
     root = _root_required()
     runtime, config = _load(root)
@@ -2585,6 +2597,8 @@ def cmd_run(automation_id: str) -> dict[str, Any]:
         _die(3, "not_found", f"unknown automation {automation_id!r}", "run `automations list`")
     except runtime.ConfigError as exc:
         _die(6, "not_runnable", str(exc))
+    except Exception as exc:
+        _archived_or_raise(runtime, exc)
     return {"queued": True, "run": row, "service": service_status(root)}
 
 
@@ -2636,6 +2650,8 @@ def cmd_retry(run_id: str) -> dict[str, Any]:
         row = runtime.retry_run(root, config, _state_path(root), run_id)
     except runtime.ConfigError as exc:
         _die(6, "not_retryable", str(exc))
+    except Exception as exc:
+        _archived_or_raise(runtime, exc)
     if row is None:
         _die(3, "not_found", f"unknown run {run_id!r}")
     return {"queued": True, "run": row}

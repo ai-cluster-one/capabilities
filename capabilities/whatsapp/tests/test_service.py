@@ -282,9 +282,13 @@ class StartRefusals(unittest.TestCase):
 
     def test_inherited_enablement_does_not_start_a_service(self):
         row = {"scope": "global", "value": {"enabled": True}}
+        # The archive check (capabilities-contract 0.47) reads the project's
+        # id and store, which this project at /p has neither of; it is not
+        # what this case is about.
         with mock.patch.object(sys, "argv", ["whatsapp", "service", "start"]), \
                 mock.patch.object(wa, "_auth_gate"), \
                 mock.patch.object(wa, "_machine_gate"), \
+                mock.patch.object(wa, "_archived_gate"), \
                 mock.patch.object(wa, "read_only_switch", return_value=False), \
                 mock.patch.object(wa, "_project_root", return_value=Path("/p")), \
                 mock.patch.object(wa, "_policy_row", return_value=row), \

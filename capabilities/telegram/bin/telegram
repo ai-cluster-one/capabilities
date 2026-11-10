@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -4091,6 +4091,13 @@ def cmd_jobs_register(description: str, chat: str | None, topic_id: str | None,
             engine=engine, origin_message_id=origin_message_id, profile=profile))
     except module.JobError as exc:
         _die(6, exc.slug, exc.message, exc.hint)
+    except Exception as exc:
+        if not module.archived(exc):
+            raise
+        _die(4, "agent_archived",
+             "the store enters no job for an archived agent: " + module.archived_words(exc),
+             "Do not restore it yourself — ask the user; `capabilities agent restore` "
+             "clears the mark. Reading, help, doctor and stopping a service still work.")
     finally:
         register.store.close()
 

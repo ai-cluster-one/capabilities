@@ -8,6 +8,7 @@ binds a schema of its own. Skipped without it."""
 from __future__ import annotations
 
 import os
+import time
 import uuid
 
 import pytest
@@ -414,7 +415,7 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(monkeypatch):
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'SET search_path TO "{schema}"')
             assert admin.execute("SELECT major, minor FROM schema_version "
-                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 1)
+                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 2)
             assert admin.execute("SELECT agent_id, worker, outcome FROM agentrooms_turns"
                                  ).fetchall() == [("p", "lab", "answered")]
             names = [r[0] for r in admin.execute(
@@ -505,7 +506,7 @@ def test_a_store_at_major_2_names_every_row_and_binding_by_the_connection_id(mon
             admin.execute(f'SET search_path TO "{schema}"')
             (cid,) = admin.execute("SELECT id FROM connections WHERE label = 'work'").fetchone()
             assert admin.execute("SELECT major, minor FROM schema_version "
-                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 1)
+                                 "WHERE owner = 'agentrooms'").fetchone() == (3, 2)
             assert store.next_batch("p", cid, "@work:x") == "b1"
             assert [w["sender"] for w in store.held("p", cid)] == ["@b:x"]
             assert store.session("p", cid, "!r")["session_id"] == "s1"
@@ -541,3 +542,155 @@ def test_a_store_at_major_2_names_every_row_and_binding_by_the_connection_id(mon
     finally:
         store.execute(f"DROP SCHEMA {schema} CASCADE")
         store.close()
+
+
+# ── an archived agent ────────────────────────────────────────────────────────
+
+
+def _archive(db_, agent_id: str, on: bool = True) -> None:
+    """Stamp or clear the mark, as `capabilities agent archive|restore` does."""
+    if on:
+        db_.execute("UPDATE agents SET archived_at = now(), archived_by = 'tester@n1' "
+                    "WHERE id = %s", (agent_id,))
+    else:
+        db_.execute("UPDATE agents SET archived_at = NULL, archived_by = NULL WHERE id = %s",
+                    (agent_id,))
+
+
+def test_the_store_takes_no_lease_and_opens_no_turn_for_an_archived_agent(store):
+    """Step 0015 guards the lease and the turn of an archived agent: taking and
+    renewing a lease and opening a turn are refused with SQLSTATE 23R01, which
+    `archived` reads; releasing the lease and ending a turn already open stay
+    allowed, another agent is untouched, and a restore lets it in again."""
+    import psycopg
+    register_agents(store, "q")
+    assert store.acquire("p", ALPHA, "h1", "n1", 1) is None
+    store.start_turn("t1", "p", ALPHA, "!r", "w", None, ["@b:x"], ["mention"])
+    _archive(store, "p")
+    assert store.archived_at("p") is not None and store.archived_at("q") is None
+    with pytest.raises(psycopg.IntegrityError) as renewing:
+        store.acquire("p", ALPHA, "h1", "n1", 1)
+    assert renewing.value.sqlstate == "23R01" and engine.archived(renewing.value)
+    with pytest.raises(psycopg.IntegrityError) as opening:
+        store.start_turn("t2", "p", ALPHA, "!r", "w", None, ["@b:x"], ["mention"])
+    assert engine.archived(opening.value)
+    store.end_turn("t1", "answered")
+    store.release("p", ALPHA, "h1")
+    assert store.execute("SELECT count(*) FROM agentrooms_leases WHERE agent_id = 'p'",
+                         fetch="one") == (0,)
+    with pytest.raises(psycopg.IntegrityError):
+        store.acquire("p", ALPHA, "h1", "n1", 1)
+    assert store.acquire("q", ALPHA, "h1", "n1", 1) is None
+    store.start_turn("t3", "q", ALPHA, "!r", "w", None, ["@b:x"], ["mention"])
+    _archive(store, "p", on=False)
+    assert store.acquire("p", ALPHA, "h1", "n1", 1) is None
+    assert not engine.archived(RuntimeError("anything else"))
+
+
+class _ServedHost:
+    """What the engine asks of the executable, for two projects on one store:
+    each admitted with one agent, a homeserver that answers no sync."""
+
+    def __init__(self, setting, projects):
+        self.setting, self.projects = setting, projects
+
+    def node(self):
+        return "n1"
+
+    def tag(self):
+        return "machine"
+
+    def entries(self):
+        return {p: {"id": p, "root": "/", "slug": p} for p in self.projects}
+
+    def list_witness(self):
+        return "fixed"
+
+    def machine_settings(self):
+        return {"max_turns": 1}
+
+    def fingerprint(self):
+        return "f"
+
+    def admit(self, project_id, entry):
+        plan = {"connection": ALPHA, "homeserver": "https://matrix.invalid",
+                "user_id": "@alpha:x", "token": "t", "token_fingerprint": "tf"}
+        plan["identity"] = (plan["homeserver"], plan["user_id"], plan["token_fingerprint"])
+        return {"setting": self.setting, "agents": {ALPHA: plan}, "store_name": "test",
+                "fingerprint": "f", "skipped": {}}, None
+
+    def check(self, entry, cid):
+        return None
+
+    def matrix(self, homeserver, token, timeout=60.0):
+        class Away:
+            def call(self, *args, **kwargs):
+                raise RuntimeError("no homeserver in this test")
+
+            def close(self):
+                pass
+        return Away()
+
+
+def _until(condition, seconds=15.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.1)
+    return condition()
+
+
+def test_the_machine_service_drops_an_archived_agent_and_serves_the_others(store, tmp_path):
+    """The store refusing an archived agent's lease is read as that agent not
+    placed: its project is dropped with nothing started for it, the other
+    project keeps its lease, and once restored it is served again."""
+    register_agents(store, "q")
+    host = _ServedHost(store.setting, ["p", "q"])
+    eng = engine.Engine(host, mode="machine", state_dir=tmp_path, echo=False)
+    eng.settings = host.machine_settings()
+    try:
+        eng.step()
+        held = lambda agent: store.execute(  # noqa: E731
+            "SELECT count(*) FROM agentrooms_leases WHERE agent_id = %s AND expires_at > now()",
+            (agent,), fetch="one")[0] == 1
+        assert _until(lambda: held("p") and held("q"))
+        _archive(store, "p")
+        # The next renewal of p's lease is refused; the engine drops p.
+        eng.slots["p"].agents[ALPHA].last_renew = 0.0
+        eng.slots["p"].agents[ALPHA].stop.set()
+        eng.slots["p"].agents[ALPHA].stop.clear()
+
+        def dropped():
+            eng.step()
+            return eng.slots["p"].state == "refused"
+        assert _until(dropped, 120.0)
+        p, q = eng.slots["p"], eng.slots["q"]
+        assert p.reason.startswith("agent_archived:") and p.plan is None and not p.agents
+        assert not held("p") and held("q") and q.state == "served"
+        # Asked again by a read, it stays dropped and nothing is started.
+        p.next_admit = 0.0
+        eng.step()
+        assert p.state == "refused" and not p.agents and not held("p")
+        _archive(store, "p", on=False)
+        p.next_admit = 0.0
+        eng.step()
+        assert p.state == "served" and _until(lambda: held("p"))
+    finally:
+        eng.shutdown()
+
+
+def test_a_project_service_for_an_archived_agent_ends_as_agent_archived(store, tmp_path):
+    """A project's own service serves its agent alone: archived, it starts
+    nothing and ends with AgentArchived, which the executable reports as exit 4
+    `agent_archived`, the contract's policy refusal a supervisor does not
+    restart."""
+    _archive(store, "p")
+    host = _ServedHost(store.setting, ["p"])
+    host.entries = lambda: {"p": {"id": "p", "root": "/", "slug": "p"}}
+    eng = engine.Engine(host, mode="project", state_dir=tmp_path, echo=False)
+    with pytest.raises(engine.AgentArchived) as ended:
+        eng.run()
+    assert "is archived" in str(ended.value)
+    assert store.execute("SELECT count(*) FROM agentrooms_leases WHERE agent_id = 'p'",
+                         fetch="one") == (0,)

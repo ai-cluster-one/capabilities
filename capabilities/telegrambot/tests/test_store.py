@@ -123,7 +123,7 @@ def test_a_store_at_major_1_takes_connection_ids_in_place_and_keeps_its_rows(mon
     setting = _setting(schema)
     old = [step for step in s.steps()
            if (step.id if hasattr(step, "id") else step[0])
-           not in ("0007-connection-ids", "0008-keys")]
+           not in ("0007-connection-ids", "0008-keys", "0009-unarchived")]
     conn = db.connect(application_name="telegrambot", setting=setting)
     try:
         # The store as the release before the cutover left it: the core at 2.0.
@@ -162,7 +162,7 @@ def test_a_store_at_major_1_takes_connection_ids_in_place_and_keeps_its_rows(mon
     store = s.Store(setting).open()
     try:
         assert store.execute("SELECT major, minor FROM schema_version WHERE owner = %s",
-                             (s.OWNER,), fetch="one") == {"major": 2, "minor": 1}
+                             (s.OWNER,), fetch="one") == {"major": 2, "minor": 2}
         helper = store.execute("SELECT id FROM core_premig_connection_names "
                                "WHERE name = 'helper'", fetch="one")["id"]
         jobs = load_service("jobs")

@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-11-10 — No run is queued for an archived agent, at automations 2.2
+
+Step `0011-unarchived` (automations 2.2, a minor step needing the store's core at 4.2, capabilities-contract 0.47) has the store refuse every insert of `automations_runs` for an archived agent - a scheduled firing, a manual run, a retry - through the core's one guard `agents_archived_refuse`, with SQLSTATE 23R01; moving and ending a run stay allowed, and a run queued before the archive stays as it was. The scheduler reads that refusal as the agent not placed, never as a crash or a failure to try again: the machine service registers and starts nothing for that project, reports it `refused` with `agent_archived`, keeps serving the others, and asks again only by reading the mark, serving it once it is restored; a project's own scheduler ends with exit 4 `agent_archived`, which a supervisor does not restart; `run` and `retry` that meet it exit 4 `agent_archived`. A release of automations 2.1 keeps working against a store at 2.2 for every agent that is not archived. Declares `capabilities-contract>=0.47,<1`. No verb, flag or JSON key changes.
+
 ## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
 
 Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

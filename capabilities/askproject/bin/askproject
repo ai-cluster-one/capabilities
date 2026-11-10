@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.12.1",
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 # ]
 # ///
 """
@@ -451,7 +451,7 @@ class PeerTimeout(Exception):
 # node; so the folder stays the target even where it is an agent's.
 from capabilities_contract.db import Step  # noqa: E402  (bound with the tiers above)
 
-SESSIONS_MAJOR, SESSIONS_MINOR = 3, 1
+SESSIONS_MAJOR, SESSIONS_MINOR = 3, 2
 # The store's foreign keys (core 4.0): every agent and node column of this
 # owner keyed by what its parent takes with it - owned rows go with it, a
 # record keeps itself and loses the pointer - and its guards admitting the
@@ -544,6 +544,25 @@ SESSIONS_STEPS = [
         'The agent whose folder target_path is on that node (agent_nodes), written with every row; null for a target that is no agent''s folder'""",
          core=(2, 0), major=3),
     Step("0004-keys", _M9_KEYS_SQL, core=(4, 0)),
+    # 3.2: nothing is recorded for an archived agent (core 4.2). The store
+    # refuses writing a session - every insert, so the upsert that updates one
+    # too - whose calling agent or target agent is archived, through the core's
+    # one guard, `agents_archived_refuse`, with SQLSTATE 23R01. A minor step: a
+    # release of 3.1 reads a store at 3.2 and keeps working for every agent
+    # that is not archived.
+    Step("0005-unarchived", """
+    CREATE FUNCTION askproject_sessions_unarchived() RETURNS trigger
+     LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+    BEGIN
+     PERFORM agents_archived_refuse(NEW.agent_id);
+     PERFORM agents_archived_refuse(NEW.target_agent_id);
+     RETURN NEW;
+    END $guard$;
+    CREATE TRIGGER askproject_sessions_unarchived BEFORE INSERT ON askproject_sessions
+     FOR EACH ROW EXECUTE FUNCTION askproject_sessions_unarchived();
+    COMMENT ON TRIGGER askproject_sessions_unarchived ON askproject_sessions IS
+        'Refuses recording a session whose calling or target agent is archived.'""",
+         core=(4, 2)),
 ]
 
 
@@ -1741,6 +1760,14 @@ def run(args):
     sys.exit(0 if ok else 1)
 
 
+# The SQLSTATE the store's guard raises for an archived agent
+# (capabilities_contract.db.AGENT_ARCHIVED_SQLSTATE).
+try:
+    from capabilities_contract.db import AGENT_ARCHIVED_SQLSTATE as _AGENT_ARCHIVED
+except ImportError:  # the header pins it; a missing library fails where the store opens
+    _AGENT_ARCHIVED = None
+
+
 def _record_session(sessions: "SessionMap", key: str, entry: dict, *,
                     interaction: bool) -> None:
     """Record the session a peer ran. The peer has already worked in the
@@ -1749,6 +1776,11 @@ def _record_session(sessions: "SessionMap", key: str, entry: dict, *,
         sessions.put(key, entry, interaction=interaction)
     except Exception as exc:  # the answer outranks the record of it
         slug = getattr(exc, "slug", type(exc).__name__)
+        if getattr(exc, "sqlstate", None) == _AGENT_ARCHIVED:
+            # Not a store failure: the caller or the target agent is archived,
+            # and the store records nothing for it.
+            slug = "agent_archived"
+            exc = exc.diag.message_primary.removeprefix("agent_archived: ")
         sys.stderr.write(f"askproject: the session was not recorded ({slug}: {exc}); "
                          "-c cannot resume it\n")
 

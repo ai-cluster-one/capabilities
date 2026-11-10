@@ -24,11 +24,11 @@
       ],
       "icon": true,
       "path": "capabilities/agentrooms",
-      "payload_sha256": "89cc3a07fbb2c9922da19592e65174e928536f4cf5c8a526100b4cca74ed8e6d",
+      "payload_sha256": "d0976f6441a49dd866b7b35bbd7f683066c88039cdb8701c31e0105955e5827d",
       "store_major": 4,
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room.",
       "tier": "standard",
-      "version": "2026-11-09 — Turns run on callva-harness-runner 0.12.1"
+      "version": "2026-11-10 — Nothing starts for an archived agent, at agentrooms 3.2"
     },
     "agenttemplates": {
       "executable": [
@@ -107,11 +107,11 @@
       ],
       "icon": true,
       "path": "capabilities/askproject",
-      "payload_sha256": "3603676711ad19f3fb3d4fe60d07c8fdcecbef3b2d4d381a1c8c51e8a9509359",
+      "payload_sha256": "394dec8cd11e23fa0194e14d1d72d686c3852d649d96ddd632eb1e67d58207fe",
       "store_major": 4,
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability.",
       "tier": "core",
-      "version": "2026-11-09 — Turns run on callva-harness-runner 0.12.1"
+      "version": "2026-11-10 — No session is recorded for an archived agent, at askproject 3.2"
     },
     "assets": {
       "executable": [
@@ -158,11 +158,11 @@
       ],
       "icon": true,
       "path": "capabilities/automations",
-      "payload_sha256": "7e1d733b1cb834789dc6a52a0294eb516e04cd97ff0b3bf7b4a504a2a953ba2a",
+      "payload_sha256": "90a8019a23ac6f11d3fc7ae6f1bd10c5ea11e173d7554e21a9a49efb91a10a7a",
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
       "tier": "core",
-      "version": "2026-11-09 — Turns run on callva-harness-runner 0.12.1"
+      "version": "2026-11-10 — No run is queued for an archived agent, at automations 2.2"
     },
     "calcomc": {
       "executable": [
@@ -924,11 +924,11 @@
       ],
       "icon": true,
       "path": "capabilities/tasks",
-      "payload_sha256": "77c46642a94c8ce3e01ecf3e3601ad0b215903f7842bcb0a16f35faebe46c28b",
+      "payload_sha256": "449c86ab9a9cb899ec7b56600484117a6203060f9b384bdba7769101dc6c939e",
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
       "tier": "core",
-      "version": "2026-11-09 — Turns run on callva-harness-runner 0.12.1"
+      "version": "2026-11-10 — No raise for an archived agent, at tasks 2.2"
     },
     "teams": {
       "executable": [
@@ -1019,11 +1019,11 @@
       ],
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "5f46e1cec374d40b0de726235440a1851f5f265339658b4d9cdd74f3bb39a66c",
+      "payload_sha256": "d9551acf6ac2a0108d57e1cdfb9f1988e480a91b59ab7b08a04eeda5a85d08b7",
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
       "tier": "standard",
-      "version": "2026-11-09 — Turns run on callva-harness-runner 0.12.1"
+      "version": "2026-11-10 — No job is entered for an archived agent, at telegram 3.2"
     },
     "telegrambot": {
       "executable": [
@@ -1069,11 +1069,11 @@
       ],
       "icon": false,
       "path": "capabilities/telegrambot",
-      "payload_sha256": "cada0809aab904d07e64913cf55d1e26fa5dfa52823bd76727cefba1dd1be1e8",
+      "payload_sha256": "6651fe6cc4ffed2a6e26090ea172c1ca47fbcc1acfc36d4ce98c1c1dbf13060b",
       "store_major": 4,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation.",
       "tier": "standard",
-      "version": "2026-11-09 — Turns run on callva-harness-runner 0.12.1"
+      "version": "2026-11-10 — No job is entered for an archived agent, at telegrambot 2.2"
     },
     "vapic": {
       "executable": [
@@ -1140,11 +1140,11 @@
       ],
       "icon": true,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "989b67767f38e2a7eb5667220a250d87ae214651e2db5cf08eb544b6f481e804",
+      "payload_sha256": "6644ec48d1f1a21d518a5a48fa0566d62f1d53a426ca34143469cdd725c1ea73",
       "store_major": 4,
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON.",
       "tier": "standard",
-      "version": "2026-11-09 — Turns run on callva-harness-runner 0.12.1"
+      "version": "2026-11-10 — No job is entered for an archived agent, at whatsapp 2.4"
     },
     "windmill": {
       "executable": [
@@ -1188,6 +1188,6 @@
       "version": "2026-10-31 — `youtrack` reads a connection's token from the agent's vault as well"
     }
   },
-  "contract_library": "0.46.0",
+  "contract_library": "0.47.0",
   "store_major": 4
 }

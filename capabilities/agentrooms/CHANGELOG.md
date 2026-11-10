@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-11-10 — Nothing starts for an archived agent, at agentrooms 3.2
+
+Step `0015-unarchived` (agentrooms 3.2, a minor step needing the store's core at 4.2, capabilities-contract 0.47) has the store refuse, through the core's one guard `agents_archived_refuse`, every insert of `agentrooms_leases` for an archived agent - taking a lease and the upsert that renews one - and every insert of `agentrooms_turns`, with SQLSTATE 23R01; releasing a lease and ending a turn stay allowed. The service reads that refusal as the agent not placed, never as a failure to try again: the machine service drops that project - its agents stopped, their leases released, its claimed wakes handed back, nothing started - and keeps serving the others, and asks again only by reading the mark, every 30 seconds, serving it again once it is restored; a project's own service ends with exit 4 `agent_archived`, the contract's policy refusal a supervisor does not restart, and an archived agent found at admission is not served at all. A release of agentrooms 3.1 keeps working against a store at 3.2 for every agent that is not archived. Declares `capabilities-contract>=0.47,<1`. No verb, flag or JSON key changes.
+
 ## 2026-11-09 — Turns run on callva-harness-runner 0.12.1
 
 Turns run on callva-harness-runner 0.12.1, in place of 0.12.0: claude runs through claude-agent-sdk 0.2.179, which bundles Claude Code 2.1.319, and the runner's tested claude range reaches 2.1.319, so a turn on an installed claude from 2.1.317 to 2.1.319 no longer carries the out-of-range warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

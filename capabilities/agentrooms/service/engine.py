@@ -52,11 +52,11 @@ from pathlib import Path
 from string import Template
 from typing import Any, Callable
 
-from capabilities_contract.db import Step
+from capabilities_contract.db import AGENT_ARCHIVED_SQLSTATE, Step
 
 LEDGER_OWNER = "agentrooms"
 LEDGER_MAJOR = 3
-LEDGER_MINOR = 1
+LEDGER_MINOR = 2
 # The store's foreign keys (core 4.0): every agent and node column of this
 # owner keyed by what its parent takes with it - owned rows go with it, a
 # record keeps itself and loses the pointer - and its guards admitting the
@@ -525,6 +525,34 @@ LEDGER_STEPS = [
         (agent_id, (coalesce(connection_id, file_connection)), room_id, started_at);
     """, core=(3, 0)),
     Step("0014-keys", _M9_KEYS_SQL, core=(4, 0)),
+    # 3.2: nothing starts for an archived agent (core 4.2). The store refuses
+    # taking or renewing its lease - every insert, so the upsert that renews
+    # one too - and opening a turn of it, through the core's one guard,
+    # `agents_archived_refuse`, with SQLSTATE 23R01. Releasing a lease and
+    # ending a turn stay allowed. A minor step: a release of 3.1 reads a store
+    # at 3.2 and keeps working for every agent that is not archived.
+    Step("0015-unarchived", r"""
+    CREATE FUNCTION agentrooms_leases_unarchived() RETURNS trigger
+     LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+    BEGIN
+     PERFORM agents_archived_refuse(NEW.agent_id);
+     RETURN NEW;
+    END $guard$;
+    CREATE TRIGGER agentrooms_leases_unarchived BEFORE INSERT ON agentrooms_leases
+     FOR EACH ROW EXECUTE FUNCTION agentrooms_leases_unarchived();
+    CREATE FUNCTION agentrooms_turns_unarchived() RETURNS trigger
+     LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+    BEGIN
+     PERFORM agents_archived_refuse(NEW.agent_id);
+     RETURN NEW;
+    END $guard$;
+    CREATE TRIGGER agentrooms_turns_unarchived BEFORE INSERT ON agentrooms_turns
+     FOR EACH ROW EXECUTE FUNCTION agentrooms_turns_unarchived();
+    COMMENT ON TRIGGER agentrooms_leases_unarchived ON agentrooms_leases IS
+        'Refuses taking or renewing the lease of an archived agent; releasing stays allowed.';
+    COMMENT ON TRIGGER agentrooms_turns_unarchived ON agentrooms_turns IS
+        'Refuses opening a turn of an archived agent; ending one stays allowed.';
+    """, core=(4, 2)),
 ]
 # The channel a change to an agent's held wakes is announced on: its version
 # for the agent's held_scope in the store's change versions, which `watch`
@@ -935,6 +963,37 @@ def verdict(ran: dict) -> dict:
     return {"verdict": "hold", "said": said, "why": ran["why"]}
 
 
+def archived(exc: BaseException | None) -> bool:
+    """Whether `exc`, or what it was raised from, is the store refusing to start
+    anything for an archived agent (SQLSTATE 23R01): that agent is not served
+    and nothing is started for it, which is neither a crash nor a failure to
+    try again."""
+    seen = 0
+    while exc is not None and seen < 8:
+        if getattr(exc, "sqlstate", None) == AGENT_ARCHIVED_SQLSTATE:
+            return True
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return False
+
+
+def archived_words(exc: BaseException | None) -> str:
+    """What the store said refusing an archived agent: its message and when and
+    by whom the agent was archived, on one line."""
+    seen = 0
+    while exc is not None and seen < 8:
+        diag = getattr(exc, "diag", None)
+        if getattr(exc, "sqlstate", None) and diag is not None and diag.message_primary:
+            words = diag.message_primary.removeprefix("agent_archived: ")
+            return words + (f" ({diag.message_detail})" if diag.message_detail else "")
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return "the agent is archived"
+
+
+class AgentArchived(Exception):
+    """The agent a project-mode service serves is archived: the process ends,
+    exit 4 `agent_archived`, as the contract refuses starting its service."""
+
+
 class StoreUnavailable(Exception):
     """The store cannot be used: none configured, unreadable, unreachable, or it
     refuses the migration. `slug` is the shared library's word for the cause."""
@@ -1056,6 +1115,14 @@ class Store:
         store's own connection."""
         with self._operation() as conn:
             return follower.poll(conn)
+
+    def archived_at(self, project: str) -> str | None:
+        """When the agent was archived, or None while it is in use: read
+        through the row's JSON, so a store whose core predates the mark answers
+        None."""
+        row = self.execute("SELECT to_jsonb(a) ->> 'archived_at' FROM agents a WHERE a.id = %s",
+                           (project,), fetch="one")
+        return row[0] if row else None
 
     # -- leases ---------------------------------------------------------------
 
@@ -2030,6 +2097,13 @@ class Agent:
                 self.stop.wait(min(backoff, 60.0))
                 backoff *= 2
             except Exception as exc:  # one agent's failure is that agent's alone
+                if archived(exc):
+                    # Not a failure to try again: the store starts nothing for
+                    # an archived agent, so its project is dropped.
+                    self.state = "archived"
+                    self.reason = f"agent_archived: {archived_words(exc)}"
+                    self.slot.mark_archived(exc)
+                    break
                 code = getattr(exc, "code", type(exc).__name__)
                 self.state, self.reason = "error", f"{code}: {exc}"
                 self.log(f"sync failed: {code}: {exc}")
@@ -2172,6 +2246,9 @@ class Slot:
         self.next_admit = 0.0
         self.last_pause_check = 0.0
         self.turns = 0
+        # Set, from any thread, when the store refused something because the
+        # agent is archived; the engine's next step drops the project.
+        self.archived: str | None = None
 
     def log(self, message: str) -> None:
         self.engine.log(self.slug, message)
@@ -2200,6 +2277,13 @@ class Slot:
             self.next_admit = time.monotonic() + ADMIT_SECONDS
             return
         self.store = store
+        # An archived agent is not served: nothing is started for it, and it
+        # is asked again, by a read, until it is restored.
+        stamped = store.archived_at(self.project_id)
+        if stamped:
+            self.not_served_archived(f"agent {self.project_id} is archived (since {stamped})")
+            return
+        self.archived = None
         self.adopt(plan)
         self.state, self.reason = "served", None
         self.log(f"served: {len(self.agents)} agent(s) on {plan['store_name']}")
@@ -2258,6 +2342,26 @@ class Slot:
         if self.state in ("served", "paused"):
             self.state = "paused" if pause else "served"
             self.reason = (pause or {}).get("reason") if pause else None
+
+    def mark_archived(self, exc: BaseException) -> None:
+        """The store refused something for this project's agent because it is
+        archived; safe from any thread."""
+        if self.archived is None:
+            self.archived = archived_words(exc)
+        self.engine.poke()
+
+    def not_served_archived(self, why: str) -> None:
+        """Drop the project as not placed: stop its agents, release their
+        leases, start nothing for it, and ask again by a read in a while."""
+        if self.agents:
+            self.release("the agent is archived; its agents are stopped")
+        self.plan = None
+        reason = f"agent_archived: {why.removeprefix('agent_archived: ')}"
+        if (self.state, self.reason) != ("refused", reason):
+            self.log(f"not served: {reason}; nothing is started for it")
+        self.state, self.reason = "refused", reason
+        self.archived = reason
+        self.next_admit = time.monotonic() + CHECK_SECONDS
 
     def release(self, said: str) -> None:
         for agent in self.agents.values():
@@ -2318,6 +2422,8 @@ class Engine:
         self.holds: dict[tuple, float] = {}
         self._refusal: dict | None = None
         self._default: dict | None = None
+        # In project mode, why the process ends because its agent is archived.
+        self.archived: str | None = None
 
     # -- small parts ----------------------------------------------------------
 
@@ -2404,6 +2510,8 @@ class Engine:
             with contextlib.suppress(OSError):
                 (self.state_dir / PID_FILE).unlink()
             handle.close()
+        if self.archived:
+            raise AgentArchived(self.archived)
 
     def step(self) -> None:
         if self.reload_requested.is_set():
@@ -2411,6 +2519,8 @@ class Engine:
             self.reload()
         self.take_list()
         for slot in list(self.slots.values()):
+            if slot.archived and slot.plan is not None:
+                slot.not_served_archived(slot.archived)
             if slot.plan is None and time.monotonic() >= slot.next_admit:
                 try:
                     slot.admit()
@@ -2418,6 +2528,12 @@ class Engine:
                     slot.state, slot.reason = "error", f"{type(exc).__name__}: {exc}"
                     slot.log(f"not served: {slot.reason}")
                     slot.next_admit = time.monotonic() + ADMIT_SECONDS
+            if slot.archived and self.mode == "project":
+                # The project's own service serves this agent alone: it ends,
+                # as the contract refuses starting it, and is not restarted.
+                self.archived = slot.archived
+                self.stopping.set()
+                return
             slot.check_pause()
         self.reap()
         self.schedule()
@@ -2558,6 +2674,16 @@ class Engine:
                 return
             self.serve(turn, agent_plan, wakes)
         except Exception as exc:
+            if archived(exc):
+                # The store opened no turn: the agent is archived. Its wakes are
+                # handed back and its project is dropped.
+                slot.log(f"{cid}: turn in {room_id} not started: agent_archived: "
+                         f"{archived_words(exc)}")
+                with contextlib.suppress(Exception):
+                    store.restore(slot.project_id, cid, room_id, turn.id)
+                finished = True
+                slot.mark_archived(exc)
+                return
             slot.log(f"{cid}: turn in {room_id} failed: {type(exc).__name__}: {exc}")
         finally:
             if not finished:

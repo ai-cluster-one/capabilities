@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -1214,7 +1214,9 @@ PROJECT VERBS (run inside a consuming project)
         null until the agent is registered, else {id, slug, kind (agent or
         system, see init --system), name, description, icon_sha, icon_bytes, onboarding_status, onboarding_routine,
         body_root, collaboration_mode, migrating_since, migrated_at,
-        created_at, updated_at}: body_root is the folder holding the body of
+        created_at, updated_at}, and archived_at and archived_by beside it
+        (null unless the agent is archived, see agent archive): body_root is
+        the folder holding the body of
         an agent without a .contextkit/config.toml binding (null: the
         project root),
         collaboration_mode ask or direct (null: ask). --icon-out
@@ -1229,17 +1231,66 @@ PROJECT VERBS (run inside a consuming project)
         a .contextkit/config.toml binding (ask: the Collaboration Mode text).
         Answers {ok, project, agent_id, created, changed, agent, store};
         writing the values a row already holds changes nothing.
-  agent list
-        Every agent the store holds - the project's store inside a project,
-        else the one this machine resolves - each as `agent show` answers it
-        with its nodes as `node list` answers them, the folder it lives in on
-        each node among them: {ok, agents [{id, slug, name, ..., nodes
-        [{node, kind, ..., folder}]}], store}. Needs no project.
+  agent list [--archived]
+        Every agent the store holds that is not archived - the project's
+        store inside a project, else the one this machine resolves - each as
+        `agent show` answers it with its nodes as `node list` answers them,
+        the folder it lives in on each node among them: {ok, agents [{id,
+        slug, name, ..., nodes [{node, kind, ..., folder}]}], store}.
+        --archived lists the archived agents instead, each {id, name, slug,
+        has_icon, archived_at, archived_by, folder}, folder being the one it
+        lives in on this machine and is still bound to, else null. Needs no
+        project.
+  agent archive <id|slug> [--check]
+        Mark an agent the store holds archived once nothing of it runs. It
+        stops nothing itself. What keeps it from being archived is read from
+        the store alone, so no folder of the agent is needed here: a server
+        node only it lives on and that is not disabled (a Mac or a shared
+        server never counts as a node); a service placed for it (`place`) or
+        holding a live lease in service_leases, deployment_service_leases or
+        agentrooms_leases; and work in flight - a running tasks raise with a
+        live lease, an automations run starting or running, an agentrooms
+        turn with no outcome, a telegram, telegrambot or whatsapp job running
+        with a live lease. Work with no lease to vouch for it counts only
+        within a day of its start, so a row whose holder went away never
+        holds an agent; a queued run or job stays as it is. --check writes
+        nothing, migrates nothing and exits 0 either way: {agent {id, name,
+        slug, kind, archived_at, archived_by}, can_archive, blocking [row],
+        checked_at}, each row {kind: node, node N, state: in_service, stop
+        {argv}, remove {argv}}, {kind: service, capability, node N, mode
+        (own | shared | null), placed, lease_expires_at, instance {state,
+        ready, checked_at} | null, state (running | placed | not_reporting |
+        lease_ending), stop {argv}} or {kind: work, capability (tasks |
+        automations | agentrooms | telegram | telegrambot | whatsapp), id,
+        node N | null, state (the tool's open state), started_at, stop:
+        null}, N being {id, label, kind, sole_agent, last_seen_at}; argv
+        name ids (`node disable <node id>`, `node remove <node id>`, `service
+        stop <name> --agent <agent id> --node <node id>`). A service_instances
+        row only says how a service row stands (running: checked within three
+        reconciles in a running state; not_reporting: checked longer ago) and
+        never makes one. Without --check the check and the mark are one
+        transaction under a lock on the agent's row, which every store guard
+        waits on: {archived, archived_at, archived_by (user@node), changed};
+        run again it changes nothing. Exit 6 agent_live while anything
+        blocks, the error's detail being the --check answer; exit 4
+        system_agent for a system agent; 6 agent_unknown; 4 under the
+        read-only switch. While archived, the store refuses to place a
+        service, take a lease or record a running service for it, and to
+        start its work (the owners' guards, exit 4 agent_archived in a
+        capability), and `agent materialize`, `place`, `service start|move`
+        and `node add` exit 4 agent_archived; reading, stopping and
+        unplacing stay open.
+  agent restore <id|slug>
+        Clear an agent's archived mark, and nothing else: no service is
+        placed or started, no node enabled and nothing queued changed:
+        {restored, changed}; run again it changes nothing. Exit 6
+        agent_unknown; 4 under the read-only switch.
   agent state <id|slug>
         One read of an agent the store holds across its nodes, writing
         nothing (allowed under the read-only switch; needs no project):
-        {ok, agent_id, agent, this_node, liveness {by, folder,
-        live_within_seconds, reason}, nodes [{...node list's fields...,
+        {ok, agent_id, agent, archived_at, archived_by, this_node, liveness
+        {by, folder, live_within_seconds, reason}, nodes [{...node list's
+        fields...,
         address, address_source (node | coolify | null), address_error?,
         seen_seconds_ago, live, gate {<capability>: {effective, source
         (project | global | machine | default), node}}, placed [capability],
@@ -2016,7 +2067,10 @@ PROJECT VERBS (run inside a consuming project)
         service gets each environment default the compiled service carries -
         its descriptor's optional defaults, then the project runtime's
         environment_defaults for it - where the supervisor's environment sets
-        none. Exit 6 agent_mismatch where the folder is bound to another agent
+        none. Where the store refuses a lease or the row of an archived agent
+        (agent archive), the service is not placed here: it is stopped, its
+        lease given up and its row dropped, and nothing is retried as a
+        failure. Exit 6 agent_mismatch where the folder is bound to another agent
         than --agent, 3 no_service; 4 under the read-only switch.
   node supervise --probe
         Answer {supervises: true} and start nothing: how the runner of an
@@ -2053,7 +2107,7 @@ PROJECT VERBS (run inside a consuming project)
         is under $XDG_STATE_HOME/capabilities/node/machine/.
   service start <name> [--node <node>] [--wait S]
   service move <name> --node <node> [--wait S]
-  service stop <name> [--node <node> | --all] [--wait S]
+  service stop <name> [--node <node> | --all] [--agent <id|slug>] [--wait S]
   service restart <name> [--node <node>] [--wait S]
   service status [<name>] [--agent <id|slug>]
         One set of handles for every capability's service, in a store-mode
@@ -2075,7 +2129,13 @@ PROJECT VERBS (run inside a consuming project)
         other node's row to go. stop unplaces it from the node, or with
         --all from every node it is placed or running on, and waits until
         those nodes hold no row: {stopped, nodes, changed, placed_on,
-        waited_seconds}, else exit 6 service_still_running. restart asks the
+        waited_seconds}, else exit 6 service_still_running. stop --agent
+        stops another agent's service, or this one's, from the store alone,
+        needing no folder of it here and no install of the capability: from
+        the node --node names, else every node it is placed on or running on,
+        answering {stopped, agent_id, nodes, changed, placed_on,
+        waited_seconds} (exit 6 agent_unknown; 4 system_agent for a system
+        agent). restart asks the
         node's manager through the store to restart its program and waits
         for the row's started_at to move: {restarted, node, state, ready,
         instance, waited_seconds}; exit 6 service_not_running where the node
@@ -2854,7 +2914,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.46.0"
+CONTRACT_LIBRARY_RELEASE = "0.47.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -2994,7 +3054,8 @@ def _store_module():
 # The verbs that write a project record — policy, configuration, the project's
 # identity and its wiring — and the machine ceiling. Under the read-only switch the manager refuses them;
 # whether the switch is on is the store tier's answer, never the manager's own.
-READ_ONLY_REFUSED_VERBS = ("agent convert", "agent set", "allow", "connections import",
+READ_ONLY_REFUSED_VERBS = ("agent archive", "agent convert", "agent restore",
+                           "agent set", "allow", "connections import",
                            "disable", "enable", "inherit", "init", "key change",
                            "key generate", "key set", "node add", "node remove",
                            "node set", "place", "quarantine", "references export",
@@ -12149,10 +12210,25 @@ def _kernel_options(args: list[str], valued: set[str], flags: set[str],
 def cmd_agent(args: list[str]) -> None:
     sub = args[0] if args else None
     if sub == "list":
-        pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "agent list")
+        pos, opts = _kernel_options(args[1:], set(), {"--json", "--archived"}, "agent list")
         if pos:
             _die(6, "input", "agent list takes no positional argument")
-        _emit(_agent_list())
+        _emit(_agent_list("--archived" in opts))
+        return
+    if sub in ("archive", "restore"):
+        flags = {"--json", "--check"} if sub == "archive" else {"--json"}
+        pos, opts = _kernel_options(args[1:], set(), flags, f"agent {sub}")
+        if len(pos) != 1 or not pos[0].strip():
+            _die(6, "input", f"agent {sub} needs one agent (its id or slug)",
+                 f"capabilities agent {sub} <id|slug>"
+                 + (" [--check]" if sub == "archive" else ""))
+        if sub == "restore":
+            _read_only_gate("agent restore")
+            _emit(_agent_restore(pos[0].strip()))
+            return
+        if "--check" not in opts:
+            _read_only_gate("agent archive")
+        _emit(_agent_archive(pos[0].strip(), "--check" in opts))
         return
     if sub == "state":
         pos, _opts = _kernel_options(args[1:], set(), {"--json"}, "agent state")
@@ -12179,16 +12255,17 @@ def cmd_agent(args: list[str]) -> None:
 
         def show(conn, agent_id):
             agent = _agent_row(conn, agent_id)
+            mark = _agent_archived_mark(conn, agent_id)
             icon = None
             if "--icon-out" in opts:
                 found = conn.execute("SELECT icon FROM agents WHERE id = %s",
                                      (agent_id,)).fetchone()
                 icon = bytes(found[0]) if found and found[0] is not None else None
-            return agent_id, agent, icon
+            return agent_id, agent, icon, mark
 
-        (agent_id, agent, icon), setting = _kernel_run(root, show)
+        (agent_id, agent, icon, mark), setting = _kernel_run(root, show)
         answer = {"ok": True, "project": str(root), "agent_id": agent_id,
-                  "registered": agent is not None, "agent": agent,
+                  "registered": agent is not None, "agent": agent, **mark,
                   "store": _kernel_store_report(setting)}
         if "--icon-out" in opts:
             if icon is None:
@@ -12262,21 +12339,33 @@ def cmd_agent(args: list[str]) -> None:
         _emit(_agent_rekey(root, pos[0].strip() if pos else None, "--dry-run" in opts))
     else:
         _die(6, "input", "agent needs a subcommand: show, set, convert, list, state, "
-             "materialize or rekey",
+             "materialize, rekey, archive or restore",
              "run `capabilities help`")
 
 
-def _agent_list() -> dict:
-    """Every agent the store holds - the project's store inside one, else the
-    machine's - with its nodes and the folder it lives in on each."""
+def _agent_list(archived: bool = False) -> dict:
+    """Every agent the store holds that is not archived - the project's store
+    inside one, else the machine's - with its nodes and the folder it lives in
+    on each. With `archived`, the archived ones instead, each as the Archived
+    list reads it: its id, name, slug, whether it has an icon, when and by
+    whom it was archived and its folder on this machine, if any."""
     conn, setting = _kernel_open(_project_root())
     import psycopg
     try:
         ids = [row[0] for row in conn.execute(
-            "SELECT id FROM agents ORDER BY slug NULLS LAST, name NULLS LAST, id")]
+            "SELECT id FROM agents a WHERE (to_jsonb(a) ->> 'archived_at' IS NOT NULL) = %s "
+            "ORDER BY slug NULLS LAST, name NULLS LAST, id", (archived,))]
         agents = []
+        here = _node_id_or(None) if archived else None
         for agent_id in ids:
             agent = _agent_row(conn, agent_id)
+            if archived:
+                folder = _agent_folder_here(agent_id, _node_rows(conn, agent_id), here)
+                agents.append({"id": agent_id, "name": agent["name"], "slug": agent["slug"],
+                               "has_icon": bool(agent["icon_bytes"]),
+                               **_agent_archived_mark(conn, agent_id),
+                               "folder": str(folder) if folder else None})
+                continue
             agent["nodes"] = _node_rows(conn, agent_id)
             agents.append(agent)
     except psycopg.Error as exc:
@@ -12309,6 +12398,7 @@ def _agent_state(ref: str) -> dict:
                  "run `capabilities agent list` to see the agents it holds")
         agent_id = found[0][0]
         agent = _agent_row(conn, agent_id)
+        mark = _agent_archived_mark(conn, agent_id)
         nodes = _node_rows(conn, agent_id)
         ago = dict(conn.execute(
             "SELECT l.node, round(extract(epoch FROM now() - n.last_seen_at))::int "
@@ -12386,7 +12476,7 @@ def _agent_state(ref: str) -> dict:
                                 and rows.get(name, (False, False))[1]),
             "holders": sorted(lease["node"] for lease in lease_rows
                               if lease["capability"] == name)})
-    return {"ok": True, "agent_id": agent_id, "agent": agent, "this_node": here,
+    return {"ok": True, "agent_id": agent_id, "agent": agent, **mark, "this_node": here,
             "liveness": {k: v for k, v in liveness.items() if k != "nodes"},
             "nodes": out_nodes, "services": services,
             "store": _kernel_store_report(setting)}
@@ -12474,6 +12564,391 @@ def _folder_agent_id(folder: Path) -> str | None:
     return _project_id_state(folder, move=False)["id"]
 
 
+# ---------------------------------------------------------------- archiving an agent
+#
+# Archive checks that nothing of the agent runs and marks it (agents.archived_at,
+# archived_by, core 4.2); it stops nothing itself. What blocks it is read from the
+# store alone, so it needs no folder of the agent here: a server node only this
+# agent lives on, still in service; a service placed or holding a live lease; and
+# work in flight. The check and the mark are one transaction under a row lock on
+# the agent, which conflicts with the FOR SHARE every store guard
+# (agents_archived_refuse) takes, so nothing can start between them. Restore clears
+# the mark and starts nothing.
+
+# A service instance row is fresh while it was checked within this many seconds:
+# three reconciles at the default cadence, as a node counts as live.
+ARCHIVE_INSTANCE_FRESH_SECONDS = LIVE_RECONCILES * 60
+# An instance state in which the service's process runs on its node; a row in
+# any other state that names the process's pid (unusable, when its doctor says
+# it cannot work) says so too.
+ARCHIVE_RUNNING_STATES = ("starting", "ready", "degraded", "failing", "stopping")
+# Work with no live lease to vouch for it - a turn, an automation run, a raise
+# with no lease - counts as in flight only while it started within this bound
+# (a day: the longest turn agentrooms admits), so a row whose holder went away
+# never keeps an agent from being archived.
+ARCHIVE_WORK_BOUND_SECONDS = 86400
+ARCHIVE_SERVICE_STATES = ("running", "placed", "not_reporting", "lease_ending")
+# Each tool's work in flight, as one query per table: (capability, table, SQL
+# answering id, node, state, started_at for the agent, the bound in seconds and
+# the agent again where named). The open states are the tool's own; a queued row
+# (an automation run pending, a job waiting or a draft) is not in flight and
+# stays as it is.
+ARCHIVE_WORK = (
+    ("tasks", "tasks_executions",
+     "SELECT e.id::text, e.node, e.status, e.started_at FROM tasks_executions e "
+     "JOIN tasks_tasks t ON t.id = e.task_id WHERE t.agent_id = %(agent)s "
+     "AND e.status = 'running' AND e.ended_at IS NULL "
+     "AND (e.lease_until > now() OR (e.lease_until IS NULL "
+     "AND e.started_at > now() - make_interval(secs => %(bound)s))) "
+     "ORDER BY e.started_at, e.id"),
+    ("automations", "automations_runs",
+     "SELECT r.id::text, r.node, r.status, r.started_at FROM automations_runs r "
+     "WHERE r.agent_id = %(agent)s AND r.status IN ('starting', 'running') "
+     "AND coalesce(r.started_at, r.queued_at) > now() - make_interval(secs => %(bound)s) "
+     "ORDER BY coalesce(r.started_at, r.queued_at), r.id"),
+    ("agentrooms", "agentrooms_turns",
+     "SELECT t.id::text, t.node, 'in_flight', t.started_at FROM agentrooms_turns t "
+     "WHERE t.agent_id = %(agent)s AND t.outcome IS NULL "
+     "AND t.started_at > now() - make_interval(secs => %(bound)s) "
+     "ORDER BY t.started_at, t.id"),
+    # Its started_at and lease are ISO text; owner_host holds the claiming node.
+    ("telegram", "telegram_jobs",
+     "SELECT j.id::text, j.owner_host, j.state, j.started_at FROM telegram_jobs j "
+     "WHERE j.agent_id = %(agent)s AND j.state = 'running' "
+     "AND CASE WHEN j.lease_expires_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "
+     "THEN j.lease_expires_at::timestamptz END > now() ORDER BY j.started_at, j.id"),
+    ("telegrambot", "telegrambot_jobs",
+     "SELECT j.id::text, j.node, j.state, j.started_at FROM telegrambot_jobs j "
+     "WHERE j.agent_id = %(agent)s AND j.state = 'running' "
+     "AND j.lease_expires_at > now() ORDER BY j.started_at, j.id"),
+    ("whatsapp", "whatsapp_jobs",
+     "SELECT j.id::text, NULL::text, j.state, j.started_at FROM whatsapp_jobs j "
+     "WHERE j.agent_id = %(agent)s AND j.state = 'running' "
+     "AND j.lease_expires_at > now() ORDER BY j.started_at, j.id"),
+)
+
+
+class _ArchiveBlocked(Exception):
+    """What still runs of an agent asked to be archived: the check's answer."""
+    def __init__(self, check: dict):
+        super().__init__("agent_live")
+        self.check = check
+
+
+def _agent_ref_id(conn, ref: str, here: str | None) -> str | None:
+    """The id of the agent the store holds under `ref`, its id or slug; this
+    node's first where system agents on different nodes share the slug."""
+    found = conn.execute(
+        "SELECT id FROM agents a WHERE id = %s OR slug = %s "
+        f"ORDER BY id = %s DESC, {AGENT_HERE_FIRST}", (ref, ref, ref, here)).fetchone()
+    return found[0] if found else None
+
+
+def _agent_archive_head(conn, agent_id: str) -> dict:
+    """The agent as the check names it, its mark read through the row's JSON so
+    a store whose core predates it answers null."""
+    row = conn.execute(
+        "SELECT id, name, slug, coalesce(to_jsonb(a) ->> 'kind', 'agent'), "
+        "to_jsonb(a) ->> 'archived_at', to_jsonb(a) ->> 'archived_by' "
+        "FROM agents a WHERE id = %s", (agent_id,)).fetchone()
+    return dict(zip(("id", "name", "slug", "kind", "archived_at", "archived_by"), row))
+
+
+def _archive_has(conn, table: str) -> bool:
+    return conn.execute("SELECT to_regclass(%s)", (table,)).fetchone()[0] is not None
+
+
+def _agent_archive_check(conn, agent_id: str) -> dict:
+    """What keeps the agent from being archived, read from the store alone and
+    writing nothing: {agent, can_archive, blocking, checked_at}. A service
+    instance row only says how a service row stands; it never makes one."""
+    stamp = _store_module()._stamp
+    head = _agent_archive_head(conn, agent_id)
+    now = conn.execute("SELECT now()").fetchone()[0]
+    blocking: list[dict] = []
+    nodes_named: set[str] = set()
+    sole = [node for (node,) in conn.execute(
+        "SELECT l.node FROM agent_nodes l JOIN nodes n ON n.id = l.node "
+        "WHERE l.agent_id = %s AND n.kind = 'server' AND n.disabled_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM agent_nodes o WHERE o.node = l.node "
+        "AND o.agent_id <> l.agent_id) ORDER BY n.label, l.node", (agent_id,)).fetchall()]
+    nodes_named.update(sole)
+
+    # Services: one row per capability and node placed there or holding a live
+    # lease there in any of the three lease tables.
+    services: dict[tuple[str, str], dict] = {}
+
+    def service(capability: str, node: str) -> dict:
+        return services.setdefault((capability, node), {
+            "placed": False, "placed_mode": None, "lease_mode": None, "expires": None})
+
+    for capability, node, mode in conn.execute(
+            "SELECT capability, node, to_jsonb(p) ->> 'mode' FROM policies p "
+            "WHERE agent_id = %s AND node IS NOT NULL AND service "
+            "ORDER BY capability, node", (agent_id,)).fetchall():
+        entry = service(capability, node)
+        entry["placed"], entry["placed_mode"] = True, mode
+    leases = []
+    if _archive_has(conn, "service_leases"):
+        leases += conn.execute(
+            "SELECT capability, node, mode, expires_at FROM service_leases "
+            "WHERE agent_id = %s AND expires_at > now()", (agent_id,)).fetchall()
+    if _archive_has(conn, "deployment_service_leases"):
+        leases += conn.execute(
+            "SELECT capability, node, NULL, expires_at FROM deployment_service_leases "
+            "WHERE agent_id = %s AND expires_at > now()", (agent_id,)).fetchall()
+    if _archive_has(conn, "agentrooms_leases"):
+        leases += conn.execute(
+            "SELECT 'agentrooms', node, NULL, expires_at FROM agentrooms_leases "
+            "WHERE agent_id = %s AND expires_at > now()", (agent_id,)).fetchall()
+    for capability, node, mode, expires in leases:
+        entry = service(capability, node)
+        entry["lease_mode"] = entry["lease_mode"] or mode
+        if entry["expires"] is None or expires > entry["expires"]:
+            entry["expires"] = expires
+    instances = {}
+    if services and _archive_has(conn, "service_instances"):
+        for capability, node, state, ready, checked, fresh, pid in conn.execute(
+                "SELECT capability, node, state, ready, checked_at, "
+                "checked_at > now() - make_interval(secs => %s), pid "
+                "FROM service_instances WHERE agent_id = %s",
+                (ARCHIVE_INSTANCE_FRESH_SECONDS, agent_id)).fetchall():
+            instances[(capability, node)] = (
+                {"state": state, "ready": ready, "checked_at": stamp(checked)},
+                bool(fresh), state in ARCHIVE_RUNNING_STATES or pid is not None)
+    nodes_named.update(node for _capability, node in services)
+
+    work: list[tuple] = []
+    for capability, table, sql in ARCHIVE_WORK:
+        if not _archive_has(conn, table):
+            continue
+        for row_id, node, state, started in conn.execute(
+                sql, {"agent": agent_id, "bound": ARCHIVE_WORK_BOUND_SECONDS}).fetchall():
+            work.append((capability, row_id, node, state, started))
+    named = {node for _c, _i, node, _s, _t in work if node} | nodes_named
+    known = {}
+    if named:
+        for node, label, kind, seen, alone in conn.execute(
+                "SELECT n.id, n.label, n.kind, n.last_seen_at, NOT EXISTS (SELECT 1 FROM "
+                "agent_nodes o WHERE o.node = n.id AND o.agent_id <> %s) "
+                "FROM nodes n WHERE n.id = ANY(%s)", (agent_id, sorted(named))).fetchall():
+            known[node] = {"id": node, "label": label, "kind": kind,
+                           "sole_agent": bool(alone), "last_seen_at": stamp(seen)}
+
+    def node_of(node: str) -> dict:
+        return known.get(node) or {"id": node, "label": None, "kind": None,
+                                   "sole_agent": None, "last_seen_at": None}
+
+    for node in sole:
+        blocking.append({"kind": "node", "node": node_of(node), "state": "in_service",
+                         "stop": {"argv": ["capabilities", "node", "disable", node]},
+                         "remove": {"argv": ["capabilities", "node", "remove", node]}})
+    for (capability, node), entry in sorted(services.items()):
+        instance, fresh, runs = instances.get((capability, node), (None, False, False))
+        if instance is not None and fresh and runs:
+            state = "running"
+        elif not entry["placed"]:
+            state = "lease_ending"
+        elif instance is not None and not fresh:
+            state = "not_reporting"
+        else:
+            state = "placed"
+        mode = (entry["placed_mode"] if entry["placed_mode"] in PLACEMENT_MODES
+                else entry["lease_mode"] if entry["lease_mode"] in PLACEMENT_MODES else None)
+        blocking.append({
+            "kind": "service", "capability": capability, "node": node_of(node),
+            "mode": mode, "placed": entry["placed"],
+            "lease_expires_at": stamp(entry["expires"]), "instance": instance,
+            "state": state,
+            "stop": {"argv": ["capabilities", "service", "stop", capability, "--agent",
+                              agent_id, "--node", node]}})
+    for capability, row_id, node, state, started in work:
+        blocking.append({"kind": "work", "capability": capability, "id": row_id,
+                         "node": node_of(node) if node in known else None,
+                         "state": state, "started_at": stamp(started), "stop": None})
+    return {"agent": head, "can_archive": not blocking, "blocking": blocking,
+            "checked_at": stamp(now)}
+
+
+def _agent_archive_conn(root: Path | None):
+    """(connection, setting) for reading the store without writing to it:
+    nothing is migrated, and the session is read-only."""
+    db = _db_module()
+    store = _store_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
+                          transaction=True)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    conn.read_only = True
+    return conn, setting
+
+
+def _agent_unknown(ref: str, setting) -> NoReturn:
+    _die(6, "agent_unknown",
+         f"the store ({setting.level}, schema {setting.schema}) holds no agent {ref!r}",
+         "run `capabilities agent list` to see the agents it holds")
+
+
+def _agent_archive(ref: str, check_only: bool) -> dict:
+    """`agent archive`: with `check_only` the check alone, writing nothing;
+    otherwise the check and the mark in one transaction under a lock on the
+    agent's row, refused with what still runs (exit 6 agent_live)."""
+    import psycopg
+    here = _node_id_or(None)
+    root = _project_root()
+    if check_only:
+        conn, setting = _agent_archive_conn(root)
+        try:
+            with conn.transaction():
+                if not _archive_has(conn, "agents"):
+                    _agent_unknown(ref, setting)
+                agent_id = _agent_ref_id(conn, ref, here)
+                if agent_id is None:
+                    _agent_unknown(ref, setting)
+                if _store_module().agent_kind(conn, agent_id) == "system":
+                    _system_agent_refusal("agent archive", agent_id)
+                return _agent_archive_check(conn, agent_id)
+        except psycopg.Error as exc:
+            _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
+                 "check the database setting with `capabilities store doctor`")
+        finally:
+            conn.close()
+    conn, setting = _kernel_open(root)
+    db = _db_module()
+    try:
+        # The lease table's own guard is in place before the mark, where the
+        # table is.
+        if _archive_has(conn, "deployment_service_leases"):
+            db.migrate(conn, SUPERVISE_LEASE_OWNER, _supervise_lease_steps(),
+                       major=SUPERVISE_LEASE_VERSION[0], minor=SUPERVISE_LEASE_VERSION[1])
+        with conn.transaction():
+            agent_id = _agent_ref_id(conn, ref, here)
+            if agent_id is None:
+                _agent_unknown(ref, setting)
+            # The lock every guard's FOR SHARE waits on; under read committed
+            # the check below then reads whatever such a write committed.
+            kind, stamped, actor = conn.execute(
+                "SELECT coalesce(kind, 'agent'), archived_at, archived_by FROM agents "
+                "WHERE id = %s FOR UPDATE", (agent_id,)).fetchone()
+            if kind == "system":
+                _system_agent_refusal("agent archive", agent_id)
+            if stamped is not None:
+                return {"archived": agent_id, "archived_at": _store_module()._stamp(stamped),
+                        "archived_by": actor, "changed": False}
+            check = _agent_archive_check(conn, agent_id)
+            if check["blocking"]:
+                raise _ArchiveBlocked(check)
+            stamped, actor = conn.execute(
+                "UPDATE agents SET archived_at = now(), archived_by = %s, updated_at = now() "
+                "WHERE id = %s RETURNING archived_at, archived_by",
+                (_archive_actor(), agent_id)).fetchone()
+        return {"archived": agent_id, "archived_at": _store_module()._stamp(stamped),
+                "archived_by": actor, "changed": True}
+    except _ArchiveBlocked as blocked:
+        check = blocked.check
+        kinds = sorted({row["kind"] for row in check["blocking"]})
+        sys.stderr.write(json.dumps({"error": {
+            "code": "agent_live",
+            "message": f"agent {check['agent']['id']} still has {len(check['blocking'])} "
+                       f"thing(s) running ({', '.join(kinds)}), so it is not archived; "
+                       "archive stops nothing itself",
+            "hint": "stop each one its row names (its stop argv), then archive again; "
+                    "`capabilities agent archive <id> --check --json` lists them",
+            "detail": check}}, ensure_ascii=False, default=str) + "\n")
+        sys.exit(6)
+    except db.DbError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    except psycopg.OperationalError as exc:
+        _die(5, "store_unreachable", f"cannot reach the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    except psycopg.Error as exc:
+        _die(5, "store_write_failed", f"the store refused the change: {exc}")
+    finally:
+        conn.close()
+
+
+def _archive_actor() -> str:
+    """Who archives, as user@node: this machine's node id, else its label."""
+    store = _store_module()
+    try:
+        return _vault_actor()
+    except store.StoreError:
+        return f"{store._user_name()}@{store.node_label()}"
+
+
+def _agent_restore(ref: str) -> dict:
+    """`agent restore`: clear the agent's mark, and nothing else."""
+    import psycopg
+    conn, setting = _kernel_open(_project_root())
+    try:
+        with conn.transaction():
+            agent_id = _agent_ref_id(conn, ref, _node_id_or(None))
+            if agent_id is None:
+                _agent_unknown(ref, setting)
+            changed = conn.execute(
+                "UPDATE agents SET archived_at = NULL, archived_by = NULL, "
+                "updated_at = now() WHERE id = %s AND archived_at IS NOT NULL",
+                (agent_id,)).rowcount > 0
+        return {"restored": agent_id, "changed": changed}
+    except psycopg.OperationalError as exc:
+        _die(5, "store_unreachable", f"cannot reach the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    except psycopg.Error as exc:
+        _die(5, "store_write_failed", f"the store refused the change: {exc}")
+    finally:
+        conn.close()
+
+
+def _agent_archived_mark(conn, agent_id: str) -> dict:
+    """{archived_at, archived_by} of the agent, each null where it is not
+    archived or the store's core predates the mark."""
+    found = _store_module().agent_archived(conn, agent_id) or {}
+    return {"archived_at": found.get("archived_at"), "archived_by": found.get("archived_by")}
+
+
+def _archived_agent_refusal(verb: str, agent_id: str) -> NoReturn:
+    _die(4, "agent_archived",
+         f"`capabilities {verb}` is refused: agent {agent_id} is archived, so nothing "
+         "may start for it",
+         f"restore it first with `capabilities agent restore {agent_id}`")
+
+
+def _refuse_archived_agent(conn, agent_id: str, verb: str) -> None:
+    """Refuse `verb` inside the caller's connection where `agent_id` is
+    archived."""
+    if _store_module().agent_archived(conn, agent_id) is not None:
+        _archived_agent_refusal(verb, agent_id)
+
+
+def _archived_agent_gate(root: Path, verb: str) -> None:
+    """Refuse `verb` where this project's agent is archived, read without
+    writing; a folder with no id or no store, or a store that does not answer,
+    is not refused here."""
+    agent_id = _project_id_state(root)["id"]
+    if not agent_id:
+        return
+    agent_id = _store_agent_id(root, agent_id)
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
+                          transaction=True)
+    except db.DbError:
+        return
+    import psycopg
+    try:
+        conn.read_only = True
+        found = _store_module().agent_archived(conn, agent_id)
+    except psycopg.Error:
+        return
+    finally:
+        conn.close()
+    if found is not None:
+        _archived_agent_refusal(verb, agent_id)
+
+
 def _write_env_local_keys(root: Path, values: dict[str, str]) -> bool:
     """Set each key in `values` in the root's .env.local, replacing the line
     that names it or adding one, every other line kept; True when the file
@@ -12527,6 +13002,7 @@ def _agent_materialize(ref: str, folder_arg: str, claude: bool, codex: bool) -> 
                  "run `capabilities agent list` to see the agents it holds")
         agent_id = found[0][0]
         _refuse_system_agent(conn, agent_id, "agent materialize")
+        _refuse_archived_agent(conn, agent_id, "agent materialize")
         if not PROJECT_ID_RE.match(agent_id):
             _die(6, "input", f"the store's agent id {agent_id!r} is not a project id",
                  PROJECT_ID_HINT)
@@ -14743,9 +15219,16 @@ class _NodeManager:
         try:
             with conn.transaction():
                 for (agent_id, capability), (code, why) in sorted(unrun.items()):
-                    self.store.service_instance_put(
-                        conn, agent_id, capability, self.here, state="unusable",
-                        problem=why, problem_code=code)
+                    try:
+                        with conn.transaction():
+                            self.store.service_instance_put(
+                                conn, agent_id, capability, self.here, state="unusable",
+                                problem=why, problem_code=code)
+                    except Exception as exc:
+                        # An archived agent's row is refused: it is not placed,
+                        # and the others' rows are written all the same.
+                        if not _archived_refusal(exc):
+                            raise
                 for agent_id, capability in sorted(gone):
                     self.store.service_instance_drop(conn, agent_id, capability, self.here)
         except Exception as exc:
@@ -16000,7 +16483,7 @@ SUPERVISE_UNLOCKED = object()
 # writes the lease's last_error any more; the column stays, since a released
 # manager still on another node, and that runner, name it.
 SUPERVISE_LEASE_OWNER = "deployment"
-SUPERVISE_LEASE_VERSION = (2, 1)
+SUPERVISE_LEASE_VERSION = (2, 2)
 SUPERVISE_LEASE_STEPS = [
     ("0001-service-leases",
      "CREATE TABLE deployment_service_leases ("
@@ -16048,6 +16531,32 @@ SELECT store_state_keys('deployment', ARRAY[
     ARRAY['deployment_service_leases', 'node', 'nodes', 'cascade']]);
 """),
 ]
+# An archived agent takes no lease: every insert, so a renewing upsert too, calls
+# the core's guard (core 4.2), which refuses it with SQLSTATE 23R01. Releasing a
+# lease is a delete and stays allowed. A minor step, so a release that knows
+# deployment 2.1 reads a store at 2.2 as a newer minor.
+SUPERVISE_LEASE_GUARD = ("0005-agent-archived", """\
+CREATE FUNCTION deployment_service_leases_unarchived() RETURNS trigger
+ LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+BEGIN
+ PERFORM agents_archived_refuse(NEW.agent_id);
+ RETURN NEW;
+END $guard$;
+CREATE TRIGGER deployment_service_leases_unarchived BEFORE INSERT ON deployment_service_leases
+ FOR EACH ROW EXECUTE FUNCTION deployment_service_leases_unarchived();
+COMMENT ON TRIGGER deployment_service_leases_unarchived ON deployment_service_leases IS \
+'Refuses taking or renewing a lease (every insert, an upsert included) for an archived \
+agent; releasing stays allowed.';""", (4, 2))
+
+
+def _supervise_lease_steps() -> list:
+    """The lease table's steps, the guard among them as the library's Step,
+    which names the core it needs; the library is imported on use."""
+    from capabilities_contract.db import Step
+    guard_id, guard_sql, core = SUPERVISE_LEASE_GUARD
+    return [*SUPERVISE_LEASE_STEPS, Step(guard_id, guard_sql, core=core)]
+
+
 SUPERVISE_STORE_SETTING_SLUGS = frozenset({
     "store_not_configured", "store_not_postgres", "store_setting_unreadable",
     "store_setting_too_new", "bad_store_setting", "sslmode_too_weak",
@@ -16160,6 +16669,17 @@ class _SuperviseProblem(Exception):
         return {"state": self.state, "error": {"code": self.code, "message": self.message}}
 
 
+def _archived_refusal(exc) -> bool:
+    """Whether a store error is the core's refusal to start anything for an
+    archived agent (agents_archived_refuse, SQLSTATE 23R01), which a guarded
+    write - a placement, a lease, a service_instances row - raises."""
+    try:
+        from capabilities_contract.db import AGENT_ARCHIVED_SQLSTATE
+    except ImportError:
+        return False
+    return getattr(exc, "sqlstate", None) == AGENT_ARCHIVED_SQLSTATE
+
+
 class _SuperviseStore:
     """The project's store, one transaction at a time: each on a transaction
     connection opened for it and closed after it, so a supervisor holds no
@@ -16222,6 +16742,12 @@ class _SuperviseStore:
             with conn.transaction():
                 return work(conn)
         except Exception as exc:  # psycopg.Error, or a connection that went away
+            if _archived_refusal(exc):
+                # The store refuses to start anything for an archived agent: not
+                # placed, rather than a store that does not answer.
+                return {"state": "archived", "error": {
+                    "code": "agent_archived",
+                    "message": " ".join(str(exc).split())[:300]}}
             return {"state": "unreachable", "error": {
                 "code": "store_unreachable",
                 "message": " ".join(f"{type(exc).__name__}: {exc}".split())[:300]}}
@@ -16257,7 +16783,7 @@ class _SuperviseLease(_SuperviseStore):
         self.maybe_held = True
 
     def _migrate(self, conn, db) -> None:
-        db.migrate(conn, SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS,
+        db.migrate(conn, SUPERVISE_LEASE_OWNER, _supervise_lease_steps(),
                    major=SUPERVISE_LEASE_VERSION[0], minor=SUPERVISE_LEASE_VERSION[1])
 
     @staticmethod
@@ -17015,6 +17541,16 @@ class _Supervisor:
         row = self.instance_row()
         found = (self.instance.drop(self.name) if row is None
                  else self.instance.put(self.name, row))
+        if found.get("state") == "archived" and self.placed:
+            # The store refuses the row of an archived agent's service: it is
+            # not placed here, so it is stopped (recorded as stopping, which
+            # the store takes) and its row dropped.
+            self.placed, self.want = False, False
+            self.reason = (f"not placed on {self.node}: the store refuses to start anything "
+                           f"for an archived agent ({found['error'].get('message')})")
+            self.say_once(("archived",), self.reason)
+            self.converge()
+            found = self.instance.drop(self.name) if self.instance_row() is None else found
         failing = (found.get("error") or {}).get("code")
         if failing != self.instance_failing:
             self.say(f"cannot record what runs here in the store: "
@@ -17116,7 +17652,10 @@ class _Supervisor:
                 self.save()
                 return
         self.yielded = None
-        shared = placed and _supervise_placement(self.name) == "shared"
+        # An archived agent's lease is refused by the store (agent_archived):
+        # the service is not placed here, never a store that does not answer.
+        archived = hold if placed and hold.get("state") == "archived" else None
+        shared = placed and not archived and _supervise_placement(self.name) == "shared"
         if shared:
             # A shared service runs on every node it is placed on, so it takes
             # no lease, and gives up one it held while it was exclusive.
@@ -17125,10 +17664,13 @@ class _Supervisor:
             reason = (f"{gate.get('reason') or 'placed'}; a shared service, so it runs on "
                       "every node it is placed on")
             key = ("shared",)
-        elif placed:
+        elif placed and not archived:
             lease = self.lease.acquire(self.name)
             state = lease.get("state")
-            if state == "held":
+            if state == "archived":
+                archived = lease
+                want, reason, key = False, "", ("archived",)
+            elif state == "held":
                 want = True
                 reason = f"{gate.get('reason') or 'placed'}; this node holds the lease"
                 key: object = ("held",)
@@ -17156,6 +17698,10 @@ class _Supervisor:
             reason = f"not placed on {self.node}: {gate.get('reason')}"
             key = ("idle", reason)
             lease = self.lease_state
+        if archived is not None:
+            placed, want, key = False, False, ("archived",)
+            reason = (f"not placed on {self.node}: the store refuses to start anything for "
+                      f"an archived agent ({(archived.get('error') or {}).get('message')})")
         if not want:
             self.held_down = False
         if want and not self.want:
@@ -17535,6 +18081,7 @@ class _MachineSupervisor(_Supervisor):
         self.foreign = None
         admitted = set()
         yielded = {}
+        archived = {}
         for agent_id in sorted(set(self.agents) | set(self.leases)):
             lease = self.leases.get(agent_id)
             if agent_id not in self.agents:
@@ -17545,6 +18092,9 @@ class _MachineSupervisor(_Supervisor):
             # One service at a time serves an agent on this node: while its
             # own service holds the agent's lease here, this one leaves it be.
             hold = self.node_lease_of(agent_id).acquire(self.name)
+            if hold.get("state") == "archived":
+                archived[agent_id] = hold
+                continue
             if hold.get("state") == "held_elsewhere":
                 yielded[agent_id] = hold
                 if lease is not None:
@@ -17560,10 +18110,25 @@ class _MachineSupervisor(_Supervisor):
                     self.root, agent_id, self.node, self.every * SUPERVISE_LEASE_TTL_RECONCILES)
             state = lease.acquire(self.name)
             self.lease_states[agent_id] = state
+            if state.get("state") == "archived":
+                archived[agent_id] = state
+                continue
             if state.get("state") == "held" or (
                     state.get("state") not in ("free", "held_elsewhere")
                     and agent_id in self.admitted and lease.still_mine()):
                 admitted.add(agent_id)
+        # The store refuses to start anything for an archived agent: it is not
+        # placed here, so it is served no longer and gives up what it holds.
+        for agent_id, refused in sorted(archived.items()):
+            self.agents.pop(agent_id, None)
+            if agent_id in self.leases:
+                self.lease_states[agent_id] = self.leases[agent_id].release_if_held(
+                    self.name, self.lease_states.get(agent_id, {}))
+            self.node_lease_of(agent_id).release_if_held(self.name)
+            self.say_once(("archived", agent_id),
+                          f"{agent_id} is not placed on {self.node}: the store refuses to "
+                          "start anything for an archived agent "
+                          f"({(refused.get('error') or {}).get('message')})")
         if self.refusal is not None and self.gate_seen != tuple(sorted(admitted)):
             self.say("the agents it serves changed; the refusal hold is lifted")
             self.refusal = None
@@ -17672,6 +18237,10 @@ class _MachineSupervisor(_Supervisor):
                 self.log.again()
             row = self.agent_row(agent_id)
             found = instance.drop(self.name) if row is None else instance.put(self.name, row)
+            if found.get("state") == "archived":
+                # An archived agent's row is refused: it is not placed here.
+                self.agents.pop(agent_id, None)
+                row, found = None, instance.drop(self.name)
             failing = (found.get("error") or {}).get("code")
             if failing != self.instance_failing:
                 self.say(f"cannot record what runs here in the store: "
@@ -17993,6 +18562,7 @@ def _service_start(args: list[str], move: bool = False) -> None:
                       f"`capabilities service start {name} --node {servers[0]}` runs it "
                       f"on the server; --node {this['node']} runs it on this machine",
                       {"this_node": this["node"], "nodes": nodes})
+    _archived_agent_gate(root, f"service {verb}")
     placed = _service_place(name, True, node)
     agent_id = _kernel_agent_id(root)
     _announce_placement(root)
@@ -18041,9 +18611,12 @@ def _service_start(args: list[str], move: bool = False) -> None:
 
 
 def _service_stop(args: list[str]) -> None:
-    name, opts = _service_options(args, "stop", {"--node", "--wait"}, {"--all"})
+    name, opts = _service_options(args, "stop", {"--node", "--wait", "--agent"}, {"--all"})
     if "--all" in opts and opts.get("--node"):
         _die(6, "input", "service stop takes --node <node> or --all, not both")
+    if opts.get("--agent"):
+        _service_stop_agent(name, opts)
+        return
     root = _require_project()
     agent_id = _kernel_agent_id(root)
     if "--all" in opts:
@@ -18077,6 +18650,65 @@ def _service_stop(args: list[str]) -> None:
     _service_fail("service_still_running",
                   f"{name} is unplaced from {', '.join(nodes)} and still runs on "
                   f"{', '.join(r['node'] for r in left)} after {waited}s",
+                  "the node's manager stops it at its next reconcile; a node that does "
+                  "not answer keeps its row until it is back", result)
+
+
+def _service_stop_agent(name: str, opts: dict) -> None:
+    """`service stop <name> --agent <id|slug>`: the stop `service stop --all`
+    makes, for an agent the store holds, read and written in the store alone,
+    so it needs no folder of the agent here and no install of the capability:
+    take the service off every node it is placed on or runs on (or the one
+    --node names), tell the node managers, and wait until no node runs it."""
+    import psycopg
+    ref = opts["--agent"].strip()
+    root = _project_root()
+    node = opts.get("--node")
+    conn, setting = _kernel_open(root)
+    try:
+        with conn.transaction():
+            agent_id = _agent_ref_id(conn, ref, _node_id_or(None))
+            if agent_id is None:
+                _agent_unknown(ref, setting)
+            _refuse_system_agent(conn, agent_id, "service stop")
+            if node:
+                nodes = [node]
+            else:
+                placed = {n for (n,) in conn.execute(
+                    "SELECT node FROM policies WHERE agent_id = %s AND capability = %s "
+                    "AND node IS NOT NULL AND service", (agent_id, name)).fetchall()}
+                nodes = sorted(placed | {r["node"] for r in
+                                         _instance_rows(conn, agent_id, name)})
+            # Unplacing writes service false, which no guard refuses, so an
+            # archived agent's services are stopped the same way.
+            changed = conn.execute(
+                "UPDATE policies SET service = false, updated_at = now() "
+                "WHERE agent_id = %s AND capability = %s AND node = ANY(%s) AND service",
+                (agent_id, name, nodes)).rowcount > 0
+            on = [n for (n,) in conn.execute(
+                "SELECT node FROM policies WHERE agent_id = %s AND capability = %s "
+                "AND node IS NOT NULL AND service ORDER BY node", (agent_id, name)).fetchall()]
+    except psycopg.OperationalError as exc:
+        _die(5, "store_unreachable", f"cannot reach the store: {exc}",
+             "check the database setting with `capabilities store doctor`")
+    except psycopg.Error as exc:
+        _die(5, "store_write_failed", f"the store refused the change: {exc}")
+    finally:
+        conn.close()
+    _announce(root, NODE_PLACEMENT_CHANNEL, agent_id)
+    rows, _done, waited = _service_watch(
+        root, agent_id, name, lambda rows: not any(r["node"] in nodes for r in rows),
+        opts["--wait"])
+    left = [r for r in rows if r["node"] in nodes]
+    result = {"stopped": name, "agent_id": agent_id, "nodes": nodes, "changed": changed,
+              "placed_on": on, "waited_seconds": waited}
+    if not left:
+        _emit(result)
+        return
+    result["still_running"] = left
+    _service_fail("service_still_running",
+                  f"{name} of agent {agent_id} is unplaced from {', '.join(nodes)} and still "
+                  f"runs on {', '.join(r['node'] for r in left)} after {waited}s",
                   "the node's manager stops it at its next reconcile; a node that does "
                   "not answer keeps its row until it is back", result)
 
@@ -20926,6 +21558,9 @@ def cmd_node(args: list[str]) -> None:
     if sub == "install":
         _node_install(args[1:])
         return
+    if sub == "add" and _project_root() is not None:
+        # Either form of node add gives the agent a node to run on.
+        _archived_agent_gate(_project_root(), "node add")
     if _agent_node_form(sub, args[1:]):
         _agent_node_verb(sub, args[1:])
         return
@@ -22844,7 +23479,7 @@ def _store_upgrade_readers(setting, survey: dict, asked: list | None = None) -> 
     # version of that step and which has no steps of its own.
     manager_owners = (
         (STORE_LEGACY_OWNER, (), _store_legacy_version()),
-        (SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS, SUPERVISE_LEASE_VERSION))
+        (SUPERVISE_LEASE_OWNER, _supervise_lease_steps(), SUPERVISE_LEASE_VERSION))
     for owner, steps, (major, minor) in manager_owners:
         if owner not in survey["owners"]:
             continue
@@ -22981,7 +23616,7 @@ def _store_readers_key(setting, survey: dict, asked: list, identities: list) -> 
             "manager": {"library": library, "store_major": db.STORE_MAJOR,
                         "steps": repr((store.STORE_OWNER, store.record_table_steps(),
                                        store.STORE_TABLES_VERSION,
-                                       SUPERVISE_LEASE_OWNER, SUPERVISE_LEASE_STEPS,
+                                       SUPERVISE_LEASE_OWNER, _supervise_lease_steps(),
                                        SUPERVISE_LEASE_VERSION))},
             "capabilities": {name: found for (name, _, _), found in zip(asked, identities)}}
     return hashlib.sha256(json.dumps(made, sort_keys=True, default=str).encode()).hexdigest()
@@ -23417,7 +24052,7 @@ def _store_upgrade_migrate_once(setting, entry: dict) -> dict:
         # Moved by the core's step, the one before it.
         steps, (major, minor) = (), _store_legacy_version()
     else:
-        steps, (major, minor) = SUPERVISE_LEASE_STEPS, SUPERVISE_LEASE_VERSION
+        steps, (major, minor) = _supervise_lease_steps(), SUPERVISE_LEASE_VERSION
     if not steps:
         return {"owner": owner, "applied": [], "version": None}
     conn = None
@@ -24140,6 +24775,8 @@ def _place_service(name: str, placed: bool, node: str | None,
     if node is None and not every and serving is not None:
         _die(6, "input", "--mode places: `place <name>` alone reports and takes none",
              f"capabilities place {name} --node <node> --mode {serving}")
+    if placed and (node is not None or every):
+        _archived_agent_gate(root, verb)
     if name not in _installed():
         _die(3, "not_installed", f"{name} is not installed",
              f"run `capabilities install {name}`")

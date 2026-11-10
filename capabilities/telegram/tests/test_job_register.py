@@ -134,6 +134,33 @@ class RegisterCase(unittest.TestCase):
             return target.submit(row["id"])
         return row
 
+    # -- an archived agent ---------------------------------------------------
+
+    def test_no_job_is_entered_for_an_archived_agent(self):
+        """Step 0011 refuses entering a job of an archived agent, SQLSTATE 23R01,
+        which `archived` reads as nothing to start rather than a failure; a job
+        already entered still moves and ends, and a restore lets it in again."""
+        import psycopg
+        waiting = self.register()
+
+        def mark(on: bool) -> None:
+            with self.store.transaction():
+                self.store._execute(
+                    "UPDATE agents SET archived_at = CASE WHEN ? THEN now() END, "
+                    "archived_by = CASE WHEN ? THEN 'ops@n1' END WHERE id = ?",
+                    (on, on, self.reg.project_id))
+
+        mark(True)
+        with self.assertRaises(psycopg.IntegrityError) as refused:
+            self.register()
+        self.assertEqual(refused.exception.sqlstate, "23R01")
+        self.assertTrue(jobs.archived(refused.exception))
+        self.assertFalse(jobs.archived(RuntimeError("anything else")))
+        self.assertTrue(self.reg.request_stop(waiting["id"])["stop_requested"])
+        self.assertEqual(len(self.reg.list(limit=10)), 1)
+        mark(False)
+        self.assertEqual(self.register()["state"], jobs.WAITING)
+
     # -- the channel a job reports into --------------------------------------
 
     def test_the_register_is_keyed_by_the_id_the_launcher_resolved(self):
@@ -191,7 +218,7 @@ class RegisterCase(unittest.TestCase):
         registered without one keeps none, and a store at the earlier version
         takes the step without losing a row."""
         self.assertEqual([_step_id(step) for step in jobs.STORE_STEPS][3], "0004-job-profile")
-        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (3, 1))
+        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (3, 2))
         with_profile = self.register(engine="claude", profile="telegram-fast")
         without = self.register(engine="codex", model="gpt-5.5")
         self.assertEqual(self.reg.get(with_profile["id"])["profile"], "telegram-fast")
@@ -344,7 +371,8 @@ class RegisterCase(unittest.TestCase):
         from capabilities_contract.db import DbError, connect, migrate
         old = [step for step in jobs.STORE_STEPS
                if _step_id(step) not in ("0007-one-register", "0008-agent-names",
-                                         "0009-connection-ids", "0010-keys")]
+                                         "0009-connection-ids", "0010-keys",
+                                         "0011-unarchived")]
         older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m1")
         conn = connect(application_name="telegram", setting=older)
         self.addCleanup(conn.close)
@@ -387,7 +415,7 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(reg.pending_amendment("old-1"), ["more"])
         version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
                                  (jobs.STORE_OWNER,)).fetchone()
-        self.assertEqual(tuple(version), (3, 1))
+        self.assertEqual(tuple(version), (3, 2))
         for table in ("telegram_jobs", "telegram_job_amendments", "telegram_job_slots",
                       "telegram_prompt_versions", "telegram_channels"):
             rows = store._execute(f"SELECT agent_id FROM {table}").fetchall()
@@ -426,7 +454,8 @@ class RegisterCase(unittest.TestCase):
         import capabilities_contract.db._migrate as core_migrate
         from capabilities_contract.db import DbError, connect, deleting, migrate
         old = [step for step in jobs.STORE_STEPS
-               if _step_id(step) not in ("0009-connection-ids", "0010-keys")]
+               if _step_id(step) not in ("0009-connection-ids", "0010-keys",
+                                         "0011-unarchived")]
         older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m2")
         conn = connect(application_name="telegram", setting=older)
         self.addCleanup(conn.close)
@@ -465,7 +494,7 @@ class RegisterCase(unittest.TestCase):
         self.addCleanup(store.close)
         version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
                                  (jobs.STORE_OWNER,)).fetchone()
-        self.assertEqual(tuple(version), (3, 1))
+        self.assertEqual(tuple(version), (3, 2))
         ids = dict(store._execute(
             "SELECT name, id FROM core_premig_connection_names").fetchall())
         self.assertEqual(set(ids), {"work", "personal", "tasks"})

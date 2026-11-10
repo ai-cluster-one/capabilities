@@ -59,7 +59,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 from uuid import uuid4
 
-from capabilities_contract.db import Step
+from capabilities_contract.db import AGENT_ARCHIVED_SQLSTATE, Step
 
 
 # How `channel_key` spells a forum topic. The column is written by whoever
@@ -140,7 +140,7 @@ def job_label(description: Any) -> str:
 # so every comparison and every reader below sees the values it always saw.
 STORE_OWNER = "telegram"
 STORE_SCHEMA_MAJOR = 3
-STORE_SCHEMA_MINOR = 1
+STORE_SCHEMA_MINOR = 2
 # The store's foreign keys (core 4.0): every agent and node column of this
 # owner keyed by what its parent takes with it - owned rows go with it, a
 # record keeps itself and loses the pointer - and its guards admitting the
@@ -623,7 +623,50 @@ STORE_STEPS = (
       FROM granted WHERE s.ctid = granted.at AND granted.cid IS NOT NULL;
     """, core=(3, 0)),
     Step("0010-keys", _M9_KEYS_SQL, core=(4, 0)),
+    # 3.2: nothing starts for an archived agent (core 4.2). The store refuses
+    # entering a job of it - every insert of telegram_jobs - through the core's
+    # one guard, `agents_archived_refuse`, with SQLSTATE 23R01
+    # (`agent_archived`, exit 4). Moving or ending a job stays allowed. A minor
+    # step: a release of 3.1 reads a store at 3.2 and keeps working for every
+    # agent that is not archived.
+    Step("0011-unarchived", r"""
+    CREATE FUNCTION telegram_jobs_unarchived() RETURNS trigger
+     LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+    BEGIN
+     PERFORM agents_archived_refuse(NEW.agent_id);
+     RETURN NEW;
+    END $guard$;
+    CREATE TRIGGER telegram_jobs_unarchived BEFORE INSERT ON telegram_jobs
+     FOR EACH ROW EXECUTE FUNCTION telegram_jobs_unarchived();
+    COMMENT ON TRIGGER telegram_jobs_unarchived ON telegram_jobs IS
+        'Refuses entering a job of an archived agent; moving or ending one stays allowed.';
+    """, core=(4, 2)),
 )
+
+
+def archived(exc: BaseException | None) -> bool:
+    """Whether `exc`, or what it was raised from, is the store refusing to start
+    anything for an archived agent (SQLSTATE 23R01): nothing is started for it,
+    which is neither a crash nor a failure to try again."""
+    seen = 0
+    while exc is not None and seen < 8:
+        if getattr(exc, "sqlstate", None) == AGENT_ARCHIVED_SQLSTATE:
+            return True
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return False
+
+
+def archived_words(exc: BaseException | None) -> str:
+    """What the store said refusing an archived agent: its message and when and
+    by whom the agent was archived, on one line."""
+    seen = 0
+    while exc is not None and seen < 8:
+        diag = getattr(exc, "diag", None)
+        if getattr(exc, "sqlstate", None) and diag is not None and diag.message_primary:
+            words = diag.message_primary.removeprefix("agent_archived: ")
+            return words + (f" ({diag.message_detail})" if diag.message_detail else "")
+        exc, seen = exc.__cause__ or exc.__context__, seen + 1
+    return "the agent is archived"
 
 # The harness runner's profile table lives in the same store, under the
 # runner's own ledger, and is applied before the register's steps wherever the

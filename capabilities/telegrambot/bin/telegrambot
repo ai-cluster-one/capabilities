@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
 #     "telethon==1.45.0",
@@ -1235,6 +1235,14 @@ def cmd_jobs(args, wanted: str | None):
                         "amendment": staged}
         except jobs.JobError as exc:
             _die(6, exc.slug, exc.message, exc.hint)
+        except Exception as exc:
+            if not _store_module().archived(exc):
+                raise
+            _die(4, "agent_archived",
+                 "the store enters no job for an archived agent: "
+                 + _store_module().archived_words(exc),
+                 "Do not restore it yourself — ask the user; `capabilities agent restore` "
+                 "clears the mark. Reading, help, doctor and stopping a service still work.")
 
 
 # ── the service: one process, a slot per project ─────────────────────────────

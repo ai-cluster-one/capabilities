@@ -362,6 +362,67 @@ def test_a_turn_hands_work_to_a_job_that_is_delivered(tmp_path, home, telegram, 
         drop_schema(schema)
 
 
+def test_a_turn_of_an_archived_agent_enters_no_job(tmp_path, home, telegram, monkeypatch):
+    """The store refuses a job of an archived agent (step 0009, SQLSTATE 23R01),
+    and the turn's `jobs register` through the real CLI says so, exit 4
+    `agent_archived`, never a store failure; nothing is entered."""
+    import psycopg
+    schema = f"tgb_arch_{uuid.uuid4().hex[:8]}"
+    token = "446:dde"
+    telegram.add_bot(token)
+    root, project_id = make_project(tmp_path, "theta", token, {
+        "allowed_users": {"42": {"name": "Ann", "role": "supervisor"}},
+        "defaults": {"debounce": 0, "delegation": "allowed"}}, schema)
+    monkeypatch.chdir(root)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(root))
+    cli = load_cli()
+    cli_path = str(CAPABILITY_DIR / "bin" / "telegrambot")
+    said: list = []
+
+    def mark(on: bool) -> None:
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f"SET search_path TO {schema}")
+            conn.execute("UPDATE agents SET archived_at = CASE WHEN %s THEN now() END, "
+                         "archived_by = CASE WHEN %s THEN 'ops@n1' END WHERE id = %s",
+                         (on, on, project_id))
+
+    def answer(prompt, kwargs):
+        env = {**os.environ, **kwargs["extra_env"]}
+        env.pop("TELEGRAMBOT_REAL_CLI", None)
+        python = [sys.executable, "-c", "import runpy,sys; sys.argv=['telegrambot']+sys.argv[1:];"
+                  f" runpy.run_path({cli_path!r}, run_name='__main__')"]
+        mark(True)
+        try:
+            found = subprocess.run(python + ["jobs", "register", "make the report",
+                                             "--chat", "1", "--requested-by", "1"],
+                                   env=env, capture_output=True, text=True, cwd=str(root))
+        finally:
+            mark(False)
+        said.append((found.returncode, found.stderr))
+        return "=== REPLY ===\nnot now"
+
+    runner = Runner(answer)
+    entry = {"id": project_id, "root": str(root), "slug": "theta"}
+    host = host_with(cli, runner, "project", entry)
+    engine, thread = serve(cli, host, "project", cli._project_state_dir("theta"))
+    try:
+        settle(lambda: engine.slots.get(project_id) and engine.slots[project_id].store, cli,
+               "the project served")
+        telegram.push(token, message(7, 42, 42, "please make the report"))
+        settle(lambda: said, cli, "the turn's register", 40)
+        code, err = said[0]
+        assert code == 4, err
+        assert json.loads(err.strip().splitlines()[-1])["error"]["code"] == "agent_archived"
+        store = engine.slots[project_id].store
+        assert store.execute("SELECT count(*) AS n FROM telegrambot_jobs", fetch="one") == \
+            {"n": 0}
+    finally:
+        engine.stopping.set()
+        engine.wake.set()
+        thread.join(30)
+        drop_schema(schema)
+
+
 def run_cli(cli, capsys, *argv, stdin=None):
     import io
     saved, saved_in = sys.argv, sys.stdin

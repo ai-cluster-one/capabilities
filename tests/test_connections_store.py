@@ -2136,6 +2136,64 @@ def test_a_supervisor_on_a_disabled_node_stops_its_service_and_lets_its_lease_go
         log.close()
 
 
+def test_a_supervisor_reads_the_stores_refusal_of_an_archived_agent_as_not_placed(lab, tmp_path):
+    # Once the agent is archived the store refuses its lease and its running
+    # row (SQLSTATE 23R01). The supervisor reads that as the service not being
+    # placed here: it stops it, lets the lease go, drops its row and starts
+    # nothing again, rather than taking the store for unreachable.
+    here = _service_lab(lab)
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    env = {**lab["env"], **here}
+    marker = tmp_path / "child.pid"
+
+    def running() -> bool:
+        if not marker.exists():
+            return False
+        try:
+            os.kill(int(marker.read_text()), 0)
+        except (ProcessLookupError, ValueError):
+            return False
+        return True
+
+    def live() -> bool:
+        return bool(_rows(lab, "SELECT 1 FROM deployment_service_leases WHERE agent_id = "
+                               f"'{PROJECT_ID}' AND expires_at > now()"))
+
+    def instance() -> list:
+        return _rows(lab, "SELECT state FROM service_instances WHERE agent_id = "
+                          f"'{PROJECT_ID}'")
+
+    logp = tmp_path / "supervise.log"
+    log = logp.open("w")
+    supervise = subprocess.Popen(
+        [str(MANAGER), "node", "supervise", "coolify", "--every", "5", "--", "sh", "-c",
+         f"echo $$ > {marker}; exec sleep 600"], cwd=lab["project"], env=env,
+        stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        assert _wait_for(lambda: running() and live() and instance(), 30), logp.read_text()
+        # The deployment lease table carries its own guard (deployment 2.2).
+        assert _rows(lab, "SELECT tgname FROM pg_trigger WHERE tgname = "
+                          "'deployment_service_leases_unarchived'")
+        # Marked as an older writer could while it was placed; archive itself
+        # refuses while a service is placed.
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("UPDATE lab.agents SET archived_at = now(), archived_by = "
+                         "'test@lab' WHERE id = %s", (PROJECT_ID,))
+        assert _wait_for(lambda: not running() and not live() and not instance(), 30), \
+            logp.read_text()
+        marker.unlink(missing_ok=True)
+        import time
+        time.sleep(12)
+        text = logp.read_text()
+        assert not running(), text
+        assert "an archived agent" in text, text
+        assert "cannot be confirmed" not in text and "restarting" not in text, text
+    finally:
+        os.killpg(supervise.pid, signal.SIGTERM)
+        supervise.wait(timeout=60)
+        log.close()
+
+
 def test_node_run_and_each_supervisor_keep_their_last_lines_in_the_store(lab, tmp_path):
     """What a service's supervisor and the service print on stderr, and what
     node run prints, read from the store as the node's log, with what reads as
@@ -2478,6 +2536,94 @@ elif args == ["service", "doctor", "--machine"]:
     except ProcessLookupError:
         alive = False
     assert not alive
+
+
+def test_a_machine_service_lets_an_archived_agent_go_as_not_placed(lab, tmp_path):
+    """Once the agent is archived the store refuses its leases: the machine
+    supervisor takes it off the list, lets its leases go and drops its row,
+    rather than taking the store for unreachable."""
+    _import(lab)
+    registry = Path(lab["env"]["CAPABILITIES_HOME"]) / "coolify"
+    registry.mkdir(parents=True)
+    (registry / "coolify").write_text("#!/bin/sh\n")
+    state = tmp_path / "machine"
+    state.mkdir()
+    listing = lab["config"] / "coolify" / "service" / "projects.json"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "coolify").write_text(f"""#!{sys.executable}
+import json, os, sys, time
+from pathlib import Path
+state = Path({str(state)!r})
+listed = Path({str(listing)!r})
+def names():
+    return sorted(json.loads(listed.read_text())["projects"]) if listed.exists() else []
+args = sys.argv[1:]
+if args == ["service", "status", "--machine"]:
+    status = state / "status.json"
+    body = json.loads(status.read_text()) if status.exists() else {{"running": False}}
+    try:
+        os.kill(body.get("pid") or 0, 0) if body.get("pid") else None
+    except ProcessLookupError:
+        body = {{"running": False}}
+    print(json.dumps({{"mode": "machine", **body}}))
+elif args == ["service", "run", "--machine"]:
+    while True:
+        (state / "status.json").write_text(json.dumps({{"running": True, "pid": os.getpid(),
+            "projects": [{{"project_id": n, "state": "served"}} for n in names()]}}))
+        time.sleep(0.5)
+elif args == ["service", "doctor", "--machine"]:
+    print(json.dumps({{"ok": True}}))
+""")
+    (bin_dir / "coolify").chmod(0o755)
+    (registry / "manifest.json").write_text(json.dumps({"name": "coolify", "service": {
+        "name": "svc", "summary": "s", "verbs": [], "placement": "exclusive",
+        "machine": {"schema": "capabilities.service.machine.v1",
+                    "command": ["coolify", "service", "run", "--machine"],
+                    "doctor": ["coolify", "service", "doctor", "--machine"],
+                    "projects": "$XDG_CONFIG_HOME/coolify/service/projects.json"}}}))
+
+    def listed():
+        return (sorted(json.loads(listing.read_text())["projects"]) if listing.exists()
+                else [])
+
+    def row():
+        found = _rows(lab, "SELECT state FROM service_instances WHERE capability = 'coolify'")
+        return found[0][0] if found else None
+
+    def leases():
+        return _rows(lab, "SELECT 'node' FROM service_leases WHERE capability = 'coolify' "
+                     "AND expires_at > now()") + _rows(
+            lab, "SELECT 'exclusive' FROM deployment_service_leases "
+                 "WHERE capability = 'coolify' AND expires_at > now()")
+    here = {"AGENT_NODE_ID": NODE}
+    _ok(_manager(lab, "node", "add", NODE, "--label", "lab-node", "--kind", "server",
+                 extra=here))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("UPDATE lab.agent_nodes SET folder = %s", (str(lab["project"]),))
+    env = {**lab["env"], **here, "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+    _ok(_manager(lab, "place", "coolify", "--node", NODE, extra=here))
+    logp = tmp_path / "supervise.log"
+    log = logp.open("w")
+    supervise = subprocess.Popen([str(MANAGER), "node", "supervise", "coolify", "--machine",
+                                  "--every", "5"], cwd=lab["project"], env=env,
+                                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+        assert _wait_for(lambda: row() == "ready" and len(leases()) == 2, 45), \
+            logp.read_text()
+        assert listed() == [PROJECT_ID]
+        # Marked as an older writer could while it was placed.
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("UPDATE lab.agents SET archived_at = now(), archived_by = "
+                         "'test@lab' WHERE id = %s", (PROJECT_ID,))
+        assert _wait_for(lambda: row() is None and leases() == [] and listed() == [], 30), \
+            logp.read_text()
+        text = logp.read_text()
+        assert "an archived agent" in text and "cannot record" not in text, text
+    finally:
+        os.killpg(supervise.pid, signal.SIGTERM)
+        supervise.wait(timeout=60)
+        log.close()
 
 
 def _stand_in_launchctl(lab, tmp_path) -> tuple[Path, Path, Path]:

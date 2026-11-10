@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -578,8 +578,9 @@ from pathlib import Path
 from typing import NoReturn
 
 import httpx
-from capabilities_contract.db import (FOLLOW_INTERVAL_SECONDS, DbError, Follower, Step,
-                                      connect, migrate, resolve_setting)
+from capabilities_contract.db import (AGENT_ARCHIVED_SQLSTATE, FOLLOW_INTERVAL_SECONDS,
+                                      DbError, Follower, Step, connect, migrate,
+                                      resolve_setting)
 
 DEFAULT_SESSION = "default"
 
@@ -1917,9 +1918,27 @@ UPDATE settings s
        connection_id = granted.cid
   FROM granted WHERE s.ctid = granted.at AND granted.cid IS NOT NULL""", core=(3, 0)),
     Step("0026-keys", _M9_KEYS_SQL, core=(4, 0)),
+    # 2.4: nothing starts for an archived agent (core 4.2). The store refuses
+    # entering a job of it - every insert of whatsapp_jobs - through the core's
+    # one guard, `agents_archived_refuse`, with SQLSTATE 23R01 (`agent_archived`,
+    # exit 4). Moving or ending a job stays allowed. A minor step: a release of
+    # 2.3 reads a store at 2.4 and keeps working for every agent that is not
+    # archived.
+    Step("0027-unarchived", """
+CREATE FUNCTION whatsapp_jobs_unarchived() RETURNS trigger
+ LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+BEGIN
+ PERFORM agents_archived_refuse(NEW.agent_id);
+ RETURN NEW;
+END $guard$;
+CREATE TRIGGER whatsapp_jobs_unarchived BEFORE INSERT ON whatsapp_jobs
+ FOR EACH ROW EXECUTE FUNCTION whatsapp_jobs_unarchived();
+COMMENT ON TRIGGER whatsapp_jobs_unarchived ON whatsapp_jobs IS
+  'Refuses entering a job of an archived agent; moving or ending one stays allowed.'""",
+         core=(4, 2)),
 ]
 STORE_SCHEMA_MAJOR = 2
-STORE_SCHEMA_MINOR = 3
+STORE_SCHEMA_MINOR = 4
 
 
 def _tables():
@@ -2052,6 +2071,15 @@ class _Store:
                     cursor.execute(sql, params if params else None)
             except self._error as exc:
                 detail = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+                if getattr(exc, "sqlstate", None) == AGENT_ARCHIVED_SQLSTATE:
+                    # Not a store failure: the agent is archived, so the store
+                    # starts nothing for it - refused as the contract refuses it.
+                    _refuse(4, "agent_archived",
+                            "the store starts nothing for an archived agent: "
+                            + detail.removeprefix("agent_archived: "),
+                            "Do not restore it yourself — ask the user; `capabilities agent "
+                            "restore` clears the mark. Reading, help, doctor and stopping a "
+                            "service still work.")
                 _refuse(5, "store_failed",
                         f"the store refused a statement: {detail}",
                         "prove the store with `capabilities store doctor`, then "

@@ -872,3 +872,89 @@ def test_an_agent_whose_settings_are_rows_and_holds_none_runs_on_the_defaults(ba
     config = cli._load_config(cli._runtime_module(), root)
     assert config["automations"] == []
     assert config["engine"]["max_parallel"] == 4 and config["engine"]["recovery"] == "fail"
+
+
+# --- An archived agent ---------------------------------------------------------
+
+def _admin():
+    """A connection to the store the fixture projects resolve, bound to its schema."""
+    import psycopg
+    from capabilities_contract import db
+
+    conn = psycopg.connect(DSN, autocommit=True)
+    conn.execute(f'SET search_path TO "{db.DEFAULT_SCHEMA}"')
+    return conn
+
+
+def _archive(farm: Farm, name: str, on: bool = True) -> None:
+    """Stamp or clear the agent's mark, as `capabilities agent archive|restore`
+    does."""
+    import psycopg
+
+    with _admin() as conn:
+        conn.execute("UPDATE agents SET archived_at = CASE WHEN %s THEN now() END, "
+                     "archived_by = CASE WHEN %s THEN 'ops-person@n1' END WHERE id = %s",
+                     (on, on, farm.projects[name]["id"]))
+
+
+@needs_store
+def test_an_archived_agent_gets_no_run_and_the_machine_serves_the_others(farm):
+    """Step 0011 refuses queueing a run of an archived agent, SQLSTATE 23R01. The
+    machine process reads it as that project not placed - nothing registered or
+    started for it, no failure tried again - and serves the other; a project's
+    own scheduler ends, exit 4 `agent_archived`, which a supervisor does not
+    restart; a command says the same; restored, the project is served again."""
+    import psycopg
+
+    for name in ("alpha", "beta", "gamma"):
+        farm.project(name)
+    for name in ("alpha", "beta"):
+        farm.join(name)
+    farm.ok(None, "service", "start", "--machine")
+    for name in ("alpha", "beta"):
+        farm.until_state(name, "served")
+    farm.ok("gamma", "service", "start")
+    for name in ("alpha", "gamma"):
+        _archive(farm, name)
+    # What either had queued before the mark stays as it was; nothing is added.
+    before = {name: [row["id"] for row in farm.runs(name)] for name in ("alpha", "gamma")}
+    # The store's own refusal, whoever asks it.
+    with _admin() as conn:
+        with pytest.raises(psycopg.IntegrityError) as refused:
+            conn.execute("INSERT INTO automations_runs (id, agent_id, automation_slug, trigger, "
+                         "status, attempt, queued_at, log_path, host, node) VALUES "
+                         "('x', %s, 'probe', 'manual', 'pending', 1, now(), '/tmp/x', 'h', %s)",
+                         (farm.projects["alpha"]["id"], HERE))
+    assert refused.value.sqlstate == "23R01"
+    # A command run by hand is refused as the contract refuses it.
+    code, error = farm.refused("alpha", "run", "probe")
+    assert (code, error["code"]) == (4, "agent_archived")
+    # The minute's firing: alpha's is refused and alpha dropped, beta's runs.
+    row = farm.until_state("alpha", "refused", MINUTE)
+    assert row["reason"].startswith("agent_archived:"), row
+    until(lambda: farm.finished("beta", trigger="schedule"), MINUTE, "beta scheduled run")
+    assert {name: [row["id"] for row in farm.runs(name)] for name in ("alpha", "gamma")} == \
+        before
+    machine = farm.machine()
+    assert machine["running"] is True
+    assert {row["project_id"]: row["state"] for row in machine["projects"]} == {
+        farm.projects["alpha"]["id"]: "refused", farm.projects["beta"]["id"]: "served"}
+    lines = farm.ok(None, "service", "logs", "--machine", "--tail", "1000")["lines"]
+    said = [line for line in lines if f"[{farm.projects['alpha']['slug']}]" in line
+            and "agent_archived" in line]
+    assert said and len([line for line in said if "registering and starting nothing" in line
+                         and "is archived" in line]) <= 2, said
+    # The project's own scheduler ended at its firing, as a refusal.
+    until(lambda: any("agent_archived" in line for line in
+                      (farm.state("gamma") / "daemon.log").read_text().splitlines()),
+          MINUTE, "gamma's scheduler ended as agent_archived")
+    ended = json.loads(next(line for line in reversed(
+        (farm.state("gamma") / "daemon.log").read_text().splitlines())
+        if line.startswith("{")))
+    assert ended["error"]["code"] == "agent_archived"
+    # Restored: the next check reads the mark gone and serves it again.
+    _archive(farm, "alpha", on=False)
+    farm.until_state("alpha", "served", 30)
+    queued = farm.ok("alpha", "run", "probe")["run"]
+    assert queued["project_id"] == farm.projects["alpha"]["id"]
+    until(lambda: farm.finished("alpha", trigger="manual"), 30, "alpha manual run")

@@ -333,7 +333,7 @@ def test_a_store_at_major_1_keeps_its_sessions_under_agent_id(lab, monkeypatch):
                 (None, str(lab.caller.resolve()), node, str(lab.target), "s-1", 3),
                 ("prj_000000000002", None, "elsewhere", "/t/other", "s-2", 1)]
             assert conn.execute("SELECT major, minor FROM schema_version "
-                                "WHERE owner = 'askproject'").fetchone() == (3, 1)
+                                "WHERE owner = 'askproject'").fetchone() == (3, 2)
             names = [r[0] for r in conn.execute(
                 "SELECT attname::text FROM pg_attribute WHERE attrelid = "
                 "'askproject_sessions'::regclass AND attnum > 0 UNION ALL "
@@ -399,7 +399,7 @@ def test_a_store_at_2_0_crosses_to_node_id_and_minus_c_continues_for_both_caller
         with psycopg.connect(STORE_DSN) as conn:
             conn.execute(f'SET search_path TO "{schema}"')
             assert conn.execute("SELECT major, minor FROM schema_version "
-                                "WHERE owner = 'askproject'").fetchone() == (3, 1)
+                                "WHERE owner = 'askproject'").fetchone() == (3, 2)
             assert conn.execute(
                 "SELECT agent_id, host, target_path, last_session_id FROM "
                 "askproject_premig_m7 ORDER BY last_session_id").fetchall() == [
@@ -448,3 +448,40 @@ def test_a_store_at_2_0_crosses_to_node_id_and_minus_c_continues_for_both_caller
     finally:
         with psycopg.connect(STORE_DSN, autocommit=True) as conn:
             conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
+
+
+def test_no_session_is_recorded_for_an_archived_target(lab):
+    """Step 0005 refuses recording a session whose target agent is archived,
+    SQLSTATE 23R01: the ask reads it as `agent_archived`, says so and records
+    nothing, rather than reporting a store failure; restored, it records again."""
+    import psycopg
+    first, _result, _ = lab.ask("--engine", "codex")
+    assert first.returncode == 0, first.stderr
+    target = "7461726765740000"
+    with psycopg.connect(STORE_DSN, autocommit=True) as conn:
+        conn.execute("SET search_path TO agentkit")
+        conn.execute("INSERT INTO agents (id, kind) VALUES (%s, 'agent') "
+                     "ON CONFLICT (id) DO NOTHING", (target,))
+        conn.execute("INSERT INTO agent_nodes (agent_id, node, folder) VALUES (%s, %s, %s) "
+                     "ON CONFLICT DO NOTHING", (target, _here(lab), str(lab.target)))
+    second, _result, _ = lab.ask("--engine", "codex")
+    assert second.returncode == 0, second.stderr
+    assert _stored(lab)[0][7] == 2
+
+    def archive(on: bool) -> None:
+        with psycopg.connect(STORE_DSN, autocommit=True) as conn:
+            conn.execute("SET search_path TO agentkit")
+            conn.execute("UPDATE agents SET archived_at = CASE WHEN %s THEN now() END, "
+                         "archived_by = CASE WHEN %s THEN 'ops@n1' END WHERE id = %s",
+                         (on, on, target))
+
+    archive(True)
+    third, _result, _ = lab.ask("--engine", "codex")
+    said = third.stderr
+    assert "the session was not recorded (agent_archived: agent " in said, said
+    assert "IntegrityError" not in said and "Traceback" not in said
+    assert _stored(lab)[0][7] == 2
+    archive(False)
+    fourth, _result, _ = lab.ask("--engine", "codex")
+    assert fourth.returncode == 0, fourth.stderr
+    assert _stored(lab)[0][7] == 3

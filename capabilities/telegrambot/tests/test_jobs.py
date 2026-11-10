@@ -82,3 +82,28 @@ def test_stop_amend_and_resume_are_asks(register):
     # Another bot's register sees none of it.
     other = jobs.JobRegister(reg.db, "prj_a", "other")
     assert other.get(row["id"]) is None
+
+
+def test_no_job_is_entered_for_an_archived_agent(register):
+    """Step 0009 refuses entering a job of an archived agent, SQLSTATE 23R01,
+    which `archived` reads as nothing to start rather than a failure; a job
+    already entered still moves, and a restore lets it in again."""
+    import psycopg
+    reg, store = register
+    first = reg.register(chat_id=42, requested_by="42", description="make the report",
+                         origin_message_id=7)
+
+    def mark(on: bool) -> None:
+        store.execute("UPDATE agents SET archived_at = CASE WHEN %s THEN now() END, "
+                      "archived_by = CASE WHEN %s THEN 'ops@n1' END WHERE id = 'prj_a'",
+                      (on, on))
+
+    mark(True)
+    with pytest.raises(psycopg.IntegrityError) as refused:
+        reg.register(chat_id=42, requested_by="42", description="second", origin_message_id=8)
+    assert refused.value.sqlstate == "23R01" and s.archived(refused.value)
+    assert not s.archived(RuntimeError("anything else"))
+    assert reg.submit(first["id"])["state"] == "waiting"
+    mark(False)
+    assert reg.register(chat_id=42, requested_by="42", description="second",
+                        origin_message_id=8)["state"] == "draft"

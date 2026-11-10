@@ -121,6 +121,37 @@ class JobsCase(td.DialogueCase):
         return lambda: not runner.live
 
 
+class ArchivedAgent(JobsCase):
+    def test_no_job_is_entered_for_an_archived_agent(self):
+        """Step 0027 refuses entering a job of an archived agent, SQLSTATE 23R01:
+        a job already entered still moves, and a restore lets it in again."""
+        import psycopg
+        _d, runner = self.make_jobs()
+        waiting, _msg = self.submit(runner, text="first")
+
+        def mark(on: bool) -> None:
+            self.db.execute("UPDATE agents SET archived_at = CASE WHEN %s THEN now() END, "
+                            "archived_by = CASE WHEN %s THEN 'ops@n1' END WHERE id = %s",
+                            (on, on, runner.register.project_id))
+
+        mark(True)
+        try:
+            with self.assertRaises(wa._Refusal) as refused:
+                runner.register.register(chat_id=ALICE_JID, requested_by=ALICE,
+                                         description="second", profile="whatsapp-job-claude")
+            self.assertEqual((refused.exception.exit_code, refused.exception.code),
+                             (4, "agent_archived"))
+            self.assertIsInstance(refused.exception.__context__, psycopg.IntegrityError)
+            self.assertEqual(refused.exception.__context__.sqlstate,
+                             wa.AGENT_ARCHIVED_SQLSTATE)
+            self.assertTrue(runner.register.request_stop(waiting["id"]))
+        finally:
+            mark(False)
+        self.assertEqual(runner.register.register(
+            chat_id=ALICE_JID, requested_by=ALICE, description="second",
+            profile="whatsapp-job-claude")["state"], jobs.DRAFT)
+
+
 # ── The tables ──────────────────────────────────────────────────────────────
 
 
@@ -247,8 +278,9 @@ class Migration(td.DialogueCase):
             result = wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
                                 minor=wa.STORE_SCHEMA_MINOR, schema=name)
         self.assertEqual(result.applied, ["0023-agent-names", "0024-prompts",
-                                          "0025-connection-ids", "0026-keys"])
-        self.assertEqual((result.major, result.minor), (2, 3))
+                                          "0025-connection-ids", "0026-keys",
+                                          "0027-unarchived"])
+        self.assertEqual((result.major, result.minor), (2, 4))
         conn.execute(f"SET search_path TO {name}")
         for table in ("whatsapp_register", "whatsapp_jobs", "whatsapp_job_amendments",
                       "whatsapp_job_slots"):
@@ -275,7 +307,8 @@ class Migration(td.DialogueCase):
         a minor; the store upgrade crosses the core's major."""
         import psycopg
         import capabilities_contract.db._migrate as core_migrate
-        old = [s for s in wa.STORE_STEPS if s.id not in ("0025-connection-ids", "0026-keys")]
+        old = [s for s in wa.STORE_STEPS if s.id not in ("0025-connection-ids", "0026-keys",
+                                                         "0027-unarchived")]
         name = f"wa_m2_{uuid.uuid4().hex[:8]}"
         conn = psycopg.connect(_cli.STORE_DSN, autocommit=True)
         self.addCleanup(conn.close)
@@ -307,8 +340,9 @@ class Migration(td.DialogueCase):
         with mock.patch.dict(os.environ, {"CAPABILITIES_STORE_UPGRADE": "1"}):
             result = wa.migrate(conn, "whatsapp", wa.STORE_STEPS, major=wa.STORE_SCHEMA_MAJOR,
                                 minor=wa.STORE_SCHEMA_MINOR, schema=name)
-        self.assertEqual(result.applied, ["0025-connection-ids", "0026-keys"])
-        self.assertEqual((result.major, result.minor), (2, 3))
+        self.assertEqual(result.applied, ["0025-connection-ids", "0026-keys",
+                                          "0027-unarchived"])
+        self.assertEqual((result.major, result.minor), (2, 4))
         conn.execute(f"SET search_path TO {name}")
         ids = dict(conn.execute("SELECT name, id FROM core_premig_connection_names"))
         self.assertEqual(

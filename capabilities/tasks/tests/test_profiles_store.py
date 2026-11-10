@@ -173,7 +173,7 @@ def test_the_librarys_table_is_migrated_first_under_its_own_ledger(lab):
     doctor = ok(cli(lab, "doctor"))
     assert doctor["profile_tables"]["owner"] == "harness"
     assert doctor["profile_tables"]["state"] == "current"
-    assert doctor["tables"]["code"] == {"major": 2, "minor": 1}
+    assert doctor["tables"]["code"] == {"major": 2, "minor": 2}
 
 
 @needs_store

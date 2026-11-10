@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.45,<1",
+#     "capabilities-contract>=0.47,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.12.1",
 #     "pyyaml>=6",
@@ -14543,7 +14543,7 @@ def cmd_service(wanted: str | None, args: list[str]) -> None:
 # callva-harness-runner owns and ships as steps of its own, applied under its own
 # ledger before these, everywhere these are: `_profile_tables` names them.
 STORE_MAJOR = 2
-STORE_MINOR = 1
+STORE_MINOR = 2
 
 _MOVE_FROM_SCHEMA_TASKS = r"""
 DO $move$
@@ -15998,6 +15998,25 @@ END
 $profile$;
 """
 
+# 2.2: nothing starts for an archived agent (core 4.2). The store refuses a raise
+# - every insert of tasks_executions, which reaches its agent through its task -
+# where the task's agent is archived, through the core's one guard,
+# `agents_archived_refuse`, with SQLSTATE 23R01 (`agent_archived`, exit 4).
+# Closing a raise already open stays allowed. A minor step: a release of 2.1
+# reads a store at 2.2 and keeps working for every agent that is not archived.
+_UNARCHIVED = r"""
+create function tasks_executions_unarchived() returns trigger
+ language plpgsql set search_path from current as $guard$
+begin
+ perform agents_archived_refuse((select t.agent_id from tasks_tasks t where t.id = new.task_id));
+ return new;
+end $guard$;
+create trigger tasks_executions_unarchived before insert on tasks_executions
+ for each row execute function tasks_executions_unarchived();
+comment on trigger tasks_executions_unarchived on tasks_executions is
+  'Refuses a raise of a task whose agent is archived; closing one stays allowed.';
+"""
+
 STORE_STEPS = [
     ("0001-move-from-schema-tasks", _MOVE_FROM_SCHEMA_TASKS),
     ("0002-tables", _TABLES_SHAPE),
@@ -16013,6 +16032,7 @@ STORE_STEPS = [
     ("0012-task-node", _TASK_NODE),
     ("0013-agent-names", _AGENT_NAMES),
     _M9Step("0014-keys", _M9_KEYS_SQL, core=(4, 0)),
+    _M9Step("0015-unarchived", _UNARCHIVED, core=(4, 2)),
 ]
 
 
@@ -16179,6 +16199,16 @@ def _guarded(handler, entry, rest) -> None:
              "the store stopped answering: " + " ".join(str(exc).split())[:300],
              f"`{NAME} doctor` proves the store is reachable and the schema is present")
     except psycopg.Error as exc:
+        if getattr(exc, "sqlstate", None) == _db().AGENT_ARCHIVED_SQLSTATE:
+            # Not a store failure: the agent is archived, so nothing starts for
+            # it. Exit 4 as the contract refuses it; a service reading the turn
+            # starts no other for it and nothing tries again.
+            _die(4, "agent_archived",
+                 "the store starts nothing for an archived agent: "
+                 + (exc.diag.message_primary or "").removeprefix("agent_archived: ")
+                 + (f" ({exc.diag.message_detail})" if exc.diag.message_detail else ""),
+                 "Do not restore it yourself — ask the user; `capabilities agent restore` "
+                 "clears the mark. Reading, help, doctor and stopping a service still work.")
         _die(5, "store_error", f"{type(exc).__name__}: {str(exc).strip()}",
              f"`{NAME} doctor` proves the store is reachable and the schema is present")
 

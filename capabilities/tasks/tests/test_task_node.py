@@ -130,11 +130,11 @@ def before_the_node(tmp_path):
     _cli.write_store_setting(tmp_path / "config", schema)
     steps, _major, _minor = mod._tables()
     owner, profile_steps, profile_major, profile_minor = mod._profile_tables()
-    assert [one for one, _sql in steps[-3:-1]] == ["0012-task-node", "0013-agent-names"]
+    assert [one for one, _sql in steps[-4:-2]] == ["0012-task-node", "0013-agent-names"]
     conn = db.connect(application_name="tasks-test", setting=_cli.store_setting(schema))
     try:
         db.migrate(conn, owner, profile_steps, major=profile_major, minor=profile_minor)
-        db.migrate(conn, mod.NAME, steps[:-3], major=1, minor=9)
+        db.migrate(conn, mod.NAME, steps[:-4], major=1, minor=9)
     finally:
         conn.close()
     with psycopg.connect(stored.DSN, autocommit=True) as conn:
@@ -172,7 +172,8 @@ def test_the_step_adds_the_node_leaving_every_task_as_it_was(before_the_node):
     # The step comes with 0013-agent-names, which crosses to 2.0, so only the
     # store upgrade takes them.
     done = ok(cli(lab, "migrate", env={"CAPABILITIES_STORE_UPGRADE": "1"}))
-    assert done["applied"] == ["0012-task-node", "0013-agent-names", "0014-keys"]
+    assert done["applied"] == ["0012-task-node", "0013-agent-names", "0014-keys",
+                               "0015-unarchived"]
     with psycopg.connect(stored.DSN) as conn:
         found = conn.execute(query)
         names = [column.name for column in found.description]
