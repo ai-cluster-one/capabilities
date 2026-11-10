@@ -55,6 +55,12 @@ TYPING_EVERY = 4.0               # sendChatAction lasts about 5 seconds
 HANDOFF_POLL = 1.0
 HANDOFF_GRACE = 8.0
 HANDOFF_MARK = "▶ "
+# What a message the service added to a job, rather than answering it, is
+# marked with: a reaction, so the job's own answer stays the only one.
+AMEND_REACTION = "✍"
+# How many messages the service sent for a job it remembers, so a reply to one
+# of them reaches that job.
+JOB_MESSAGES_KEPT = 500
 VOICE_MARK = "[voice] "
 VOICE_KINDS = ("voice", "video_note", "audio")
 SERVICE_COMMANDS = ("status", "stop", "profiles", "reload", "set", "help")
@@ -536,6 +542,7 @@ class Run:
         self.started = time.time()
         self.handoff: dict | None = None
         self.handed_off = False
+        self.amended: dict | None = None
 
 
 class Dialogue:
@@ -581,6 +588,11 @@ class Dialogue:
         self.signaller: threading.Thread | None = None
         self.reload_waiters: list[dict] = []
         self.jobs = None
+        # (chat, message id) -> job id, for the messages the service sent for a job.
+        self.job_messages: collections.OrderedDict = collections.OrderedDict()
+        # The amendments the service itself staged, per job, so a turn is not
+        # read as having amended a job the service amended beside it.
+        self.service_amended = collections.Counter()
         self.stats = collections.Counter()
         self.update_settings(settings)
 
@@ -777,6 +789,8 @@ class Dialogue:
                 self.store.finish(self.agent_id, self.connection, msg.chat_id,
                                   msg.topic_id or 0, [msg.message_id])
             return verdict
+        if self.route_to_job(job):
+            return verdict
         self.enqueue(job)
         return verdict
 
@@ -797,6 +811,101 @@ class Dialogue:
         if isinstance(job_or_msg, dict):
             return (job_or_msg["chat_id"], job_or_msg["topic_id"] or 0)
         return (job_or_msg.chat_id, job_or_msg.topic_id or 0)
+
+    # -- the chat's jobs -------------------------------------------------------------
+
+    def note_job_message(self, chat, ids, job_id) -> None:
+        """Remember what the service sent for a job, so a reply to it reaches the job."""
+        if not job_id:
+            return
+        with self.lock:
+            for message_id in ids or ():
+                if message_id:
+                    self.job_messages[(int(chat), int(message_id))] = job_id
+            while len(self.job_messages) > JOB_MESSAGES_KEPT:
+                self.job_messages.popitem(last=False)
+
+    def channel_jobs(self, chat, topic, *, actor_id=None) -> list[dict]:
+        """The waiting and running jobs of one chat or topic, as the register holds them."""
+        if self.jobs is None:
+            return []
+        return self.jobs.register.open_jobs(chat, topic or 0, actor_id=actor_id)
+
+    def linked_job(self, job) -> dict | None:
+        """The open job a message is a reply to: its origin message, or a message
+        the service sent for it. Only a job its sender asked for counts."""
+        target = job["msg"].reply_to
+        if not target or self.jobs is None:
+            return None
+        with self.lock:
+            sent_for = self.job_messages.get((int(job["chat_id"]), int(target)))
+        for row in self.channel_jobs(job["chat_id"], job["topic_id"],
+                                     actor_id=str(job["sender_id"])):
+            if row["id"] == sent_for or row.get("origin_message_id") == target:
+                return row
+        return None
+
+    def route_to_job(self, job) -> bool:
+        """A reply to a running or waiting job of its own sender is added to that
+        job and starts no turn, so the job answers it once. Anything else - a
+        voice note still to transcribe, a sender who may not use jobs, a reply to
+        nothing open - goes to a turn as before."""
+        if job.get("voice") or job["msg"].is_bot or \
+                not self.jobs_available(job["role"], job["chat_id"], job["sender_id"]):
+            return False
+        try:
+            row = self.linked_job(job)
+            if row is None:
+                return False
+            text = tail_row(job["msg"], self.policy, {})["text"]
+            staged = self.jobs.register.stage_amendment(row["id"], text,
+                                                        actor_id=str(job["sender_id"]))
+            if staged is None:
+                return False
+            self.service_amended[row["id"]] += 1
+            self.jobs.register.amend(row["id"], actor_id=str(job["sender_id"]))
+        except Exception as exc:
+            self.log(f"{job['chat_id']} #{job['message_id']} not added to a job "
+                     f"({type(exc).__name__}: {exc}); a turn answers it")
+            return False
+        with contextlib.suppress(Exception):
+            self.store.finish(self.agent_id, self.connection, job["chat_id"],
+                              job["topic_id"] or 0, [job["message_id"]])
+        with contextlib.suppress(Exception):
+            self.api.react(job["chat_id"], job["message_id"], AMEND_REACTION)
+        self.stats["added_to_job"] += 1
+        self.log(f"{job['chat_id']} #{job['message_id']} added to job {row['id'][:8]}")
+        return True
+
+    def jobs_state(self, chat, topic) -> list[str]:
+        """The `Channel state` lines naming the chat's open jobs."""
+        if self.jobs is None:
+            return []
+        try:
+            rows = self.channel_jobs(chat, topic)
+        except Exception as exc:
+            return [f"Open jobs here: unknown, the register did not answer ({type(exc).__name__})"]
+        if not rows:
+            return ["Open jobs here: none"]
+        lines = [f"Open jobs here: {len(rows)}, in the register when this turn started"]
+        for row in rows:
+            asker = row.get("requested_by")
+            name = self.policy.name(int(chat), int(asker), str(asker)) \
+                if str(asker or "").isdigit() else asker
+            origin = f", from #{row['origin_message_id']}" if row.get("origin_message_id") else ""
+            lines.append(f"- job {row['id'][:8]} {row['state']}"
+                         f"{', stopping' if row.get('stop_requested') else ''}, asked by "
+                         f"{name}{origin}: {row.get('description') or ''}")
+        return lines
+
+    def amendment_marks(self, chat, topic) -> dict:
+        """Each job of a chat or topic and the amendments it holds, so a turn that
+        adds to one is seen doing so."""
+        if self.jobs is None:
+            return {}
+        rows = self.jobs.register.list(limit=50, chat_id=chat, topic_id=topic or 0)
+        return {row["id"]: int(row.get("amendments") or 0) - self.service_amended[row["id"]]
+                for row in rows}
 
     def enqueue(self, job) -> None:
         """Put one admitted message into its channel: into the batch its sender
@@ -1441,7 +1550,8 @@ class Dialogue:
             handle.write(json.dumps(authority, ensure_ascii=False, indent=2) + "\n")
         return raw
 
-    def outbox_for(self, job, stem: str, progress_after: float) -> Outbox:
+    def outbox_for(self, job, stem: str, progress_after: float,
+                   job_id: str | None = None) -> Outbox:
         path = self.state_dir / "outbox" / f"{stem}-{os.getpid()}-{time.time_ns()}.jsonl"
 
         def send(kind, text, file):
@@ -1452,8 +1562,9 @@ class Dialogue:
                 self.api.send_file(chat, Path(file), caption=text or None, topic_id=topic,
                                    reply_to=reply_to, markdown=True)
             else:
-                self.api.send_text(chat, text, topic_id=topic, reply_to=reply_to,
-                                   markdown=True)
+                sent = self.api.send_text(chat, text, topic_id=topic, reply_to=reply_to,
+                                          markdown=True)
+                self.note_job_message(chat, sent if isinstance(sent, list) else [], job_id)
 
         return Outbox(path, send, progress_after=progress_after)
 
@@ -1523,6 +1634,7 @@ class Dialogue:
             state.append(f"Project: this turn runs in {cwd}")
         if batch.get("gate_reason"):
             state.append(f"Woken by: the reply gate, nobody addressed you ({batch['gate_reason']})")
+        state += self.jobs_state(chat, topic)
         if delegate:
             state.append(f"Jobs command: {wrapper} jobs")
             notice = self.jobs.pause_notice()
@@ -1551,7 +1663,10 @@ class Dialogue:
         call = {"prompt": prompt, "profile": profile, "origin": origin, "cwd": cwd,
                 "environ": env, "extra_env": extra_env, "authority": authority,
                 "timeout": float(channel["worker_timeout"]), "delegate": delegate,
-                "outbox": outbox}
+                "outbox": outbox, "amendment_marks": {}}
+        if delegate:
+            with contextlib.suppress(Exception):
+                call["amendment_marks"] = self.amendment_marks(chat, topic)
         if authority is not None:
             call["authority_file"] = self.write_authority(authority, f"{chat}-{first['message_id']}")
             extra_env["CAPABILITIES_AUTH_CONTEXT"] = call["authority_file"]
@@ -1599,7 +1714,8 @@ class Dialogue:
                 outcome = "stopped"
                 return
             if call["delegate"]:
-                threading.Thread(target=self.watch_handoff, args=(run, ended, first),
+                threading.Thread(target=self.watch_handoff,
+                                 args=(run, ended, first, call["amendment_marks"]),
                                  daemon=True).start()
             result = self.runner_run()(
                 call["prompt"], call["profile"], call["cwd"], session=self.session_fresh(),
@@ -1611,8 +1727,19 @@ class Dialogue:
             if run.handoff is not None:
                 answer = "" if run.handed_off else cut_at_reply_marker(
                     getattr(result, "answer", "") or "")
-                self.say(last, answer or HANDOFF_MARK + run.handoff["description"])
+                sent = self.say(last, answer or HANDOFF_MARK + run.handoff["description"])
+                self.note_job_message(chat, sent, run.handoff.get("id"))
                 outcome = "handed_off"
+                return
+            if run.amended is not None:
+                answer = "" if run.handed_off else cut_at_reply_marker(
+                    getattr(result, "answer", "") or "")
+                if answer:
+                    self.note_job_message(chat, self.say(last, answer), run.amended["id"])
+                else:
+                    with contextlib.suppress(Exception):
+                        self.api.react(last["chat_id"], last["message_id"], AMEND_REACTION)
+                outcome = "added_to_job"
                 return
             if run.stopped:
                 outcome = "stopped"
@@ -1650,7 +1777,10 @@ class Dialogue:
                                   bot_turn=bool(first["msg"].is_bot))
             self.log(f"{chat}{'/' + str(topic) if topic else ''} #{ids[0]} turn {outcome}")
 
-    def watch_handoff(self, run: Run, ended: threading.Event, first) -> None:
+    def watch_handoff(self, run: Run, ended: threading.Event, first, marks=None) -> None:
+        """A turn that submits a job, or adds to one of its chat's jobs, has handed
+        the work over: it is given a short grace to say its line and then ended,
+        and the job's answer is the only one."""
         while not ended.wait(HANDOFF_POLL):
             with contextlib.suppress(Exception):
                 row = self.jobs.register.submitted_from(first["chat_id"],
@@ -1659,7 +1789,15 @@ class Dialogue:
                 if row is not None:
                     run.handoff = row
                     break
-        if run.handoff is None or ended.wait(HANDOFF_GRACE):
+            if marks:
+                with contextlib.suppress(Exception):
+                    now = self.amendment_marks(first["chat_id"], first["topic_id"])
+                    added = [job_id for job_id, count in now.items()
+                             if job_id in marks and count > marks[job_id]]
+                    if added:
+                        run.amended = {"id": added[0]}
+                        break
+        if (run.handoff is None and run.amended is None) or ended.wait(HANDOFF_GRACE):
             return
         run.handed_off = True
         run.cancel.set()
@@ -1685,7 +1823,8 @@ class Dialogue:
         job = {"chat_id": chat, "topic_id": topic or None, "message_id": row.get("origin_message_id"),
                "group": chat < 0, "external": bool(row.get("external")),
                "msg": type("Origin", (), {"is_bot": False})()}
-        outbox = self.outbox_for(job, f"job-{row['id'][:8]}", channel["progress_after"])
+        outbox = self.outbox_for(job, f"job-{row['id'][:8]}", channel["progress_after"],
+                                 job_id=row["id"])
         if self.policy.default("progress_from_stream") and origin.get("harness") == "codex":
             outbox.stream = []
         resumed = bool(row.get("session_id"))

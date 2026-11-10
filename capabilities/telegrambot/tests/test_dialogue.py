@@ -588,6 +588,133 @@ def test_what_a_worker_sends_and_a_job_result_are_rendered(tmp_path):
     assert api.rendered == [True, True, True]
 
 
+class JobRegister:
+    """The job register as the dialogue asks it: open jobs, amendments, handoffs."""
+
+    def __init__(self, rows=()):
+        self.rows = [dict(r) for r in rows]
+        self.amendments: list[tuple] = []
+
+    def open_jobs(self, chat_id=None, topic_id=None, *, actor_id=None, include_drafts=False):
+        return [dict(r) for r in self.rows if r["state"] in ("waiting", "running")
+                and r["chat_id"] == chat_id and r["topic_id"] == topic_id
+                and (actor_id is None or r["requested_by"] == actor_id)]
+
+    def list(self, *, limit=50, chat_id=None, topic_id=None, **_):
+        return [dict(r) for r in self.rows if r["chat_id"] == chat_id and r["topic_id"] == topic_id]
+
+    def stage_amendment(self, job_id, text, *, actor_id=None):
+        row = next(r for r in self.rows if r["id"] == job_id)
+        if actor_id is not None and row["requested_by"] != actor_id:
+            return None
+        row["amendments"] += 1
+        self.amendments.append((job_id, text))
+        return f"amendment-{len(self.amendments)}"
+
+    def amend(self, job_id, *, actor_id=None):
+        return next(r for r in self.rows if r["id"] == job_id)
+
+    def submitted_from(self, chat_id, topic_id, origin_message_id):
+        return None
+
+
+class Jobs:
+    def __init__(self, rows=()):
+        self.register = JobRegister(rows)
+
+    def reachable(self):
+        return True
+
+    def pause_notice(self):
+        return None
+
+    def stop_channel(self, chat_id, topic_id):
+        return False
+
+
+DELEGATING = {"allowed_users": {str(ANN): {"name": "Ann", "role": "supervisor"}},
+              "defaults": {"delegation": "allowed"}}
+
+
+def running_job(**extra):
+    return {"id": "abcdef12-0000-0000-0000-000000000000", "state": "running", "chat_id": ANN,
+            "topic_id": 0, "requested_by": str(ANN), "origin_message_id": 5,
+            "description": "make the quarterly report", "amendments": 0,
+            "stop_requested": False, **extra}
+
+
+def test_a_turn_is_given_its_chats_open_jobs_by_the_service(tmp_path):
+    dialogue, store, api, runner, clock = make(tmp_path)
+    dialogue.jobs = Jobs([running_job()])
+    dialogue.offer_update(update(9, "what is the weather"))
+    drain(dialogue, clock)
+    prompt = runner.calls[0]["prompt"]
+    assert "Open jobs here: 1" in prompt
+    assert "- job abcdef12 running, asked by Ann, from #5: make the quarterly report" in prompt
+    dialogue.jobs = Jobs()
+    dialogue.offer_update(update(10, "and now?"))
+    drain(dialogue, clock)
+    assert "Open jobs here: none" in runner.calls[1]["prompt"]
+
+
+def test_a_reply_to_a_running_job_is_added_to_it_and_no_turn_answers_it(tmp_path):
+    dialogue, store, api, runner, clock = make(tmp_path, DELEGATING)
+    dialogue.jobs = Jobs([running_job()])
+    reg = dialogue.jobs.register
+    # A reply to the message the job came from.
+    dialogue.offer_update(update(9, "only Q3, please", reply_to_message={"message_id": 5}))
+    # A reply to a line the service sent for the job.
+    dialogue.note_job_message(ANN, [700], running_job()["id"])
+    dialogue.offer_update(update(10, "and in euros",
+                                 reply_to_message={"message_id": 700, "from": {"id": BOT}}))
+    drain(dialogue, clock)
+    assert runner.calls == [] and api.sent == []
+    assert reg.amendments == [(running_job()["id"], "only Q3, please"),
+                              (running_job()["id"], "and in euros")]
+    assert api.reactions == [(ANN, 9, d.AMEND_REACTION), (ANN, 10, d.AMEND_REACTION)]
+    assert store.channel("prj_test", "helper", ANN)["last_message_id"] == 10
+    # A message that is about something else is answered while the job runs.
+    dialogue.offer_update(update(11, "what time is it in Tokyo"))
+    drain(dialogue, clock)
+    assert len(runner.calls) == 1 and api.sent[-1]["text"] == "hello there"
+    assert len(reg.amendments) == 2
+
+
+def test_a_reply_to_someone_elses_job_is_not_added_to_it(tmp_path):
+    settings = {"allowed_users": {str(ANN): {"name": "Ann", "role": "supervisor"},
+                                  str(BOB): {"name": "Bob", "role": "supervisor"}},
+                "defaults": {"delegation": "allowed"}}
+    dialogue, store, api, runner, clock = make(tmp_path, settings)
+    dialogue.jobs = Jobs([running_job(chat_id=BOB)])
+    dialogue.offer_update(update(9, "only Q3", sender=BOB, name="Bob", chat=BOB,
+                                 reply_to_message={"message_id": 5}))
+    drain(dialogue, clock)
+    # Bob's chat holds Ann's job; Bob's reply is not Ann's to add, so a turn answers it.
+    assert dialogue.jobs.register.amendments == [] and len(runner.calls) == 1
+
+
+def test_a_turn_that_adds_to_a_job_gives_no_answer_of_its_own(tmp_path, monkeypatch):
+    monkeypatch.setattr(d, "HANDOFF_POLL", 0.01)
+    monkeypatch.setattr(d, "HANDOFF_GRACE", 0.05)
+    holder = {}
+
+    def amends_then_keeps_going(prompt, kwargs):
+        holder["jobs"].register.stage_amendment(running_job()["id"], "make it Q3",
+                                                actor_id=str(ANN))
+        kwargs["cancel"].wait(5)
+        return Result("Here is the whole report again, done by this turn.")
+
+    dialogue, store, api, runner, clock = make(tmp_path, DELEGATING,
+                                               runner=Runner(amends_then_keeps_going))
+    dialogue.jobs = holder["jobs"] = Jobs([running_job()])
+    dialogue.offer_update(update(9, "actually only Q3"))
+    drain(dialogue, clock)
+    assert len(runner.calls) == 1
+    assert api.sent == []                                  # the job answers, not the turn
+    assert api.reactions == [(ANN, 9, d.AMEND_REACTION)]
+    assert dialogue.stats["added_to_job"] == 1
+
+
 def test_parse_command_and_quoting():
     assert d.parse_command("/status", "helper_bot") == ("status", [])
     assert d.parse_command("/set tail 5", "helper_bot") == ("set", ["tail", "5"])

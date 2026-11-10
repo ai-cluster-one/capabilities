@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-10 — A message about a running job reaches the job, and the job answers once
+
+A message that arrived while one of its chat's background jobs ran started a turn of its own beside the job, which knew nothing of the job unless the model asked the register, so the bot could answer the same subject twice. The service now gives every turn the chat's or topic's waiting and running jobs in `Channel state` (`Open jobs here:`, each job's short id, state, who asked, the message it came from and its outcome line). A reply from a job's requester to the message the job came from, or to a line the service sent for the job, is added to that job as an amendment without a turn - a running job continues its session with it, a waiting one starts with it - and is marked with a ✍ reaction. A turn that adds to one of its chat's jobs is ended like a turn that hands work over: its short line stands, nothing else it would say is sent, and a turn cut short leaves a ✍ instead. Any other message is answered while the job runs, as before. No verb, flag, setting or output key changes.
+
 ## 2026-11-10 — `telegrambot` declares its title, Telegram Bot, and its Lucide icon, `bot-message-square`
 
 The manifest carries `title`, `Telegram Bot`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `bot-message-square`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `telegrambot`. Nothing else changes.

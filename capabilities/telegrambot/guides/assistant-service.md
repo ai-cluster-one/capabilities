@@ -76,6 +76,8 @@ A group or a topic can add its own context (`context` in its settings, or `conte
 
 To let turns hand longer work to background jobs, set `defaults.delegation` to `allowed`, or allow it per person or group.
 
+While a job waits or runs, every turn in its chat or topic is told about it, and the job keeps the subject: a reply from the person who asked for it, to the request or to a line the job sent, is added to the job without a turn and marked with ✍, and a turn that adds to a job ends without an answer of its own. Anything else said meanwhile is answered as usual.
+
 ## 6. Start it
 
 On a machine that runs several agents, one process serves every bot of every project that joins it:
