@@ -140,7 +140,7 @@ def job_label(description: Any) -> str:
 # so every comparison and every reader below sees the values it always saw.
 STORE_OWNER = "telegram"
 STORE_SCHEMA_MAJOR = 3
-STORE_SCHEMA_MINOR = 2
+STORE_SCHEMA_MINOR = 3
 # The store's foreign keys (core 4.0): every agent and node column of this
 # owner keyed by what its parent takes with it - owned rows go with it, a
 # record keeps itself and loses the pointer - and its guards admitting the
@@ -641,7 +641,56 @@ STORE_STEPS = (
     COMMENT ON TRIGGER telegram_jobs_unarchived ON telegram_jobs IS
         'Refuses entering a job of an archived agent; moving or ending one stays allowed.';
     """, core=(4, 2)),
+    # 3.3: every change to a job or an amendment is announced (`JOBS_CHANNEL`).
+    # The register's two tables raise the agent's version of the channel in
+    # `schema_channel` and notify the channel with the agent as the payload, so
+    # a runner follows one version instead of reading the tables to find out
+    # whether anything moved, and every writer - a daemon, the CLI, a worker on
+    # another machine - announces without code of its own. A lease moved
+    # forward and nothing else is not announced: nobody acts on it, and the
+    # runner renews its own leases on a cadence. The trigger is deferred to the
+    # commit, so a writer takes the channel's row after every other lock of its
+    # transaction and two writers cannot each hold what the other waits for. A
+    # store without `schema_channel` announces nothing, as the core's own
+    # announcements do. A minor step: a release of 3.2 writes a store at 3.3 and
+    # its writes are announced too.
+    Step("0012-announced", r"""
+    CREATE FUNCTION telegram_jobs_announce() RETURNS trigger
+     LANGUAGE plpgsql AS $announce$
+    DECLARE agent text;
+    BEGIN
+     IF tg_op = 'DELETE' THEN agent := old.agent_id; ELSE agent := new.agent_id; END IF;
+     IF tg_op = 'UPDATE' AND tg_table_name = 'telegram_jobs'
+        AND (to_jsonb(new) - 'lease_expires_at' - 'updated_at')
+            = (to_jsonb(old) - 'lease_expires_at' - 'updated_at') THEN
+      RETURN NULL;
+     END IF;
+     IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN
+      EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version)
+       VALUES (%L, $1, 1) ON CONFLICT (channel, scope) DO UPDATE SET version = c.version + 1',
+       tg_table_schema, 'telegram_jobs') USING agent;
+      PERFORM pg_notify('telegram_jobs', agent);
+     END IF;
+     RETURN NULL;
+    END $announce$;
+    CREATE CONSTRAINT TRIGGER telegram_jobs_announce
+     AFTER INSERT OR UPDATE OR DELETE ON telegram_jobs
+     DEFERRABLE INITIALLY DEFERRED
+     FOR EACH ROW EXECUTE FUNCTION telegram_jobs_announce();
+    CREATE CONSTRAINT TRIGGER telegram_job_amendments_announce
+     AFTER INSERT OR UPDATE OR DELETE ON telegram_job_amendments
+     DEFERRABLE INITIALLY DEFERRED
+     FOR EACH ROW EXECUTE FUNCTION telegram_jobs_announce();
+    COMMENT ON TRIGGER telegram_jobs_announce ON telegram_jobs IS
+        'Raises the agent''s version of channel telegram_jobs in schema_channel and notifies it, at commit; a lease moved forward alone is not announced.';
+    COMMENT ON TRIGGER telegram_job_amendments_announce ON telegram_job_amendments IS
+        'Raises the agent''s version of channel telegram_jobs in schema_channel and notifies it, at commit.';
+    """),
 )
+
+# The channel every change to the register is announced on, scoped by agent:
+# step 0012's triggers raise it, and a runner follows it (`Follower`).
+JOBS_CHANNEL = "telegram_jobs"
 
 
 def archived(exc: BaseException | None) -> bool:

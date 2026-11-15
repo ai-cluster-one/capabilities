@@ -380,6 +380,11 @@ def import_daemon(tmp: Path, service_settings: dict, *,
             module.STORE_SETTING = dataclasses.replace(
                 module.STORE_SETTING, schema=f"tgtest_{uuid.uuid4().hex}")
             register_project(module)
+            # A case reads the register as the daemon does: on the register
+            # thread, after every save handed to it before.
+            stored = module.load_register
+            module.load_register = (
+                lambda daemon=module, stored=stored: daemon.register_blocking(stored))
         else:
             # The register is a table in the store. A case without one keeps
             # it in memory instead, apart from the daemon's own copy as the
@@ -684,14 +689,15 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(), store=True)
             self.addCleanup(daemon.close_job_register)
-            daemon.save_register({"test": {"last_processed_message_id": 7}})
+            # A save is handed to the register thread; its future is the write.
+            daemon.save_register({"test": {"last_processed_message_id": 7}}).result()
             with mock.patch.object(daemon.channels, "write",
                                    side_effect=RuntimeError("store gone")):
-                daemon.save_register({"test": {"last_processed_message_id": 8}})
+                daemon.save_register({"test": {"last_processed_message_id": 8}}).result()
             stored = daemon.channels.rows(daemon._JOB_STORE.conn, daemon._register_scope())
             self.assertEqual(stored["test"]["last_processed_message_id"], 7)
             self.assertEqual(daemon.load_register()["test"]["last_processed_message_id"], 8)
-            daemon.save_register(daemon.load_register())
+            daemon.save_register(daemon.load_register()).result()
             stored = daemon.channels.rows(daemon._JOB_STORE.conn, daemon._register_scope())
             self.assertEqual(stored["test"]["last_processed_message_id"], 8)
 
@@ -1343,7 +1349,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
                 lambda: daemon.load_register()["123"]["last_processed_message_id"] == 92)
 
             def durable_job_succeeded():
-                rows = daemon.job_register().list(limit=1)
+                rows = daemon.register_blocking(lambda: daemon.job_register().list(limit=1))
                 return bool(rows and rows[0]["outcome"] == "succeeded")
 
             await wait_until(durable_job_succeeded)

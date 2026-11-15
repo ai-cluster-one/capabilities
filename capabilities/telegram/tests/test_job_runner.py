@@ -66,8 +66,20 @@ def end_children(children):
 
 
 def job_settings(**overrides):
-    return settings(job_poll_interval=0.05, **overrides)
+    return settings(**{"job_poll_interval": 0.05, **overrides})
 
+
+
+def store_view(case, daemon):
+    """The register as another connection reaches it, closed with the case.
+
+    The daemon's own connection belongs to its register thread, so a case that
+    reads or writes while a session runs does it the way `telegram jobs` and
+    every other process do: on a connection of its own to the same store."""
+    store, register = daemon.jobs.open_register(
+        daemon.PROJECT_CAPABILITIES_DIR, setting=daemon.STORE_SETTING)
+    case.addCleanup(store.close)
+    return register
 
 
 def queued(register, **payload):
@@ -158,7 +170,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                 daemon.STORE_SETTING, schema=f"tgtest_{time.time_ns()}")
             register_project(daemon)
             self.addCleanup(daemon.close_job_register)
-            row = queued(daemon.job_register(), channel_key="123",
+            row = queued(store_view(self, daemon), channel_key="123",
                          requested_by="777", description="on the project's database",
                          engine="stub")
             self.assertEqual(row["description"], "on the project's database")
@@ -166,7 +178,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
     async def test_the_daemon_opens_its_projects_register(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             self.addCleanup(daemon.close_job_register)
             self.assertEqual(register.surface, "telegram")
             self.assertIsNotNone(register.project_id)
@@ -339,7 +351,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
                 item.get("text") == "the ledger is reconciled"
                 for item in client.sent), timeout=6)
 
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             rows = register.list()
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["state"], daemon.jobs.STOPPED)
@@ -360,7 +372,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(
                 td, delegation={"mode": "allowed"})
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                                     description="reconcile the ledger",
                                     engine="stub")
@@ -440,7 +452,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             mine = queued(register, channel_key="123", requested_by="777",
                                      description="mine", engine="stub")
             elsewhere = queued(register, channel_key="999", requested_by="777",
@@ -475,7 +487,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             for label in ("first", "second", "third"):
                 queued(register, channel_key="123", requested_by="777",
                                   description=label, engine="stub")
@@ -503,6 +515,151 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             await wait_until(lambda: len(started) == 3, timeout=8)
             self.assertEqual(started, ["first", "second", "third"])
             await self.stop_session(client, task)
+
+    # -- the register never holds the loop, and is followed, not polled -------
+
+    @staticmethod
+    def listening():
+        """How many sessions of the store listen on the register's channel."""
+        import psycopg
+        with psycopg.connect(STORE_DSN, autocommit=True) as conn:
+            return conn.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE query = %s",
+                ('LISTEN "telegram_jobs"',)).fetchone()[0]
+
+    async def test_a_runner_tick_never_holds_the_event_loop(self):
+        """The register is a round trip away, and the loop carries the calls'
+        audio. With every statement the register sends taking 300 ms, a ticker
+        on the same loop keeps its 10 ms beat while the runner claims, runs and
+        lands a job: the register's work is all on its own thread."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            register = store_view(self, daemon)
+            row = queued(register, channel_key="123", requested_by="777",
+                         description="far from the store", engine="stub")
+            real = daemon.jobs.JobStore._execute
+
+            def far(store, sql, params=()):
+                if daemon.on_register_thread():
+                    time.sleep(0.3)
+                return real(store, sql, params)
+
+            self.enterContext(mock.patch.object(daemon.jobs.JobStore, "_execute", far))
+            loop = asyncio.get_running_loop()
+            gaps, beating = [], asyncio.Event()
+
+            async def ticker():
+                last = loop.time()
+                while not beating.is_set():
+                    await asyncio.sleep(0.01)
+                    now = loop.time()
+                    gaps.append(now - last)
+                    last = now
+
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            beat = asyncio.create_task(ticker())
+            await wait_until(
+                lambda: register.get(row["id"])["outcome"] == daemon.jobs.SUCCEEDED,
+                timeout=60)
+            beating.set()
+            await beat
+            self.assertGreater(len(gaps), 100, "the ticker ran while the runner worked")
+            self.assertLess(max(gaps), 0.05,
+                            f"the loop was held for {max(gaps) * 1000:.0f} ms")
+            await self.stop_session(client, task)
+
+    async def test_an_idle_runner_reads_no_table(self):
+        """When nothing moved, a tick reads the channel's version and nothing
+        else: no statement of the register's own reaches the store between
+        the duties that fall due by time."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td)
+            self.addCleanup(daemon.close_job_register)
+            statements = []
+            real = daemon.jobs.JobStore._execute
+
+            def counted(store, sql, params=()):
+                if daemon.on_register_thread():
+                    statements.append(sql)
+                return real(store, sql, params)
+
+            self.enterContext(mock.patch.object(daemon.jobs.JobStore, "_execute", counted))
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(lambda: any("register ready" in line
+                                         for line in daemon._test_logs))
+            await asyncio.sleep(0.5)
+            statements.clear()
+            await asyncio.sleep(1.0)
+            self.assertEqual(statements, [],
+                             "an idle runner polled at 50 ms and read no table")
+            await self.stop_session(client, task)
+
+    async def test_with_one_address_a_queued_job_is_taken_within_the_poll(self):
+        """The store setting names one address, so nothing listens: the runner
+        polls the channel's version every `job_poll_interval` and takes a job
+        another process queued within that interval."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td, job_poll_interval=0.5)
+            self.addCleanup(daemon.close_job_register)
+            self.assertFalse(daemon.STORE_SETTING.has_transaction_address)
+            loop = asyncio.get_running_loop()
+            taken = []
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                taken.append(loop.time())
+                return successful_result("done")
+
+            daemon.WORKERS["stub"] = worker
+            before = self.listening()
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await asyncio.sleep(1.2)
+            queued_at = loop.time()
+            queued(store_view(self, daemon), channel_key="123", requested_by="777",
+                   description="queued elsewhere", engine="stub")
+            await wait_until(lambda: taken, timeout=5)
+            self.assertLess(taken[0] - queued_at, 0.5 + 1.0)
+            self.assertEqual(self.listening(), before, "one address: nothing listens")
+            await self.stop_session(client, task)
+
+    async def test_with_a_session_address_a_queued_job_wakes_the_runner(self):
+        """Where the store names its two addresses apart, the runner also
+        listens on the channel, so a job another process queues is taken as
+        soon as its commit is notified, long before the next poll."""
+        from urllib.parse import urlparse
+        with tempfile.TemporaryDirectory() as td:
+            daemon = self.daemon_with_store(td, job_poll_interval=30)
+            self.addCleanup(daemon.close_job_register)
+            daemon.STORE_SETTING = dataclasses.replace(
+                daemon.STORE_SETTING, transaction_port=urlparse(STORE_DSN).port or 5432)
+            self.assertTrue(daemon.STORE_SETTING.has_transaction_address)
+            loop = asyncio.get_running_loop()
+            taken = []
+
+            def worker(_chat, _tail, state=None, _procs=None):
+                taken.append(loop.time())
+                return successful_result("done")
+
+            daemon.WORKERS["stub"] = worker
+            before = self.listening()
+            client = FakeClient([])
+            task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            await wait_until(lambda: self.listening() > before, timeout=10)
+            queued_at = loop.time()
+            queued(store_view(self, daemon), channel_key="123", requested_by="777",
+                   description="queued elsewhere", engine="stub")
+            await wait_until(lambda: taken, timeout=10)
+            self.assertLess(taken[0] - queued_at, 3.0,
+                            "taken on the notification, not at the 30 s poll")
+            await self.stop_session(client, task)
+            await wait_until(lambda: self.listening() == before, timeout=5)
 
     async def test_a_store_connection_ended_under_the_runner_is_reopened(self):
         """The store or the network ends the register's connection while the
@@ -554,7 +711,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td, profile="telegram-codex")
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             queued(register, channel_key="123", requested_by="777",
                               description="the stub one", engine="stub")
             seen = []
@@ -579,7 +736,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td, profile="telegram-codex")
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             queued(register, channel_key="123", requested_by="777",
                               description="pinned model", engine="codex",
                               model="gpt-pinned")
@@ -604,7 +761,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         daemon = self.daemon_with_store(td, profile="telegram-claude")
         self.addCleanup(daemon.close_job_register)
         self.enterContext(held(daemon, specs))
-        register = daemon.job_register()
+        register = store_view(self, daemon)
         job = queued(register, channel_key="123", requested_by="777",
                      description="the work", **row)
         fake = FakeHarness(answer="done", session_id="sess-1")
@@ -670,7 +827,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             queued(register, channel_key="123", requested_by="777",
                               description="reconcile the ledger", engine="stub")
 
@@ -695,7 +852,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             queued(register, channel_key="123", requested_by="777",
                               description="reconcile the ledger", engine="stub")
 
@@ -727,7 +884,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                                     description="send the table",
                                     engine="claude")
@@ -767,7 +924,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = import_daemon(Path(td), job_settings(), store=True,
                                    job_worker=template)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             queued(register, channel_key="123", requested_by="777",
                               description="compare the two ledgers",
                               engine="stub")
@@ -805,7 +962,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                                     description="durable delivery", engine="stub")
             runs = []
@@ -848,7 +1005,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(
                 td, delegation={"mode": "allowed"})
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                                     description="reconcile the ledger",
                                     engine="stub")
@@ -909,7 +1066,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         session the first attempt checkpointed while it ran."""
         daemon = self.daemon_with_store(td)
         self.addCleanup(daemon.close_job_register)
-        register = daemon.job_register()
+        register = store_view(self, daemon)
         row = queued(register, channel_key="123", requested_by="777",
                      description="reconcile the ledger", engine="claude")
         register.stage_amendment(row["id"], "use the March export")
@@ -997,7 +1154,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                                     description="do not start", engine="stub")
             before_popen = asyncio.Event()
@@ -1038,7 +1195,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             blocker = queued(register, channel_key="123", requested_by="777",
                                         description="the long one", engine="stub")
             victim = queued(register, channel_key="123", requested_by="777",
@@ -1081,7 +1238,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             victim = queued(register, channel_key="123", requested_by="777",
                             description=brief, engine="stub")
             store, cli = self.as_cli(daemon)
@@ -1106,7 +1263,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                                     description="the long one", engine="stub")
             runs = []
@@ -1169,7 +1326,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             first = queued(register, channel_key="123", requested_by="777",
                                       description="first", engine="codex")
             second = queued(register, channel_key="123", requested_by="777",
@@ -1200,7 +1357,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
             daemon.QUOTA_RESET_MARGIN_SECONDS = 0.0
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                          description="first", engine="codex")
             fake = FakeHarness(ok=False, kind="quota", answer="",
@@ -1239,7 +1396,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         daemon = import_daemon(Path(td), supervised, store=True)
         self.assertEqual(daemon.STORE_SETTING.url, STORE_DSN)
         self.addCleanup(daemon.close_job_register)
-        register = daemon.job_register()
+        register = store_view(self, daemon)
         row = queued(register, channel_key="123", requested_by="777",
                                 description="reconcile the ledger",
                                 engine="codex", model=REFUSED_MODEL)
@@ -1315,7 +1472,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                                     description="interrupted work", engine="stub")
             running = register.claim_next(
@@ -1355,7 +1512,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = self.daemon_with_store(td)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             row = queued(register, channel_key="123", requested_by="777",
                                     description="survive the restart", engine="stub")
             runs = []
@@ -1382,7 +1539,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(register.get(row["id"])["session_id"], "thread-1")
 
             await self.stop_session(first_client, first)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             interrupted = register.get(row["id"])
             self.assertEqual(interrupted["state"], daemon.jobs.WAITING)
             self.assertIsNone(interrupted["outcome"])
@@ -1415,7 +1572,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
         one per durable job where a dialogue turn accumulates one per message."""
         daemon = self.daemon_with_store(td)
         self.addCleanup(daemon.close_job_register)
-        register = daemon.job_register()
+        register = store_view(self, daemon)
         row = queued(register, channel_key="123", requested_by="777",
                      description="the job", engine="stub")
         daemon.WORKERS["stub"] = worker
@@ -1490,7 +1647,7 @@ class JobRunnerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(seen)
             # The session's own register went with the session; this is the
             # reopened one, exactly as a restart reads the row.
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             self.assertEqual(register.get(row["id"])["state"], daemon.jobs.WAITING)
             self.assertEqual(self.left_behind(daemon), [])
 
@@ -1671,7 +1828,7 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), self.call_settings(), store=True)
             self.addCleanup(daemon.close_job_register)
-            register = daemon.job_register()
+            register = store_view(self, daemon)
             # What a daemon that died mid-call leaves behind: a call's row,
             # running under its owner, with a checkpoint the queue could resume.
             draft = register.register(
@@ -1787,7 +1944,7 @@ class StreamProgressJobTests(unittest.IsolatedAsyncioTestCase):
     async def run_codex_job(self, td, worker, **overrides):
         daemon = import_daemon(Path(td), job_settings(**overrides), store=True)
         self.addCleanup(daemon.close_job_register)
-        register = daemon.job_register()
+        register = store_view(self, daemon)
         row = queued(register, channel_key="123", requested_by="777",
                      description="reconcile the ledger", engine="codex")
         daemon.WORKERS["codex"] = worker

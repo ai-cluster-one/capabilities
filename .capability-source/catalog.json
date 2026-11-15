@@ -1151,13 +1151,13 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "d5b352e42bfd15b5dd4f48de0d3e1c1b176944cc1acddeb7507e4fa128fc4da1",
+      "payload_sha256": "8c2cd67928b0be28119e070f4d4c7d5b62fc4294e38124b879d6485ccf568062",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
       "tier": "standard",
       "title": "Telegram",
-      "version": "2026-11-16 — The telegram service installs on a machine that never had ntgcalls 3.0.3"
+      "version": "2026-11-16 — Calls no longer stutter: the job register never runs on the event loop, and the runner is woken by changes, at telegram 3.3"
     },
     "telegrambot": {
       "executable": [
