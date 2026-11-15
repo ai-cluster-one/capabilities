@@ -1074,12 +1074,12 @@
       ],
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "1f3df8389d74923e65c1a7059c7d97925bde17a59935a4b7dea55e482ee57efd",
+      "payload_sha256": "47a21d49d77e0e9ee9506b3cc92610ed779c773d9c25af35a217acaacabd3034",
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
       "tier": "standard",
       "title": "Telegram",
-      "version": "2026-11-15 — A GPT Live call speaks in real time, without a growing delay"
+      "version": "2026-11-15 — Calls no longer stutter: the job register never runs on the event loop, and the runner is woken by changes, at telegram 3.3"
     },
     "telegrambot": {
       "executable": [

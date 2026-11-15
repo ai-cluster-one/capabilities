@@ -161,6 +161,96 @@ class RegisterCase(unittest.TestCase):
         mark(False)
         self.assertEqual(self.register()["state"], jobs.WAITING)
 
+    # -- the register announces its changes ------------------------------------
+
+    def channel_version(self, store=None):
+        row = (store or self.store)._execute(
+            "SELECT version FROM schema_channel WHERE channel = ? AND scope = ?",
+            (jobs.JOBS_CHANNEL, self.reg.project_id)).fetchone()
+        return row[0] if row else 0
+
+    @staticmethod
+    def announcing_triggers(store):
+        return sorted(row[0] for row in store._execute(
+            "SELECT t.tgname FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+            "WHERE c.relnamespace = current_schema()::regnamespace "
+            "AND t.tgname LIKE ? AND NOT t.tgisinternal", ("%announce",)).fetchall())
+
+    def test_every_write_to_a_job_or_an_amendment_raises_the_channel_version(self):
+        """Step 0012 announces every change a runner acts on, whoever writes
+        it: an insert, a stop asked for, an amendment staged, each from
+        another connection, raises this agent's version of the channel and
+        notifies it with the agent as the payload. A lease moved forward and
+        nothing else is not a change anybody acts on, and is not announced."""
+        from capabilities_contract.db import Follower, connect
+        self.assertEqual(self.announcing_triggers(self.store),
+                         ["telegram_job_amendments_announce", "telegram_jobs_announce"])
+        cli_store, cli = self.open()
+        self.addCleanup(cli_store.close)
+        listener = connect(application_name="telegram", setting=self.setting)
+        self.addCleanup(listener.close)
+        listener.autocommit = True
+        listener.execute(f'LISTEN "{jobs.JOBS_CHANNEL}"')
+        follower = Follower([(jobs.JOBS_CHANNEL, self.reg.project_id)],
+                            application_name="telegram", setting=self.setting)
+        follower.poll(self.store.conn)
+
+        seen = self.channel_version()
+        row = self.register(reg=cli)
+        self.assertGreater(self.channel_version(), seen, "an insert is announced")
+        # The insert and the submit are two commits, each notified.
+        notified = list(listener.notifies(timeout=2, stop_after=1))
+        self.assertEqual({n.payload for n in notified}, {self.reg.project_id})
+        self.assertEqual(list(follower.poll(self.store.conn)),
+                         [(jobs.JOBS_CHANNEL, self.reg.project_id)])
+
+        seen = self.channel_version()
+        cli.request_stop(row["id"])
+        self.assertGreater(self.channel_version(), seen, "a stop asked for is announced")
+        cli.resume(row["id"])
+
+        seen = self.channel_version()
+        self.assertIsNotNone(cli.stage_amendment(row["id"], "and the second ledger"))
+        self.assertGreater(self.channel_version(), seen, "an amendment is announced")
+
+        claimed = cli.claim_next(owner_id="daemon", owner_host="host", max_parallel=1)
+        self.assertEqual(claimed["id"], row["id"])
+        self.assertTrue(follower.poll(self.store.conn), "the claim moved the channel")
+        seen = self.channel_version()
+        self.assertTrue(cli.renew(claimed["id"], claimed["attempt_token"], "daemon"))
+        self.assertEqual(self.channel_version(), seen, "a renewed lease is not announced")
+        self.assertEqual(follower.poll(self.store.conn), {})
+
+    def test_the_announcing_step_applies_to_a_store_at_3_2(self):
+        """A store a release of 3.2 left takes step 0012 as a minor step, with
+        its rows as they were, and is announced from then on."""
+        from capabilities_contract.db import connect, migrate
+        older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m32")
+        conn = connect(application_name="telegram", setting=older)
+        self.addCleanup(conn.close)
+        steps = [step for step in jobs.STORE_STEPS if _step_id(step) != "0012-announced"]
+        migrate(conn, jobs.STORE_OWNER, steps, major=3, minor=2)
+        register_agents(conn, self.project_id)
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO telegram_jobs (id, agent_id, surface, channel_key, "
+                        "requested_by, description, engine, state, created_at, updated_at) "
+                        "VALUES ('old-1', %s, 'telegram', '123', '42', 'from 3.2', 'codex', "
+                        "'waiting', '2026-11-14T00:00:00Z', '2026-11-14T00:00:00Z')",
+                        (self.project_id,))
+        conn.commit()
+
+        store, reg = jobs.open_register(self.envelope, setting=older)
+        self.addCleanup(store.close)
+        version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
+                                 (jobs.STORE_OWNER,)).fetchone()
+        self.assertEqual(tuple(version), (3, 3))
+        self.assertEqual(self.announcing_triggers(store),
+                         ["telegram_job_amendments_announce", "telegram_jobs_announce"])
+        self.assertEqual(reg.get("old-1")["description"], "from 3.2")
+        self.assertEqual(self.channel_version(store), 0)
+        reg.request_stop("old-1")
+        self.assertEqual(self.channel_version(store), 1)
+
     # -- the channel a job reports into --------------------------------------
 
     def test_the_register_is_keyed_by_the_id_the_launcher_resolved(self):
@@ -218,7 +308,7 @@ class RegisterCase(unittest.TestCase):
         registered without one keeps none, and a store at the earlier version
         takes the step without losing a row."""
         self.assertEqual([_step_id(step) for step in jobs.STORE_STEPS][3], "0004-job-profile")
-        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (3, 2))
+        self.assertEqual((jobs.STORE_SCHEMA_MAJOR, jobs.STORE_SCHEMA_MINOR), (3, 3))
         with_profile = self.register(engine="claude", profile="telegram-fast")
         without = self.register(engine="codex", model="gpt-5.5")
         self.assertEqual(self.reg.get(with_profile["id"])["profile"], "telegram-fast")
@@ -372,7 +462,7 @@ class RegisterCase(unittest.TestCase):
         old = [step for step in jobs.STORE_STEPS
                if _step_id(step) not in ("0007-one-register", "0008-agent-names",
                                          "0009-connection-ids", "0010-keys",
-                                         "0011-unarchived")]
+                                         "0011-unarchived", "0012-announced")]
         older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m1")
         conn = connect(application_name="telegram", setting=older)
         self.addCleanup(conn.close)
@@ -415,7 +505,7 @@ class RegisterCase(unittest.TestCase):
         self.assertEqual(reg.pending_amendment("old-1"), ["more"])
         version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
                                  (jobs.STORE_OWNER,)).fetchone()
-        self.assertEqual(tuple(version), (3, 2))
+        self.assertEqual(tuple(version), (3, 3))
         for table in ("telegram_jobs", "telegram_job_amendments", "telegram_job_slots",
                       "telegram_prompt_versions", "telegram_channels"):
             rows = store._execute(f"SELECT agent_id FROM {table}").fetchall()
@@ -455,7 +545,7 @@ class RegisterCase(unittest.TestCase):
         from capabilities_contract.db import DbError, connect, deleting, migrate
         old = [step for step in jobs.STORE_STEPS
                if _step_id(step) not in ("0009-connection-ids", "0010-keys",
-                                         "0011-unarchived")]
+                                         "0011-unarchived", "0012-announced")]
         older = dataclasses.replace(self.setting, schema=f"{self.setting.schema}_m2")
         conn = connect(application_name="telegram", setting=older)
         self.addCleanup(conn.close)
@@ -494,7 +584,7 @@ class RegisterCase(unittest.TestCase):
         self.addCleanup(store.close)
         version = store._execute("SELECT major, minor FROM schema_version WHERE owner = ?",
                                  (jobs.STORE_OWNER,)).fetchone()
-        self.assertEqual(tuple(version), (3, 2))
+        self.assertEqual(tuple(version), (3, 3))
         ids = dict(store._execute(
             "SELECT name, id FROM core_premig_connection_names").fetchall())
         self.assertEqual(set(ids), {"work", "personal", "tasks"})

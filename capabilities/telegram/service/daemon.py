@@ -97,6 +97,7 @@ each turn. The register holds only what Telegram doesn't — the watermark and t
 per-channel /set overrides.
 """
 import asyncio
+import concurrent.futures
 import contextlib
 import copy
 import fcntl
@@ -556,7 +557,7 @@ _PROMPT_LAST = {}
 _PROMPT_OUTAGE_SAID = False
 # Prompts are read by the event loop and by the threads that build a worker's
 # turn, so their connection is their own rather than the register's, which
-# belongs to the loop, and one reader at a time uses it.
+# belongs to the register thread, and one reader at a time uses it.
 _PROMPT_LOCK = threading.Lock()
 
 
@@ -634,16 +635,20 @@ JOB_OWNER_ID = f"{JOB_OWNER_HOST}:{os.getpid()}:{time.time_ns()}"
 # The owner a call's task runs under: this daemon, outside the runner's slots.
 VOICE_OWNER_ID = jobs.direct_owner(JOB_OWNER_ID)
 JOB_LEASE_SECONDS = 30.0
+# How many finished jobs' results one tick leases for sending.
+JOB_DELIVERY_BATCH = 20
 
 
 def job_register():
     """The job register this daemon drains, opened once.
 
-    The connection belongs to the thread that opened it, which is the event
-    loop: every read and write below happens there, and the workers that do the
-    long work never touch it. A connection the store or the network has ended
-    is dropped here and a new one opened, so a store that comes back is used
-    again without waiting for the Telegram session to end.
+    The register is called on the register thread and nowhere else: the event
+    loop awaits it with `in_register` or `on_register`, and a worker's thread
+    hands it a write with `submit_register`, so a round trip to the store never
+    holds the loop that carries Telegram, the calls and their audio. One thread
+    also keeps every call in the order it was made. A connection the store or
+    the network has ended is dropped here and a new one opened, so a store that
+    comes back is used again without waiting for the Telegram session to end.
     """
     global _JOB_STORE, _JOB_REGISTER
     if _JOB_STORE is not None and _JOB_STORE.lost():
@@ -663,6 +668,113 @@ def close_job_register():
         with contextlib.suppress(Exception):
             _JOB_STORE.close()
     _JOB_STORE, _JOB_REGISTER = None, None
+
+
+# THE REGISTER THREAD
+# ===================
+# The register's store is a round trip away - tens of milliseconds to a shared
+# Postgres - and the event loop carries Telegram, the calls and the audio they
+# pump every 10 ms. So the register has a thread of its own, one worker that
+# runs every call in the order it was submitted, and the loop only ever waits
+# for it with `await`. Nothing on the loop touches the register's connection:
+# that is the rule, and it holds by there being no other way to reach it.
+_REGISTER_THREAD = threading.local()
+
+
+def _mark_register_thread():
+    _REGISTER_THREAD.here = True
+
+
+def on_register_thread() -> bool:
+    return bool(getattr(_REGISTER_THREAD, "here", False))
+
+
+_REGISTER_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="telegram-register",
+    initializer=_mark_register_thread)
+# The runner's wait for the register to move blocks for up to a poll interval,
+# on a listener where there is one, so it has a thread of its own: neither the
+# loop nor the register thread, whose calls must not queue behind it.
+_REGISTER_WAIT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="telegram-register-wait")
+
+
+def _submit_register(fn, args, kwargs, *, watched):
+    def call():
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if not watched:
+                log(f"register: {getattr(fn, '__name__', 'call')} failed: "
+                    f"{_short_error(exc)}")
+            raise
+    return _REGISTER_EXECUTOR.submit(call)
+
+
+def submit_register(fn, *args, **kwargs):
+    """Queue `fn(*args, **kwargs)` on the register thread and answer its
+    future, for a write whose answer nobody waits for. It runs after every
+    call submitted before it; one that fails is logged, since nobody else
+    reads it."""
+    return _submit_register(fn, args, kwargs, watched=False)
+
+
+async def in_register(fn, *args, **kwargs):
+    """`fn(*args, **kwargs)` run on the register thread, awaited from the loop.
+
+    A task cancelled while it waits stops waiting, and the call still runs: a
+    write that was asked for lands, and in its place in the order."""
+    landing = asyncio.wrap_future(_submit_register(fn, args, kwargs, watched=True))
+    try:
+        return await asyncio.shield(landing)
+    except asyncio.CancelledError:
+        # Nobody reads its answer now; its failure is still taken, not left
+        # for asyncio to report as never retrieved.
+        landing.add_done_callback(lambda done: done.cancelled() or done.exception())
+        raise
+
+
+def register_blocking(fn, *args, **kwargs):
+    """`fn(*args, **kwargs)` on the register thread, for a caller that is not
+    the event loop and may wait: a worker's thread, or the register thread
+    itself, which runs it at once."""
+    if on_register_thread():
+        return fn(*args, **kwargs)
+    return _submit_register(fn, args, kwargs, watched=True).result()
+
+
+class _OnRegister:
+    """The register's methods, each an awaitable run on the register thread:
+    `await on_register.stop(job_id, ...)` is `job_register().stop(job_id, ...)`
+    off the loop."""
+
+    def __getattr__(self, name):
+        async def call(*args, **kwargs):
+            return await in_register(
+                lambda: getattr(job_register(), name)(*args, **kwargs))
+        call.__name__ = name
+        return call
+
+
+on_register = _OnRegister()
+
+
+def job_follower():
+    """What the runner follows to learn that the register moved: this
+    project's version of `jobs.JOBS_CHANNEL`, which every write to a job or an
+    amendment raises (step 0012), read in one query on the register's own
+    connection. Only where the store setting names a session address apart
+    does it also listen, so a write wakes the runner before its next poll."""
+    from capabilities_contract.db import Follower
+    return Follower([(jobs.JOBS_CHANNEL, job_register().project_id)],
+                    application_name=jobs.STORE_OWNER, setting=STORE_SETTING)
+
+
+def poll_job_follower(follower):
+    """The followed versions that moved since the last poll, on the register
+    thread and the register's connection."""
+    job_register()
+    return follower.poll(_JOB_STORE.conn)
 
 
 def _read_project_layout(reload_file=False):
@@ -3378,9 +3490,10 @@ def _delivery_description(reply_to, is_direct):
 # --- register (dynamic state: watermark + per-channel /set overrides) ---------
 # The register is one row per channel in `telegram_channels` (`channels.py`),
 # for this project and connection, written through the job
-# register's connection, which belongs to the event loop as every caller here
-# does. `register.json` under the service state dir held it before; a node
-# carries that file into the store once and never writes it again.
+# register's connection on the register thread: `load_register` runs there, and
+# `save_register` hands it a copy of the register to write. `register.json`
+# under the service state dir held it before; a node carries that file into
+# the store once and never writes it again.
 # What the store holds of each row, as this daemon last read or wrote it, so a
 # save writes only the rows that changed since.
 _REGISTER_STORED = {}
@@ -3433,7 +3546,8 @@ def load_register():
     """The register the store holds for this project and connection, after
     carrying in a `register.json` not yet imported. Where a save could not
     reach the store, the register it could not write is served
-    instead: this daemon holds the service, so its copy is the newer one."""
+    instead: this daemon holds the service, so its copy is the newer one.
+    Run on the register thread, after every save handed to it before."""
     global _REGISTER_STORED
     if _REGISTER_UNSAVED is not None:
         return copy.deepcopy(_REGISTER_UNSAVED)
@@ -3446,6 +3560,13 @@ def load_register():
 
 
 def save_register(reg):
+    """Hand the register thread `reg` as it stands now, to write; answers the
+    write's future. The loop goes on at once, and the writes land in the order
+    they were saved."""
+    return submit_register(_write_register, copy.deepcopy(reg))
+
+
+def _write_register(reg):
     """Write the rows of `reg` that changed since the store last held them, in
     one transaction, so a job leaving its row and the watermark passing it are
     one commit. A store that does not answer keeps them for the next save,
@@ -5399,14 +5520,15 @@ def harness_run(prompt, profile, cwd, **kwargs):
     return profiles.runner().run(prompt, profile, cwd, **kwargs)
 
 
-def turn_profiles():
-    """The profiles a turn may resolve against: every active version this
-    project reaches in the store, and the project id they were read for.
+# The profiles as the register thread last read them for a turn on the loop.
+_TURN_PROFILES = ([], None)
 
-    Read on the event loop, which owns the register's connection, once per
-    turn, so a profile saved a moment ago is the one the next turn runs on. A
-    store that cannot be read leaves the bundled profiles, which is what a
-    turn reaches without one."""
+
+def _read_turn_profiles():
+    """Every active profile version this project reaches in the store, and the
+    project id they were read for; on the register thread. A store that
+    cannot be read leaves the bundled profiles, which is what a turn reaches
+    without one."""
     try:
         register = job_register()
         return (profiles.stored(_JOB_STORE.conn, register.project_id, STORE_SETTING.schema),
@@ -5415,6 +5537,26 @@ def turn_profiles():
         log(f"profiles: store not read, a turn resolves among the bundled profiles: "
             f"{_short_error(exc)}")
         return [], None
+
+
+async def refresh_turn_profiles():
+    """Read the profiles on the register thread for the turn about to start,
+    so a profile saved a moment ago is the one the next turn runs on. Every
+    loop-side entry to a turn, a command or a reload awaits it first."""
+    global _TURN_PROFILES
+    _TURN_PROFILES = await in_register(_read_turn_profiles)
+
+
+def turn_profiles():
+    """The profiles a turn may resolve against, and the project id they were
+    read for. On the event loop it is what `refresh_turn_profiles` last read,
+    since the loop never waits on the store; any other thread reads them now,
+    on the register thread."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return register_blocking(_read_turn_profiles)
+    return _TURN_PROFILES
 
 
 def resolve_turn_profile(name):
@@ -5835,8 +5977,8 @@ def worker_turn(loop, worker, key, tail, state, procs):
         # whatever the turn would otherwise have run.
         run_worker = worker_harness
     elif run_worker is worker_harness and "profile" not in state:
-        # Resolved here, on the loop, where the store's connection lives: a
-        # profile saved a moment ago is the one this turn runs on.
+        # Resolved here, on the loop, among the profiles the turn's entry read
+        # before it started: a profile saved a moment ago is the one it runs on.
         name = (state.get("settings") or {}).get("profile") or profiles.PREFIX + str(worker)
         state["profile"] = resolve_turn_profile(name)
 
@@ -6669,7 +6811,7 @@ async def run_session(client):
     _log_skipped_routes(SKIPPED_ROUTES.values())
     write_health(routes=routes)
 
-    reg = load_register()
+    reg = await in_register(load_register)
     if migrate_register(reg):
         save_register(reg)
     recovered = _recover_incomplete_jobs(reg)
@@ -7168,6 +7310,7 @@ async def run_session(client):
         job["started_at"] = now()
         job["attempts"] = current_attempts + 1
         save_register(reg)
+        await refresh_turn_profiles()
         s, turn_profile = settings_on_profile(s)
 
         proc_key = proc_key_for(key, job)
@@ -7219,6 +7362,7 @@ async def run_session(client):
             if authority is not None:
                 authority_context = write_authority_context(
                     authority, f"{key}-{job.get('message_id')}")
+            register_reachable = await jobs_available()
             state = {"now": now_display(), "chat_id": job.get("chat_id") or base_chat_id,
                      "channel_key": key, "connection": CONNECTION,
                      "chat_type": "private" if is_direct else "group",
@@ -7238,7 +7382,7 @@ async def run_session(client):
                      "authority": authority,
                      "authority_context": authority_context,
                      "progress_outbox": str(progress_outbox),
-                     "jobs_available": (jobs_available() and _delegation_allowed(
+                     "jobs_available": (register_reachable and _delegation_allowed(
                          group_policy, job.get("sender_id"))),
                      "quota_pause": quota_pause_notice(),
                      "worker_session": worker_session,
@@ -7696,6 +7840,7 @@ async def run_session(client):
         items = items[-settings["max_batch"]:]
         batch_ids = [item["message"].id for item in items]
         started = time.monotonic()
+        await refresh_turn_profiles()
         s, turn_found = settings_on_profile(channel_settings(reg, key))
         harness, model, tokens, error = s["worker"], None, None, None
         emoji = await gate_emoji(chat_id, ent_id)
@@ -7890,11 +8035,11 @@ async def run_session(client):
     # paused on quota. A later quota stop of the same job lands silently.
     quota_notified = set()
 
-    def jobs_available():
+    async def jobs_available():
         """Whether the register can be reached at all. A store that is not
         there is a reason to keep answering, not a reason to stop."""
         try:
-            job_register()
+            await in_register(job_register)
             return True
         except Exception:
             return False
@@ -7926,13 +8071,16 @@ async def run_session(client):
             timespec="microseconds")
 
     def leave_quota_pause():
+        """Whether the queue is not paused on quota, ending a pause whose time
+        has come. The jobs it held are put back by `resume_quota_jobs`."""
         if quota["until"] and time.time() < quota["until"]:
-            return
+            return False
         quota["until"], quota["reason"] = None, None
-        try:
-            register = job_register()
-        except Exception:
-            return
+        return True
+
+    def resume_quota_jobs(register):
+        """Put the jobs a quota stopped back in the queue; on the register
+        thread."""
         for row in register.self_resuming():
             if row.get("outcome") != jobs.QUOTA:
                 continue
@@ -7967,19 +8115,22 @@ async def run_session(client):
     # them — a dialogue worker, a person at a terminal, another machine — is
     # gone by the time they are acted on. The daemon is the only process that
     # can act, because it is the one holding the process groups, so it reads
-    # them off the register on every tick.
+    # them off the register whenever it moved.
 
-    async def honour_asks(register):
-        for row in register.stop_pending():
+    async def honour_asks(stops, amends):
+        """Act on the stops and amendments the tick read: `stops` every job a
+        stop is asked for, `amends` this daemon's running jobs an amendment
+        waits for."""
+        for row in stops:
             message = f"Stopped: «{jobs.job_label(row['description'])}». It keeps its place and can be continued."
             if row["state"] == jobs.WAITING:
-                stopped = register.cancel_waiting(
+                stopped = await on_register.cancel_waiting(
                     row["id"], error="stopped by request", result_text=message)
             elif row.get("lease_owner") == JOB_OWNER_ID:
                 stopping_jobs.add(row["id"])
                 try:
                     process_stopped = await stop_job_process(row, "stopped by request")
-                    stopped = (register.stop(
+                    stopped = (await on_register.stop(
                         row["id"], jobs.CANCELLED, error="stopped by request",
                         attempt_token=row["attempt_token"], owner_id=JOB_OWNER_ID,
                         result_text=message) if process_stopped else None)
@@ -7998,13 +8149,13 @@ async def run_session(client):
             if stopped is not None:
                 log(f"{row['channel_key']}: stopped job {row['id']}; it keeps its "
                     f"session and `jobs resume` continues it")
-        for row in register.amend_pending():
+        for row in amends:
             if row.get("lease_owner") != JOB_OWNER_ID:
                 continue
             amending.add(row["id"])
             try:
                 process_stopped = await stop_job_process(row, "amended")
-                amended = (register.finish_amendment(
+                amended = (await on_register.finish_amendment(
                     row["id"], row["attempt_token"], JOB_OWNER_ID)
                     if process_stopped else None)
             finally:
@@ -8014,8 +8165,10 @@ async def run_session(client):
                     f"{'continuing' if amended['state'] == jobs.WAITING else 'kept stopped'} "
                     f"session {row.get('session_id') or '(not yet opened)'}")
 
-    async def reconcile_expired_attempts(register, reason="worker lease expired"):
-        """Fence dead owners without touching a healthy overlapping daemon."""
+    def reconcile_expired_attempts(register, reason="worker lease expired"):
+        """Fence dead owners without touching a healthy overlapping daemon; on
+        the register thread, which also ends a local orphan's process group
+        while its slot is still held."""
         interrupted = []
         for row in register.expired_active():
             local_owner = row.get("owner_host") in (JOB_OWNER_HOST, JOB_LEGACY_HOST)
@@ -8073,26 +8226,29 @@ async def run_session(client):
             ent_id, text, is_direct, reply_to=reply_to, force_reply=True, mark=mark)
         return sent
 
-    async def deliver_job_results(register):
-        """Drain execution results independently from execution itself."""
-        for row in register.claim_deliveries(
-                JOB_OWNER_ID, limit=20,
-                lease_seconds=max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3)):
+    async def deliver_job_results(claimed):
+        """Send the results the tick leased to this daemon, independently from
+        execution itself; answers whether every one of them was delivered."""
+        delivered_all = True
+        for row in claimed:
             delivery_token = row["delivery_token"]
             try:
                 sent = await report_job(row, row.get("result_text") or "")
                 if sent is None:
-                    register.finish_delivery(
+                    delivered_all = False
+                    await on_register.finish_delivery(
                         row["id"], delivery_token, JOB_OWNER_ID,
                         delivered=False, error="channel is unreachable")
                 else:
-                    register.finish_delivery(
+                    await on_register.finish_delivery(
                         row["id"], delivery_token, JOB_OWNER_ID, delivered=True)
             except Exception as exc:
-                register.finish_delivery(
+                delivered_all = False
+                await on_register.finish_delivery(
                     row["id"], delivery_token, JOB_OWNER_ID, delivered=False,
                     error=_short_error(exc, limit=480))
                 log(f"{row['channel_key']}: job {row['id']} result delivery failed; retrying")
+        return delivered_all
 
     async def run_job_row(row):
         """One registered job, from its own slot.
@@ -8111,13 +8267,13 @@ async def run_session(client):
         # engine-specific: a job registered under codex and continued under
         # claude has no session to continue, which is the whole reason the
         # register records the engine at all.
+        await refresh_turn_profiles()
         s, turn_profile = settings_on_job_profile(channel_settings(reg, key), row)
-        register = job_register()
         sender = job_sender(row, group_policy)
         attempt_token = row.get("attempt_token")
         if not attempt_token:
             raise RuntimeError(f"job {job_id} has no attempt ownership token")
-        amendment_rows = register.claim_amendments(
+        amendment_rows = await on_register.claim_amendments(
             job_id, attempt_token, JOB_OWNER_ID)
         amendments = [item["text"] for item in amendment_rows]
         if amendments:
@@ -8191,7 +8347,8 @@ async def run_session(client):
             # additions earlier attempts already handed to the session as well,
             # for a resume that finds the session was never written.
             fresh_request = ({**current_request, "text": "\n\n".join(
-                [row["description"], *register.acked_amendment(job_id), *amendments])}
+                [row["description"], *await on_register.acked_amendment(job_id),
+                 *amendments])}
                 if resume_session else current_request)
             progress_outbox = prepare_progress_outbox(
                 f"job-{_safe_file_part(job_id)}")
@@ -8210,8 +8367,8 @@ async def run_session(client):
             opened_session = {"id": row.get("session_id")}
             amendments_acked = {"value": False}
 
-            async def persist_process(pid, pgid):
-                return register.attach_process(
+            def persist_process(pid, pgid):
+                return job_register().attach_process(
                     job_id, attempt_token, JOB_OWNER_ID, pid=pid, pgid=pgid)
 
             def remember_worker_process(started):
@@ -8221,9 +8378,10 @@ async def run_session(client):
                 runs in - the thread codex opened, or the id the runner pinned
                 for claude before launch - so an amendment to a running attempt
                 has a checkpoint to continue. A start the register refuses ends
-                the run."""
-                accepted = asyncio.run_coroutine_threadsafe(
-                    persist_process(started.pid, started.pid), loop).result(timeout=5)
+                the run. Called on the run's thread, which waits for the
+                register thread to record it."""
+                accepted = submit_register(
+                    persist_process, started.pid, started.pid).result(timeout=5)
                 if not accepted:
                     raise RuntimeError("job attempt lost ownership before process start")
                 if started.session_id:
@@ -8232,17 +8390,18 @@ async def run_session(client):
             def remember_worker_session(thread_id):
                 """Persist a session as soon as the harness runs in it.
 
-                The run reports its start from the executor thread while the
-                store connection belongs to this event loop.  Schedule the
-                write back onto the loop so an amendment, stop, or daemon
-                restart seconds later already has the checkpoint it must
-                continue.
+                The run reports its start from the executor thread, which
+                waits while the register thread writes it, so an amendment,
+                stop, or daemon restart seconds later already has the
+                checkpoint it must continue. A write that fails is logged and
+                does not end the run.
                 """
                 if not thread_id or thread_id == opened_session["id"]:
                     return
                 opened_session["id"] = thread_id
 
                 def persist():
+                    register = job_register()
                     current = register.get(job_id)
                     if (current is None or current["state"] != jobs.RUNNING
                             or current.get("attempt_token") != attempt_token):
@@ -8255,7 +8414,8 @@ async def run_session(client):
                         amendments_acked["value"] = True
                     log(f"{key}: job {job_id} opened session {thread_id}")
 
-                loop.call_soon_threadsafe(persist)
+                with contextlib.suppress(Exception):
+                    submit_register(persist).result(timeout=5)
 
             def on_worker_event(event):
                 if progress_window is not None:
@@ -8301,10 +8461,10 @@ async def run_session(client):
                               delivery_reply_id, progress_stop,
                               progress_after=s["progress_after"],
                               window=progress_window))
-            current_before_start = register.get(job_id)
+            current_before_start = await on_register.get(job_id)
             if (current_before_start is not None
                     and current_before_start.get("stop_requested")):
-                register.stop(
+                await on_register.stop(
                     job_id, jobs.CANCELLED, attempt_token=attempt_token,
                     owner_id=JOB_OWNER_ID, require_stop_requested=True,
                     error="stopped by request",
@@ -8315,21 +8475,21 @@ async def run_session(client):
             result = await future
             reply, meta = result["reply"], result["meta"]
             if amendment_rows and not amendments_acked["value"]:
-                register.ack_amendments(job_id, attempt_token, JOB_OWNER_ID)
                 amendments_acked["value"] = True
-            current_after_run = register.get(job_id)
+                await on_register.ack_amendments(job_id, attempt_token, JOB_OWNER_ID)
+            current_after_run = await on_register.get(job_id)
             if current_after_run is not None and current_after_run.get("stop_requested"):
-                register.stop(
+                await on_register.stop(
                     job_id, jobs.CANCELLED, attempt_token=attempt_token,
                     owner_id=JOB_OWNER_ID,
                     error="stopped by request",
                     result_text=f"Stopped: «{jobs.job_label(row['description'])}». It keeps its place and can be continued.")
                 return
-            if register.has_pending_amendment(job_id):
-                register.finish_amendment(job_id, attempt_token, JOB_OWNER_ID)
+            if await on_register.has_pending_amendment(job_id):
+                await on_register.finish_amendment(job_id, attempt_token, JOB_OWNER_ID)
                 log(f"{key}: job {job_id} finished while a newer amendment arrived; continuing")
                 return
-            finished = register.stop(
+            finished = await on_register.stop(
                 job_id, jobs.SUCCEEDED, exit_code=0,
                 session_id=meta.get("session_id"), model=meta.get("model"),
                 attempt_token=attempt_token, owner_id=JOB_OWNER_ID, result_text=reply,
@@ -8344,30 +8504,36 @@ async def run_session(client):
         except asyncio.CancelledError:
             process_stopped = await terminate_worker(
                 proc_key, future, cancel_event, "job task cancelled")
-            if process_stopped:
-                register.stop(job_id, jobs.INTERRUPTED, attempt_token=attempt_token,
-                              owner_id=JOB_OWNER_ID,
-                              error="job task cancelled before completion")
             # A session shutdown is an interruption of the runner, not a
             # request to stop this job.  Put it back where the next daemon can
             # claim it, preserving the rollout checkpoint written above.  An
             # explicit `jobs stop` takes the exception path instead and remains
-            # stopped until somebody resumes it.
-            current = register.get(job_id) or row
-            if (process_stopped and closing and JOB_RECOVERY == "requeue"
-                    and safe_job_recovery(current)):
-                register.resume(job_id)
-                log(f"{key}: job {job_id} interrupted by session close; requeued")
+            # stopped until somebody resumes it.  One hand-off, so the landing
+            # is whole even though this task is already cancelled.
+            requeue = process_stopped and closing and JOB_RECOVERY == "requeue"
+
+            def land_cancelled():
+                register = job_register()
+                if process_stopped:
+                    register.stop(job_id, jobs.INTERRUPTED, attempt_token=attempt_token,
+                                  owner_id=JOB_OWNER_ID,
+                                  error="job task cancelled before completion")
+                current = register.get(job_id) or row
+                if requeue and safe_job_recovery(current):
+                    register.resume(job_id)
+                    log(f"{key}: job {job_id} interrupted by session close; requeued")
+
+            await in_register(land_cancelled)
             raise
         except Exception as exc:
             process_stopped = await terminate_worker(
                 proc_key, future, cancel_event, "job failed")
-            current = register.get(job_id)
+            current = await on_register.get(job_id)
             reason = _short_error(exc, limit=480)
             if job_id in stopping_jobs or (
                     current is not None and current["stop_requested"]):
                 if future is None or process_stopped:
-                    register.stop(
+                    await on_register.stop(
                         job_id, jobs.CANCELLED, attempt_token=attempt_token,
                         owner_id=JOB_OWNER_ID, require_stop_requested=True,
                         error="stopped by request",
@@ -8375,12 +8541,12 @@ async def run_session(client):
                 log(f"{key}: job {job_id} stopped; `jobs resume` continues it")
             elif job_id in amending or (current is not None
                                         and current["state"] == jobs.WAITING) \
-                    or register.has_pending_amendment(job_id):
+                    or await on_register.has_pending_amendment(job_id):
                 # An amendment took the row back into the queue while the
                 # process was being stopped. That is the amendment working, not
                 # a failure, and the runner will pick it up again.
                 if current is not None and current["state"] == jobs.RUNNING:
-                    register.finish_amendment(job_id, attempt_token, JOB_OWNER_ID)
+                    await on_register.finish_amendment(job_id, attempt_token, JOB_OWNER_ID)
                 log(f"{key}: job {job_id} stopped for an amendment")
             elif getattr(exc, "kind", None) == "quota":
                 resume_at = enter_quota_pause(reason)
@@ -8390,18 +8556,22 @@ async def run_session(client):
                 told = job_id in quota_notified
                 quota_notified.add(job_id)
                 stopped_on_quota = True
-                register.stop(job_id, jobs.QUOTA, error=reason,
+                await on_register.stop(job_id, jobs.QUOTA, error=reason,
                               attempt_token=attempt_token, owner_id=JOB_OWNER_ID,
                               resume_at=resume_at,
                               result_text=None if told else (
                                   quota_pause_notice() or reason),
                               result_silent=told)
             elif closing:
-                register.stop(job_id, jobs.INTERRUPTED, error=reason,
-                              attempt_token=attempt_token, owner_id=JOB_OWNER_ID)
-                current = register.get(job_id) or row
-                if JOB_RECOVERY == "requeue" and safe_job_recovery(current):
-                    register.resume(job_id)
+                def land_interrupted():
+                    register = job_register()
+                    register.stop(job_id, jobs.INTERRUPTED, error=reason,
+                                  attempt_token=attempt_token, owner_id=JOB_OWNER_ID)
+                    current = register.get(job_id) or row
+                    if JOB_RECOVERY == "requeue" and safe_job_recovery(current):
+                        register.resume(job_id)
+
+                await in_register(land_interrupted)
                 log(f"{key}: job {job_id} interrupted by session close: {reason}")
             else:
                 # A refused model is recorded as one. It stopped the work before
@@ -8417,7 +8587,7 @@ async def run_session(client):
                                        for p in participants)
                                 else f"«{jobs.job_label(row['description'])}» could not be completed. "
                                      "Please tell an administrator.")
-                register.stop(job_id,
+                await on_register.stop(job_id,
                               jobs.MODEL_REFUSED if refused else jobs.FAILED,
                               error=detail,
                               attempt_token=attempt_token, owner_id=JOB_OWNER_ID,
@@ -8443,58 +8613,167 @@ async def run_session(client):
             job_cancels.pop(job_id, None)
             job_futures.pop(job_id, None)
 
+    # What the runner does on the register thread, in two hand-offs a tick:
+    # what falls due and what moved, then what it takes.
+
+    def runner_reads(*, renew, fence, read, read_quota, voice_ids, lease):
+        register = job_register()
+        if renew:
+            for active_row in register.active():
+                owner = active_row.get("lease_owner")
+                if owner == JOB_OWNER_ID or (owner == VOICE_OWNER_ID
+                                             and active_row["id"] in voice_ids):
+                    register.renew(active_row["id"], active_row["attempt_token"],
+                                   owner, lease)
+        if fence:
+            reconcile_expired_attempts(register)
+        return {"stops": register.stop_pending() if read else [],
+                "amends": register.amend_pending() if read else [],
+                "quota_until": register.quota_until() if read_quota else None}
+
+    def runner_takes(*, resume_quota, deliver, claims, lease):
+        register = job_register()
+        if resume_quota:
+            resume_quota_jobs(register)
+        owed = (register.claim_deliveries(JOB_OWNER_ID, limit=JOB_DELIVERY_BATCH,
+                                          lease_seconds=lease)
+                if deliver else [])
+        claimed = []
+        for _ in range(claims):
+            row = register.claim_next(
+                owner_id=JOB_OWNER_ID, owner_host=JOB_OWNER_HOST,
+                max_parallel=MAX_PARALLEL_JOBS, lease_seconds=lease)
+            if row is None:
+                break
+            claimed.append(row)
+        return owed, claimed
+
+    def drop_lost_register():
+        if _JOB_STORE is not None and _JOB_STORE.lost():
+            close_job_register()
+            return True
+        return False
+
+    # Set when a job of this daemon ends, so its slot is offered at once.
+    runner_wake = asyncio.Event()
+
     async def job_runner():
         """Watch the register and, while there is a free slot, take the oldest
         queued job of this project.
 
         No estimation, no priority, no classes of size: order is arrival order,
         and preemption is something the operator asks for explicitly.
+
+        The tables are read only when they moved. Every write to a job or an
+        amendment raises this project's version of `jobs.JOBS_CHANNEL`, which
+        one query on the register thread reads every `job_poll_interval`; where
+        the store names a session address apart, a listener on a thread of its
+        own also ends the wait the moment such a write commits, and a job of
+        this daemon ending ends it too. What falls due by time rather than by a
+        change keeps its own cadence: this daemon's leases are renewed three
+        times a lease; once a lease an attempt whose owner stopped renewing is
+        fenced, a result whose sender died is leased again and the asks are
+        read again; and a quota pause ends at its time. All of it runs on the
+        register thread, so a tick never holds the loop.
         """
-        while not closing:
-            try:
-                register = job_register()
-                for active_row in register.active():
-                    if active_row.get("lease_owner") == JOB_OWNER_ID:
-                        register.renew(active_row["id"], active_row["attempt_token"],
-                                       JOB_OWNER_ID,
-                                       max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
-                    elif (active_row.get("lease_owner") == VOICE_OWNER_ID
-                            and active_row["id"] in voice_rows):
-                        register.renew(active_row["id"], active_row["attempt_token"],
-                                       VOICE_OWNER_ID,
-                                       max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
-                await reconcile_expired_attempts(register)
-                await honour_asks(register)
-                durable_quota = register.quota_until()
-                if durable_quota:
-                    with contextlib.suppress(ValueError):
-                        quota["until"] = max(
-                            quota["until"] or 0,
-                            datetime.fromisoformat(durable_quota).timestamp())
-                        quota["reason"] = quota["reason"] or (
-                            "A worker exhausted its quota.")
-                leave_quota_pause()
-                await deliver_job_results(register)
-                while (quota["until"] is None
-                       and len(job_tasks) < MAX_PARALLEL_JOBS):
-                    claimed = register.claim_next(
-                        owner_id=JOB_OWNER_ID, owner_host=JOB_OWNER_HOST,
-                        max_parallel=MAX_PARALLEL_JOBS,
-                        lease_seconds=max(JOB_LEASE_SECONDS,
-                                          JOB_POLL_INTERVAL * 3))
-                    if claimed is None:
-                        break
-                    task = asyncio.create_task(run_job_row(claimed))
-                    job_tasks[task] = claimed["id"]
-                    task.add_done_callback(lambda t: job_tasks.pop(t, None))
-            except Exception as exc:
-                if _JOB_STORE is not None and _JOB_STORE.lost():
-                    close_job_register()
-                    log(f"jobs: lost the store connection, reopening it on the "
-                        f"next tick: {_short_error(exc)}")
-                else:
-                    log(f"jobs: runner tick failed: {_short_error(exc)}")
-            await asyncio.sleep(JOB_POLL_INTERVAL)
+        loop = asyncio.get_running_loop()
+        follower = None
+        stop_waiting = threading.Event()
+        waiting = None
+        # A change not yet acted on; the first tick reads everything.
+        moved = True
+        next_renew = next_fence = 0.0
+        deliveries_owed, deliver_after = True, 0.0
+        try:
+            while not closing:
+                lease = max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3)
+                failed = False
+                try:
+                    if follower is None:
+                        follower = await in_register(job_follower)
+                    if await in_register(poll_job_follower, follower):
+                        moved = True
+                    started = time.monotonic()
+                    renew_due = started >= next_renew
+                    fence_due = started >= next_fence
+                    quota_due = quota["until"] is not None and time.time() >= quota["until"]
+                    deliveries_owed = deliveries_owed or moved or fence_due
+                    deliver = deliveries_owed and started >= deliver_after
+                    if moved or renew_due or fence_due or quota_due or deliver:
+                        seen = await in_register(
+                            runner_reads, renew=renew_due, fence=fence_due,
+                            read=moved or fence_due, read_quota=moved or quota_due,
+                            voice_ids=frozenset(voice_rows), lease=lease)
+                        if renew_due:
+                            next_renew = started + lease / 3
+                        if fence_due:
+                            next_fence = started + lease
+                        if seen["quota_until"]:
+                            with contextlib.suppress(ValueError):
+                                quota["until"] = max(
+                                    quota["until"] or 0,
+                                    datetime.fromisoformat(seen["quota_until"]).timestamp())
+                                quota["reason"] = quota["reason"] or (
+                                    "A worker exhausted its quota.")
+                        await honour_asks(seen["stops"], seen["amends"])
+                        lifted = leave_quota_pause()
+                        offered = moved or quota_due
+                        claims = (max(0, MAX_PARALLEL_JOBS - len(job_tasks))
+                                  if lifted and offered else 0)
+                        if claims or deliver or (lifted and offered):
+                            owed, claimed = await in_register(
+                                runner_takes, resume_quota=lifted and offered,
+                                deliver=deliver, claims=claims, lease=lease)
+                            for row in claimed:
+                                task = asyncio.create_task(run_job_row(row))
+                                job_tasks[task] = row["id"]
+
+                                def ended(done):
+                                    job_tasks.pop(done, None)
+                                    runner_wake.set()
+
+                                task.add_done_callback(ended)
+                            if deliver:
+                                delivered_all = await deliver_job_results(owed)
+                                deliveries_owed = (not delivered_all
+                                                   or len(owed) >= JOB_DELIVERY_BATCH)
+                                if not delivered_all:
+                                    deliver_after = time.monotonic() + JOB_POLL_INTERVAL
+                    moved = False
+                except Exception as exc:
+                    failed = True
+                    if await in_register(drop_lost_register):
+                        log(f"jobs: lost the store connection, reopening it on the "
+                            f"next tick: {_short_error(exc)}")
+                    else:
+                        log(f"jobs: runner tick failed: {_short_error(exc)}")
+                # Until the next change, the next poll, or the next duty due; a
+                # tick that failed is tried again at the next poll.
+                due = min(next_renew, next_fence)
+                if quota["until"] is not None:
+                    due = min(due, time.monotonic() + quota["until"] - time.time())
+                if deliveries_owed:
+                    due = min(due, deliver_after)
+                pause = (JOB_POLL_INTERVAL if failed else
+                         max(0.0, min(JOB_POLL_INTERVAL, due - time.monotonic())))
+                if waiting is not None and waiting.done():
+                    with contextlib.suppress(BaseException):
+                        waiting.result()
+                    waiting = None
+                if follower is not None and waiting is None:
+                    waiting = loop.run_in_executor(
+                        _REGISTER_WAIT_EXECUTOR, follower.wait, pause, stop_waiting)
+                woken = asyncio.ensure_future(runner_wake.wait())
+                try:
+                    await asyncio.wait([w for w in (waiting, woken) if w is not None],
+                                       timeout=pause, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    woken.cancel()
+                runner_wake.clear()
+        finally:
+            stop_waiting.set()
+            if follower is not None:
+                _REGISTER_WAIT_EXECUTOR.submit(follower.close)
 
     async def echo_voice_message(message, chat_id, key, is_direct, group_policy=None,
                                  sender_name=None):
@@ -8752,6 +9031,9 @@ async def run_session(client):
             profile = await _sender_profile(event.message, group_policy, direct=is_direct)
             cmd = _command_name(text)
             log(f"{key}: /command «{text[:40]}» from {profile['id']} ({profile['role']})")
+            # `/status`, `/profiles`, `/set profile` and `/reload` resolve
+            # profiles; they are read off the loop before any command runs.
+            await refresh_turn_profiles()
             if not _control_command_allowed(cmd, profile, group_policy):
                 reply = _control_denied_reply(cmd, profile)
                 log(f"{key}: denied command {cmd} for {profile['id']} ({profile['role']})")
@@ -9185,24 +9467,29 @@ async def run_session(client):
                         continue
                     on_progress(note, "worker")
 
-        def open_voice_row(key, description, s):
+        def begin_voice_row(key, description, s):
+            """Register a call's task and take it straight into running; on
+            the register thread."""
+            register = job_register()
+            draft = register.register(
+                channel_key=key, requested_by=key, description=description,
+                engine=s["worker"], model=s["model"], profile=s["profile"])
+            row = register.begin_direct(
+                draft["id"], owner_id=VOICE_OWNER_ID, owner_host=JOB_OWNER_HOST,
+                lease_seconds=max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
+            if row is None:
+                register.discard(draft["id"])
+                raise RuntimeError(f"job {draft['id']} could not be started")
+            return row
+
+        async def open_voice_row(key, description, s):
             """Record a call's task in the job register, already running.
 
             The record never decides whether the task runs: a register that
             cannot be reached costs the task its row, never the caller their
             answer."""
-            draft = None
             try:
-                register = job_register()
-                draft = register.register(
-                    channel_key=key, requested_by=key, description=description,
-                    engine=s["worker"], model=s["model"], profile=s["profile"])
-                row = register.begin_direct(
-                    draft["id"], owner_id=VOICE_OWNER_ID, owner_host=JOB_OWNER_HOST,
-                    lease_seconds=max(JOB_LEASE_SECONDS, JOB_POLL_INTERVAL * 3))
-                if row is None:
-                    register.discard(draft["id"])
-                    raise RuntimeError(f"job {draft['id']} could not be started")
+                row = await in_register(begin_voice_row, key, description, s)
             except Exception as exc:
                 if jobs.archived(exc):
                     # The agent is archived: the task is not started, and the
@@ -9215,16 +9502,20 @@ async def run_session(client):
             log(f"voice: task recorded as job {row['id']}")
             return row
 
-        def note_voice_attempt(row, proc_key, number):
+        async def note_voice_attempt(row, proc_key, number):
             """Point the row at the worker this attempt runs, and refuse to start
             one a stop is already waiting for."""
             voice_rows[row["id"]] = {"proc_key": proc_key}
-            try:
+
+            def note():
                 register = job_register()
                 if number > 1:
                     register.update_attempt(row["id"], row["attempt_token"],
                                             VOICE_OWNER_ID, attempt=number)
-                current = register.get(row["id"])
+                return register.get(row["id"])
+
+            try:
+                current = await in_register(note)
             except Exception as exc:
                 log(f"voice: job {row['id']} attempt not recorded — {_short_error(exc)}")
                 return
@@ -9232,24 +9523,30 @@ async def run_session(client):
                 raise WorkerStopped(f"job {row['id']} stopped by request")
 
         def record_voice_attempt(row, **columns):
-            """One write against the attempt this daemon owns. Called on the event
-            loop; a worker thread hands it over with `call_soon_threadsafe`."""
+            """One write against the attempt this daemon owns, on the register
+            thread; the run's thread hands it over with `submit_register`."""
             try:
                 job_register().update_attempt(
                     row["id"], row["attempt_token"], VOICE_OWNER_ID, **columns)
             except Exception as exc:
                 log(f"voice: job {row['id']} not updated — {_short_error(exc)}")
 
-        def land_voice_row(row, outcome, *, error=None, meta=None, notice=False):
+        async def land_voice_row(row, outcome, *, error=None, meta=None, notice=False):
             """Stop a call's row with the reason its task ended.
 
             The call path delivers the result itself, spoken or to the chat, so
             the row's result is silent, except for the notice of an interruption
             nothing else will send. An amendment written from the chat while the
-            task ran is continued on the same session, the way any job's is."""
+            task ran is continued on the same session, the way any job's is.
+            The landing runs on the register thread, and a task cancelled while
+            it waits still lands its row."""
             if row is None:
                 return
             voice_rows.pop(row["id"], None)
+            await in_register(write_voice_landing, row, outcome, error=error,
+                              meta=meta, notice=notice)
+
+        def write_voice_landing(row, outcome, *, error, meta, notice):
             meta = meta or {}
             try:
                 register = job_register()
@@ -9293,12 +9590,12 @@ async def run_session(client):
             channel lists it, `jobs stop` reaches it, and a restart that cuts it
             off leaves it interrupted rather than gone. It starts at once and
             holds none of the runner's slots."""
+            await refresh_turn_profiles()
             s, turn_profile = settings_on_profile(voice_agent_settings())
             key = str(caller_id)
             provider = provider or voice_agent.DEFAULT_PROVIDER
-            row = open_voice_row(key, record, s) if record else None
+            row = await open_voice_row(key, record, s) if record else None
             attempts = {"n": 0}
-            event_loop = asyncio.get_running_loop()
 
             async def attempt(resume_session, seen):
                 """One worker run, from its own clean slate.
@@ -9319,7 +9616,7 @@ async def run_session(client):
                 proc_key = worker_proc_key(key, task_id)
                 attempts["n"] += 1
                 if row is not None:
-                    note_voice_attempt(row, proc_key, attempts["n"])
+                    await note_voice_attempt(row, proc_key, attempts["n"])
                 authority_context = None
                 worker_session = None
                 cancel_event = threading.Event()
@@ -9329,17 +9626,21 @@ async def run_session(client):
                     """Called once the harness runs, with its pid and the
                     session it runs in."""
                     if row is not None:
-                        event_loop.call_soon_threadsafe(
-                            lambda: record_voice_attempt(
-                                row, pid=int(started.pid), pgid=int(started.pid)))
+                        # Waited for, as a job's start is: the row names the
+                        # process and the session before the run goes on.
+                        with contextlib.suppress(Exception):
+                            submit_register(
+                                record_voice_attempt, row, pid=int(started.pid),
+                                pgid=int(started.pid)).result(timeout=5)
                     if on_progress is None or started.harness != "codex":
                         return
                     thread_id = started.session_id
                     if thread_id and not seen["thread_id"]:
                         seen["thread_id"] = thread_id
                         if row is not None:
-                            event_loop.call_soon_threadsafe(
-                                lambda: record_voice_attempt(row, session_id=thread_id))
+                            with contextlib.suppress(Exception):
+                                submit_register(record_voice_attempt, row,
+                                                session_id=thread_id).result(timeout=5)
                         if lane is not None:
                             # Written here, seconds into the run, rather than on
                             # the way out: the whole point is that there is no
@@ -9510,24 +9811,24 @@ async def run_session(client):
                         # call or in a call days from now.
                         lane.needs_reanchor = bool(seen["compacted"])
                         save_lane(caller_id, lane)
-                    land_voice_row(row, jobs.SUCCEEDED, meta=result.get("meta"))
+                    await land_voice_row(row, jobs.SUCCEEDED, meta=result.get("meta"))
                     return result
             except asyncio.CancelledError:
-                land_voice_row(row, jobs.INTERRUPTED, notice=True,
-                               error="voice task cancelled before completion")
+                await land_voice_row(row, jobs.INTERRUPTED, notice=True,
+                                     error="voice task cancelled before completion")
                 raise
             except WorkerStopped:
-                land_voice_row(row, jobs.CANCELLED, error="stopped by request")
+                await land_voice_row(row, jobs.CANCELLED, error="stopped by request")
                 raise
             except WorkerModelRefused as exc:
-                land_voice_row(row, jobs.MODEL_REFUSED,
-                               error=_short_error(exc, limit=480))
+                await land_voice_row(row, jobs.MODEL_REFUSED,
+                                     error=_short_error(exc, limit=480))
                 raise
             except Exception as exc:
                 # A worker killed because the session is closing broke for the
                 # same reason a restart breaks one, and is recorded as that.
-                land_voice_row(row, jobs.INTERRUPTED if closing else jobs.FAILED,
-                               notice=closing, error=_short_error(exc, limit=480))
+                await land_voice_row(row, jobs.INTERRUPTED if closing else jobs.FAILED,
+                                     notice=closing, error=_short_error(exc, limit=480))
                 raise
             finally:
                 if row is not None:
@@ -10818,19 +11119,22 @@ async def run_session(client):
     # Reconcile attempts owned by a daemon that is gone. A local orphan is
     # terminated before its slot can be reused; a foreign-host attempt cannot
     # be proved dead here and is stopped for inspection rather than duplicated.
-    try:
+    def startup_reconcile():
         register = job_register()
         durable_quota = register.quota_until()
+        interrupted = reconcile_expired_attempts(
+            register, "service found an expired worker lease on startup")
+        return durable_quota, interrupted, register.counts()
+
+    try:
+        durable_quota, interrupted, counts = await in_register(startup_reconcile)
         if durable_quota:
             with contextlib.suppress(ValueError):
                 quota["until"] = datetime.fromisoformat(durable_quota).timestamp()
                 quota["reason"] = "A previous worker exhausted its quota."
-        interrupted = await reconcile_expired_attempts(
-            register, "service found an expired worker lease on startup")
         if interrupted:
             log(f"jobs: {len(interrupted)} interrupted "
                 f"under fenced recovery; only locally-owned checkpointed work was continued")
-        counts = register.counts()
         log(f"jobs: register ready — slots={MAX_PARALLEL_JOBS} {counts or 'empty'}")
     except Exception as exc:
         log(f"jobs: register unavailable, the job class is off this session: "
@@ -10895,10 +11199,11 @@ async def run_session(client):
             await asyncio.gather(*pending_jobs, return_exceptions=True)
         job_tasks.clear()
         kill_all_workers("session closing cleanup")
-        # The register's connection belongs to the thread that opened it, and a
-        # reconnect opens a new session. Closing it here means the next one
-        # opens its own rather than inheriting one from a session that ended.
-        close_job_register()
+        # A reconnect opens a new session. Closing the register here, on its
+        # thread and after every write this session handed it, means the next
+        # one opens its own rather than inheriting one from a session that
+        # ended.
+        await in_register(close_job_register)
 
 
 async def stop_call_recorder_process(process, reason):
@@ -10996,8 +11301,17 @@ async def main():
         shutdown_requested = True
         main_task.cancel()
 
-    def request_reload():
+    reloads = set()
+
+    async def reload_with_profiles():
+        await refresh_turn_profiles()
         reload_runtime_settings()
+
+    def request_reload():
+        # The profiles the new settings name are read off the loop first.
+        task = asyncio.ensure_future(reload_with_profiles())
+        reloads.add(task)
+        task.add_done_callback(reloads.discard)
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         with contextlib.suppress(NotImplementedError):
