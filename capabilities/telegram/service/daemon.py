@@ -10245,6 +10245,11 @@ async def run_session(client):
             if active_recording["caller_id"] is None and \
                     active_voice_call["caller_id"] is None:
                 return
+            # Media frames arrive a hundred times a second and say nothing
+            # about how a call ends; naming each one costs the event loop the
+            # time the outbound pump needs.
+            if type(update).__name__ == "StreamFrames":
+                return
             status = getattr(update, "status", None)
             blocks = getattr(update, "blocks", None)
             detail = "" if blocks is None else f" blocks={[len(b) for b in blocks]}"

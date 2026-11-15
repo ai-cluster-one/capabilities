@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import operator
 import time
 from array import array
 
@@ -116,6 +117,18 @@ PROGRESS_POLL_SECONDS = 1.0
 SPEECH_RMS_OPEN = 600
 SPEECH_RMS_CLOSE = 300
 
+# The outbound pump keeps an absolute schedule: a tick that runs late is repaid
+# by sending the owed frames back to back, and the schedule is given up only
+# when it is hopelessly behind. Resetting it on every late tick loses those
+# milliseconds for good, and because this stream never pauses, the loss piles
+# up as a backlog that grows for the whole call.
+PUMP_RESYNC_SECONDS = 1.0
+
+# The stream is paced by the service and carries its own silence, so a healthy
+# buffer holds about one network burst. Anything above this is latency the
+# caller hears; it is paid back by dropping silent frames, never speech.
+OUTBOUND_TARGET_BYTES = int(AGENT_RATE * 2 * 0.2)
+
 # What the worker is handed instead of a request. The delegation carries no
 # task text, so inventing one means scraping the caller's speech and hoping the
 # scrape is right — which is a fiction with its own failure modes. The turn was
@@ -162,7 +175,7 @@ def _rms(payload: bytes) -> float:
     samples.frombytes(payload[:len(payload) // 2 * 2])
     if not samples:
         return 0.0
-    return (sum(s * s for s in samples) / len(samples)) ** 0.5
+    return (sum(map(operator.mul, samples, samples)) / len(samples)) ** 0.5
 
 
 def chunk_for_append(text: str, budget: int = APPEND_CHAR_BUDGET) -> list[str]:
@@ -248,6 +261,9 @@ class VoiceCallSession:
         self.interruptions = 0
         self.dropped_input_chunks = 0
         self.messages_sent = 0
+        self.max_outbound_backlog = 0
+        self.trimmed_silence_frames = 0
+        self.pump_resyncs = 0
 
         # The open user turn. The delegation event carries no task text, so this
         # is what the backend is actually given.
@@ -324,11 +340,19 @@ class VoiceCallSession:
 
     async def _outbound_pump(self):
         """Feed the capture slot at real time. GPT Live streams continuously, so
-        the buffer normally holds about one tick; silence covers a gap."""
+        the buffer normally holds about one tick; silence covers a gap.
+
+        The schedule is absolute (see PUMP_RESYNC_SECONDS), and a backlog above
+        OUTBOUND_TARGET_BYTES is trimmed of silence before the next frame goes,
+        so the caller hears the model at most a fraction of a second late."""
         next_tick = time.monotonic()
         while True:
             try:
-                if len(self._outbound) >= AGENT_FRAME_BYTES:
+                self._trim_outbound_silence()
+                backlog = len(self._outbound)
+                if backlog > self.max_outbound_backlog:
+                    self.max_outbound_backlog = backlog
+                if backlog >= AGENT_FRAME_BYTES:
                     payload = bytes(self._outbound[:AGENT_FRAME_BYTES])
                     del self._outbound[:AGENT_FRAME_BYTES]
                 else:
@@ -347,8 +371,13 @@ class VoiceCallSession:
                 delay = next_tick - time.monotonic()
                 if delay > 0:
                     await asyncio.sleep(delay)
-                else:
+                elif delay < -PUMP_RESYNC_SECONDS:
                     next_tick = time.monotonic()
+                    self.pump_resyncs += 1
+                else:
+                    # Owed frames go out at once, but the loop still yields so
+                    # the inbound side and the session are not starved.
+                    await asyncio.sleep(0)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -356,6 +385,16 @@ class VoiceCallSession:
                 self._log(f"voice: outbound pump stopped — {self._pump_error}")
                 await self._note_stream_end("pump_error")
                 return
+
+    def _trim_outbound_silence(self):
+        """Pay a backlog back out of silence. Frames are dropped from the front
+        while the buffer is above target and the frame at the front is silent;
+        the first frame of speech stops it, so nothing said is ever cut."""
+        while len(self._outbound) - AGENT_FRAME_BYTES >= OUTBOUND_TARGET_BYTES:
+            if _rms(self._outbound[:AGENT_FRAME_BYTES]) >= SPEECH_RMS_CLOSE:
+                return
+            del self._outbound[:AGENT_FRAME_BYTES]
+            self.trimmed_silence_frames += 1
 
     async def _note_stream_end(self, reason):
         if self._stream_ended:
@@ -878,6 +917,11 @@ class VoiceCallSession:
             "agent_voiced_seconds": round(self.agent_voiced_frames * FRAME_SECONDS, 3),
             "interruptions": self.interruptions,
             "dropped_input_chunks": self.dropped_input_chunks,
+            "max_outbound_backlog_seconds": round(
+                self.max_outbound_backlog / (AGENT_RATE * 2), 3),
+            "trimmed_silence_seconds": round(
+                self.trimmed_silence_frames * FRAME_SECONDS, 3),
+            "pump_resyncs": self.pump_resyncs,
             "pump_error": self._pump_error,
             "messages_sent": self.messages_sent,
             "tasks": (self._task_runner.history

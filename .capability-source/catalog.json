@@ -1074,12 +1074,12 @@
       ],
       "icon": true,
       "path": "capabilities/telegram",
-      "payload_sha256": "80a16449b833c0b9ec0f40f92f3a40e0fc14eda39a718e0b07666c2857695c9d",
+      "payload_sha256": "1f3df8389d74923e65c1a7059c7d97925bde17a59935a4b7dea55e482ee57efd",
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
       "tier": "standard",
       "title": "Telegram",
-      "version": "2026-11-10 — `telegram` declares its title, Telegram"
+      "version": "2026-11-15 — A GPT Live call speaks in real time, without a growing delay"
     },
     "telegrambot": {
       "executable": [

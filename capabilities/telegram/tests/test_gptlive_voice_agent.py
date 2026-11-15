@@ -184,6 +184,60 @@ class MediaTests(unittest.TestCase):
             # Seconds-as-a-float would land around 1.7e9; milliseconds are 1e12.
             self.assertGreater(stamp, 10 ** 11)
 
+    def test_a_late_tick_is_repaid_rather_than_lost(self):
+        """Every GPT Live call sent its voice at 55-66% of real time: the pump
+        restarted its schedule after any slot that ran over, so the time was
+        never paid back, and a stream that never pauses piled up a backlog
+        that reached a minute and a half by the end of a call."""
+
+        class SlowCalls(RecordingCalls):
+            async def send_frame(self, chat_id, device, data, frame_info):
+                await super().send_frame(chat_id, device, data, frame_info)
+                if len(self.sent) % 4 == 0:
+                    await asyncio.sleep(0.025)
+
+        with fake_runtime_modules():
+            module = import_gptlive()
+
+            async def run():
+                session = module.VoiceCallSession(
+                    SlowCalls(), 42, api_key="k", model=None, voice=None,
+                    system_instruction="p", caller_name="C",
+                    log=lambda *_: None)
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                session.start_pump()
+                await asyncio.sleep(0.6)
+                elapsed = loop.time() - started
+                await session.stop()
+                return len(session._calls.sent), elapsed
+
+            sent, elapsed = asyncio.run(run())
+        self.assertGreaterEqual(sent, 0.9 * elapsed / module.FRAME_SECONDS)
+
+    def test_a_backlog_is_paid_back_from_silence(self):
+        with fake_runtime_modules():
+            module = import_gptlive()
+            session = build_session(module)
+            frame = module.AGENT_FRAME_BYTES
+            speech = (b"\x00\x40" * (frame // 2)) * 50
+            session._outbound.extend(module.AGENT_SILENCE * 100)
+            session._outbound.extend(speech)
+            session._trim_outbound_silence()
+        self.assertEqual(bytes(session._outbound), speech)
+        self.assertEqual(session.trimmed_silence_frames, 100)
+
+    def test_speech_is_never_trimmed(self):
+        with fake_runtime_modules():
+            module = import_gptlive()
+            session = build_session(module)
+            frame = module.AGENT_FRAME_BYTES
+            held = (b"\x00\x40" * (frame // 2)) * 100 + module.AGENT_SILENCE * 100
+            session._outbound.extend(held)
+            session._trim_outbound_silence()
+        self.assertEqual(bytes(session._outbound), held)
+        self.assertEqual(session.trimmed_silence_frames, 0)
+
     def test_one_rate_carries_the_whole_tract(self):
         with fake_runtime_modules():
             module = import_gptlive()
