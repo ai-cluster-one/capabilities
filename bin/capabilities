@@ -2913,20 +2913,20 @@ DEFAULT_CONTEXT_PROMPT = (
 )
 BUILD_CONTEXT_PROMPT = DEFAULT_CONTEXT_PROMPT.replace(
     CONTEXT_PROMPT_REFRESH, "with `capabilities build`")
-SERVICE_SUPERVISION_CAPABILITY = "deployment"
-# A deliberate exception to "pointers flow down, an asset never names its
-# consumer". Someone who installs the manager and one service capability has
-# no way to discover that keeping that service running has a standard answer
-# at all, and the question arrives the moment the daemon does. So the answer is
-# named beside every declared service.
+# Someone who installs the manager and one service capability has no way to
+# discover that keeping that service running has a standard answer at all, and
+# the question arrives the moment the daemon does. So the answer is named
+# beside every declared service.
 #
-# It stays an exception rather than a habit because of how it is written: one
-# manager-owned string rendered next to each service, never a sentence copied
-# into a capability, and a route rather than a restatement - what supervision
-# is and how it works stays entirely with the capability named here.
+# One manager-owned string rendered next to each service, never a sentence
+# copied into a capability, and a route rather than a restatement: what
+# supervision is and how it works stays with the manager's node verbs, which
+# `capabilities help` documents.
 SERVICE_SUPERVISION_POINTER = (
     "  Keeping it running - on this machine or on a server - is the "
-    f"`{SERVICE_SUPERVISION_CAPABILITY}` capability's domain: "
+    "manager's: `capabilities node supervise {name}` runs it as this node's "
+    "gate places it, and `capabilities node install --apply` installs this "
+    "machine's node manager; start at `capabilities help`."
 )
 CORE_CAPABILITIES = ("agenttemplates", "askproject", "assets", "automations", "context", "deployment", "inbox", "memory", "routine", "tasks", "teams")
 # The catalogue's core tier, and its only declaration. Which capabilities are
@@ -26242,10 +26242,7 @@ def _compose_context(root: Path, build: bool = False,
                 if verb_hint:
                     line += f" (verbs: {verb_hint})"
                 bullet.append(line)
-                bullet.append(SERVICE_SUPERVISION_POINTER + (
-                    f"start at `{SERVICE_SUPERVISION_CAPABILITY} help`."
-                    if _registry_dir(SERVICE_SUPERVISION_CAPABILITY).is_dir()
-                    else "it is not installed here."))
+                bullet.append(SERVICE_SUPERVISION_POINTER.format(name=name))
             if refs:
                 if bullet:
                     bullet.append("")

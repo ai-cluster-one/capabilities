@@ -102,16 +102,18 @@ def test_a_declared_service_is_told_where_persistence_is_answered(tmp_path: Path
     project, env = _service_project(tmp_path, with_deployment=True)
     fragment = _fragment(project, env)
     assert "- Service (`telegram service ...`)" in fragment
-    assert "`deployment` capability's domain" in fragment
-    assert "start at `deployment help`" in fragment
+    assert "`capabilities node supervise telegram`" in fragment
+    assert "`capabilities node install --apply`" in fragment
+    assert "`deployment` capability's domain" not in fragment
+    assert "deployment help" not in fragment
 
 
-def test_the_pointer_is_honest_when_deployment_is_absent(tmp_path: Path) -> None:
+def test_the_pointer_names_the_manager_whether_deployment_is_installed_or_not(tmp_path: Path) -> None:
     project, env = _service_project(tmp_path, with_deployment=False)
     fragment = _fragment(project, env)
-    assert "`deployment` capability's domain" in fragment
-    assert "it is not installed here" in fragment
-    assert "deployment help" not in fragment
+    assert "`capabilities node supervise telegram`" in fragment
+    assert "it is not installed here" not in fragment
+    assert "deployment" not in fragment
 
 
 def test_a_capability_without_a_service_is_told_nothing(tmp_path: Path) -> None:
