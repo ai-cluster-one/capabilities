@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-16 — The telegram service installs on a machine that never had ntgcalls 3.0.3
+
+ntgcalls 3.0.3 is gone from PyPI, so a machine that did not already hold it in its package cache could not install the daemon or the call recorder, and the service failed at every start. Both now run on ntgcalls 3.0.7 with py-tgcalls 3.0.1b2, which differs from 3.0.1b1 only in no longer reading a stale copy of this account's own join as this account leaving a group call. No verb, flag, setting or JSON key changes.
+
 ## 2026-11-15 — A GPT Live call speaks in real time, without a growing delay
 
 On a GPT Live call the assistant's voice reached the caller at 55-66% of real time: the outbound pump started its schedule over after any 10 ms slot that ran late, so the lost time was never paid back, and because the model's stream never pauses the backlog grew for the whole call, to about a minute and a half by the end of a three-minute call, heard as choppy audio and an answer that came later and later. The pump now keeps an absolute schedule, sends owed frames at once, and starts over only when more than a second behind, as the Gemini pump does. A backlog above 200 ms is paid back by dropping silent frames from its front, never speech. The call's summary adds `max_outbound_backlog_seconds`, `trimmed_silence_seconds` and `pump_resyncs`, so a recording shows how the voice kept up. The daemon no longer logs a `call-update: StreamFrames` line for every media frame, a hundred a second during a call. No verb, flag or setting changes.

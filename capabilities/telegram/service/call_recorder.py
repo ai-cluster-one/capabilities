@@ -2,8 +2,8 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "py-tgcalls==3.0.1b1",
-#     "ntgcalls==3.0.3",
+#     "py-tgcalls==3.0.1b2",
+#     "ntgcalls==3.0.7",
 #     "telethon==1.45.0",
 #     "capabilities-contract>=0.47,<1",
 # ]

@@ -3,8 +3,8 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "telethon==1.45.0",
-#     "py-tgcalls==3.0.1b1",
-#     "ntgcalls==3.0.3",
+#     "py-tgcalls==3.0.1b2",
+#     "ntgcalls==3.0.7",
 #     "google-genai>=1.36.0",
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
@@ -43,20 +43,27 @@
 # 2026-09-12 and 2026-09-22 with no fault, where b20's rate expected about
 # four. The issue was closed as completed on 2026-09-22.
 #
-# ntgcalls 3.0.3 and py-tgcalls 3.0.1b1 move together: from ntgcalls 3.0.2 the
+# ntgcalls 3.0.7 and py-tgcalls 3.0.1b2 move together: from ntgcalls 3.0.2 the
 # participants request carries the ssrcs the media stack is missing, and 3.0.1b1
 # is the first py-tgcalls that accepts that second argument. 3.0.1b1 also keeps
 # each group call's participants current from Telegram's updates instead of an
 # hour-long cache, so the audio-map refresh reloads the call rather than
-# dropping a cache entry. The pin moved only after a live probe of the surface
-# this daemon actually touches - the constructors, the filters, the private
-# participant state and source map, and the media-stack log strings the
-# audio-map reconciler parses - because the tests stub the library and cannot
-# see a native change at all.
+# dropping a cache entry; 3.0.1b2 changes only that a stale copy of this
+# account's own join no longer reads as this account leaving. The pin moved
+# only after a live probe of the surface this daemon actually touches - the
+# constructors, the filters, the private participant state and source map, and
+# the media-stack log strings the audio-map reconciler parses - because the
+# tests stub the library and cannot see a native change at all.
 #
-# Still open on rc3 and carried into 3.0.3: ntgcalls#75, one SIGSEGV on
-# ntg-work shortly after a P2P-to-conference migration, faulting at 0x10 under
-# six frames rather than #61's four at 0x58. Seen once, on 2026-09-14.
+# ntgcalls 3.0.3 left PyPI, so a machine without it cached could not install
+# this script; 3.0.7 replaces it. py-tgcalls 3.0.1 final is not taken: it
+# rewrites the client cache and the group call this daemon reaches into, and
+# needs a conference test of its own first.
+#
+# ntgcalls#75, one SIGSEGV on ntg-work shortly after a P2P-to-conference
+# migration, faulting at 0x10 under six frames rather than #61's four at 0x58,
+# seen once on rc3 on 2026-09-14, was closed upstream on 2026-10-19 because it
+# had not come back on 3.0.3; no commit names a fix for it.
 """
 Telegram assistant daemon — the persistent MTProto process (push, not polling).
 
