@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-11-16 — Turns run on callva-harness-runner 0.12.2
+
+Turns run on callva-harness-runner 0.12.2, in place of 0.12.1: claude runs through claude-agent-sdk 0.2.183, which bundles Claude Code 2.1.326, and the runner's tested claude range reaches 2.1.326, so a turn on an installed claude from 2.1.320 to 2.1.326 no longer carries the out-of-range warning. Codex is unchanged. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-16 — `memory guide <topic>` renders its guide
 
 `memory guide service`, and every other `memory guide <topic>`, failed with `NameError: name '_STATE_HOME' is not defined`, because the contract's guide verb keeps its guide cache under the capability's state home and memory named none. The script now defines `_STATE_HOME` from `XDG_STATE_HOME`, or `~/.local/state`, as the other capabilities do, so the guide is printed. Nothing else changes.

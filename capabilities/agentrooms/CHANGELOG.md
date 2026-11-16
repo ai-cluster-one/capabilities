@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-11-16 — Turns run on callva-harness-runner 0.12.2
+
+Turns run on callva-harness-runner 0.12.2, in place of 0.12.1: claude runs through claude-agent-sdk 0.2.183, which bundles Claude Code 2.1.326, and the runner's tested claude range reaches 2.1.326, so a turn on an installed claude from 2.1.320 to 2.1.326 no longer carries the out-of-range warning. Codex is unchanged. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-16 — `agentrooms` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Комнаты агентов, and Estonian (`et`), Agentide toad, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
