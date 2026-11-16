@@ -1192,6 +1192,16 @@ def _job_view(row: dict) -> dict:
     return out
 
 
+def _tell_turn_it_amended(job_id: str) -> None:
+    """A turn that adds to a job says so in its own outbox, so the service knows
+    this turn handed its message over - not an amendment made anywhere else."""
+    path = os.environ.get("TELEGRAMBOT_PROGRESS_OUTBOX", "").strip()
+    if not path:
+        return
+    with contextlib.suppress(OSError), open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"time": time.time(), "kind": "amended", "job": job_id}) + "\n")
+
+
 def cmd_jobs(args, wanted: str | None):
     if args.action == "help":
         return JOBS_HELP
@@ -1263,6 +1273,8 @@ def cmd_jobs(args, wanted: str | None):
                 staged = reg.stage_amendment(job_id, args.text, actor_id=actor)
                 if staged is None:
                     _die(6, "empty_amendment", "the amendment is empty")
+                if turn:
+                    _tell_turn_it_amended(job_id)
                 return {**_job_view(reg.amend(job_id, actor_id=actor) or row),
                         "amendment": staged}
         except jobs.JobError as exc:

@@ -600,9 +600,6 @@ class JobRegister:
                 and r["chat_id"] == chat_id and r["topic_id"] == topic_id
                 and (actor_id is None or r["requested_by"] == actor_id)]
 
-    def list(self, *, limit=50, chat_id=None, topic_id=None, **_):
-        return [dict(r) for r in self.rows if r["chat_id"] == chat_id and r["topic_id"] == topic_id]
-
     def stage_amendment(self, job_id, text, *, actor_id=None):
         row = next(r for r in self.rows if r["id"] == job_id)
         if actor_id is not None and row["requested_by"] != actor_id:
@@ -693,14 +690,21 @@ def test_a_reply_to_someone_elses_job_is_not_added_to_it(tmp_path):
     assert dialogue.jobs.register.amendments == [] and len(runner.calls) == 1
 
 
+def amend_as_a_turn(register, kwargs, text):
+    """What `telegrambot jobs amend` does inside a turn: stage the amendment and
+    say so in the turn's own outbox."""
+    register.stage_amendment(running_job()["id"], text, actor_id=str(ANN))
+    with open(kwargs["extra_env"]["TELEGRAMBOT_PROGRESS_OUTBOX"], "a") as handle:
+        handle.write(json.dumps({"kind": "amended", "job": running_job()["id"]}) + "\n")
+
+
 def test_a_turn_that_adds_to_a_job_gives_no_answer_of_its_own(tmp_path, monkeypatch):
     monkeypatch.setattr(d, "HANDOFF_POLL", 0.01)
     monkeypatch.setattr(d, "HANDOFF_GRACE", 0.05)
     holder = {}
 
     def amends_then_keeps_going(prompt, kwargs):
-        holder["jobs"].register.stage_amendment(running_job()["id"], "make it Q3",
-                                                actor_id=str(ANN))
+        amend_as_a_turn(holder["jobs"].register, kwargs, "make it Q3")
         kwargs["cancel"].wait(5)
         return Result("Here is the whole report again, done by this turn.")
 
@@ -713,6 +717,29 @@ def test_a_turn_that_adds_to_a_job_gives_no_answer_of_its_own(tmp_path, monkeypa
     assert api.sent == []                                  # the job answers, not the turn
     assert api.reactions == [(ANN, 9, d.AMEND_REACTION)]
     assert dialogue.stats["added_to_job"] == 1
+
+
+def test_a_job_amended_elsewhere_does_not_silence_a_turn_about_something_else(tmp_path,
+                                                                                monkeypatch):
+    monkeypatch.setattr(d, "HANDOFF_POLL", 0.01)
+    monkeypatch.setattr(d, "HANDOFF_GRACE", 0.05)
+    holder = {}
+
+    def answers_while_the_job_is_amended_elsewhere(prompt, kwargs):
+        # Another topic's turn, the operator's CLI or the service's own routing
+        # adds to the job while this turn answers an unrelated question.
+        holder["jobs"].register.stage_amendment(running_job()["id"], "make it Q3",
+                                                actor_id=str(ANN))
+        time.sleep(0.3)
+        return Result("=== REPLY ===\nIt is noon in Tokyo.")
+
+    dialogue, store, api, runner, clock = make(
+        tmp_path, DELEGATING, runner=Runner(answers_while_the_job_is_amended_elsewhere))
+    dialogue.jobs = holder["jobs"] = Jobs([running_job()])
+    dialogue.offer_update(update(9, "what time is it in Tokyo"))
+    drain(dialogue, clock)
+    assert [m["text"] for m in api.sent] == ["It is noon in Tokyo."]
+    assert api.reactions == [] and dialogue.stats["added_to_job"] == 0
 
 
 def test_parse_command_and_quoting():

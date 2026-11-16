@@ -506,6 +506,21 @@ class Outbox:
                 out.append(json.loads(line))
         return out
 
+    def amended_job(self) -> str | None:
+        """The job this run added to with its own `jobs amend`, if it did: the
+        CLI writes that into this run's outbox, so an amendment made anywhere
+        else - another topic, the operator, the service - never shows here."""
+        try:
+            data = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        for line in data.splitlines():
+            with contextlib.suppress(ValueError, AttributeError):
+                item = json.loads(line)
+                if item.get("kind") == "amended" and item.get("job"):
+                    return str(item["job"])
+        return None
+
     def relay(self, final: bool = False) -> None:
         with self.lock:
             lines = self._lines()
@@ -543,6 +558,7 @@ class Run:
         self.handoff: dict | None = None
         self.handed_off = False
         self.amended: dict | None = None
+        self.outbox = None
 
 
 class Dialogue:
@@ -590,9 +606,6 @@ class Dialogue:
         self.jobs = None
         # (chat, message id) -> job id, for the messages the service sent for a job.
         self.job_messages: collections.OrderedDict = collections.OrderedDict()
-        # The amendments the service itself staged, per job, so a turn is not
-        # read as having amended a job the service amended beside it.
-        self.service_amended = collections.Counter()
         self.stats = collections.Counter()
         self.update_settings(settings)
 
@@ -862,7 +875,6 @@ class Dialogue:
                                                         actor_id=str(job["sender_id"]))
             if staged is None:
                 return False
-            self.service_amended[row["id"]] += 1
             self.jobs.register.amend(row["id"], actor_id=str(job["sender_id"]))
         except Exception as exc:
             self.log(f"{job['chat_id']} #{job['message_id']} not added to a job "
@@ -897,15 +909,6 @@ class Dialogue:
                          f"{', stopping' if row.get('stop_requested') else ''}, asked by "
                          f"{name}{origin}: {row.get('description') or ''}")
         return lines
-
-    def amendment_marks(self, chat, topic) -> dict:
-        """Each job of a chat or topic and the amendments it holds, so a turn that
-        adds to one is seen doing so."""
-        if self.jobs is None:
-            return {}
-        rows = self.jobs.register.list(limit=50, chat_id=chat, topic_id=topic or 0)
-        return {row["id"]: int(row.get("amendments") or 0) - self.service_amended[row["id"]]
-                for row in rows}
 
     def enqueue(self, job) -> None:
         """Put one admitted message into its channel: into the batch its sender
@@ -1663,10 +1666,7 @@ class Dialogue:
         call = {"prompt": prompt, "profile": profile, "origin": origin, "cwd": cwd,
                 "environ": env, "extra_env": extra_env, "authority": authority,
                 "timeout": float(channel["worker_timeout"]), "delegate": delegate,
-                "outbox": outbox, "amendment_marks": {}}
-        if delegate:
-            with contextlib.suppress(Exception):
-                call["amendment_marks"] = self.amendment_marks(chat, topic)
+                "outbox": outbox}
         if authority is not None:
             call["authority_file"] = self.write_authority(authority, f"{chat}-{first['message_id']}")
             extra_env["CAPABILITIES_AUTH_CONTEXT"] = call["authority_file"]
@@ -1715,7 +1715,7 @@ class Dialogue:
                 return
             if call["delegate"]:
                 threading.Thread(target=self.watch_handoff,
-                                 args=(run, ended, first, call["amendment_marks"]),
+                                 args=(run, ended, first),
                                  daemon=True).start()
             result = self.runner_run()(
                 call["prompt"], call["profile"], call["cwd"], session=self.session_fresh(),
@@ -1777,7 +1777,7 @@ class Dialogue:
                                   bot_turn=bool(first["msg"].is_bot))
             self.log(f"{chat}{'/' + str(topic) if topic else ''} #{ids[0]} turn {outcome}")
 
-    def watch_handoff(self, run: Run, ended: threading.Event, first, marks=None) -> None:
+    def watch_handoff(self, run: Run, ended: threading.Event, first) -> None:
         """A turn that submits a job, or adds to one of its chat's jobs, has handed
         the work over: it is given a short grace to say its line and then ended,
         and the job's answer is the only one."""
@@ -1789,14 +1789,10 @@ class Dialogue:
                 if row is not None:
                     run.handoff = row
                     break
-            if marks:
-                with contextlib.suppress(Exception):
-                    now = self.amendment_marks(first["chat_id"], first["topic_id"])
-                    added = [job_id for job_id, count in now.items()
-                             if job_id in marks and count > marks[job_id]]
-                    if added:
-                        run.amended = {"id": added[0]}
-                        break
+            amended = run.outbox.amended_job() if run.outbox is not None else None
+            if amended:
+                run.amended = {"id": amended}
+                break
         if (run.handoff is None and run.amended is None) or ended.wait(HANDOFF_GRACE):
             return
         run.handed_off = True
