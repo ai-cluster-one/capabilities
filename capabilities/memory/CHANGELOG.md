@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-11-16 — `memory guide <topic>` renders its guide
+
+`memory guide service`, and every other `memory guide <topic>`, failed with `NameError: name '_STATE_HOME' is not defined`, because the contract's guide verb keeps its guide cache under the capability's state home and memory named none. The script now defines `_STATE_HOME` from `XDG_STATE_HOME`, or `~/.local/state`, as the other capabilities do, so the guide is printed. Nothing else changes.
+
 ## 2026-11-16 — `memory` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Память, and Estonian (`et`), Mälu, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.

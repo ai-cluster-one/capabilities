@@ -932,7 +932,7 @@
       "level": 0,
       "lucide_icon": "brain",
       "path": "capabilities/memory",
-      "payload_sha256": "53214399a3701febe27b4c4012f4e6157b12e5851d54ea288c62bbb6b8f479f7",
+      "payload_sha256": "f69761b98a69f38b19dac2535592c72cdf98092671df36bb5f9b90cf40b85e46",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a constant block in every session's context that says how to record and search them, and a grooming pass, run on a schedule, that consolidates the entries.",
@@ -948,7 +948,7 @@
           "title": "Память"
         }
       },
-      "version": "2026-11-16 — `memory` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-16 — `memory guide <topic>` renders its guide"
     },
     "notion": {
       "executable": [
