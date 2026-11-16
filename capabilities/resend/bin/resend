@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """resend — send-only email CLI over the Resend HTTP API (resend.com).
@@ -130,6 +130,24 @@ SUMMARY = ("Send-only email CLI over the Resend HTTP API — deliver mail from "
            "recipient allow-list), list sending domains and their "
            "verification status (domains), and prove key + reachability "
            "(doctor). One-way by construction: no read or receive surface.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Resend',
+           "description": ('CLI только для отправки почты через HTTP API Resend — доставка писем с'
+                            ' подтверждённого домена отправки (send, с разрешением на запись и '
+                            'необязательным списком разрешённых получателей), список доменов '
+                            'отправки и статуса их проверки (domains) и проверка ключа и '
+                            'доступности (doctor). Односторонний по устройству: чтения и приёма '
+                            'нет.')},
+    "et": {"title": 'Resend',
+           "description": ('Ainult saatmiseks mõeldud e-posti CLI Resendi HTTP API kaudu – kirjade'
+                            ' saatmine kinnitatud saatmisdomeenilt (send, kirjutusõigusega ja '
+                            'valikulise lubatud saajate loendiga), saatmisdomeenide ja nende '
+                            'kinnitamise oleku loetlemine (domains) ning võtme ja kättesaadavuse '
+                            'tõestamine (doctor). Ülesehituselt ühesuunaline: lugemise ega '
+                            'vastuvõtmise pinda pole.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "RESEND_API_KEY", "secret": True, "required": True,

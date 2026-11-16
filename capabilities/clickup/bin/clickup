@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """
@@ -367,6 +367,20 @@ TITLE = "ClickUp"
 SUMMARY = ("ClickUp CLI over the REST API — read/create/update/comment-on tasks and "
            "subtasks, complete via status, manage assignees, tags, dependencies, "
            "custom fields, attachments, and webhooks across spaces and lists.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'ClickUp',
+           "description": ('CLI для ClickUp через REST API — чтение, создание, изменение и '
+                            'комментирование задач и подзадач, завершение через статус, управление '
+                            'исполнителями, тегами, зависимостями, пользовательскими полями, '
+                            'вложениями и вебхуками в пространствах и списках.')},
+    "et": {"title": 'ClickUp',
+           "description": ('ClickUp CLI REST API kaudu – ülesannete ja alamülesannete lugemine, '
+                            'loomine, muutmine ja kommenteerimine, lõpetamine oleku kaudu, '
+                            'täitjate, siltide, sõltuvuste, kohandatud väljade, manuste ja '
+                            'veebihaakide haldamine ruumides ja loendites.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "CLICKUP_API_TOKEN", "secret": True, "required": True,

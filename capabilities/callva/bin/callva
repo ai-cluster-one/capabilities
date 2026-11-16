@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """callva — agent-first CLI for the CallVA voice-AI platform.
@@ -475,6 +475,28 @@ SUMMARY = ("CallVA voice-AI platform CLI over the External API — "
            "schedules, automations (Windmill scripts), webhook logs, "
            "record actions, saved calls-list views, issues, knowledge, "
            "variables, settings, projects, phone numbers, and providers.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'CallVA',
+           "description": ('CLI платформы голосового ИИ CallVA через External API — чтение, '
+                            'создание, изменение и удаление агентов, наборов речевого стека, на '
+                            'которых они работают, и инструментов, которые они вызывают, ресурсов '
+                            '(промптов), звонков, расшифровок, записей, аналитики звонков, '
+                            'пользовательских полей, расписаний вебхуков, автоматизаций (скрипты '
+                            'Windmill), журналов вебхуков, действий над записями, сохранённых '
+                            'представлений списка звонков, проблем, знаний, переменных, настроек, '
+                            'проектов, телефонных номеров и провайдеров.')},
+    "et": {"title": 'CallVA',
+           "description": ('CallVA hääl-tehisintellekti platvormi CLI External API kaudu – '
+                            'agentide, nende kõnevirna eelseadistuste ja kutsutavate tööriistade, '
+                            'varade (viipade), kõnede, transkriptsioonide, salvestiste, '
+                            'kõneanalüütika, kohandatud väljade, veebihaakide ajakavade, '
+                            'automatiseerimiste (Windmilli skriptid), veebihaakide logide, '
+                            'kirjetoimingute, salvestatud kõneloendi vaadete, probleemide, '
+                            'teadmiste, muutujate, seadete, projektide, telefoninumbrite ja '
+                            'teenusepakkujate lugemine, loomine, muutmine ja kustutamine.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "CALLVA_API_KEY", "secret": True, "required": True,

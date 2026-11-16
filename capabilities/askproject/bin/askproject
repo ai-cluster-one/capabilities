@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.12.1",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """
@@ -326,6 +326,20 @@ LUCIDE_ICON = "message-circle-question-mark"
 SUMMARY = ("Bridge to a coding agent in ANOTHER project — spawn a headless peer "
            "(claude or codex) in a target project under a read or act profile, and "
            "return its answer with cost, token, and files-changed traceability.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Вопрос проекту',
+           "description": ('Мост к агенту-программисту в ДРУГОМ проекте — запускает фонового '
+                            'собеседника (claude или codex) в целевом проекте с профилем чтения или'
+                            ' действия и возвращает его ответ с отчётом о стоимости, токенах и '
+                            'изменённых файлах.')},
+    "et": {"title": 'Küsi projektilt',
+           "description": ('Sild TEISE projekti kodeerimisagendini – käivitab sihtprojektis '
+                            'lugemis- või tegutsemisprofiiliga taustal töötava partneri (claude või'
+                            ' codex) ja tagastab selle vastuse koos kulu, tokenite ja muudetud '
+                            'failide jälgitavusega.')},
+}
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS: list = []   # no credentials — it drives the local `claude` CLI on PATH
 DOCS_BASE = ""

@@ -446,8 +446,10 @@ MACHINE VERBS
         only for one the store holds no row of; a quarantined row is
         effective "disabled" with source "machine". Every row carries `icon`,
         true when the installed capability carries one (see icon), and
-        `title` and `lucide_icon` from its manifest: its human name and the
-        Lucide name of its line icon, null where it declares none.
+        `title`, `lucide_icon` and `translations` from its manifest: its
+        human name, the Lucide name of its line icon, and its title and
+        summary in other languages keyed by language code, each null where
+        it declares none.
   search [QUERY] [--source ID]
         Search cached catalogues from the official and registered sources;
         the official source is fetched first when it has no local copy yet.
@@ -2984,7 +2986,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.48.0"
+CONTRACT_LIBRARY_RELEASE = "0.49.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -4732,6 +4734,11 @@ INVENTORY_NETWORK_MODES = ("none", "optional", "required")
 # is lowercase words joined by hyphens (SHEBANG.md, the manifest table).
 TITLE_MAX_LENGTH = 40
 LUCIDE_ICON_PATTERN = r"^[a-z0-9]+(-[a-z0-9]+)*$"
+# The languages a manifest may translate its title and summary into
+# (`translations`), and what each translation may carry: English stays the
+# required source and the fallback (SHEBANG.md, the manifest table).
+TRANSLATION_LANGUAGES = ("ru", "et")
+TRANSLATION_KEYS = ("title", "description")
 
 
 FIELD_TYPES = ("string", "integer", "number", "boolean", "url", "email",
@@ -4961,6 +4968,46 @@ def _title_problems(manifest: dict) -> list[str]:
         icon = manifest["lucide_icon"]
         if not isinstance(icon, str) or not re.fullmatch(LUCIDE_ICON_PATTERN, icon):
             problems.append(f"lucide_icon {icon!r} does not match {LUCIDE_ICON_PATTERN}")
+    problems += _translation_problems(manifest)
+    return problems
+
+
+def _translation_problems(manifest: dict) -> list[str]:
+    """The shape of `translations` where a manifest declares it: an object
+    keyed by a known language code, each an object of an optional `title`,
+    bounded and one line as the English title is, and an optional
+    `description`, the summary in that language, one line where the English
+    summary is. Not required, so a capability without it still installs."""
+    if "translations" not in manifest:
+        return []
+    translations = manifest["translations"]
+    if not isinstance(translations, dict):
+        return ["translations is not an object"]
+    problems: list[str] = []
+    summary = manifest.get("summary")
+    summary_one_line = not (isinstance(summary, str) and ("\n" in summary or "\r" in summary))
+    for code, texts in translations.items():
+        at = f"translations.{code}"
+        if code not in TRANSLATION_LANGUAGES:
+            problems.append(f"{at} is not a known language ({'|'.join(TRANSLATION_LANGUAGES)})")
+            continue
+        if not isinstance(texts, dict):
+            problems.append(f"{at} is not an object")
+            continue
+        for key in texts:
+            if key not in TRANSLATION_KEYS:
+                problems.append(f"{at}.{key} is not one of {'|'.join(TRANSLATION_KEYS)}")
+        for key in TRANSLATION_KEYS:
+            if key not in texts:
+                continue
+            text = texts[key]
+            if not isinstance(text, str) or not text.strip():
+                problems.append(f"{at}.{key} is not a non-empty string")
+            elif key == "title" or summary_one_line:
+                if text != text.strip() or "\n" in text or "\r" in text:
+                    problems.append(f"{at}.{key} is not one line without surrounding space")
+                elif key == "title" and len(text) > TITLE_MAX_LENGTH:
+                    problems.append(f"{at}.title is longer than {TITLE_MAX_LENGTH} characters")
     return problems
 
 
@@ -8256,7 +8303,8 @@ def cmd_list() -> None:
                        "summary": (manifest or {}).get("summary", ""),
                        "tier": _capability_tier(name),
                        "icon": _has_icon(_registry_dir(name)),
-                       "lucide_icon": (manifest or {}).get("lucide_icon")}
+                       "lucide_icon": (manifest or {}).get("lucide_icon"),
+                       "translations": (manifest or {}).get("translations")}
         local = _gate_state(project_caps.get(name)) if root else "absent"
         global_state = _gate_state(global_caps.get(name))
         effective, source = _effective_gate_state(
@@ -35230,8 +35278,8 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
 def _catalog_entry_of(capdir: Path, summary: str, declared: dict | None = None) -> dict:
     """One capability's catalogue entry: what a reader needs to list it and
     to know whether a copy is current, with nothing installed - its summary,
-    its title and the Lucide name of its line icon where its manifest
-    declares them, whether it has an icon, the newest heading of its change
+    its title, the Lucide name of its line icon and its translations where
+    its manifest declares them, whether it has an icon, the newest heading of its change
     log (null where it has none) and the hash of its payload; its level and
     the manager level it requires, as its script declares them; and what
     fetching it alone takes - the files its payload hash covers and which of
@@ -35241,7 +35289,7 @@ def _catalog_entry_of(capdir: Path, summary: str, declared: dict | None = None) 
     return {
         "path": f"capabilities/{capdir.name}",
         "summary": summary,
-        **{key: declared[key] for key in ("title", "lucide_icon")
+        **{key: declared[key] for key in ("title", "lucide_icon", "translations")
            if declared and declared.get(key)},
         "payload_sha256": _payload_sha256(capdir),
         "icon": _has_icon(capdir),

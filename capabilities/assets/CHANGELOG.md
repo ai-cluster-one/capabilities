@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-11-16 — `assets` declares its title and summary in Russian and Estonian
+
+The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Материалы, and Estonian (`et`), Materjalid, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
+
 ## 2026-11-10 — `assets` declares its title, Assets, and its Lucide icon, `archive`
 
 The manifest carries `title`, `Assets`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `archive`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `assets`, and its `icon.png` is unchanged. Nothing else changes.

@@ -1,5 +1,9 @@
 # teams — change log
 
+## 2026-11-16 — `teams` declares its title and summary in Russian and Estonian
+
+The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Команды, and Estonian (`et`), Meeskonnad, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
+
 ## 2026-11-16 — `teams` declares level 1, the level a capabilities manager that composes no Teams section of its own requires
 
 The script declares `LEVEL = 1`: this teams composes the agent's Teams section itself through the declared `section` command, and the capabilities manager of this release requires that level and no longer composes the section for a teams that does not. `capabilities self-update` brings an installed teams below it along, and `install` and `update` refuse a teams below it. Nothing else changes.

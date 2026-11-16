@@ -1,5 +1,9 @@
 # agenttemplates — change log
 
+## 2026-11-16 — `agenttemplates` declares its title and summary in Russian and Estonian
+
+The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Шаблоны агентов, and Estonian (`et`), Agendimallid, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
+
 ## 2026-11-10 — `agenttemplates` declares its title, Agent Templates, and its Lucide icon, `layout-template`
 
 The manifest carries `title`, `Agent Templates`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `layout-template`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `agenttemplates`, and its `icon.png` is unchanged. Nothing else changes.

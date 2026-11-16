@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """emta — agent-first CLI for the Estonian Tax Board (maasikas.emta.ee).
@@ -214,6 +214,20 @@ SUMMARY = ("Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay "
            "balances, per-period balances, prepay ledger. Session is "
            "paste-fed from a logged-in browser. Stateful — run `emta "
            "doctor` first.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'EMTA',
+           "description": ('CLI только для чтения Налогово-таможенного департамента Эстонии '
+                            '(maasikas.emta.ee) — остатки предоплаты, остатки по периодам, книга '
+                            'предоплат. Сессия вставляется из браузера, где выполнен вход. Хранит '
+                            'состояние — сначала запустите `emta doctor`.')},
+    "et": {"title": 'EMTA',
+           "description": ('Maksu- ja Tolliameti (maasikas.emta.ee) ainult lugemiseks mõeldud CLI '
+                            '– ettemaksukonto saldod, perioodide saldod, ettemaksukonto väljavõte. '
+                            'Seanss kleebitakse sisse logitud brauserist. Olekuga – käivita esmalt '
+                            '`emta doctor`.')},
+}
 SCOPE = "project"   # the consuming project's tax data — service/tenant-bound
 CRED_KEYS: list = []        # no durable env-resolvable secret — see deviations.md
 WRITE_VERBS: set = set()    # read-only surface

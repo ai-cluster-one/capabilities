@@ -2,7 +2,7 @@
   "assets": {
     "DOCTRINE.md": "ec97a3db62521c82d2103595883575b8822e69a54fb1abfce5ec96468352fd7d",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "72c131734c2ff8271442f4ffb00d48e7996f7af274ac042ef431e0d36d953346",
+    "SHEBANG.md": "d441bbecd3851e41392d8f425d2a74e42729975e156734736d65df5711d20f71",
     "SOURCES.md": "0f7680ad11f43c628eb8d9b21c23456c8081fe6a61b30e8bca9bac5e6d8c492d",
     "TEMPLATE.md": "3d815f02a99716ee174cf512ede0951ade110a6cc0a8c91cf520bf63fc521f72",
     "contract/CHANGELOG.md": "7a3f2c1c03cad3f2934e2939372e9c6ace064e225ba15aa856fda73e4e0732c9",
@@ -26,7 +26,7 @@
   "level": 1,
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "788035f91b822061a6738ce6766eba504a43c2c791333f555908acdf3e159a9b"
+    "sha256": "bec086a6f349742394dddfc5edf8d7920e4f577b76125eb83b9308d00bd8e3c3"
   },
   "requires": {
     "teams": 1

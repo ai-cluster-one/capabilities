@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """rclonec — a credential harness around the official `rclone` binary. It resolves one
@@ -121,6 +121,25 @@ SUMMARY = ("Credential harness around the official `rclone` binary — resolves 
            "rclone's other backends), injects it as configuration, and forwards your "
            "command straight to `rclone` (everything but rclonec's own verbs passes "
            "through untouched); the command surface is `rclone help`.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Rclone',
+           "description": ('Обёртка учётных данных вокруг официального бинарника `rclone` — '
+                            'превращает одно именованное подключение в один удалённый ресурс rclone'
+                            ' (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, '
+                            'OneDrive, Box, SFTP, WebDAV и другие бэкенды rclone), подставляет его '
+                            'как конфигурацию и передаёт вашу команду прямо в `rclone` (всё, кроме '
+                            'собственных команд rclonec, проходит без изменений); набор команд — '
+                            '`rclone help`.')},
+    "et": {"title": 'Rclone',
+           "description": ('Mandaadikiht ametliku `rclone` programmi ümber – teisendab ühe nimega '
+                            "ühenduse üheks rclone'i kaugsihtkohaks (Google Drive, Amazon S3, "
+                            'Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV ja '
+                            "rclone'i muud taustsüsteemid), lisab selle konfiguratsioonina ja "
+                            'edastab su käsu otse `rclone`-le (kõik peale rclonec enda käskude '
+                            'läheb muutmata läbi); käskude pind on `rclone help`.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 # A connection names its own secret env keys, because which secrets exist depends on the
 # backend it declares; there is no fixed set to declare here (see deviations.md).

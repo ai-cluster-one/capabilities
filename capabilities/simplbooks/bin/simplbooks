@@ -5,7 +5,7 @@
 #     "httpx>=0.27",
 #     "click>=8.1",
 #     "beautifulsoup4>=4.12",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """simplbooks — agent-first CLI for the SimpleBooks accounting app."""
@@ -51,6 +51,25 @@ SUMMARY = ("SimpleBooks accounting CLI over a browser session (no public "
            "record payments/incomings, post balanced journal entries, stage "
            "bank payment orders, and process the PSD2 bank worklist. "
            "Stateful — run `simplbooks doctor` first.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'SimplBooks',
+           "description": ('CLI бухгалтерии SimpleBooks через браузерную сессию (публичного API '
+                            'нет) — чтение клиентов, счетов на оплату, закупок, бухгалтерских '
+                            'счетов, банковских операций и финансовых проводок, создание счетов на '
+                            'оплату и входящих счетов, учёт платежей и поступлений, проведение '
+                            'сбалансированных журнальных записей, подготовка банковских платёжных '
+                            'поручений и обработка банковского списка задач PSD2. Хранит состояние '
+                            '— сначала запустите `simplbooks doctor`.')},
+    "et": {"title": 'SimplBooks',
+           "description": ('SimpleBooksi raamatupidamise CLI brauseriseansi kaudu (avalikku API-d '
+                            'pole) – klientide, arvete, ostude, kontode, pangatehingute ja '
+                            'finantstehingute lugemine, müügi- ja ostuarvete loomine, maksete ja '
+                            'laekumiste kirjendamine, tasakaalus päevikukannete postitamine, '
+                            'pangamaksekorralduste ettevalmistamine ja PSD2 panga töönimekirja '
+                            'töötlemine. Olekuga – käivita esmalt `simplbooks doctor`.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "SIMPLBOOKS_EMAIL", "secret": False, "required": True,

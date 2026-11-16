@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "click>=8.1",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """directo — agent-first CLI for a Directo ERP instance (login.directo.ee).
@@ -76,6 +76,20 @@ SUMMARY = ("Directo ERP CLI over the browser-session endpoints its web UI "
            "uses — log in, select a location, and read the authed `*.asp` "
            "surface (sales, purchases, stock, ledger). Stateful — run "
            "`directo doctor` first.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Directo',
+           "description": ('CLI для ERP Directo через конечные точки браузерной сессии, которые '
+                            'использует его веб-интерфейс, — вход, выбор местоположения и чтение '
+                            '`*.asp`-страниц за авторизацией (продажи, закупки, склад, главная '
+                            'книга). Хранит состояние — сначала запустите `directo doctor`.')},
+    "et": {"title": 'Directo',
+           "description": ('Directo ERP CLI veebiliidese kasutatavate brauseriseansi otspunktide '
+                            'kaudu – sisselogimine, asukoha valimine ja autenditud `*.asp`-pinna '
+                            'lugemine (müük, ostud, laoseis, pearaamat). Olekuga – käivita esmalt '
+                            '`directo doctor`.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "DIRECTO_USERNAME", "secret": True, "required": True,

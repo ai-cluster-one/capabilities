@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 #     "slack_sdk>=3.33",
 #     "websocket-client>=1.8",
 # ]
@@ -140,6 +140,24 @@ SUMMARY = ("Slack CLI that reads the linked user's own workspace over their web 
            "DMs, public and private channels), read message history and thread "
            "replies, keep an incremental-synced Postgres store, and capture live. "
            "Read-only: it never writes to Slack.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Slack (чтение)',
+           "description": ('CLI для Slack, который читает собственное рабочее пространство '
+                            'привязанного пользователя через его веб-сессию (токен xoxc + cookie d)'
+                            ' — список бесед (личные, групповые личные, публичные и приватные '
+                            'каналы), чтение истории сообщений и ответов в ветках, инкрементально '
+                            'синхронизируемое хранилище Postgres и захват в реальном времени. '
+                            'Только чтение: в Slack он никогда не пишет.')},
+    "et": {"title": 'Slack (lugemine)',
+           "description": ('Slacki CLI, mis loeb seotud kasutaja enda tööruumi tema veebiseansi '
+                            'kaudu (xoxc token + d küpsis) – vestluste loetlemine (otsesõnumid, '
+                            'grupi otsesõnumid, avalikud ja privaatsed kanalid), sõnumiajaloo ja '
+                            'lõimevastuste lugemine, järkjärgult sünkroonitav Postgresi hoidla ja '
+                            'reaalajas jäädvustamine. Ainult lugemiseks: Slacki ei kirjuta see '
+                            'kunagi.')},
+}
 SCOPE = "user"      # the session is the person's own account, machine-wide
 # The conventional, cascade-resolved names a connection's token_env / cookie_env
 # point at when it names no env of its own. The actual per-connection secrets are

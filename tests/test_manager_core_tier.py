@@ -98,9 +98,9 @@ def test_list_and_inventory_rows_carry_the_tier_and_nothing_else_moves(tmp_path)
     assert listed[STANDARD]["tier"] == "standard"
     assert listed[idle_core]["tier"] == "core"
     for row in listed.values():
-        assert set(row) == {"name", "title", "summary", "tier", "icon", "lucide_icon", "project_gate",
-                            "global_gate", "effective", "source", "machine",
-                            "machine_connections"}
+        assert set(row) == {"name", "title", "summary", "tier", "icon", "lucide_icon",
+                            "translations", "project_gate", "global_gate", "effective",
+                            "source", "machine", "machine_connections"}
     # Core is a mark, not a grant: an unenabled core capability stays exactly
     # as gated as a standard one would be.
     assert listed[idle_core]["effective"] != "enabled"

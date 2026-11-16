@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """
@@ -150,6 +150,20 @@ TITLE = "Notion"
 SUMMARY = ("Notion CLI over the REST API — publish markdown to pages: list "
            "child pages, fetch a page as markdown, replace a page's body and "
            "title, create under a parent, and upsert by exact title.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Notion',
+           "description": ('CLI для Notion через REST API — публикация markdown на страницы: '
+                            'список дочерних страниц, получение страницы в виде markdown, замена '
+                            'тела и заголовка страницы, создание под родителем и создание-или-'
+                            'обновление по точному заголовку.')},
+    "et": {"title": 'Notion',
+           "description": ('Notioni CLI REST API kaudu – markdowni avaldamine lehtedele: '
+                            'alamlehtede loetlemine, lehe toomine markdownina, lehe sisu ja '
+                            'pealkirja asendamine, loomine vanema alla ning täpse pealkirja järgi '
+                            'loomine või uuendamine.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "NOTION_TOKEN", "secret": True, "required": True,

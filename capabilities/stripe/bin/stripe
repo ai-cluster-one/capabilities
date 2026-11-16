@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """stripe — read-only Stripe fetch CLI. Emits a neutral JSON contract of what
@@ -144,6 +144,20 @@ SUMMARY = ("Read-only Stripe CLI over the REST API — emit a neutral JSON "
            "contract of account activity (sync-plan), check "
            "identity/reachability (doctor), list invoices and download their "
            "PDFs, and read balance-transactions and payouts.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Stripe',
+           "description": ('CLI Stripe только для чтения через REST API — выдача нейтрального '
+                            'JSON-контракта активности аккаунта (sync-plan), проверка личности и '
+                            'доступности (doctor), список счетов и загрузка их PDF, чтение '
+                            'балансовых операций и выплат.')},
+    "et": {"title": 'Stripe',
+           "description": ("Ainult lugemiseks mõeldud Stripe'i CLI REST API kaudu – konto tegevuse"
+                            ' neutraalse JSON-lepingu väljastamine (sync-plan), identiteedi ja '
+                            'kättesaadavuse kontroll (doctor), arvete loetlemine ja nende PDF-ide '
+                            'allalaadimine ning saldotehingute ja väljamaksete lugemine.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "STRIPE_SECRET_KEY", "secret": True, "required": True,

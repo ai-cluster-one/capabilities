@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """coolify — Coolify CLI over the REST API. Drives a self-hosted Coolify
@@ -369,6 +369,20 @@ TITLE = "Coolify"
 SUMMARY = ("Coolify CLI over the REST API — list projects/resources/servers, "
            "read application & service status and logs, and deploy/restart/"
            "stop/start them on a self-hosted Coolify instance.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Coolify',
+           "description": ('CLI для Coolify через REST API — список проектов, ресурсов и серверов,'
+                            ' чтение статуса и журналов приложений и сервисов, а также их '
+                            'развёртывание, перезапуск, остановка и запуск на собственном '
+                            'экземпляре Coolify.')},
+    "et": {"title": 'Coolify',
+           "description": ('Coolify CLI REST API kaudu – projektide, ressursside ja serverite '
+                            'loetlemine, rakenduste ja teenuste oleku ning logide lugemine ning '
+                            'nende juurutamine, taaskäivitamine, peatamine ja käivitamine '
+                            'isehostitud Coolify eksemplaril.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "COOLIFY_BASE_URL", "secret": False, "required": True,

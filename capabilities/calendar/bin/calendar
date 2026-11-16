@@ -5,7 +5,7 @@
 #     "httpx>=0.27",
 #     "python-dateutil>=2.9",   # RFC 5545 recurrence rules, evaluated here
 #     "tzdata>=2024.1",   # a slim host carries no system zone database
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """
@@ -242,6 +242,18 @@ TITLE = "Calendar"
 LUCIDE_ICON = "calendar"
 SUMMARY = ("CalDAV CLI for remote calendars — list calendars, read, search "
            "and check busy blocks, and book events on a principal.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Календарь',
+           "description": ('CLI CalDAV для удалённых календарей — список календарей, чтение, поиск'
+                            ' и проверка занятых интервалов, а также бронирование событий для '
+                            'участника.')},
+    "et": {"title": 'Kalender',
+           "description": ('CalDAV CLI kaugkalendrite jaoks – kalendrite loetlemine, lugemine, '
+                            'otsing ja hõivatud aegade kontroll ning sündmuste broneerimine osaleja'
+                            ' jaoks.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [       # the default secret key; a connection may name its own
     {"key": "CALENDAR_APP_PASSWORD", "secret": True, "required": False,

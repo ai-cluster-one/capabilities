@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "psycopg2-binary>=2.9",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """journal — agent-first CLI for a PostgreSQL voice-journal store.
@@ -164,6 +164,19 @@ LUCIDE_ICON = "notebook"
 SUMMARY = ("Journal CLI over a PostgreSQL store — list and read voice-journal "
            "entries, write enrichment back, chunk transcripts for embedding, "
            "and search the store at three levels.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Журнал',
+           "description": ('CLI журнала через хранилище PostgreSQL — список и чтение записей '
+                            'голосового журнала, запись обогащённых данных обратно, разбиение '
+                            'расшифровок на фрагменты для эмбеддингов и поиск по хранилищу на трёх '
+                            'уровнях.')},
+    "et": {"title": 'Päevik',
+           "description": ('Päeviku CLI PostgreSQL-i hoidla kaudu – häälpäeviku kirjete loetlemine'
+                            ' ja lugemine, rikastuse tagasi kirjutamine, transkriptsioonide '
+                            'tükeldamine manustamiseks ja hoidlast otsimine kolmel tasemel.')},
+}
 SCOPE = "user"      # personal-account tool: one human, one journal store
 CRED_KEYS = [       # a registry entry supplies these per connection
     {"key": "JOURNAL_DB_PASSWORD", "secret": True, "required": True,

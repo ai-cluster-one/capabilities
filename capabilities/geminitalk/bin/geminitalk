@@ -4,7 +4,7 @@
 # dependencies = [
 #     "google-genai>=1.36.0",
 #     "sounddevice>=0.5.1",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """geminitalk - Gemini Live voice companion for the current project.
@@ -189,6 +189,18 @@ TITLE = "Gemini Talk"
 SUMMARY = ("Gemini Live native-audio project companion with continuous duplex audio, "
            "bounded project tools, optional headless Codex delegation, and an active "
            "Codex-thread relay.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Разговор с Gemini',
+           "description": ('Проектный собеседник на Gemini Live с нативным звуком: непрерывный '
+                            'дуплексный звук, ограниченные инструменты проекта, необязательное '
+                            'делегирование фоновому Codex и ретрансляция активной ветки Codex.')},
+    "et": {"title": 'Gemini vestlus',
+           "description": ("Gemini Live'i natiivse heliga projektikaaslane pideva dupleksheli, "
+                            'piiratud projektitööriistade, valikulise taustal töötavale Codexile '
+                            'delegeerimise ja aktiivse Codexi lõime vahendamisega.')},
+}
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "GEMINITALK_API_KEY", "secret": True, "required": True,

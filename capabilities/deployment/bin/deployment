@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -456,6 +456,18 @@ LUCIDE_ICON = "rocket"
 SUMMARY = ("Project deployment standard - declare the services a project runs, "
            "compile them into a container image, and describe the targets they "
            "deploy to.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Развёртывание',
+           "description": ('Стандарт развёртывания проекта — объявить сервисы, которые запускает '
+                            'проект, собрать их в образ контейнера и описать цели, куда они '
+                            'развёртываются.')},
+    "et": {"title": 'Juurutamine',
+           "description": ('Projekti juurutamise standard – kirjelda teenused, mida projekt '
+                            'käitab, kompileeri need konteineri kujutiseks ja kirjelda sihtkohad, '
+                            'kuhu need juurutatakse.')},
+}
 SCOPE = "project"
 CRED_KEYS: list = []
 WRITE_VERBS = {"init", "setup", "scaffold", "sync", "deploy", "rollback"}

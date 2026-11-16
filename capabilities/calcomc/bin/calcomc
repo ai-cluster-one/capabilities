@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """calcomc — Cal.com CLI over the Cal.com API v2: bookings, event types, slots,
@@ -207,6 +207,24 @@ SUMMARY = ("Cal.com CLI over the Cal.com API v2 — list, read and cancel "
            "calendars and their busy times, and reach any other endpoint "
            "through `api`; writes are refused unless the connection grants "
            "them, and `doctor` proves the key and the account it resolves to.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Cal.com',
+           "description": ('CLI для Cal.com через Cal.com API v2 — список, чтение и отмена '
+                            'бронирований, чтение типов событий, свободных слотов, расписаний, '
+                            'подключённых календарей и их занятого времени, а также доступ к любой '
+                            'другой конечной точке через `api`; запись отклоняется, если '
+                            'подключение её не разрешает, а `doctor` проверяет ключ и аккаунт, к '
+                            'которому он относится.')},
+    "et": {"title": 'Cal.com',
+           "description": ('Cal.com CLI Cal.com API v2 kaudu – broneeringute loetlemine, lugemine '
+                            'ja tühistamine, sündmusetüüpide, vabade aegade, ajakavade, ühendatud '
+                            'kalendrite ja nende hõivatud aegade lugemine ning mis tahes muu '
+                            'otspunkti kasutamine `api` kaudu; kirjutamisest keeldutakse, kui '
+                            'ühendus seda ei luba, ja `doctor` tõestab võtme ja konto, millele see '
+                            'viitab.')},
+}
 SCOPE = "user"      # credential scope: a Cal.com API key belongs to one account
 CRED_KEYS = [
     {"key": "CAL_API_KEY", "secret": True, "required": True,

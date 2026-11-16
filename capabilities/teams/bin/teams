@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -214,6 +214,20 @@ LUCIDE_ICON = "users"
 SUMMARY = ("Teams of agents that share instructions kept in the store - list the teams "
            "you are in, read their documents, and create teams, add members and save, "
            "rename and retire their versioned documents.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Команды',
+           "description": ('Команды агентов с общими инструкциями в хранилище — список команд, в '
+                            'которых вы состоите, чтение их документов, создание команд, добавление'
+                            ' участников, а также сохранение, переименование и вывод из обращения '
+                            'их версионируемых документов.')},
+    "et": {"title": 'Meeskonnad',
+           "description": ('Agentide meeskonnad, kes jagavad hoidlas peetavaid juhiseid – loetle '
+                            'meeskonnad, kuhu kuulud, loe nende dokumente ning loo meeskondi, lisa '
+                            'liikmeid ja salvesta, nimeta ümber ning kõrvalda kasutusest nende '
+                            'versioonitud dokumente.')},
+}
 SCOPE = "project"
 CRED_KEYS: list = []
 # Every verb that changes the store's teams; each is refused under the

@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """
@@ -250,6 +250,34 @@ import httpx
 NAME = "youtrack"
 TITLE = "YouTrack"
 SUMMARY = "YouTrack CLI for issues (read with links and tags, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, add/remove issue links by direction phrase, tag and untag by tag name, and log and list work items), user and group lookup, project reads and paged custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments)."
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'YouTrack',
+           "description": ('CLI YouTrack для задач (чтение со ссылками и тегами, постраничный '
+                            'поиск с выбором полей, комментарии — при необходимости видимые только '
+                            'указанным пользователям или группам, создание нумерованной задачи или '
+                            'черновика с любыми пользовательскими полями прямо при создании, '
+                            'изменение заголовка, описания и любого пользовательского поля, '
+                            'добавление и удаление связей задач по фразе направления, установка и '
+                            'снятие тегов по имени, учёт и список трудозатрат), поиска '
+                            'пользователей и групп, чтения проектов и постраничных схем '
+                            'пользовательских полей, сохранённых поисков и базы знаний (поиск, '
+                            'чтение, создание, изменение и перенос статей, комментарии к статьям).')},
+    "et": {"title": 'YouTrack',
+           "description": ('YouTracki CLI probleemide jaoks (lugemine linkide ja siltidega, '
+                            'lehekülgedeks jaotatud otsing väljade valikuga, kommenteerimine – '
+                            'soovi korral nähtav ainult nimetatud kasutajatele või gruppidele, '
+                            'loomine nummerdatud probleemina või mustandina, kus loomisel saab '
+                            'määrata mis tahes kohandatud välja, kokkuvõtte, kirjelduse ja mis '
+                            'tahes kohandatud välja muutmine, probleemide linkide lisamine ja '
+                            'eemaldamine suunafraasi järgi, siltide lisamine ja eemaldamine sildi '
+                            'nime järgi ning tööaja logimine ja loetlemine), kasutajate ja gruppide'
+                            ' otsingu, projektide lugemise ja lehekülgedeks jaotatud kohandatud '
+                            'väljade skeemide, salvestatud otsingute ning teadmusbaasi jaoks '
+                            '(artiklite otsimine, lugemine, loomine, muutmine ja ümberpaigutamine '
+                            'ning artiklite kommentaarid).')},
+}
 SCOPE = "project"
 CRED_KEYS = [
     {"key": "YOUTRACK_URL", "secret": False, "required": True,

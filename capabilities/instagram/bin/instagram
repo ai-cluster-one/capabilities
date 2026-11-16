@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """instagram — agent-first CLI over an authenticated Instagram web session.
@@ -50,6 +50,18 @@ SUMMARY = (
     "profiles, resolve Direct threads, and send text messages. Stateful — run "
     "`instagram doctor` first."
 )
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Instagram',
+           "description": ('CLI для Instagram через сохранённую браузерную сессию — проверка '
+                            'личности, чтение профилей, поиск переписок Direct и отправка текстовых'
+                            ' сообщений. Хранит состояние — сначала запустите `instagram doctor`.')},
+    "et": {"title": 'Instagram',
+           "description": ('Instagrami CLI salvestatud brauseriseansi kaudu – identiteedi '
+                            'kontroll, profiilide lugemine, Directi vestluste leidmine ja '
+                            'tekstisõnumite saatmine. Olekuga – käivita esmalt `instagram doctor`.')},
+}
 SCOPE = "user"
 CRED_KEYS: list[dict[str, Any]] = []
 

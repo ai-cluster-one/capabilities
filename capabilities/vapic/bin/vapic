@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """vapic - a capability harness around the official `vapi` CLI.
@@ -178,6 +178,18 @@ TITLE = "Vapi"
 SUMMARY = ("Connection harness around the official `vapi` CLI - resolves a "
            "Vapi API key, injects it, and forwards commands to `vapi` with a "
            "narrow read-list fallback; the command surface is `vapi --help`.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Vapi',
+           "description": ('Обёртка подключения вокруг официального CLI `vapi` — находит API-ключ '
+                            'Vapi, подставляет его и передаёт команды в `vapi` с узким запасным '
+                            'вариантом для чтения списков; набор команд — `vapi --help`.')},
+    "et": {"title": 'Vapi',
+           "description": ('Ühenduskiht ametliku `vapi` CLI ümber – leiab Vapi API-võtme, lisab '
+                            'selle ja edastab käsud `vapi`-le kitsa loendite lugemise '
+                            'varuvariandiga; käskude pind on `vapi --help`.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "VAPI_API_KEY", "secret": True, "required": True,

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -591,6 +591,18 @@ TITLE = "WhatsApp"
 SUMMARY = ("WhatsApp CLI carrying its own engine — link a device, keep the "
            "account's chats and messages in a Postgres store, read and deepen them "
            "on demand, transcribe voice notes, and export a chat to JSON.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'WhatsApp',
+           "description": ('CLI для WhatsApp со встроенным движком — привязка устройства, хранение'
+                            ' чатов и сообщений аккаунта в хранилище Postgres, чтение и дозагрузка '
+                            'их по запросу, расшифровка голосовых сообщений и экспорт чата в JSON.')},
+    "et": {"title": 'WhatsApp',
+           "description": ('WhatsAppi CLI oma mootoriga – seadme sidumine, konto vestluste ja '
+                            'sõnumite hoidmine Postgresi hoidlas, nende lugemine ja süvendamine '
+                            'vajadusel, häälsõnumite transkribeerimine ja vestluse eksport JSON-i.')},
+}
 SCOPE = "user"      # credential scope: "project" | "user"
 CRED_KEYS = [       # the flat keys the cascade resolves for every connection
     {"key": "DEEPGRAM_API_KEY", "secret": True, "required": False,

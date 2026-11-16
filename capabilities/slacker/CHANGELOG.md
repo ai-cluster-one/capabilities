@@ -1,5 +1,9 @@
 # slacker — change log
 
+## 2026-11-16 — `slacker` declares its title and summary in Russian and Estonian
+
+The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Slack (чтение), and Estonian (`et`), Slack (lugemine), each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
+
 ## 2026-11-10 — `slacker` declares its title, Slack Reader
 
 The manifest carries `title`, `Slack Reader`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `slacker`, and its `icon.png` is unchanged. Nothing else changes.

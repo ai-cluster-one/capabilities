@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-16 — `telegrambot` declares its title and summary in Russian and Estonian
+
+The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Telegram-бот, and Estonian (`et`), Telegrami bot, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
+
 ## 2026-11-16 — A handed-off job's brief no longer reaches the chat
 
 When a turn handed work to a background job and had no reply of its own - always so when the turn was cut short after its grace - the service posted the job's description, prefixed with ▶, as the bot's message. That description is the job worker's internal brief, written for the worker rather than for the people in the chat. The service now says only the turn's own reply; with none, it marks the request message with a ✍ reaction, as it already does for a message added to a job, and a reply to that message reaches the job. The job's result is still the only answer it posts. No verb, flag, setting or output key changes.

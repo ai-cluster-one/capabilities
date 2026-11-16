@@ -26,13 +26,23 @@
       "level": 0,
       "lucide_icon": "messages-square",
       "path": "capabilities/agentrooms",
-      "payload_sha256": "f2be75bb09ba9a7b552299d531b417a77f5c3dfc13f88e0984dd9a2698d0e481",
+      "payload_sha256": "fa242882408969a1ffbffd75a5525c9de37b706d1b875d085a72d6c2b87bd161",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room.",
       "tier": "standard",
       "title": "Agent Rooms",
-      "version": "2026-11-16 — `read --before EVENT_ID` pages a room back through its history"
+      "translations": {
+        "et": {
+          "description": "Agendid suhtlevad tubades ühel jagatud Matrixi koduserveril – agendi registreerimine, tubade avamine, nendega liitumine, lugemine ja postitamine client-server API kaudu; operaator, kes võtab kutseid vastu ja määrab iga toa kohta, kes võib agenti äratada; ning masina teenus, mis äratab nõustunud agendid lubatud saatja mainimise, otsesõnumi või märgitud toa peale, hoiab ülejäänu operaatori jaoks, lubab ja piirab iga käiku agendiga seotud töötaja kaudu ning vastab toa kohta ühe jätkatava harness-seansi kaudu.",
+          "title": "Agentide toad"
+        },
+        "ru": {
+          "description": "Агенты общаются в комнатах на одном общем Matrix-сервере — регистрация агента, создание комнат, вход в них, чтение и публикация через client-server API; оператор, который принимает приглашения и для каждой комнаты решает, кто может будить агента; и служба на машине, которая будит подключённых агентов по упоминанию, личному сообщению или отмеченной комнате от допущенного отправителя, придерживает остальное для оператора, допускает и ограничивает каждый ход через воркер, привязанный к агенту, и отвечает через одну возобновляемую сессию харнесса на комнату.",
+          "title": "Комнаты агентов"
+        }
+      },
+      "version": "2026-11-16 — `agentrooms` declares its title and summary in Russian and Estonian"
     },
     "agenttemplates": {
       "executable": [
@@ -69,13 +79,23 @@
       "level": 0,
       "lucide_icon": "layout-template",
       "path": "capabilities/agenttemplates",
-      "payload_sha256": "3244c7e50b6953a00ae16ce6dff404a129489e8ed9d0e4cb1225858fb3288d63",
+      "payload_sha256": "345b1e8f16177ee88e4558dad3a6e40570181f0703fe9cd28694531230089f5a",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "The agent templates a new agent is made from - the starter context files and each agent template (its manifest, icon, context, routines) - carried as files in this capability's bundle; list them and show one, and the manager's `templates` and `init --template` read them from here.",
       "tier": "core",
       "title": "Agent Templates",
-      "version": "2026-11-10 — `agenttemplates` declares its title, Agent Templates, and its Lucide icon, `layout-template`"
+      "translations": {
+        "et": {
+          "description": "Agendimallid, millest uus agent luuakse – algsed kontekstifailid ja iga agendimall (selle manifest, ikoon, kontekst, rutiinid), mis on failidena selle rakenduse komplektis; neid saab loetleda ja ükshaaval näidata ning halduri `templates` ja `init --template` loevad neid siit.",
+          "title": "Agendimallid"
+        },
+        "ru": {
+          "description": "Шаблоны, из которых создаётся новый агент, — стартовые файлы контекста и каждый шаблон агента (его манифест, значок, контекст, процедуры), хранящиеся как файлы в пакете этого приложения; их можно перечислить и показать по одному, а `templates` и `init --template` менеджера читают их отсюда.",
+          "title": "Шаблоны агентов"
+        }
+      },
+      "version": "2026-11-16 — `agenttemplates` declares its title and summary in Russian and Estonian"
     },
     "asana": {
       "executable": [
@@ -89,13 +109,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/asana",
-      "payload_sha256": "db14b42108ee3f092da5f729e76a93925d9b2d569f930dee61b983cfdb2b6999",
+      "payload_sha256": "e15af78329a97fc68e76e552edfeed99da95b4d1a67395b3d02700ba10f4424a",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Asana CLI over the REST API — read/create/comment-on tasks and subtasks, @mention, manage tags, board sections, dependencies, and the API-only machine-state field.",
       "tier": "standard",
       "title": "Asana",
-      "version": "2026-11-10 — `asana` declares its title, Asana"
+      "translations": {
+        "et": {
+          "description": "Asana CLI REST API kaudu – ülesannete ja alamülesannete lugemine, loomine ja kommenteerimine, @mainimised, siltide, tahvli jaotiste, sõltuvuste ja ainult API kaudu kättesaadava machine-state välja haldamine.",
+          "title": "Asana"
+        },
+        "ru": {
+          "description": "CLI для Asana через REST API — чтение, создание и комментирование задач и подзадач, @упоминания, управление тегами, разделами досок, зависимостями и полем machine-state, доступным только через API.",
+          "title": "Asana"
+        }
+      },
+      "version": "2026-11-16 — `asana` declares its title and summary in Russian and Estonian"
     },
     "askproject": {
       "executable": [
@@ -120,13 +150,23 @@
       "level": 0,
       "lucide_icon": "message-circle-question-mark",
       "path": "capabilities/askproject",
-      "payload_sha256": "671889b9ccb92137a5eb4093421a2e5de091c62f0ccbe5d517d528bf7858d1a0",
+      "payload_sha256": "c7021eade0435d7e22bea909a37e7c780b1fab96a24e6d01f786245c7f030cc4",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability.",
       "tier": "core",
       "title": "Ask Project",
-      "version": "2026-11-10 — `askproject` declares its title, Ask Project, and its Lucide icon, `message-circle-question-mark`"
+      "translations": {
+        "et": {
+          "description": "Sild TEISE projekti kodeerimisagendini – käivitab sihtprojektis lugemis- või tegutsemisprofiiliga taustal töötava partneri (claude või codex) ja tagastab selle vastuse koos kulu, tokenite ja muudetud failide jälgitavusega.",
+          "title": "Küsi projektilt"
+        },
+        "ru": {
+          "description": "Мост к агенту-программисту в ДРУГОМ проекте — запускает фонового собеседника (claude или codex) в целевом проекте с профилем чтения или действия и возвращает его ответ с отчётом о стоимости, токенах и изменённых файлах.",
+          "title": "Вопрос проекту"
+        }
+      },
+      "version": "2026-11-16 — `askproject` declares its title and summary in Russian and Estonian"
     },
     "assets": {
       "executable": [
@@ -146,13 +186,23 @@
       "level": 0,
       "lucide_icon": "archive",
       "path": "capabilities/assets",
-      "payload_sha256": "0c6b9d9df89ccd710d99e44f7c16314f1a807182ae80946486cf299186ec09f8",
+      "payload_sha256": "94b18df3281ce5e477a12949d2993f0adee003b58b2a9cfe7ab7a82a62563c3d",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder.",
       "tier": "core",
       "title": "Assets",
-      "version": "2026-11-10 — `assets` declares its title, Assets, and its Lucide icon, `archive`"
+      "translations": {
+        "et": {
+          "description": "Projekti materjalid: markdown versioonitud dokumentidena projekti PostgreSQL-i hoidlas – plaanid, uuringud, seansid, koosolekud, päevik, kokkuvõtted ja aruanded, salvestatud üks versioon korraga, täistekstiotsingu ja versioonide võrdlusega – ning iga muu fail baithaaval S3-ühilduvas ämbris sha256-kontrolliga; kõik imporditakse agendi materjalide kaustast ja eksporditakse sinna.",
+          "title": "Materjalid"
+        },
+        "ru": {
+          "description": "Материалы проекта: markdown как версионируемые документы в хранилище PostgreSQL проекта — планы, исследования, сессии, встречи, журнал, сводки и отчёты, сохраняемые по одной версии, с полнотекстовым поиском и сравнением версий, — и любые другие файлы, хранимые байт в байт в S3-совместимом бакете с проверкой sha256; всё импортируется из папки материалов агента и экспортируется в неё.",
+          "title": "Материалы"
+        }
+      },
+      "version": "2026-11-16 — `assets` declares its title and summary in Russian and Estonian"
     },
     "automations": {
       "executable": [
@@ -179,13 +229,23 @@
       "level": 0,
       "lucide_icon": "timer",
       "path": "capabilities/automations",
-      "payload_sha256": "492b1a22364247b3d43a6e7b7c5532f84498bb48e45cb817e7da722acb884ebb",
+      "payload_sha256": "cd3f97e007862129f314d92e1ce21b24e1acc50127c88f85b30738de2c072362",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
       "tier": "core",
       "title": "Automations",
-      "version": "2026-11-10 — `automations` declares its title, Automations, and its Lucide icon, `timer`"
+      "translations": {
+        "et": {
+          "description": "Projektisisene ajastaja ja alamprotsesside käivitaja versioonitud konfiguratsiooni, hoidlas peetava käivitusajaloo, samaaegsuse, korduskatsete, ajalõppude ja tühistamisega.",
+          "title": "Automatiseerimised"
+        },
+        "ru": {
+          "description": "Локальный для проекта планировщик и запуск подпроцессов с версионируемой конфигурацией, историей запусков в хранилище, параллельностью, повторами, тайм-аутами и отменой.",
+          "title": "Автоматизации"
+        }
+      },
+      "version": "2026-11-16 — `automations` declares its title and summary in Russian and Estonian"
     },
     "calcomc": {
       "executable": [
@@ -199,13 +259,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/calcomc",
-      "payload_sha256": "02e677e079a51268a938946fc59c9a089929c801fa25094d8c535d948dc3d30a",
+      "payload_sha256": "4da93ad5231abfeb4ef795ae9d071c1af6771c262bef4d8853f329669d3f8ad6",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Cal.com CLI over the Cal.com API v2 — list, read and cancel bookings, read event types, available slots, schedules, connected calendars and their busy times, and reach any other endpoint through `api`; writes are refused unless the connection grants them, and `doctor` proves the key and the account it resolves to.",
       "tier": "standard",
       "title": "Cal.com",
-      "version": "2026-11-10 — `calcomc` declares its title, Cal.com"
+      "translations": {
+        "et": {
+          "description": "Cal.com CLI Cal.com API v2 kaudu – broneeringute loetlemine, lugemine ja tühistamine, sündmusetüüpide, vabade aegade, ajakavade, ühendatud kalendrite ja nende hõivatud aegade lugemine ning mis tahes muu otspunkti kasutamine `api` kaudu; kirjutamisest keeldutakse, kui ühendus seda ei luba, ja `doctor` tõestab võtme ja konto, millele see viitab.",
+          "title": "Cal.com"
+        },
+        "ru": {
+          "description": "CLI для Cal.com через Cal.com API v2 — список, чтение и отмена бронирований, чтение типов событий, свободных слотов, расписаний, подключённых календарей и их занятого времени, а также доступ к любой другой конечной точке через `api`; запись отклоняется, если подключение её не разрешает, а `doctor` проверяет ключ и аккаунт, к которому он относится.",
+          "title": "Cal.com"
+        }
+      },
+      "version": "2026-11-16 — `calcomc` declares its title and summary in Russian and Estonian"
     },
     "calendar": {
       "executable": [
@@ -224,13 +294,23 @@
       "level": 0,
       "lucide_icon": "calendar",
       "path": "capabilities/calendar",
-      "payload_sha256": "ef1d38344e04bd56d3374faf8b8702cc031a4ce2769c28996fe5de94057ef6b7",
+      "payload_sha256": "1a713c7d9a391f85b8cbf5a59cb8c902f680c55f7170e6f1c50b59566f67f77d",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "CalDAV CLI for remote calendars — list calendars, read, search and check busy blocks, and book events on a principal.",
       "tier": "standard",
       "title": "Calendar",
-      "version": "2026-11-10 — `calendar` declares its title, Calendar, and its Lucide icon, `calendar`"
+      "translations": {
+        "et": {
+          "description": "CalDAV CLI kaugkalendrite jaoks – kalendrite loetlemine, lugemine, otsing ja hõivatud aegade kontroll ning sündmuste broneerimine osaleja jaoks.",
+          "title": "Kalender"
+        },
+        "ru": {
+          "description": "CLI CalDAV для удалённых календарей — список календарей, чтение, поиск и проверка занятых интервалов, а также бронирование событий для участника.",
+          "title": "Календарь"
+        }
+      },
+      "version": "2026-11-16 — `calendar` declares its title and summary in Russian and Estonian"
     },
     "callva": {
       "executable": [
@@ -256,13 +336,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/callva",
-      "payload_sha256": "4aaa3f675793e24664c31bb854f30841360a9f68068f99bde18f5d8d9bed22d8",
+      "payload_sha256": "d4bce3cde52f6f9c2ec7281bb95dbb5db63d81609c0e343bcd867fd731e8d31d",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "CallVA voice-AI platform CLI over the External API — read/create/update/delete agents, the speech-stack presets they run on and the tools they call, assets (prompts), calls, transcripts, recordings, call analytics, custom fields, webhook schedules, automations (Windmill scripts), webhook logs, record actions, saved calls-list views, issues, knowledge, variables, settings, projects, phone numbers, and providers.",
       "tier": "standard",
       "title": "CallVA",
-      "version": "2026-11-10 — `callva` declares its title, CallVA"
+      "translations": {
+        "et": {
+          "description": "CallVA hääl-tehisintellekti platvormi CLI External API kaudu – agentide, nende kõnevirna eelseadistuste ja kutsutavate tööriistade, varade (viipade), kõnede, transkriptsioonide, salvestiste, kõneanalüütika, kohandatud väljade, veebihaakide ajakavade, automatiseerimiste (Windmilli skriptid), veebihaakide logide, kirjetoimingute, salvestatud kõneloendi vaadete, probleemide, teadmiste, muutujate, seadete, projektide, telefoninumbrite ja teenusepakkujate lugemine, loomine, muutmine ja kustutamine.",
+          "title": "CallVA"
+        },
+        "ru": {
+          "description": "CLI платформы голосового ИИ CallVA через External API — чтение, создание, изменение и удаление агентов, наборов речевого стека, на которых они работают, и инструментов, которые они вызывают, ресурсов (промптов), звонков, расшифровок, записей, аналитики звонков, пользовательских полей, расписаний вебхуков, автоматизаций (скрипты Windmill), журналов вебхуков, действий над записями, сохранённых представлений списка звонков, проблем, знаний, переменных, настроек, проектов, телефонных номеров и провайдеров.",
+          "title": "CallVA"
+        }
+      },
+      "version": "2026-11-16 — `callva` declares its title and summary in Russian and Estonian"
     },
     "callvatest": {
       "executable": [
@@ -280,13 +370,23 @@
       "icon": false,
       "level": 0,
       "path": "capabilities/callvatest",
-      "payload_sha256": "f4824c921d2196d47b6c04b9a8de1e32cb05795e75e0d5f8c6f12a4ea428192e",
+      "payload_sha256": "9041845c8a8f3747a6e8a336728c11caa2d46c02ff083c4cc7291c8fae9ba036",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "CallVA agent test harness — drives a deployed voice agent through a real LiveKit room over text, then asserts the transcript, the tools it called, the arguments it generated, the results it answered from, and the fields stored after the call.",
       "tier": "standard",
       "title": "CallVA Test",
-      "version": "2026-11-10 — `callvatest` declares its title, CallVA Test"
+      "translations": {
+        "et": {
+          "description": "CallVA agentide testraamistik – juhib juurutatud häälagenti tekstipõhiselt läbi päris LiveKiti toa ning kontrollib seejärel transkriptsiooni, kutsutud tööriistu, genereeritud argumente, tulemusi, millest ta vastas, ja pärast kõnet salvestatud välju.",
+          "title": "CallVA test"
+        },
+        "ru": {
+          "description": "Тестовый стенд для агентов CallVA — проводит развёрнутого голосового агента через настоящую комнату LiveKit в текстовом режиме, затем проверяет расшифровку, вызванные инструменты, сгенерированные аргументы, результаты, на которые он опирался в ответах, и поля, сохранённые после звонка.",
+          "title": "Тест CallVA"
+        }
+      },
+      "version": "2026-11-16 — `callvatest` declares its title and summary in Russian and Estonian"
     },
     "clickup": {
       "executable": [
@@ -301,13 +401,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/clickup",
-      "payload_sha256": "6a9b59fe06a678f215800d712783e5a538ada17b44625699ae89c72a29aa0e89",
+      "payload_sha256": "8a72ba30413c6d58206eafa01bf77914cb16e77b036bef51eec33ae1a392a16c",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "ClickUp CLI over the REST API — read/create/update/comment-on tasks and subtasks, complete via status, manage assignees, tags, dependencies, custom fields, attachments, and webhooks across spaces and lists.",
       "tier": "standard",
       "title": "ClickUp",
-      "version": "2026-11-10 — `clickup` declares its title, ClickUp"
+      "translations": {
+        "et": {
+          "description": "ClickUp CLI REST API kaudu – ülesannete ja alamülesannete lugemine, loomine, muutmine ja kommenteerimine, lõpetamine oleku kaudu, täitjate, siltide, sõltuvuste, kohandatud väljade, manuste ja veebihaakide haldamine ruumides ja loendites.",
+          "title": "ClickUp"
+        },
+        "ru": {
+          "description": "CLI для ClickUp через REST API — чтение, создание, изменение и комментирование задач и подзадач, завершение через статус, управление исполнителями, тегами, зависимостями, пользовательскими полями, вложениями и вебхуками в пространствах и списках.",
+          "title": "ClickUp"
+        }
+      },
+      "version": "2026-11-16 — `clickup` declares its title and summary in Russian and Estonian"
     },
     "context": {
       "executable": [
@@ -325,13 +435,23 @@
       "level": 0,
       "lucide_icon": "book-open",
       "path": "capabilities/context",
-      "payload_sha256": "cbeca32583a8741f2b841148a27f512dc92a47810c2b94f35dd04b56e658a209",
+      "payload_sha256": "6c1ab375aa19fa4844cb638b67dc0cce5af805bffd503be64ebc03c5bc3e39fb",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte.",
       "tier": "core",
       "title": "Context",
-      "version": "2026-11-10 — `context` declares its title, Context, and its Lucide icon, `book-open`"
+      "translations": {
+        "et": {
+          "description": "Agendi doktriin versioonitud dokumentidena projekti PostgreSQL-i hoidlas – loetlemine, näitamine, salvestamine baasiga, ajalugu, võrdlus ja kasutusest kõrvaldamine ning kontekstikausta baithaaval import ja eksport.",
+          "title": "Kontekst"
+        },
+        "ru": {
+          "description": "Доктрина агента как версионируемые документы в хранилище PostgreSQL проекта — список, показ, сохранение с базой, история, сравнение и вывод из обращения, а также импорт и экспорт папки контекста байт в байт.",
+          "title": "Контекст"
+        }
+      },
+      "version": "2026-11-16 — `context` declares its title and summary in Russian and Estonian"
     },
     "coolify": {
       "executable": [
@@ -389,13 +509,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/coolify",
-      "payload_sha256": "a2d8f31d394c3d187c09f97987240313e0268f6f05d9d7e150d3b57ed41355d2",
+      "payload_sha256": "88fadf675f22c4e2cfcee923910a06a1eb29ea09509e97b9536330bde98cba9e",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance.",
       "tier": "standard",
       "title": "Coolify",
-      "version": "2026-11-10 — `coolify` declares its title, Coolify"
+      "translations": {
+        "et": {
+          "description": "Coolify CLI REST API kaudu – projektide, ressursside ja serverite loetlemine, rakenduste ja teenuste oleku ning logide lugemine ning nende juurutamine, taaskäivitamine, peatamine ja käivitamine isehostitud Coolify eksemplaril.",
+          "title": "Coolify"
+        },
+        "ru": {
+          "description": "CLI для Coolify через REST API — список проектов, ресурсов и серверов, чтение статуса и журналов приложений и сервисов, а также их развёртывание, перезапуск, остановка и запуск на собственном экземпляре Coolify.",
+          "title": "Coolify"
+        }
+      },
+      "version": "2026-11-16 — `coolify` declares its title and summary in Russian and Estonian"
     },
     "deployment": {
       "executable": [
@@ -430,13 +560,23 @@
       "level": 0,
       "lucide_icon": "rocket",
       "path": "capabilities/deployment",
-      "payload_sha256": "74525b77e916d511874e857432db8de209c3bd9749573cee7bec473ca8110d78",
+      "payload_sha256": "58284e5b6d19c23b242a64440c1a725f285b4fc0ae10f2889a0fd863edf85049",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to.",
       "tier": "core",
       "title": "Deployment",
-      "version": "2026-11-10 — `deployment` declares its title, Deployment, and its Lucide icon, `rocket`"
+      "translations": {
+        "et": {
+          "description": "Projekti juurutamise standard – kirjelda teenused, mida projekt käitab, kompileeri need konteineri kujutiseks ja kirjelda sihtkohad, kuhu need juurutatakse.",
+          "title": "Juurutamine"
+        },
+        "ru": {
+          "description": "Стандарт развёртывания проекта — объявить сервисы, которые запускает проект, собрать их в образ контейнера и описать цели, куда они развёртываются.",
+          "title": "Развёртывание"
+        }
+      },
+      "version": "2026-11-16 — `deployment` declares its title and summary in Russian and Estonian"
     },
     "directo": {
       "executable": [
@@ -451,13 +591,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/directo",
-      "payload_sha256": "289f49d188c80853f825561232520f1eb565dc5daadb812ca33c4fb09cb838ab",
+      "payload_sha256": "4fc22b1d749e4dbf8bc78f42b2a8220a524e0190e112de2c9155297df9dcd1fc",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Directo ERP CLI over the browser-session endpoints its web UI uses — log in, select a location, and read the authed `*.asp` surface (sales, purchases, stock, ledger). Stateful — run `directo doctor` first.",
       "tier": "standard",
       "title": "Directo",
-      "version": "2026-11-10 — `directo` declares its title, Directo"
+      "translations": {
+        "et": {
+          "description": "Directo ERP CLI veebiliidese kasutatavate brauseriseansi otspunktide kaudu – sisselogimine, asukoha valimine ja autenditud `*.asp`-pinna lugemine (müük, ostud, laoseis, pearaamat). Olekuga – käivita esmalt `directo doctor`.",
+          "title": "Directo"
+        },
+        "ru": {
+          "description": "CLI для ERP Directo через конечные точки браузерной сессии, которые использует его веб-интерфейс, — вход, выбор местоположения и чтение `*.asp`-страниц за авторизацией (продажи, закупки, склад, главная книга). Хранит состояние — сначала запустите `directo doctor`.",
+          "title": "Directo"
+        }
+      },
+      "version": "2026-11-16 — `directo` declares its title and summary in Russian and Estonian"
     },
     "emta": {
       "executable": [
@@ -473,13 +623,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/emta",
-      "payload_sha256": "4ae50e78b3f4755202b59079c1b62ecada4bfb5760c36a3316a59c0870b3f80e",
+      "payload_sha256": "5572050994b9a30da1e136672d13442cfd80a60bbfe77d4ccf42d1fcc6328661",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay balances, per-period balances, prepay ledger. Session is paste-fed from a logged-in browser. Stateful — run `emta doctor` first.",
       "tier": "standard",
       "title": "EMTA",
-      "version": "2026-11-10 — `emta` declares its title, EMTA"
+      "translations": {
+        "et": {
+          "description": "Maksu- ja Tolliameti (maasikas.emta.ee) ainult lugemiseks mõeldud CLI – ettemaksukonto saldod, perioodide saldod, ettemaksukonto väljavõte. Seanss kleebitakse sisse logitud brauserist. Olekuga – käivita esmalt `emta doctor`.",
+          "title": "EMTA"
+        },
+        "ru": {
+          "description": "CLI только для чтения Налогово-таможенного департамента Эстонии (maasikas.emta.ee) — остатки предоплаты, остатки по периодам, книга предоплат. Сессия вставляется из браузера, где выполнен вход. Хранит состояние — сначала запустите `emta doctor`.",
+          "title": "EMTA"
+        }
+      },
+      "version": "2026-11-16 — `emta` declares its title and summary in Russian and Estonian"
     },
     "fathom": {
       "executable": [
@@ -495,13 +655,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/fathom",
-      "payload_sha256": "fbba81d3e005ae0021a059eaceec01b7eb8164d4c1cc0ffd6b484296659d9070",
+      "payload_sha256": "17772f8e676ff354ced2a8cb8260b526bbcf4ad9fc6da857467794b8369ad175",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Fathom CLI over the External API + a PostgreSQL store — sync meetings and transcripts in one pass, read/update stored meetings, manage a vocabulary, and search the store at three levels.",
       "tier": "standard",
       "title": "Fathom",
-      "version": "2026-11-10 — `fathom` declares its title, Fathom"
+      "translations": {
+        "et": {
+          "description": "Fathomi CLI External API ja PostgreSQL-i hoidla kaudu – koosolekute ja transkriptsioonide sünkroonimine ühe käiguga, salvestatud koosolekute lugemine ja muutmine, sõnavara haldamine ja hoidlast otsimine kolmel tasemel.",
+          "title": "Fathom"
+        },
+        "ru": {
+          "description": "CLI для Fathom через External API и хранилище PostgreSQL — синхронизация встреч и расшифровок за один проход, чтение и изменение сохранённых встреч, управление словарём и поиск по хранилищу на трёх уровнях.",
+          "title": "Fathom"
+        }
+      },
+      "version": "2026-11-16 — `fathom` declares its title and summary in Russian and Estonian"
     },
     "geminitalk": {
       "executable": [
@@ -520,13 +690,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/geminitalk",
-      "payload_sha256": "2e66b94fa3f8342d303530a5a4b9317a284e9092283aee9515b7cb51979dddc9",
+      "payload_sha256": "8ab58c337ad0b991d47fbe90e40dc5d93af42073c365ad93b818f760e7cf3cd9",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay.",
       "tier": "standard",
       "title": "Gemini Talk",
-      "version": "2026-11-10 — `geminitalk` declares its title, Gemini Talk"
+      "translations": {
+        "et": {
+          "description": "Gemini Live'i natiivse heliga projektikaaslane pideva dupleksheli, piiratud projektitööriistade, valikulise taustal töötavale Codexile delegeerimise ja aktiivse Codexi lõime vahendamisega.",
+          "title": "Gemini vestlus"
+        },
+        "ru": {
+          "description": "Проектный собеседник на Gemini Live с нативным звуком: непрерывный дуплексный звук, ограниченные инструменты проекта, необязательное делегирование фоновому Codex и ретрансляция активной ветки Codex.",
+          "title": "Разговор с Gemini"
+        }
+      },
+      "version": "2026-11-16 — `geminitalk` declares its title and summary in Russian and Estonian"
     },
     "ical": {
       "executable": [
@@ -543,13 +723,23 @@
       "level": 0,
       "lucide_icon": "calendar",
       "path": "capabilities/ical",
-      "payload_sha256": "6b96440878b7111ad16fb19ff0443410f830339dbd6ecc6e9fa9849cd2cf9fb5",
+      "payload_sha256": "48170283c21a500dd7e3b2b4a7fb02a698197bcb68747dd512f766191abcf317",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk.",
       "tier": "standard",
       "title": "Apple Calendar",
-      "version": "2026-11-10 — `ical` declares its title, Apple Calendar, and its Lucide icon, `calendar`"
+      "translations": {
+        "et": {
+          "description": "macOS-i kalendri CLI indekseeritud EventKiti lugemiste ja Calendar.appi automatiseeritud kirjutamistega seadistatud kalendrites (kalendrid, sündmused, näitamine, otsing, vaba/hõivatud, loomine, muutmine, kustutamine). Kirjutamist piirab ühenduse poliitika (scope + allow_write); ühtegi mandaati kettale ei salvestata.",
+          "title": "Apple'i kalender"
+        },
+        "ru": {
+          "description": "CLI для Календаря macOS с индексированным чтением через EventKit и записью через автоматизацию Calendar.app по настроенным календарям (календари, события, показ, поиск, занятость, создание, изменение, удаление). Запись ограничена политикой подключения (scope + allow_write); учётные данные на диске не хранятся.",
+          "title": "Календарь Apple"
+        }
+      },
+      "version": "2026-11-16 — `ical` declares its title and summary in Russian and Estonian"
     },
     "inbox": {
       "executable": [
@@ -565,13 +755,23 @@
       "level": 0,
       "lucide_icon": "inbox",
       "path": "capabilities/inbox",
-      "payload_sha256": "2c409470a86d38893bc66c58853a276d317d4b48c7ffc95c8b406201d0af8aa7",
+      "payload_sha256": "af92c1293fe56448b14d8a296ec71f4be8980b1c6e5e94862ea3c2d9672ce646",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "A go-between to the person - an agent puts in a question to answer yes or no, a message to answer in words, or something to know, and leaves the command that takes the answer; the person lists, reads, answers and archives them, and the answer runs the asker's command in the asker's own folder. Whatever an agent puts before a person in the Inbox, itself or through another tool, is written for someone deciding, not someone reading code: say what this is, why it comes up now, what is needed from the person, and which answer you recommend and why, in plain language with no code, file paths, line numbers, commit or task ids, or internal names, under a title that says the matter itself.",
       "tier": "core",
       "title": "Inbox",
-      "version": "2026-11-10 — `inbox` declares its title, Inbox, and its Lucide icon, `inbox`"
+      "translations": {
+        "et": {
+          "description": "Vahendaja inimesega – agent paneb sisse küsimuse, millele vastatakse jah või ei, sõnumi, millele vastatakse sõnadega, või midagi teadmiseks ning jätab käsu, mis vastuse vastu võtab; inimene loetleb, loeb, vastab ja arhiveerib need ning vastus käivitab küsija käsu küsija enda kaustas. Kõik, mille agent Sissetulevates inimese ette paneb, ise või mõne muu tööriista kaudu, on kirjutatud otsustajale, mitte koodi lugejale: ütle, mis see on, miks see praegu üles kerkib, mida inimeselt vaja on ja millist vastust soovitad ning miks, lihtsas keeles, ilma koodi, failiteede, reanumbrite, commit'i- või ülesande-ID-de ja siseste nimedeta, pealkirja all, mis ütleb asja enda.",
+          "title": "Sissetulevad"
+        },
+        "ru": {
+          "description": "Посредник между агентом и человеком — агент кладёт вопрос, на который отвечают да или нет, сообщение, на которое отвечают словами, или что-то для сведения и оставляет команду, принимающую ответ; человек просматривает, читает, отвечает и архивирует их, а ответ запускает команду спросившего в его собственной папке. Всё, что агент кладёт перед человеком во Входящие, сам или через другой инструмент, пишется для того, кто принимает решение, а не для того, кто читает код: скажите, что это, почему это возникло сейчас, что нужно от человека и какой ответ вы рекомендуете и почему, простым языком, без кода, путей к файлам, номеров строк, идентификаторов коммитов или задач и внутренних названий, под заголовком, который называет саму суть дела.",
+          "title": "Входящие"
+        }
+      },
+      "version": "2026-11-16 — `inbox` declares its title and summary in Russian and Estonian"
     },
     "instagram": {
       "executable": [
@@ -587,13 +787,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/instagram",
-      "payload_sha256": "1527aa85462d07ba7f229974bf641e3c7bee2a1f8faa49f81a40d0c1d799e8f9",
+      "payload_sha256": "66704fdc740d2c4cf51d9cace78865b48f2ac8bfd7fcd3ebc091814db7782918",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first.",
       "tier": "standard",
       "title": "Instagram",
-      "version": "2026-11-10 — `instagram` declares its title, Instagram"
+      "translations": {
+        "et": {
+          "description": "Instagrami CLI salvestatud brauseriseansi kaudu – identiteedi kontroll, profiilide lugemine, Directi vestluste leidmine ja tekstisõnumite saatmine. Olekuga – käivita esmalt `instagram doctor`.",
+          "title": "Instagram"
+        },
+        "ru": {
+          "description": "CLI для Instagram через сохранённую браузерную сессию — проверка личности, чтение профилей, поиск переписок Direct и отправка текстовых сообщений. Хранит состояние — сначала запустите `instagram doctor`.",
+          "title": "Instagram"
+        }
+      },
+      "version": "2026-11-16 — `instagram` declares its title and summary in Russian and Estonian"
     },
     "journal": {
       "executable": [
@@ -610,13 +820,23 @@
       "level": 0,
       "lucide_icon": "notebook",
       "path": "capabilities/journal",
-      "payload_sha256": "7f77965b97f8745a685898db377a33f4c619c231b47632467f542ca72390c4b4",
+      "payload_sha256": "23fbc9dcaef9637a6492017ae5eb9ebefc01174d1addc1efc440db9786df4945",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Journal CLI over a PostgreSQL store — list and read voice-journal entries, write enrichment back, chunk transcripts for embedding, and search the store at three levels.",
       "tier": "standard",
       "title": "Journal",
-      "version": "2026-11-10 — `journal` declares its title, Journal, and its Lucide icon, `notebook`"
+      "translations": {
+        "et": {
+          "description": "Päeviku CLI PostgreSQL-i hoidla kaudu – häälpäeviku kirjete loetlemine ja lugemine, rikastuse tagasi kirjutamine, transkriptsioonide tükeldamine manustamiseks ja hoidlast otsimine kolmel tasemel.",
+          "title": "Päevik"
+        },
+        "ru": {
+          "description": "CLI журнала через хранилище PostgreSQL — список и чтение записей голосового журнала, запись обогащённых данных обратно, разбиение расшифровок на фрагменты для эмбеддингов и поиск по хранилищу на трёх уровнях.",
+          "title": "Журнал"
+        }
+      },
+      "version": "2026-11-16 — `journal` declares its title and summary in Russian and Estonian"
     },
     "macmail": {
       "executable": [
@@ -633,13 +853,23 @@
       "level": 0,
       "lucide_icon": "mail",
       "path": "capabilities/macmail",
-      "payload_sha256": "edc2fe6abebb62162feff3b0e431e9c3c9694e4a3f4e8feb7bccdd43cafdcd94",
+      "payload_sha256": "a3f2a93ea73edc90da9abbd7359c7e2bac7336c7e7a32ef438b02520e817c4f6",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON.",
       "tier": "standard",
       "title": "Apple Mail",
-      "version": "2026-11-10 — `macmail` declares its title, Apple Mail, and its Lucide icon, `mail`"
+      "translations": {
+        "et": {
+          "description": "Mail.appi CLI macOS-i automatiseerimise kaudu – kirjade lugemine ja otsimine seadistatud kontodel, kirja näitamine, manuste salvestamine, mustandid (ei saada kunagi) ja postkasti eksport JSON-i.",
+          "title": "Apple'i Mail"
+        },
+        "ru": {
+          "description": "CLI для Mail.app через автоматизацию macOS — чтение и поиск почты по настроенным аккаунтам, показ письма, сохранение вложений, черновики (без отправки) и экспорт почтового ящика в JSON.",
+          "title": "Почта Apple"
+        }
+      },
+      "version": "2026-11-16 — `macmail` declares its title and summary in Russian and Estonian"
     },
     "mailbox": {
       "executable": [
@@ -657,13 +887,23 @@
       "level": 0,
       "lucide_icon": "mail",
       "path": "capabilities/mailbox",
-      "payload_sha256": "2f6bea14cca146a45b4f3be39c7a88fad5389e406d0b83a338d0e08a8791fac7",
+      "payload_sha256": "4222f909bc99554fa226c666e0518c7e089f44e6c81bb035fb23521ceb1b48c8",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, send, and save a draft into Drafts without sending it; send, draft, move and seen need a write grant.",
       "tier": "standard",
       "title": "Mailbox",
-      "version": "2026-11-10 — `mailbox` declares its title, Mailbox, and its Lucide icon, `mail`"
+      "translations": {
+        "et": {
+          "description": "Õhuke IMAP/SMTP CLI postkastide jaoks – kirjade loetlemine ja näitamine, manuste salvestamine, PDF-i renderdamine, toore .eml-i salvestamine, `\\Seen` märgistamine, kaustade vahel teisaldamine, saatmine ja mustandi salvestamine kausta Drafts ilma saatmata; saatmine, mustand, teisaldamine ja loetuks märkimine vajavad kirjutusõigust.",
+          "title": "Postkast"
+        },
+        "ru": {
+          "description": "Простой CLI IMAP/SMTP для почтовых ящиков — список и показ писем, сохранение вложений, вывод в PDF, сохранение исходного .eml, отметка `\\Seen`, перенос между папками, отправка и сохранение черновика в Drafts без отправки; отправка, черновик, перенос и отметка о прочтении требуют разрешения на запись.",
+          "title": "Почтовый ящик"
+        }
+      },
+      "version": "2026-11-16 — `mailbox` declares its title and summary in Russian and Estonian"
     },
     "memory": {
       "executable": [
@@ -692,13 +932,23 @@
       "level": 0,
       "lucide_icon": "brain",
       "path": "capabilities/memory",
-      "payload_sha256": "ed7547c8c7e1b15634bc5f479d688e172df06541dfabd1afb1e9912248140656",
+      "payload_sha256": "53214399a3701febe27b4c4012f4e6157b12e5851d54ea288c62bbb6b8f479f7",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a constant block in every session's context that says how to record and search them, and a grooming pass, run on a schedule, that consolidates the entries.",
       "tier": "core",
       "title": "Memory",
-      "version": "2026-11-10 — `memory` declares its title, Memory, and its Lucide icon, `brain`"
+      "translations": {
+        "et": {
+          "description": "Projekti mälu PostgreSQL-i hoidlas – järeldused, mis salvestatakse ükshaaval ja leitakse vajadusel, iga seansi kontekstis püsiv plokk, mis ütleb, kuidas neid salvestada ja otsida, ning ajakava järgi käiv korrastusetapp, mis kirjeid koondab.",
+          "title": "Mälu"
+        },
+        "ru": {
+          "description": "Память проекта в хранилище PostgreSQL — выводы, записываемые по одной записи и находимые по запросу, постоянный блок в контексте каждой сессии, объясняющий, как их записывать и искать, и проход упорядочивания по расписанию, который объединяет записи.",
+          "title": "Память"
+        }
+      },
+      "version": "2026-11-16 — `memory` declares its title and summary in Russian and Estonian"
     },
     "notion": {
       "executable": [
@@ -712,13 +962,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/notion",
-      "payload_sha256": "19ee0ec43e91d25b429c4ad58cad53c9da86c468aba7a7de9291b257baad4daa",
+      "payload_sha256": "6966ca2774eb51285c627734af6389390ae731a7eee6df8c72020e6d614091bf",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Notion CLI over the REST API — publish markdown to pages: list child pages, fetch a page as markdown, replace a page's body and title, create under a parent, and upsert by exact title.",
       "tier": "standard",
       "title": "Notion",
-      "version": "2026-11-10 — `notion` declares its title, Notion"
+      "translations": {
+        "et": {
+          "description": "Notioni CLI REST API kaudu – markdowni avaldamine lehtedele: alamlehtede loetlemine, lehe toomine markdownina, lehe sisu ja pealkirja asendamine, loomine vanema alla ning täpse pealkirja järgi loomine või uuendamine.",
+          "title": "Notion"
+        },
+        "ru": {
+          "description": "CLI для Notion через REST API — публикация markdown на страницы: список дочерних страниц, получение страницы в виде markdown, замена тела и заголовка страницы, создание под родителем и создание-или-обновление по точному заголовку.",
+          "title": "Notion"
+        }
+      },
+      "version": "2026-11-16 — `notion` declares its title and summary in Russian and Estonian"
     },
     "railwayc": {
       "executable": [
@@ -734,13 +994,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/railwayc",
-      "payload_sha256": "f70289120109437f9d163b65a4cd1c6499d01932dfb79f2c9c5c9a931a1972d4",
+      "payload_sha256": "124f54cd9e7c9a3c4d43320313e532c55f555591227d96a5a7356e65ef3f0546",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Credential harness around the official `railway` CLI — resolves a project-scoped Railway token, injects it, and forwards your command straight to `railway` (everything but railwayc's own verbs passes through untouched); the command surface is `railway help`.",
       "tier": "standard",
       "title": "Railway",
-      "version": "2026-11-10 — `railwayc` declares its title, Railway"
+      "translations": {
+        "et": {
+          "description": "Mandaadikiht ametliku `railway` CLI ümber – leiab projektipõhise Railway tokeni, lisab selle ja edastab su käsu otse `railway`-le (kõik peale railwayc enda käskude läheb muutmata läbi); käskude pind on `railway help`.",
+          "title": "Railway"
+        },
+        "ru": {
+          "description": "Обёртка учётных данных вокруг официального CLI `railway` — находит токен Railway для проекта, подставляет его и передаёт вашу команду прямо в `railway` (всё, кроме собственных команд railwayc, проходит без изменений); набор команд — `railway help`.",
+          "title": "Railway"
+        }
+      },
+      "version": "2026-11-16 — `railwayc` declares its title and summary in Russian and Estonian"
     },
     "rclonec": {
       "executable": [
@@ -759,13 +1029,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/rclonec",
-      "payload_sha256": "f604417f03af22ec1b8f2c720fecfe739a2076abf1d49ca035bfa805a2935159",
+      "payload_sha256": "0956a955025b1e14fb9ec6d7455e68e552d6ad3b51e3480a222ab3985a77af94",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`.",
       "tier": "standard",
       "title": "Rclone",
-      "version": "2026-11-10 — `rclonec` declares its title, Rclone"
+      "translations": {
+        "et": {
+          "description": "Mandaadikiht ametliku `rclone` programmi ümber – teisendab ühe nimega ühenduse üheks rclone'i kaugsihtkohaks (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV ja rclone'i muud taustsüsteemid), lisab selle konfiguratsioonina ja edastab su käsu otse `rclone`-le (kõik peale rclonec enda käskude läheb muutmata läbi); käskude pind on `rclone help`.",
+          "title": "Rclone"
+        },
+        "ru": {
+          "description": "Обёртка учётных данных вокруг официального бинарника `rclone` — превращает одно именованное подключение в один удалённый ресурс rclone (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV и другие бэкенды rclone), подставляет его как конфигурацию и передаёт вашу команду прямо в `rclone` (всё, кроме собственных команд rclonec, проходит без изменений); набор команд — `rclone help`.",
+          "title": "Rclone"
+        }
+      },
+      "version": "2026-11-16 — `rclonec` declares its title and summary in Russian and Estonian"
     },
     "resend": {
       "executable": [
@@ -779,13 +1059,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/resend",
-      "payload_sha256": "2c080148fd25204245fd2cadb49022cd6245998428fc5c6792906bd407e31523",
+      "payload_sha256": "d561b8dcdb3e62d1fe61eeb6bf5c883f26b7207a8ca02cf0bb3249e754f9f1fc",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Send-only email CLI over the Resend HTTP API — deliver mail from a verified sending domain (send, write-gated with an optional recipient allow-list), list sending domains and their verification status (domains), and prove key + reachability (doctor). One-way by construction: no read or receive surface.",
       "tier": "standard",
       "title": "Resend",
-      "version": "2026-11-10 — `resend` declares its title, Resend"
+      "translations": {
+        "et": {
+          "description": "Ainult saatmiseks mõeldud e-posti CLI Resendi HTTP API kaudu – kirjade saatmine kinnitatud saatmisdomeenilt (send, kirjutusõigusega ja valikulise lubatud saajate loendiga), saatmisdomeenide ja nende kinnitamise oleku loetlemine (domains) ning võtme ja kättesaadavuse tõestamine (doctor). Ülesehituselt ühesuunaline: lugemise ega vastuvõtmise pinda pole.",
+          "title": "Resend"
+        },
+        "ru": {
+          "description": "CLI только для отправки почты через HTTP API Resend — доставка писем с подтверждённого домена отправки (send, с разрешением на запись и необязательным списком разрешённых получателей), список доменов отправки и статуса их проверки (domains) и проверка ключа и доступности (doctor). Односторонний по устройству: чтения и приёма нет.",
+          "title": "Resend"
+        }
+      },
+      "version": "2026-11-16 — `resend` declares its title and summary in Russian and Estonian"
     },
     "routine": {
       "executable": [
@@ -805,13 +1095,23 @@
       "level": 0,
       "lucide_icon": "list-ordered",
       "path": "capabilities/routine",
-      "payload_sha256": "ed37c9dcf11a00528349322a4371892965f71c5a6872f9939fb48c32a54c74c4",
+      "payload_sha256": "86fd048d50f8b5af0624e55367204ef1af4e2f51d7b7ee8f0e441c63b7a48b10",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte.",
       "tier": "core",
       "title": "Routines",
-      "version": "2026-11-10 — `routine` declares its title, Routines, and its Lucide icon, `list-ordered`"
+      "translations": {
+        "et": {
+          "description": "Projekti korduvate protseduuride CLI – `.routines` retseptide loetlemine, valideerimine ja renderdamine ning rutiinide hoidmine versioonitud dokumentidena projekti hoidlas: näitamine, salvestamine baasiga, ajalugu, võrdlus, kasutusest kõrvaldamine ning rutiinide kausta baithaaval import ja eksport.",
+          "title": "Rutiinid"
+        },
+        "ru": {
+          "description": "CLI процедур проекта — список, проверка и вывод рецептов `.routines` и хранение процедур как версионируемых документов в хранилище проекта: показ, сохранение с базой, история, сравнение, вывод из обращения, а также импорт и экспорт папки процедур байт в байт.",
+          "title": "Процедуры"
+        }
+      },
+      "version": "2026-11-16 — `routine` declares its title and summary in Russian and Estonian"
     },
     "signoz": {
       "executable": [
@@ -828,13 +1128,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/signoz",
-      "payload_sha256": "32deba65926d5aee7da0283de5d55e8d2c99a8ad8dec3b88d62412ff2a09e671",
+      "payload_sha256": "607fd2d322bb3c50ee033ae5ea7170788b57645dbf733f4aa2fd61c35a4b72e0",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances.",
       "tier": "standard",
       "title": "SigNoz",
-      "version": "2026-11-10 — `signoz` declares its title, SigNoz"
+      "translations": {
+        "et": {
+          "description": "SigNozi CLI haldus- ja Query Builderi API kaudu – teenuste, mõõdikute ja väljade avastamine, logidest ja jälgedest otsimine, armatuurlaudade, hoiatuste, vaadete ja kanalite uurimine ning toorpäringute käivitamine pilves või isehostitud eksemplaridel.",
+          "title": "SigNoz"
+        },
+        "ru": {
+          "description": "CLI для SigNoz через API управления и Query Builder — поиск сервисов, метрик и полей, поиск по журналам и трассировкам, просмотр дашбордов, оповещений, представлений и каналов и выполнение сырых запросов к API в облаке или на собственных экземплярах.",
+          "title": "SigNoz"
+        }
+      },
+      "version": "2026-11-16 — `signoz` declares its title and summary in Russian and Estonian"
     },
     "simplbooks": {
       "executable": [
@@ -861,13 +1171,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/simplbooks",
-      "payload_sha256": "e2fa5377b18f0543e057da7be96b35bf44ab077963ed00250d6853f00a14c18f",
+      "payload_sha256": "f170d9043e73e6e69d7047b3afd95ae93450b207a54a629ffabb248c266bdc2b",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "SimpleBooks accounting CLI over a browser session (no public API) — read clients/invoices/purchases/accounts/bank-transactions/financial_transactions, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist. Stateful — run `simplbooks doctor` first.",
       "tier": "standard",
       "title": "SimplBooks",
-      "version": "2026-11-10 — `simplbooks` declares its title, SimplBooks"
+      "translations": {
+        "et": {
+          "description": "SimpleBooksi raamatupidamise CLI brauseriseansi kaudu (avalikku API-d pole) – klientide, arvete, ostude, kontode, pangatehingute ja finantstehingute lugemine, müügi- ja ostuarvete loomine, maksete ja laekumiste kirjendamine, tasakaalus päevikukannete postitamine, pangamaksekorralduste ettevalmistamine ja PSD2 panga töönimekirja töötlemine. Olekuga – käivita esmalt `simplbooks doctor`.",
+          "title": "SimplBooks"
+        },
+        "ru": {
+          "description": "CLI бухгалтерии SimpleBooks через браузерную сессию (публичного API нет) — чтение клиентов, счетов на оплату, закупок, бухгалтерских счетов, банковских операций и финансовых проводок, создание счетов на оплату и входящих счетов, учёт платежей и поступлений, проведение сбалансированных журнальных записей, подготовка банковских платёжных поручений и обработка банковского списка задач PSD2. Хранит состояние — сначала запустите `simplbooks doctor`.",
+          "title": "SimplBooks"
+        }
+      },
+      "version": "2026-11-16 — `simplbooks` declares its title and summary in Russian and Estonian"
     },
     "skyscanner": {
       "executable": [
@@ -882,13 +1202,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/skyscanner",
-      "payload_sha256": "c0f5ea40dbbb6db9c14901440574a219418656f2df40d9eaf836e578e1e053e8",
+      "payload_sha256": "c2e60c70cdb3bb2e5e36c4516f246077f5ca6c1703418368c8e62594357f3c53",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Skyscanner flight search over plain HTTP — resolve places, search live itineraries with prices, comfort facts (stops, layovers, self-transfer, airport changes) and booking links, and read the cached cheapest price per day; read-only, optionally through an Oxylabs residential proxy that keeps Skyscanner's bot protection from blocking the address.",
       "tier": "standard",
       "title": "Skyscanner",
-      "version": "2026-11-10 — `skyscanner` declares its title, Skyscanner"
+      "translations": {
+        "et": {
+          "description": "Skyscanneri lennuotsing tavalise HTTP kaudu – kohtade tuvastamine, reaalajas marsruutide otsing hindade, mugavusandmete (ümberistumised, ooteajad, iseseisev ümberistumine, lennujaama vahetus) ja broneerimislinkidega ning vahemällu salvestatud odavaima päevahinna lugemine; ainult lugemiseks, valikuliselt Oxylabsi residentsiaalse puhverserveri kaudu, et Skyscanneri robotikaitse aadressi ei blokeeriks.",
+          "title": "Skyscanner"
+        },
+        "ru": {
+          "description": "Поиск авиабилетов Skyscanner по обычному HTTP — определение мест, поиск актуальных маршрутов с ценами, сведениями об удобстве (пересадки, стыковки, самостоятельная пересадка, смена аэропорта) и ссылками на бронирование, а также чтение кэшированной минимальной цены по дням; только чтение, при необходимости через резидентный прокси Oxylabs, чтобы защита Skyscanner от ботов не блокировала адрес.",
+          "title": "Skyscanner"
+        }
+      },
+      "version": "2026-11-16 — `skyscanner` declares its title and summary in Russian and Estonian"
     },
     "slack": {
       "executable": [
@@ -931,13 +1261,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/slack",
-      "payload_sha256": "276496d7ea9dc471bdbf5f3e36de0eb10e53261075385783beba19f02a29d0c0",
+      "payload_sha256": "4eb4ed8fbcca62231a4471d4e9ce9a3fdaec67ba71a097bb4ac586d4412e7a1f",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy.",
       "tier": "standard",
       "title": "Slack",
-      "version": "2026-11-10 — `slack` declares its title, Slack"
+      "translations": {
+        "et": {
+          "description": "Slacki CLI boti tokeni kaudu – kanalitesse, gruppidesse, lõimedesse ja otsesõnumitesse postitamine ning nende lugemine ja nimede teisendamine ID-deks; vestlussihtmärke piirab projekti lubatud loendi poliitika.",
+          "title": "Slack"
+        },
+        "ru": {
+          "description": "CLI для Slack через токен бота — публикация и чтение каналов, групп, веток и личных сообщений и сопоставление имён с идентификаторами; целевые беседы ограничены политикой списка разрешённых в проекте.",
+          "title": "Slack"
+        }
+      },
+      "version": "2026-11-16 — `slack` declares its title and summary in Russian and Estonian"
     },
     "slacker": {
       "executable": [
@@ -960,13 +1300,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/slacker",
-      "payload_sha256": "d96cf0a521d234da53f2fd43f8c4296b7faacab87a7a902e4aeee6e59eb922dc",
+      "payload_sha256": "8703a5eb5d9d02e63658ddfd7a857fc52d2c9739397f4ecca7f58c7aecdd69ce",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live. Read-only: it never writes to Slack.",
       "tier": "standard",
       "title": "Slack Reader",
-      "version": "2026-11-10 — `slacker` declares its title, Slack Reader"
+      "translations": {
+        "et": {
+          "description": "Slacki CLI, mis loeb seotud kasutaja enda tööruumi tema veebiseansi kaudu (xoxc token + d küpsis) – vestluste loetlemine (otsesõnumid, grupi otsesõnumid, avalikud ja privaatsed kanalid), sõnumiajaloo ja lõimevastuste lugemine, järkjärgult sünkroonitav Postgresi hoidla ja reaalajas jäädvustamine. Ainult lugemiseks: Slacki ei kirjuta see kunagi.",
+          "title": "Slack (lugemine)"
+        },
+        "ru": {
+          "description": "CLI для Slack, который читает собственное рабочее пространство привязанного пользователя через его веб-сессию (токен xoxc + cookie d) — список бесед (личные, групповые личные, публичные и приватные каналы), чтение истории сообщений и ответов в ветках, инкрементально синхронизируемое хранилище Postgres и захват в реальном времени. Только чтение: в Slack он никогда не пишет.",
+          "title": "Slack (чтение)"
+        }
+      },
+      "version": "2026-11-16 — `slacker` declares its title and summary in Russian and Estonian"
     },
     "stripe": {
       "executable": [
@@ -980,13 +1330,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/stripe",
-      "payload_sha256": "e7d732d8d2f1dec2555c8460a070cacf624cee808599c53a9b63eca653dd295c",
+      "payload_sha256": "0cb0fb16ef70322b4dcc7fd085fe59cd59eb23a4cfca90a839d54c676cbd02d6",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Read-only Stripe CLI over the REST API — emit a neutral JSON contract of account activity (sync-plan), check identity/reachability (doctor), list invoices and download their PDFs, and read balance-transactions and payouts.",
       "tier": "standard",
       "title": "Stripe",
-      "version": "2026-11-10 — `stripe` declares its title, Stripe"
+      "translations": {
+        "et": {
+          "description": "Ainult lugemiseks mõeldud Stripe'i CLI REST API kaudu – konto tegevuse neutraalse JSON-lepingu väljastamine (sync-plan), identiteedi ja kättesaadavuse kontroll (doctor), arvete loetlemine ja nende PDF-ide allalaadimine ning saldotehingute ja väljamaksete lugemine.",
+          "title": "Stripe"
+        },
+        "ru": {
+          "description": "CLI Stripe только для чтения через REST API — выдача нейтрального JSON-контракта активности аккаунта (sync-plan), проверка личности и доступности (doctor), список счетов и загрузка их PDF, чтение балансовых операций и выплат.",
+          "title": "Stripe"
+        }
+      },
+      "version": "2026-11-16 — `stripe` declares its title and summary in Russian and Estonian"
     },
     "tasks": {
       "executable": [
@@ -1049,13 +1409,23 @@
       "level": 0,
       "lucide_icon": "list-checks",
       "path": "capabilities/tasks",
-      "payload_sha256": "dd95b3670eeb76807d18d444844310f2685ceeb5d567a5e21cf075ddac3db514",
+      "payload_sha256": "fff9cf0c721916fd67f74ace49edc52e2447fd2e9277761117b11461ebe7c522",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
       "tier": "core",
       "title": "Tasks",
-      "version": "2026-11-10 — `tasks` declares its title, Tasks, and its Lucide icon, `list-checks`"
+      "translations": {
+        "et": {
+          "description": "Ülesannete jälgija PostgreSQL-i hoidlas – eesmärgiga ülesanded ja ainult lisatav kirje sellest, mida nendega tehti, nii et praegu ettevõetav töö tõuseb ise esile.",
+          "title": "Ülesanded"
+        },
+        "ru": {
+          "description": "Трекер задач в хранилище PostgreSQL — задачи с целью и неизменяемая запись того, что по ним сделано, так что работа, которую можно взять сейчас, всплывает сама.",
+          "title": "Задачи"
+        }
+      },
+      "version": "2026-11-16 — `tasks` declares its title and summary in Russian and Estonian"
     },
     "teams": {
       "executable": [
@@ -1070,13 +1440,23 @@
       "level": 1,
       "lucide_icon": "users",
       "path": "capabilities/teams",
-      "payload_sha256": "ffc92e2c3c8392f4f0adf62d19b2e4996e4f0f6075c99f4b0bbe23ec974c8642",
+      "payload_sha256": "75f2b978688295a7576f064e54b1738052ac6d3535d080743967a6e1f7e1c9f6",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
       "tier": "core",
       "title": "Teams",
-      "version": "2026-11-16 — `teams` declares level 1, the level a capabilities manager that composes no Teams section of its own requires"
+      "translations": {
+        "et": {
+          "description": "Agentide meeskonnad, kes jagavad hoidlas peetavaid juhiseid – loetle meeskonnad, kuhu kuulud, loe nende dokumente ning loo meeskondi, lisa liikmeid ja salvesta, nimeta ümber ning kõrvalda kasutusest nende versioonitud dokumente.",
+          "title": "Meeskonnad"
+        },
+        "ru": {
+          "description": "Команды агентов с общими инструкциями в хранилище — список команд, в которых вы состоите, чтение их документов, создание команд, добавление участников, а также сохранение, переименование и вывод из обращения их версионируемых документов.",
+          "title": "Команды"
+        }
+      },
+      "version": "2026-11-16 — `teams` declares its title and summary in Russian and Estonian"
     },
     "telegram": {
       "executable": [
@@ -1151,13 +1531,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "8c2cd67928b0be28119e070f4d4c7d5b62fc4294e38124b879d6485ccf568062",
+      "payload_sha256": "d73e2de11b65d6bad4e4a2f94854c5f7cc6bf8e06d2c22bf50adc044871fb2e8",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
       "tier": "standard",
       "title": "Telegram",
-      "version": "2026-11-16 — Calls no longer stutter: the job register never runs on the event loop, and the runner is woken by changes, at telegram 3.3"
+      "translations": {
+        "et": {
+          "description": "Telegrami CLI isikliku MTProto konto kaudu – vestluse lugemine ja otsimine, foorumi teemade loetlemine, teksti, meedia ja reaktsioonide saatmine vestlusesse või selle teemasse, ajaloo eksport JSON-i, hääl- ja helisõnumite transkribeerimine. Olekuga – käivita esmalt `telegram doctor`.",
+          "title": "Telegram"
+        },
+        "ru": {
+          "description": "CLI для Telegram через личный аккаунт MTProto — чтение и поиск в чате, список тем форума, отправка текста, медиа и реакций в чат или одну из его тем, экспорт истории в JSON, расшифровка голосовых и аудио. Хранит состояние — сначала запустите `telegram doctor`.",
+          "title": "Telegram"
+        }
+      },
+      "version": "2026-11-16 — `telegram` declares its title and summary in Russian and Estonian"
     },
     "telegrambot": {
       "executable": [
@@ -1205,13 +1595,23 @@
       "level": 0,
       "lucide_icon": "bot-message-square",
       "path": "capabilities/telegrambot",
-      "payload_sha256": "38ee7911e3569fea2a4cf4389e5513da81d8cd477b5f5047031985a1f3be9bfb",
+      "payload_sha256": "9db67801ce5d5887fa3f9ff836d31abb2e8f6957cf80caf2155d2280e4483fb6",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation.",
       "tier": "standard",
       "title": "Telegram Bot",
-      "version": "2026-11-16 — A handed-off job's brief no longer reaches the chat"
+      "translations": {
+        "et": {
+          "description": "Agendi enda Telegrami kanal boti kaudu – uued sõnumid ja iga kirjutamine HTTP Bot API kaudu, ajalugu loetakse Telegramist sõnuminumbri järgi tagasi MTProto seansi kaudu, kuhu boti token sisse logib, vestlused ja inimesed, keda bot on näinud, ning agendi viibad tarnitud standardi järgi; vestlusest ei hoia keegi koopiat.",
+          "title": "Telegrami bot"
+        },
+        "ru": {
+          "description": "Собственный канал агента в Telegram через бота — новые сообщения и каждая запись через HTTP Bot API, история, читаемая обратно из Telegram по номеру сообщения через сессию MTProto, в которую входит токен бота, чаты и люди, которых видел бот, и промпты агента по поставляемому стандарту; копию переписки ничто не хранит.",
+          "title": "Telegram-бот"
+        }
+      },
+      "version": "2026-11-16 — `telegrambot` declares its title and summary in Russian and Estonian"
     },
     "vapic": {
       "executable": [
@@ -1229,13 +1629,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/vapic",
-      "payload_sha256": "3d886bf2820e4b3cdb69c0bfd23d26c59dd629f36fa16cee0e0363a557141e53",
+      "payload_sha256": "b72d7e0d8e3c1d221ebea36c0326a5aa806f0527937795c48aaa2940984dde14",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Connection harness around the official `vapi` CLI - resolves a Vapi API key, injects it, and forwards commands to `vapi` with a narrow read-list fallback; the command surface is `vapi --help`.",
       "tier": "standard",
       "title": "Vapi",
-      "version": "2026-11-10 — `vapic` declares its title, Vapi"
+      "translations": {
+        "et": {
+          "description": "Ühenduskiht ametliku `vapi` CLI ümber – leiab Vapi API-võtme, lisab selle ja edastab käsud `vapi`-le kitsa loendite lugemise varuvariandiga; käskude pind on `vapi --help`.",
+          "title": "Vapi"
+        },
+        "ru": {
+          "description": "Обёртка подключения вокруг официального CLI `vapi` — находит API-ключ Vapi, подставляет его и передаёт команды в `vapi` с узким запасным вариантом для чтения списков; набор команд — `vapi --help`.",
+          "title": "Vapi"
+        }
+      },
+      "version": "2026-11-16 — `vapic` declares its title and summary in Russian and Estonian"
     },
     "whatsapp": {
       "executable": [
@@ -1282,13 +1692,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "02ec8d762641c0bc7d3d056e47385804f972fe97afdd8654f034a1d14d15a14b",
+      "payload_sha256": "78d5ae2c7e03501dc40580368e3c949bfddd9606171495579f16a32bdf432aa0",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON.",
       "tier": "standard",
       "title": "WhatsApp",
-      "version": "2026-11-10 — `whatsapp` declares its title, WhatsApp"
+      "translations": {
+        "et": {
+          "description": "WhatsAppi CLI oma mootoriga – seadme sidumine, konto vestluste ja sõnumite hoidmine Postgresi hoidlas, nende lugemine ja süvendamine vajadusel, häälsõnumite transkribeerimine ja vestluse eksport JSON-i.",
+          "title": "WhatsApp"
+        },
+        "ru": {
+          "description": "CLI для WhatsApp со встроенным движком — привязка устройства, хранение чатов и сообщений аккаунта в хранилище Postgres, чтение и дозагрузка их по запросу, расшифровка голосовых сообщений и экспорт чата в JSON.",
+          "title": "WhatsApp"
+        }
+      },
+      "version": "2026-11-16 — `whatsapp` declares its title and summary in Russian and Estonian"
     },
     "windmill": {
       "executable": [
@@ -1307,13 +1727,23 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/windmill",
-      "payload_sha256": "55d253455c21d4537ddfb59afdca8016397517d0b0169e73f6bc859fbba879b0",
+      "payload_sha256": "2698a72f13b3067a1dddb7ab4e2c24f50f9c5d6b05c8de3d43d94175994153dd",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Windmill CLI over the REST API — deploy scripts, attach cron schedules, run jobs, read run history/logs, and manage secret variables and folders.",
       "tier": "standard",
       "title": "Windmill",
-      "version": "2026-11-10 — `windmill` declares its title, Windmill"
+      "translations": {
+        "et": {
+          "description": "Windmilli CLI REST API kaudu – skriptide juurutamine, cron-ajakavade lisamine, tööde käivitamine, käivitusajaloo ja logide lugemine ning salajaste muutujate ja kaustade haldamine.",
+          "title": "Windmill"
+        },
+        "ru": {
+          "description": "CLI для Windmill через REST API — развёртывание скриптов, привязка cron-расписаний, запуск заданий, чтение истории и журналов запусков, управление секретными переменными и папками.",
+          "title": "Windmill"
+        }
+      },
+      "version": "2026-11-16 — `windmill` declares its title and summary in Russian and Estonian"
     },
     "youtrack": {
       "executable": [
@@ -1329,15 +1759,25 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/youtrack",
-      "payload_sha256": "3ef683dbe02f00a316395ec2c538727a659cff1c11b3b65571216206bf61f4f9",
+      "payload_sha256": "dbffb365b303b9e725f3fc131dd6b2f7c6e42f2364e855e3eaf2560291f7e549",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "YouTrack CLI for issues (read with links and tags, paged search with field projection, comment — optionally visible only to named users or groups — create as a numbered issue or a draft with any custom field set in the create call, update of summary, description and any custom field, add/remove issue links by direction phrase, tag and untag by tag name, and log and list work items), user and group lookup, project reads and paged custom-field schemas, saved searches, and the knowledge base (search, read, create, update and re-parent articles, and article comments).",
       "tier": "standard",
       "title": "YouTrack",
-      "version": "2026-11-10 — `youtrack` declares its title, YouTrack"
+      "translations": {
+        "et": {
+          "description": "YouTracki CLI probleemide jaoks (lugemine linkide ja siltidega, lehekülgedeks jaotatud otsing väljade valikuga, kommenteerimine – soovi korral nähtav ainult nimetatud kasutajatele või gruppidele, loomine nummerdatud probleemina või mustandina, kus loomisel saab määrata mis tahes kohandatud välja, kokkuvõtte, kirjelduse ja mis tahes kohandatud välja muutmine, probleemide linkide lisamine ja eemaldamine suunafraasi järgi, siltide lisamine ja eemaldamine sildi nime järgi ning tööaja logimine ja loetlemine), kasutajate ja gruppide otsingu, projektide lugemise ja lehekülgedeks jaotatud kohandatud väljade skeemide, salvestatud otsingute ning teadmusbaasi jaoks (artiklite otsimine, lugemine, loomine, muutmine ja ümberpaigutamine ning artiklite kommentaarid).",
+          "title": "YouTrack"
+        },
+        "ru": {
+          "description": "CLI YouTrack для задач (чтение со ссылками и тегами, постраничный поиск с выбором полей, комментарии — при необходимости видимые только указанным пользователям или группам, создание нумерованной задачи или черновика с любыми пользовательскими полями прямо при создании, изменение заголовка, описания и любого пользовательского поля, добавление и удаление связей задач по фразе направления, установка и снятие тегов по имени, учёт и список трудозатрат), поиска пользователей и групп, чтения проектов и постраничных схем пользовательских полей, сохранённых поисков и базы знаний (поиск, чтение, создание, изменение и перенос статей, комментарии к статьям).",
+          "title": "YouTrack"
+        }
+      },
+      "version": "2026-11-16 — `youtrack` declares its title and summary in Russian and Estonian"
     }
   },
-  "contract_library": "0.48.0",
+  "contract_library": "0.49.0",
   "store_major": 4
 }

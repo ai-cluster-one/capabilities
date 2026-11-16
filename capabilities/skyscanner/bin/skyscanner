@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx[http2]>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """skyscanner — Skyscanner flight search over plain HTTP: resolve places, search
@@ -243,6 +243,25 @@ SUMMARY = ("Skyscanner flight search over plain HTTP — resolve places, search 
            "airport changes) and booking links, and read the cached cheapest price "
            "per day; read-only, optionally through an Oxylabs residential proxy "
            "that keeps Skyscanner's bot protection from blocking the address.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Skyscanner',
+           "description": ('Поиск авиабилетов Skyscanner по обычному HTTP — определение мест, '
+                            'поиск актуальных маршрутов с ценами, сведениями об удобстве '
+                            '(пересадки, стыковки, самостоятельная пересадка, смена аэропорта) и '
+                            'ссылками на бронирование, а также чтение кэшированной минимальной цены'
+                            ' по дням; только чтение, при необходимости через резидентный прокси '
+                            'Oxylabs, чтобы защита Skyscanner от ботов не блокировала адрес.')},
+    "et": {"title": 'Skyscanner',
+           "description": ('Skyscanneri lennuotsing tavalise HTTP kaudu – kohtade tuvastamine, '
+                            'reaalajas marsruutide otsing hindade, mugavusandmete (ümberistumised, '
+                            'ooteajad, iseseisev ümberistumine, lennujaama vahetus) ja '
+                            'broneerimislinkidega ning vahemällu salvestatud odavaima päevahinna '
+                            'lugemine; ainult lugemiseks, valikuliselt Oxylabsi residentsiaalse '
+                            'puhverserveri kaudu, et Skyscanneri robotikaitse aadressi ei '
+                            'blokeeriks.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "SKYSCANNER_OXYLABS_PASSWORD", "secret": True, "required": False,

@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """
@@ -233,6 +233,18 @@ TITLE = "Windmill"
 SUMMARY = ("Windmill CLI over the REST API — deploy scripts, attach cron "
            "schedules, run jobs, read run history/logs, and manage secret "
            "variables and folders.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Windmill',
+           "description": ('CLI для Windmill через REST API — развёртывание скриптов, привязка '
+                            'cron-расписаний, запуск заданий, чтение истории и журналов запусков, '
+                            'управление секретными переменными и папками.')},
+    "et": {"title": 'Windmill',
+           "description": ('Windmilli CLI REST API kaudu – skriptide juurutamine, cron-ajakavade '
+                            'lisamine, tööde käivitamine, käivitusajaloo ja logide lugemine ning '
+                            'salajaste muutujate ja kaustade haldamine.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "WINDMILL_URL", "secret": False, "required": True,

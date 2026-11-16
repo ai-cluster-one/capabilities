@@ -5,7 +5,7 @@
 #     "httpx>=0.27",
 #     "livekit>=1.1,<2",
 #     "pyyaml>=6",
-#     "capabilities-contract>=0.48,<1",
+#     "capabilities-contract>=0.49,<1",
 # ]
 # ///
 """callvatest — agent-first CLI that regression-tests a deployed CallVA voice agent.
@@ -440,6 +440,21 @@ SUMMARY = ("CallVA agent test harness — drives a deployed voice agent through 
            "real LiveKit room over text, then asserts the transcript, the tools "
            "it called, the arguments it generated, the results it answered from, "
            "and the fields stored after the call.")
+# The title and summary in Russian and Estonian; English stays the source
+# and the fallback (SHEBANG.md, the manifest table).
+TRANSLATIONS = {
+    "ru": {"title": 'Тест CallVA',
+           "description": ('Тестовый стенд для агентов CallVA — проводит развёрнутого голосового '
+                            'агента через настоящую комнату LiveKit в текстовом режиме, затем '
+                            'проверяет расшифровку, вызванные инструменты, сгенерированные '
+                            'аргументы, результаты, на которые он опирался в ответах, и поля, '
+                            'сохранённые после звонка.')},
+    "et": {"title": 'CallVA test',
+           "description": ('CallVA agentide testraamistik – juhib juurutatud häälagenti '
+                            'tekstipõhiselt läbi päris LiveKiti toa ning kontrollib seejärel '
+                            'transkriptsiooni, kutsutud tööriistu, genereeritud argumente, '
+                            'tulemusi, millest ta vastas, ja pärast kõnet salvestatud välju.')},
+}
 SCOPE = "project"   # credential scope: "project" | "user"
 CRED_KEYS = [
     {"key": "CALLVA_API_KEY", "secret": True, "required": True,

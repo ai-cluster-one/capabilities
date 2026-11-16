@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-11-16 — `agentrooms` declares its title and summary in Russian and Estonian
+
+The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Комнаты агентов, and Estonian (`et`), Agentide toad, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
+
 ## 2026-11-16 — `read --before EVENT_ID` pages a room back through its history
 
 `read ROOM --before EVENT_ID [--limit N]` returns the N messages strictly older than EVENT_ID, oldest first, in the shape `read` already prints - {room_id, limit, count, more, messages}, each message with its supervisor mark - so a reader opens a room at its latest page and walks it back to its first message by passing the oldest event_id of each page as the next `--before`, nothing skipped or repeated. `more` is false only when no older message remains. It refuses an encrypted room as `read` does, and a room the agent left reads back from before the leave. An EVENT_ID that is not an event in the room the agent can read exits 3 `event_not_found`; one not starting with `$` exits 6 `bad_event`. `read` without `--before` is unchanged.

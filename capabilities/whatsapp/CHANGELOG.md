@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-11-16 — `whatsapp` declares its title and summary in Russian and Estonian
+
+The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), WhatsApp, and Estonian (`et`), WhatsApp, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
+
 ## 2026-11-10 — `whatsapp` declares its title, WhatsApp
 
 The manifest carries `title`, `WhatsApp`, the capability's human name, fixed here and never renamed, from the `TITLE` constant. The capability binds `capabilities-contract` 0.48 or later, which emits it. It is still addressed as `whatsapp`, and its `icon.png` is unchanged. Nothing else changes.
