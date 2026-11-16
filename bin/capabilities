@@ -699,8 +699,11 @@ STORE VERBS
         capability?, quarantined?, further?, store {major, minor} | null,
         reads {major, minor} | null, release_store_major?, state (current, pending,
         upgrade_needed, schema_too_new, checksum_mismatch, empty, unknown),
-        crosses, error?}], blockers [{code, message, hint, owner?}], next
-        [command], backup {dir, needed_bytes, free_bytes}, tools {pg_dump,
+        crosses, error?}], lagging (behind only) [{owner, by, capability?,
+        quarantined?, reads, store, newer_release (true, false, or null where
+        it cannot be read), source?, error?, reason}], blockers [{code,
+        message, hint, owner?}], next [command], backup {dir, needed_bytes,
+        free_bytes}, tools {pg_dump,
         pg_restore: {path, version, major} | null} (the one the upgrade uses:
         the first of the server's major or newer in each PATH entry, then in
         Homebrew's opt/postgresql@N, opt/postgresql and opt/libpq under
@@ -717,7 +720,14 @@ STORE VERBS
         progress {started_at, target_major, phases, manager_release} | null}.
         state is empty (the store holds no schema: nothing to cross), current
         (nothing to cross), behind (the store is on a newer major than this
-        machine's releases read: next is self-update, then update),
+        machine's releases read: lagging names each owner that does - the
+        manager where the store's major is above what it reads, each
+        capability whose tables the store holds at a major above what its
+        release reads - with both versions and whether a newer release is
+        published in its registered source, as `update --check` answers it;
+        the message says each in words, and next holds only what brings one
+        up: self-update for the manager, `capabilities update <name>` for a
+        capability whose source has a newer release, nothing where none is),
         upgrade_available, blocked, unreachable or unconfigured. upgrade_needed
         is true where the newest line reads a newer major than the store's,
         or an installed release crosses an owner's major, or a press of this
@@ -24317,10 +24327,12 @@ def _store_upgrade_judge(answer: dict, setting, key: str, available: dict | None
     if survey["major"] > STORE_MAJOR or survey["major"] > lib_major or any(
             entry["state"] == "schema_too_new" for entry in readers):
         answer.update(state="behind")
-        answer["message"] = (f"the store is on a newer schema than this machine's releases "
-                             f"read (store major {survey['major']}, this manager reads "
-                             f"{STORE_MAJOR}): this machine catches up rather than crossing")
-        answer["next"] = ["capabilities self-update", "capabilities update"]
+        lagging, words, steps = _store_upgrade_lagging(survey, readers, available)
+        answer["lagging"] = lagging
+        answer["message"] = ("the store is on a newer schema than this machine's releases "
+                             "read, so this machine catches up rather than crossing: "
+                             + "; ".join(words))
+        answer["next"] = steps
         return answer
     crossing = target > survey["major"]
     answer["upgrade_needed"] = needed = crossing or any(entry["crosses"] for entry in readers)
@@ -24410,6 +24422,110 @@ def _store_upgrade_judge(answer: dict, setting, key: str, available: dict | None
     answer["next"] = ([STORE_UPGRADE_COMMAND] if not blockers
                       else [b["hint"] for b in blockers if b.get("hint")])
     return answer
+
+
+def _store_upgrade_lagging(survey: dict, readers: list[dict], available: dict
+                           ) -> tuple[list[dict], list[str], list[str]]:
+    """Who makes a store `behind`: (lagging, words, next). Each lagging owner
+    is {owner, by, capability?, quarantined?, reads, store, newer_release
+    (true, false, or null where it cannot be told), source?, error?, reason};
+    words say each in a sentence and next holds only the commands that bring
+    one of them up. The manager lags where the store's major is above what it
+    reads; a capability where its `migrate status` answers schema_too_new,
+    and whether a newer release is published in its registered source is
+    what `update --check` answers for it."""
+    lib_major = _db_module().STORE_MAJOR
+    held = survey["major"]
+    lagging: list[dict] = []
+    words: list[str] = []
+    steps: list[str] = []
+    reads = min(STORE_MAJOR, lib_major)
+    if held > reads:
+        newest = available.get("major")
+        newer = None if newest is None else newest >= held
+        entry = {"owner": "core", "by": "manager", "reads": {"major": reads, "minor": None},
+                 "store": survey["owners"].get("core"), "newer_release": newer,
+                 "source": available.get("source")}
+        if newer is None and available.get("error"):
+            entry["error"] = available["error"]
+        entry["reason"] = (
+            f"this manager reads store major {reads} and the store is on major {held}; "
+            + (f"the newest manager release reads major {newest}, so `capabilities "
+               "self-update` takes it" if newer else
+               f"the newest manager release reads major {newest}, so no published manager "
+               f"reads major {held} yet" if newer is False else
+               "whether a newer manager release is published cannot be read"
+               + (f" ({available['error'].get('message')})" if available.get("error") else "")))
+        lagging.append(entry)
+        words.append(entry["reason"])
+        if newer is not False:
+            steps.append("capabilities self-update")
+
+    def major(version: object) -> object:
+        return version.get("major") if isinstance(version, dict) else None
+
+    checked: dict = {}
+    for reader in readers:
+        if reader.get("state") != "schema_too_new" \
+                or (reader["by"] == "manager" and reader["owner"] == "core"):
+            continue
+        entry = {key: reader[key] for key in ("owner", "by", "capability", "quarantined")
+                 if key in reader}
+        entry.update(reads=reader.get("reads"), store=reader.get("store"))
+        tables = (f"the {reader['owner']} tables at major {major(entry['reads'])} and the "
+                  f"store holds them at major {major(entry['store'])}")
+        if reader["by"] == "manager":
+            entry["newer_release"] = None
+            entry["reason"] = f"this manager reads {tables}; `capabilities self-update` " \
+                              "brings the manager's own tables up"
+            if "capabilities self-update" not in steps:
+                steps.append("capabilities self-update")
+            lagging.append(entry)
+            words.append(entry["reason"])
+            continue
+        name = reader["capability"]
+        if name not in checked:
+            checked[name] = _captured(_update_check_answer, name)
+        found, error = checked[name]
+        row = (found or {}).get("checked") or [{}]
+        row = row[0] if isinstance(row[0], dict) else {}
+        error = error or row.get("error")
+        entry["source"] = row.get("source")
+        where = f"its source ({entry['source']})" if entry["source"] else "its source"
+        held_here = " (quarantined here)" if reader.get("quarantined") else ""
+        if error is not None:
+            entry["newer_release"] = None
+            entry["error"] = error
+            said = (f"whether a newer release of {name} is published in {where} cannot be "
+                    f"read ({error.get('message')})")
+            command = f"capabilities update {name}"
+        elif row.get("update_available"):
+            entry["newer_release"] = True
+            said = (f"a newer release of {name} is published in {where}; "
+                    f"`capabilities update {name}` takes it")
+            command = f"capabilities update {name}"
+        elif row.get("refused"):
+            entry["newer_release"] = True
+            said = (f"a newer release of {name} is published in {where}, and this machine "
+                    f"does not take it: {row['refused'].get('message')}")
+            command = "capabilities self-update"
+        elif (row.get("store_major") or {}).get("message") and (row.get("available") or {}) \
+                .get("catalog_sha256") != (row.get("installed") or {}).get("catalog_sha256"):
+            entry["newer_release"] = True
+            said = (f"a newer release of {name} is published in {where}, and `capabilities "
+                    f"update` keeps what is installed: {row['store_major']['message']}")
+            command = None
+        else:
+            entry["newer_release"] = False
+            said = (f"no newer release of {name} is published in {where}, so `capabilities "
+                    f"update` leaves it reading major {major(entry['reads'])}")
+            command = None
+        entry["reason"] = f"{name}{held_here} reads {tables}; {said}"
+        lagging.append(entry)
+        words.append(entry["reason"])
+        if command is not None and command not in steps:
+            steps.append(command)
+    return lagging, words, steps
 
 
 def cmd_store_upgrade_check() -> None:

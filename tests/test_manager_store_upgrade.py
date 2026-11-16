@@ -994,6 +994,36 @@ def test_a_store_at_another_major_is_refused_with_the_commands_not_read_as_disab
     assert machine.ok("store", "upgrade", "--check")["state"] == "behind"
 
 
+
+def test_behind_names_the_capability_that_lags_and_whether_its_source_has_newer(
+    machine,
+) -> None:
+    source = _probe(machine.tmp / "src" / "capabilities" / "probe", second=False)
+    installed = machine.ok("install", "probe", "--from", str(source), "--allow")
+    assert installed["migrate"]["ok"] is True, installed
+    # A newer probe elsewhere took its tables a major on; the core stays at the
+    # major this manager reads.
+    machine.sql("UPDATE schema_version SET major = 2 WHERE owner = 'probe'")
+    checked = machine.ok("store", "upgrade", "--check")
+    assert checked["state"] == "behind"
+    assert checked["store"]["major"] == STORE
+    assert f"store major {STORE}, this manager reads {STORE}" not in checked["message"]
+    [lag] = checked["lagging"]
+    assert (lag["by"], lag["capability"], lag["owner"]) == ("capability", "probe", "probe")
+    assert lag["reads"]["major"] == 1 and lag["store"]["major"] == 2
+    assert lag["newer_release"] is False
+    assert "probe" in checked["message"] and "major 1" in checked["message"] \
+        and "major 2" in checked["message"]
+    assert "no newer release" in checked["message"]
+    assert checked["next"] == []
+    # Its source now holds a newer release, which `update` takes.
+    _probe(source, second=True)
+    checked = machine.ok("store", "upgrade", "--check")
+    [lag] = checked["lagging"]
+    assert lag["newer_release"] is True
+    assert checked["next"] == ["capabilities update probe"]
+
+
 # --- a further owner a capability migrates ----------------------------------------
 
 # A library's table probe migrates before its own, as tasks migrates the harness
