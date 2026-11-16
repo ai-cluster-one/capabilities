@@ -140,14 +140,19 @@ class Lab:
 
     def _snapshot(self, legacy: bool = False) -> None:
         """teams as install records it: its stub, its own manifest, and an
-        executable that runs this tree's teams. With `legacy`, the manifest a
-        teams payload carried before it declared its command."""
+        executable that runs this tree's teams and declares its level. With
+        `legacy`, the manifest a teams payload carried before it declared its
+        command, at level 0."""
         manifest = json.loads(self.teams("manifest", "--json"))
+        level = M._script_levels(TEAMS)["LEVEL"]
         if legacy:
             manifest["contribution"] = {"markdown": manifest["contribution"]["markdown"]}
+            level = 0
         entry = self.tmp / "registry" / "teams"
         entry.mkdir(parents=True, exist_ok=True)
-        (entry / "teams").write_text(f'#!/bin/sh\nexec "{sys.executable}" "{TEAMS}" "$@"\n')
+        (entry / "teams").write_text(
+            f"#!{sys.executable}\nimport os, sys\nLEVEL = {level}\n"
+            f"os.execv(sys.executable, [sys.executable, {str(TEAMS)!r}, *sys.argv[1:]])\n")
         (entry / "teams").chmod(0o755)
         (entry / "stub").write_text(f"{manifest['summary']} Run `teams help`.\n")
         (entry / "manifest.json").write_text(json.dumps(manifest))
@@ -354,18 +359,20 @@ def test_teams_declares_its_section_as_a_standing_command(lab):
     assert lab.fragment().startswith(section + "\n# Capabilities\n")
 
 
-def test_a_teams_payload_that_declares_no_command_keeps_its_section(lab):
-    # A manager carrying this change beside a teams installed before it: the
-    # manager composes the section itself, the same in both forms.
+def test_a_teams_below_the_managers_requirement_says_so_in_its_entry(lab):
+    # A manager from before levels switched to this one and left a teams that
+    # declares no command: no Teams section, and its entry says how to bring it.
+    assert M.MANAGER_REQUIRES["teams"] == M._script_levels(TEAMS)["LEVEL"] == 1
     _seed(lab)
-    lab.teams("mode", "ops", "always")
-    lab.teams("doc", "save", "ops", "runbook", "--from", "-",
-              stdin="---\ndescription: How we run.\nload: always\n---\nRun.\n\n## Steps\n")
-    declared_fragment, declared_build = lab.fragment(), lab.build()
+    current = lab.build()
+    assert "# Teams\n" in current and "below the level" not in current
     lab._snapshot(legacy=True)
-    assert lab.fragment() == declared_fragment
-    assert lab.build() == declared_build
-    assert "# Teams\n" in declared_build
+    line = ("`teams` is installed at level 0, below the level 1 this manager requires, "
+            "so part of what it gives this context may be missing; "
+            "`capabilities update teams` brings it.")
+    for text in (lab.fragment(), lab.build()):
+        assert "# Teams\n" not in text
+        assert line in _section(text)
 
 
 def test_a_teams_section_that_fails_costs_one_line_in_its_place(lab):

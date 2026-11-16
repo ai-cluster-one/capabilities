@@ -41,7 +41,7 @@ CATALOG_REL = ".capability-source/catalog.json"
 BUNDLE = REPO / "capabilities" / "resend"
 M = runpy.run_path(str(MANAGER), run_name="manager_compat_levels_test")
 LEVEL_LINE = "MANAGER_LEVEL = 1\n"
-REQUIRES_LINE = "MANAGER_REQUIRES: dict = {}\n"
+REQUIRES_LINE = 'MANAGER_REQUIRES: dict = {"teams": 1}\n'
 COMPAT_KEYS = {"manager_level", "unmet", "update_needed", "next"}
 UNMET_KEYS = {"name", "needs", "installed", "required", "required_by", "command"}
 
@@ -228,7 +228,7 @@ def test_levels_are_read_from_the_script_without_running_it() -> None:
         levels, problems = declared(bad)
         assert levels["LEVEL"] == 0
         assert problems == ["LEVEL must be a literal non-negative integer"]
-    assert M["MANAGER_LEVEL"] == 1 and M["MANAGER_REQUIRES"] == {}
+    assert M["MANAGER_LEVEL"] == 1 and M["MANAGER_REQUIRES"] == {"teams": 1}
 
 
 def test_install_refuses_a_level_that_is_not_a_literal(tmp_path: Path) -> None:

@@ -1,5 +1,9 @@
 # teams — change log
 
+## 2026-11-16 — `teams` declares level 1, the level a capabilities manager that composes no Teams section of its own requires
+
+The script declares `LEVEL = 1`: this teams composes the agent's Teams section itself through the declared `section` command, and the capabilities manager of this release requires that level and no longer composes the section for a teams that does not. `capabilities self-update` brings an installed teams below it along, and `install` and `update` refuse a teams below it. Nothing else changes.
+
 ## 2026-11-10 — `teams` declares its title, Teams, and its Lucide icon, `users`
 
 The manifest carries `title`, `Teams`, the capability's human name, fixed here and never renamed, and `lucide_icon`, `users`, the Lucide name of its line icon, from the `TITLE` and `LUCIDE_ICON` constants, so a reader draws the icon as a vector at its own weight and size. The capability binds `capabilities-contract` 0.48 or later, which emits them. It is still addressed as `teams`. Nothing else changes.

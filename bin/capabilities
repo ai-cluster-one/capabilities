@@ -2237,7 +2237,10 @@ PROJECT VERBS (run inside a consuming project)
         capability list here and ahead of the agent's own doctrine in
         `build`; a command that fails, does not answer in time, or prints
         more than the ceiling or text that is not UTF-8 is replaced by one
-        line naming it, and costs nothing else. The manager knows nothing of
+        line naming it, and costs nothing else. A capability installed below
+        the level this manager requires of it (MANAGER_REQUIRES, Levels under
+        self-update) has one line under its entry naming `capabilities update
+        <name>`. The manager knows nothing of
         what any block says (SHEBANG.md, the manifest's `contribution`). Run by hand, a
         host mode prints the file it wrote and the enabled set. Run as the host's SessionStart hook (the
         harness pipes a payload whose hook_event_name is SessionStart), it
@@ -3005,7 +3008,9 @@ STORE_UPGRADE_COMMAND = "capabilities store upgrade"
 # other's minimum. A level rises only when a release gains something another
 # release will require.
 MANAGER_LEVEL = 1
-MANAGER_REQUIRES: dict = {}
+# teams 1 composes its own Teams section through its declared command; this
+# manager composes none for a teams that does not.
+MANAGER_REQUIRES: dict = {"teams": 1}
 _CONTRACT_TIERS = ("core", "store", "connections")
 _REQUIRED_CONTRACT_TIERS = ("core", "store")
 _AUTHORING_ASSETS = (
@@ -25952,47 +25957,6 @@ def _declared_blocks(root: Path, declared: dict[str, tuple[list[str], str]]
     return blocks
 
 
-TEAMS_CAPABILITY = "teams"
-
-
-def _teams_rows(root: Path) -> tuple[list[tuple], list[tuple]] | None:
-    """The teams this agent is a member of, as (name, description, always),
-    and the active version of every enabled document of those in always mode,
-    as (team, name, load, description, body), read from its store in a
-    read-only transaction; empty where the store has no teams tables; None
-    where there is nothing to read: no project id, or no store. A store that
-    does not answer raises its DbError or psycopg error."""
-    agent = _project_id_state(root)["id"]
-    if not agent:
-        return None
-    db = _db_module()
-    try:
-        setting = db.resolve_setting(root)
-    except db.DbError as exc:
-        if exc.slug == "store_not_configured":
-            return None
-        raise
-    conn = db.connect(application_name=_store_module().STORE_APPLICATION, setting=setting,
-                      transaction=True)
-    import psycopg
-    try:
-        conn.read_only = True
-        teams = conn.execute(
-            "SELECT t.name, t.description, t.always FROM teams_teams t JOIN teams_members m "
-            "ON m.team = t.name WHERE m.agent_id = %s ORDER BY t.name", (agent,)).fetchall()
-        always = [row[0] for row in teams if row[2]]
-        documents = conn.execute(
-            "SELECT d.team, d.name, v.load, v.description, v.body FROM teams_documents d "
-            "JOIN teams_versions v ON v.team = d.team AND v.document = d.name AND v.active "
-            "WHERE d.enabled AND d.team = ANY(%s) ORDER BY d.team, d.name",
-            (always,)).fetchall() if always else []
-        return teams, documents
-    except psycopg.errors.UndefinedTable:
-        return [], []
-    finally:
-        conn.close()
-
-
 _FENCE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 _ATX_HEADING = re.compile(r"^( {0,3})(#{1,6})([ \t].*)?$")
 _SETEXT_UNDERLINE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
@@ -26050,76 +26014,18 @@ def _shift_headings(text: str, by: int) -> str:
     return "\n".join(out)
 
 
-def _team_document(name: str, body: str) -> list[str]:
-    """One always document under its team: a level-3 heading, then its text
-    shifted two levels. A document that opens with its own title keeps that
-    title as the heading; one that does not is headed by its name."""
-    shifted = _shift_headings(body.strip(), 2)
-    if re.match(r"^### ", shifted):
-        return [shifted, ""]
-    return [f"### {_md_escape(name)}", "", shifted, ""]
-
-
-def _teams_context(root: Path) -> list[str]:
-    """The body of the Teams section, composed from the store at each build:
-    the lines that say these teams bind the agent and that its own doctrine
-    wins on conflict, then each team it is a member of under a level-2 heading
-    with its line. A team in ordinary mode adds how to read its instructions;
-    one in always mode adds its enabled always documents whole, each under a
-    level-3 heading, and its enabled on-request documents as one level-3
-    group by their line. It reads nothing that changes from one session to
-    the next, so it changes only when the teams do. A command it prints
-    quotes each name as a shell word, since a name is free text. Nothing
-    where the agent is in no team or has no store; one line naming the
-    failure where the store does not answer."""
-    import psycopg
-    db = _db_module()
-    try:
-        read = _teams_rows(root)
-    except (db.DbError, psycopg.Error) as exc:
-        reason = exc.message if isinstance(exc, db.DbError) else str(exc).splitlines()[0]
-        return [f"This agent's teams are unavailable: {_md_escape(reason)}. "
-                f"`{TEAMS_CAPABILITY} doctor` names the repair.", ""]
-    if not read or not read[0]:
+def _context_below_requirement(name: str) -> list[str]:
+    """One line under a capability's entry where the installed payload is
+    below the level this manager requires of it (MANAGER_REQUIRES) - one a
+    manager from before levels left behind when it switched to this one - so
+    what it no longer gives this context is not lost without a word."""
+    required = MANAGER_REQUIRES.get(name, 0)
+    level = _script_levels(_script_path(name))["LEVEL"]
+    if level >= required:
         return []
-    teams, documents = read
-    lines = ["You are a member of the teams below, and their rules bind you. Where a team's "
-             "rule conflicts with your own doctrine further down, your own doctrine wins.", ""]
-    for name, description, always in teams:
-        lines += [f"## {_md_escape(name)}", ""]
-        if not always:
-            lines += [f"{_md_escape(description)} Read its instructions on request: "
-                      f"`{TEAMS_CAPABILITY} show {shlex.quote(name)}`.", ""]
-            continue
-        lines += [_md_escape(description), ""]
-        own = [doc for doc in documents if doc[0] == name]
-        for _team, doc, load, _line, body in own:
-            if load == "always":
-                lines += _team_document(doc, body)
-        on_request = [doc for doc in own if doc[2] == "on-request"]
-        if on_request:
-            lines += ["### On request", ""]
-            lines += [f"- `{TEAMS_CAPABILITY} doc show {shlex.quote(name)} {shlex.quote(doc)}` "
-                      f"- {_md_escape(line)}"
-                      for _team, doc, _load, line, _body in on_request]
-            lines.append("")
-    return lines
-
-
-def _teams_section(root: Path, enabled: list[str]) -> list[str]:
-    """The Teams section this manager composes from the store itself, for a
-    `teams` payload whose declaration names no command - one installed before
-    `teams` declared its own - so no agent loses its teams between a manager
-    update and the capability update that follows it. Nothing where `teams`
-    is not enabled and installed for the agent, where its declaration names a
-    command, or where the agent is in no team."""
-    if TEAMS_CAPABILITY not in enabled:
-        return []
-    stub, manifest = _load_snapshots(TEAMS_CAPABILITY)
-    if stub is None or _contribution_command(TEAMS_CAPABILITY, manifest) is not None:
-        return []
-    body = _teams_context(root)
-    return ["# Teams", "", *body] if body else []
+    return [f"`{name}` is installed at level {level}, below the level {required} this "
+            f"manager requires, so part of what it gives this context may be missing; "
+            f"`capabilities update {name}` brings it.", ""]
 
 
 # Set by `init` alone: its offline part (envelope, identity, host wiring) never
@@ -26183,9 +26089,6 @@ def _compose_context(root: Path, build: bool = False,
     blocks = _declared_blocks(root, declared)
     top = ["\n".join(blocks[name]).strip() for name, (_command, place) in declared.items()
            if place == "standing" and name in blocks]
-    bridge = _teams_section(root, enabled)
-    if bridge:
-        top.append("\n".join(bridge).strip())
     lines: list[str] = []
     if standing is not None:
         standing.extend(top)
@@ -26214,6 +26117,7 @@ def _compose_context(root: Path, build: bool = False,
                 continue
             lines += [_md_escape(stub), ""]
             lines += _context_contribution(name, manifest)
+            lines += _context_below_requirement(name)
             if declared.get(name, ((), ""))[1] == "entry":
                 lines += blocks.get(name, [])
             try:

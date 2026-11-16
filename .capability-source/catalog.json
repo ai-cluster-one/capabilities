@@ -1067,16 +1067,16 @@
         "tests/test_teams.py"
       ],
       "icon": false,
-      "level": 0,
+      "level": 1,
       "lucide_icon": "users",
       "path": "capabilities/teams",
-      "payload_sha256": "0b996562477d3669376e930e83bad3bea9b63f36079a501310c1f58106c89f72",
+      "payload_sha256": "ffc92e2c3c8392f4f0adf62d19b2e4996e4f0f6075c99f4b0bbe23ec974c8642",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
       "tier": "core",
       "title": "Teams",
-      "version": "2026-11-10 — `teams` declares its title, Teams, and its Lucide icon, `users`"
+      "version": "2026-11-16 — `teams` declares level 1, the level a capabilities manager that composes no Teams section of its own requires"
     },
     "telegram": {
       "executable": [

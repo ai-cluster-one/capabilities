@@ -234,6 +234,9 @@ BLOCK = ("`teams list` names the teams you are in and `teams list --all` every t
          "`teams show <team>` lists a team's documents and `teams doc show <team> <doc>` "
          "reads one; `teams help` gives every command.\n")
 CONTRIBUTION = {"markdown": BLOCK, "command": ["section"], "place": "standing"}
+# Level 1: the first teams that composes its own section through the declared
+# command, which the manager requires now that it composes none of its own.
+LEVEL = 1
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"

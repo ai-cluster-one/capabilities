@@ -52,13 +52,16 @@ def _init_repo(path: Path) -> None:
 def _copy_manager(dest: Path) -> None:
     """Carry the manager into a fixture source.
 
-    Source verification holds a tree's core declaration to that tree's own
-    catalogue. A fixture carries a sliver of the catalogue and removes parts of
-    it, so its manager declares no core capability at all."""
+    Source verification holds a tree's core declaration and the capability
+    levels its manager requires to that tree's own catalogue. A fixture
+    carries a sliver of the catalogue and removes parts of it, so its manager
+    declares no core capability and requires none."""
     text = MANAGER.read_text()
-    line = next(entry for entry in text.splitlines()
-                if entry.startswith("CORE_CAPABILITIES = "))
-    dest.write_text(text.replace(line, "CORE_CAPABILITIES = ()", 1))
+    for prefix, literal in (("CORE_CAPABILITIES = ", "CORE_CAPABILITIES = ()"),
+                            ("MANAGER_REQUIRES: dict = ", "MANAGER_REQUIRES: dict = {}")):
+        line = next(entry for entry in text.splitlines() if entry.startswith(prefix))
+        text = text.replace(line, literal, 1)
+    dest.write_text(text)
     shutil.copymode(MANAGER, dest)
 
 
