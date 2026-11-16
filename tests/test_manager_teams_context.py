@@ -375,6 +375,16 @@ def test_a_teams_below_the_managers_requirement_says_so_in_its_entry(lab):
         assert line in _section(text)
 
 
+def test_a_capability_the_manager_requires_nothing_of_is_not_read(monkeypatch):
+    # Composition reads a script's level only for a name MANAGER_REQUIRES
+    # names, so a capability that declares nothing costs nothing.
+    def unread(script):
+        raise AssertionError(f"read {script}")
+    monkeypatch.setattr(M, "_script_levels", unread)
+    assert "alpha" not in M.MANAGER_REQUIRES
+    assert M._context_below_requirement("alpha") == []
+
+
 def test_a_teams_section_that_fails_costs_one_line_in_its_place(lab):
     _seed(lab)
     entry = lab.tmp / "registry" / "teams" / "teams"

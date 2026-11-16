@@ -26020,6 +26020,8 @@ def _context_below_requirement(name: str) -> list[str]:
     manager from before levels left behind when it switched to this one - so
     what it no longer gives this context is not lost without a word."""
     required = MANAGER_REQUIRES.get(name, 0)
+    if not required:
+        return []
     level = _script_levels(_script_path(name))["LEVEL"]
     if level >= required:
         return []
