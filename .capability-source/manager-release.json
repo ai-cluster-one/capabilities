@@ -26,7 +26,7 @@
   "level": 1,
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "24e9eb8d6aee8bd998eb7ef1325342d9ea3880599c0f715900b39d46234de7bb"
+    "sha256": "c29a7aba86058eae1cd710aa4f2ab50bbfbd284578df05695b2f354f5597591f"
   },
   "requires": {},
   "schema": "capabilities.manager-release.v1",

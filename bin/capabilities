@@ -24485,7 +24485,7 @@ def _store_upgrade_lagging(survey: dict, readers: list[dict], available: dict
             continue
         name = reader["capability"]
         if name not in checked:
-            checked[name] = _captured(_update_check_answer, name)
+            checked[name] = _quiet_captured(_update_check_answer, name)
         found, error = checked[name]
         row = (found or {}).get("checked") or [{}]
         row = row[0] if isinstance(row[0], dict) else {}
