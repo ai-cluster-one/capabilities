@@ -1205,13 +1205,13 @@
       "level": 0,
       "lucide_icon": "bot-message-square",
       "path": "capabilities/telegrambot",
-      "payload_sha256": "9668a1c62186458299d30281f3f7c1c90cb9ff701b292d79cd9fd4aae726939e",
+      "payload_sha256": "38ee7911e3569fea2a4cf4389e5513da81d8cd477b5f5047031985a1f3be9bfb",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation.",
       "tier": "standard",
       "title": "Telegram Bot",
-      "version": "2026-11-10 — A message about a running job reaches the job, and the job answers once"
+      "version": "2026-11-16 — A handed-off job's brief no longer reaches the chat"
     },
     "vapic": {
       "executable": [

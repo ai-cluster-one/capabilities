@@ -54,9 +54,9 @@ SELF_MARKER = " (you)"
 TYPING_EVERY = 4.0               # sendChatAction lasts about 5 seconds
 HANDOFF_POLL = 1.0
 HANDOFF_GRACE = 8.0
-HANDOFF_MARK = "▶ "
-# What a message the service added to a job, rather than answering it, is
-# marked with: a reaction, so the job's own answer stays the only one.
+# What a message handed to a job, rather than answered, is marked with when the
+# turn says nothing of its own: a reaction, so the job's own answer stays the
+# only one and nothing of the job's brief reaches the chat.
 AMEND_REACTION = "✍"
 # How many messages the service sent for a job it remembers, so a reply to one
 # of them reaches that job.
@@ -1727,8 +1727,12 @@ class Dialogue:
             if run.handoff is not None:
                 answer = "" if run.handed_off else cut_at_reply_marker(
                     getattr(result, "answer", "") or "")
-                sent = self.say(last, answer or HANDOFF_MARK + run.handoff["description"])
-                self.note_job_message(chat, sent, run.handoff.get("id"))
+                if answer:
+                    self.note_job_message(chat, self.say(last, answer), run.handoff.get("id"))
+                else:
+                    self.note_job_message(chat, [last["message_id"]], run.handoff.get("id"))
+                    with contextlib.suppress(Exception):
+                        self.api.react(last["chat_id"], last["message_id"], AMEND_REACTION)
                 outcome = "handed_off"
                 return
             if run.amended is not None:

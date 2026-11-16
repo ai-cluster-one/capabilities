@@ -742,6 +742,80 @@ def test_a_job_amended_elsewhere_does_not_silence_a_turn_about_something_else(tm
     assert api.reactions == [] and dialogue.stats["added_to_job"] == 0
 
 
+class SubmittingRegister(JobRegister):
+    """A register a turn submits one job to: from then on the request message
+    names it."""
+
+    def __init__(self, rows=()):
+        super().__init__(rows)
+        self.submitted = False
+
+    def submitted_from(self, chat_id, topic_id, origin_message_id):
+        if not self.submitted:
+            return None
+        return next(dict(r) for r in self.rows if r["origin_message_id"] == origin_message_id)
+
+
+def hand_off(tmp_path, monkeypatch, turn, *, grace=0.05):
+    """A turn that submits a job from message 9 and then does what `turn` does."""
+    monkeypatch.setattr(d, "HANDOFF_POLL", 0.01)
+    monkeypatch.setattr(d, "HANDOFF_GRACE", grace)
+    jobs = Jobs()
+    jobs.register = SubmittingRegister([running_job(origin_message_id=9)])
+
+    def submits(prompt, kwargs):
+        jobs.register.submitted = True
+        return turn(kwargs)
+
+    dialogue, store, api, runner, clock = make(tmp_path, DELEGATING, runner=Runner(submits))
+    dialogue.jobs = jobs
+    dialogue.offer_update(update(9, "make the quarterly report"))
+    drain(dialogue, clock)
+    assert len(runner.calls) == 1 and dialogue.stats["handed_off"] == 1
+    return dialogue, api, clock
+
+
+def test_a_handoff_cut_after_the_grace_reacts_and_never_posts_the_jobs_brief(tmp_path,
+                                                                             monkeypatch):
+    def keeps_going(kwargs):
+        kwargs["cancel"].wait(5)
+        return Result("=== REPLY ===\nHere is the whole report, done by this turn.")
+
+    dialogue, api, clock = hand_off(tmp_path, monkeypatch, keeps_going)
+    assert api.sent == []                                  # no brief, no late answer
+    assert api.reactions == [(ANN, 9, d.AMEND_REACTION)]
+    # A reply to the request still reaches the job.
+    dialogue.offer_update(update(10, "only Q3", reply_to_message={"message_id": 9}))
+    drain(dialogue, clock)
+    assert dialogue.jobs.register.amendments == [(running_job()["id"], "only Q3")]
+    assert api.sent == []
+
+
+def test_a_handoff_with_no_reply_of_its_own_reacts_instead_of_posting_text(tmp_path,
+                                                                           monkeypatch):
+    def ends_in_the_grace(kwargs):
+        time.sleep(0.2)
+        return Result("")
+
+    dialogue, api, clock = hand_off(tmp_path, monkeypatch, ends_in_the_grace, grace=3.0)
+    assert api.sent == []
+    assert api.reactions == [(ANN, 9, d.AMEND_REACTION)]
+
+
+def test_a_handoff_posts_the_turns_own_reply_and_maps_it_to_the_job(tmp_path, monkeypatch):
+    def says_its_line(kwargs):
+        time.sleep(0.2)
+        return Result("=== REPLY ===\nOn it.")
+
+    dialogue, api, clock = hand_off(tmp_path, monkeypatch, says_its_line, grace=3.0)
+    assert [m["text"] for m in api.sent] == ["On it."] and api.reactions == []
+    sent_id = api.next_id
+    dialogue.offer_update(update(10, "in euros",
+                                 reply_to_message={"message_id": sent_id, "from": {"id": BOT}}))
+    drain(dialogue, clock)
+    assert dialogue.jobs.register.amendments == [(running_job()["id"], "in euros")]
+
+
 def test_parse_command_and_quoting():
     assert d.parse_command("/status", "helper_bot") == ("status", [])
     assert d.parse_command("/set tail 5", "helper_bot") == ("set", ["tail", "5"])

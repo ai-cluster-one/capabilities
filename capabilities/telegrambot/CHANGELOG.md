@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-16 — A handed-off job's brief no longer reaches the chat
+
+When a turn handed work to a background job and had no reply of its own - always so when the turn was cut short after its grace - the service posted the job's description, prefixed with ▶, as the bot's message. That description is the job worker's internal brief, written for the worker rather than for the people in the chat. The service now says only the turn's own reply; with none, it marks the request message with a ✍ reaction, as it already does for a message added to a job, and a reply to that message reaches the job. The job's result is still the only answer it posts. No verb, flag, setting or output key changes.
+
 ## 2026-11-10 — A message about a running job reaches the job, and the job answers once
 
 A message that arrived while one of its chat's background jobs ran started a turn of its own beside the job, which knew nothing of the job unless the model asked the register, so the bot could answer the same subject twice. The service now gives every turn the chat's or topic's waiting and running jobs in `Channel state` (`Open jobs here:`, each job's short id, state, who asked, the message it came from and its outcome line). A reply from a job's requester to the message the job came from, or to a line the service sent for the job, is added to that job as an amendment without a turn - a running job continues its session with it, a waiting one starts with it - and is marked with a ✍ reaction. A turn that adds to a job through its own `jobs amend` is ended like a turn that hands work over: its short line stands, nothing else it would say is sent, and a turn cut short leaves a ✍ instead; an amendment made anywhere else - another topic's turn, the operator's CLI, the service's own routing - ends no turn. Any other message is answered while the job runs, as before. No verb, flag, setting or output key changes.
