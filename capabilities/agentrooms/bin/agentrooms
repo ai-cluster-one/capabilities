@@ -231,7 +231,7 @@ COMMANDS
         Encrypted rooms print no messages. Exit 0 on SIGTERM or SIGINT or
         when its reader goes away; 2 a token the homeserver rejects; a
         ROOM that is encrypted exits 6 before following starts.
-    read ROOM [--limit N]
+    read ROOM [--limit N] [--before EVENT_ID]
         The last N messages (default 20, 1-100), oldest first: {room_id,
         limit, count, more, messages: [{event_id, sender, ts, msgtype, body,
         thread, reply_to, data, file, supervisor}]}. `more` is true when older
@@ -239,7 +239,13 @@ COMMANDS
         posted with `post --as-supervisor` - each null where the mark does
         not carry it - and null on any other. Refuses an encrypted room. An
         archived room - or any room the agent left - reads up to the agent's
-        leave.
+        leave. --before EVENT_ID pages back: the N messages strictly older
+        than EVENT_ID, in the same shape, with `more` false only when none
+        older remain; pass the oldest event_id of one page as --before of
+        the next to walk the room back to its first message, nothing skipped
+        or repeated. An EVENT_ID that is not an event in ROOM the agent can
+        read exits 3 event_not_found; one not starting with $ exits 6
+        bad_event.
     open NAME --invite WHO [--invite WHO ...] [--topic TEXT]
         WRITE. Create a room: room version 12, unfederated, unencrypted,
         invite-only, its rights fixed at creation through the power-level
@@ -1579,10 +1585,45 @@ def _message_row(event: dict) -> dict:
             "supervisor": _engine().supervisor_of(content)}
 
 
-def cmd_read(cfg: dict, room: str, limit: int) -> dict:
+def _messages_before(m: Matrix, room_id: str, event_id: str, limit: int) -> tuple[list, bool]:
+    """Up to `limit` messages strictly older than `event_id`, newest first, and
+    whether older ones remain: the event's own position, from /context, is the
+    token paging backwards starts from, and one message past `limit` is asked
+    for so `more` is known rather than guessed."""
+    try:
+        context = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/context/{_q(event_id)}",
+                         params={"limit": "0"})
+    except MatrixError as exc:
+        if exc.exit_code == 3:
+            _die(3, "event_not_found", f"{event_id} is not an event in {room_id} this agent can read",
+                 "pass an event_id that `read` returned for this room")
+        _fail(exc)
+    token, found = (context or {}).get("start"), []
+    while token and len(found) <= limit:
+        try:
+            page = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/messages",
+                          params={"dir": "b", "from": token, "limit": str(limit + 1 - len(found)),
+                                  "filter": json.dumps({"types": ["m.room.message"]})}) or {}
+        except MatrixError as exc:
+            _fail(exc)
+        chunk = page.get("chunk") or []
+        found += [e for e in chunk if e.get("type") == "m.room.message"]
+        if not chunk or page.get("end") in (None, token):
+            break
+        token = page["end"]
+    return found[:limit], len(found) > limit
+
+
+def cmd_read(cfg: dict, room: str, limit: int, before: str | None = None) -> dict:
+    if before is not None and not before.startswith("$"):
+        _die(6, "bad_event", f"--before {before!r} is not an event id ($...)")
     with _matrix(cfg) as m:
         room_id = _resolve_room(m, cfg, room)
         _refuse_encrypted(m, room_id)
+        if before is not None:
+            chunk, more = _messages_before(m, room_id, before, limit)
+            return {"room_id": room_id, "limit": limit, "count": len(chunk), "more": more,
+                    "messages": [_message_row(e) for e in reversed(chunk)]}
         try:
             found = m.call("GET", f"/_matrix/client/v3/rooms/{_q(room_id)}/messages",
                            params={"dir": "b", "limit": str(limit),
@@ -5143,6 +5184,7 @@ def _parser() -> _Parser:
     read = sub.add_parser("read")
     read.add_argument("room")
     read.add_argument("--limit", type=_limit, default=20)
+    read.add_argument("--before")
     opened = sub.add_parser("open")
     opened.add_argument("name")
     opened.add_argument("--invite", action="append", required=True)
@@ -5378,7 +5420,7 @@ def main() -> None:
     elif cmd == "archive":
         _emit(cmd_archive(cfg, args.room))
     elif cmd == "read":
-        _emit(cmd_read(cfg, args.room, args.limit))
+        _emit(cmd_read(cfg, args.room, args.limit, args.before))
     elif cmd == "watch":
         cmd_watch(cfg, args.room, args.held)
     elif cmd == "open":

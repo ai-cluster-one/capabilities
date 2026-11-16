@@ -46,6 +46,8 @@ class FakeHomeserver:
         self.claimed: set[str] = set()
         self.served: dict[str, dict] = {}
         self.profiles: dict[str, dict] = {}
+        # A room's whole timeline, oldest first, for rooms read by paging back.
+        self.history: dict[str, list[dict]] = {}
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
@@ -202,6 +204,25 @@ class FakeHomeserver:
             return httpx.Response(200, json={"event_id": event})
         if path == "/_matrix/media/v3/upload":
             return httpx.Response(200, json={"content_uri": f"mxc://{SERVER}/abc"})
+        if "/context/" in path:
+            room = unquote(path.split("/rooms/")[1].split("/")[0])
+            event = unquote(path.rsplit("/", 1)[1])
+            ids = [e["event_id"] for e in self.history.get(room, [])]
+            if event not in ids:
+                return httpx.Response(404, json={"errcode": "M_NOT_FOUND", "error": "no event"})
+            return httpx.Response(200, json={"start": f"p{ids.index(event)}", "end": "e",
+                                             "event": self.history[room][ids.index(event)]})
+        if path.endswith("/messages") and \
+                unquote(path.split("/rooms/")[1].split("/")[0]) in self.history:
+            timeline = self.history[unquote(path.split("/rooms/")[1].split("/")[0])]
+            params = request.url.params
+            assert params["dir"] == "b"
+            at = int(params.get("from", f"p{len(timeline)}")[1:])
+            start = max(0, at - int(params["limit"]))
+            out = {"chunk": list(reversed(timeline[start:at])), "start": f"p{at}"}
+            if start > 0:
+                out["end"] = f"p{start}"
+            return httpx.Response(200, json=out)
         if path.endswith("/messages"):
             chunk = [{"type": "m.room.message", "event_id": f"$m{i}", "sender": f"@b:{SERVER}",
                       "origin_server_ts": 1_700_000_000_000 + i,
@@ -583,6 +604,42 @@ def test_read_is_chronological_and_says_when_more_exists(cli, project, homeserve
     assert out["more"] is True and out["count"] == 3
     code, _out, err = run(cli, capsys, "read", "!room", "--limit", "500")
     assert code == 6
+
+
+def test_read_before_pages_back_to_the_first_message(cli, project, homeserver, capsys):
+    connect(project, allow_write=False)
+    homeserver.history["!room"] = [
+        {"type": "m.room.message", "event_id": f"$h{i}", "sender": f"@b:{SERVER}",
+         "origin_server_ts": 1_700_000_000_000 + i,
+         "content": {"msgtype": "m.text", "body": f"history {i}"}} for i in range(1, 46)]
+    seen, before, pages = [], "$h45", []
+    while True:
+        code, out, err = run(cli, capsys, "read", "!room", "--before", before, "--limit", "20")
+        assert code == 0, err
+        assert set(out) == {"room_id", "limit", "count", "more", "messages"}
+        assert out["count"] == len(out["messages"]) and out["limit"] == 20
+        ids = [m["event_id"] for m in out["messages"]]
+        assert ids == sorted(ids, key=lambda e: int(e[2:]))  # oldest first
+        seen = ids + seen
+        pages.append((out["count"], out["more"]))
+        if not out["more"]:
+            break
+        before = ids[0]
+    assert pages == [(20, True), (20, True), (4, False)]
+    assert seen == [f"$h{i}" for i in range(1, 45)]  # nothing skipped, nothing twice
+    assert out["messages"][0]["supervisor"] is None
+    # The page ending exactly at the first message says no more remain.
+    code, out, _err = run(cli, capsys, "read", "!room", "--before", "$h21", "--limit", "20")
+    assert out["count"] == 20 and out["more"] is False
+    code, out, _err = run(cli, capsys, "read", "!room", "--before", "$h1")
+    assert out["count"] == 0 and out["more"] is False and out["messages"] == []
+    code, _out, err = run(cli, capsys, "read", "!room", "--before", "$elsewhere")
+    assert code == 3 and err["error"]["code"] == "event_not_found"
+    code, _out, err = run(cli, capsys, "read", "!room", "--before", "h3")
+    assert code == 6 and err["error"]["code"] == "bad_event"
+    homeserver.encrypted.add("!secret")
+    code, _out, err = run(cli, capsys, "read", "!secret", "--before", "$h3")
+    assert code == 6 and err["error"]["code"] == "encrypted_room"
 
 
 def test_connections_masks_the_token_and_doctor_checks_identity(cli, project, homeserver, capsys):
