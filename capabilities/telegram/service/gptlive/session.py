@@ -37,14 +37,22 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import faulthandler
 import gc
 import operator
 import os
+import re
 import sys
+import tempfile
 import threading
 import time
 import traceback
 from array import array
+
+try:
+    import resource
+except ImportError:  # not a POSIX host
+    resource = None
 
 from pytgcalls.exceptions import NotInCallError
 from pytgcalls.types import Device, Frame
@@ -188,6 +196,21 @@ LOOP_STALL_SECONDS = 0.1
 LOOP_WATCH_INTERVAL = 0.02
 LOOP_STALL_LOG_LIMIT = 20
 GC_PAUSE_SECONDS = 0.02
+# A hold that keeps the interpreter itself leaves the loop watch nothing to
+# read, so every hold also gets evidence that needs no interpreter: the stacks
+# of every thread, written by faulthandler's own C thread when no beat has come
+# for STALL_DUMP_AFTER_SECONDS, and what the process did meanwhile - CPU, context
+# switches and page faults - which tells a thread busy in C (CPU spent), a
+# process the system paused (none spent, little switching) and a start of a
+# subprocess (a thread in it, CPU in the kernel) apart. The dump is re-armed at
+# most every STALL_DUMP_REARM_SECONDS, so every hold of STALL_DUMP_AFTER_SECONDS
+# or more is caught, and a shorter one may not be.
+STALL_DUMP_AFTER_SECONDS = 0.13
+STALL_DUMP_REARM_SECONDS = 0.03
+STALL_DUMP_THREADS = 12
+STALL_DUMP_FRAMES = 3
+_DUMP_THREAD = re.compile(r"^(?:Current thread|Thread) (0x[0-9a-fA-F]+)")
+_DUMP_FRAME = re.compile(r'^\s+File "(.*)", line (\d+) in (.+?)\s*$')
 
 
 class _LoopWatch:
@@ -218,11 +241,17 @@ class _LoopWatch:
         self.gc_pauses = 0
         self.gc_max = 0.0
         self.gc_total = 0.0
+        self._dump = None
+        self._armed_at = None
+        self._usage = None
 
     def start(self):
         self._loop_thread = threading.get_ident()
         self.beat = self._clock()
         gc.callbacks.append(self._on_gc)
+        with contextlib.suppress(Exception):
+            self._dump = tempfile.TemporaryFile(buffering=0)
+        self._usage = _usage()
         self._thread = threading.Thread(target=self._run, name="voice-loop-watch",
                                         daemon=True)
         self._thread.start()
@@ -231,6 +260,61 @@ class _LoopWatch:
         self._stopped.set()
         with contextlib.suppress(ValueError):
             gc.callbacks.remove(self._on_gc)
+        dump, self._dump = self._dump, None
+        if dump is not None:
+            if self._armed_at is not None:
+                with contextlib.suppress(Exception):
+                    faulthandler.cancel_dump_traceback_later()
+            with contextlib.suppress(Exception):
+                dump.close()
+
+    def arm(self, now):
+        """Called on every beat: keep the C thread's dump pushed out, so it
+        is written only while no beat comes."""
+        if self._dump is None:
+            return
+        if self._armed_at is not None and now - self._armed_at < STALL_DUMP_REARM_SECONDS:
+            return
+        try:
+            faulthandler.dump_traceback_later(STALL_DUMP_AFTER_SECONDS, repeat=False,
+                                              file=self._dump)
+        except Exception:
+            # No evidence is worse than some, never worse than a broken call.
+            with contextlib.suppress(Exception):
+                self._dump.close()
+            self._dump = None
+            return
+        self._armed_at = now
+
+    def usage_since(self):
+        """What the process did since the previous beat, and the baseline for
+        the next one."""
+        previous, current = self._usage, _usage()
+        self._usage = current
+        if previous is None or current is None:
+            return None
+        return {key: current[key] - previous[key] for key in current}
+
+    def threads(self):
+        """Every thread's stack as the C thread wrote it during the hold, or
+        None when it wrote nothing; the dump is cleared for the next hold."""
+        if self._dump is None:
+            return None
+        try:
+            fd = self._dump.fileno()
+            os.lseek(fd, 0, os.SEEK_SET)
+            chunks = []
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+        except Exception:
+            return None
+        text = b"".join(chunks).decode("utf-8", "replace")
+        return _read_dump(text, self._loop_thread) if text.strip() else None
 
     def where(self, beat):
         """Where the loop was held during the stall that began at `beat`."""
@@ -265,6 +349,55 @@ class _LoopWatch:
         if paused >= GC_PAUSE_SECONDS:
             self.gc_pauses += 1
             self.gc_max = max(self.gc_max, paused)
+
+
+def _usage():
+    """The process's own CPU, context switches and page faults so far."""
+    if resource is None:
+        return None
+    try:
+        used = resource.getrusage(resource.RUSAGE_SELF)
+    except Exception:
+        return None
+    return {
+        "user": used.ru_utime,
+        "sys": used.ru_stime,
+        "voluntary": used.ru_nvcsw,
+        "involuntary": used.ru_nivcsw,
+        "major_faults": used.ru_majflt,
+        "minor_faults": used.ru_minflt,
+    }
+
+
+def _read_dump(text, loop_thread):
+    """faulthandler's dump of every thread, as one line per distinct stack:
+    the thread's name, then its innermost frames. Threads parked at the same
+    place are counted on one line, so the one doing something stands out."""
+    names = {thread.ident: thread.name for thread in threading.enumerate()}
+    names[loop_thread] = "event loop"
+    stacks, current = [], None
+    for line in text.splitlines():
+        found = _DUMP_THREAD.match(line)
+        if found:
+            ident = int(found.group(1), 16)
+            current = [names.get(ident, f"thread {found.group(1)}"), []]
+            stacks.append(current)
+            continue
+        found = _DUMP_FRAME.match(line)
+        if found and current is not None and len(current[1]) < STALL_DUMP_FRAMES:
+            filename, lineno, name = found.groups()
+            current[1].append(f"{name} ({os.path.basename(filename)}:{lineno})")
+    grouped = {}
+    for name, frames in stacks:
+        if name == "voice-loop-watch":
+            continue
+        where = " < ".join(frames) or "no Python frame"
+        grouped.setdefault(where, []).append(name)
+    lines = []
+    for where, holders in grouped.items():
+        who = holders[0] if len(holders) == 1 else f"{len(holders)}x {holders[0]}"
+        lines.append(f"{who}: {where}")
+    return lines[:STALL_DUMP_THREADS]
 
 
 def _rms(payload: bytes) -> float:
@@ -380,6 +513,10 @@ class VoiceCallSession:
         self.loop_stall_max = 0.0
         self.loop_stall_total = 0.0
         self.loop_stall_worst = None
+        self.loop_stall_events = []
+        # When the call handed work to the worker: the holds measured so far
+        # came in the second after it.
+        self._handed_over_at = []
         self._first_inbound_at = None
         self._last_inbound_at = None
         self.inbound_frames = 0
@@ -537,8 +674,13 @@ class VoiceCallSession:
         now = time.monotonic()
         previous = self._watch.beat
         self._watch.beat = now
+        self._watch.arm(now)
+        used = self._watch.usage_since()
         held = now - previous
-        if held < LOOP_STALL_SECONDS or self._last_send_at is None:
+        if held < LOOP_STALL_SECONDS:
+            return
+        threads = self._watch.threads()
+        if self._last_send_at is None:
             return
         where = self._watch.where(previous)
         self.loop_stalls += 1
@@ -546,9 +688,59 @@ class VoiceCallSession:
         if held > self.loop_stall_max:
             self.loop_stall_max = held
             self.loop_stall_worst = where
-        if self.loop_stalls <= LOOP_STALL_LOG_LIMIT:
-            self._log(f"voice: event loop held {held * 1000:.0f} ms during the "
-                      f"call, in {where}")
+        if self.loop_stalls > LOOP_STALL_LOG_LIMIT:
+            return
+        event = self._stall_event(previous, held, where, used, threads)
+        self.loop_stall_events.append(event)
+        self._log(self._stall_line(event))
+
+    def note_handed_over(self):
+        """The call is handing work to the worker now."""
+        self._handed_over_at.append(time.monotonic())
+
+    def _stall_event(self, began, held, where, used, threads):
+        ms = lambda seconds: round(seconds * 1000, 1)  # noqa: E731
+        event = {"at_s": round(began - self.origin, 3), "held_ms": ms(held),
+                 "in": where}
+        if used is not None:
+            event.update({
+                "cpu_ms": ms(used["user"] + used["sys"]),
+                "user_ms": ms(used["user"]),
+                "sys_ms": ms(used["sys"]),
+                "voluntary_switches": used["voluntary"],
+                "involuntary_switches": used["involuntary"],
+                "major_faults": used["major_faults"],
+                "minor_faults": used["minor_faults"],
+            })
+        # Negative when the hand-over came during the hold itself.
+        earlier = [at for at in self._handed_over_at if at <= began + held]
+        if earlier:
+            event["handover"] = len(earlier)
+            event["after_handover_s"] = round(began - earlier[-1], 3)
+        event["threads"] = threads
+        return event
+
+    @staticmethod
+    def _stall_line(event):
+        line = (f"voice: event loop held {event['held_ms']:.0f} ms during the "
+                f"call, in {event['in']}")
+        if "cpu_ms" in event:
+            line += (f"; process cpu {event['cpu_ms']:.0f} ms (user "
+                     f"{event['user_ms']:.0f}, sys {event['sys_ms']:.0f}), switches "
+                     f"{event['voluntary_switches']} voluntary / "
+                     f"{event['involuntary_switches']} involuntary, faults "
+                     f"{event['major_faults']} major / {event['minor_faults']} minor")
+        if "handover" in event:
+            after = event["after_handover_s"]
+            line += (f"; began {after:.2f} s after hand-over {event['handover']} "
+                     f"to the worker" if after >= 0 else
+                     f"; hand-over {event['handover']} to the worker came "
+                     f"{-after:.2f} s into it")
+        if event["threads"] is None:
+            line += "; threads: no dump written during the hold"
+        else:
+            line += "; threads: " + " | ".join(event["threads"])
+        return line
 
     def _note_send(self, started, finished):
         """Time between two frames handed to ntgcalls, which is the time between
@@ -597,7 +789,10 @@ class VoiceCallSession:
                 "max_ms": ms(self.loop_stall_max),
                 "total_ms": ms(self.loop_stall_total),
                 "worst_in": self.loop_stall_worst,
+                "events": list(self.loop_stall_events),
             },
+            "handovers_at_s": [round(at - self.origin, 3)
+                               for at in self._handed_over_at],
             "gc": {
                 "pauses_over_20ms": self._watch.gc_pauses,
                 "max_ms": ms(self._watch.gc_max),
@@ -909,6 +1104,7 @@ class VoiceCallSession:
 
             # Keyed by the delegation, because the request text is the same
             # frame every time and would otherwise read as the same task twice.
+            self.note_handed_over()
             decision = self._task_runner.start(
                 HANDED_TURN_REQUEST, signature=delegation_id)
             job_id = decision.get("job_id")
@@ -1023,6 +1219,7 @@ class VoiceCallSession:
             "already busy, so it was never started. They asked, in their words: "
             f"\"{held}\"\n\n"
             + HANDED_TURN_REQUEST)
+        self.note_handed_over()
         decision = self._task_runner.start(request, signature=f"deferred::{held[:200]}")
         job_id = decision.get("job_id")
         if not decision.get("ok") or not job_id:

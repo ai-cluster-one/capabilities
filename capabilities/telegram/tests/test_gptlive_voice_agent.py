@@ -19,6 +19,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -275,6 +276,92 @@ class MediaTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("voice: media at the ntgcalls boundary")
                             for line in lines), lines)
         self.assertNotIn(session._watch._on_gc, gc.callbacks)
+
+    def test_a_hold_that_keeps_the_interpreter_still_says_what_held_it(self):
+        """In the owner's call every hold was "not sampled": a thread held the
+        interpreter, so nothing in Python could look. Each hold now carries
+        what the process did during it and every thread's stack written by
+        faulthandler's C thread, and the hand-over to the worker beside it."""
+        import re as regex
+        import threading as threads
+        lines = []
+        pattern = regex.compile(r"(a+)+b")
+
+        held, release = threads.Event(), threads.Event()
+
+        def busy_in_c():
+            # A backtracking match runs in C and never lets the interpreter go.
+            # The thread then stays, as a pool's worker does.
+            pattern.match("a" * 23)
+            held.set()
+            release.wait(5)
+
+        with fake_runtime_modules():
+            module = import_gptlive()
+
+            async def run():
+                session = build_session(module, log=lines.append)
+                session.start_pump()
+                await asyncio.sleep(0.1)
+                session.note_handed_over()
+                worker = threads.Thread(target=busy_in_c, name="worker-start")
+                worker.start()
+                await asyncio.to_thread(held.wait, 5)
+                await asyncio.sleep(0.1)
+                try:
+                    return await session.stop()
+                finally:
+                    release.set()
+                    worker.join()
+
+            summary = asyncio.run(run())
+        stalls = summary["media"]["loop_stalls"]
+        self.assertGreaterEqual(stalls["count"], 1, lines)
+        event = max(stalls["events"], key=lambda item: item["held_ms"])
+        self.assertGreaterEqual(event["held_ms"], 200)
+        self.assertGreaterEqual(event["cpu_ms"], event["held_ms"] * 0.5)
+        self.assertEqual(event["handover"], 1)
+        self.assertGreater(event["after_handover_s"] * 1000, -event["held_ms"])
+        self.assertTrue(any(line.startswith("worker-start: busy_in_c")
+                            for line in event["threads"]), event["threads"])
+        self.assertEqual(len(summary["media"]["handovers_at_s"]), 1)
+        self.assertTrue(any("event loop held" in line and "process cpu" in line
+                            and "worker-start: busy_in_c" in line
+                            and "hand-over 1 to the worker" in line
+                            for line in lines), lines)
+
+    def test_stall_evidence_failing_breaks_neither_the_call_nor_its_stop(self):
+        """The evidence is extra: when faulthandler cannot be armed and the
+        process usage cannot be read, frames still go and the call stops."""
+        import time as clock
+        lines = []
+        with fake_runtime_modules():
+            module = import_gptlive()
+
+            def refuse(*_args, **_kwargs):
+                raise RuntimeError("no watchdog here")
+
+            async def run():
+                session = build_session(module, log=lines.append)
+                with mock.patch.object(module.faulthandler, "dump_traceback_later",
+                                       refuse), \
+                        mock.patch.object(module, "_usage", lambda: None):
+                    session.start_pump()
+                    await asyncio.sleep(0.05)
+                    clock.sleep(0.2)
+                    await asyncio.sleep(0.05)
+                    sent = len(session._calls.sent)
+                    summary = await session.stop()
+                return session, sent, summary
+
+            session, sent, summary = asyncio.run(run())
+        self.assertGreater(sent, 5)
+        event = summary["media"]["loop_stalls"]["events"][0]
+        self.assertIsNone(event["threads"])
+        self.assertNotIn("cpu_ms", event)
+        self.assertTrue(any("no dump written during the hold" in line
+                            for line in lines), lines)
+        self.assertIsNone(session._watch._dump)
 
     def test_missing_and_zero_caller_frames_are_counted(self):
         with fake_runtime_modules() as Frame:
