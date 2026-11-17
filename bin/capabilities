@@ -5393,7 +5393,10 @@ def _prepare_script_environment(name: str, script: Path) -> None:
     """Have uv make the environment `script` runs in before anything runs it,
     under its own limit, with uv's own account of what it downloads and
     installs passed through on stderr. A script uv does not run through its
-    inline metadata is left to run as it is."""
+    inline metadata is left to run as it is. A preparation uv cannot carry out
+    - an older uv without `sync --script`, among others - only warns, and the
+    snapshot makes the environment as it did before; only running out of time
+    refuses."""
     import signal
     uv = shutil.which("uv")
     try:
@@ -5414,7 +5417,8 @@ def _prepare_script_environment(name: str, script: Path) -> None:
                                 stdout=2, stderr=2,
                                 start_new_session=True)
     except OSError as exc:
-        _die(6, "snapshot_failed", f"preparing {name}'s environment failed: {exc}")
+        _warn(f"{name}: environment not prepared ahead ({exc}); the snapshot makes it")
+        return
     try:
         rc = proc.wait(timeout=ENVIRONMENT_PREPARE_TIMEOUT_SECONDS)
     except BaseException:
@@ -5431,8 +5435,8 @@ def _prepare_script_environment(name: str, script: Path) -> None:
              "uv's account of the download is above; run the install again to resume it "
              "from what uv already holds")
     if rc != 0:
-        _die(6, "snapshot_failed", f"preparing {name}'s environment: `uv sync --script` "
-             f"exited {rc}", "uv's account of the failure is above")
+        _warn(f"{name}: environment not prepared ahead (`uv sync --script` exited {rc}); "
+              "the snapshot makes it")
 
 
 def _snapshot(name: str, script: Path, registry: Path | None = None) -> dict:
