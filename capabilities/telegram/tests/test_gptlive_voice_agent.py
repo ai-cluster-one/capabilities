@@ -279,9 +279,11 @@ class MediaTests(unittest.TestCase):
 
     def test_a_hold_that_keeps_the_interpreter_still_says_what_held_it(self):
         """In the owner's call every hold was "not sampled": a thread held the
-        interpreter, so nothing in Python could look. Each hold now carries
-        what the process did during it and every thread's stack written by
-        faulthandler's C thread, and the hand-over to the worker beside it."""
+        interpreter, so nothing in Python could look. Each hold carries what
+        the process did during it and the hand-over to the worker beside it.
+        It takes no faulthandler dump: re-arming one on every beat waited on a
+        dump that never finished, and the call's event loop stopped for good."""
+        import faulthandler
         import re as regex
         import threading as threads
         lines = []
@@ -314,7 +316,9 @@ class MediaTests(unittest.TestCase):
                     release.set()
                     worker.join()
 
-            summary = asyncio.run(run())
+            with mock.patch.object(faulthandler, "dump_traceback_later") as dump:
+                summary = asyncio.run(run())
+        dump.assert_not_called()
         stalls = summary["media"]["loop_stalls"]
         self.assertGreaterEqual(stalls["count"], 1, lines)
         event = max(stalls["events"], key=lambda item: item["held_ms"])
@@ -322,46 +326,97 @@ class MediaTests(unittest.TestCase):
         self.assertGreaterEqual(event["cpu_ms"], event["held_ms"] * 0.5)
         self.assertEqual(event["handover"], 1)
         self.assertGreater(event["after_handover_s"] * 1000, -event["held_ms"])
-        self.assertTrue(any(line.startswith("worker-start: busy_in_c")
-                            for line in event["threads"]), event["threads"])
+        self.assertNotIn("threads", event)
         self.assertEqual(len(summary["media"]["handovers_at_s"]), 1)
         self.assertTrue(any("event loop held" in line and "process cpu" in line
-                            and "worker-start: busy_in_c" in line
                             and "hand-over 1 to the worker" in line
                             for line in lines), lines)
 
     def test_stall_evidence_failing_breaks_neither_the_call_nor_its_stop(self):
-        """The evidence is extra: when faulthandler cannot be armed and the
-        process usage cannot be read, frames still go and the call stops."""
+        """The evidence is extra: when the process usage cannot be read, frames
+        still go and the call stops."""
         import time as clock
         lines = []
         with fake_runtime_modules():
             module = import_gptlive()
 
-            def refuse(*_args, **_kwargs):
-                raise RuntimeError("no watchdog here")
-
             async def run():
                 session = build_session(module, log=lines.append)
-                with mock.patch.object(module.faulthandler, "dump_traceback_later",
-                                       refuse), \
-                        mock.patch.object(module, "_usage", lambda: None):
+                with mock.patch.object(module, "_usage", lambda: None):
                     session.start_pump()
                     await asyncio.sleep(0.05)
                     clock.sleep(0.2)
                     await asyncio.sleep(0.05)
                     sent = len(session._calls.sent)
                     summary = await session.stop()
-                return session, sent, summary
+                return sent, summary
 
-            session, sent, summary = asyncio.run(run())
+            sent, summary = asyncio.run(run())
         self.assertGreater(sent, 5)
         event = summary["media"]["loop_stalls"]["events"][0]
-        self.assertIsNone(event["threads"])
         self.assertNotIn("cpu_ms", event)
-        self.assertTrue(any("no dump written during the hold" in line
-                            for line in lines), lines)
-        self.assertIsNone(session._watch._dump)
+        self.assertTrue(any("event loop held" in line for line in lines), lines)
+
+    def test_late_bursts_are_played_from_a_cushion_without_holes(self):
+        """A call counted 85 underrun frames in 3 minutes: the pump played each
+        burst of the model's audio the moment it came, so a burst more than ten
+        milliseconds late put silence inside a word. It now plays from a cushion
+        of OUTBOUND_PREFILL_BYTES, and fills it again after running dry.
+
+        Time is virtual here - only the pump's sleeps advance it - so the
+        jitter is exact and the result does not depend on the machine's load."""
+        import base64
+        chunk_seconds = 0.02
+        first = b"\x00\x40"   # a voiced sample, one per utterance, told apart
+        second = b"\x00\x30"
+        with fake_runtime_modules():
+            module = import_gptlive()
+            chunk = int(module.AGENT_RATE * 2 * chunk_seconds) // 2
+            arrivals, last = [], 0.0
+            for k in range(60):  # 1.2 s of speech, each chunk up to 60 ms late
+                last = max(last, 0.1 + k * chunk_seconds + (k * 37 % 61) / 1000)
+                arrivals.append((last, first * chunk))
+            resume = last + 0.3  # the model sends nothing, then speaks again
+            arrivals += [(resume + k * chunk_seconds, second * chunk) for k in range(10)]
+            now = [0.0]
+            clock = types.SimpleNamespace(monotonic=lambda: now[0],
+                                          time=lambda: 1.7e9 + now[0])
+            real_sleep = asyncio.sleep
+
+            async def virtual_sleep(delay, *args):
+                now[0] += max(delay, 0)
+                await real_sleep(0)
+
+            async def run():
+                session = build_session(module)
+                session.start_pump()
+                for at, payload in arrivals:
+                    while now[0] < at:
+                        await real_sleep(0)
+                    session._on_output_audio(types.SimpleNamespace(
+                        delta=base64.b64encode(payload).decode()))
+                while now[0] < resume + 0.4:
+                    await real_sleep(0)
+                await session.stop()
+                return session
+
+            with mock.patch.object(module, "time", clock), \
+                    mock.patch.object(module.asyncio, "sleep", virtual_sleep):
+                session = asyncio.run(run())
+        sent = session._calls.sent
+        voice = [frame[:2] for frame in sent]
+        for sample in (first, second):
+            at = [n for n, head in enumerate(voice) if head == sample]
+            self.assertEqual(at, list(range(at[0], at[-1] + 1)),
+                             f"silence inside speech {sample!r}")
+            self.assertEqual(len(at), sum(len(p) for _, p in arrivals
+                                          if p[:2] == sample) // module.AGENT_FRAME_BYTES)
+        # The second utterance waited, in silence, for its own cushion.
+        start = int(round(resume / module.FRAME_SECONDS))
+        played = voice.index(second)
+        cushion = module.OUTBOUND_PREFILL_BYTES / (module.AGENT_RATE * 2)
+        self.assertGreaterEqual(played - start, int(cushion / module.FRAME_SECONDS) - 3)
+        self.assertTrue(all(sent[n] == module.AGENT_SILENCE for n in range(start, played)))
 
     def test_missing_and_zero_caller_frames_are_counted(self):
         with fake_runtime_modules() as Frame:

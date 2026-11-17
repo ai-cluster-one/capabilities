@@ -1,5 +1,9 @@
 # whatsapp — change log
 
+## 2026-11-17 — Turns run on callva-harness-runner 0.12.3
+
+Turns run on callva-harness-runner 0.12.3, in place of 0.12.2: finding the claude or codex executable no longer lists the fallback folders when `PATH` already has it. On a machine where fnm had left tens of thousands of per-shell folders, every turn's start spent over a second of CPU holding the interpreter on that list; it now takes well under a millisecond, and finds the same executable. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-16 — Turns run on callva-harness-runner 0.12.2
 
 Turns run on callva-harness-runner 0.12.2, in place of 0.12.1: claude runs through claude-agent-sdk 0.2.183, which bundles Claude Code 2.1.326, and the runner's tested claude range reaches 2.1.326, so a turn on an installed claude from 2.1.320 to 2.1.326 no longer carries the out-of-range warning. Codex is unchanged. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

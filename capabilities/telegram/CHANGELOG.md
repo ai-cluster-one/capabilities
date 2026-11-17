@@ -1,5 +1,15 @@
 # telegram — change log
 
+## 2026-11-17 — A GPT Live call no longer hangs the daemon at its start, and plays the model's audio from an 80 ms cushion
+
+The thread stacks a hold of the event loop recorded, added earlier the same day, are gone: faulthandler's timed dump was re-armed on every beat of the pump, a dump walking the frames of running threads never finished, and re-arming it waited for that dump, so the daemon stopped for good just after a call connected and the next call only rang. A hold still records what the process did during it and how long after a hand-over to the worker it began; `loop_stalls.events` no longer carries `threads`, and the `voice: event loop held` line no longer ends in `threads:`.
+
+The outbound pump played each burst of the model's audio the moment it came, so a burst more than ten milliseconds late put silence inside a word. It now starts playing once 80 ms is buffered, and after running dry waits for 80 ms again, so the model is heard up to 80 ms later and a late burst no longer breaks a word. `underrun_frames` counts silence sent while the model's last chunk was voiced, which includes the silence after the model stops sending mid-speech. No verb, flag or setting changes.
+
+## 2026-11-17 — Turns run on callva-harness-runner 0.12.3
+
+Turns run on callva-harness-runner 0.12.3, in place of 0.12.2: finding the claude or codex executable no longer lists the fallback folders when `PATH` already has it. On a machine where fnm had left tens of thousands of per-shell folders, every turn's start spent over a second of CPU holding the interpreter on that list; it now takes well under a millisecond, and finds the same executable. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-17 — A hold of a GPT Live call's event loop records what the process and every thread were doing during it
 
 A hold that keeps the interpreter itself was logged only as `not sampled (the interpreter itself was held)`, which cannot tell a thread busy in C, a process the system paused and the start of a subprocess apart, and these need different cures. Each hold of 100 ms or more now also records what the process did during it - CPU (user and system), voluntary and involuntary context switches, and major and minor page faults - and every thread's innermost Python frames, written by faulthandler's own C thread while the hold lasts, so they are there even when no Python could run; every hold of 130 ms or more gets them. Threads parked at the same place are counted on one line, so the one doing something stands out. Each hold also says how long after the call last handed work to the worker it began. All of this is added to the `voice: event loop held` log line and to `voice_agent.media`, as `loop_stalls.events` (up to twenty a call) and `handovers_at_s`. This is measurement only: the call sounds as it did, nothing a call says or sends changes, and no verb, flag, setting or existing JSON key changes.

@@ -26,7 +26,7 @@
       "level": 0,
       "lucide_icon": "messages-square",
       "path": "capabilities/agentrooms",
-      "payload_sha256": "4edd371fb4302410749cf6cf51ae433ebbc496cb40cf2b427bdf9d627f5dd35c",
+      "payload_sha256": "5265a05d0729b7e7142d44dd4177ebd3f2ace72917762b0db58ac58bd6f565f6",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room.",
@@ -42,7 +42,7 @@
           "title": "Комнаты агентов"
         }
       },
-      "version": "2026-11-16 — Turns run on callva-harness-runner 0.12.2"
+      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
     },
     "agenttemplates": {
       "executable": [
@@ -150,7 +150,7 @@
       "level": 0,
       "lucide_icon": "message-circle-question-mark",
       "path": "capabilities/askproject",
-      "payload_sha256": "680a96441e5ef472096bc42771b4abb66ff8875a87c40b9b0f5ba2de4ee5d6ee",
+      "payload_sha256": "756f33a75436c23848c317867b2e54f2a360048f73c3b0693b4fee442ced9b3a",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability.",
@@ -166,7 +166,7 @@
           "title": "Вопрос проекту"
         }
       },
-      "version": "2026-11-16 — Turns run on callva-harness-runner 0.12.2"
+      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
     },
     "assets": {
       "executable": [
@@ -229,7 +229,7 @@
       "level": 0,
       "lucide_icon": "timer",
       "path": "capabilities/automations",
-      "payload_sha256": "296b96088fdc41e3e02ad3847b4973f6b4bf78c5b36707a3405441d50a395bf5",
+      "payload_sha256": "3fc3b94dfe0a2d0ec72ed366c29621424d9fda1771e3f2a4186ad2995fc66430",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
@@ -245,7 +245,7 @@
           "title": "Автоматизации"
         }
       },
-      "version": "2026-11-16 — Turns run on callva-harness-runner 0.12.2"
+      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
     },
     "calcomc": {
       "executable": [
@@ -932,7 +932,7 @@
       "level": 0,
       "lucide_icon": "brain",
       "path": "capabilities/memory",
-      "payload_sha256": "dbbdc37cfd768e8d8d9b77f8533a032e8376287566b10a28feffa2b41122b13a",
+      "payload_sha256": "cf10ddf338903da84e3738abb6f76e2b736012c030016b31cdc0e29be21213b9",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a constant block in every session's context that says how to record and search them, and a grooming pass, run on a schedule, that consolidates the entries.",
@@ -948,7 +948,7 @@
           "title": "Память"
         }
       },
-      "version": "2026-11-16 — Turns run on callva-harness-runner 0.12.2"
+      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
     },
     "notion": {
       "executable": [
@@ -1409,7 +1409,7 @@
       "level": 0,
       "lucide_icon": "list-checks",
       "path": "capabilities/tasks",
-      "payload_sha256": "ff5b2aa771f288cec6bd648ae349e4b6bdc0d0c04d52da7606ba59fcde334c6d",
+      "payload_sha256": "d211a91608de64dc836792370e8a63cc52a9c14b9b9e65fd80f399cc7ac42406",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
@@ -1425,7 +1425,7 @@
           "title": "Задачи"
         }
       },
-      "version": "2026-11-16 — Turns run on callva-harness-runner 0.12.2"
+      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
     },
     "teams": {
       "executable": [
@@ -1531,7 +1531,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "6179d553a43575ef6d9e8273f89f7a708bd80c69427edbb7dccf2306797de8b7",
+      "payload_sha256": "af00e83d15ce5acf34a079d81123a0a2aebfa97412fee0c2dc54d5e06f59eea1",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
@@ -1547,7 +1547,7 @@
           "title": "Telegram"
         }
       },
-      "version": "2026-11-17 — A hold of a GPT Live call's event loop records what the process and every thread were doing during it"
+      "version": "2026-11-17 — A GPT Live call no longer hangs the daemon at its start, and plays the model's audio from an 80 ms cushion"
     },
     "telegrambot": {
       "executable": [
@@ -1595,7 +1595,7 @@
       "level": 0,
       "lucide_icon": "bot-message-square",
       "path": "capabilities/telegrambot",
-      "payload_sha256": "ce71c475fd3fd30b93adc52b925fadeec07ed1e08a88eea8f12d928975745f91",
+      "payload_sha256": "ea297394e4c4eedae41db81381bfabda5d44f90051bfdf062b7d050bae3be8ef",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation.",
@@ -1611,7 +1611,7 @@
           "title": "Telegram-бот"
         }
       },
-      "version": "2026-11-16 — Turns run on callva-harness-runner 0.12.2"
+      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
     },
     "vapic": {
       "executable": [
@@ -1692,7 +1692,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/whatsapp",
-      "payload_sha256": "8de657cee5a503ab9cf156edadd6c4fda0b76623a7553c7f876c4d8d2265b2ac",
+      "payload_sha256": "77a1a27e43df93aefc471b8bbb9056d4e3cce7249d207bbff8300de55c15ef21",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "WhatsApp CLI carrying its own engine — link a device, keep the account's chats and messages in a Postgres store, read and deepen them on demand, transcribe voice notes, and export a chat to JSON.",
@@ -1708,7 +1708,7 @@
           "title": "WhatsApp"
         }
       },
-      "version": "2026-11-16 — Turns run on callva-harness-runner 0.12.2"
+      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
     },
     "windmill": {
       "executable": [

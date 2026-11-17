@@ -37,13 +37,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
-import faulthandler
 import gc
 import operator
 import os
-import re
 import sys
-import tempfile
 import threading
 import time
 import traceback
@@ -142,6 +139,12 @@ PUMP_RESYNC_SECONDS = 1.0
 # caller hears; it is paid back by dropping silent frames, never speech.
 OUTBOUND_TARGET_BYTES = int(AGENT_RATE * 2 * 0.2)
 
+# The model's audio arrives in bursts whose spacing jitters by tens of
+# milliseconds. The pump starts playing only once this much is buffered, and
+# after running dry waits for this much again, so a late burst is absorbed by
+# the cushion instead of becoming silence inside a word.
+OUTBOUND_PREFILL_BYTES = int(AGENT_RATE * 2 * 0.08)
+
 # What the worker is handed instead of a request. The delegation carries no
 # task text, so inventing one means scraping the caller's speech and hoping the
 # scrape is right — which is a fiction with its own failure modes. The turn was
@@ -197,20 +200,14 @@ LOOP_WATCH_INTERVAL = 0.02
 LOOP_STALL_LOG_LIMIT = 20
 GC_PAUSE_SECONDS = 0.02
 # A hold that keeps the interpreter itself leaves the loop watch nothing to
-# read, so every hold also gets evidence that needs no interpreter: the stacks
-# of every thread, written by faulthandler's own C thread when no beat has come
-# for STALL_DUMP_AFTER_SECONDS, and what the process did meanwhile - CPU, context
-# switches and page faults - which tells a thread busy in C (CPU spent), a
-# process the system paused (none spent, little switching) and a start of a
-# subprocess (a thread in it, CPU in the kernel) apart. The dump is re-armed at
-# most every STALL_DUMP_REARM_SECONDS, so every hold of STALL_DUMP_AFTER_SECONDS
-# or more is caught, and a shorter one may not be.
-STALL_DUMP_AFTER_SECONDS = 0.13
-STALL_DUMP_REARM_SECONDS = 0.03
-STALL_DUMP_THREADS = 12
-STALL_DUMP_FRAMES = 3
-_DUMP_THREAD = re.compile(r"^(?:Current thread|Thread) (0x[0-9a-fA-F]+)")
-_DUMP_FRAME = re.compile(r'^\s+File "(.*)", line (\d+) in (.+?)\s*$')
+# read, so every hold also gets evidence that needs no interpreter: what the
+# process did meanwhile - CPU, context switches and page faults - which tells a
+# thread busy in C (CPU spent), a process the system paused (none spent, little
+# switching) and a start of a subprocess (a thread in it, CPU in the kernel)
+# apart. No stack of the C-held threads is taken: faulthandler's timed dump
+# walks frames that running threads change under it, and re-arming it waits for
+# a dump in progress, so on a live call the dump never finished and the event
+# loop stopped for good waiting on it.
 
 
 class _LoopWatch:
@@ -241,16 +238,12 @@ class _LoopWatch:
         self.gc_pauses = 0
         self.gc_max = 0.0
         self.gc_total = 0.0
-        self._dump = None
-        self._armed_at = None
         self._usage = None
 
     def start(self):
         self._loop_thread = threading.get_ident()
         self.beat = self._clock()
         gc.callbacks.append(self._on_gc)
-        with contextlib.suppress(Exception):
-            self._dump = tempfile.TemporaryFile(buffering=0)
         self._usage = _usage()
         self._thread = threading.Thread(target=self._run, name="voice-loop-watch",
                                         daemon=True)
@@ -260,31 +253,6 @@ class _LoopWatch:
         self._stopped.set()
         with contextlib.suppress(ValueError):
             gc.callbacks.remove(self._on_gc)
-        dump, self._dump = self._dump, None
-        if dump is not None:
-            if self._armed_at is not None:
-                with contextlib.suppress(Exception):
-                    faulthandler.cancel_dump_traceback_later()
-            with contextlib.suppress(Exception):
-                dump.close()
-
-    def arm(self, now):
-        """Called on every beat: keep the C thread's dump pushed out, so it
-        is written only while no beat comes."""
-        if self._dump is None:
-            return
-        if self._armed_at is not None and now - self._armed_at < STALL_DUMP_REARM_SECONDS:
-            return
-        try:
-            faulthandler.dump_traceback_later(STALL_DUMP_AFTER_SECONDS, repeat=False,
-                                              file=self._dump)
-        except Exception:
-            # No evidence is worse than some, never worse than a broken call.
-            with contextlib.suppress(Exception):
-                self._dump.close()
-            self._dump = None
-            return
-        self._armed_at = now
 
     def usage_since(self):
         """What the process did since the previous beat, and the baseline for
@@ -294,27 +262,6 @@ class _LoopWatch:
         if previous is None or current is None:
             return None
         return {key: current[key] - previous[key] for key in current}
-
-    def threads(self):
-        """Every thread's stack as the C thread wrote it during the hold, or
-        None when it wrote nothing; the dump is cleared for the next hold."""
-        if self._dump is None:
-            return None
-        try:
-            fd = self._dump.fileno()
-            os.lseek(fd, 0, os.SEEK_SET)
-            chunks = []
-            while True:
-                chunk = os.read(fd, 65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-            os.ftruncate(fd, 0)
-            os.lseek(fd, 0, os.SEEK_SET)
-        except Exception:
-            return None
-        text = b"".join(chunks).decode("utf-8", "replace")
-        return _read_dump(text, self._loop_thread) if text.strip() else None
 
     def where(self, beat):
         """Where the loop was held during the stall that began at `beat`."""
@@ -367,37 +314,6 @@ def _usage():
         "major_faults": used.ru_majflt,
         "minor_faults": used.ru_minflt,
     }
-
-
-def _read_dump(text, loop_thread):
-    """faulthandler's dump of every thread, as one line per distinct stack:
-    the thread's name, then its innermost frames. Threads parked at the same
-    place are counted on one line, so the one doing something stands out."""
-    names = {thread.ident: thread.name for thread in threading.enumerate()}
-    names[loop_thread] = "event loop"
-    stacks, current = [], None
-    for line in text.splitlines():
-        found = _DUMP_THREAD.match(line)
-        if found:
-            ident = int(found.group(1), 16)
-            current = [names.get(ident, f"thread {found.group(1)}"), []]
-            stacks.append(current)
-            continue
-        found = _DUMP_FRAME.match(line)
-        if found and current is not None and len(current[1]) < STALL_DUMP_FRAMES:
-            filename, lineno, name = found.groups()
-            current[1].append(f"{name} ({os.path.basename(filename)}:{lineno})")
-    grouped = {}
-    for name, frames in stacks:
-        if name == "voice-loop-watch":
-            continue
-        where = " < ".join(frames) or "no Python frame"
-        grouped.setdefault(where, []).append(name)
-    lines = []
-    for where, holders in grouped.items():
-        who = holders[0] if len(holders) == 1 else f"{len(holders)}x {holders[0]}"
-        lines.append(f"{who}: {where}")
-    return lines[:STALL_DUMP_THREADS]
 
 
 def _rms(payload: bytes) -> float:
@@ -477,6 +393,7 @@ class VoiceCallSession:
         self._pending_input = bytearray()
         self._input_queue = asyncio.Queue(maxsize=INPUT_QUEUE_FRAMES)
         self._outbound = bytearray()
+        self._refilling = True
         self._turns = []
         self._pump_error = None
 
@@ -613,8 +530,10 @@ class VoiceCallSession:
                         self._input_queue.put_nowait(chunk)
 
     async def _outbound_pump(self):
-        """Feed the capture slot at real time. GPT Live streams continuously, so
-        the buffer normally holds about one tick; silence covers a gap.
+        """Feed the capture slot at real time from a cushion of
+        OUTBOUND_PREFILL_BYTES: playing starts once the cushion is buffered, and
+        after the buffer runs dry silence covers the gap until it is buffered
+        again.
 
         The schedule is absolute (see PUMP_RESYNC_SECONDS), and a backlog above
         OUTBOUND_TARGET_BYTES is trimmed of silence before the next frame goes,
@@ -627,15 +546,22 @@ class VoiceCallSession:
                 backlog = len(self._outbound)
                 if backlog > self.max_outbound_backlog:
                     self.max_outbound_backlog = backlog
-                if backlog >= AGENT_FRAME_BYTES:
+                if self._refilling and backlog >= OUTBOUND_PREFILL_BYTES:
+                    self._refilling = False
+                if not self._refilling and backlog >= AGENT_FRAME_BYTES:
                     payload = bytes(self._outbound[:AGENT_FRAME_BYTES])
                     del self._outbound[:AGENT_FRAME_BYTES]
                 else:
+                    if not self._refilling:
+                        self._refilling = True
                     payload = AGENT_SILENCE
                     self.silence_frames += 1
                     if self._speaking:
-                        # The model was mid-word and the next of it had not
-                        # arrived: a hole in its speech, made on this side.
+                        # The last chunk the model sent was voiced and the next
+                        # had not arrived: a hole in its speech, made on this
+                        # side. It also counts the silence after the model
+                        # stops sending mid-speech, since only a quiet chunk
+                        # ends speaking.
                         self.underrun_frames += 1
                 self.agent_frames += 1
                 if self._agent_writer is not None:
@@ -674,12 +600,10 @@ class VoiceCallSession:
         now = time.monotonic()
         previous = self._watch.beat
         self._watch.beat = now
-        self._watch.arm(now)
         used = self._watch.usage_since()
         held = now - previous
         if held < LOOP_STALL_SECONDS:
             return
-        threads = self._watch.threads()
         if self._last_send_at is None:
             return
         where = self._watch.where(previous)
@@ -690,7 +614,7 @@ class VoiceCallSession:
             self.loop_stall_worst = where
         if self.loop_stalls > LOOP_STALL_LOG_LIMIT:
             return
-        event = self._stall_event(previous, held, where, used, threads)
+        event = self._stall_event(previous, held, where, used)
         self.loop_stall_events.append(event)
         self._log(self._stall_line(event))
 
@@ -698,7 +622,7 @@ class VoiceCallSession:
         """The call is handing work to the worker now."""
         self._handed_over_at.append(time.monotonic())
 
-    def _stall_event(self, began, held, where, used, threads):
+    def _stall_event(self, began, held, where, used):
         ms = lambda seconds: round(seconds * 1000, 1)  # noqa: E731
         event = {"at_s": round(began - self.origin, 3), "held_ms": ms(held),
                  "in": where}
@@ -717,7 +641,6 @@ class VoiceCallSession:
         if earlier:
             event["handover"] = len(earlier)
             event["after_handover_s"] = round(began - earlier[-1], 3)
-        event["threads"] = threads
         return event
 
     @staticmethod
@@ -736,10 +659,6 @@ class VoiceCallSession:
                      f"to the worker" if after >= 0 else
                      f"; hand-over {event['handover']} to the worker came "
                      f"{-after:.2f} s into it")
-        if event["threads"] is None:
-            line += "; threads: no dump written during the hold"
-        else:
-            line += "; threads: " + " | ".join(event["threads"])
         return line
 
     def _note_send(self, started, finished):
