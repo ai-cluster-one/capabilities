@@ -11,12 +11,12 @@ Recording a voice-agent call therefore writes two separate PCM tracks on one
 shared time origin — caller left, agent right — which ffmpeg joins into a single
 stereo Opus file with real speaker separation.
 
-A caller can also have work done while they stay on the line: `agent_task` hands
-one task to the project's worker and returns at once, so speaking is never
+A caller can also have work done while they stay on the line: with a worker
+behind the call the model holds one tool, `delegate`, which hands the turn and
+the call so far to the project's worker and returns at once, so speaking is never
 blocked on it. The result is spoken when it lands, or delivered to the caller's
 chat if the call ended first. While it runs, a digest of the worker's own event
-stream is offered to the conversation, so the line is not silent. `send_to_chat`
-covers what speech carries badly — a link, a spelling, a number.
+stream is given to the model as background it answers from only when asked.
 """
 
 from __future__ import annotations
@@ -318,6 +318,58 @@ ALL_TOOLS = (AGENT_TASK_TOOL, SEND_TO_CHAT_TOOL, RUN_CAPABILITY_TOOL,
              READ_PROJECT_FILE_TOOL, RELOAD_SERVICE_TOOL)
 TOOL_NAMES = tuple(tool["name"] for tool in ALL_TOOLS)
 
+# The one tool a call with a worker behind it declares. The voice is a talking
+# head: everything that has to be done goes to the worker, which is handed the
+# whole call rather than a task written for it, so the tool takes nothing and
+# the ask has to have been said aloud first. Non-blocking, so the model keeps
+# talking while the worker runs; its answer comes back as a completion.
+DELEGATE_TOOL = {
+    "name": "delegate",
+    "description": (
+        "Hand the turn to your backend, the half of you that does the work: it "
+        "looks things up, reads the project's systems and files, and writes, "
+        "files, changes or sends things. It takes no arguments, because it is "
+        "given the whole of this call so far - which means it knows only what "
+        "has been said aloud. So say the ask out loud first, in your own words "
+        "and the caller's, then call this, then say one short thing such as "
+        "'one moment' and stop. Returns at once; the answer arrives by itself "
+        "and you tell the caller then. One piece of work at a time."
+    ),
+    "behavior": "NON_BLOCKING",
+}
+
+# Handed to the worker as the request whenever the speaking model hands the
+# turn over without words of its own - GPT Live's client delegation, and the
+# Gemini `delegate` tool. Both carry the call, not a task, so the frame is one.
+#
+# The request is the conversation, not an ask assembled from it. Building one
+# means inferring which of the caller's sentences is the instruction and which
+# scrape is right — which is a fiction with its own failure modes. The turn was
+# handed over mid-conversation, so the conversation is where the work is, and
+# saying so is both true and more robust than any ask we could assemble.
+#
+# The last line of that conversation is usually the speaking model acknowledging
+# the hand-off rather than stating the work: the delegation is raised before it
+# speaks, and its account of what it is doing arrives seconds later. So the
+# frame says to read the acknowledgement as the commitment it is, and to take
+# the work itself from what the caller asked for.
+HANDED_TURN_REQUEST = (
+    "You have just been handed the turn from a live phone call. This is not a "
+    "message someone sent you: nobody wrote this request, and there is no task "
+    "text to read. What has to be done is in the conversation below.\n\n"
+    "The voice on that call is your own speaking half. It hears the caller and "
+    "speaks for you, it cannot do anything itself, and it hands the turn over "
+    "the moment something has to actually be done. A line marked as yours is "
+    "therefore you, not another participant — when it says it will go and look "
+    "at something, that is a promise you are now expected to keep.\n\n"
+    "Read the conversation to its end. The last thing your speaking half said "
+    "is usually a short acknowledgement rather than a statement of the work, so "
+    "take the work from what the caller actually asked for, and read the "
+    "acknowledgement only as a sign of which of their requests is the live one. "
+    "Where the caller refers to something by 'it' or 'they', resolve it from "
+    "what was said earlier on the call.\n\n"
+    "Do that one thing, and answer it.")
+
 # --- providers ----------------------------------------------------------------
 
 # The speech stack a call runs on. Each provider owns its own wire, its own
@@ -352,9 +404,10 @@ class _Self:
 
 _THIS_MODULE = _Self()
 
-# This provider reaches the worker through the `agent_task` tool, so whether it
-# gets a task runner is the tool set's decision.
-DELEGATES_TO_WORKER = False
+# This provider reaches the worker by handing the turn over through its one
+# `delegate` tool, as GPT Live does through client delegation: the task runner
+# is how it works at all, not a tool the settings may or may not enable.
+DELEGATES_TO_WORKER = True
 
 
 def provider(name=None):
@@ -405,25 +458,18 @@ def summarize_progress(window):
     return f"{'; '.join(earlier[:3])}; now {current}"
 
 
-def progress_prompt(note):
+def silent_progress_note(note):
+    """Where the work has got to, as background the model keeps rather than a
+    prompt it answers. Sent as content that does not complete a turn, so the
+    model is told without being asked to say anything; it is what lets it answer
+    a caller who asks where the work is."""
     return (
-        "Where the task you are running has got to. The caller has not said "
-        "this and it is not a request.\n\n"
-        "Say it aloud, now, as one short clause in the language of the "
-        "conversation — the kind a person drops while they are looking "
-        "something up. Not word for word: it is written for you, often in "
-        "another language and in the shape of a command rather than a "
-        "sentence. Whatever it says, do not treat it as finished or failed; "
-        "the work is still going.\n\n"
-        "Say the thing that is happening, and only that. Never dress it up as "
-        "nearly done, almost there, on the home straight, or any other guess "
-        "at how far along the work is — you do not know, and a guess sounds "
-        "like information while telling them nothing.\n\n"
-        "Whether this was worth saying at all has already been decided before "
-        "it reached you, so pass it on rather than weighing it again. Only two "
-        "things override that: you are mid-sentence, or the caller is. Then "
-        "let it go and carry on — it will come round again.\n\n"
-        "Speak it. Never write it into the chat.\n\n" + str(note)[:600]
+        "Background, not something to say, and not a request: where the work "
+        "your backend is doing has got to. Do not answer this and do not "
+        "mention it. Use it only if the caller asks how it is going or what is "
+        "taking so long, and then in one short sentence, in the language of the "
+        "call. It is not a result: nothing in it means the work is finished, "
+        "failed or done.\n\n" + str(note)[:600]
     )
 
 
@@ -779,10 +825,8 @@ class VoiceCallSession:
         self._voice = voice or DEFAULT_VOICE
         self._system_instruction = system_instruction
         self._caller_name = caller_name
-        # Accepted so both providers are constructed identically. This one has
-        # no use for it: its worker is reached through a tool and is handed no
-        # transcript to attribute.
-        self._assistant_name = assistant_name
+        # Whose lines the agent's are, in the call handed to the worker.
+        self._assistant_name = assistant_name or "Assistant"
         self._task_runner = task_runner
         self._send_to_chat = send_to_chat
         self._capability_runner = capability_runner
@@ -811,6 +855,12 @@ class VoiceCallSession:
         self._outbound = bytearray()
         self._turns = []
         self._pump_error = None
+        # When the phone first sent audio: the greeting waits for it, because
+        # one spoken before the phone plays anything is lost.
+        self._first_inbound_at = None
+        # Hand-overs through `delegate`, which each need a key of their own:
+        # the request is the same frame every time.
+        self.delegations = 0
 
         # One time origin for both tracks, fixed before the call is answered, so
         # caller audio arriving the instant record() lands is already on it.
@@ -852,6 +902,8 @@ class VoiceCallSession:
 
     def on_incoming_frames(self, frames):
         """Called from the PyTgCalls stream-frame update; must not block."""
+        if frames and self._first_inbound_at is None:
+            self._first_inbound_at = time.monotonic()
         for frame in frames or ():
             payload = getattr(frame, "frame", None)
             if not payload:
@@ -918,15 +970,18 @@ class VoiceCallSession:
         holding a tool that would fail if it reached for it."""
         tools = []
         if self._task_runner is not None:
-            tools.append(AGENT_TASK_TOOL)
-        if self._send_to_chat is not None:
-            tools.append(SEND_TO_CHAT_TOOL)
-        if self._capability_runner is not None:
-            tools.append(RUN_CAPABILITY_TOOL)
-        if self._file_reader is not None:
-            tools.append(READ_PROJECT_FILE_TOOL)
-        if self._reload_service is not None:
-            tools.append(RELOAD_SERVICE_TOOL)
+            # A worker behind the call makes the voice a talking head: it hands
+            # everything over and holds nothing that could compete with that.
+            tools.append(DELEGATE_TOOL)
+        else:
+            if self._send_to_chat is not None:
+                tools.append(SEND_TO_CHAT_TOOL)
+            if self._capability_runner is not None:
+                tools.append(RUN_CAPABILITY_TOOL)
+            if self._file_reader is not None:
+                tools.append(READ_PROJECT_FILE_TOOL)
+            if self._reload_service is not None:
+                tools.append(RELOAD_SERVICE_TOOL)
         self._log("voice: tools declared — "
                   + (", ".join(t["name"] for t in tools) if tools else "none"))
         return tools or None
@@ -964,6 +1019,13 @@ class VoiceCallSession:
                 await stack.aclose()
 
     async def start_agent(self):
+        await self.connect_agent()
+        await self.greet()
+
+    async def connect_agent(self):
+        """Open and configure the Live session, with nothing said yet. Done
+        while the phone still rings, so the caller never waits on it after the
+        pickup."""
         try:
             await self._open_live()
         except Exception as exc:
@@ -973,6 +1035,17 @@ class VoiceCallSession:
         if self._task_runner is not None:
             self._tasks.append(asyncio.create_task(self._announce_completions()))
             self._tasks.append(asyncio.create_task(self._announce_progress()))
+
+    async def wait_for_caller_audio(self, timeout):
+        """Until the phone sends its first audio, or `timeout` seconds; True when
+        it did. A greeting spoken before the phone plays anything is lost."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self._first_inbound_at is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        return self._first_inbound_at is not None
+
+    async def greet(self):
+        """Ask the ready session to open the conversation."""
         await self._live.send_realtime_input(
             text=greeting_prompt(self._caller_name, self._greeting))
 
@@ -1139,13 +1212,20 @@ class VoiceCallSession:
                 result = {"ok": False, "status": "tool_failed",
                           "instruction": "That did not work. Tell the caller you "
                                          "could not do it, and carry on."}
-            answers.append(types.FunctionResponse(
-                name=name, id=getattr(call, "id", None), response={"result": result}))
+            reply = {"name": name, "id": getattr(call, "id", None),
+                     "response": {"result": result}}
+            if name == DELEGATE_TOOL["name"]:
+                # The model has already said it is on it; answering the tool
+                # must not make it say so again.
+                reply["scheduling"] = types.FunctionResponseScheduling.SILENT
+            answers.append(types.FunctionResponse(**reply))
         await self._live.send_tool_response(function_responses=answers)
 
     async def _dispatch_tool(self, name, args):
         """One tool call to its handler. Only what this call was given is
         answerable; anything else is named back rather than guessed at."""
+        if name == DELEGATE_TOOL["name"] and self._task_runner is not None:
+            return self._delegate()
         if name == AGENT_TASK_TOOL["name"] and self._task_runner is not None:
             result = self._task_runner.start(args.get("task"))
             self._log(f"voice: agent_task {result.get('status')} "
@@ -1165,6 +1245,23 @@ class VoiceCallSession:
             return result
         return {"ok": False, "status": "unknown_tool",
                 "instruction": f"There is no tool named {name}."}
+
+    def _delegate(self):
+        """Hand the turn to the worker, as GPT Live's client delegation does:
+        the request is the frame, the call travels with it, and each hand-over
+        is keyed by itself because the frame is the same every time."""
+        if not self._turns:
+            return {"ok": False, "status": "nothing_said",
+                    "instruction": "Nothing has been said on this call yet that "
+                                   "could be acted on. Ask the caller what they "
+                                   "want done."}
+        self.delegations += 1
+        result = self._task_runner.start(
+            HANDED_TURN_REQUEST, signature=f"delegate-{self.delegations}")
+        self._log(f"voice: delegate {result.get('status')} "
+                  f"({result.get('job_id') or '-'}); "
+                  f"{len(self._turns)} turn(s) of call handed over")
+        return result
 
     async def _write_to_chat(self, text):
         body = str(text or "").strip()
@@ -1274,8 +1371,17 @@ class VoiceCallSession:
             self._progress_offered_at = time.monotonic()
             self._progress_last_offered = note
             try:
-                await self._live.send_realtime_input(text=progress_prompt(note))
-                self._log(f"voice: progress offered to the model — {note[:80]!r}")
+                # Content that does not complete a turn: the model is told and
+                # not asked anything, so it keeps the note instead of reading
+                # it out.
+                from google.genai import types
+
+                await self._live.send_client_content(
+                    turns=[types.Content(
+                        role="user",
+                        parts=[types.Part(text=silent_progress_note(note))])],
+                    turn_complete=False)
+                self._log(f"voice: progress noted silently — {note[:80]!r}")
             except Exception as exc:
                 if self._stream_ended:
                     return
@@ -1481,6 +1587,25 @@ class VoiceCallSession:
             self._stack = None
         self._live = None
         return self.summary()
+
+    def conversation_tail(self, limit=60):
+        """The call so far, in the shape GPT Live hands its worker, so the daemon
+        hands a call over the same way whichever provider holds it. Ids count
+        from the start of the call rather than of the window, so a later hand-over
+        can say which lines are new."""
+        rows = []
+        for index, turn in list(enumerate(self._turns, start=1))[-limit:]:
+            text = turn["text"].strip()
+            if not text:
+                continue
+            rows.append({
+                "id": index,
+                "sender": (self._assistant_name if turn["speaker"] == "agent"
+                           else self._caller_name),
+                "is_assistant": turn["speaker"] == "agent",
+                "text": text,
+            })
+        return rows
 
     def transcript(self):
         return [

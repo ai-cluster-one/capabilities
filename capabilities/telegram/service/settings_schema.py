@@ -44,7 +44,7 @@ VOICE_PROVIDER_OPTIONAL_DOCUMENTS = ("delegation",)
 # The provider whose document keys predate the split, and whose prompts a
 # project may already have written under the unsuffixed key.
 VOICE_PROVIDER_INCUMBENT = "gemini"
-VOICE_SESSION_MODES = {"carry", "fresh"}
+VOICE_SESSION_MODES = {"carry", "call", "fresh"}
 TRANSCRIPTION_MODES = {"disabled", "auto"}
 CALL_GROUP_MODES = {
     "disabled", "off", "none", "auto", "automatic", "on_request",
@@ -490,8 +490,11 @@ def _voice_session(value, path):
     `carry` keeps the session a finished task ran in and offers it to the next
     task and the next call, so a follow-up builds on what was already found
     instead of paying for the same lookups again. Nothing expires it; `/reload`
-    is the way to a new one. `fresh` gives every task its own session — the way
-    out if continuity ever proves worse than the rediscovery it replaces."""
+    is the way to a new one. `call` keeps one session for the length of a call
+    and starts each call on a new one; on a claude profile that session is one
+    worker process kept open for the call. `fresh` gives every task its own
+    session — the way out if continuity ever proves worse than the rediscovery
+    it replaces."""
     value = _object(value, path)
     _unknown(value, VOICE_SESSION_KEYS, path)
     if "mode" in value:

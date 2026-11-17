@@ -1,5 +1,19 @@
 # telegram — change log
 
+## 2026-11-17 — Gemini Live hands work over as GPT Live does, a call's worker stays open for the call, and the greeting waits for the phone
+
+A Gemini Live call with the project's worker behind it - every call the service answers - now declares one tool, `delegate`, in place of `agent_task`, `send_to_chat`, `run_capability`, `read_project_file` and `reload_service`: it takes no arguments, runs non-blocking, and hands the worker the call so far under the same request GPT Live's hand-over uses, so `tools` is not read on such a call, as it is not on GPT Live. The log says `voice: tools declared — delegate`. Its answer to the tool asks the model for nothing, since it has already said it is on it, and with nothing said yet it tells the model to ask the caller. The mechanism the model is told ships as `service/gemini/prompts/delegation.md` and is read after the project's own voice prompt, as GPT Live's is; a project with no Gemini voice prompt is still not answered. **This is a change a consumer sees:** a project that enabled those tools for Gemini calls no longer has them on a call; the worker does that work.
+
+A note about the work no longer asks Gemini for an answer, so it is no longer read aloud: it is background the model keeps and uses only when the caller asks how the work is going (`voice: progress noted silently`). Notes are paced as before.
+
+Both providers now open and configure the speech session while the phone rings and greet only after the pickup, once the phone has sent its first audio (at most 3 s) and 1 s more, since a greeting spoken earlier was lost and the caller heard silence; the log says `voice: greeting <id> (after the phone's first audio)`. A caller who hangs up during that wait is not greeted.
+
+A hand-over into a worker session that already holds the call now sends only the lines said since the last hand-over, under a short request, instead of the progress instructions, the request and the whole call again; the first hand-over, a new session or a re-anchor sends everything as before. Lines are numbered from the start of the call, and the dispatch log says `handed=full` or `handed=follow-on` with the lines sent of the total and the request's length.
+
+`defaults.voice_agent.session.mode` takes a third value, `call`: one worker session for the length of a call, each call starting on a new one (`voice: a new worker session for this call`). On a claude profile that session is one worker process kept open for the call through callva-harness-runner 0.13.0's kept-open conversation, so a hand-over no longer waits for a process to start; it logs `voice: hot worker open`, and closes once the call has ended and no task of it still runs (`voice: hot worker closed after <n> turn(s)`). A worker that does not open, or a turn that fails, leaves the rest of the call on one process per task, and `/stop` and the task timeout end a turn of it as they end any other. `carry` and `fresh` are unchanged. Turns run on callva-harness-runner 0.13.0, in place of 0.12.3; nothing a profile or a result does changes.
+
+The worker's progress instructions no longer ask for a line "roughly every 0 seconds" when `progress_interval` is 0; they use the default interval. No verb or flag changes; the only new setting value is `call`.
+
 ## 2026-11-17 — A Gemini Live call connects again
 
 A Gemini Live call could not connect at all: the google-genai the daemon installs dials API version v1 by default, and the Live socket on v1 answers HTTP 404 for every model. The Live connection is now opened on v1beta, where the same key reaches the Live models. The default model, the phrase writer and every setting are unchanged; no verb, flag or JSON key changes.

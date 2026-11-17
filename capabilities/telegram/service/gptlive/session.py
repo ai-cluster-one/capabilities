@@ -146,32 +146,9 @@ OUTBOUND_TARGET_BYTES = int(AGENT_RATE * 2 * 0.2)
 OUTBOUND_PREFILL_BYTES = int(AGENT_RATE * 2 * 0.08)
 
 # What the worker is handed instead of a request. The delegation carries no
-# task text, so inventing one means scraping the caller's speech and hoping the
-# scrape is right — which is a fiction with its own failure modes. The turn was
-# handed over mid-conversation, so the conversation is where the work is, and
-# saying so is both true and more robust than any ask we could assemble.
-#
-# The last line of that conversation is usually the speaking model acknowledging
-# the hand-off rather than stating the work: the delegation is raised before it
-# speaks, and its account of what it is doing arrives seconds later. So the
-# frame says to read the acknowledgement as the commitment it is, and to take
-# the work itself from what the caller asked for.
-HANDED_TURN_REQUEST = (
-    "You have just been handed the turn from a live phone call. This is not a "
-    "message someone sent you: nobody wrote this request, and there is no task "
-    "text to read. What has to be done is in the conversation below.\n\n"
-    "The voice on that call is your own speaking half. It hears the caller and "
-    "speaks for you, it cannot do anything itself, and it hands the turn over "
-    "the moment something has to actually be done. A line marked as yours is "
-    "therefore you, not another participant — when it says it will go and look "
-    "at something, that is a promise you are now expected to keep.\n\n"
-    "Read the conversation to its end. The last thing your speaking half said "
-    "is usually a short acknowledgement rather than a statement of the work, so "
-    "take the work from what the caller actually asked for, and read the "
-    "acknowledgement only as a sign of which of their requests is the live one. "
-    "Where the caller refers to something by 'it' or 'they', resolve it from "
-    "what was said earlier on the call.\n\n"
-    "Do that one thing, and answer it.")
+# task text; the conversation is the request. The frame is shared with the
+# Gemini provider's `delegate` tool, which hands the turn over the same way.
+HANDED_TURN_REQUEST = common.HANDED_TURN_REQUEST
 
 # How often the assistant is brought up to date when it is not narrating. Not
 # silence: a caller who asks what is taking so long is owed a real answer, and
@@ -825,6 +802,14 @@ class VoiceCallSession:
                 f"gpt-live session did not start within {CONNECT_TIMEOUT}s")
         self._tasks.append(asyncio.create_task(self._sender()))
 
+    async def wait_for_caller_audio(self, timeout):
+        """Until the phone sends its first audio, or `timeout` seconds; True when
+        it did. A greeting spoken before the phone plays anything is lost."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while self._first_inbound_at is None and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        return self._first_inbound_at is not None
+
     async def greet(self):
         """Ask the ready session to open the conversation."""
         # Commentary, not instructions. An instructions append is a standing
@@ -1257,9 +1242,11 @@ class VoiceCallSession:
         The worker is otherwise handed one sentence and nothing about the
         exchange it came out of, so a question that refers to the answer before
         it cannot be resolved at all. A call is minutes long, so the whole of it
-        costs little and there is no telling in advance which part mattered."""
+        costs little and there is no telling in advance which part mattered.
+        Ids count from the start of the call rather than of the window, so a
+        later hand-over can say which lines are new."""
         rows = []
-        for index, turn in enumerate(self._turns[-limit:], start=1):
+        for index, turn in list(enumerate(self._turns, start=1))[-limit:]:
             text = turn["text"].strip()
             if not text:
                 continue

@@ -9,7 +9,7 @@
 #     "openai>=3.16.0",
 #     "psycopg2-binary>=2.9",
 #     "capabilities-contract>=0.47,<1",
-#     "callva-harness-runner==0.12.3",
+#     "callva-harness-runner==0.13.0",
 # ]
 # ///
 # callva-harness-runner launches every worker turn - dialogue, durable job,
@@ -2628,7 +2628,13 @@ def read_voice_context(provider=None):
     if VOICE_PROMPT_FILE_EXPLICIT:
         # A project that names a file has said exactly what it wants read.
         return read_service_document(VOICE_CONTEXT_FILE)
-    parts = [read_voice_document("voice-agent", provider),
+    own = read_voice_document("voice-agent", provider)
+    if not own and provider == VOICE_PROVIDER_INCUMBENT:
+        # The mechanism alone is not a prompt. Gemini answered no call without
+        # the project's own before it had a mechanism to add, and answers none
+        # now: the readiness check names the missing document instead.
+        return ""
+    parts = [own,
              read_voice_mechanism(provider),
              read_voice_document("delegation", provider)]
     return "\n\n".join(part for part in parts if part)
@@ -3851,6 +3857,22 @@ VOICE_TASK_DELIVERY = (
     "answer in one or two short spoken sentences, plain words only, no markdown, "
     "no lists, no URLs")
 
+# The request a session already holding this call is handed on a later
+# hand-over, in place of the progress instructions and the frame it already has:
+# only what was said since comes with it.
+VOICE_FOLLOW_ON_REQUEST = (
+    "Your speaking half has handed you the turn again. Below is what has been "
+    "said on the call since the last handover; everything before it you already "
+    "have. Read it to its end and decide what has to be done now, under the "
+    "same rules as before, and answer it.")
+
+# The greeting waits for the phone's first audio after the pickup, for at most
+# this long, and then for this much more: a greeting spoken before the phone
+# plays anything is lost, and the first frames arrive before the phone is
+# playing what it receives.
+VOICE_GREET_WAIT = 3.0
+VOICE_GREET_SETTLE = 1.0
+
 VOICE_SUMMARY_DELIVERY = (
     "your reply is posted into the chat as the record of a call that just "
     "ended — write it as plain prose in the language of the call, no preamble, "
@@ -4046,7 +4068,13 @@ def voice_task_preamble(chat_id, seconds):
     goes into the task text itself with the command and the chat spelled out.
     Where those lines go is the part the worker cannot guess: to the assistant
     holding the call, which decides what is worth saying aloud.
+
+    A project that sets the interval to 0 has the call kept quiet, not the
+    worker: the assistant still hears every line, so the worker is still asked
+    for them at the default cadence rather than "every 0 seconds".
     """
+    if not seconds or seconds <= 0:
+        seconds = voice_agent.DEFAULT_PROGRESS_INTERVAL
     return (
         "Someone is waiting on a live phone call for this, so silence costs "
         "them directly.\n\n"
@@ -5834,10 +5862,31 @@ def worker_harness(chat, tail, state=None, procs=None):
             refused["error"] = exc
             run.cancel.set()
 
+    hot = st.get("hot_worker")
+
     def attempt(session, prompt):
+        if hot is not None:
+            return hot_turn(prompt)
         return harness_run(
             prompt, profile, cwd, session=session, environ=environ, extra_env=extra_env,
             on_event=st.get("on_worker_event"), cancel=run.cancel, on_start=on_start)
+
+    def hot_turn(prompt):
+        """The next turn of the call's open worker. Its process started when the
+        call opened it, so the start is reported here, once per turn, for the
+        process table and the task's row to name it; `/stop` and the timeout
+        end it through the same cancel, which ends the process with the turn."""
+        if hot.started is not None:
+            on_start(hot.started)
+        if refused:
+            raise refused["error"]
+        result = hot.conversation.send(prompt, on_event=st.get("on_worker_event"),
+                                       cancel=run.cancel)
+        if result.ok:
+            hot.turns += 1
+        else:
+            hot.retire(f"turn ended {result.failure.kind}")
+        return result
 
     try:
         result = attempt(session, build_prompt(tail, st))
@@ -6042,6 +6091,11 @@ class WorkerLane:
         # One row per session this call touched, for the call's own metadata.
         # The carried-over session is seeded in as the first row.
         self.sessions = []
+        # The last line of this call the session has been handed, by the id
+        # the call's tail gives it. Memory only and per call: a session that
+        # already holds the call is handed only what was said since, and any
+        # change of session starts the count again.
+        self.handed_through = 0
 
     def classify(self, harness, resumed, thread_started):
         """What a failed attempt means for the session.
@@ -6074,6 +6128,7 @@ class WorkerLane:
         if not session_id or str(session_id) == self.session_id:
             return
         self.session_id = str(session_id)
+        self.handed_through = 0
         self.turns = int(record.get("turns") or 0)
         self.needs_reanchor = bool(record.get("needs_reanchor"))
         if not self.sessions or self.sessions[-1]["session_id"] != self.session_id:
@@ -6093,6 +6148,7 @@ class WorkerLane:
             return
         self.session_id = str(session_id)
         self.turns = 0
+        self.handed_through = 0
         self.sessions.append(
             {"session_id": self.session_id, "turns": 0, "closed": None})
 
@@ -6108,6 +6164,7 @@ class WorkerLane:
         if session_id != self.session_id:
             self.session_id = session_id
             self.turns = 0
+            self.handed_through = 0
         self.turns += 1
         if not self.sessions or self.sessions[-1]["session_id"] != session_id:
             self.sessions.append(
@@ -6125,6 +6182,7 @@ class WorkerLane:
         self.session_id = None
         self.turns = 0
         self.needs_reanchor = False
+        self.handed_through = 0
 
 
 _LANES_LOCK = threading.Lock()
@@ -6192,6 +6250,90 @@ def forget_lanes():
         with contextlib.suppress(OSError):
             LANES_FILE.unlink()
     return carried
+
+
+class HotWorker:
+    """One call's worker, kept open for the length of the call.
+
+    In session mode `call` on a claude profile, every hand-over of the call is
+    the next turn of one harness process rather than a new process resuming
+    the session, so the worker reads the request seconds sooner. What a turn's
+    environment points at - the progress outbox, the Telegram session copy, the
+    authority context - is fixed when the process starts, so those are the
+    call's, made once when it opens and removed when it closes.
+
+    It keeps state; the runner's conversation runs the turns. `worker_harness`
+    sends into it when a turn's state names it, and the call's own code opens
+    and closes it."""
+
+    def __init__(self, key):
+        self.key = str(key)
+        self.conversation = None
+        self.started = None
+        self.turns = 0
+        self.progress_outbox = None
+        self.worker_session = None
+        self.authority_context = None
+        # The task opening it, awaited by a hand-over that arrives first.
+        self.opening = None
+        # Tasks of the call still running: it is closed only once none is.
+        self.tasks = 0
+        self.hung_up = False
+        self.closed = False
+        self.retired = None
+
+    @property
+    def is_open(self):
+        return (not self.closed and self.retired is None
+                and self.conversation is not None and self.conversation.is_open)
+
+    @property
+    def session_id(self):
+        return getattr(self.conversation, "session_id", None)
+
+    def mint_outbox(self, stem):
+        """The call's progress outbox, minted once for the call; one held
+        before is dropped first. `close` drops it with the call."""
+        discard_progress_outbox(self.progress_outbox)
+        self.progress_outbox = str(prepare_progress_outbox(stem))
+        return self.progress_outbox
+
+    def retire(self, reason):
+        """Stop using it for this call; the call's later turns take the
+        per-task path. Its resources stay until the call closes it, since the
+        turn that retired it may still be reading them."""
+        if self.retired is None:
+            self.retired = reason
+            log(f"voice: hot worker retired ({reason}); later hand-overs of this "
+                "call run one process each")
+        if self.conversation is not None:
+            with contextlib.suppress(Exception):
+                self.conversation.close()
+
+    def open(self, found, state):
+        """Start the process; blocking, so run off the call's loop. Never
+        raises for a harness that does not open: the conversation carries the
+        failure and `is_open` says so."""
+        lib = profiles.runner()
+        profile = lib.Profile.from_dict(found["knobs"])
+        environ, extra_env = worker_env_parts(state)
+        started = []
+        self.conversation = lib.open_conversation(
+            profile, str(state.get("project_dir") or PROJECT_ROOT),
+            environ=environ, extra_env=extra_env, on_start=started.append)
+        self.started = started[0] if started else None
+        return self.conversation
+
+    def close(self):
+        """End the process and remove the call's resources; blocking."""
+        if self.conversation is not None:
+            with contextlib.suppress(Exception):
+                self.conversation.close()
+        discard_progress_outbox(self.progress_outbox)
+        cleanup_worker_session(self.worker_session)
+        if self.authority_context:
+            with contextlib.suppress(OSError):
+                Path(self.authority_context).unlink()
 
 
 class NotAuthorized(Exception):
@@ -9427,6 +9569,7 @@ async def run_session(client):
             "metadata": None,
             "started_at": None,
             "lane": None,
+            "hot_worker": None,
             "starting": False,
             "finishing": False,
         }
@@ -9436,6 +9579,79 @@ async def run_session(client):
         # because a task outlives the call that started it: two workers on one
         # carried session would be two processes writing one codex rollout.
         voice_tasks_running = {}
+        # Closings of calls' workers under way, held so none is collected
+        # before it has run.
+        hot_worker_closings = set()
+
+        async def open_call_worker(caller_id, caller_name):
+            """The call's one worker process, in session mode `call` on a claude
+            profile; None otherwise, and every task then runs a process of its
+            own. Its resources are made here, once for the call; the process
+            opens off the call's loop, and a hand-over that comes first waits
+            for it."""
+            if voice_agent_settings()["session_mode"] != "call":
+                return None
+            await refresh_turn_profiles()
+            s, found = settings_on_profile(voice_agent_settings())
+            if s["worker"] != "claude" or not isinstance(found, dict):
+                return None
+            key = str(caller_id)
+            call_id = f"voice-call-{int(time.time())}"
+            job = voice_task_job(caller_id, caller_name, "", call_id)
+            authority = _authority_policy_for(job, None, True)
+            hot = HotWorker(key)
+            hot.mint_outbox(f"{_safe_file_part(key)}-{call_id}")
+            hot.worker_session = prepare_worker_session(key, call_id)
+            if authority is not None:
+                hot.authority_context = write_authority_context(
+                    authority, f"{key}-{call_id}")
+            state = {"chat_id": key, "connection": CONNECTION,
+                     "chat_type": "private", "settings": s,
+                     "current_request": {"message_id": call_id, "sender_id": key,
+                                         "sender_name": job["sender_name"],
+                                         "sender_role": job["sender_role"],
+                                         "kind": job["kind"]},
+                     "progress_outbox": hot.progress_outbox,
+                     "worker_session": hot.worker_session,
+                     "authority_context": hot.authority_context}
+
+            async def opening():
+                started = time.monotonic()
+                try:
+                    conversation = await asyncio.to_thread(hot.open, found, state)
+                except Exception as exc:
+                    hot.retire(f"did not open: {_short_error(exc)}")
+                    return
+                if conversation.is_open:
+                    log(f"voice: hot worker open for {key} on {s['profile']}, session "
+                        f"{hot.session_id}, in {time.monotonic() - started:.1f}s")
+                else:
+                    failure = conversation.failure
+                    hot.retire(f"did not open: {getattr(failure, 'kind', None)} "
+                               f"{getattr(failure, 'message', '')}"[:300])
+
+            hot.opening = asyncio.create_task(opening())
+            return hot
+
+        async def close_call_worker(hot):
+            if hot.opening is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(hot.opening)
+            await asyncio.to_thread(hot.close)
+            log(f"voice: hot worker closed after {hot.turns} turn(s)")
+
+        def release_call_worker(hot):
+            """The call is over for its worker: closed now when no task of the
+            call still runs, else when the last one ends. Safe to ask twice."""
+            if hot is None:
+                return
+            hot.hung_up = True
+            if hot.closed or hot.tasks > 0:
+                return
+            hot.closed = True
+            closing = asyncio.create_task(close_call_worker(hot))
+            hot_worker_closings.add(closing)
+            closing.add_done_callback(hot_worker_closings.discard)
 
         def voice_call_busy():
             return active_voice_call["starting"] or active_voice_call["session"] is not None
@@ -9580,7 +9796,8 @@ async def run_session(client):
 
         async def run_voice_task(caller_id, caller_name, text,
                                  delivery=VOICE_TASK_DELIVERY, on_progress=None,
-                                 lane=None, tail=None, provider=None, record=None):
+                                 lane=None, tail=None, provider=None, record=None,
+                                 hot=None):
             """One task the caller asked for mid-call, run by the project's own
             worker — the same machinery a message runs, under the authority the
             same user's messages resolve to.
@@ -9598,7 +9815,16 @@ async def run_session(client):
             job register for as long as it runs and after: the caller's own
             channel lists it, `jobs stop` reaches it, and a restart that cuts it
             off leaves it interrupted rather than gone. It starts at once and
-            holds none of the runner's slots."""
+            holds none of the runner's slots.
+
+            With a `hot` worker that is open, the task is the next turn of the
+            call's one worker process, on the call's own resources; one that is
+            not open leaves the task to run a process of its own.
+
+            A hand-over into a session that already holds this call is given
+            only the lines of the call it has not seen, under a short request,
+            rather than the progress instructions, the frame and the whole call
+            again."""
             await refresh_turn_profiles()
             s, turn_profile = settings_on_profile(voice_agent_settings())
             key = str(caller_id)
@@ -9616,10 +9842,22 @@ async def run_session(client):
                 would leave /stop unable to say which run it was killing."""
                 voice_task_counter["n"] += 1
                 task_id = f"voice-{int(time.time())}-{voice_task_counter['n']}"
-                worker_text = text
-                if on_progress is not None:
-                    worker_text = voice_task_preamble(
-                        caller_id, VOICE_PROGRESS_INTERVAL) + text
+                use_hot = hot is not None and hot.is_open
+                whole = list(tail or [])
+                follow_on = bool(whole and resume_session and not reanchor
+                                 and lane is not None and lane.handed_through > 0)
+                if follow_on:
+                    handed = [row for row in whole
+                              if int(row.get("id") or 0) > lane.handed_through]
+                    worker_text = VOICE_FOLLOW_ON_REQUEST
+                else:
+                    handed = whole
+                    worker_text = text
+                    if on_progress is not None:
+                        worker_text = voice_task_preamble(
+                            caller_id, VOICE_PROGRESS_INTERVAL) + text
+                seen["handed_through"] = max(
+                    (int(row.get("id") or 0) for row in handed), default=0)
                 job = voice_task_job(caller_id, caller_name, worker_text, task_id)
                 authority = _authority_policy_for(job, None, True)
                 proc_key = worker_proc_key(key, task_id)
@@ -9666,13 +9904,24 @@ async def run_session(client):
                     if stage:
                         on_progress(stage, "stream")
 
-                progress_outbox = prepare_progress_outbox(
-                    f"{_safe_file_part(key)}-{task_id}")
+                if use_hot:
+                    # The call's own, emptied so this task's reader sees only
+                    # this task's lines.
+                    progress_outbox = Path(hot.progress_outbox)
+                    with contextlib.suppress(OSError):
+                        progress_outbox.write_text("")
+                else:
+                    progress_outbox = prepare_progress_outbox(
+                        f"{_safe_file_part(key)}-{task_id}")
                 try:
-                    worker_session = prepare_worker_session(key, task_id)
-                    if authority is not None:
-                        authority_context = write_authority_context(
-                            authority, f"{key}-{task_id}")
+                    if use_hot:
+                        worker_session = hot.worker_session
+                        authority_context = hot.authority_context
+                    else:
+                        worker_session = prepare_worker_session(key, task_id)
+                        if authority is not None:
+                            authority_context = write_authority_context(
+                                authority, f"{key}-{task_id}")
                     # A stored prompt, read off the loop the call's audio runs on.
                     voice_backend = await asyncio.to_thread(
                         read_voice_document, "backend", provider)
@@ -9705,18 +9954,23 @@ async def run_session(client):
                              "resume_session": resume_session,
                              "resume_reanchor": reanchor,
                              "cancel_event": cancel_event,
-                             "proc_key": proc_key}
+                             "proc_key": proc_key,
+                             "hot_worker": hot if use_hot else None}
                     log(f"voice: task {task_id} dispatched profile={s['profile']} "
                         f"worker={s['worker']} "
                         f"model={s['model'] or 'default'} "
                         f"session={resume_session or 'new'} "
-                        f"authority={_authority_summary(authority)}")
+                        f"authority={_authority_summary(authority)} "
+                        f"handed={'follow-on' if follow_on else 'full'} "
+                        f"{len(handed)}/{len(whole)} turn(s), "
+                        f"{len(worker_text)} chars of request"
+                        + (" on the call's hot worker" if use_hot else ""))
                     if on_progress is not None:
                         progress_task = asyncio.create_task(
                             tail_voice_progress(progress_outbox, on_progress,
                                                 caller_id))
                     loop = asyncio.get_running_loop()
-                    future = worker_turn(loop, s["worker"], key, tail or [],
+                    future = worker_turn(loop, s["worker"], key, handed,
                                          state, procs)
                     done, _ = await asyncio.wait({future},
                                                  timeout=float(s["worker_timeout"]))
@@ -9742,11 +9996,13 @@ async def run_session(client):
                         progress_task.cancel()
                         with contextlib.suppress(BaseException):
                             await progress_task
-                    discard_progress_outbox(progress_outbox)
-                    cleanup_worker_session(worker_session)
-                    if authority_context:
-                        with contextlib.suppress(OSError):
-                            Path(authority_context).unlink()
+                    if not use_hot:
+                        # The call's own are removed when the call closes it.
+                        discard_progress_outbox(progress_outbox)
+                        cleanup_worker_session(worker_session)
+                        if authority_context:
+                            with contextlib.suppress(OSError):
+                                Path(authority_context).unlink()
                     release_worker_proc(proc_key)
 
             # Resuming is only safe while the run is being watched: the thread
@@ -9758,7 +10014,16 @@ async def run_session(client):
             if watching:
                 lane.refresh(_read_lanes().get(str(caller_id)))
                 voice_tasks_running[key] = voice_tasks_running.get(key, 0) + 1
+            if hot is not None and hot.opening is not None and not hot.opening.done():
+                # Asked for before the call's worker finished opening: waiting
+                # for it is still sooner than starting a process of its own.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(hot.opening)
             resume_session = lane.session_id if watching else None
+            if hot is not None and hot.is_open and resume_session != hot.session_id:
+                # The call's worker holds a session of its own, which nothing has
+                # been handed yet: its first turn is the whole frame.
+                resume_session = None
             reanchor = bool(lane.needs_reanchor) if watching else False
             try:
                 while True:
@@ -9766,7 +10031,8 @@ async def run_session(client):
                     # would report the previous task's thread as this one's, so a
                     # session that was lost would read as one that half-ran, and
                     # the recovery this exists for would quietly never happen.
-                    seen = {"thread_id": None, "compacted": False}
+                    seen = {"thread_id": None, "compacted": False,
+                            "handed_through": 0}
                     try:
                         result = await attempt(resume_session, seen)
                     except asyncio.CancelledError:
@@ -9821,6 +10087,10 @@ async def run_session(client):
                         # on the next turn, whether that turn comes later in this
                         # call or in a call days from now.
                         lane.needs_reanchor = bool(seen["compacted"])
+                        if seen["handed_through"]:
+                            # Kept in memory only: the next hand-over into this
+                            # session sends what was said after this line.
+                            lane.handed_through = seen["handed_through"]
                         save_lane(caller_id, lane)
                     await land_voice_row(row, jobs.SUCCEEDED, meta=result.get("meta"))
                     return result
@@ -10208,10 +10478,20 @@ async def run_session(client):
 
             # `fresh` removes the lane rather than disabling it: with nothing to
             # carry a session, every task runs on its own exactly as it did
-            # before any of this existed.
-            lane = (load_lane(caller_id)
-                    if voice_agent_settings()["session_mode"] == "carry"
-                    else None)
+            # before any of this existed. `call` drops the one on record and
+            # starts the call on an empty one, which its tasks then share.
+            session_mode = voice_agent_settings()["session_mode"]
+            if session_mode == "carry":
+                lane = load_lane(caller_id)
+            elif session_mode == "call":
+                save_lane(caller_id, None)
+                lane = WorkerLane()
+                log("voice: a new worker session for this call")
+            else:
+                lane = None
+            # The call's own worker process, opened after the pickup where the
+            # session mode and the profile have one.
+            call_worker = {"hot": None}
             if lane is not None and lane.session_id:
                 log(f"voice: carrying session {lane.session_id} "
                     f"({lane.turns} turn(s)) into this call")
@@ -10230,11 +10510,21 @@ async def run_session(client):
                 live = active_voice_call.get("session")
                 tail = (live.conversation_tail()
                         if hasattr(live, "conversation_tail") else [])
-                result = await run_voice_task(caller_id, caller_name, text,
-                                              on_progress=note_task_progress,
-                                              lane=lane, tail=tail,
-                                              provider=policy.get("provider"),
-                                              record=call_task_description(text, tail))
+                hot = call_worker["hot"]
+                if hot is not None:
+                    hot.tasks += 1
+                try:
+                    result = await run_voice_task(caller_id, caller_name, text,
+                                                  on_progress=note_task_progress,
+                                                  lane=lane, tail=tail,
+                                                  provider=policy.get("provider"),
+                                                  record=call_task_description(text, tail),
+                                                  hot=hot)
+                finally:
+                    if hot is not None:
+                        hot.tasks -= 1
+                        if hot.hung_up:
+                            release_call_worker(hot)
                 return result["reply"]
 
             task_runner = voice_agent.VoiceTaskRunner(
@@ -10302,11 +10592,12 @@ async def run_session(client):
                 "finishing": False,
             })
             # A provider that can open its session apart from the greeting has
-            # it configured and greeting while the phone still rings, so the
-            # caller is greeted the moment the call is answered. The greeting's
-            # audio waits in the session until the pump starts after play().
+            # it connected and configured while the phone still rings, and
+            # greets once the phone has sent its first audio after the pickup:
+            # a greeting spoken before the phone plays anything is lost.
             prepared = (hasattr(session, "connect_agent")
                         and hasattr(session, "greet"))
+            answered = False
 
             def hung_up():
                 # The caller can hang up while the phone still rings. The
@@ -10332,7 +10623,6 @@ async def run_session(client):
                     log(f"voice: session ready for {caller_id} before the pickup, "
                         f"{len(history)} chars of chat tail, in "
                         f"{time.monotonic() - prepare_started:.1f}s")
-                    await session.greet()
                     if hung_up():
                         log(f"voice: {caller_id} hung up before the pickup")
                         return
@@ -10356,7 +10646,36 @@ async def run_session(client):
                     ),
                 )
                 session.start_pump()
-                if not prepared:
+                answered = True
+                if not hung_up():
+                    try:
+                        hot = await open_call_worker(caller_id, caller_name)
+                    except Exception as exc:
+                        # The call is answered either way; its tasks then run
+                        # one process each.
+                        log(f"voice: hot worker not opened — {_short_error(exc)}")
+                        hot = None
+                    call_worker["hot"] = hot
+                    if hot is not None:
+                        if hung_up():
+                            release_call_worker(hot)
+                        else:
+                            active_voice_call["hot_worker"] = hot
+                if prepared:
+                    heard = False
+                    if hasattr(session, "wait_for_caller_audio"):
+                        heard = await session.wait_for_caller_audio(VOICE_GREET_WAIT)
+                    await asyncio.sleep(VOICE_GREET_SETTLE)
+                    if hung_up():
+                        # Finishing the call has already recorded and released
+                        # it, its worker included.
+                        log(f"voice: {caller_id} hung up before the greeting")
+                        return
+                    log(f"voice: greeting {caller_id} "
+                        + ("(after the phone's first audio)" if heard else
+                           f"(no audio from the phone within {VOICE_GREET_WAIT:g}s)"))
+                    await session.greet()
+                else:
                     # Answered, and both slots are already carrying audio.
                     # Reading the chat tail now costs a moment of dead air.
                     tail_started = time.monotonic()
@@ -10373,8 +10692,10 @@ async def run_session(client):
                 if prepared and hung_up():
                     # The hang-up stopped the session under its connect, and
                     # finishing the call has already recorded and released it.
-                    log(f"voice: {caller_id} hung up before the pickup")
+                    log(f"voice: {caller_id} hung up before the "
+                        + ("greeting" if answered else "pickup"))
                     return
+                release_call_worker(call_worker["hot"])
                 error = f"{type(exc).__name__}: {exc}"[:500]
                 log(f"voice: cannot answer call from {caller_id}: {error}")
                 with contextlib.suppress(Exception):
@@ -10393,7 +10714,8 @@ async def run_session(client):
                     "session": None, "caller_id": None, "caller_name": None,
                     "record": False, "output": None, "caller_pcm": None,
                     "agent_pcm": None, "metadata_path": None, "metadata": None,
-                    "started_at": None, "lane": None, "finishing": False,
+                    "started_at": None, "lane": None, "hot_worker": None,
+                    "finishing": False,
                 })
                 return
             metadata.update({
@@ -10437,6 +10759,9 @@ async def run_session(client):
             # metadata this feeds is written afterwards, and a lane read then
             # would always be gone.
             lane = active_voice_call["lane"]
+            # The call's worker outlives the call only as long as a task of it
+            # still runs.
+            release_call_worker(active_voice_call.get("hot_worker"))
 
             summary = await session.stop()
             tracks = session.tracks
@@ -10446,7 +10771,8 @@ async def run_session(client):
                 "session": None, "caller_id": None, "caller_name": None,
                 "record": False, "output": None, "caller_pcm": None,
                 "agent_pcm": None, "metadata_path": None, "metadata": None,
-                "started_at": None, "lane": None, "finishing": False,
+                "started_at": None, "lane": None, "hot_worker": None,
+                "finishing": False,
             })
 
             # The call ending is not the session ending — that is the whole point

@@ -40,6 +40,8 @@ from _harness import (  # noqa: E402
     FakeHarness,
     harness_turn,
     held,
+    lib as runner_lib,
+    result as runner_result,
 )
 
 
@@ -2956,6 +2958,16 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         # everything about progress lives in the preamble and nowhere else.
         self.assertNotIn("progress", daemon.VOICE_TASK_DELIVERY)
 
+    async def test_a_quiet_call_never_asks_for_progress_every_0_seconds(self):
+        """An interval of 0 keeps the call quiet, not the worker: the assistant
+        still hears every line, so the worker is asked at the default cadence."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            preamble = daemon.voice_task_preamble(4242, 0)
+
+        self.assertNotIn("every 0 seconds", preamble)
+        self.assertIn("every 10 seconds", preamble)
+
     async def test_the_call_summary_does_not_depend_on_a_recording(self):
         """The summary is started before the recording is joined, so it is ready
         to reply to it — and a call with no recording still gets one."""
@@ -3007,7 +3019,9 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(daemon.GEMINI_SECRET_ENV, "PROJECT_GEMINI_KEY")
             api_key, voice_context, blocked = daemon.voice_call_readiness()
             self.assertEqual(api_key, "live-key")
-            self.assertEqual(voice_context, "Speak briefly.")
+            # The project's prompt, then the mechanism of the one tool it holds.
+            self.assertTrue(voice_context.startswith("Speak briefly.\n\n"))
+            self.assertIn("`delegate`", voice_context)
             self.assertIsNone(blocked)
 
     async def test_voice_call_is_blocked_when_the_named_key_is_unresolved(self):
@@ -5235,6 +5249,30 @@ class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(lane.turns, 100)
             self.assertEqual(len(lane.sessions), 1)
 
+    async def test_what_a_session_was_handed_is_forgotten_when_the_session_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            lane = daemon.WorkerLane()
+            lane.pin("thread-1")
+            lane.handed_through = 7
+            lane.pin("thread-1")                       # the same session
+            kept = lane.handed_through
+            lane.pin("thread-2")                       # another one
+            after_pin = lane.handed_through
+            lane.handed_through = 3
+            lane.refresh({"session_id": "thread-3", "turns": 1})
+            after_refresh = lane.handed_through
+            lane.handed_through = 3
+            lane.open("thread-4")
+            after_open = lane.handed_through
+            lane.handed_through = 3
+            lane.clear("task_failed")
+            after_clear = lane.handed_through
+
+        self.assertEqual(kept, 7)
+        self.assertEqual((after_pin, after_refresh, after_open, after_clear),
+                         (0, 0, 0, 0))
+
     async def test_each_session_a_call_used_is_kept_with_its_ending(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
@@ -5250,7 +5288,7 @@ class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
                  for row in lane.sessions],
                 [("thread-1", 1, "session_lost"), ("thread-2", 1, "call_ended")])
 
-    async def test_the_schema_admits_only_the_two_session_modes(self):
+    async def test_the_schema_admits_only_the_three_session_modes(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())
             base = {"connection": "test", "assistant_name": "Assistant",
@@ -5265,6 +5303,7 @@ class WorkerSessionContinuityTests(unittest.IsolatedAsyncioTestCase):
                     root, root)
 
             validated({"mode": "carry"})
+            validated({"mode": "call"})
             validated({"mode": "fresh"})
             with self.assertRaisesRegex(Exception, "must be one of"):
                 validated({"mode": "sometimes"})
@@ -9053,8 +9092,9 @@ class ProgressOutboxLifetimeTests(unittest.IsolatedAsyncioTestCase):
                    and node is not mint
                    and "prepare_progress_outbox" in own_calls(node)]
         self.assertEqual(sorted(node.name for node in minting),
-                         ["attempt", "run_job_row", "run_one_job"],
-                         "the voice task, the durable job and the dialogue turn")
+                         ["attempt", "mint_outbox", "run_job_row", "run_one_job"],
+                         "the voice task, the call's kept-open worker, the "
+                         "durable job and the dialogue turn")
         undropped = sorted(node.name for node in minting
                            if "discard_progress_outbox" not in own_calls(node))
         self.assertEqual(
@@ -9739,6 +9779,47 @@ class VoiceTaskHarnessTests(unittest.IsolatedAsyncioTestCase):
             client.disconnected.set()
             await asyncio.wait_for(session_task, timeout=10)
 
+    async def test_a_later_hand_over_sends_only_what_is_new(self):
+        """The same resumed session was handed the progress instructions, the
+        frame and the whole call on every hand-over, so it held the same frame
+        many times over. After the first it is handed what was said since."""
+        with tempfile.TemporaryDirectory() as td:
+            fake = FakeHarness(answer="found it", session_id="thread-7")
+            daemon, client, session_task, run_task = await self.answered_call(td, fake)
+            session = self.Session.instances[-1]
+            said = [{"id": 1, "sender": "Caller", "is_assistant": False,
+                     "text": "how many invoices are open"},
+                    {"id": 2, "sender": "Assistant", "is_assistant": True,
+                     "text": "let me check"}]
+            session.conversation_tail = lambda limit=60: list(said)
+            self.assertEqual(await asyncio.wait_for(run_task("THE FRAME"), timeout=15),
+                             "found it")
+            said += [{"id": 3, "sender": "Caller", "is_assistant": False,
+                      "text": "and the overdue ones"},
+                     {"id": 4, "sender": "Assistant", "is_assistant": True,
+                      "text": "one moment"}]
+            self.assertEqual(await asyncio.wait_for(run_task("THE FRAME"), timeout=15),
+                             "found it")
+            first, second = (call["prompt"] for call in fake.calls)
+            logged = list(daemon._test_logs)
+            client.disconnected.set()
+            await asyncio.wait_for(session_task, timeout=10)
+
+        self.assertEqual(fake.calls[1]["session"].kind, "resume")
+        self.assertIn("THE FRAME", first)
+        self.assertIn("Report what you are doing", first)
+        self.assertIn("how many invoices are open", first)
+        self.assertIn(daemon.VOICE_FOLLOW_ON_REQUEST, second)
+        self.assertNotIn("THE FRAME", second)
+        self.assertNotIn("Report what you are doing", second)
+        self.assertNotIn("how many invoices are open", second)
+        self.assertIn("and the overdue ones", second)
+        self.assertIn("one moment", second)
+        self.assertTrue(any("handed=full 2/2 turn(s)" in line for line in logged), logged)
+        self.assertTrue(any(f"handed=follow-on 2/4 turn(s), "
+                            f"{len(daemon.VOICE_FOLLOW_ON_REQUEST)} chars of request"
+                            in line for line in logged), logged)
+
 
 
 class VoicePickupOrderTests(unittest.IsolatedAsyncioTestCase):
@@ -9766,6 +9847,10 @@ class VoicePickupOrderTests(unittest.IsolatedAsyncioTestCase):
         async def connect_agent(self):
             self.steps.append("connect_agent")
 
+        async def wait_for_caller_audio(self, timeout):
+            self.steps.append("wait_for_caller_audio")
+            return True
+
         async def greet(self):
             self.steps.append("greet")
 
@@ -9776,6 +9861,7 @@ class VoicePickupOrderTests(unittest.IsolatedAsyncioTestCase):
                                          "voice_agent": {"mode": "enabled"}}}
         daemon = import_daemon(Path(td), base, voice_context="Answer briefly.",
                                project_env={"GOOGLE_API_KEY": "test-key"})
+        daemon.VOICE_GREET_SETTLE = 0.0
         steps = []
         session_class.steps = steps
         daemon.voice_agent.VoiceTaskRunner = lambda *a, **k: SimpleNamespace()
@@ -9800,13 +9886,66 @@ class VoicePickupOrderTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(session_task, timeout=10)
         return steps, logged
 
-    async def test_a_provider_that_can_prepare_is_greeting_before_the_pickup(self):
+    async def test_a_provider_that_can_prepare_greets_after_the_phone_s_first_audio(self):
+        """Greeted while the phone still rang, the caller heard nothing: the
+        greeting was spoken before the phone played audio and was lost. The
+        session is still ready before the pickup; the greeting waits."""
         with tempfile.TemporaryDirectory() as td:
-            steps, logged = await self.ring(td, self.Prepared, "start_pump")
-        self.assertEqual(steps, ["set_system_instruction", "connect_agent", "greet",
-                                 "record", "play", "start_pump"])
+            steps, logged = await self.ring(td, self.Prepared, "greet")
+        self.assertEqual(steps, ["set_system_instruction", "connect_agent",
+                                 "record", "play", "start_pump",
+                                 "wait_for_caller_audio", "greet"])
         self.assertTrue(any(line.startswith("voice: session ready for 777 before the pickup, ")
                             for line in logged), logged)
+        self.assertIn("voice: greeting 777 (after the phone's first audio)", logged)
+
+    async def test_a_caller_who_hangs_up_while_the_phone_is_awaited_is_not_greeted(self):
+        class Ending(self.Prepared):
+            tracks = []
+            hang_up = None
+
+            async def wait_for_caller_audio(self, timeout):
+                self.steps.append("wait_for_caller_audio")
+                await self.hang_up()
+                return False
+
+            async def stop(self):
+                self.steps.append("stop")
+                return {"transcript": [], "pump_error": None, "interruptions": 0,
+                        "dropped_input_chunks": 0, "caller_seconds": 0,
+                        "agent_seconds": 0, "agent_voiced_seconds": 0,
+                        "messages_sent": 0, "tasks": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            base = settings(worker_timeout=30)
+            base["defaults"]["voice_agent"] = {"profile": "telegram-codex"}
+            base["allowed_users"] = {"777": {"name": "Caller", "role": "owner",
+                                             "voice_agent": {"mode": "enabled"}}}
+            daemon = import_daemon(Path(td), base, voice_context="Answer briefly.",
+                                   project_env={"GOOGLE_API_KEY": "test-key"})
+            daemon.VOICE_GREET_SETTLE = 0.0
+            steps = []
+            Ending.steps = steps
+            daemon.voice_agent.VoiceTaskRunner = lambda *a, **k: SimpleNamespace(detach=None)
+            daemon.voice_agent.VoiceCallSession = Ending
+            logged = []
+            client = FakeClient()
+            with mock.patch.object(daemon, "log", side_effect=logged.append):
+                session_task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                calls = daemon.PyTgCalls.instances[-1]
+
+                async def hang_up():
+                    await calls.handlers["call_ended"](None, SimpleNamespace(chat_id=777))
+
+                Ending.hang_up = staticmethod(hang_up)
+                await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+                await wait_until(lambda: any("777 hung up before the greeting" in line
+                                             for line in logged), timeout=10)
+                client.disconnected.set()
+                await asyncio.wait_for(session_task, timeout=10)
+        self.assertIn("stop", steps)
+        self.assertNotIn("greet", steps)
 
     async def test_a_provider_that_cannot_prepare_answers_first(self):
         """Reading the tail before the answer on such a provider would only move
@@ -9884,6 +10023,202 @@ class VoicePickupOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steps.count("connect_agent"), 1, steps)
         self.assertFalse(any("ignoring voice call from 778" in line for line in logged),
                          logged)
+
+
+class FakeConversation:
+    """A kept-open claude conversation as the runner's `open_conversation`
+    returns it: a real child stands in for the process, each `send` is one turn,
+    and a turn that is cancelled ends the conversation as the runner's does."""
+
+    instances = []
+    opens = True
+    blocks = False
+
+    def __init__(self, profile, cwd, *, session=None, environ=None, extra_env=None,
+                 stderr_tail=40, on_start=None):
+        self.profile, self.cwd = profile, cwd
+        self.extra_env = dict(extra_env or {})
+        self.session_id = "hot-session-1"
+        self.sent = []
+        self.closes = 0
+        self.cancelled = False
+        self.failure = None if self.opens else runner_lib.Failure(
+            runner_lib.FailureKind("error"), "claude would not start")
+        self._open = self.opens
+        self.child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            start_new_session=True, stdin=subprocess.DEVNULL)
+        if self.opens and on_start is not None:
+            on_start(runner_lib.Started("claude", self.child.pid, self.session_id))
+        self.instances.append(self)
+
+    @property
+    def is_open(self):
+        return self._open
+
+    def send(self, prompt, *, on_event=None, cancel=None):
+        self.sent.append(prompt)
+        if not self._open:
+            return runner_result("claude", ok=False, kind="error", answer="",
+                                 session_id=self.session_id, message="not open")
+        while self.blocks and not (cancel is not None and cancel.is_set()):
+            time.sleep(0.02)
+        if cancel is not None and cancel.is_set():
+            self.cancelled = True
+            self._end()
+            return runner_result("claude", ok=False, kind="cancelled", answer="",
+                                 session_id=self.session_id, message="turn cancelled")
+        return runner_result("claude", answer=f"answer {len(self.sent)}",
+                             session_id=self.session_id)
+
+    def _end(self):
+        self._open = False
+        if self.child.poll() is None:
+            self.child.kill()
+            self.child.wait()
+
+    def close(self):
+        self.closes += 1
+        self._end()
+
+
+class HotWorkerTests(unittest.IsolatedAsyncioTestCase):
+    """Session mode `call` on a claude profile: the call's hand-overs are turns
+    of one worker process kept open for the call, not a process each."""
+
+    class Session(StubVoiceCallSession):
+        instances = []
+        tracks = []
+        said = []
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.instances.append(self)
+
+        def conversation_tail(self, limit=60):
+            return list(self.said)
+
+        async def stop(self):
+            return {"transcript": [], "pump_error": None, "interruptions": 0,
+                    "dropped_input_chunks": 0, "caller_seconds": 0,
+                    "agent_seconds": 0, "agent_voiced_seconds": 0,
+                    "messages_sent": 0, "tasks": []}
+
+    async def answered_call(self, td, *, opens=True, blocks=False, worker_timeout=30):
+        base = settings(worker_timeout=worker_timeout)
+        base["defaults"]["voice_agent"] = {"profile": "telegram-claude",
+                                           "session": {"mode": "call"}}
+        base["allowed_users"] = {"777": {"name": "Caller", "role": "supervisor",
+                                         "voice_agent": {"mode": "enabled"}}}
+        daemon = import_daemon(Path(td), base, voice_context="Answer briefly.",
+                               project_env={"GOOGLE_API_KEY": "test-key"})
+        fake = FakeHarness(answer="from a process of its own")
+        daemon.harness_run = fake
+        # A session the caller carried from before: a call in this mode does
+        # not take it up.
+        earlier = daemon.WorkerLane()
+        earlier.pin("earlier-session")
+        daemon.save_lane(777, earlier)
+        FakeConversation.instances = []
+        FakeConversation.opens, FakeConversation.blocks = opens, blocks
+        self.Session.said = [{"id": 1, "sender": "Caller", "is_assistant": False,
+                              "text": "how many invoices are open"},
+                             {"id": 2, "sender": "Assistant", "is_assistant": True,
+                              "text": "let me check"}]
+        captured = {}
+
+        def capture_runner(run_task, *args, **kwargs):
+            captured["run"] = run_task
+            return SimpleNamespace()
+
+        daemon.voice_agent.VoiceTaskRunner = capture_runner
+        daemon.voice_agent.VoiceCallSession = self.Session
+        patch = mock.patch.object(runner_lib, "open_conversation", FakeConversation)
+        patch.start()
+        self.addCleanup(patch.stop)
+        client = FakeClient()
+        session_task = asyncio.create_task(daemon.run_session(client))
+        await client.started.wait()
+        calls = daemon.PyTgCalls.instances[-1]
+        await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+        await wait_until(lambda: "run" in captured, timeout=10)
+        await wait_until(lambda: any("hot worker" in line for line in daemon._test_logs),
+                         timeout=10)
+        return daemon, client, session_task, captured["run"], calls, fake
+
+    async def hang_up(self, daemon, client, session_task, calls):
+        await calls.handlers["call_ended"](None, SimpleNamespace(chat_id=777))
+        await wait_until(lambda: any("hot worker closed" in line
+                                     for line in daemon._test_logs), timeout=10)
+        client.disconnected.set()
+        await asyncio.wait_for(session_task, timeout=10)
+
+    async def test_the_call_s_hand_overs_are_turns_of_one_open_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon, client, session_task, run_task, calls, fake = \
+                await self.answered_call(td)
+            self.assertIsNone(daemon.load_lane(777).session_id)
+            self.assertEqual(len(FakeConversation.instances), 1)
+            conversation = FakeConversation.instances[0]
+            outbox = Path(conversation.extra_env["TELEGRAM_PROGRESS_OUTBOX"])
+
+            first = await asyncio.wait_for(run_task("THE FRAME"), timeout=15)
+            # The call's outbox, emptied for each task and kept between them.
+            self.assertTrue(outbox.exists())
+            self.Session.said += [{"id": 3, "sender": "Caller", "is_assistant": False,
+                                   "text": "and the overdue ones"}]
+            second = await asyncio.wait_for(run_task("THE FRAME"), timeout=15)
+            self.assertEqual(conversation.closes, 0)
+            await self.hang_up(daemon, client, session_task, calls)
+            logged = list(daemon._test_logs)
+
+        self.assertEqual((first, second), ("answer 1", "answer 2"))
+        self.assertEqual(fake.calls, [])
+        self.assertIn("THE FRAME", conversation.sent[0])
+        self.assertIn("how many invoices are open", conversation.sent[0])
+        self.assertIn(daemon.VOICE_FOLLOW_ON_REQUEST, conversation.sent[1])
+        self.assertNotIn("how many invoices are open", conversation.sent[1])
+        self.assertIn("and the overdue ones", conversation.sent[1])
+        self.assertEqual(conversation.closes, 1)
+        self.assertFalse(outbox.exists())
+        self.assertIn("voice: a new worker session for this call", logged)
+        self.assertTrue(any(line.startswith("voice: hot worker open for 777 ")
+                            for line in logged), logged)
+        self.assertTrue(any("handed=full 2/2 turn(s)" in line
+                            and "on the call's hot worker" in line for line in logged))
+        self.assertTrue(any("handed=follow-on 1/3 turn(s)" in line
+                            and "on the call's hot worker" in line for line in logged))
+        self.assertIn("voice: hot worker closed after 2 turn(s)", logged)
+
+    async def test_a_timed_out_turn_ends_the_worker_and_the_call_goes_on_without_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon, client, session_task, run_task, calls, fake = \
+                await self.answered_call(td, blocks=True, worker_timeout=1)
+            conversation = FakeConversation.instances[0]
+            with self.assertRaises(Exception) as caught:
+                await asyncio.wait_for(run_task("THE FRAME"), timeout=15)
+            after = await asyncio.wait_for(run_task("THE FRAME"), timeout=15)
+            await self.hang_up(daemon, client, session_task, calls)
+
+        self.assertIn("timed out", str(caught.exception))
+        self.assertTrue(conversation.cancelled)
+        self.assertFalse(conversation.is_open)
+        self.assertEqual(after, "from a process of its own")
+        self.assertEqual(len(fake.calls), 1)
+        self.assertIn("THE FRAME", fake.calls[0]["prompt"])
+
+    async def test_a_worker_that_does_not_open_leaves_each_task_its_own_process(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon, client, session_task, run_task, calls, fake = \
+                await self.answered_call(td, opens=False)
+            answer = await asyncio.wait_for(run_task("THE FRAME"), timeout=15)
+            await self.hang_up(daemon, client, session_task, calls)
+            logged = list(daemon._test_logs)
+
+        self.assertEqual(answer, "from a process of its own")
+        self.assertEqual(FakeConversation.instances[0].sent, [])
+        self.assertTrue(any("hot worker retired (did not open" in line
+                            for line in logged), logged)
 
 
 class StoreRegisterTests(unittest.IsolatedAsyncioTestCase):

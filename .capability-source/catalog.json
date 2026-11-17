@@ -1479,6 +1479,7 @@
         "service/daemon.py",
         "service/forum.py",
         "service/gate.py",
+        "service/gemini/prompts/delegation.md",
         "service/gemini/templates/voice-agent.md",
         "service/gptlive/__init__.py",
         "service/gptlive/prompts/delegation.md",
@@ -1531,7 +1532,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "763a384e7bfdd7abdf0b37fa120d3e5f85dba82a1b8568a87f0ed11db946a8ae",
+      "payload_sha256": "8b9c17412b7877cc634a82977d61524c9286c85791fcbb4591089593d8fd7a46",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
@@ -1547,7 +1548,7 @@
           "title": "Telegram"
         }
       },
-      "version": "2026-11-17 — A Gemini Live call connects again"
+      "version": "2026-11-17 — Gemini Live hands work over as GPT Live does, a call's worker stays open for the call, and the greeting waits for the phone"
     },
     "telegrambot": {
       "executable": [

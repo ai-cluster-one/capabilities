@@ -581,6 +581,25 @@ class PrepareBeforePickupTests(unittest.TestCase):
         self.assertEqual(error, "gpt-live session ended before it was ready")
         self.assertLess(elapsed, 1.0)
 
+    def test_waiting_for_the_phone_ends_at_its_first_audio_or_the_bound(self):
+        """The greeting waits for the phone after the pickup: one spoken while
+        the phone still plays nothing is lost."""
+        with fake_runtime_modules() as Frame:
+            module = import_gptlive()
+
+            async def run():
+                session = build_session(module)
+                silent = await session.wait_for_caller_audio(0.1)
+                session.on_incoming_frames([Frame(frame=b"\x00\x01" * 240)])
+                started = asyncio.get_running_loop().time()
+                heard = await session.wait_for_caller_audio(5.0)
+                return silent, heard, asyncio.get_running_loop().time() - started
+
+            silent, heard, waited = asyncio.run(run())
+        self.assertFalse(silent)
+        self.assertTrue(heard)
+        self.assertLess(waited, 1.0)
+
     def test_start_agent_still_connects_then_greets(self):
         live = FakeLive()
         with fake_runtime_modules():
@@ -678,11 +697,16 @@ class ProviderDeclarationTests(unittest.TestCase):
         self.assertEqual(package.TOOL_NAMES, ())
         self.assertTrue(package.DELEGATES_TO_WORKER)
 
-    def test_the_other_provider_reaches_it_by_tool(self):
+    def test_the_other_provider_hands_the_turn_over_too(self):
+        """Gemini reaches the worker through its one `delegate` tool, with the
+        same frame, so it is given the runner whatever the tool set says."""
         with fake_runtime_modules():
             shared = import_module_at("voice_agent", SERVICE_DIR / "voice_agent.py")
-        self.assertFalse(shared.DELEGATES_TO_WORKER)
-        self.assertIn("agent_task", shared.TOOL_NAMES)
+            module = import_module_at("gptlive_session_under_test",
+                                      SERVICE_DIR / "gptlive" / "session.py")
+        self.assertTrue(shared.DELEGATES_TO_WORKER)
+        self.assertEqual(shared.DELEGATE_TOOL["name"], "delegate")
+        self.assertIs(module.HANDED_TURN_REQUEST, shared.HANDED_TURN_REQUEST)
 
 
 class ForeignVocabularyTests(unittest.TestCase):
@@ -816,6 +840,18 @@ class ConversationTailTests(unittest.TestCase):
             self.assertTrue(row["text"].strip())
             self.assertIn("id", row)
 
+    def test_ids_count_from_the_start_of_the_call(self):
+        """So a later hand-over can say which lines are new."""
+        with fake_runtime_modules():
+            module = import_gptlive()
+            session = build_session(module)
+            session._turns = [{"speaker": "caller" if n % 2 else "agent",
+                               "text": f"line {n}", "at": 0.0} for n in range(1, 66)]
+        tail = session.conversation_tail()
+        self.assertEqual(len(tail), 60)
+        self.assertEqual((tail[0]["id"], tail[0]["text"]), (6, "line 6"))
+        self.assertEqual((tail[-1]["id"], tail[-1]["text"]), (65, "line 65"))
+
     def test_the_agent_speaking_closes_the_caller_s_open_turn(self):
         """Otherwise a reaction to the last answer rides along with the next ask."""
         with fake_runtime_modules():
@@ -851,6 +887,17 @@ class PromptOwnershipTests(unittest.TestCase):
         body = self.MECHANISM.read_text()
         for owed in ("Handing work over", "While it works", "When it comes back"):
             self.assertIn(owed, body)
+
+    def test_gemini_ships_a_mechanism_of_its_own_for_its_one_tool(self):
+        """Read the way GPT Live's is: `<provider>/prompts/delegation.md`."""
+        mechanism = SERVICE_DIR / "gemini" / "prompts" / "delegation.md"
+        self.assertTrue(mechanism.is_file())
+        body = mechanism.read_text()
+        for owed in ("Handing work over", "While it works", "When it comes back",
+                     "`delegate`"):
+            self.assertIn(owed, body)
+        source = (SERVICE_DIR / "daemon.py").read_text()
+        self.assertIn('HERE / provider / "prompts" / "delegation.md"', source)
 
     def test_nothing_seeds_the_mechanism_into_a_project(self):
         """A seeded copy is an editable copy, whatever the prose asks."""

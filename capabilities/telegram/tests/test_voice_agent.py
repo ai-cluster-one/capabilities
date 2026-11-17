@@ -233,10 +233,25 @@ def fake_genai_types():
     saved = {name: sys.modules.get(name) for name in names}
 
     class FunctionResponse:
-        def __init__(self, name=None, id=None, response=None):
+        def __init__(self, name=None, id=None, response=None, scheduling=None):
             self.name = name
             self.id = id
             self.response = response
+            self.scheduling = scheduling
+
+    class FunctionResponseScheduling:
+        SILENT = "SILENT"
+        WHEN_IDLE = "WHEN_IDLE"
+        INTERRUPT = "INTERRUPT"
+
+    class Part:
+        def __init__(self, text=None):
+            self.text = text
+
+    class Content:
+        def __init__(self, role=None, parts=None):
+            self.role = role
+            self.parts = parts
 
     google = types.ModuleType("google")
     google.__path__ = []
@@ -266,6 +281,9 @@ def fake_genai_types():
     genai.FakeModels = FakeModels
     genai_types = types.ModuleType("google.genai.types")
     genai_types.FunctionResponse = FunctionResponse
+    genai_types.FunctionResponseScheduling = FunctionResponseScheduling
+    genai_types.Part = Part
+    genai_types.Content = Content
     genai_types.Blob = Blob
     genai.types = genai_types
     google.genai = genai
@@ -287,12 +305,17 @@ class FakeLive:
     def __init__(self):
         self.tool_responses = []
         self.texts = []
+        # Content sent with `send_client_content`, as (turns, turn_complete).
+        self.contents = []
 
     async def send_tool_response(self, function_responses):
         self.tool_responses.extend(function_responses)
 
     async def send_realtime_input(self, text=None, audio=None):
         self.texts.append(text)
+
+    async def send_client_content(self, turns=None, turn_complete=True):
+        self.contents.append((turns, turn_complete))
 
 
 def tool_call(task, call_id="call-1", name="agent_task"):
@@ -588,6 +611,137 @@ class AgentTaskTests(unittest.IsolatedAsyncioTestCase):
 
     async def fail_delivery(self, completion):
         raise AssertionError("the call was still up; nothing should reach the chat")
+
+
+def delegate_call(call_id):
+    return types.SimpleNamespace(
+        tool_call=types.SimpleNamespace(function_calls=[
+            types.SimpleNamespace(name="delegate", id=call_id, args={})]))
+
+
+class DelegateTests(unittest.IsolatedAsyncioTestCase):
+    """With a worker behind the call the voice is a talking head, as on GPT
+    Live: one tool, `delegate`, which hands the turn and the call over."""
+
+    async def test_a_call_with_a_worker_declares_delegate_and_nothing_else(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            logged = []
+
+            async def anything(*_args):
+                return {"ok": True}
+
+            def build(task_runner):
+                return va.VoiceCallSession(
+                    RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                    system_instruction="s", caller_name="Caller",
+                    task_runner=task_runner, send_to_chat=anything,
+                    capability_runner=anything, file_reader=anything,
+                    reload_service=lambda: {"status": "ok"}, log=logged.append)
+
+            runner = va.VoiceTaskRunner(anything, anything, log=lambda *_: None)
+            with_worker = build(runner)._declared_tools()
+            without = build(None)._declared_tools()
+
+        self.assertEqual(with_worker, [va.DELEGATE_TOOL])
+        self.assertEqual(va.DELEGATE_TOOL["name"], "delegate")
+        self.assertEqual(va.DELEGATE_TOOL["behavior"], "NON_BLOCKING")
+        self.assertNotIn("parameters", va.DELEGATE_TOOL)
+        self.assertIn("say the ask out loud first", va.DELEGATE_TOOL["description"])
+        self.assertIn("voice: tools declared — delegate", logged)
+        # Without a worker the call keeps the tools it was given.
+        self.assertEqual([tool["name"] for tool in without],
+                         ["send_to_chat", "run_capability", "read_project_file",
+                          "reload_service"])
+        self.assertTrue(va.DELEGATES_TO_WORKER)
+
+    async def test_delegate_hands_the_call_over_as_gpt_live_does(self):
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            handed = []
+            release = asyncio.Event()
+
+            async def work(text):
+                handed.append(text)
+                await release.wait()
+                return "twelve"
+
+            async def nowhere(_completion):
+                raise AssertionError("the call is up; nothing goes to the chat")
+
+            runner = va.VoiceTaskRunner(work, nowhere, log=lambda *_: None)
+            session = task_session(va, runner)
+            await session._handle_tool_call(delegate_call("d-1"))
+            nothing_said = session._live.tool_responses[-1]
+
+            session._record_fragment("caller", "how many invoices are open")
+            session._record_fragment("agent", "let me check")
+            await session._handle_tool_call(delegate_call("d-2"))
+            first = session._live.tool_responses[-1]
+            release.set()
+            await asyncio.gather(*runner._jobs.values())
+            # The same frame again is a new hand-over, not a repeat of the last.
+            await session._handle_tool_call(delegate_call("d-3"))
+            second = session._live.tool_responses[-1]
+            await asyncio.gather(*runner._jobs.values())
+            tail = session.conversation_tail()
+
+        self.assertEqual(nothing_said.response["result"]["status"], "nothing_said")
+        self.assertIn("Ask the caller", nothing_said.response["result"]["instruction"])
+        self.assertEqual(first.response["result"]["status"], "started")
+        self.assertEqual(second.response["result"]["status"], "started")
+        self.assertEqual(first.scheduling, "SILENT")
+        # The runner folds whitespace, for GPT Live's hand-overs as for these.
+        frame = " ".join(va.HANDED_TURN_REQUEST.split())
+        self.assertEqual(handed, [frame, frame])
+        self.assertEqual(tail, [
+            {"id": 1, "sender": "Caller", "is_assistant": False,
+             "text": "how many invoices are open"},
+            {"id": 2, "sender": "Assistant", "is_assistant": True,
+             "text": "let me check"}])
+
+    async def test_tail_ids_count_from_the_start_of_the_call(self):
+        with fake_runtime_modules():
+            va = import_voice_agent()
+            session = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="s", caller_name="Caller", log=lambda *_: None)
+            session._turns = [{"speaker": "caller" if n % 2 else "agent", "at": "",
+                               "text": f"line {n}"} for n in range(1, 66)]
+            tail = session.conversation_tail()
+
+        self.assertEqual(len(tail), 60)
+        self.assertEqual((tail[0]["id"], tail[0]["text"]), (6, "line 6"))
+        self.assertEqual((tail[-1]["id"], tail[-1]["text"]), (65, "line 65"))
+
+    async def test_the_session_is_ready_before_the_pickup_and_greets_after_the_phone(self):
+        with fake_runtime_modules() as Frame, fake_genai_types():
+            va = import_voice_agent()
+            session = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="s", caller_name="Caller", log=lambda *_: None)
+            live = ScriptedLive([])
+
+            async def _open_live(resume_handle=None):
+                session._live = live
+                session._live_ready.set()
+
+            session._open_live = _open_live
+            await session.connect_agent()
+            said_on_connect = list(live.texts)
+            silent_phone = await session.wait_for_caller_audio(0.1)
+            session.on_incoming_frames([Frame(frame=b"\x00\x01" * 160)])
+            started = time.monotonic()
+            heard = await session.wait_for_caller_audio(5.0)
+            waited = time.monotonic() - started
+            await session.greet()
+            await session.stop()
+
+        self.assertEqual(said_on_connect, [])
+        self.assertFalse(silent_phone)
+        self.assertTrue(heard)
+        self.assertLess(waited, 1.0)
+        self.assertEqual(live.texts, [va.greeting_prompt("Caller")])
 
 
 class VoiceAgentMediaTests(unittest.IsolatedAsyncioTestCase):
@@ -1100,6 +1254,40 @@ class ProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(too_soon)
         self.assertTrue(far_enough)
 
+    async def test_progress_is_noted_silently_rather_than_asked_for_an_answer(self):
+        """A note sent as realtime text demands an answer, so every one was
+        read aloud. It goes as content that does not complete a turn."""
+        with fake_runtime_modules(), fake_genai_types():
+            va = import_voice_agent()
+            runner = va.VoiceTaskRunner(lambda text: self.never(),
+                                        self.never, log=lambda *_: None)
+            runner._jobs["j"] = object()               # something is running
+            session = task_session(va, runner)
+            logged = []
+            session._log = logged.append
+            session._progress_interval = 0.0
+            session._caller_spoke_at = time.monotonic() - va.PROGRESS_CALLER_QUIET - 1
+            session._agent_voiced_at = time.monotonic() - va.PROGRESS_AGENT_QUIET - 1
+            session.note_progress("got the list, twelve of them", source="worker")
+
+            progress = asyncio.create_task(session._announce_progress())
+            await asyncio.sleep(1.3)
+            progress.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await progress
+
+        self.assertEqual(session._live.texts, [])
+        self.assertEqual(len(session._live.contents), 1)
+        turns, turn_complete = session._live.contents[0]
+        self.assertFalse(turn_complete)
+        self.assertEqual(turns[0].role, "user")
+        text = turns[0].parts[0].text
+        self.assertIn("got the list, twelve of them", text)
+        self.assertIn("Do not answer this", text)
+        self.assertIn("only if the caller asks", text)
+        self.assertTrue(any(line.startswith("voice: progress noted silently")
+                            for line in logged), logged)
+
     async def never(self, *_args):
         raise AssertionError("nothing should run in a progress-only test")
 
@@ -1474,7 +1662,7 @@ class SessionResumptionTests(unittest.IsolatedAsyncioTestCase):
             session._live = FakeLive()
             session._live_ready.set()
             await asyncio.sleep(1.3)
-            self.assertTrue(session._live.texts)
+            self.assertTrue(session._live.contents)
 
             progress.cancel()
             with contextlib.suppress(asyncio.CancelledError):
