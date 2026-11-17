@@ -1298,6 +1298,48 @@ def resumption_update(handle, resumable=True):
         go_away=None, server_content=None, tool_call=None)
 
 
+class LiveClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_live_connection_is_opened_on_api_v1beta(self):
+        """The Live socket on API v1, google-genai's default, answers 404 for
+        every model; a call reaches the speech model only on v1beta."""
+        with fake_runtime_modules(), fake_genai_types():
+            import google.genai as genai
+            va = import_voice_agent()
+            built = []
+            connected = []
+
+            class Live:
+                def connect(self, **kwargs):
+                    connected.append(kwargs)
+
+                    @contextlib.asynccontextmanager
+                    async def socket():
+                        yield FakeLive()
+                    return socket()
+
+            class Client:
+                def __init__(self, **kwargs):
+                    built.append(kwargs)
+                    self.aio = types.SimpleNamespace(live=Live())
+
+            genai.Client = Client
+            session = va.VoiceCallSession(
+                RecordingCalls(), 42, api_key="k", model=None, voice=None,
+                system_instruction="s", caller_name="Caller",
+                log=lambda *_: None)
+            await session._open_live()
+            try:
+                self.assertEqual(len(built), 1)
+                self.assertEqual(built[0].get("api_key"), "k")
+                self.assertEqual(
+                    (built[0].get("http_options") or {}).get("api_version"),
+                    "v1beta")
+                self.assertEqual(connected[0]["model"], va.DEFAULT_MODEL)
+                self.assertTrue(session._live_ready.is_set())
+            finally:
+                await session._close_live()
+
+
 class SessionResumptionTests(unittest.IsolatedAsyncioTestCase):
     """A connection to the speech model is retired long before a talkative
     caller is finished. What must survive that is the conversation."""

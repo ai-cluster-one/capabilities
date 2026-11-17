@@ -37,6 +37,9 @@ from pytgcalls.types import Device, Frame
 from call_recording_helpers import ensure_ffmpeg, iso_utc, probe_audio_duration
 
 DEFAULT_MODEL = "gemini-3.1-flash-live-preview"
+# The Live socket is served on API version v1beta only: on v1, the default of
+# the google-genai the daemon installs, it answers HTTP 404 for every model.
+LIVE_API_VERSION = "v1beta"
 DEFAULT_VOICE = "Aoede"
 DEFAULT_HISTORY_MESSAGES = 30
 # One task per call, always. Several workers on one call race each other's
@@ -936,7 +939,8 @@ class VoiceCallSession:
 
         stack = contextlib.AsyncExitStack()
         try:
-            client = genai.Client(api_key=self._api_key)
+            client = genai.Client(api_key=self._api_key,
+                                  http_options={"api_version": LIVE_API_VERSION})
             self._live = await stack.enter_async_context(
                 client.aio.live.connect(
                     model=self._model,

@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-17 — A Gemini Live call connects again
+
+A Gemini Live call could not connect at all: the google-genai the daemon installs dials API version v1 by default, and the Live socket on v1 answers HTTP 404 for every model. The Live connection is now opened on v1beta, where the same key reaches the Live models. The default model, the phrase writer and every setting are unchanged; no verb, flag or JSON key changes.
+
 ## 2026-11-17 — A GPT Live call greets the caller the moment it is answered
 
 The pickup was followed by three or four seconds of silence: only after answering did the daemon read the chat tail, open the Live session, configure it and ask for the greeting. A GPT Live call now does all of that while the phone still rings, logs `voice: session ready for <id> before the pickup, <n> chars of chat tail, in <s>s`, and answers once the greeting is asked for; the greeting's audio waits for the pump that starts after the answer, and the model's leading silence is still dropped. The session splits `start_agent` into `connect_agent` and `greet`, and `start_agent` stays as the two in order. A provider without them, the Gemini Live one, keeps the old order.
