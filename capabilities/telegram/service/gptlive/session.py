@@ -439,16 +439,16 @@ class VoiceCallSession:
 
     def on_incoming_frames(self, frames):
         """Called from the PyTgCalls stream-frame update; must not block."""
-        now = time.monotonic()
-        if self._first_inbound_at is None:
-            self._first_inbound_at = now
-        elif frames:
-            gap = now - self._last_inbound_at
-            if gap > self.inbound_gap_max:
-                self.inbound_gap_max = gap
-            if gap >= INBOUND_GAP_LATE_SECONDS:
-                self.inbound_gaps_late += 1
         if frames:
+            now = time.monotonic()
+            if self._first_inbound_at is None:
+                self._first_inbound_at = now
+            else:
+                gap = now - self._last_inbound_at
+                if gap > self.inbound_gap_max:
+                    self.inbound_gap_max = gap
+                if gap >= INBOUND_GAP_LATE_SECONDS:
+                    self.inbound_gaps_late += 1
             self._last_inbound_at = now
         for frame in frames or ():
             payload = getattr(frame, "frame", None)

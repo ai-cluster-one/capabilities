@@ -291,6 +291,24 @@ class MediaTests(unittest.TestCase):
         self.assertGreaterEqual(inbound["missing_frames"], 8)
         self.assertGreaterEqual(inbound["gaps_over_50ms"], 1)
 
+    def test_an_empty_first_batch_of_caller_frames_breaks_nothing(self):
+        """ntgcalls can hand the frame callback an empty list; the caller's
+        audio after it still reaches the call, and the call still stops."""
+        with fake_runtime_modules() as Frame:
+            module = import_gptlive()
+            speech = b"\x00\x40" * (module.CALLER_FRAME_BYTES // 2)
+
+            async def run():
+                session = build_session(module)
+                session.on_incoming_frames([])
+                for _ in range(3):
+                    session.on_incoming_frames([Frame(frame=speech)])
+                return session, await session.stop()
+
+            session, summary = asyncio.run(run())
+        self.assertEqual(session.caller_bytes, 3 * len(speech))
+        self.assertEqual(summary["media"]["inbound"]["frames"], 3)
+
     def test_one_rate_carries_the_whole_tract(self):
         with fake_runtime_modules():
             module = import_gptlive()
