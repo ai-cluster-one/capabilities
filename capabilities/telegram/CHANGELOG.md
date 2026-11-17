@@ -4,7 +4,7 @@
 
 The pickup was followed by three or four seconds of silence: only after answering did the daemon read the chat tail, open the Live session, configure it and ask for the greeting. A GPT Live call now does all of that while the phone still rings, logs `voice: session ready for <id> before the pickup, <n> chars of chat tail, in <s>s`, and answers once the greeting is asked for; the greeting's audio waits for the pump that starts after the answer, and the model's leading silence is still dropped. The session splits `start_agent` into `connect_agent` and `greet`, and `start_agent` stays as the two in order. A provider without them, the Gemini Live one, keeps the old order.
 
-A caller who hung up while the phone rang ended the Live session at once, yet the call set-up waited out the whole 20 s connect timeout and the next call was refused as one already in progress. Opening the session now stops the moment the session ends, with `gpt-live session ended before it was ready`. Nothing a setting or a verb does changes; no JSON key changes.
+A caller who hung up while the phone rang ended the Live session at once, yet the call set-up waited out the whole 20 s connect timeout and the next call was refused as one already in progress. Opening the session now stops the moment the session ends, with `gpt-live session ended before it was ready`. A caller who hangs up while the chat tail is read or the greeting is asked for is not answered either, so they are never called back and the line is free for the next call; the log says `voice: <id> hung up before the pickup`. Nothing a setting or a verb does changes; no JSON key changes.
 
 ## 2026-11-17 — A GPT Live call no longer hangs the daemon at its start, and plays the model's audio from an 80 ms cushion
 

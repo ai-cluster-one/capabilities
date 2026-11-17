@@ -9816,6 +9816,75 @@ class VoicePickupOrderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steps, ["record", "play", "start_pump",
                                  "set_system_instruction", "start_agent"])
 
+    async def test_a_caller_who_hangs_up_while_the_tail_is_read_is_not_answered(self):
+        """A hang-up while the phone rings finishes the call there and then.
+        Answering after it would ring the caller back and hold the line, so the
+        next caller would be refused as a call already active."""
+
+        class Ending(self.Prepared):
+            tracks = []
+
+            async def stop(self):
+                self.steps.append("stop")
+                return {"transcript": [], "pump_error": None, "interruptions": 0,
+                        "dropped_input_chunks": 0, "caller_seconds": 0,
+                        "agent_seconds": 0, "agent_voiced_seconds": 0,
+                        "messages_sent": 0, "tasks": []}
+
+        with tempfile.TemporaryDirectory() as td:
+            base = settings(worker_timeout=30)
+            base["defaults"]["voice_agent"] = {"profile": "telegram-codex"}
+            base["allowed_users"] = {
+                "777": {"name": "Caller", "role": "owner",
+                        "voice_agent": {"mode": "enabled"}},
+                "778": {"name": "Next", "role": "owner",
+                        "voice_agent": {"mode": "enabled"}}}
+            daemon = import_daemon(Path(td), base, voice_context="Answer briefly.",
+                                   project_env={"GOOGLE_API_KEY": "test-key"})
+            steps = []
+            Ending.steps = steps
+            daemon.voice_agent.VoiceTaskRunner = lambda *a, **k: SimpleNamespace(detach=None)
+            daemon.voice_agent.VoiceCallSession = Ending
+            logged = []
+            client = FakeClient()
+            reading = asyncio.Event()
+            release = asyncio.Event()
+            plain = client.get_messages
+
+            async def slow_tail(chat, limit=None):
+                if not reading.is_set():
+                    reading.set()
+                    await release.wait()
+                return await plain(chat, limit=limit)
+
+            client.get_messages = slow_tail
+            with mock.patch.object(daemon, "log", side_effect=logged.append):
+                session_task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                calls = daemon.PyTgCalls.instances[-1]
+                answered = calls.record
+
+                async def record(chat_id, *args, **kwargs):
+                    steps.append(f"record {chat_id}")
+                    return await answered(chat_id, *args, **kwargs)
+
+                calls.record = record
+                await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+                await wait_until(reading.is_set, timeout=10)
+                with contextlib.suppress(Exception):
+                    await calls.handlers["call_ended"](None, SimpleNamespace(chat_id=777))
+                release.set()
+                await wait_until(lambda: any("777 hung up before the pickup" in line
+                                             for line in logged), timeout=10)
+                await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=778))
+                await wait_until(lambda: "record 778" in steps, timeout=10)
+                client.disconnected.set()
+                await asyncio.wait_for(session_task, timeout=10)
+        self.assertNotIn("record 777", steps)
+        self.assertEqual(steps.count("connect_agent"), 1, steps)
+        self.assertFalse(any("ignoring voice call from 778" in line for line in logged),
+                         logged)
+
 
 class StoreRegisterTests(unittest.IsolatedAsyncioTestCase):
     """The register is a row per channel in the store, so the node that runs

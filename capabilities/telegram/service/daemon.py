@@ -10307,11 +10307,23 @@ async def run_session(client):
             # audio waits in the session until the pump starts after play().
             prepared = (hasattr(session, "connect_agent")
                         and hasattr(session, "greet"))
+
+            def hung_up():
+                # The caller can hang up while the phone still rings. The
+                # hang-up finishes this call there and then, so the call is no
+                # longer this session's; answering after it would ring the
+                # caller back and hold the line for the next one.
+                return (active_voice_call["session"] is not session
+                        or active_voice_call["finishing"])
+
             try:
                 if prepared:
                     prepare_started = time.monotonic()
                     history = await voice_chat_history(
                         caller_id, policy["history"], caller_name)
+                    if hung_up():
+                        log(f"voice: {caller_id} hung up before the pickup")
+                        return
                     session.set_system_instruction(voice_agent.build_system_prompt(
                         voice_context, history,
                         now_line=voice_agent.current_time_line(
@@ -10321,6 +10333,9 @@ async def run_session(client):
                         f"{len(history)} chars of chat tail, in "
                         f"{time.monotonic() - prepare_started:.1f}s")
                     await session.greet()
+                    if hung_up():
+                        log(f"voice: {caller_id} hung up before the pickup")
+                        return
                 # record() answers the call and claims the inbound slot; play()
                 # then claims the outbound one on the same connection.
                 await calls.record(
@@ -10355,6 +10370,11 @@ async def run_session(client):
                             VOICE_TIMEZONE, VOICE_TIMEZONE_NAME)))
                     await session.start_agent()
             except Exception as exc:
+                if prepared and hung_up():
+                    # The hang-up stopped the session under its connect, and
+                    # finishing the call has already recorded and released it.
+                    log(f"voice: {caller_id} hung up before the pickup")
+                    return
                 error = f"{type(exc).__name__}: {exc}"[:500]
                 log(f"voice: cannot answer call from {caller_id}: {error}")
                 with contextlib.suppress(Exception):
