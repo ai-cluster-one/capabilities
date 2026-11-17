@@ -1,5 +1,11 @@
 # telegram — change log
 
+## 2026-11-17 — A GPT Live call greets the caller the moment it is answered
+
+The pickup was followed by three or four seconds of silence: only after answering did the daemon read the chat tail, open the Live session, configure it and ask for the greeting. A GPT Live call now does all of that while the phone still rings, logs `voice: session ready for <id> before the pickup, <n> chars of chat tail, in <s>s`, and answers once the greeting is asked for; the greeting's audio waits for the pump that starts after the answer, and the model's leading silence is still dropped. The session splits `start_agent` into `connect_agent` and `greet`, and `start_agent` stays as the two in order. A provider without them, the Gemini Live one, keeps the old order.
+
+A caller who hung up while the phone rang ended the Live session at once, yet the call set-up waited out the whole 20 s connect timeout and the next call was refused as one already in progress. Opening the session now stops the moment the session ends, with `gpt-live session ended before it was ready`. Nothing a setting or a verb does changes; no JSON key changes.
+
 ## 2026-11-17 — A GPT Live call no longer hangs the daemon at its start, and plays the model's audio from an 80 ms cushion
 
 The thread stacks a hold of the event loop recorded, added earlier the same day, are gone: faulthandler's timed dump was re-armed on every beat of the pump, a dump walking the frames of running threads never finished, and re-arming it waited for that dump, so the daemon stopped for good just after a call connected and the next call only rang. A hold still records what the process did during it and how long after a hand-over to the worker it began; `loop_stalls.events` no longer carries `threads`, and the `voice: event loop held` line no longer ends in `threads:`.

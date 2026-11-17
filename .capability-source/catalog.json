@@ -1531,7 +1531,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "af00e83d15ce5acf34a079d81123a0a2aebfa97412fee0c2dc54d5e06f59eea1",
+      "payload_sha256": "f85825cb783ce0085b0f1b80219e981b2d60bb7821577653dacbb90df4ea5ebb",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
@@ -1547,7 +1547,7 @@
           "title": "Telegram"
         }
       },
-      "version": "2026-11-17 — A GPT Live call no longer hangs the daemon at its start, and plays the model's audio from an 80 ms cushion"
+      "version": "2026-11-17 — A GPT Live call greets the caller the moment it is answered"
     },
     "telegrambot": {
       "executable": [

@@ -13,6 +13,7 @@ of both.
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import inspect
 import sys
@@ -20,7 +21,7 @@ import tempfile
 import types
 import unittest
 from unittest import mock
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 TELEGRAM_DIR = Path(__file__).resolve().parents[1]
@@ -458,6 +459,142 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(module.AGENT_RATE, 24000)
         self.assertEqual(module.AGENT_FRAME_BYTES, 480)
         self.assertEqual(module.INPUT_CHUNK_BYTES, 4800)
+
+
+
+class FakeLive:
+    """A Live connection that answers `session.start` and then streams the
+    events a test puts on it. `starts` False makes the start fail the way a
+    socket does when the caller hangs up while the phone still rings."""
+
+    def __init__(self, starts=True):
+        self.starts = starts
+        self.said = []
+        self.events = asyncio.Queue()
+
+        class Channel:
+            def __init__(channel, name):
+                channel.name = name
+
+            async def append(channel, **kwargs):
+                self.said.append((channel.name, kwargs))
+
+        self.session = types.SimpleNamespace(
+            start=self._start,
+            commentary=Channel("commentary"),
+            instructions=Channel("instructions"),
+            input_audio=Channel("input_audio"),
+        )
+
+    async def _start(self, session):
+        self.said.append(("start", session))
+        if not self.starts:
+            raise ConnectionError("closed while ringing")
+        await self.events.put(types.SimpleNamespace(
+            type="session.started", session=types.SimpleNamespace(id="live-1")))
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        event = await self.events.get()
+        if event is None:
+            raise StopAsyncIteration
+        return event
+
+    def client(self):
+        live = self
+
+        @asynccontextmanager
+        async def connect():
+            yield live
+
+        class Client:
+            def __init__(client, **kwargs):
+                client.live = types.SimpleNamespace(connect=connect)
+
+        return Client
+
+
+class PrepareBeforePickupTests(unittest.TestCase):
+    """The pickup used to be followed by three or four seconds of silence: the
+    Live session was opened, configured and asked to greet only after the call
+    was answered. The daemon now does all of that while the phone rings, which
+    needs the session opened apart from its greeting."""
+
+    def test_the_session_is_configured_and_greeting_before_any_audio_leaves(self):
+        live = FakeLive()
+        with fake_runtime_modules():
+            module = import_gptlive()
+            sys.modules["openai"].AsyncOpenAI = live.client()
+
+            async def run():
+                session = build_session(module)
+                await session.connect_agent()
+                await session.greet()
+                said = [name for name, _ in live.said]
+                sent_before_pump = list(session._calls.sent)
+                # The greeting's audio arrives while the phone still rings and
+                # waits for the pump, which starts after the pickup.
+                voiced = (b"\x00\x40" * (module.AGENT_FRAME_BYTES // 2)) * 10
+                await live.events.put(types.SimpleNamespace(
+                    type="session.output_audio.delta",
+                    delta=base64.b64encode(voiced).decode("ascii")))
+                await asyncio.sleep(0.02)
+                buffered = len(session._outbound)
+                session.start_pump()
+                await asyncio.sleep(0.2)
+                await live.events.put(None)
+                await session.stop()
+                return said, sent_before_pump, buffered, session._calls.sent
+
+            said, sent_before_pump, buffered, sent = asyncio.run(run())
+        self.assertEqual(said[:2], ["start", "commentary"])
+        self.assertIn("project prompt", live.said[0][1]["instructions"])
+        self.assertEqual(sent_before_pump, [])
+        self.assertEqual(buffered, module.AGENT_FRAME_BYTES * 10)
+        self.assertIn(b"\x00\x40" * (module.AGENT_FRAME_BYTES // 2), sent)
+
+    def test_a_session_that_ends_before_it_is_ready_frees_the_line_at_once(self):
+        """Seen live: the caller hung up while it rang, the Live session ended
+        at once, and the old wait held the line for the whole connect timeout,
+        so the next call was refused as one already in progress."""
+        live = FakeLive(starts=False)
+        with fake_runtime_modules():
+            module = import_gptlive()
+            sys.modules["openai"].AsyncOpenAI = live.client()
+
+            async def run():
+                session = build_session(module)
+                started = asyncio.get_running_loop().time()
+                try:
+                    await asyncio.wait_for(session.connect_agent(), 2.0)
+                except module.common.VoiceAgentError as exc:
+                    error = str(exc)
+                else:
+                    error = None
+                elapsed = asyncio.get_running_loop().time() - started
+                await session.stop()
+                return error, elapsed
+
+            error, elapsed = asyncio.run(run())
+        self.assertEqual(error, "gpt-live session ended before it was ready")
+        self.assertLess(elapsed, 1.0)
+
+    def test_start_agent_still_connects_then_greets(self):
+        live = FakeLive()
+        with fake_runtime_modules():
+            module = import_gptlive()
+            sys.modules["openai"].AsyncOpenAI = live.client()
+
+            async def run():
+                session = build_session(module)
+                await session.start_agent()
+                await live.events.put(None)
+                await session.stop()
+
+            asyncio.run(run())
+        self.assertEqual([name for name, _ in live.said][:2], ["start", "commentary"])
 
 
 class SessionContractTests(unittest.TestCase):

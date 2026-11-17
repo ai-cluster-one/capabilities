@@ -10250,8 +10250,8 @@ async def run_session(client):
                 api_key=api_key,
                 model=policy["model"],
                 voice=policy["voice"],
-                # The prompt is set once the call is answered: building it means
-                # reading the chat tail, and that must not delay the pickup.
+                # The prompt is set while the phone rings where the provider can
+                # prepare its session, and after the pickup where it cannot.
                 system_instruction="",
                 caller_name=caller_name,
                 assistant_name=ASSISTANT_NAME,
@@ -10301,7 +10301,26 @@ async def run_session(client):
                 "lane": lane,
                 "finishing": False,
             })
+            # A provider that can open its session apart from the greeting has
+            # it configured and greeting while the phone still rings, so the
+            # caller is greeted the moment the call is answered. The greeting's
+            # audio waits in the session until the pump starts after play().
+            prepared = (hasattr(session, "connect_agent")
+                        and hasattr(session, "greet"))
             try:
+                if prepared:
+                    prepare_started = time.monotonic()
+                    history = await voice_chat_history(
+                        caller_id, policy["history"], caller_name)
+                    session.set_system_instruction(voice_agent.build_system_prompt(
+                        voice_context, history,
+                        now_line=voice_agent.current_time_line(
+                            VOICE_TIMEZONE, VOICE_TIMEZONE_NAME)))
+                    await session.connect_agent()
+                    log(f"voice: session ready for {caller_id} before the pickup, "
+                        f"{len(history)} chars of chat tail, in "
+                        f"{time.monotonic() - prepare_started:.1f}s")
+                    await session.greet()
                 # record() answers the call and claims the inbound slot; play()
                 # then claims the outbound one on the same connection.
                 await calls.record(
@@ -10322,20 +10341,19 @@ async def run_session(client):
                     ),
                 )
                 session.start_pump()
-                # Answered, and both slots are already carrying audio. Reading
-                # the chat tail now costs a moment of dead air; reading it before
-                # the answer costs the ring window, after which pytgcalls tries
-                # to *place* a call instead of accepting one.
-                tail_started = time.monotonic()
-                history = await voice_chat_history(
-                    caller_id, policy["history"], caller_name)
-                log(f"voice: chat tail for {caller_id} — {len(history)} chars in "
-                    f"{time.monotonic() - tail_started:.1f}s")
-                session.set_system_instruction(voice_agent.build_system_prompt(
-                    voice_context, history,
-                    now_line=voice_agent.current_time_line(
-                        VOICE_TIMEZONE, VOICE_TIMEZONE_NAME)))
-                await session.start_agent()
+                if not prepared:
+                    # Answered, and both slots are already carrying audio.
+                    # Reading the chat tail now costs a moment of dead air.
+                    tail_started = time.monotonic()
+                    history = await voice_chat_history(
+                        caller_id, policy["history"], caller_name)
+                    log(f"voice: chat tail for {caller_id} — {len(history)} chars in "
+                        f"{time.monotonic() - tail_started:.1f}s")
+                    session.set_system_instruction(voice_agent.build_system_prompt(
+                        voice_context, history,
+                        now_line=voice_agent.current_time_line(
+                            VOICE_TIMEZONE, VOICE_TIMEZONE_NAME)))
+                    await session.start_agent()
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"[:500]
                 log(f"voice: cannot answer call from {caller_id}: {error}")

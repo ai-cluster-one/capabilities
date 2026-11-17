@@ -2956,23 +2956,6 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
         # everything about progress lives in the preamble and nowhere else.
         self.assertNotIn("progress", daemon.VOICE_TASK_DELIVERY)
 
-    async def test_the_call_is_answered_before_the_chat_tail_is_read(self):
-        """Reading the tail first expires the ring window, after which pytgcalls
-        tries to *place* a call instead of accepting the offered one. The handler
-        only runs on a real call, so the ordering itself is the guard."""
-        source = DAEMON_PATH.read_text()
-        body = source.split("async def start_voice_call", 1)[1]
-        body = body.split("def begin_voice_call", 1)[0]
-        order = [body.index(marker) for marker in (
-            "await calls.record(",
-            "await calls.play(",
-            "session.start_pump()",
-            "await voice_chat_history(",
-            "session.set_system_instruction(",
-            "await session.start_agent()",
-        )]
-        self.assertEqual(order, sorted(order))
-
     async def test_the_call_summary_does_not_depend_on_a_recording(self):
         """The summary is started before the recording is joined, so it is ready
         to reply to it — and a call with no recording still gets one."""
@@ -9755,6 +9738,83 @@ class VoiceTaskHarnessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(("resume", "thread-7"), sessions)
             client.disconnected.set()
             await asyncio.wait_for(session_task, timeout=10)
+
+
+
+class VoicePickupOrderTests(unittest.IsolatedAsyncioTestCase):
+    """What happens before the pickup and what after it, read off a real call.
+
+    A provider that can open its session apart from the greeting has it
+    configured and greeting while the phone rings, so the caller is greeted the
+    moment the call is answered rather than after three or four seconds of
+    silence. A provider that cannot keeps the old order: answer first, then read
+    the chat tail and start the agent."""
+
+    class Unprepared(StubVoiceCallSession):
+        steps = None
+
+        def start_pump(self):
+            self.steps.append("start_pump")
+
+        def set_system_instruction(self, text):
+            self.steps.append("set_system_instruction")
+
+        async def start_agent(self):
+            self.steps.append("start_agent")
+
+    class Prepared(Unprepared):
+        async def connect_agent(self):
+            self.steps.append("connect_agent")
+
+        async def greet(self):
+            self.steps.append("greet")
+
+    async def ring(self, td, session_class, last_step):
+        base = settings(worker_timeout=30)
+        base["defaults"]["voice_agent"] = {"profile": "telegram-codex"}
+        base["allowed_users"] = {"777": {"name": "Caller", "role": "owner",
+                                         "voice_agent": {"mode": "enabled"}}}
+        daemon = import_daemon(Path(td), base, voice_context="Answer briefly.",
+                               project_env={"GOOGLE_API_KEY": "test-key"})
+        steps = []
+        session_class.steps = steps
+        daemon.voice_agent.VoiceTaskRunner = lambda *a, **k: SimpleNamespace()
+        daemon.voice_agent.VoiceCallSession = session_class
+        logged = []
+        client = FakeClient()
+        with mock.patch.object(daemon, "log", side_effect=logged.append):
+            session_task = asyncio.create_task(daemon.run_session(client))
+            await client.started.wait()
+            calls = daemon.PyTgCalls.instances[-1]
+            for verb in ("record", "play"):
+                answered = getattr(calls, verb)
+
+                async def noted(*args, _verb=verb, _answered=answered, **kwargs):
+                    steps.append(_verb)
+                    return await _answered(*args, **kwargs)
+
+                setattr(calls, verb, noted)
+            await calls.handlers["incoming_p2p_call"](None, SimpleNamespace(chat_id=777))
+            await wait_until(lambda: last_step in steps, timeout=10)
+            client.disconnected.set()
+            await asyncio.wait_for(session_task, timeout=10)
+        return steps, logged
+
+    async def test_a_provider_that_can_prepare_is_greeting_before_the_pickup(self):
+        with tempfile.TemporaryDirectory() as td:
+            steps, logged = await self.ring(td, self.Prepared, "start_pump")
+        self.assertEqual(steps, ["set_system_instruction", "connect_agent", "greet",
+                                 "record", "play", "start_pump"])
+        self.assertTrue(any(line.startswith("voice: session ready for 777 before the pickup, ")
+                            for line in logged), logged)
+
+    async def test_a_provider_that_cannot_prepare_answers_first(self):
+        """Reading the tail before the answer on such a provider would only move
+        the dead air into the ring window, so it keeps the order it had."""
+        with tempfile.TemporaryDirectory() as td:
+            steps, _ = await self.ring(td, self.Unprepared, "start_agent")
+        self.assertEqual(steps, ["record", "play", "start_pump",
+                                 "set_system_instruction", "start_agent"])
 
 
 class StoreRegisterTests(unittest.IsolatedAsyncioTestCase):

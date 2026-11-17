@@ -797,16 +797,36 @@ class VoiceCallSession:
     # --- session -----------------------------------------------------------
 
     async def start_agent(self):
+        await self.connect_agent()
+        await self.greet()
+
+    async def connect_agent(self):
+        """Open and configure the Live session. Done while the phone still
+        rings, so the caller never waits on it after the pickup."""
         from openai import AsyncOpenAI
 
         self._client = AsyncOpenAI(api_key=self._api_key)
-        self._tasks.append(asyncio.create_task(self._run_session()))
+        running = asyncio.create_task(self._run_session())
+        self._tasks.append(running)
+        # The session can end before it is ready - the caller hung up while
+        # the phone rang - and then waiting out the timeout would keep the
+        # line busy for the next call.
+        ready = asyncio.create_task(self._live_ready.wait())
         try:
-            await asyncio.wait_for(self._live_ready.wait(), CONNECT_TIMEOUT)
-        except asyncio.TimeoutError as exc:
+            await asyncio.wait({ready, running}, timeout=CONNECT_TIMEOUT,
+                               return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            ready.cancel()
+        if not self._live_ready.is_set():
+            if running.done():
+                raise common.VoiceAgentError(
+                    "gpt-live session ended before it was ready")
             raise common.VoiceAgentError(
-                f"gpt-live session did not start within {CONNECT_TIMEOUT}s") from exc
+                f"gpt-live session did not start within {CONNECT_TIMEOUT}s")
         self._tasks.append(asyncio.create_task(self._sender()))
+
+    async def greet(self):
+        """Ask the ready session to open the conversation."""
         # Commentary, not instructions. An instructions append is a standing
         # rule: the model reads it, keeps it, and goes on waiting for the caller,
         # which is a call that opens in silence. Commentary is something to say,
