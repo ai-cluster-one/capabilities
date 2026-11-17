@@ -37,8 +37,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import gc
 import operator
+import os
+import sys
+import threading
 import time
+import traceback
 from array import array
 
 from pytgcalls.exceptions import NotInCallError
@@ -165,6 +170,102 @@ QUIET_PROGRESS_SECONDS = 10.0
 CONNECT_TIMEOUT = 20.0
 CLOSE_DRAIN_TIMEOUT = 5.0
 
+# What the call sounded like is decided at the boundary with ntgcalls, which
+# holds no queue and paces nothing: each frame handed to it is encoded and on
+# the wire at once, so the time between two sends is the time between two
+# packets at the phone. A send gap of a few tens of milliseconds is absorbed by
+# the phone's jitter buffer; a gap of hundreds - the process held by something
+# else while a call runs - is concealed there as an electronic gap, and the
+# burst that repays it leaves that buffer deeper for the rest of the call, which
+# is heard as a metallic voice answering seconds late. The recording cannot show
+# any of it: it is written at the moment of sending. So the call measures it.
+SEND_GAP_LATE_SECONDS = 0.02
+SEND_GAP_BURST_SECONDS = 0.002
+INBOUND_GAP_LATE_SECONDS = 0.05
+# A hold of the event loop this long is named, with where it was held: the
+# stall is what the caller hears, and where it happened is what removes it.
+LOOP_STALL_SECONDS = 0.1
+LOOP_WATCH_INTERVAL = 0.02
+LOOP_STALL_LOG_LIMIT = 20
+GC_PAUSE_SECONDS = 0.02
+
+
+class _LoopWatch:
+    """Names what holds the event loop while a call runs.
+
+    The pump beats every ten milliseconds. A thread of its own looks at that
+    beat, and when it has gone stale past LOOP_STALL_SECONDS it takes the loop
+    thread's stack once - while the stall is still happening, which is the only
+    moment its cause can be read. The pump measures the stall's length when it
+    wakes and asks here for where it was. Garbage collection holds every thread,
+    so its pauses are timed beside it.
+
+    A stall whose stack was never taken held the interpreter itself, so not even
+    this thread could run; that is reported as such rather than as nothing."""
+
+    def __init__(self, interval=LOOP_WATCH_INTERVAL, threshold=LOOP_STALL_SECONDS,
+                 clock=time.monotonic):
+        self.beat = clock()
+        self._interval = interval
+        self._threshold = threshold
+        self._clock = clock
+        self._loop_thread = None
+        self._thread = None
+        self._stopped = threading.Event()
+        self._sampled_beat = None
+        self._where = None
+        self._gc_started = None
+        self.gc_pauses = 0
+        self.gc_max = 0.0
+        self.gc_total = 0.0
+
+    def start(self):
+        self._loop_thread = threading.get_ident()
+        self.beat = self._clock()
+        gc.callbacks.append(self._on_gc)
+        self._thread = threading.Thread(target=self._run, name="voice-loop-watch",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stopped.set()
+        with contextlib.suppress(ValueError):
+            gc.callbacks.remove(self._on_gc)
+
+    def where(self, beat):
+        """Where the loop was held during the stall that began at `beat`."""
+        if self._sampled_beat == beat and self._where:
+            return self._where
+        return "not sampled (the interpreter itself was held)"
+
+    def _run(self):
+        while not self._stopped.wait(self._interval):
+            beat = self.beat
+            if self._clock() - beat < self._threshold or self._sampled_beat == beat:
+                continue
+            frame = sys._current_frames().get(self._loop_thread)
+            if frame is None:
+                continue
+            stack = traceback.extract_stack(frame)[-4:]
+            del frame
+            self._where = " < ".join(
+                f"{entry.name} ({os.path.basename(entry.filename)}:{entry.lineno})"
+                for entry in reversed(stack))
+            self._sampled_beat = beat
+
+    def _on_gc(self, phase, info):
+        if phase == "start":
+            self._gc_started = time.perf_counter()
+            return
+        if self._gc_started is None:
+            return
+        paused = time.perf_counter() - self._gc_started
+        self._gc_started = None
+        self.gc_total += paused
+        if paused >= GC_PAUSE_SECONDS:
+            self.gc_pauses += 1
+            self.gc_max = max(self.gc_max, paused)
+
 
 def _rms(payload: bytes) -> float:
     """Level of one PCM16 frame, used only to tell speech from the silence the
@@ -265,6 +366,27 @@ class VoiceCallSession:
         self.trimmed_silence_frames = 0
         self.pump_resyncs = 0
 
+        # Measured where audio meets ntgcalls; see SEND_GAP_LATE_SECONDS.
+        self._watch = _LoopWatch()
+        self._last_send_at = None
+        self.send_gap_max = 0.0
+        self.send_gaps_late = 0
+        self.send_gaps_stalled = 0
+        self.burst_frames = 0
+        self.send_call_max = 0.0
+        self.silence_frames = 0
+        self.underrun_frames = 0
+        self.loop_stalls = 0
+        self.loop_stall_max = 0.0
+        self.loop_stall_total = 0.0
+        self.loop_stall_worst = None
+        self._first_inbound_at = None
+        self._last_inbound_at = None
+        self.inbound_frames = 0
+        self.inbound_zero_frames = 0
+        self.inbound_gap_max = 0.0
+        self.inbound_gaps_late = 0
+
         # The open user turn. The delegation event carries no task text, so this
         # is what the backend is actually given.
         self._user_turn = []
@@ -312,14 +434,29 @@ class VoiceCallSession:
         """Start the paced capture pump before the session is up, so the
         outbound slot never stalls: a tick with nothing buffered sends
         silence."""
+        self._watch.start()
         self._tasks.append(asyncio.create_task(self._outbound_pump()))
 
     def on_incoming_frames(self, frames):
         """Called from the PyTgCalls stream-frame update; must not block."""
+        now = time.monotonic()
+        if self._first_inbound_at is None:
+            self._first_inbound_at = now
+        elif frames:
+            gap = now - self._last_inbound_at
+            if gap > self.inbound_gap_max:
+                self.inbound_gap_max = gap
+            if gap >= INBOUND_GAP_LATE_SECONDS:
+                self.inbound_gaps_late += 1
+        if frames:
+            self._last_inbound_at = now
         for frame in frames or ():
             payload = getattr(frame, "frame", None)
             if not payload:
                 continue
+            self.inbound_frames += max(1, len(payload) // CALLER_FRAME_BYTES)
+            if payload.count(0) == len(payload):
+                self.inbound_zero_frames += 1
             self.caller_bytes += len(payload)
             if self._caller_writer is not None:
                 self._caller_writer.write(payload)
@@ -348,6 +485,7 @@ class VoiceCallSession:
         next_tick = time.monotonic()
         while True:
             try:
+                self._note_beat()
                 self._trim_outbound_silence()
                 backlog = len(self._outbound)
                 if backlog > self.max_outbound_backlog:
@@ -357,9 +495,15 @@ class VoiceCallSession:
                     del self._outbound[:AGENT_FRAME_BYTES]
                 else:
                     payload = AGENT_SILENCE
+                    self.silence_frames += 1
+                    if self._speaking:
+                        # The model was mid-word and the next of it had not
+                        # arrived: a hole in its speech, made on this side.
+                        self.underrun_frames += 1
                 self.agent_frames += 1
                 if self._agent_writer is not None:
                     self._agent_writer.write(payload)
+                sent_at = time.monotonic()
                 try:
                     await self._calls.send_frame(
                         self._chat_id, Device.MICROPHONE, payload,
@@ -367,6 +511,7 @@ class VoiceCallSession:
                 except NotInCallError:
                     await self._note_stream_end("not_in_call")
                     return
+                self._note_send(sent_at, time.monotonic())
                 next_tick += FRAME_SECONDS
                 delay = next_tick - time.monotonic()
                 if delay > 0:
@@ -385,6 +530,96 @@ class VoiceCallSession:
                 self._log(f"voice: outbound pump stopped — {self._pump_error}")
                 await self._note_stream_end("pump_error")
                 return
+
+    def _note_beat(self):
+        """One pump iteration: the beat the loop watch reads, and the stall
+        the last one measured if the loop was held since."""
+        now = time.monotonic()
+        previous = self._watch.beat
+        self._watch.beat = now
+        held = now - previous
+        if held < LOOP_STALL_SECONDS or self._last_send_at is None:
+            return
+        where = self._watch.where(previous)
+        self.loop_stalls += 1
+        self.loop_stall_total += held
+        if held > self.loop_stall_max:
+            self.loop_stall_max = held
+            self.loop_stall_worst = where
+        if self.loop_stalls <= LOOP_STALL_LOG_LIMIT:
+            self._log(f"voice: event loop held {held * 1000:.0f} ms during the "
+                      f"call, in {where}")
+
+    def _note_send(self, started, finished):
+        """Time between two frames handed to ntgcalls, which is the time between
+        two packets at the phone."""
+        took = finished - started
+        if took > self.send_call_max:
+            self.send_call_max = took
+        if self._last_send_at is not None:
+            gap = started - self._last_send_at
+            if gap > self.send_gap_max:
+                self.send_gap_max = gap
+            if gap >= SEND_GAP_LATE_SECONDS:
+                self.send_gaps_late += 1
+            if gap >= LOOP_STALL_SECONDS:
+                self.send_gaps_stalled += 1
+            if gap < SEND_GAP_BURST_SECONDS:
+                self.burst_frames += 1
+        self._last_send_at = started
+
+    def media_report(self):
+        """The call's timing at the ntgcalls boundary, both ways."""
+        span = ((self._last_inbound_at - self._first_inbound_at)
+                if self._first_inbound_at is not None else 0.0)
+        expected = int(round(span / FRAME_SECONDS)) + (1 if self.inbound_frames else 0)
+        ms = lambda seconds: round(seconds * 1000, 1)  # noqa: E731
+        return {
+            "send": {
+                "frames": self.agent_frames,
+                "gap_max_ms": ms(self.send_gap_max),
+                "gaps_over_20ms": self.send_gaps_late,
+                "gaps_over_100ms": self.send_gaps_stalled,
+                "burst_frames": self.burst_frames,
+                "call_max_ms": ms(self.send_call_max),
+                "silence_frames": self.silence_frames,
+                "underrun_frames": self.underrun_frames,
+            },
+            "inbound": {
+                "frames": self.inbound_frames,
+                "missing_frames": max(0, expected - self.inbound_frames),
+                "zero_frames": self.inbound_zero_frames,
+                "gap_max_ms": ms(self.inbound_gap_max),
+                "gaps_over_50ms": self.inbound_gaps_late,
+            },
+            "loop_stalls": {
+                "count": self.loop_stalls,
+                "max_ms": ms(self.loop_stall_max),
+                "total_ms": ms(self.loop_stall_total),
+                "worst_in": self.loop_stall_worst,
+            },
+            "gc": {
+                "pauses_over_20ms": self._watch.gc_pauses,
+                "max_ms": ms(self._watch.gc_max),
+                "total_ms": ms(self._watch.gc_total),
+            },
+        }
+
+    def _log_media(self, report):
+        send, inbound = report["send"], report["inbound"]
+        stalls, collector = report["loop_stalls"], report["gc"]
+        line = (f"voice: media at the ntgcalls boundary - send {send['frames']} "
+                f"frames, gaps >20ms {send['gaps_over_20ms']}, >100ms "
+                f"{send['gaps_over_100ms']}, max {send['gap_max_ms']} ms, burst "
+                f"{send['burst_frames']}, underrun {send['underrun_frames']}; "
+                f"inbound {inbound['frames']} frames, missing "
+                f"{inbound['missing_frames']}, zero {inbound['zero_frames']}, max gap "
+                f"{inbound['gap_max_ms']} ms; loop stalls {stalls['count']} (max "
+                f"{stalls['max_ms']} ms, total {stalls['total_ms']} ms); gc pauses "
+                f"{collector['pauses_over_20ms']} (max {collector['max_ms']} ms)")
+        if stalls["worst_in"]:
+            line += f"; worst stall in {stalls['worst_in']}"
+        self._log(line)
 
     def _trim_outbound_silence(self):
         """Pay a backlog back out of silence. Frames are dropped from the front
@@ -856,6 +1091,9 @@ class VoiceCallSession:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks = []
+        self._watch.stop()
+        with contextlib.suppress(Exception):
+            self._log_media(self.media_report())
         # Work the caller started outlives the call: nothing can be spoken any
         # more, so the results go to the chat rather than being dropped. The
         # prompt promises the caller exactly this.
@@ -937,6 +1175,7 @@ class VoiceCallSession:
             "usage_seconds": round(self._usage_seconds, 1),
             "context_usage_ratio": self._context_ratio,
             "close_reason": self._close_reason,
+            "media": self.media_report(),
         }
 
     @property

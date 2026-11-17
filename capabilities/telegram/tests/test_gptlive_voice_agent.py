@@ -238,6 +238,59 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(bytes(session._outbound), held)
         self.assertEqual(session.trimmed_silence_frames, 0)
 
+    def test_a_held_loop_is_measured_and_named(self):
+        """A GPT Live call sounded metallic, stuttered and answered seconds late
+        while its recording, written at the moment of sending, was clean. What
+        the phone hears is the time between frames handed to ntgcalls, and a
+        hold of the process puts a gap and then a burst there; the call has to
+        say so, and say what held it."""
+        import gc
+        import time as clock
+        lines = []
+
+        def hold_the_loop():
+            clock.sleep(0.25)
+
+        with fake_runtime_modules():
+            module = import_gptlive()
+
+            async def run():
+                session = build_session(module, log=lines.append)
+                session.start_pump()
+                await asyncio.sleep(0.1)
+                hold_the_loop()
+                await asyncio.sleep(0.1)
+                summary = await session.stop()
+                return session, summary
+
+            session, summary = asyncio.run(run())
+        media = summary["media"]
+        self.assertEqual(media["loop_stalls"]["count"], 1)
+        self.assertGreaterEqual(media["loop_stalls"]["max_ms"], 200)
+        self.assertIn("hold_the_loop", media["loop_stalls"]["worst_in"])
+        self.assertGreaterEqual(media["send"]["gaps_over_100ms"], 1)
+        self.assertGreaterEqual(media["send"]["gap_max_ms"], 200)
+        self.assertTrue(any("event loop held" in line and "hold_the_loop" in line
+                            for line in lines), lines)
+        self.assertTrue(any(line.startswith("voice: media at the ntgcalls boundary")
+                            for line in lines), lines)
+        self.assertNotIn(session._watch._on_gc, gc.callbacks)
+
+    def test_missing_and_zero_caller_frames_are_counted(self):
+        with fake_runtime_modules() as Frame:
+            module = import_gptlive()
+            session = build_session(module)
+            speech = b"\x00\x40" * (module.CALLER_FRAME_BYTES // 2)
+            session.on_incoming_frames([Frame(frame=speech)])
+            import time as clock
+            clock.sleep(0.1)
+            session.on_incoming_frames([Frame(frame=bytes(module.CALLER_FRAME_BYTES))])
+            inbound = session.media_report()["inbound"]
+        self.assertEqual(inbound["frames"], 2)
+        self.assertEqual(inbound["zero_frames"], 1)
+        self.assertGreaterEqual(inbound["missing_frames"], 8)
+        self.assertGreaterEqual(inbound["gaps_over_50ms"], 1)
+
     def test_one_rate_carries_the_whole_tract(self):
         with fake_runtime_modules():
             module = import_gptlive()

@@ -10435,6 +10435,10 @@ async def run_session(client):
                 "transcript_text": voice_agent.transcript_text(
                     transcript, ASSISTANT_NAME, caller_name),
             })
+            if summary.get("media") is not None:
+                # The call's timing where audio meets ntgcalls, both ways: what
+                # the caller heard and the recording, written at sending, cannot.
+                metadata["voice_agent"]["media"] = summary["media"]
             metadata.update({
                 "recording_ended_at": iso_utc(),
                 "wall_duration_seconds": round(wall_duration, 3),
