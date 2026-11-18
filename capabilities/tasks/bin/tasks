@@ -113,6 +113,9 @@ WRITING  (needs allow_write on a selected connection; exit 4 otherwise)
   tasks workers save <name> <file|-> [--base ID]  save a worker's new version;
                                                 see WORKERS
   tasks workers remove <name> [--base ID]       take a worker out of the project
+  tasks workers lift <name>                     lift its lane hold - a spent usage
+                                                limit or its after hook holding -
+                                                so its next claim runs at once
   tasks workers import [--apply]                move worker files into the store
   tasks hooks save <name> <file|-> [--description TEXT] [--base ID]
                                                 save a hook's new version; the
@@ -711,9 +714,15 @@ HOOKS
   worker - the service's, or `run` by hand - takes a task until the moment, or
   for the worker's cool-down when there is none; it is recorded on the raise's
   metrics as `lane_hold` (`until`, `by`, `said`), so it holds across a service
-  restart, and `run` reports it as `lane_held`. A claim on a held lane takes
-  nothing, still sweeps, and answers `lane_held`; a task named with --key is
-  taken whatever holds its lane. Escalate moves the task along the chain while
+  restart, and `run` reports it as `lane_held`, with `lift`, the command that
+  lifts it. A claim on a held lane takes nothing, still sweeps, and answers
+  `lane_held`; a task named with --key is taken whatever holds its lane.
+  `tasks workers lift <worker>` lifts the hold before its moment: each hold of
+  that worker still ahead is marked `lifted` (`at`, `by`) and keeps the rest
+  of what it recorded, it ends at the lift for the claim, the stall clock and
+  the service's next wake alike, and a service serving the project wakes at
+  once. It answers the holds it lifted under `lifted`, and `changed` false
+  when the lane was not held; under a raise it is refused with exit 4. Escalate moves the task along the chain while
   it stands where the raise left it; a task that ended, complete or closed, is
   never reopened by it, and that answer holds the lane instead. An exit other
   than 0 is also noted as `after_hook` on the raise's metrics, in the answer
@@ -732,6 +741,9 @@ HOOKS
   held no claim of that worker runs, so the stall clock runs against no task
   of it: a task's time held back counts again only from a hold after the
   moment. The worker's `after` hook may hold the lane longer, never shorter.
+  The hold ends at its moment, or earlier when a person lifts it with `tasks
+  workers lift <worker>`; a raise after the lift that hits the limit again
+  holds the lane again.
 
 LINES
   A line is a named conveyor: the group of workers that produces one kind of
@@ -6108,8 +6120,10 @@ def _in_place(cur, tid: str) -> dict:
 
 
 def _lane_until(alias: str = "e") -> str:
-    """The moment a raise's lane hold runs to, as the store reads it."""
-    return f"({alias}.metrics -> 'lane_hold' ->> 'until')::timestamptz"
+    """The moment a raise's lane hold runs to, as the store reads it: the moment
+    it named, or the moment `workers lift` lifted it when that came first."""
+    return (f"least(({alias}.metrics -> 'lane_hold' ->> 'until')::timestamptz, "
+            f"({alias}.metrics -> 'lane_hold' -> 'lifted' ->> 'at')::timestamptz)")
 
 
 def _stamp(moment) -> str:
@@ -8351,12 +8365,14 @@ def cmd_workers(entry, args: list[str]) -> None:
     loose = opts["_loose"]
     usage = (f"{NAME} workers list | show <name> [--version ID] | history <name> | "
              "save <name> <file|-> [--base ID] | remove <name> [--base ID] | "
-             "import [--apply]")
-    if not loose or loose[0] not in ("list", "show", "history", "save", "remove", "import"):
+             "lift <name> | import [--apply]")
+    if not loose or loose[0] not in ("list", "show", "history", "save", "remove", "lift",
+                                     "import"):
         _die(6, "input", "workers needs an action" if not loose
              else f"unknown workers action {loose[0]!r}", usage)
     action, rest = loose[0], loose[1:]
-    wants = {"list": 0, "import": 0, "show": 1, "history": 1, "remove": 1, "save": 2}[action]
+    wants = {"list": 0, "import": 0, "show": 1, "history": 1, "remove": 1, "lift": 1,
+             "save": 2}[action]
     if len(rest) != wants:
         _die(6, "input", f"workers {action} takes {wants} argument(s)", usage)
     if action in ("save", "remove") or (action == "import" and opts.get("apply")):
@@ -8372,6 +8388,9 @@ def cmd_workers(entry, args: list[str]) -> None:
     if not _WORKER_NAME.fullmatch(name):
         _die(6, "input", f"{name!r} is not a worker name: lowercase letters, digits, "
              "`-` and `_`, starting with a letter or digit")
+    if action == "lift":
+        _lane_lift(entry, project, name)
+        return
     if action == "save":
         try:
             spec, body = _parse_worker(_read_input(rest[1]), rest[1])
@@ -9809,7 +9828,54 @@ def _lane_held(cur, worker: str, project: str) -> dict | None:
     hold = rows[0]["hold"] or {}
     return {"until": hold.get("until") or _stamp(rows[0]["until"]),
             "execution": str(rows[0]["execution"]),
-            **{k: hold[k] for k in ("by", "said") if hold.get(k)}}
+            **{k: hold[k] for k in ("by", "said") if hold.get(k)},
+            "lift": f"{NAME} workers lift {worker}"}
+
+
+def _lane_lift(entry, project: str, worker: str) -> None:
+    """Lift the lane hold this worker's claims are under now: every hold still
+    ahead that a raise of this worker in this project recorded is marked
+    `lifted` (`at`, `by`) beside what it said, so the raise keeps its evidence
+    and every reader of the hold sees it end at the lift. The project's
+    claimable version is raised in the same transaction, so a service serving
+    the project wakes and the lane's next turn runs at once."""
+    if _worker_execution():
+        _die(4, "policy",
+             "`workers lift` is refused under a raise: a turn that lifts the hold its "
+             "own conveyor is under spends the limit the hold waits out",
+             "a person lifts a lane hold, outside any turn")
+    with _connect(entry) as conn, conn.cursor() as cur:
+        cur.execute(f"""update {SCHEMA}.tasks_executions e
+                           set metrics = jsonb_set(e.metrics, '{{lane_hold,lifted}}',
+                                                   jsonb_build_object('at', now(), 'by', %s::text))
+                          from {SCHEMA}.tasks_tasks t
+                         where t.id = e.task_id and {_raised_here_clause('e', 't')}
+                           and e.worker = %s and e.metrics ? 'lane_hold'
+                           and jsonb_typeof(e.metrics -> 'lane_hold') = 'object'
+                           and {_lane_until()} > now()
+                     returning e.id as execution, e.metrics -> 'lane_hold' as hold""",
+                    (_actor(), project, project, worker))
+        rows = _rows(cur)
+        if rows:
+            cur.execute("select to_regclass(%s) is not null as present",
+                        (f"{SCHEMA}.schema_channel",))
+            if cur.fetchone()["present"]:
+                cur.execute(f"""insert into {SCHEMA}.schema_channel as c (channel, scope, version)
+                                values (%s, %s, 1) on conflict (channel, scope)
+                                do update set version = c.version + 1""",
+                            (CLAIMABLE_CHANNEL, project))
+            cur.execute("select pg_notify(%s, json_build_object('schema', %s::text, "
+                        "'agent_id', %s::text)::text)", (CLAIMABLE_CHANNEL, SCHEMA, project))
+        conn.commit()
+    holds = [row["hold"] or {} for row in rows]
+    answer = {"worker": worker, "changed": bool(rows),
+              "lifted": [{"execution": str(row["execution"]),
+                          **{k: hold[k] for k in ("until", "by", "said") if hold.get(k)}}
+                         for row, hold in zip(rows, holds)]}
+    if holds:
+        answer.update({"lifted_at": holds[0]["lifted"]["at"],
+                       "lifted_by": holds[0]["lifted"]["by"]})
+    _emit(answer)
 
 
 def _lane_held_now(entry, worker: dict) -> dict | None:

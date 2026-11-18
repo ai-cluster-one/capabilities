@@ -1409,7 +1409,7 @@
       "level": 0,
       "lucide_icon": "list-checks",
       "path": "capabilities/tasks",
-      "payload_sha256": "e4dd7e39b0ce4e47eca72b5ef3dacdc92b94ee72bd3372b303279c9f5b2047aa",
+      "payload_sha256": "e9fa5039a72a185c3caa83fda8fd24b603cb4824243246c7f862f0104f7587b9",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
@@ -1425,7 +1425,7 @@
           "title": "Задачи"
         }
       },
-      "version": "2026-11-18 — A task picked up too many times in its life goes to a person, also with a chain"
+      "version": "2026-11-18 — `tasks workers lift` lifts a lane hold before its moment"
     },
     "teams": {
       "executable": [

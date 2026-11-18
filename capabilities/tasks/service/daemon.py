@@ -1344,6 +1344,8 @@ class ProjectSlot:
                 said.append(f"lane held until {lane.get('until')}"
                             + (f" by {lane['by']}" if lane.get("by") else "")
                             + (f", said {str(lane['said'])[:200]}" if lane.get("said")
+                               else "")
+                            + (f"; lift it with `{lane['lift']}`" if lane.get("lift")
                                else ""))
             after = answer.get("after_hook")
             if isinstance(after, dict) and after.get("exit") != 0:

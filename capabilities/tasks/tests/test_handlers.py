@@ -490,6 +490,60 @@ def test_a_usage_limit_holds_the_lane_and_spends_no_attempt(project, store, ends
 
 
 @needs_store
+def test_workers_lift_ends_a_limit_hold_at_once_and_keeps_its_record(project, store, ends,
+                                                                      capsys, monkeypatch):
+    """A lane held for a spent usage limit is lifted by `workers lift`: the next
+    claim takes a task at once, the raise still records the hold it set, and a
+    running service is told through the claimable version."""
+    entry, schema, conn = store
+    esc.supervised(project)
+    esc.conveyor(project)
+    add(entry, capsys, "t-first")
+    add(entry, capsys, "t-second")
+    ends.update(said=CLAUDE_WEEKLY)
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    held = answer(capsys)["lane_held"]
+    ends.update(said=None)
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    refused = answer(capsys)
+    assert refused["claimed"] is None
+    assert refused["lane_held"]["lift"] == "tasks workers lift alpha"
+    # Under a raise the lift is refused.
+    monkeypatch.setenv("TASKS_EXECUTION", "00000000-0000-0000-0000-000000000000")
+    with pytest.raises(SystemExit) as stopped:
+        mod.cmd_workers(entry, ["lift", "alpha"])
+    assert stopped.value.code == 4
+    capsys.readouterr()
+    monkeypatch.delenv("TASKS_EXECUTION")
+    version = lambda: conn.execute(  # noqa: E731
+        f"""select coalesce(max(version), 0) from {schema}.schema_channel
+             where channel = 'tasks_claimable'""").fetchone()[0] \
+        if conn.execute("select to_regclass(%s)", (f"{schema}.schema_channel",)).fetchone()[0] \
+        else None
+    before = version()
+    mod.cmd_workers(entry, ["lift", "alpha"])
+    lifted = answer(capsys)
+    assert lifted["changed"] is True and lifted["worker"] == "alpha"
+    assert [one["until"] for one in lifted["lifted"]] == [held["until"]]
+    assert lifted["lifted_at"] and lifted["lifted_by"]
+    if before is not None:
+        assert version() > before
+    # The raise keeps what the hold recorded, beside the lift.
+    [raised] = raises_of(entry, capsys, "t-first")
+    kept = raised["metrics"]["lane_hold"]
+    assert kept["until"] == held["until"] and kept["lifted"]["at"] == lifted["lifted_at"]
+    assert lane_until(conn, schema, "t-first") == datetime.datetime.fromisoformat(held["until"])
+    # The lane runs at once, and the service's next moment no longer waits for it.
+    with mod._connect(entry) as c, c.cursor() as cur:
+        assert mod._lane_held(cur, "alpha", mod._writing_project()) is None
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    assert answer(capsys)["claimed"] == "t-second"
+    # A lane not held answers that nothing changed.
+    mod.cmd_workers(entry, ["lift", "alpha"])
+    assert answer(capsys) == {"worker": "alpha", "changed": False, "lifted": []}
+
+
+@needs_store
 def test_a_lane_held_by_a_limit_runs_no_stall_clock_until_its_moment(project, store, ends,
                                                                      capsys):
     """A task its hook held before the limit, and holds again once the lane

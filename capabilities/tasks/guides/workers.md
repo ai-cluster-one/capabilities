@@ -62,6 +62,8 @@ Both answer in one vocabulary, by their exit: 0 is go; 75 is hold, until the mom
 
 The capability ships after-raise handlers of its own for the harnesses' accounts. A raise that ended on Claude Code's or Codex's usage limit holds the lane until the reset the harness names - the five-hour and the weekly limits alike - and one naming no reset, or a harness not logged in, for 30 minutes; the raise is no attempt at the work, and no task of the lane is escalated for the time the lane stood held.
 
+A lane hold ends at its moment or when a person lifts it: `tasks workers lift <worker>` marks each hold of that worker still ahead `lifted`, keeps what the raise recorded, and wakes a service serving the project, so the lane's next turn runs at once. Lift it once the account has its limit back sooner than the hold says - a plan upgraded, a limit reset early, a harness logged in again. A held claim names the command under `lane_held.lift`, and the service's log line says it.
+
 ```markdown
 ---
 takes: [change]
