@@ -1409,7 +1409,7 @@
       "level": 0,
       "lucide_icon": "list-checks",
       "path": "capabilities/tasks",
-      "payload_sha256": "d211a91608de64dc836792370e8a63cc52a9c14b9b9e65fd80f399cc7ac42406",
+      "payload_sha256": "8bf50123b621a9a8cf756ccb5712353642aaf740de5c88f07f5b71877c11171b",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
@@ -1425,7 +1425,7 @@
           "title": "Задачи"
         }
       },
-      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
+      "version": "2026-11-18 — A resumed raise records what it cost, not the session's running total"
     },
     "teams": {
       "executable": [

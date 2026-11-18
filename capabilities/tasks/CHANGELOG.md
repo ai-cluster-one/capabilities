@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-18 — A resumed raise records what it cost, not the session's running total
+
+A raise that resumes a cut-off claude session records in its `cost_usd` only what that turn cost. The harness reports a resumed session's whole running total, which the session's transcript carries over from the turns before; the run now reads that carried total, the highest `cost-state` total in the transcript, before the turn starts and takes it off the reported total. A task's `cost_total`, its `runs.cost_usd` and `--sort cost` no longer count the earlier turns a second time. A transcript that carries no total, or a reported total below the carried one, records the reported total as before; a fresh turn and a resume that falls back to a fresh session record their full cost as before. Raises recorded before this release keep the cost they recorded. No verb, flag or JSON key changes.
+
 ## 2026-11-17 — Turns run on callva-harness-runner 0.12.3
 
 Turns run on callva-harness-runner 0.12.3, in place of 0.12.2: finding the claude or codex executable no longer lists the fallback folders when `PATH` already has it. On a machine where fnm had left tens of thousands of per-shell folders, every turn's start spent over a second of CPU holding the interpreter on that list; it now takes well under a millisecond, and finds the same executable. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

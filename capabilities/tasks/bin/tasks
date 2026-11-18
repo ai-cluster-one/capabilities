@@ -291,7 +291,9 @@ ONE TURN OF THE CONVEYOR
   on this machine, or the resume fails at launch - in seconds, writing
   nothing, and not for the account's limit - the turn starts a fresh session
   with the whole frame instead, and the raise's detail says so. A resumed raise
-  counts against `attempts` like any other.
+  counts against `attempts` like any other. It records what it cost itself:
+  the harness reports a resumed session's whole running total, so the total
+  the session's transcript carried when the turn began is taken off it.
 
   A turn proves it is alive. Its claim holds the task by a short lease, and
   while the turn lives one writer renews that lease every beat - a sixth of
@@ -10694,12 +10696,54 @@ def _session_kept(ref: str, profile) -> bool:
     """Whether the claude session this id names is still on this machine: its
     transcript under the harness's configuration directory, in whichever project
     folder it was written."""
+    return bool(_session_transcripts(ref, profile))
+
+
+def _session_transcripts(ref: str, profile) -> list:
+    """The transcripts of the claude session this id names, under the harness's
+    configuration directory, in whichever project folder each was written."""
     if not _SESSION_ID.fullmatch(ref or ""):
-        return False
+        return []
     configured = ((getattr(profile, "env_set", None) or {}).get("CLAUDE_CONFIG_DIR")
                   or os.environ.get("CLAUDE_CONFIG_DIR"))
     home = Path(configured).expanduser() if configured else Path.home() / ".claude"
-    return any((home / "projects").glob(f"*/{ref}.jsonl"))
+    return sorted((home / "projects").glob(f"*/{ref}.jsonl"))
+
+
+def _session_carried(ref: str, profile) -> float:
+    """What the claude session this id names had already cost before a turn
+    resumes it: the highest running total its transcript recorded, which is the
+    total the harness restores on resume and then reports as the turn's cost. Zero when
+    the transcript recorded none, or cannot be read."""
+    carried = 0.0
+    for path in _session_transcripts(ref, profile):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    if '"cost-state"' not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(record, dict) or record.get("type") != "cost-state":
+                        continue
+                    total = record.get("totalCostUSD")
+                    if isinstance(total, (int, float)) and not isinstance(total, bool):
+                        carried = max(carried, float(total))
+        except OSError:
+            continue
+    return carried
+
+
+def _turn_cost(spent, carried: float):
+    """What a turn cost, from the total the harness reported and the total its
+    session carried in. A resumed session reports its whole running total, so
+    what it carried is taken off; a total below what was carried means the
+    session did not restore it, and the total is the turn's own."""
+    if spent is None or not carried or spent < carried:
+        return spent
+    return round(spent - carried, 10)
 
 
 _CONTINUATION = """Task {key}: the turn you were running on it in this session, as the worker `{worker}`, was cut off before it reached an ending of its own ({why}). This is a new turn on the same task under a new raise, continuing this session.
@@ -11216,6 +11260,7 @@ def cmd_run(entry, args: list[str]) -> None:
         # A raise of another worker is never continued: that one is a handoff.
         previous = held.get("previous")
         resumed = fell_back = None
+        carried = 0.0
         if claude and _cut_off(previous) and previous.get("run_system") == "claude" \
                 and previous.get("run_ref"):
             if _session_kept(previous["run_ref"], worker["profile"]):
@@ -11232,6 +11277,9 @@ def cmd_run(entry, args: list[str]) -> None:
         # the beat's pace, and the model as soon as the harness names it.
         progress = _Progress(entry, execution, every)
         if resumed:
+            # What the session had cost before this turn, taken before it runs:
+            # the harness reports the resumed session's whole total as its cost.
+            carried = _session_carried(resumed["run_ref"], worker["profile"])
             _record_run(entry, execution, "claude", resumed["run_ref"])
             result, elapsed_ms = _boot(worker, _continuation(worker, task, resumed),
                                        execution, _project_here(),
@@ -11248,6 +11296,7 @@ def cmd_run(entry, args: list[str]) -> None:
                              f"raise {resumed['id']} failed at launch ({why}), so this "
                              "turn started a fresh session with the whole frame.")
                 resumed = None
+                carried = 0.0
                 _record_run(entry, execution, "claude", pinned)
         if not resumed:
             result, elapsed_ms = _boot(worker, prompt, execution, _project_here(), session,
@@ -11281,7 +11330,8 @@ def cmd_run(entry, args: list[str]) -> None:
                 report["taken_in"] = taken
         # What the turn cost is kept whenever the harness reported it, on every path:
         # a turn stopped by the account's limit after real work still spent that.
-        measured = (("cost_usd", result.cost_usd), ("duration_ms", result.duration_ms),
+        cost = _turn_cost(result.cost_usd, carried)
+        measured = (("cost_usd", cost), ("duration_ms", result.duration_ms),
                     ("num_turns", result.num_turns), ("elapsed_ms", elapsed_ms),
                     ("model", result.model))
         metrics = {k: v for k, v in measured if v is not None}
@@ -11320,10 +11370,10 @@ def cmd_run(entry, args: list[str]) -> None:
                          if one)
         _close(entry, execution, outcome, said or None,
                result.harness, pointer, metrics, tid, report)
-        if result.cost_usd is not None and not _foreign(landing):
+        if cost is not None and not _foreign(landing):
             # Another project's task keeps its own metadata; what this turn cost
             # stays on the raise.
-            report["cost_total"] = _accumulate_cost(entry, tid, result.cost_usd)
+            report["cost_total"] = _accumulate_cost(entry, tid, cost)
         # Every raise leaves exactly one entry, including a raise that did nothing. A
         # task picked up that left no trace is indistinguishable from one never
         # picked up, and telling those apart is how a stalled queue is noticed.

@@ -2194,6 +2194,42 @@ def test_a_cut_off_raise_is_resumed_by_the_same_worker(project, store, monkeypat
     assert second["detail"] is None
 
 
+@needs_store
+def test_a_resumed_raise_records_only_what_it_cost(project, store, monkeypatch, capsys):
+    entry, schema, conn = store
+    _todo(entry, capsys, "t-cost")
+
+    def resumed(execution, session):
+        _as_raise(monkeypatch, capsys, execution,
+                  (mod.cmd_set, (entry, ["t-cost", "--status", "complete"])))
+        # The harness reports the resumed session's whole running total.
+        return Result(ok=True, harness="claude", session_id=session.id,
+                      model="m", cost_usd=1.96, duration_ms=10, num_turns=1)
+
+    _turns(monkeypatch, _cut(entry, monkeypatch, capsys, "t-cost"), resumed)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(project / "claude-config"))
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    _answer(capsys)
+    [first] = _raises(entry, capsys, "t-cost")
+    assert first["metrics"]["cost_usd"] == 0.5
+    _keep_session(project, monkeypatch, first["run_ref"])
+    transcript = next((project / "claude-config" / "projects").glob(
+        f"*/{first['run_ref']}.jsonl"))
+    transcript.write_text("{}\n" + json.dumps({"type": "cost-state",
+                                               "totalCostUSD": 0.5}) + "\n")
+    _cooled(conn, schema)
+
+    mod.cmd_run(entry, ["implementation", "--apply"])
+    report = _answer(capsys)
+    assert report["resumed_from"] == str(first["id"])
+    [_first, second] = _raises(entry, capsys, "t-cost")
+    assert second["metrics"]["cost_usd"] == pytest.approx(1.46)
+    assert report["cost_total"] == pytest.approx(1.96)
+    mod.cmd_list(entry, ["--status", "complete"])
+    [row] = [t for t in _answer(capsys)["tasks"] if t["unique_key"] == "t-cost"]
+    assert row["runs"]["cost_usd"] == pytest.approx(1.96)
+
+
 def _abandoned_raise(entry, conn, schema, worker, ref):
     """A raise of `worker` whose lease lapsed and that a claim closed, as a
     killed turn leaves one, long enough ago that its task's cool-down is over."""
