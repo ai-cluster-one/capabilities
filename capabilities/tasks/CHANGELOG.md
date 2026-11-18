@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-18 — A task picked up too many times in its life goes to a person, also with a chain
+
+In a project that sets an escalation chain, a worker's claim no longer takes a task that has been picked up, over its whole life, as many times as three times that worker's `limits.attempts`: it escalates it instead to the chain's last name, a person, `waiting`, with the trail entry saying it was picked up that many times and went around too many times. The count takes every raise of the task that ended, by any worker and from any place, except the raises that spend no attempt - `exhausted`, `waiting`, `missing` - and no move resets it, so a task passed round the workers at every turn, whose attempts in place never reach the limit, now stops. Only that task leaves the conveyor; every other task keeps running. The per-place count is unchanged: raises in place reaching `limits.attempts` still move the task one name along the chain. A task assigned to a person is still never escalated. A project without a chain parks as before. No verb, flag or JSON key is removed or renamed.
+
 ## 2026-11-18 — Every raise records the tokens its turn used
 
 A conveyor turn's raise records in its metrics, under `tokens`, the token counts the harness reported for the turn, in the runner's names: `input`, `output`, `cache_read` and `cache_creation`, each left out when the harness did not report it, and `tokens` left out when it reported none. A codex turn, which reports no price, now shows what it used: its `cost_usd` stays absent, and its `tokens` carries `input`, `output` and `cache_read`. A claude turn records its `cost_usd` as before and gains the same counts. A task's `cost_total`, its `runs.cost_usd` and `without_cost`, and `--sort cost` are unchanged: they read `cost_usd` alone. Raises recorded before this release keep the metrics they recorded. No verb, flag or JSON key is removed or renamed.

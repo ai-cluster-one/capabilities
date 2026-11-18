@@ -249,7 +249,8 @@ ONE TURN OF THE CONVEYOR
   for the shipped after-raise handlers; neither writes anything to the task.
   At the ceiling the task is handed back to a person instead of dispatched
   again; in a project that sets an escalation chain, attempts count raises in
-  place instead and the claim escalates the task rather than take it, as
+  place instead, a lifetime limit of three times them counts raises over the
+  task's whole life, and the claim escalates the task rather than take it, as
   ESCALATION states. A task parked because its worker names a routine or a
   profile that is not there is marked `missing` and does not spend it either.
 
@@ -356,7 +357,9 @@ WORKERS
     limits:                       # optional, every one of them
       attempts: 3                 # raises that did work before it is parked;
                                   # with an escalation chain, raises in place
-                                  # before it is escalated - see ESCALATION
+                                  # before it is escalated, and three times as
+                                  # many raises in its life before it goes to
+                                  # a person - see ESCALATION
       lease_seconds: 11400        # default: the profile's timeout plus 600
       cool_down_seconds: 60       # after a raise that left the task where it
                                   # was, before a claim takes it again
@@ -834,10 +837,13 @@ ESCALATION
   falsely. Without a chain nothing is recorded.
 
   A worker's claim (`run`, by hand or by the service) escalates a task it was
-  about to take, instead of taking it, in three cases:
+  about to take, instead of taking it, in four cases:
 
-    its raises in place have reached the worker's `limits.attempts`; this is
-    counted before its `before` hook is asked
+    it has been picked up, over its whole life, as many times as the lifetime
+    limit - three times the worker's `limits.attempts`; it goes to the chain's
+    last name, a person, and the entry says it went around too many times
+    its raises in place have reached the worker's `limits.attempts`; this and
+    the lifetime limit are counted before its `before` hook is asked
     its `before` hook holds it back, has held it back in this place for
     longer than `stall_after`, and the worker's lane has started or ended no
     raise in this project for `stall_after`
@@ -854,7 +860,12 @@ ESCALATION
   `service status` shows how long its oldest due task has waited. A task
   assigned to a person is never escalated by these rules. With a chain,
   `limits.attempts` counts raises in place and the whole-life count that
-  parks a task is not applied.
+  parks a task is not applied; the lifetime limit counts instead. Every move
+  starts a place again, so a task passed round the workers at each turn never
+  reaches its attempts in place, and the lifetime limit is what ends that
+  circle: it counts every raise of the task that ended, by any worker and from
+  any place, except those that spend no attempt, and no move resets it. It
+  takes the one task off the conveyor; every other task keeps running.
 
   To escalate is to move the task: to `waiting`, its pickup and its
   `blocked_by` let go, assigned to the name after its assignee in the chain,
@@ -5506,8 +5517,7 @@ def _escalated_instead(cur, escalation: dict | None, task: dict,
     if not escalation or _foreign(task):
         return None
     facts = _in_place(cur, str(task["id"]))
-    why = _attempts_reason(escalation, task, facts)
-    target = _escalation_target(escalation, task.get("assignee")) if why else None
+    target, why = _claim_escalation(escalation, task, facts)
     if target is None:
         return None
     return _escalate(cur, task, target, why, facts, project)
@@ -6079,11 +6089,19 @@ def _in_place_sql() -> str:
 def _in_place(cur, tid: str) -> dict:
     """place_since, refused_since, raises_in_place, held_since and how many
     seconds the task has been held back since then by the store's clock, for
-    one task."""
+    one task, and raises_in_life: every raise of the task, by any worker and
+    from any place, that has ended and was an attempt at the work - none marked
+    with what `_UNSPENT_MARKS` names."""
+    unspent = ", ".join(f"'{mark}'" for mark in _UNSPENT_MARKS)
     cur.execute(f"""select pl.place_since, rf.refused_since, rf.raises_in_place,
                            rf.held_since,
                            extract(epoch from now() - rf.held_since)::bigint
-                             as held_seconds
+                             as held_seconds,
+                           (select count(*) from {SCHEMA}.tasks_executions e
+                             where e.task_id = t.id and e.status <> 'running'
+                               and {_a_raise()}
+                               and not (e.metrics ?| array[{unspent}]))
+                             as raises_in_life
                       from {SCHEMA}.tasks_tasks t {_in_place_sql()}
                      where t.id::text = %s""", (tid,))
     return _rows(cur)[0]
@@ -6109,6 +6127,42 @@ def _span(seconds) -> str:
     if seconds >= 60:
         return f"{seconds // 60}m"
     return f"{seconds}s"
+
+
+# How many times one task may be picked up over its whole life, as a multiple of
+# the attempts of the worker about to pick it up, in a project with a chain.
+# Attempts there count in place, and every move starts the place again, so a
+# task passed round its workers would never reach them; this count no move
+# resets.
+_LIFETIME_FACTOR = 3
+
+
+def _claim_escalation(escalation: dict, task: dict, facts: dict) -> tuple:
+    """Whom a claim escalates this task to instead of taking it, and why; (None,
+    None) takes it. Picked up as many times in its life as the lifetime limit,
+    it goes to the chain's last name, a person; otherwise its raises in place
+    reaching the worker's attempts move it one name along."""
+    why = _lifetime_reason(escalation, task, facts)
+    if why:
+        return escalation["escalate_to"][-1], why
+    why = _attempts_reason(escalation, task, facts)
+    target = _escalation_target(escalation, task.get("assignee")) if why else None
+    return (target, why) if target else (None, None)
+
+
+def _lifetime_reason(escalation: dict, task: dict, facts: dict) -> str | None:
+    """Why a claim sends this task to the end of the chain instead of taking it:
+    it has been picked up, over its whole life, as many times as the lifetime
+    limit - `_LIFETIME_FACTOR` times the worker's `limits.attempts`."""
+    if _is_person(task.get("assignee"), escalation):
+        return None
+    limit = _LIFETIME_FACTOR * escalation["attempts"]
+    if int(facts.get("raises_in_life") or 0) < limit:
+        return None
+    return (f"picked up {facts['raises_in_life']} times in its life, and worker "
+            f"{escalation['worker']!r} allows {limit} ({_LIFETIME_FACTOR} times its "
+            f"{escalation['attempts']} attempts); it went around too many times, so it "
+            "leaves the conveyor for a person")
 
 
 def _attempts_reason(escalation: dict, task: dict, facts: dict) -> str | None:
@@ -10060,8 +10114,7 @@ def _would_escalate(cur, escalation: dict, task: dict) -> dict | None:
     if _foreign(task):
         return None
     facts = _in_place(cur, str(task["id"]))
-    why = _attempts_reason(escalation, task, facts)
-    target = _escalation_target(escalation, task.get("assignee")) if why else None
+    target, why = _claim_escalation(escalation, task, facts)
     if target is None:
         return None
     return {"task": _address(task), "task_id": str(task["id"]), "to": target, "why": why}

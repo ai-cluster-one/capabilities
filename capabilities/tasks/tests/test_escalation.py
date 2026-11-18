@@ -636,6 +636,53 @@ def test_key_at_the_attempts_ceiling_escalates_and_says_so(project, store, turns
     assert shown(entry, capsys, "t-key")["task"]["status"] == "waiting" and turns == []
 
 
+def moved_after(conn, schema: str, key: str, minutes: float) -> None:
+    """The task was handed on `minutes` ago, after its raises: a move of its
+    assignee to alpha, so its place starts again then."""
+    conn.execute(f"""insert into {schema}.tasks_changes
+                       (task_id, field, old_value, new_value, actor, changed_at)
+                     select id, 'assignee', 'supervisor', 'alpha', 'supervisor',
+                            now() - make_interval(mins => %s)
+                       from {schema}.tasks_tasks where unique_key = %s""", (minutes, key))
+    conn.execute(f"update {schema}.tasks_tasks set assignee = 'alpha' where unique_key = %s",
+                 (key,))
+
+
+@needs_store
+def test_a_task_passed_round_past_its_lifetime_goes_to_the_person(project, store, turns,
+                                                                  capsys):
+    """Every move starts the place again, so attempts in place never stop a
+    task handed on at each turn; picked up three times the attempts in its
+    life, it goes to the chain's last name, and the next task is still taken."""
+    entry, schema, conn = store
+    supervised(project)
+    conveyor(project)
+    tid = add(entry, capsys, "t-circle")
+    aged(conn, schema, "t-circle", 3)
+    raised(conn, schema, "t-circle", 9, hours_ago=2)
+    moved_after(conn, schema, "t-circle", 90)
+    # One short of the limit: an exhausted raise spends no attempt.
+    add(entry, capsys, "t-other")
+    aged(conn, schema, "t-other", 3)
+    raised(conn, schema, "t-other", 9, exhausted=1, hours_ago=2)
+    moved_after(conn, schema, "t-other", 90)
+    with mod._connect(entry) as c, c.cursor() as cur:
+        facts = mod._in_place(cur, tid)
+    assert facts["raises_in_place"] == 0 and facts["raises_in_life"] == 9
+    mod.cmd_run(entry, ["alpha", "--apply"])
+    report = answer(capsys)
+    [moved] = report["escalated"]
+    assert moved["task"] == "t-circle" and moved["to"] == "owner"
+    assert "picked up 9 times in its life" in moved["why"]
+    assert "went around too many times" in moved["why"]
+    assert report["claimed"] == "t-other" and turns == ["t-other"]
+    task = shown(entry, capsys, "t-circle")["task"]
+    assert (task["status"], task["assignee"]) == ("waiting", "owner")
+    [scan] = [one for one in trail(entry, capsys, "t-circle") if one["actor"] == "tasks:scan"]
+    assert "Escalated from alpha to owner" in scan["description"]
+    assert "went around too many times" in scan["description"]
+
+
 @needs_store
 def test_without_the_settings_attempts_count_as_before(project, store, stubborn, capsys):
     """No chain: raises in place escalate nothing, and the whole-life count
