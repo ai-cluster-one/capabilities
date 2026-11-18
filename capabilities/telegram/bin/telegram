@@ -1509,7 +1509,15 @@ async def iter_all_dialogs(client: TelegramClient, limit: int | None = None):
 async def resolve_chat(client: TelegramClient, chat: str):
     try:
         if chat.lstrip("-").isdigit():
-            return await client.get_entity(int(chat))
+            try:
+                return await client.get_entity(int(chat))
+            except ValueError:
+                # A fresh process has no access hash cached for a bare id;
+                # the dialog list carries the entity `chats` printed it from.
+                async for dialog in iter_all_dialogs(client):
+                    if dialog.id == int(chat):
+                        return dialog.entity
+                raise
         if chat.startswith("@") or chat.startswith("+"):
             return await client.get_entity(chat)
         lowered = chat.lower()

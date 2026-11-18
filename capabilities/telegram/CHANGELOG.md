@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-18 — A numeric id that `chats` lists resolves in a fresh process
+
+`read`, `send` and every other verb that takes a chat died `chat_not_found` on a numeric id the process had not met yet, so an untitled user chat with no @username, which `chats` lists by id alone, could not be reached at all. When Telegram's entity cache does not know the id, the chat is now looked up by id in the dialog list, the main list and the archive; an id no dialog carries still exits 3 `chat_not_found`. @username, +phone and title resolution are unchanged; no verb, flag or JSON key changes.
+
 ## 2026-11-17 — Gemini Live hands work over as GPT Live does, a call's worker stays open for the call, and the greeting waits for the phone
 
 A Gemini Live call with the project's worker behind it - every call the service answers - now declares one tool, `delegate`, in place of `agent_task`, `send_to_chat`, `run_capability`, `read_project_file` and `reload_service`: it takes no arguments, runs non-blocking, and hands the worker the call so far under the same request GPT Live's hand-over uses, so `tools` is not read on such a call, as it is not on GPT Live. The log says `voice: tools declared — delegate`. Its answer to the tool asks the model for nothing, since it has already said it is on it, and with nothing said yet it tells the model to ask the caller. The mechanism the model is told ships as `service/gemini/prompts/delegation.md` and is read after the project's own voice prompt, as GPT Live's is; a project with no Gemini voice prompt is still not answered. **This is a change a consumer sees:** a project that enabled those tools for Gemini calls no longer has them on a call; the worker does that work.

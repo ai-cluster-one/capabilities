@@ -700,6 +700,32 @@ class OutboundActionsTests(unittest.TestCase):
 
         self.assertIs(entity, archive[1].entity)
 
+    def test_resolve_by_numeric_id_finds_an_untitled_chat_in_the_dialogs(self):
+        """gh-125: `chats` lists an untitled, username-less user chat by id,
+        and `read <that id>` died `chat_not_found` because a fresh process's
+        entity cache cannot resolve a bare id."""
+        main, archive = self._two_folders()
+        untitled = _dialog(5001, "", _entity("User", bot=False))
+        client = _DialogClient(main + [untitled], archive, folderless=main[:2])
+
+        async def get_entity(_peer):
+            raise ValueError("Could not find the input entity")
+        client.get_entity = get_entity
+        cli = import_cli()
+
+        entity = asyncio.run(cli.resolve_chat(client, "5001"))
+        self.assertIs(entity, untitled.entity)
+        entity = asyncio.run(cli.resolve_chat(client, "11"))
+        self.assertIs(entity, archive[1].entity)
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr), \
+                self.assertRaises(SystemExit) as stopped:
+            asyncio.run(cli.resolve_chat(client, "999999"))
+        self.assertEqual(stopped.exception.code, 3)
+        self.assertEqual(json.loads(stderr.getvalue())["error"]["code"],
+                         "chat_not_found")
+
     def test_resolve_by_title_keeps_the_most_recent_match_first(self):
         """An ambiguous title resolves to the match nearest the top of the
         whole listing, not to the main list ahead of the archive."""
