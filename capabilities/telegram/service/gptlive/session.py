@@ -45,6 +45,7 @@ import threading
 import time
 import traceback
 from array import array
+from urllib.parse import urlsplit
 
 try:
     import resource
@@ -338,10 +339,14 @@ class VoiceCallSession:
                  agent_track=None, task_runner=None, send_to_chat=None,
                  capability_runner=None, file_reader=None, on_stream_end=None,
                  reload_service=None, greeting=None, assistant_name=None,
-                 progress_interval=common.DEFAULT_PROGRESS_INTERVAL, log=print):
+                 progress_interval=common.DEFAULT_PROGRESS_INTERVAL, log=print,
+                 base_url=None):
         self._calls = calls
         self._chat_id = chat_id
         self._api_key = api_key
+        # The endpoint the project's OPENAI_BASE_URL names, such as the EU one;
+        # None keeps the SDK's own.
+        self._base_url = base_url
         self._model = resolve_model(model, log)
         self._voice = resolve_voice(voice, log)
         self._system_instruction = system_instruction
@@ -782,7 +787,15 @@ class VoiceCallSession:
         rings, so the caller never waits on it after the pickup."""
         from openai import AsyncOpenAI
 
-        self._client = AsyncOpenAI(api_key=self._api_key)
+        if self._base_url:
+            self._client = AsyncOpenAI(api_key=self._api_key,
+                                       base_url=self._base_url)
+            # The host and nothing else: the URL is the project's to name, and
+            # the log is not where it, or the key, is repeated.
+            host = urlsplit(self._base_url).hostname or "(no host)"
+            self._log(f"gpt-live: endpoint {host}")
+        else:
+            self._client = AsyncOpenAI(api_key=self._api_key)
         running = asyncio.create_task(self._run_session())
         self._tasks.append(running)
         # The session can end before it is ready - the caller hung up while

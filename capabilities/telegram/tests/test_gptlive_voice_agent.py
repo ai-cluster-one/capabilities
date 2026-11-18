@@ -616,6 +616,48 @@ class PrepareBeforePickupTests(unittest.TestCase):
         self.assertEqual([name for name, _ in live.said][:2], ["start", "commentary"])
 
 
+class EndpointTests(unittest.TestCase):
+    """OPENAI_BASE_URL names the endpoint a call is reached at, such as the EU
+    one; unset, the client is built as it always was. The log names the host
+    and never the key."""
+
+    def _connect(self, **overrides):
+        live = FakeLive()
+        built, lines = [], []
+        with fake_runtime_modules():
+            module = import_gptlive()
+            Client = live.client()
+
+            class Recording(Client):
+                def __init__(client, **kwargs):
+                    built.append(kwargs)
+                    super().__init__(**kwargs)
+
+            sys.modules["openai"].AsyncOpenAI = Recording
+
+            async def run():
+                session = build_session(module, log=lambda line: lines.append(str(line)),
+                                        **overrides)
+                await session.connect_agent()
+                await live.events.put(None)
+                await session.stop()
+
+            asyncio.run(run())
+        return built, lines
+
+    def test_unset_keeps_the_client_as_it_was(self):
+        built, lines = self._connect()
+        self.assertEqual(built, [{"api_key": "test-key"}])
+        self.assertFalse([line for line in lines if "endpoint" in line])
+
+    def test_a_named_endpoint_is_the_one_dialled_and_only_its_host_is_logged(self):
+        built, lines = self._connect(base_url="https://eu.api.openai.com/v1")
+        self.assertEqual(built, [{"api_key": "test-key",
+                                  "base_url": "https://eu.api.openai.com/v1"}])
+        self.assertIn("gpt-live: endpoint eu.api.openai.com", lines)
+        self.assertFalse([line for line in lines if "test-key" in line])
+
+
 class SessionContractTests(unittest.TestCase):
     """What the daemon reads off a session when a call ends.
 

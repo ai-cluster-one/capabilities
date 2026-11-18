@@ -2567,6 +2567,10 @@ OPENAI_SECRET_ENV = ((CONNECTION_ENTRY or {}).get("openai_secret_env")
 # Which environment name holds the key each speech stack answers to. The
 # connection names them, so a project that keeps its keys elsewhere says so once.
 VOICE_SECRET_ENVS = {"gemini": GEMINI_SECRET_ENV, "gptlive": OPENAI_SECRET_ENV}
+# The endpoint a speech stack is reached at, where a project may name its own
+# (OpenAI's EU endpoint, for a key made in an EU project), resolved like its
+# key. Unset, the stack's SDK keeps its own endpoint.
+VOICE_ENDPOINT_ENVS = {"gptlive": "OPENAI_BASE_URL"}
 
 
 NAME = "telegram"
@@ -10684,6 +10688,9 @@ async def run_session(client):
                 elsewhere=lambda: voice_tasks_running.get(str(caller_id), 0) > 0,
             )
             spec = voice_agent.provider(policy.get("provider"))
+            endpoint_env = VOICE_ENDPOINT_ENVS.get(getattr(spec, "NAME", None))
+            endpoint = (await asyncio.to_thread(_env_value, endpoint_env)
+                        if endpoint_env else None)
             session = spec.VoiceCallSession(
                 calls,
                 caller_id,
@@ -10718,6 +10725,7 @@ async def run_session(client):
                 on_stream_end=lambda: end_call_after_stream_loss(caller_id),
                 progress_interval=VOICE_PROGRESS_INTERVAL,
                 log=log,
+                **({"base_url": endpoint} if endpoint else {}),
             )
             active_voice_call.update({
                 "session": session,

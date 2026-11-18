@@ -1532,7 +1532,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "317e13b3758d869b0c0e218a0c7837f78a34a79c08b008a166471ea678427aab",
+      "payload_sha256": "bea002cbc1626f8f5008af36aaf7a9e25a6529b1e69a46ee0ac55eb37a52632b",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
@@ -1548,7 +1548,7 @@
           "title": "Telegram"
         }
       },
-      "version": "2026-11-18 — `telegram call hangup` ends the running voice call, and a call's backend uses it when the caller says goodbye"
+      "version": "2026-11-18 — A GPT Live call can be reached at the endpoint `OPENAI_BASE_URL` names, such as OpenAI's EU endpoint"
     },
     "telegrambot": {
       "executable": [

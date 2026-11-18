@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-18 — A GPT Live call can be reached at the endpoint `OPENAI_BASE_URL` names, such as OpenAI's EU endpoint
+
+`OPENAI_BASE_URL`, resolved like `OPENAI_API_KEY` (the project's env files, the environment or the agent's vault), now sets the endpoint a GPT Live call is opened at: `https://eu.api.openai.com/v1` opens its socket on `eu.api.openai.com`, which answers only a key made in a project with EU data residency. The session logs `gpt-live: endpoint <host>`, the host alone. Unset, the client is built as before and nothing is logged. Gemini calls are unchanged; no verb, flag, setting or JSON key changes.
+
 ## 2026-11-18 — `telegram call hangup` ends the running voice call, and a call's backend uses it when the caller says goodbye
 
 A new verb, `telegram call hangup [--chat ID] [--timeout S]`, ends the voice call the running service holds. It reaches the daemon the way `service reload` does, through the account's owner record: it writes `call-hangup.json` into the account's control directory and sends SIGUSR1, and the daemon answers under `call_hangup` in its health file. The answer comes at once - `{"hangup": "scheduled", "chat_id": ...}` - and the daemon ends the call itself once the line is quiet: no task running or waiting to be spoken, the voice silent and no audio left to play, for 2 s after the agent has spoken again (6 s where it says nothing), and after 30 s at most. The ending is the ordinary one (`stop_reason` `hangup_requested`), so the recording and the summary still arrive. With no call running, or none in the chat `--chat` names, it exits 5 `no_active_call`. A daemon advertises that it reads the signal with `call_hangup_signal` in its health file; one that does not, started from an older bundle, is never signalled, and the verb exits 6 `call_hangup_unsupported`. Inside a service turn the verb ends only that turn's own chat's call (`--chat` naming another is exit 4 `chat_scope_denied`).
