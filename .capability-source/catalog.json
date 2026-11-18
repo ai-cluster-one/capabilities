@@ -1409,7 +1409,7 @@
       "level": 0,
       "lucide_icon": "list-checks",
       "path": "capabilities/tasks",
-      "payload_sha256": "e5ca7898e54c94d6db99bf5c47c218f7b22fe0a1386d3918925d958f705c886d",
+      "payload_sha256": "18fbd45965db064ed0ab4f65815da3cc4ac79a57d1ca7d8578ea065d390ff88a",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
@@ -1425,7 +1425,7 @@
           "title": "Задачи"
         }
       },
-      "version": "2026-11-18 — A resumed raise records what it cost, not the session's running total"
+      "version": "2026-11-18 — The Mac hold keeps a turn out of idle sleep only"
     },
     "teams": {
       "executable": [

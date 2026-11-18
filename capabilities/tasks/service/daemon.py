@@ -99,7 +99,10 @@ runs, and nothing else here does: beside each turn it starts, and each it
 adopts, the daemon starts `caffeinate -i -w` on the turn's pid, which holds the
 assertion until that process ends. The holder runs in a session of its own, so
 it outlives the daemon as the turn does, and the daemon lets go of it when the
-turn ends. Elsewhere no assertion is taken.
+turn ends. Elsewhere no assertion is taken. Idle sleep is all it holds off: a
+Mac that sleeps because its lid closed on battery, or that goes back to sleep
+after a DarkWake with the lid closed on battery, sleeps under a running turn
+all the same, and no assertion a process may take prevents that.
 """
 
 from __future__ import annotations

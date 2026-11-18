@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-18 — The Mac hold keeps a turn out of idle sleep only
+
+The assertion the tasks service holds for a conveyor turn on macOS keeps the machine from idling into sleep and does nothing more; the entry of 2026-10-10 said it kept a turn from being cut off by the Mac sleeping, and now says idle sleep. A Mac that sleeps for another reason still sleeps under a running turn: closing the lid on battery, and the return to sleep after a DarkWake with the lid closed on battery, are not held off by `caffeinate -i`, and no assertion a process may take holds them off, since the system-sleep assertion is honoured only on AC power. A turn whose lease runs out during such a sleep loses its raise as any other cut-off turn does; keep the Mac on power while turns run with the lid closed. Nothing the service does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-18 — A resumed raise records what it cost, not the session's running total
 
 A raise that resumes a cut-off claude session records in its `cost_usd` only what that turn cost. The harness reports a resumed session's whole running total, which the session's transcript carries over from the turns before; the run now reads that carried total, the highest `cost-state` total in the transcript, before the turn starts and takes it off the reported total. A task's `cost_total`, its `runs.cost_usd` and `--sort cost` no longer count the earlier turns a second time. A transcript that carries no total, or a reported total below the carried one, records the reported total as before; a fresh turn and a resume that falls back to a fresh session record their full cost as before. Raises recorded before this release keep the cost they recorded. No verb, flag or JSON key changes.
@@ -242,7 +246,7 @@ Every raise records the worker version it was claimed under in the new column `t
 
 ## 2026-10-10 — On a Mac a running turn keeps the machine out of idle sleep
 
-On macOS the tasks service holds an idle-sleep assertion for the life of every conveyor turn it starts, and of every turn it adopts after a restart, so a turn is not cut off by the Mac sleeping. Beside each turn it runs `/usr/bin/caffeinate -i -w <turn pid>` in a session of its own, which lets go the moment the turn's process ends, and the service also ends it when it sees the turn end or cuts it off. While no turn runs nothing is held, and on any other platform no assertion is taken.
+On macOS the tasks service holds an idle-sleep assertion for the life of every conveyor turn it starts, and of every turn it adopts after a restart, so a turn is not cut off by the Mac idling into sleep. Beside each turn it runs `/usr/bin/caffeinate -i -w <turn pid>` in a session of its own, which lets go the moment the turn's process ends, and the service also ends it when it sees the turn end or cuts it off. While no turn runs nothing is held, and on any other platform no assertion is taken.
 
 ## 2026-10-10 — Each project's store is resolved for that project, and a turn uses its daemon's
 
