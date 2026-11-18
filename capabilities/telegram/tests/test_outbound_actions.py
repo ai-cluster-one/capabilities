@@ -2383,5 +2383,75 @@ class JobRegisterProfileTests(unittest.TestCase):
         self.assertEqual((code, rows, error["code"]), (4, [], "job_scope_denied"))
 
 
+
+# A stand-in daemon: it sleeps, and with `answers` it reads SIGUSR1 the way the
+# service does and answers that no call is running.
+_STAND_IN = """
+import json, os, signal, sys, time
+health, control, answers = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+def on_usr1(*_):
+    request = json.load(open(os.path.join(control, "call-hangup.json")))
+    record = json.load(open(health))
+    record["call_hangup"] = {"request_id": request["request_id"],
+                             "status": "no_active_call"}
+    json.dump(record, open(health, "w"))
+if answers:
+    signal.signal(signal.SIGUSR1, on_usr1)
+print("ready", flush=True)
+time.sleep(30)
+"""
+
+
+class CallHangupCase(unittest.TestCase):
+    """`call hangup` signals only a daemon that says it reads the signal, and a
+    daemon holding no call is exit 5 no_active_call."""
+
+    def hang_up(self, advertises):
+        import subprocess
+        cli = import_cli()
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        control = Path(td.name) / "control"
+        control.mkdir()
+        health = Path(td.name) / "health.json"
+        daemon = subprocess.Popen(
+            [sys.executable, "-c", _STAND_IN, str(health), str(control),
+             "1" if advertises else "0"], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(daemon.kill)
+        self.assertEqual(daemon.stdout.readline().strip(), "ready")
+        record = {"pid": daemon.pid, "launch_nonce": "n"}
+        if advertises:
+            record["call_hangup_signal"] = 1
+        health.write_text(json.dumps(record))
+        live = {"owner": {"pid": daemon.pid, "launch_nonce": "n",
+                          "health_file": str(health)},
+                "owner_running": True, "control": {"control": control},
+                "connection": "lab"}
+        stderr = io.StringIO()
+        with mock.patch.object(cli, "_auth_context", return_value=None), \
+                mock.patch.object(cli, "_service_project_root",
+                                  return_value=Path(td.name)), \
+                mock.patch.object(cli, "_service_liveness", return_value=live), \
+                mock.patch.dict(os.environ, {"TELEGRAM_AUTHORIZED_CHAT_ID": ""}), \
+                contextlib.redirect_stderr(stderr), \
+                self.assertRaises(SystemExit) as stopped:
+            cli.cmd_call_hangup(None, None, 5.0)
+        return stopped.exception.code, json.loads(stderr.getvalue())["error"], \
+            daemon, control
+
+    def test_an_older_daemon_is_never_signalled(self):
+        code, error, daemon, control = self.hang_up(advertises=False)
+
+        self.assertEqual((code, error["code"]), (6, "call_hangup_unsupported"))
+        self.assertIsNone(daemon.poll())          # SIGUSR1 would have killed it
+        self.assertFalse((control / "call-hangup.json").exists())
+
+    def test_no_call_running_is_exit_5(self):
+        code, error, daemon, _ = self.hang_up(advertises=True)
+
+        self.assertEqual((code, error["code"]), (5, "no_active_call"))
+        self.assertIsNone(daemon.poll())
+
+
 if __name__ == "__main__":
     unittest.main()

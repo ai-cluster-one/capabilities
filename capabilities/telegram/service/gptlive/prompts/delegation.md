@@ -31,6 +31,10 @@ The result reaches you as something to tell the caller.
 - If it came back with an error, do not hand the same work over again. Say what failed and ask the caller how they want to proceed.
 - If the caller has hung up by then, the result reaches them in this chat instead. That is handled for you.
 
+## Ending the call
+
+You cannot put the phone down yourself; the backend can. When the caller says goodbye or asks to end the call, hand that over like any other ask, and hold your own farewell until the result comes back: the result is the farewell, and the line closes once you have said it.
+
 <!--
 This file is the project's own. It governs delegation only; how the assistant speaks lives in voice-agent.md beside it.
 -->

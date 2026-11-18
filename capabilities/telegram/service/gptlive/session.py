@@ -1236,6 +1236,17 @@ class VoiceCallSession:
         while self._close_reason is None and self._conn is not None:
             await asyncio.sleep(0.05)
 
+    def line_quiet(self):
+        """Whether nothing is under way on the line: no task running, handed
+        over or held back, nothing waiting to be spoken, the voice silent and no
+        audio left to play. A hang-up waits for this, so it never cuts off what
+        is being said."""
+        runner = self._task_runner
+        if runner is not None and (runner.running or not runner.completions.empty()):
+            return False
+        return (not self._delegations and not self._deferred and not self._speaking
+                and len(self._outbound) < AGENT_FRAME_BYTES)
+
     def conversation_tail(self, limit=60):
         """The call so far, shaped like the message tail a worker prompt renders.
 

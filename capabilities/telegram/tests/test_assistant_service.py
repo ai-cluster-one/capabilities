@@ -5857,6 +5857,46 @@ class ChannelPromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Report before you go deep.", prompt)
             self.assertNotIn("{{", prompt)
 
+    async def test_a_call_task_is_told_how_to_hang_up_and_a_dialogue_turn_is_not(self):
+        """The command that ends a call is a fact of the call's own task, stated
+        in the full prompt and in a resumed one, with the call's chat."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            line = (f'Hang-up command: {daemon.WORKER_BIN / "telegram"} '
+                    'call hangup --chat 5')
+
+            full = daemon.build_prompt([], {"chat_id": "5", "voice_task": "v1"})
+            resumed = daemon.build_prompt([], {
+                "chat_id": "5", "voice_task": "v2", "resume_session": "s",
+                "current_request": {"text": "go on"}})
+            dialogue = daemon.build_prompt([], {"chat_id": "5"})
+
+            self.assertIn(line, full)
+            self.assertIn("## Ending the call", full)
+            self.assertIn(line, resumed)
+            self.assertNotIn("Hang-up command:", dialogue)
+            self.assertNotIn("## Ending the call", dialogue)
+
+    async def test_the_daemon_advertises_the_hang_up_and_answers_without_a_call(self):
+        """`call hangup` signals only a daemon whose health says it reads the
+        signal; with no call held, the answer is no_active_call and the request
+        is consumed."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            daemon.write_health("healthy")
+            self.assertEqual(
+                json.loads(daemon.HEALTH_FILE.read_text())["call_hangup_signal"], 1)
+            daemon.CALL_HANGUP_FILE.parent.mkdir(parents=True, exist_ok=True)
+            daemon.CALL_HANGUP_FILE.write_text(json.dumps(
+                {"request_id": "r1", "chat_id": "5"}))
+
+            daemon.request_call_hangup()
+
+            answer = json.loads(daemon.HEALTH_FILE.read_text())["call_hangup"]
+            self.assertEqual((answer["request_id"], answer["status"]),
+                             ("r1", "no_active_call"))
+            self.assertFalse(daemon.CALL_HANGUP_FILE.exists())
+
     async def test_the_schema_admits_only_the_two_context_modes(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings())

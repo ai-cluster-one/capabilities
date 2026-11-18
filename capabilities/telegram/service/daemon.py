@@ -1194,6 +1194,8 @@ CONTROL_DIR = Path(os.environ.get("TELEGRAM_ACCOUNT_CONTROL_DIR") or EXPECTED_CO
 if CONTROL_DIR.resolve() != EXPECTED_CONTROL_DIR.resolve():
     sys.exit(f"account control dir mismatch: expected {EXPECTED_CONTROL_DIR}, got {CONTROL_DIR}")
 LOCK_FILE = CONTROL_DIR / "daemon.lock"
+# What `telegram call hangup` leaves for SIGUSR1 to read.
+CALL_HANGUP_FILE = CONTROL_DIR / "call-hangup.json"
 OWNER_FILE = CONTROL_DIR / "owner.json"
 OWNERSHIP_FILE = CONTROL_DIR / "ownership-v1.json"
 PID_FILE = SERVICE_STATE_DIR / "daemon.pid"
@@ -2303,6 +2305,9 @@ def write_health(state=None, **updates):
         "sync_interval_seconds": SYNC_INTERVAL,
         "stale_after_seconds": SYNC_STALE_AFTER,
         "telethon_version": getattr(telethon, "__version__", None),
+        # `telegram call hangup` signals SIGUSR1 only to a daemon that says it
+        # reads it: one that predates the handler would die of the signal.
+        "call_hangup_signal": 1,
         **_owner_provenance(),
         **updates,
     })
@@ -2387,6 +2392,33 @@ def reached_profile_problems(settings):
     with its position; empty when every one does."""
     active, project = turn_profiles()
     return profiles.check(settings, os.environ, active, project)
+
+
+# The live session's hang-up, set while a session runs: the signal arrives in
+# `main`, and the call it ends belongs to the session.
+CALL_HANGUP = {"handler": None}
+
+
+def request_call_hangup():
+    """SIGUSR1: read the request `telegram call hangup` left and hand it to the
+    live session, which answers under `call_hangup` in the health file."""
+    try:
+        request = json.loads(CALL_HANGUP_FILE.read_text())
+    except (OSError, ValueError) as exc:
+        log(f"call hangup: no readable request ({type(exc).__name__})")
+        return
+    with contextlib.suppress(OSError):
+        CALL_HANGUP_FILE.unlink()
+    if not isinstance(request, dict) or not request.get("request_id"):
+        log("call hangup: request without an id ignored")
+        return
+    handler = CALL_HANGUP["handler"]
+    if handler is None:
+        write_health(call_hangup={
+            "request_id": str(request["request_id"]), "status": "no_active_call",
+            "chat_id": request.get("chat_id"), "answered_at": now()})
+        return
+    handler(request)
 
 
 def reload_runtime_settings():
@@ -3852,6 +3884,25 @@ def call_task_description(text, tail=None):
     return f"Asked on a call: {line}" if line else "Asked on a call"
 
 
+# What a call's backend is told about ending the call, beside the project's own
+# backend prose; the command itself is a fact of the run (`voice_hangup_line`).
+VOICE_HANGUP_INSTRUCTION = (
+    "## Ending the call\n\n"
+    "You can end this call with the Hang-up command in the channel state. Use it "
+    "when the caller has said goodbye or asked to end the call and nothing they "
+    "asked for is unfinished. Run it first, then return only the farewell, one "
+    "short sentence in the caller's language. The line closes once it has been "
+    "said. If it is unclear, ask instead.")
+
+
+def voice_hangup_line(st):
+    """The run fact naming the command that ends this call, or None."""
+    if not st.get("voice_task") or st.get("chat_id") is None:
+        return None
+    return (f'Hang-up command: {WORKER_BIN / "telegram"} call hangup '
+            f'--chat {st["chat_id"]}')
+
+
 VOICE_TASK_DELIVERY = (
     "the caller is on a live phone call and your reply is read aloud to them — "
     "answer in one or two short spoken sentences, plain words only, no markdown, "
@@ -3872,6 +3923,13 @@ VOICE_FOLLOW_ON_REQUEST = (
 # playing what it receives.
 VOICE_GREET_WAIT = 3.0
 VOICE_GREET_SETTLE = 1.0
+
+# A hang-up waits for the line to be quiet this long once the agent has spoken
+# again (its farewell), this long where it has said nothing since, and never
+# longer than the last in all.
+CALL_HANGUP_QUIET = 2.0
+CALL_HANGUP_QUIET_UNVOICED = 6.0
+CALL_HANGUP_MAX_WAIT = 30.0
 
 VOICE_SUMMARY_DELIVERY = (
     "your reply is posted into the chat as the record of a call that just "
@@ -4817,6 +4875,8 @@ def resumed_prompt(st, tail=None):
         lines.append(f"Time: {st['now']}")
     if req.get("delivery"):
         lines.append(f"Delivery: {req['delivery']}")
+    if voice_hangup_line(st):
+        lines.append(voice_hangup_line(st))
     if _woken_by_gate(st):
         lines.append(_woken_by_gate(st))
     if lines:
@@ -4882,6 +4942,9 @@ def build_prompt(tail, state=None):
         backend = (st.get("voice_backend") or "").strip()
         if backend:
             context = f"{context}\n\n{backend}" if context else backend
+        if voice_hangup_line(st):
+            context = (f"{context}\n\n{VOICE_HANGUP_INSTRUCTION}" if context
+                       else VOICE_HANGUP_INSTRUCTION)
         # Delegation prose describes a capability that either exists for this
         # requester or does not, so it follows the register rather than the
         # room's prose choice.
@@ -4957,6 +5020,8 @@ def build_prompt(tail, state=None):
             f'{WORKER_BIN / "telegram"} progress "<one short line>"')
     if st.get("jobs_available"):
         lines.append(f'Jobs command: {WORKER_BIN / "telegram"} jobs')
+    if voice_hangup_line(st):
+        lines.append(voice_hangup_line(st))
     if st.get("quota_pause"):
         lines.append(f"Queue paused: {st['quota_pause']}")
     if _woken_by_gate(st):
@@ -10286,6 +10351,91 @@ async def run_session(client):
             stream_loss_finalisers.add(task)
             task.add_done_callback(stream_loss_finalisers.discard)
 
+        hangups = {"task": None, "session": None}
+
+        def hang_up_voice_call(request):
+            """`telegram call hangup`: answer at once, end the call once the
+            line is quiet.
+
+            The answer cannot wait for the ending: the one asking is usually
+            the call's own backend turn, whose farewell is what the line has to
+            carry first, and it is still running. So the hang-up waits until no
+            task runs, nothing is left to speak and the voice has been silent a
+            moment - after the agent has spoken again, or a longer moment where
+            it says nothing - and then goes through the ordinary ending, so the
+            recording and the summary follow as they do for any call."""
+            request_id = str(request["request_id"])
+            wanted = str(request.get("chat_id") or "").strip()
+            session = active_voice_call["session"]
+            caller_id = active_voice_call["caller_id"]
+            if (session is None or active_voice_call["finishing"]
+                    or (wanted and wanted != str(caller_id))):
+                write_health(call_hangup={
+                    "request_id": request_id, "status": "no_active_call",
+                    "chat_id": wanted or None, "answered_at": now()})
+                log(f"call hangup: no voice call to end"
+                    + (f" in chat {wanted}" if wanted else ""))
+                return
+            write_health(call_hangup={
+                "request_id": request_id, "status": "scheduled",
+                "chat_id": str(caller_id), "answered_at": now()})
+            if hangups["session"] is session and hangups["task"] is not None:
+                log(f"call hangup: already scheduled for {caller_id}")
+                return
+            log(f"call hangup: scheduled for {caller_id}; waiting for a quiet line")
+
+            async def _hang_up():
+                started = time.monotonic()
+                voiced = session.agent_voiced_frames
+                quiet_since = None
+                while time.monotonic() - started < CALL_HANGUP_MAX_WAIT:
+                    if active_voice_call["session"] is not session:
+                        return              # the call ended some other way
+                    if session.line_quiet():
+                        quiet_since = quiet_since or time.monotonic()
+                        quiet = time.monotonic() - quiet_since
+                        if quiet >= (CALL_HANGUP_QUIET
+                                     if session.agent_voiced_frames > voiced
+                                     else CALL_HANGUP_QUIET_UNVOICED):
+                            break
+                    else:
+                        quiet_since = None
+                    await asyncio.sleep(0.1)
+                else:
+                    log(f"call hangup: line not quiet after "
+                        f"{CALL_HANGUP_MAX_WAIT:g}s — ending anyway")
+                if active_voice_call["session"] is not session:
+                    return
+                log(f"call hangup: ending the call with {caller_id}")
+                # Only from here on is it an ending the session close has to
+                # wait for; while it waits for quiet, a close ends the call
+                # itself and this returns.
+                stream_loss_finalisers.add(asyncio.current_task())
+                try:
+                    await finish_voice_call("hangup_requested")
+                except Exception as exc:
+                    log(f"voice: could not end the call cleanly — "
+                        f"{type(exc).__name__}: {exc}")
+                    if active_voice_call.get("caller_id") == caller_id:
+                        active_voice_call["finishing"] = False
+                finally:
+                    try:
+                        await flush_call_summary()
+                    except Exception as exc:
+                        log(f"voice: could not flush the call summary — "
+                            f"{type(exc).__name__}: {exc}")
+
+            task = asyncio.create_task(_hang_up())
+            hangups.update({"task": task, "session": session})
+
+            def _done(done):
+                stream_loss_finalisers.discard(done)
+                if hangups["task"] is done:
+                    hangups.update({"task": None, "session": None})
+            task.add_done_callback(_done)
+
+        CALL_HANGUP["handler"] = hang_up_voice_call
+
         async def read_voice_project_file(wanted):
             """One project file, read for the caller. The project body names
             these; without this the call could only be told they exist."""
@@ -11535,6 +11685,7 @@ async def run_session(client):
         await disconnected_task
     finally:
         closing = True
+        CALL_HANGUP["handler"] = None
         # Stream-loss finalisation is deliberately detached from the Gemini
         # receiver so stop() cannot cancel its own caller. It is still owned by
         # this session: reconnect or shutdown waits for it, then finalises any
@@ -11698,6 +11849,8 @@ async def main():
             loop.add_signal_handler(sig, request_shutdown)
     with contextlib.suppress(NotImplementedError):
         loop.add_signal_handler(signal.SIGHUP, request_reload)
+    with contextlib.suppress(NotImplementedError):
+        loop.add_signal_handler(signal.SIGUSR1, request_call_hangup)
     lock_handle = None
     wrote_pid = False
     call_recorder_task = None

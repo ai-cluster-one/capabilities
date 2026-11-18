@@ -165,9 +165,10 @@ def pin_jobs_to_service_project(argv):
 
     A profile is the same: the settings that name the profile a room runs on
     are the daemon's, so a profile a worker saves or lists is the daemon
-    project's, wherever the turn runs.
+    project's, wherever the turn runs. So is a call: `call hangup` reaches the
+    daemon holding the call, through its project's connection.
     """
-    if argv[1:2] not in (["jobs"], ["profiles"]):
+    if argv[1:2] not in (["jobs"], ["profiles"], ["call"]):
         return
     root = os.environ.get("TELEGRAM_SERVICE_PROJECT_ROOT", "").strip()
     envelope = os.environ.get("TELEGRAM_SERVICE_PROJECT_ENVELOPE", "").strip()

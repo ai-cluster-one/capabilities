@@ -1588,6 +1588,16 @@ class VoiceCallSession:
         self._live = None
         return self.summary()
 
+    def line_quiet(self):
+        """Whether nothing is under way on the line: no task running or waiting
+        to be spoken, the model between turns and no audio left to play. A
+        hang-up waits for this, so it never cuts off what is being said."""
+        runner = self._task_runner
+        if runner is not None and (runner.running or not runner.completions.empty()):
+            return False
+        return (self._announcing is None and self._model_idle.is_set()
+                and len(self._outbound) < AGENT_FRAME_BYTES)
+
     def conversation_tail(self, limit=60):
         """The call so far, in the shape GPT Live hands its worker, so the daemon
         hands a call over the same way whichever provider holds it. Ids count

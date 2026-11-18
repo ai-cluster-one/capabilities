@@ -272,6 +272,24 @@ Commands:
                                                writes nothing; `unresolved`
                                                names a profile that does not
                                                resolve or fit.
+  telegram call hangup [--chat ID] [--timeout S]
+                                               End the voice call the running
+                                               service holds, after what is
+                                               already being said: the service
+                                               answers `scheduled` at once and
+                                               closes the line once it has been
+                                               quiet for a moment (at most
+                                               about 30 s), through the
+                                               ordinary ending, so the
+                                               recording and summary still
+                                               arrive. Exit 5 no_active_call
+                                               when no call runs (in that chat,
+                                               with --chat); exit 6
+                                               call_hangup_unsupported when the
+                                               running service predates it,
+                                               which is then never signalled.
+                                               Inside a service turn it ends
+                                               only that turn's own chat's call.
   telegram service doctor|run|start|reload|stop|status|logs
                                                Manage the bundled Telegram assistant
                                                service for this project. The engine
@@ -5409,6 +5427,91 @@ def _service_reload_result(connection_flag: str | None, session_flag: str | None
          "inspect `telegram service status` and `telegram service logs`")
 
 
+# The request `call hangup` leaves in the account's control directory for the
+# daemon to read on SIGUSR1, and the health field a daemon that reads it
+# advertises. A daemon that does not advertise it would die of the signal, so
+# it is never sent one.
+CALL_HANGUP_REQUEST = "call-hangup.json"
+CALL_HANGUP_SIGNAL_FIELD = "call_hangup_signal"
+
+
+def cmd_call_hangup(connection_flag: str | None, chat: str | None,
+                    timeout: float) -> dict:
+    """Ask the running daemon to end the voice call it is holding.
+
+    It reaches the daemon the way `service reload` does: through the
+    account-global owner record, after proving the PID by its health file. The
+    daemon answers at once that the hang-up is scheduled, and ends the call
+    itself once the line is quiet, through the ordinary ending, so the farewell
+    already queued is heard and the recording and summary still follow. Inside
+    a daemon-launched turn the call may only be the turn's own chat's."""
+    import signal
+
+    ctx = _auth_context()
+    if ctx and ctx.get("source") == "telegram":
+        own = str(ctx.get("chat_id") or "").strip()
+    else:
+        own = os.environ.get("TELEGRAM_AUTHORIZED_CHAT_ID", "").strip()
+    if own:
+        if chat and str(chat) not in (own, "current", "$current"):
+            _die(4, "chat_scope_denied",
+                 "a turn may end only its own chat's call",
+                 f"requested={chat}; current_chat_id={own}")
+        chat = own
+    elif chat in ("current", "$current"):
+        _die(6, "chat_required", "`current` names a chat only inside a service turn")
+    root = _service_project_root()
+    live = _service_liveness(root, connection_flag, None)
+    owner, control = live["owner"], live["control"]
+    if not isinstance(owner, dict) or not live["owner_running"] or not control:
+        _die(5, "service_not_running", "telegram service is not running",
+             "a call is held only by a running `telegram service`")
+    health_path = Path(str(owner.get("health_file") or ""))
+    health = _json_file(health_path)
+    pid = owner.get("pid")
+    if (not isinstance(pid, int)
+            or not isinstance(health, dict)
+            or health.get("launch_nonce") != owner.get("launch_nonce")
+            or health.get("pid") != pid):
+        _die(6, "service_provenance_mismatch",
+             "owner and health provenance do not match; refusing to signal a PID")
+    if not health.get(CALL_HANGUP_SIGNAL_FIELD):
+        _die(6, "call_hangup_unsupported",
+             "the running telegram service cannot be asked to hang up",
+             "it predates `telegram call hangup`; restart it on the current bundle")
+    request_id = secrets.token_hex(8)
+    _atomic_json(Path(control["control"]) / CALL_HANGUP_REQUEST, {
+        "schema": "telegram.call-hangup.v1",
+        "request_id": request_id,
+        "chat_id": str(chat) if chat else None,
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+    })
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except ProcessLookupError:
+        _die(5, "service_not_running", "telegram service exited before the hang-up")
+    except PermissionError as exc:
+        _die(6, "call_hangup_failed", f"cannot signal service process {pid}: {exc}")
+    deadline = time.time() + max(0.0, timeout)
+    while time.time() < deadline:
+        answer = (_json_file(health_path) or {}).get("call_hangup")
+        if isinstance(answer, dict) and answer.get("request_id") == request_id:
+            if answer.get("status") != "scheduled":
+                _die(5, "no_active_call",
+                     "no voice call is running" + (f" in chat {chat}" if chat else ""),
+                     "there is nothing to hang up")
+            return {"hangup": "scheduled", "chat_id": answer.get("chat_id"),
+                    "pid": pid, "connection": live["connection"],
+                    "note": "the call ends once the line is quiet, after what is "
+                            "already being said"}
+        if not _pid_alive(pid):
+            _die(5, "service_not_running", "telegram service exited during the hang-up")
+        time.sleep(0.05)
+    _die(5, "call_hangup_timeout",
+         f"telegram service did not acknowledge the hang-up within {timeout:g}s",
+         "inspect `telegram service logs`")
+
+
 def cmd_service_logs(connection_flag: str | None, session_flag: str | None,
                      tail: int) -> dict:
     root = _service_project_root()
@@ -5750,6 +5853,14 @@ def main() -> None:
     job_scope(jb.add_parser(
         "resume", help="continue stopped work, whatever stopped it"))
 
+    pcall = sub.add_parser("call", help="control the voice call the service holds")
+    call_sub = pcall.add_subparsers(dest="call_cmd", required=True)
+    hangup = call_sub.add_parser(
+        "hangup", help="end the running voice call once the line is quiet")
+    hangup.add_argument("--chat", help="the caller's chat id; refused unless it is the call's")
+    hangup.add_argument("--timeout", type=float, default=5.0,
+                        help="seconds to wait for the service to answer")
+
     psvc = sub.add_parser("service", help="manage the bundled assistant service")
     svc = psvc.add_subparsers(dest="service_cmd", required=True)
     svc.add_parser("init", help="create project-local service settings/context")
@@ -5884,6 +5995,9 @@ def main() -> None:
     if args.cmd == "prompts":
         # The prompts are rows in the store, so this never opens Telegram.
         _emit(cmd_prompts(args))
+        return
+    if args.cmd == "call":
+        _emit(cmd_call_hangup(connection_flag, args.chat, args.timeout))
         return
     if args.cmd == "service":
         if args.service_cmd == "init":
