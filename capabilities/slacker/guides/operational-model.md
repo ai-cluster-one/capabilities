@@ -1,14 +1,14 @@
 # Operational model
 
-`slacker` reads one Slack workspace as the person who links their own account, the way the `whatsapp` and `telegram` capabilities read as their vendor's own client. It lists the conversations that account can already see, reads their history and threads, keeps them in the project's Postgres store, syncs them forward, and captures them live. It never writes to Slack.
+`slacker` reads one Slack workspace as the person who links their own account, the way the `whatsapp` and `telegram` capabilities read as their vendor's own client. It lists the conversations that account can already see, reads their history and threads, keeps them in the project's Postgres store, syncs them forward, and captures them live. On a connection that grants writes it also writes as that person does in their own client: it sends, replies, edits, deletes, reacts, uploads, marks read and opens a DM.
 
 ## What it is
 
 A Slack web client holds a session as an `xoxc-` token for one workspace plus a `d` cookie shared across the person's workspaces. A program holding that pair is, to Slack, one more of the person's own browser sessions. `slacker` uses the pair exactly as the browser does, over the public Web API at `https://slack.com/api/<method>`, with the token as a bearer and the cookie beside it. There is no app to install, no admin approval, no bot, and no OAuth token. The session is the person's own; this capability adds no concealment, no monitoring bypass, and no client-identity spoofing.
 
-## What it reads, and only reads
+## What it reads
 
-The verb surface is small and entirely read-only:
+The read verbs:
 
 - `doctor` / `whoami` — prove the session (`auth.test`), the linked user, and the workspace, and check the connection's `team_id` / `expect_user` bindings.
 - `conversations` — list what the account can see: direct messages (`im`), group direct messages (`mpim`), and the public and private channels it belongs to.
@@ -18,7 +18,22 @@ The verb surface is small and entirely read-only:
 - `sync` — bring the store forward incrementally for every member conversation, or one named channel.
 - `service run` — hold the session's event stream and capture live.
 
-There is no verb that sends a message, sets presence, joins a channel, or marks anything read. `WRITE_VERBS` is empty and every connection reports `allow_write: false`, because nothing here writes to Slack at all.
+## What it writes
+
+The write verbs act as the person acts in their own Slack client, through the same Web API methods the web client calls, over the same session:
+
+- `send <channel> <text>` — send a message to a DM, group DM or channel (`chat.postMessage`); `--thread <ts>` replies in that thread and `--broadcast` also posts the reply to the channel. Text `-` is read from stdin.
+- `edit <channel> <ts> <text>` and `delete <channel> <ts>` — edit or delete one of the account's own messages (`chat.update`, `chat.delete`).
+- `react` and `unreact <channel> <ts> <emoji>` — add or remove the account's reaction (`reactions.add`, `reactions.remove`); asking for what already holds answers `changed: false`.
+- `upload <channel> <path>` — upload a file into the conversation, or a thread with `--thread`, posted with `--comment` (Slack's external upload: an upload URL, the bytes, then the completion into the conversation).
+- `mark <channel> [<ts>]` — mark the conversation read up to `ts`, by default its newest message (`conversations.mark`).
+- `open <user> [<user> ...]` — open the DM with one user, or the group DM with several (`conversations.open`), and answer its channel id.
+
+Every write verb is in `WRITE_VERBS`, and the contract's write gate refuses it with exit 4 on a connection that does not grant writes. A connection grants nothing by default (`allow_write: false`); a person grants one with `capabilities set slacker grant <connection> '{"allow_write": true}'` inside the project. A write Slack itself refuses — a message that is not the account's own, an archived conversation, an unknown emoji — exits 6 naming Slack's reason.
+
+What a write changes lands in the store the way the live capture records the same act arriving as an event: a sent message or reply is a `live` row keyed by its `ts`, and a reply raises its stored parent's reply count; an edit moves the stored text and edited time, keeping the message's thread and reactions; a deletion sets the soft `deleted` flag; a reaction moves the message's reactions map; an opened conversation is a conversation row. A read mark is not captured, so `mark` writes nothing to the store. When the capture service is running it also receives the event, and the `ts` key means the row is never doubled.
+
+Nothing here sets presence, joins a channel, or presents the session as another client.
 
 ## The store
 

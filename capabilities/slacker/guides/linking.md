@@ -69,4 +69,4 @@ A machine with several workspaces declares one connection each, with its own `to
 
 ## What never leaves the system
 
-No secret value is ever written to the registry, a plan, a log, a commit, or command output. The capability has no write verb: it reads the person's own workspace and stores it in the person's own database, and sends nothing back to Slack.
+No secret value is ever written to the registry, a plan, a log, a commit, or command output. A linked connection reads; it writes to Slack — sends, edits, reacts and the rest — only once a person grants it writes with `capabilities set slacker grant <connection> '{"allow_write": true}'` inside the project.

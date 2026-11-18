@@ -1295,28 +1295,29 @@
         "tests/test_connection_state.py",
         "tests/test_link.py",
         "tests/test_parsing.py",
-        "tests/test_store.py"
+        "tests/test_store.py",
+        "tests/test_write.py"
       ],
       "icon": true,
       "level": 0,
       "path": "capabilities/slacker",
-      "payload_sha256": "8703a5eb5d9d02e63658ddfd7a857fc52d2c9739397f4ecca7f58c7aecdd69ce",
+      "payload_sha256": "d2d80b35a3572e6b10dd72b8091872525e31f28f652ad32c213bc5d589e81f19",
       "requires_manager": 0,
       "store_major": 4,
-      "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live. Read-only: it never writes to Slack.",
+      "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live — and write as that user: send, reply in a thread, edit, delete, react, upload a file, mark read and open a DM, each gated by a write grant on the connection.",
       "tier": "standard",
       "title": "Slack Reader",
       "translations": {
         "et": {
-          "description": "Slacki CLI, mis loeb seotud kasutaja enda tööruumi tema veebiseansi kaudu (xoxc token + d küpsis) – vestluste loetlemine (otsesõnumid, grupi otsesõnumid, avalikud ja privaatsed kanalid), sõnumiajaloo ja lõimevastuste lugemine, järkjärgult sünkroonitav Postgresi hoidla ja reaalajas jäädvustamine. Ainult lugemiseks: Slacki ei kirjuta see kunagi.",
+          "description": "Slacki CLI, mis loeb seotud kasutaja enda tööruumi tema veebiseansi kaudu (xoxc token + d küpsis) – vestluste loetlemine (otsesõnumid, grupi otsesõnumid, avalikud ja privaatsed kanalid), sõnumiajaloo ja lõimevastuste lugemine, järkjärgult sünkroonitav Postgresi hoidla ja reaalajas jäädvustamine – ning kirjutamine selle kasutajana: saatmine, lõimes vastamine, muutmine, kustutamine, reaktsioonid, faili üleslaadimine, loetuks märkimine ja otsevestluse avamine, igaüks ühenduse kirjutusloa alusel.",
           "title": "Slack (lugemine)"
         },
         "ru": {
-          "description": "CLI для Slack, который читает собственное рабочее пространство привязанного пользователя через его веб-сессию (токен xoxc + cookie d) — список бесед (личные, групповые личные, публичные и приватные каналы), чтение истории сообщений и ответов в ветках, инкрементально синхронизируемое хранилище Postgres и захват в реальном времени. Только чтение: в Slack он никогда не пишет.",
+          "description": "CLI для Slack, который читает собственное рабочее пространство привязанного пользователя через его веб-сессию (токен xoxc + cookie d) — список бесед (личные, групповые личные, публичные и приватные каналы), чтение истории сообщений и ответов в ветках, инкрементально синхронизируемое хранилище Postgres и захват в реальном времени — а также пишет от имени этого пользователя: отправка, ответ в ветке, правка, удаление, реакции, загрузка файла, отметка прочитанного и открытие личной беседы, каждое по разрешению на запись в подключении.",
           "title": "Slack (чтение)"
         }
       },
-      "version": "2026-11-16 — `slacker` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-18 — `slacker` writes to Slack as the linked user"
     },
     "stripe": {
       "executable": [

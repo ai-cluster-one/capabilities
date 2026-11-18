@@ -8,9 +8,9 @@
 # ]
 # ///
 """
-slacker — read a Slack workspace as the linked user, over their own session.
+slacker — read and write a Slack workspace as the linked user, over their own session.
 
-Agent-invoked, read-only. Links the person's OWN Slack account by its web-client
+Agent-invoked. Links the person's OWN Slack account by its web-client
 session (the workspace `xoxc-` token plus the shared `d` cookie), the way the
 `whatsapp` and `telegram` capabilities emulate their vendor's own client, and
 reads only what that account can already see: direct messages, group direct
@@ -18,11 +18,16 @@ messages, and the public and private channels it belongs to, their message
 history and thread replies. It keeps that history in the project's Postgres
 store, syncs it forward incrementally, and a bundled service captures it live.
 
-This capability never writes to Slack. It sends no messages, sets no presence,
-joins no channels, and marks nothing read; it has no write verb at all. The
-session is the person's own, used transparently as one more of their browser
-sessions — there is no concealment, no monitoring bypass, and no client-identity
-spoofing. Run `slacker doctor` first to prove the session and the workspace.
+It also writes as that person does in their own client: it sends a message to a
+DM, group DM or channel, replies in a thread (optionally also to the channel),
+edits and deletes the account's own messages, adds and removes reactions,
+uploads a file with a comment, marks a conversation read, and opens a DM or group
+DM. Each write is refused with exit 4 unless the connection grants writes
+(`allow_write`, given per connection), and what it writes lands in the store as
+the capture records it. It sets no presence and joins no channel. The session is
+the person's own, used transparently as one more of their browser sessions —
+there is no concealment, no monitoring bypass, and no client-identity spoofing.
+Run `slacker doctor` first to prove the session and the workspace.
 
 Startup protocol
   1. `slacker doctor` — proves the session authorises (`auth.test`), resolves
@@ -30,8 +35,10 @@ Startup protocol
   2. Exit 2 means the session is invalid or expired (`invalid_auth`): the person
      links the connection again (its `d` cookie is short-lived; there is no
      silent refresh).
-  3. Exit 6 is a configuration fault (no connection, no store); exit 4 is policy
-     (a disabled capability); exit 5 is the store or Slack being unreachable.
+  3. Exit 6 is a configuration fault (no connection, no store) or a write Slack
+     refused (not your message, an archived conversation); exit 4 is policy (a
+     disabled capability, or a write on a connection that does not grant
+     writes); exit 5 is the store or Slack being unreachable.
 
 Connections
   A connection is one workspace session of one linked account. It carries the
@@ -109,6 +116,33 @@ Commands
   slacker service ...                The bundled live-capture listener (see
                                      `slacker service help`).
 
+Writes (each needs a connection that grants writes; exit 4 otherwise)
+  slacker send <channel> <text> [--thread TS] [--broadcast]
+                                     Send a message to a DM, group DM or
+                                     channel; with --thread, reply in that
+                                     thread, and with --broadcast also post
+                                     the reply to the channel. Text `-` reads
+                                     it from stdin. Answers the new ts.
+  slacker edit <channel> <ts> <text> Edit one of the account's own messages.
+  slacker delete <channel> <ts>      Delete one of the account's own messages.
+  slacker react <channel> <ts> <emoji>
+  slacker unreact <channel> <ts> <emoji>
+                                     Add or remove the account's reaction
+                                     (the emoji's name, e.g. thumbsup); what
+                                     already holds answers changed:false.
+  slacker upload <channel> <path> [--comment TEXT] [--thread TS] [--title T]
+                                     Upload a file, posted with the comment,
+                                     to the conversation or into a thread.
+  slacker mark <channel> [<ts>]      Mark the conversation read up to ts, by
+                                     default up to its newest message.
+  slacker open <user> [<user> ...]   Open the DM with one user, or the group
+                                     DM with several, and answer its channel.
+  Each answers the channel and ts it wrote, and records the write in the store
+  as the live capture records the same act: a sent message or reply as its row
+  (a reply raises its parent's reply count), an edit as the new text, a
+  deletion as the soft flag, a reaction in the message's reactions, an opened
+  conversation as its row. A read mark is not captured.
+
 Contract commands (shared by every capability)
   slacker connections                Resolve every connection, secrets masked
   slacker stub                       One-line summary
@@ -138,8 +172,10 @@ TITLE = "Slack Reader"
 SUMMARY = ("Slack CLI that reads the linked user's own workspace over their web "
            "session (xoxc token + d cookie) — list conversations (DMs, group "
            "DMs, public and private channels), read message history and thread "
-           "replies, keep an incremental-synced Postgres store, and capture live. "
-           "Read-only: it never writes to Slack.")
+           "replies, keep an incremental-synced Postgres store, and capture live "
+           "— and write as that user: send, reply in a thread, edit, delete, "
+           "react, upload a file, mark read and open a DM, each gated by a write "
+           "grant on the connection.")
 # The title and summary in Russian and Estonian; English stays the source
 # and the fallback (SHEBANG.md, the manifest table).
 TRANSLATIONS = {
@@ -148,15 +184,20 @@ TRANSLATIONS = {
                             'привязанного пользователя через его веб-сессию (токен xoxc + cookie d)'
                             ' — список бесед (личные, групповые личные, публичные и приватные '
                             'каналы), чтение истории сообщений и ответов в ветках, инкрементально '
-                            'синхронизируемое хранилище Postgres и захват в реальном времени. '
-                            'Только чтение: в Slack он никогда не пишет.')},
+                            'синхронизируемое хранилище Postgres и захват в реальном времени '
+                            '— а также пишет от имени этого пользователя: отправка, ответ в '
+                            'ветке, правка, удаление, реакции, загрузка файла, отметка '
+                            'прочитанного и открытие личной беседы, каждое по разрешению на '
+                            'запись в подключении.')},
     "et": {"title": 'Slack (lugemine)',
            "description": ('Slacki CLI, mis loeb seotud kasutaja enda tööruumi tema veebiseansi '
                             'kaudu (xoxc token + d küpsis) – vestluste loetlemine (otsesõnumid, '
                             'grupi otsesõnumid, avalikud ja privaatsed kanalid), sõnumiajaloo ja '
                             'lõimevastuste lugemine, järkjärgult sünkroonitav Postgresi hoidla ja '
-                            'reaalajas jäädvustamine. Ainult lugemiseks: Slacki ei kirjuta see '
-                            'kunagi.')},
+                            'reaalajas jäädvustamine – ning kirjutamine selle kasutajana: '
+                            'saatmine, lõimes vastamine, muutmine, kustutamine, reaktsioonid, '
+                            'faili üleslaadimine, loetuks märkimine ja otsevestluse avamine, '
+                            'igaüks ühenduse kirjutusloa alusel.')},
 }
 SCOPE = "user"      # the session is the person's own account, machine-wide
 # The conventional, cascade-resolved names a connection's token_env / cookie_env
@@ -228,10 +269,11 @@ LINK_METHODS = [{
             "the session out over Chrome's DevTools protocol, closes the window "
             "and deletes the profile. Needs a Chrome and a display; with "
             "neither, link by paste (`connection add --stdin`)."}]
-WRITE_VERBS: set = set()   # this capability has no verb that writes to Slack
-# No write leaves the system because nothing writes at all. The gate never fires
-# (WRITE_VERBS is empty); a read-only surface is reported as allow_write:false.
-WRITE_DEFAULT = False
+# The verbs that write to Slack as the linked person. Each is refused (exit 4)
+# unless the connection grants allow_write; a grant is given per connection.
+WRITE_VERBS = {"send", "edit", "delete", "react", "unreact", "upload", "mark",
+               "open"}
+WRITE_DEFAULT = False   # a write leaves the system as the person: granted explicitly
 MACHINE_READS = ("connections", "doctor")   # outside a project: read-only machine reads
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/slacker/guides/")
@@ -1422,7 +1464,7 @@ def _slack():
 
 class SlackClient:
     """The linked user's web session, carried as the web client carries it: the
-    xoxc- token as a bearer and the `d` cookie beside it. Read calls only."""
+    xoxc- token as a bearer and the `d` cookie beside it."""
 
     def __init__(self, cfg: dict):
         WebClient, self._err = _slack()
@@ -1457,6 +1499,9 @@ class SlackClient:
         if err in ("channel_not_found", "not_in_channel", "thread_not_found"):
             _refuse(6, err, f"Slack: {err}",
                     "the session cannot see that conversation")
+        if err in _WRITE_REFUSALS:
+            _refuse(6, err, f"Slack refused the write: {err}",
+                    _WRITE_REFUSALS[err])
         if err == "missing_scope":
             _refuse(6, "missing_scope",
                     "the session lacks a scope this read needs",
@@ -1556,6 +1601,100 @@ class SlackClient:
             if page >= (paging.get("pages") or 1):
                 return
             page += 1
+
+    # Writes. Each is the call the web client makes for the same act, posted as
+    # a form body, as the person's own session; nothing here sets presence or
+    # dresses the session as another client.
+
+    def _post(self, method: str, **kwargs) -> dict:
+        try:
+            return self.client.api_call(method, data={
+                k: v for k, v in kwargs.items() if v is not None}).data
+        except self._err as exc:
+            self._raise(exc)
+
+    def post_message(self, channel: str, text: str, thread_ts: str | None = None,
+                     broadcast: bool = False) -> dict:
+        return self._post("chat.postMessage", channel=channel, text=text,
+                          thread_ts=thread_ts,
+                          reply_broadcast="true" if broadcast and thread_ts else None)
+
+    def update_message(self, channel: str, ts: str, text: str) -> dict:
+        return self._post("chat.update", channel=channel, ts=ts, text=text)
+
+    def delete_message(self, channel: str, ts: str) -> dict:
+        return self._post("chat.delete", channel=channel, ts=ts)
+
+    def reaction(self, channel: str, ts: str, name: str, add: bool) -> dict:
+        return self._post("reactions.add" if add else "reactions.remove",
+                          channel=channel, timestamp=ts, name=name)
+
+    def mark(self, channel: str, ts: str) -> dict:
+        return self._post("conversations.mark", channel=channel, ts=ts)
+
+    def open_conversation(self, users: list[str]) -> dict:
+        return self._post("conversations.open", users=",".join(users),
+                          return_im="true")
+
+    def upload(self, channel: str, path: Path, comment: str | None,
+               thread_ts: str | None, title: str | None) -> dict:
+        """The web client's external upload: ask for an upload URL, send the
+        bytes to it, then complete the upload into the conversation."""
+        try:
+            return self.client.files_upload_v2(
+                channel=channel, file=str(path), filename=path.name,
+                title=title or path.name, initial_comment=comment,
+                thread_ts=thread_ts).data
+        except self._err as exc:
+            self._raise(exc)
+
+    def file_share_ts(self, file_id: str, channel: str, tries: int = 6) -> str | None:
+        """The ts of the message an upload was shared in. Slack shares the file
+        a moment after the upload completes, so this asks a few times."""
+        for attempt in range(tries):
+            info = self._call("files.info", file=file_id).get("file") or {}
+            shares = info.get("shares") or {}
+            for scope in ("public", "private"):
+                for share in (shares.get(scope) or {}).get(channel) or []:
+                    if share.get("ts"):
+                        return share["ts"]
+            if attempt + 1 < tries:
+                time.sleep(1)
+        return None
+
+    def message(self, channel: str, ts: str, thread_ts: str | None = None) -> dict | None:
+        """One message as Slack now holds it, or None."""
+        if thread_ts and thread_ts != ts:
+            data = self._call("conversations.replies", channel=channel,
+                              ts=thread_ts, oldest=ts, latest=ts, inclusive=True,
+                              limit=2)
+        else:
+            data = self._call("conversations.history", channel=channel,
+                              oldest=ts, latest=ts, inclusive=True, limit=1)
+        return next((m for m in data.get("messages") or [] if m.get("ts") == ts),
+                    None)
+
+    def latest_ts(self, channel: str) -> str | None:
+        data = self._call("conversations.history", channel=channel, limit=1)
+        messages = data.get("messages") or []
+        return messages[0].get("ts") if messages else None
+
+
+# Slack's answers that refuse a write the session asked for, with what to do.
+_WRITE_REFUSALS = {
+    "cant_update_message": "only the linked account's own messages can be edited",
+    "cant_delete_message": "only the linked account's own messages can be deleted",
+    "edit_window_closed": "the workspace no longer allows editing that message",
+    "message_not_found": "no message has that ts in that conversation",
+    "msg_too_long": "the text is longer than Slack accepts in one message",
+    "no_text": "the message needs text",
+    "is_archived": "the conversation is archived",
+    "restricted_action": "the workspace does not let this account post there",
+    "invalid_name": "no emoji has that name; pass it without colons",
+    "too_many_reactions": "the message holds as many reactions as Slack allows",
+    "user_not_found": "no user has that id in this workspace",
+    "invalid_timestamp": "that is not a message ts in the conversation",
+}
 
 
 # --- Reads -------------------------------------------------------------------
@@ -1909,6 +2048,199 @@ def cmd_sync(args) -> dict:
             "new": sum(r["new"] for r in results), "detail": results}
 
 
+# --- Writes ------------------------------------------------------------------
+#
+# Each write is a verb in WRITE_VERBS, refused with exit 4 by the contract's
+# write gate unless the connection grants allow_write. Each is the act the
+# person would do in their own client, over their own session, and lands in the
+# store as the capture records the same act arriving as an event: a sent message
+# or reply is a live row keyed by its ts, an edit moves the text and the edited
+# time, a deletion is the soft flag, a reaction moves the {name: [users]} map,
+# an opened conversation is a conversation row. Marking read is not captured.
+
+def _text_arg(text: str | None) -> str:
+    """The message text, from the argument, or from stdin when it is `-`."""
+    if text == "-":
+        text = sys.stdin.read()
+    if not (text or "").strip():
+        _refuse(6, "invalid_arguments", "the message text is empty",
+                "pass the text, or `-` to read it from stdin")
+    return text
+
+
+def _self_user_id(db: _Store, client: SlackClient) -> str:
+    return _get_meta(db, "user_id") or client.auth_test().get("user_id") or ""
+
+
+def _record_edit(db: _Store, channel_id: str, ts: str, text: str,
+                 message: dict) -> None:
+    """An edit of a stored message moves its text and edited time, keeping its
+    thread, reactions and reply count; an edit of one the store has not seen
+    stores the message as Slack answered it, so an edit is never lost."""
+    edited_f = _ts_float((message.get("edited") or {}).get("ts")) or time.time()
+    with _writing(db):
+        cur = db.execute(
+            f"""UPDATE slacker_messages SET text = %s,
+                  edited_at = {_TS_PARAM},
+                  raw = COALESCE(raw, '{{}}'::jsonb) || %s::jsonb,
+                  sync_type = 'live', captured_at = now()
+                WHERE account = %s AND channel_id = %s AND ts = %s""",
+            (text, edited_f, json.dumps({"text": text, "edited": message.get("edited")
+                                         or {"ts": f"{edited_f:.6f}"}}),
+             db.account, channel_id, ts))
+        updated = cur.rowcount
+    if not updated:
+        _upsert_message(db, channel_id, {**message, "ts": ts, "text": text},
+                        "live", authoritative=True)
+
+
+def _record_reply(db: _Store, channel_id: str, thread_ts: str) -> None:
+    """A new reply raises its stored parent's reply count by one, as the
+    capture's message_replied event would; an unseen parent is left to sync."""
+    with _writing(db):
+        db.execute(
+            """UPDATE slacker_messages SET thread_ts = COALESCE(thread_ts, ts),
+                 reply_count = reply_count + 1, captured_at = now()
+               WHERE account = %s AND channel_id = %s AND ts = %s""",
+            (db.account, channel_id, thread_ts))
+
+
+def _record_sent(db: _Store, channel_id: str, message: dict) -> bool:
+    inserted = _upsert_message(db, channel_id, message, "live", authoritative=True)
+    thread_ts = message.get("thread_ts")
+    if inserted and thread_ts and thread_ts != message.get("ts"):
+        _record_reply(db, channel_id, thread_ts)
+    return inserted
+
+
+def cmd_send(args) -> dict:
+    cfg = get_config(args)
+    channel = _normalize_channel_id(args.channel)
+    text = _text_arg(args.text)
+    if args.broadcast and not args.thread:
+        _refuse(6, "invalid_arguments", "--broadcast needs --thread",
+                "a reply is also posted to the channel only when it is a reply")
+    client = SlackClient(cfg)
+    db = _open_store(cfg)
+    data = client.post_message(channel, text, args.thread, args.broadcast)
+    channel = data.get("channel") or channel
+    message = {**(data.get("message") or {}), "ts": data.get("ts")}
+    stored = _record_sent(db, channel, message)
+    db.close()
+    return {"ok": True, "connection": cfg["id"], "channel": channel,
+            "ts": data.get("ts"), "thread_ts": args.thread,
+            "broadcast": bool(args.broadcast), "stored": stored}
+
+
+def cmd_edit(args) -> dict:
+    cfg = get_config(args)
+    channel = _normalize_channel_id(args.channel)
+    text = _text_arg(args.text)
+    client = SlackClient(cfg)
+    db = _open_store(cfg)
+    data = client.update_message(channel, args.ts, text)
+    _record_edit(db, data.get("channel") or channel, args.ts,
+                 data.get("text") or text, data.get("message") or {})
+    db.close()
+    return {"ok": True, "connection": cfg["id"],
+            "channel": data.get("channel") or channel, "ts": args.ts,
+            "edited": True}
+
+
+def cmd_delete(args) -> dict:
+    cfg = get_config(args)
+    channel = _normalize_channel_id(args.channel)
+    client = SlackClient(cfg)
+    db = _open_store(cfg)
+    data = client.delete_message(channel, args.ts)
+    _apply_delete(db, data.get("channel") or channel, args.ts)
+    db.close()
+    return {"ok": True, "connection": cfg["id"],
+            "channel": data.get("channel") or channel, "ts": args.ts,
+            "deleted": True}
+
+
+def cmd_react(args) -> dict:
+    """`react` adds one reaction and `unreact` removes it. Asking for what
+    already holds is answered as unchanged, not refused."""
+    add = args.command == "react"
+    cfg = get_config(args)
+    channel = _normalize_channel_id(args.channel)
+    name = (args.emoji or "").strip().strip(":")
+    if not name:
+        _refuse(6, "invalid_arguments", "an emoji name is required",
+                "pass it as Slack names it, e.g. thumbsup")
+    client = SlackClient(cfg)
+    db = _open_store(cfg)
+    changed = True
+    try:
+        client.reaction(channel, args.ts, name, add)
+    except _Refusal as refusal:
+        if refusal.message.endswith("already_reacted" if add else "no_reaction"):
+            changed = False
+        else:
+            raise
+    _apply_reaction(db, channel, args.ts, name, _self_user_id(db, client), added=add)
+    db.close()
+    return {"ok": True, "connection": cfg["id"], "channel": channel,
+            "ts": args.ts, "reaction": name,
+            "action": "added" if add else "removed", "changed": changed}
+
+
+def cmd_upload(args) -> dict:
+    cfg = get_config(args)
+    channel = _normalize_channel_id(args.channel)
+    path = Path(args.path).expanduser()
+    if not path.is_file():
+        _refuse(6, "file_not_found", f"no file at {args.path!r}",
+                "pass the path of a file to upload")
+    client = SlackClient(cfg)
+    db = _open_store(cfg)
+    data = client.upload(channel, path, args.comment, args.thread, args.title)
+    files = data.get("files") or ([data["file"]] if data.get("file") else [])
+    file_id = (files[0] if files else {}).get("id")
+    ts = client.file_share_ts(file_id, channel) if file_id else None
+    stored = False
+    if ts:
+        message = client.message(channel, ts, args.thread)
+        if message:
+            stored = _record_sent(db, channel, message)
+    db.close()
+    return {"ok": True, "connection": cfg["id"], "channel": channel,
+            "file": file_id, "name": path.name, "ts": ts,
+            "thread_ts": args.thread, "stored": stored}
+
+
+def cmd_mark(args) -> dict:
+    cfg = get_config(args)
+    channel = _normalize_channel_id(args.channel)
+    client = SlackClient(cfg)
+    ts = args.ts or client.latest_ts(channel)
+    if not ts:
+        return {"ok": True, "connection": cfg["id"], "channel": channel,
+                "ts": None, "marked": False, "note": "the conversation is empty"}
+    client.mark(channel, ts)
+    return {"ok": True, "connection": cfg["id"], "channel": channel,
+            "ts": ts, "marked": True}
+
+
+def cmd_open(args) -> dict:
+    cfg = get_config(args)
+    users = [u.strip().lstrip("@") for u in args.users if u.strip().lstrip("@")]
+    if not users:
+        _refuse(6, "invalid_arguments", "at least one user id is required",
+                "pass user ids (U...), as `history` and `search` name them")
+    client = SlackClient(cfg)
+    db = _open_store(cfg)
+    conv = client.open_conversation(users).get("channel") or {}
+    if conv.get("id"):
+        _upsert_conversation(db, {**conv, "is_member": True})
+    db.close()
+    return {"ok": True, "connection": cfg["id"], "channel": conv.get("id"),
+            "kind": _conv_kind(conv) if conv else None, "users": users,
+            "already_open": bool(conv.get("is_open")) if "is_open" in conv else None}
+
+
 # --- Live-capture service ----------------------------------------------------
 
 def _service_home(cfg: dict) -> Path:
@@ -2256,6 +2588,43 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="re-fetch from the beginning, not only what is newer")
     sy.add_argument("--limit", "-n", type=_positive_int, default=1000)
 
+    sn = _leaf("send")
+    sn.add_argument("channel")
+    sn.add_argument("text", help="the message text, or - to read it from stdin")
+    sn.add_argument("--thread", help="the parent ts: reply in its thread")
+    sn.add_argument("--broadcast", action="store_true",
+                    help="with --thread, also post the reply to the channel")
+
+    ed = _leaf("edit")
+    ed.add_argument("channel")
+    ed.add_argument("ts")
+    ed.add_argument("text", help="the new text, or - to read it from stdin")
+
+    de = _leaf("delete")
+    de.add_argument("channel")
+    de.add_argument("ts")
+
+    for verb in ("react", "unreact"):
+        r = _leaf(verb)
+        r.add_argument("channel")
+        r.add_argument("ts")
+        r.add_argument("emoji", help="the emoji name, e.g. thumbsup")
+
+    up = _leaf("upload")
+    up.add_argument("channel")
+    up.add_argument("path")
+    up.add_argument("--comment", help="the message the file is posted with")
+    up.add_argument("--thread", help="the parent ts: post the file in its thread")
+    up.add_argument("--title", help="the file's title (default: its name)")
+
+    mk = _leaf("mark")
+    mk.add_argument("channel")
+    mk.add_argument("ts", nargs="?",
+                    help="read up to this ts (default: the newest message)")
+
+    op = _leaf("open")
+    op.add_argument("users", nargs="+", help="one user id for a DM, several for a group DM")
+
     sv = _leaf("service")
     sv.add_argument("service_command",
                     choices=["init", "doctor", "run", "start", "stop", "reload",
@@ -2322,11 +2691,17 @@ def main() -> None:
         "whoami": cmd_whoami, "conversations": cmd_conversations,
         "history": cmd_history, "thread": cmd_thread, "search": cmd_search,
         "sync": cmd_sync,
+        "send": cmd_send, "edit": cmd_edit, "delete": cmd_delete,
+        "react": cmd_react, "unreact": cmd_react, "upload": cmd_upload,
+        "mark": cmd_mark, "open": cmd_open,
         "service": cmd_service, "link": cmd_link,
     }
     handler = handlers.get(args.command)
     if handler is None:
         _die(6, "unknown_command", f"no handler for {args.command!r}")
+    if args.command in WRITE_VERBS:
+        cfg = get_config(args)
+        _write_gate(cfg["id"], cfg["allow_write"], args.command)
     result = handler(args)
     if result is not None:
         _emit(result)
