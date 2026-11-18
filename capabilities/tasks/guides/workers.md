@@ -113,12 +113,6 @@ tasks workers save alpha alpha.md --base <version>
 
 `tasks workers list` lists the project's workers, `tasks workers history <name>` every version of one, and `tasks workers show <name> --version <id>` any of them. No version is ever edited or deleted, and every raise records under `worker_id` the version it was claimed under, so `tasks runs <task>` shows exactly which role and fence each turn ran with. A project reads and writes only its own workers, and nothing working under a raise saves one, since what a turn may write is declared there.
 
-## Moving worker files into the store
-
-A project that kept its workers as files in `capabilities/tasks/workers/` moves them once. `tasks workers import` says what it would do; `tasks workers import --apply` saves each file as its worker's first version - or finds the store already holding that exact version, as it does on a second machine sharing the store - and removes the files. It moves all of them or none: a file that cannot be read, or one that differs from a version the store already holds for its name, refuses the import and is named, because the store's version is what runs.
-
-A project that updates tasks while still carrying the files needs no step of its own: `tasks run --apply` and the service, as it loads its declaration, perform that same import before they claim anything, one at a time across turns starting together, and say on stderr - in the service's log - what they imported. The removed files then show as deletions in the project's git; commit them. Where the import would be refused, `run` and the service refuse with `workers_not_imported`, naming the files, rather than run without them, and the service log names the fix; `doctor` imports nothing and reports the files while any is there. Repair or remove the file named, or run `tasks workers import --apply` to see why it refuses.
-
 ## Profiles
 
 A profile is one harness with its settings, a callva-harness-runner profile, and the store keeps it as versions the way it keeps workers, in the library's own table: at the project's scope, or at the global scope every project reads. It is written as the library's flat profile file - TOML with a top-level `harness` and that harness's knobs beside it - and saved by its name:
@@ -132,7 +126,9 @@ A name resolves to the project's active version, then the global one, then the p
 
 A project writes only its own project profiles and the global ones, and nothing working under a raise writes any. Every raise records under `profile_id` the version it ran on, beside the worker version under `worker_id`; a raise on a shipped profile records none. `tasks runs <task>` shows both, so each turn shows exactly which role, fence and model it ran with.
 
-A project that kept its profiles as files in `capabilities/tasks/profiles/` moves them once with `tasks profiles import --apply`, as for worker files: all or none, never over a different version the project already holds, and the files are removed. While any is there, `doctor`, `run` and the service refuse with `profiles_not_imported`. The machine's profile folder is not read by `tasks`: a profile every project should share is saved with `--global`.
+The machine's profile folder is not read by `tasks`: a profile every project should share is saved with `--global`.
+
+Past versions of a worker and of a harness profile are read with `tasks workers history <name>` and `tasks profiles history <name>`.
 
 ### Choosing profiles by where the service runs
 
