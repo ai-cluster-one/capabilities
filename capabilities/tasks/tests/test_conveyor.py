@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 from callva import harness_runner
 from callva.harness_runner import Failure, FailureKind, Result
+from callva.harness_runner.result import Tokens
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _cli  # noqa: E402
@@ -1082,6 +1083,35 @@ def test_a_finished_turn_carries_its_measurements_and_its_pinned_session(
     assert report["trail_grew_by"] == 1 and report["turn"]["ok"] is True
     assert "answer" not in report["turn"] and "raw" not in report["turn"]
     assert store.notes == [] and "lane_hold" not in released["metrics"]
+    # The runner reported no tokens, so the metrics name none.
+    assert "tokens" not in released["metrics"]
+
+
+def test_every_turn_records_the_tokens_its_harness_counted(project, monkeypatch, capsys):
+    store = Store()
+    harness = Harness(Result(ok=True, harness="claude", session_id=None, model="claude-opus-5",
+                           cost_usd=0.5, duration_ms=10, num_turns=2,
+                           tokens=Tokens(input=100, output=20, cache_read=50,
+                                         cache_creation=5)),
+                    lands="complete", writes=True)
+    report, released = one_turn(monkeypatch, capsys, store, harness)
+    assert released["metrics"]["tokens"] == {"input": 100, "output": 20,
+                                             "cache_read": 50, "cache_creation": 5}
+    assert released["metrics"]["cost_usd"] == 0.5 and store.costs == [0.5]
+
+
+def test_a_codex_turn_records_its_tokens_and_no_cost(project, monkeypatch, capsys):
+    store = Store()
+    harness = Harness(Result(ok=True, harness="codex", session_id="thread-1", model="gpt-6",
+                           duration_ms=10,
+                           tokens=Tokens(input=1200, output=300, cache_read=800)),
+                    lands="complete", writes=True)
+    report, released = one_turn(monkeypatch, capsys, store, harness)
+    # Codex reports no price, so its tokens are what the raise records it used,
+    # and a count the harness did not report is left out rather than written as null.
+    assert released["metrics"]["tokens"] == {"input": 1200, "output": 300, "cache_read": 800}
+    assert "cost_usd" not in released["metrics"]
+    assert released["metrics"]["model"] == "gpt-6"
 
 
 def test_a_quota_failure_returns_the_attempt_and_holds_the_lane(

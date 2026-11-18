@@ -1409,7 +1409,7 @@
       "level": 0,
       "lucide_icon": "list-checks",
       "path": "capabilities/tasks",
-      "payload_sha256": "18fbd45965db064ed0ab4f65815da3cc4ac79a57d1ca7d8578ea065d390ff88a",
+      "payload_sha256": "f99a907cfe87adda83c4f6934800f01fdcf2d0143d4089edd2b87a894c37c93e",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
@@ -1425,7 +1425,7 @@
           "title": "Задачи"
         }
       },
-      "version": "2026-11-18 — The Mac hold keeps a turn out of idle sleep only"
+      "version": "2026-11-18 — Every raise records the tokens its turn used"
     },
     "teams": {
       "executable": [

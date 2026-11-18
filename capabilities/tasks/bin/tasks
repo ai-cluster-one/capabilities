@@ -10746,6 +10746,15 @@ def _turn_cost(spent, carried: float):
     return round(spent - carried, 10)
 
 
+def _turn_tokens(tokens) -> dict:
+    """The token counts a turn's result carries, in the runner's own names -
+    input, output, cache_read, cache_creation - leaving out each count the
+    harness did not report."""
+    return {name: getattr(tokens, name, None) for name in
+            ("input", "output", "cache_read", "cache_creation")
+            if getattr(tokens, name, None) is not None}
+
+
 _CONTINUATION = """Task {key}: the turn you were running on it in this session, as the worker `{worker}`, was cut off before it reached an ending of its own ({why}). This is a new turn on the same task under a new raise, continuing this session.
 
 Continue from where the turn stopped rather than starting again, and do not redo what is already done. Read the task first with `{cli} show {key}`: something may have been written to it since.
@@ -11335,6 +11344,11 @@ def cmd_run(entry, args: list[str]) -> None:
                     ("num_turns", result.num_turns), ("elapsed_ms", elapsed_ms),
                     ("model", result.model))
         metrics = {k: v for k, v in measured if v is not None}
+        # The tokens the harness counted for this turn, on every harness: codex
+        # reports no price, so its tokens are the only measure of what it used.
+        tokens = _turn_tokens(result.tokens)
+        if tokens:
+            metrics["tokens"] = tokens
         metrics.update(marks)
         if limit is not None:
             metrics["lane_hold"] = limit

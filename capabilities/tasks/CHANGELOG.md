@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-18 — Every raise records the tokens its turn used
+
+A conveyor turn's raise records in its metrics, under `tokens`, the token counts the harness reported for the turn, in the runner's names: `input`, `output`, `cache_read` and `cache_creation`, each left out when the harness did not report it, and `tokens` left out when it reported none. A codex turn, which reports no price, now shows what it used: its `cost_usd` stays absent, and its `tokens` carries `input`, `output` and `cache_read`. A claude turn records its `cost_usd` as before and gains the same counts. A task's `cost_total`, its `runs.cost_usd` and `without_cost`, and `--sort cost` are unchanged: they read `cost_usd` alone. Raises recorded before this release keep the metrics they recorded. No verb, flag or JSON key is removed or renamed.
+
 ## 2026-11-18 — The Mac hold keeps a turn out of idle sleep only
 
 The assertion the tasks service holds for a conveyor turn on macOS keeps the machine from idling into sleep and does nothing more; the entry of 2026-10-10 said it kept a turn from being cut off by the Mac sleeping, and now says idle sleep. A Mac that sleeps for another reason still sleeps under a running turn: closing the lid on battery, and the return to sleep after a DarkWake with the lid closed on battery, are not held off by `caffeinate -i`, and no assertion a process may take holds them off, since the system-sleep assertion is honoured only on AC power. A turn whose lease runs out during such a sleep loses its raise as any other cut-off turn does; keep the Mac on power while turns run with the lid closed. Nothing the service does changes; no verb, flag or JSON key changes.
