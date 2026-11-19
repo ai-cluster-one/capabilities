@@ -181,6 +181,35 @@ class AwaitsSignInAgainstARealEndpoint(unittest.TestCase):
             su._await_session(port, timeout=1)
         self.assertEqual(caught.exception.code, "link_timeout")
 
+    def test_a_timeout_says_what_the_window_held_without_a_secret(self):
+        # a workspace page whose origin holds no localConfig_v2, a sign-in
+        # page whose path carries its secret, and a `d` cookie on its domain
+        port = self._serve([
+            {"type": "page", "url": "https://acme.slack.com/messages",
+             "webSocketDebuggerUrl": "ws://127.0.0.1:1/x"},
+            {"type": "page", "url": "https://slack.com/z-app-secret-link?s=1",
+             "webSocketDebuggerUrl": "ws://127.0.0.1:1/y"}])
+        cdp = _FakeCdp(local_config=None, cookies=[
+            {"name": "d", "domain": "acme.slack.com", "value": "xoxd-onboarding"}])
+        self._with_fake_cdp(cdp)
+        with self.assertRaises(su._Refusal) as caught:
+            su._await_session(port, timeout=1)
+        refusal = caught.exception
+        self.assertEqual((refusal.code, refusal.exit_code), ("link_timeout", 6))
+        self.assertIn("Slack pages open: acme.slack.com, slack.com", refusal.message)
+        self.assertIn("the page read (acme.slack.com) held no signed-in workspace",
+                      refusal.message)
+        self.assertIn("`d` cookies on acme.slack.com", refusal.message)
+        for secret in ("xoxd-onboarding", "z-app-secret-link", "/messages"):
+            self.assertNotIn(secret, refusal.message)
+
+    def test_a_timeout_with_no_slack_page_says_so(self):
+        port = self._serve([{"type": "page", "url": "https://news.example.com",
+                             "webSocketDebuggerUrl": "ws://127.0.0.1:1/x"}])
+        with self.assertRaises(su._Refusal) as caught:
+            su._await_session(port, timeout=1)
+        self.assertIn("no Slack page was open", caught.exception.message)
+
     def test_a_refused_endpoint_reads_as_the_window_closed(self):
         # nothing listening on this port → connection refused → window_closed
         with self.assertRaises(su._Refusal) as caught:
@@ -277,6 +306,41 @@ class LinkRefusesCleanly(unittest.TestCase):
             su.cmd_link(self._args())
         self.assertEqual(caught.exception.code, "link_unverified")
         self.assertEqual(caught.exception.exit_code, 2)
+
+    def test_auth_test_answered_without_json_says_what_slack_sent(self):
+        # slack_sdk turns a body that is not JSON into this error on a response
+        # that still holds the status and headers; the real check runs on it
+        class SlackApiError(Exception):
+            def __init__(self, response):
+                super().__init__("The request to the Slack API failed.")
+                self.response = response
+
+        class Response(dict):
+            api_url = "https://slack.com/api/auth.test"
+            status_code = 302
+            headers = {"Location": "https://acme.slack.com/signin?redir=xoxc-acme-123",
+                       "Content-Type": "text/html; charset=utf-8"}
+
+        class WebClient:
+            def __init__(self, token, headers):
+                pass
+
+            def api_call(self, method, params):
+                raise SlackApiError(Response(
+                    ok=False, error="Received a response in a non-JSON format: "))
+
+        self._patch(su, "_slack", lambda: (WebClient, SlackApiError))
+        self._stub_browser(teams=[TEAM_A], cookie="xoxd-secret")
+        self._forbid_persist()
+        with self.assertRaises(su._Refusal) as caught:
+            su.cmd_link(self._args())
+        refusal = caught.exception
+        self.assertEqual((refusal.code, refusal.exit_code), ("link_unverified", 5))
+        self.assertIn("Slack answered auth.test with no API answer (HTTP 302, "
+                      "redirect to https://acme.slack.com/signin, content type "
+                      "text/html, an empty body)", refusal.message)
+        self.assertNotIn("xoxc-acme-123", refusal.message)
+        self.assertNotIn("xoxd-secret", refusal.message)
 
     def test_the_happy_path_carries_no_secret_value_in_its_result(self):
         self._stub_browser(teams=[TEAM_A], cookie="xoxd-secret")

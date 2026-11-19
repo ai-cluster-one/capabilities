@@ -702,9 +702,52 @@ def _await_session(port: int, timeout: int) -> tuple:
             announced = True
         time.sleep(1.5)
     _refuse(6, "link_timeout",
-            f"no signed-in Slack workspace appeared within {timeout}s",
+            f"no signed-in Slack workspace appeared within {timeout}s; "
+            f"at the end {_sign_in_seen(port)}",
             "sign in during the window `slacker link` opens, or link by paste "
             "(`slacker connection add <id> --stdin`)")
+
+
+def _url_host(url: str) -> str:
+    from urllib.parse import urlsplit
+    return urlsplit(url or "").hostname or "?"
+
+
+def _sign_in_seen(port: int) -> str:
+    """What the window held when the wait for sign-in ended, told by host and
+    count only: the Slack pages open, how many signed-in workspaces the page
+    `link` reads held in its `localConfig_v2`, and the domains of the `d`
+    cookies. A page's path, a token and a cookie value are never told — a
+    sign-in link carries its secret in its path."""
+    try:
+        pages = [t for t in _cdp_http(port, "/json/list")
+                 if t.get("type") == "page" and "slack.com" in (t.get("url") or "")]
+        if not pages:
+            return "no Slack page was open"
+        said = ["Slack pages open: "
+                + ", ".join(_url_host(t.get("url")) for t in pages)]
+        target = _slack_page(port)
+        if target is None:
+            return said[0] + "; none could be read"
+        cdp = _Cdp(target["webSocketDebuggerUrl"])
+        try:
+            teams = _read_teams(cdp)
+            cdp.call("Network.enable")
+            domains = [c.get("domain") or "?"
+                       for c in cdp.call("Network.getAllCookies").get("cookies") or []
+                       if c.get("name") == "d"
+                       and (c.get("domain") or "").endswith("slack.com")]
+        finally:
+            cdp.close()
+        said.append(f"the page read ({_url_host(target.get('url'))}) held "
+                    + (f"{len(teams)} signed-in workspace(s)" if teams
+                       else "no signed-in workspace")
+                    + " in localConfig_v2")
+        said.append("`d` cookies on " + ", ".join(domains) if domains
+                    else "no `d` cookie on slack.com")
+        return "; ".join(said)
+    except (_BrowserGone, _Refusal):
+        return "the window could not be read"
 
 
 def _match_team(teams: list[dict], wanted: str) -> dict | None:
@@ -1462,6 +1505,32 @@ def _slack():
     return WebClient, SlackApiError
 
 
+def _not_an_api_answer(resp, err: str) -> str:
+    """What Slack sent back where its API answers JSON - the method, the HTTP
+    status, where it redirected and the kind of body - so a session Slack's
+    API does not take says what Slack did with it. The redirect is told
+    without its query and the body not at all: either may echo what was sent."""
+    from urllib.parse import urlsplit
+    headers = {}
+    for key, value in (getattr(resp, "headers", None) or {}).items():
+        headers[str(key).lower()] = value[0] if isinstance(value, list) and value \
+            else value
+    path = urlsplit(getattr(resp, "api_url", None) or "").path
+    method = path.rstrip("/").rsplit("/", 1)[-1] or "the API"
+    status = getattr(resp, "status_code", None)
+    said = [f"HTTP {status}" if status is not None else "no HTTP status"]
+    location = headers.get("location")
+    if location:
+        where = urlsplit(str(location))
+        said.append(f"redirect to {where.scheme}://{where.netloc}{where.path}"
+                    if where.netloc else f"redirect to {where.path}")
+    ctype = str(headers.get("content-type") or "").split(";")[0].strip()
+    said.append(f"content type {ctype}" if ctype else "no content type")
+    body = err.split(":", 1)[1].strip() if ":" in err else ""
+    said.append("a body that is not JSON" if body else "an empty body")
+    return f"Slack answered {method} with no API answer ({', '.join(said)})"
+
+
 class SlackClient:
     """The linked user's web session, carried as the web client carries it: the
     xoxc- token as a bearer and the `d` cookie beside it."""
@@ -1483,6 +1552,8 @@ class SlackClient:
     def _raise(self, exc) -> NoReturn:
         resp = getattr(exc, "response", None)
         err = (resp.get("error") if resp is not None else None) or str(exc)
+        if str(err).startswith("Received a response in a non-JSON format"):
+            _refuse(5, "slack_error", _not_an_api_answer(resp, str(err)))
         if err in ("invalid_auth", "not_authed", "token_revoked",
                    "token_expired", "account_inactive"):
             _refuse(2, "invalid_auth",
