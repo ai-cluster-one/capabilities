@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-19 — Under a request's authority, a capability it does not grant still answers its help, guide, stub and manifest
+
+The package ships with `capabilities-contract` 0.49.1, so `update` brings each installed capability's environments to it. Under a `CAPABILITIES_AUTH_CONTEXT` whose `allowed_capabilities` does not grant a capability, its `help`, `guide`, `stub` and `manifest` now answer instead of exiting 4 `capability_not_authorized`, as project policy already lets them through for a capability a project does not enable; every other verb of it still exits 4 `capability_not_authorized`, and a granted capability's verb list is judged as before. Without an auth context nothing changes. No verb, flag or JSON key is removed or renamed.
+
 ## 2026-11-16 — The manager composes no Teams section of its own, and requires teams level 1, which composes it
 
 The manager no longer reads the teams tables or composes a Teams section for a teams payload whose declaration names no command; the section is only what `teams section` prints through the declaration teams makes. In its place the release declares `MANAGER_REQUIRES = {"teams": 1}`, the teams that declares its command, so `self-update` from a manager that knows levels brings an installed teams along before switching or refuses, and `install` and `update` refuse a teams below it, keeping what is installed. Where a manager from before levels switched to this release and left a capability below the level this manager requires of it, its entry in `capabilities context` and `build` carries one line naming `capabilities update <name>`, and `doctor` and `self-update --check` name it under `compat`, so no agent loses its team rules without a word. No verb, flag or JSON key is removed or renamed.

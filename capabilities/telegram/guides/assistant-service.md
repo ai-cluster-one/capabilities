@@ -790,7 +790,7 @@ Service control commands are handled by the daemon before a worker job exists, s
 
 ## Tool Authority
 
-The service creates a per-job `CAPABILITIES_AUTH_CONTEXT` file for workers when `settings.json` declares an `authority` policy. Capability CLIs read this file before resolving credentials; an unlisted capability exits with policy refusal (`exit 4`). This is a fail-closed authorization gate on the supported capability path, while `context.md` remains soft behavioral guidance. It is not an OS sandbox: a hostile process with the same unrestricted Unix access can bypass the supported path. Capability policy and connection `allow_write` remain the hard gates for external writes.
+The service creates a per-job `CAPABILITIES_AUTH_CONTEXT` file for workers when `settings.json` declares an `authority` policy. Capability CLIs read this file before resolving credentials; an unlisted capability exits with policy refusal (`exit 4`) for every verb but its reference commands `help`, `guide`, `stub` and `manifest`, which read it and act on nothing. This is a fail-closed authorization gate on the supported capability path, while `context.md` remains soft behavioral guidance. It is not an OS sandbox: a hostile process with the same unrestricted Unix access can bypass the supported path. Capability policy and connection `allow_write` remain the hard gates for external writes.
 
 Role policies live under `authority.roles.<role>.allowed_capabilities`:
 

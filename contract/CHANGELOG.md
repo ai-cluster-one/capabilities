@@ -1,5 +1,9 @@
 # contract — change log
 
+## 2026-11-19 — A capability a request's authority does not grant still answers its help, guide, stub and manifest; capabilities-contract 0.49.1
+
+`capabilities-contract` 0.49.1 lets `_auth_gate()` pass `help`, `guide`, `stub` and `manifest` of a capability that a `CAPABILITIES_AUTH_CONTEXT`'s `allowed_capabilities` does not grant - absent from it or refused by its rule - as project policy already lets them through for a capability a project does not enable. Every other verb of such a capability still exits 4 `capability_not_authorized`; a granted capability's verb list, an invalid context, and a call without an auth context answer as before.
+
 ## 2026-11-10 — The manifest carries the capability's title and its Lucide icon name; capabilities-contract 0.48.0
 
 `capabilities-contract` 0.48.0 gives `_manifest_core()` `title` from a capability's `TITLE` constant and `lucide_icon` from its `LUCIDE_ICON` constant, each only where declared, so every manifest built on it carries them. Nothing else changes and the store major stays 4.

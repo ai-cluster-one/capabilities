@@ -1548,7 +1548,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "210f3d9408fea40e8246b4648d110d23993366a5cab88a0ebff25ba7da8c0bc1",
+      "payload_sha256": "fd7aefd527d49e6e2900fad126f21e2fc7c48a45434ef9c4558e4178a1dcd99a",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
@@ -1795,6 +1795,6 @@
       "version": "2026-11-16 — `youtrack` declares its title and summary in Russian and Estonian"
     }
   },
-  "contract_library": "0.49.0",
+  "contract_library": "0.49.1",
   "store_major": 4
 }
