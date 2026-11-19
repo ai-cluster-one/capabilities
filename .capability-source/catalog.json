@@ -1281,16 +1281,31 @@
     },
     "slacker": {
       "executable": [
-        "bin/slacker"
+        "bin/slacker",
+        "service/worker-bin/slacker"
       ],
       "files": [
         "CHANGELOG.md",
         "bin/slacker",
+        "guides/assistant-service.md",
         "guides/linking.md",
         "guides/operational-model.md",
         "icon.png",
-        "service/settings.json",
+        "service/dialogue.py",
+        "service/jobs.py",
+        "service/profiles.py",
+        "service/profiles/slacker-claude.toml",
+        "service/profiles/slacker-codex.toml",
+        "service/profiles/slacker-job-claude.toml",
+        "service/profiles/slacker-job-codex.toml",
+        "service/settings_schema.py",
+        "service/templates/context.md",
+        "service/templates/delegation.md",
+        "service/templates/job-worker.md",
+        "service/templates/settings.json",
+        "service/worker-bin/slacker",
         "tests/_cli.py",
+        "tests/test_assistant.py",
         "tests/test_capture.py",
         "tests/test_connection_state.py",
         "tests/test_link.py",
@@ -1301,7 +1316,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/slacker",
-      "payload_sha256": "0a962fd6b533fb31ff0eb0f2af919b85b9ec0495449e173a50e461585905d968",
+      "payload_sha256": "bef1208a877a9c9c756a8a9399ccbd024e51be7d500d64aebc9b649ad2d359ff",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live — and write as that user: send, reply in a thread, edit, delete, react, upload a file, mark read and open a DM, each gated by a write grant on the connection.",
@@ -1317,7 +1332,7 @@
           "title": "Slack (чтение)"
         }
       },
-      "version": "2026-11-19 — A refused `slacker link` says what Slack and the window held"
+      "version": "2026-11-19 — The service answers in Slack as the linked user"
     },
     "stripe": {
       "executable": [

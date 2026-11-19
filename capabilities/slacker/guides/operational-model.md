@@ -16,7 +16,7 @@ The read verbs:
 - `thread <channel> <thread_ts>` — read a thread's replies, from the store once it holds every reply the parent counts, otherwise from Slack.
 - `search <query>` — search message text across every conversation the account can see, through Slack's own search (`search.messages`), so it finds messages the store has never captured and needs no store or running capture. Each match carries its `channel`, `ts` and `thread_ts`, which `history` and `thread` read; no match is a `count` of 0 at exit 0, while an invalid session, a refused read or an unreachable Slack exits non-zero.
 - `sync` — bring the store forward incrementally for every member conversation, or one named channel.
-- `service run` — hold the session's event stream and capture live.
+- `service run` — hold the session's event stream and capture live; where its settings admit anyone, also answer as the assistant (see below).
 
 ## What it writes
 
@@ -43,6 +43,7 @@ Captured data lives in the project's Postgres database, in `slacker_*` tables ke
 - `slacker_messages` — one row per message, keyed by `(account, channel_id, ts)`; the Slack `ts` is the natural id and the dedup key. A deletion is a soft `deleted` flag; reactions are a `{name: [user_id]}` jsonb; the whole original object is kept in `raw` so a parser fix can rebuild the typed columns.
 - `slacker_users` — users seen in the capture, resolved from `users.info` on demand.
 - `slacker_meta` — the schema version and the linked identity.
+- `slacker_register`, `slacker_jobs`, `slacker_job_amendments`, `slacker_job_slots`, `slacker_prompts` — the assistant service's own rows, keyed by the agent's id (see the `assistant-service` guide); a message the service posted is marked `sent_by_service`, and an audio clip's words are kept in `transcript`.
 
 ## Incremental sync and live capture
 
@@ -51,6 +52,10 @@ Captured data lives in the project's Postgres database, in `slacker_*` tables ke
 The `capture` service holds the session's realtime event stream and writes each new message, edit, deletion, thread reply and reaction into the store as it arrives. On a dropped connection it reconnects with backoff and, before resuming the live stream, backfills each member conversation from its cursor, so the window it was disconnected for is closed through the same dedup path. No channel message is lost and nothing is doubled, because the store's `ts` key is the single source of identity for both the live and the backfill writes. A thread reply posted during the drop is the exception: Slack's channel history carries no thread replies except those also sent to the channel, so the backfill does not reach it, and `thread <channel> <thread_ts> --fresh` reads it.
 
 Until a realtime connection has held for 30 seconds, each reconnect doubles the backoff, up to a minute, and the log names why the connection ended: a refused handshake is logged as `realtime handshake failed` with its HTTP status. The socket carries the session's `d` cookie and the web client's origin. The gateway can accept the socket and then refuse the session with an error frame; that is logged as `realtime handshake failed` with the gateway's error code and counts as a failed connect. The service's health reads `connecting` until the gateway's first other frame and `connected` from then, and it counts each captured event (`events`, `last_event_at`) as it is written.
+
+## The assistant
+
+The same service answers the messages its settings admit, as the linked person, the way the `whatsapp` and `telegram` assistant services answer theirs. Its settings, written through `slacker settings` and taken by a running listener at `slacker service reload`, say which direct messages, group direct messages, channels and threads it answers in, who may wake it (by Slack user id), whether a listed conversation wakes it on a mention or on every message, each person's role and the authority a role's turn runs under, and the harness profile (Claude or Codex, model, effort) each conversation's turns run on. One person's consecutive messages collect into one turn after a debounce, the turn reads the conversation (in a thread, the thread) back from the store, runs through callva-harness-runner, and its answer is posted in the thread the request was made in, or in a thread under it in a channel. A turn may hand longer work to a job; an audio clip is transcribed before its turn. The service posts only through the connection's write grant: on a connection that does not grant writes it answers nothing. Settings that admit nobody leave it capturing exactly as before. The `assistant-service` guide holds the whole model.
 
 ## Session lifetime
 

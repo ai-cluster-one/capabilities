@@ -113,8 +113,22 @@ Commands
                                      than the stored cursor, deduplicating on
                                      the message timestamp. --limit bounds how
                                      far back a first sync or --full reaches.
-  slacker service ...                The bundled live-capture listener (see
-                                     `slacker service help`).
+  slacker service ...                The bundled listener: live capture, and
+                                     the assistant that answers the messages
+                                     its settings admit (see `slacker service
+                                     help` and `slacker guide
+                                     assistant-service`).
+  slacker settings [get|set|unset|put|edit] ...
+                                     The assistant's settings, validated on
+                                     write; `service reload` makes a running
+                                     listener take them.
+  slacker prompts list|show|put|history|retire [<key>]
+                                     The assistant's prompts (context,
+                                     delegation, job-worker): the agent's own
+                                     versions in the store over the bundle's
+                                     standard text.
+  slacker jobs help|list|active|show|register|submit|amend|discard|stop|resume
+                                     The work an assistant turn handed over.
 
 Writes (each needs a connection that grants writes; exit 4 otherwise)
   slacker send <channel> <text> [--thread TS] [--broadcast]
@@ -205,6 +219,9 @@ SCOPE = "user"      # the session is the person's own account, machine-wide
 # the CONN_FIELDS below (env-templated), exactly as calcomc's secret_env relates
 # to its CRED_KEYS CAL_API_KEY. Never a value here — only the key names.
 CRED_KEYS = [
+    {"key": "DEEPGRAM_API_KEY", "secret": True, "required": False,
+     "note": "audio-clip transcription for the assistant service, where Slack "
+             "carries no transcript of its own"},
     {"key": "SLACKER_TOKEN", "secret": True, "required": True,
      "note": "the workspace web-session token (xoxc-...); the conventional key "
              "name a connection's token_env points at"},
@@ -253,6 +270,15 @@ CONN_FIELDS = [
      'type': 'string',
      'required': False},
 ]
+# What the machine is given once, before any connection; `setup` writes it.
+SETUP_FIELDS = [{'key': 'DEEPGRAM_API_KEY',
+                 'label': 'Transcription key',
+                 'help': 'The Deepgram key the assistant service transcribes audio '
+                         'clips with, where Slack carries no transcript of its own.',
+                 'type': 'string',
+                 'secret': True,
+                 'required': False,
+                 'shared': 'DEEPGRAM_API_KEY'}]
 # `link` signs the person in through a Chrome window it opens and reads the
 # session out itself, so nobody copies a token or a cookie. The contract's own
 # `connection add <id> --stdin` stays as the paste fallback for a machine with
@@ -269,6 +295,105 @@ LINK_METHODS = [{
             "the session out over Chrome's DevTools protocol, closes the window "
             "and deletes the profile. Needs a Chrome and a display; with "
             "neither, link by paste (`connection add --stdin`)."}]
+# Where the assistant service's settings live, and the keys it declares;
+# `settings` reads and writes them, and `_settings_check` validates the whole
+# document through the bundle's schema before anything is written. The keys
+# named here are the ones a person sets most; every other key the schema
+# admits (allowed_users, allowed_channels, authority) is set by its path.
+SETTINGS = {'homes': [{'scope': 'project',
+                       'path': 'service/settings.json',
+                       'format': 'json',
+                       'inherits': 'global'},
+                      {'scope': 'global', 'path': 'service/settings.json',
+                       'format': 'json'}],
+            'keys': [{'key': 'connection',
+                      'label': 'Connection',
+                      'help': 'The connection the service runs on.',
+                      'type': 'string',
+                      'required': False,
+                      'scope': 'project',
+                      'apply': 'restart'},
+                     {'key': 'environment',
+                      'label': 'Environment',
+                      'help': 'Which half of the machine this service is; jobs '
+                              'are filed under it.',
+                      'type': 'string',
+                      'scope': 'project',
+                      'apply': 'restart'},
+                     {'key': 'assistant_name',
+                      'label': 'Assistant name',
+                      'help': 'The name the assistant answers to.',
+                      'type': 'string',
+                      'scope': 'project',
+                      'apply': 'reload'},
+                     {'key': 'direct_messages.mode',
+                      'label': 'Direct messages',
+                      'help': 'Who may wake the assistant in a direct message.',
+                      'type': 'enum',
+                      'choices': ['allowlist', 'anyone', 'off'],
+                      'scope': 'project',
+                      'apply': 'reload'},
+                     {'key': 'defaults.profile',
+                      'label': 'Profile',
+                      'help': 'The harness profile a turn runs on where its '
+                              'conversation names none.',
+                      'type': 'string',
+                      'default': 'slacker-claude',
+                      'scope': 'project',
+                      'apply': 'reload'},
+                     {'key': 'defaults.debounce',
+                      'label': 'Debounce',
+                      'help': 'Seconds a turn waits for the person to stop '
+                              'writing; each message restarts it.',
+                      'type': 'number',
+                      'default': 3,
+                      'minimum': 0,
+                      'maximum': 300,
+                      'scope': 'project',
+                      'apply': 'reload'},
+                     {'key': 'defaults.tail_size',
+                      'label': 'Tail',
+                      'help': 'Messages of the conversation a turn reads.',
+                      'type': 'integer',
+                      'default': 40,
+                      'minimum': 1,
+                      'maximum': 500,
+                      'scope': 'project',
+                      'apply': 'reload'},
+                     {'key': 'defaults.worker_timeout',
+                      'label': 'Worker timeout',
+                      'help': 'Seconds a turn may take.',
+                      'type': 'integer',
+                      'default': 120,
+                      'minimum': 1,
+                      'maximum': 3600,
+                      'scope': 'project',
+                      'apply': 'reload'},
+                     {'key': 'defaults.max_parallel_jobs',
+                      'label': 'Parallel jobs',
+                      'help': 'Jobs running at once.',
+                      'type': 'integer',
+                      'default': 1,
+                      'minimum': 1,
+                      'maximum': 32,
+                      'scope': 'project',
+                      'apply': 'reload'},
+                     {'key': 'defaults.job_recovery',
+                      'label': 'Job recovery',
+                      'help': 'What becomes of work a restart interrupted.',
+                      'type': 'enum',
+                      'choices': ['inspect', 'requeue'],
+                      'default': 'requeue',
+                      'scope': 'project',
+                      'apply': 'reload'},
+                     {'key': 'defaults.voice_transcription',
+                      'label': 'Voice transcription',
+                      'help': 'Which audio clips are transcribed.',
+                      'type': 'enum',
+                      'choices': ['off', 'addressed', 'auto'],
+                      'default': 'addressed',
+                      'scope': 'project',
+                      'apply': 'reload'}]}
 # The verbs that write to Slack as the linked person. Each is refused (exit 4)
 # unless the connection grants allow_write; a grant is given per connection.
 WRITE_VERBS = {"send", "edit", "delete", "react", "unreact", "upload", "mark",
@@ -277,7 +402,7 @@ WRITE_DEFAULT = False   # a write leaves the system as the person: granted expli
 MACHINE_READS = ("connections", "doctor")   # outside a project: read-only machine reads
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/slacker/guides/")
-STATE = True        # the live-capture service keeps control files on this machine
+STATE = True        # the listener keeps control files on this machine
 TABLES = True       # slacker_* tables in the project's database, built by _tables()
 INVENTORY = {"network": "none"}   # the service's state is files on this machine
 POST_INSTALL: list[dict] = []
@@ -290,7 +415,11 @@ SERVICE = {
                 "web-session event stream and writes every new message, edit, "
                 "deletion, thread reply and reaction into the store as it "
                 "arrives, backfilling through the sync cursor on each reconnect "
-                "so a drop loses no channel message and duplicates nothing."),
+                "so a drop loses no channel message and duplicates nothing; and "
+                "answers the messages its settings admit with a dialogue turn on "
+                "the harness runner, posted as the linked user through the "
+                "connection's write grant, and runs the jobs those turns hand "
+                "over."),
     "verbs": ["init", "doctor", "run", "start", "reload", "stop", "status", "logs"],
     "config": "capabilities/slacker/service",
     "state": "<account-state>/service",
@@ -968,7 +1097,7 @@ def _normalize_channel_id(value: str) -> str:
 
 STORE_VERSION = "1"
 STORE_SCHEMA_MAJOR = 1
-STORE_SCHEMA_MINOR = 1
+STORE_SCHEMA_MINOR = 2
 
 # A store setting that cannot be used is a configuration fault (exit 6); a store
 # that cannot be reached or refuses the migration is the environment's (exit 5).
@@ -1054,6 +1183,197 @@ COMMENT ON COLUMN slacker_conversations.gap_newest IS
   'While a sync from the cursor is unfinished: the newest ts it fetched, where the cursor moves once the gap below is closed.';
 COMMENT ON COLUMN slacker_conversations.gap_latest IS
   'While a sync from the cursor is unfinished: the oldest ts it reached; everything from here to gap_newest is stored, and the next sync resumes below it.'"""),
+    # 1.2: the assistant service. Additive, so a release of 1.1 reads a store
+    # at 1.2 unchanged. What the service posted is marked on the message row,
+    # which the capture's upsert never sets, so a post never wakes a turn and
+    # reads as the assistant's in a later prompt; an audio clip's transcript
+    # sits beside its message for every later reader.
+    Step("0009-messages-service", """
+ALTER TABLE slacker_messages
+  ADD COLUMN sent_by_service boolean NOT NULL DEFAULT false,
+  ADD COLUMN transcript text, ADD COLUMN transcript_error text;
+COMMENT ON COLUMN slacker_messages.sent_by_service IS
+  'True for a message the assistant service posted as the linked user; never set by the capture, so the mark survives the event that echoes the post.';
+COMMENT ON COLUMN slacker_messages.transcript IS
+  'The words of the message''s audio clips, from Slack''s own transcript or the service''s transcription.';
+COMMENT ON COLUMN slacker_messages.transcript_error IS
+  'Why the message''s audio could not be transcribed; it is not tried again.'"""),
+    # What the assistant answered, per agent, environment, account and
+    # conversation: the first message it admitted there, the watermark, the ts
+    # it processed within a day of it, and its counters. A lookup row keyed by
+    # what it joins, not an entity.
+    Step("0010-register", """
+CREATE TABLE slacker_register (
+  agent_id text NOT NULL CHECK (agent_id <> ''),
+  environment text NOT NULL CHECK (environment <> ''),
+  account text NOT NULL CHECK (account <> ''),
+  channel_id text NOT NULL CHECK (channel_id <> ''),
+  first_ts timestamptz, watermark timestamptz,
+  processed jsonb NOT NULL DEFAULT '{}'::jsonb,
+  counters jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz, updated_at timestamptz,
+  PRIMARY KEY (agent_id, environment, account, channel_id));
+COMMENT ON TABLE slacker_register IS
+  'Per agent, environment, account and conversation: what the assistant service admitted, so a message is answered once and nothing before its first sight of a conversation is.';
+COMMENT ON COLUMN slacker_register.processed IS
+  'The ts of each message admitted within a day of the watermark, mapped to its epoch; older ones are settled by the watermark.';
+COMMENT ON COLUMN slacker_register.counters IS
+  'Turn outcomes counted for status; read by nothing that decides.'"""),
+    # The work a dialogue turn hands over, as whatsapp keeps it: what was
+    # asked, by whom, from which message, which thread its answer goes to, how
+    # it ran (the engine's session is the checkpoint), who owns the current
+    # attempt and until when, why it stopped, and its result until it is
+    # delivered. `host` is the machine whose listener holds the attempt, since
+    # a pid means something only there; an attempt is not pinned to a node, so
+    # no node is named.
+    Step("0011-jobs", """
+CREATE TABLE slacker_jobs (
+  agent_id text NOT NULL CHECK (agent_id <> ''),
+  id text NOT NULL, environment text NOT NULL,
+  account text NOT NULL, chat_id text NOT NULL, thread_ts text,
+  requested_by text NOT NULL, origin_message_id text, description text NOT NULL,
+  profile text, engine text, model text, session_id text,
+  host text, pid integer, pgid integer,
+  state text NOT NULL, outcome text,
+  attempt integer NOT NULL DEFAULT 0, amendments integer NOT NULL DEFAULT 0,
+  stop_requested boolean NOT NULL DEFAULT false,
+  exit_code integer, error text,
+  attempt_token text, lease_owner text, lease_expires_at timestamptz,
+  resume_at timestamptz,
+  result_text text, result_silent boolean NOT NULL DEFAULT false,
+  delivery_state text, delivery_attempts integer NOT NULL DEFAULT 0,
+  delivery_error text, delivered_at timestamptz, delivered_message_id text,
+  created_at timestamptz NOT NULL, started_at timestamptz,
+  finished_at timestamptz, execution_finished_at timestamptz,
+  updated_at timestamptz NOT NULL,
+  CONSTRAINT slacker_jobs_pkey PRIMARY KEY (id),
+  CONSTRAINT slacker_jobs_state_check
+    CHECK (state IN ('draft', 'waiting', 'running', 'stopped')),
+  CONSTRAINT slacker_jobs_outcome_check
+    CHECK (outcome IN ('succeeded', 'failed', 'cancelled', 'interrupted',
+                       'quota', 'model_refused')),
+  CONSTRAINT slacker_jobs_delivery_check
+    CHECK (delivery_state IN ('pending', 'delivered')));
+CREATE INDEX slacker_jobs_queue
+  ON slacker_jobs (agent_id, environment, account, state, created_at);
+CREATE INDEX slacker_jobs_by_chat
+  ON slacker_jobs (agent_id, environment, account, chat_id, state);
+CREATE UNIQUE INDEX slacker_jobs_live_session
+  ON slacker_jobs (session_id) WHERE state = 'running';
+CREATE UNIQUE INDEX slacker_jobs_by_origin
+  ON slacker_jobs (agent_id, environment, account, chat_id, origin_message_id)
+  WHERE origin_message_id IS NOT NULL;
+COMMENT ON TABLE slacker_jobs IS
+  'Work an assistant turn handed over, run by the listener''s job runner and answered into its conversation, in thread_ts, once.';
+COMMENT ON COLUMN slacker_jobs.thread_ts IS
+  'The thread the result is posted in; null posts it at the conversation''s top level.';
+COMMENT ON COLUMN slacker_jobs.attempt_token IS
+  'Names the one attempt every write about a running job must match, so an owner that lost its lease changes nothing.';
+COMMENT ON COLUMN slacker_jobs.host IS
+  'The machine whose listener holds the attempt; a pid means something only there.'"""),
+    # Text added to a job while it runs, kept until the engine has taken it.
+    Step("0012-job-amendments", """
+CREATE TABLE slacker_job_amendments (
+  agent_id text NOT NULL CHECK (agent_id <> ''),
+  id text NOT NULL, environment text NOT NULL,
+  account text NOT NULL, job_id text NOT NULL, text text NOT NULL,
+  state text NOT NULL, claim_token text, created_at timestamptz NOT NULL,
+  claimed_at timestamptz, acked_at timestamptz,
+  CONSTRAINT slacker_job_amendments_pkey PRIMARY KEY (id),
+  CONSTRAINT slacker_job_amendments_state_check
+    CHECK (state IN ('pending', 'claimed', 'acked')));
+CREATE INDEX slacker_job_amendments_pending
+  ON slacker_job_amendments (agent_id, environment, account, job_id, state, created_at);
+COMMENT ON TABLE slacker_job_amendments IS
+  'Text added to a job while it runs, kept until the engine has taken it.'"""),
+    # One row per attempt holding one of the `max_parallel_jobs` slots, so the
+    # budget is a fact of the store rather than of one listener's memory.
+    Step("0013-job-slots", """
+CREATE TABLE slacker_job_slots (
+  agent_id text NOT NULL CHECK (agent_id <> ''),
+  environment text NOT NULL, account text NOT NULL,
+  slot integer NOT NULL, job_id text NOT NULL, owner_id text NOT NULL,
+  attempt_token text NOT NULL, lease_expires_at timestamptz NOT NULL,
+  CONSTRAINT slacker_job_slots_pkey PRIMARY KEY (agent_id, environment, account, slot),
+  CONSTRAINT slacker_job_slots_job_key UNIQUE (agent_id, environment, account, job_id));
+COMMENT ON TABLE slacker_job_slots IS
+  'One row per running job attempt holding one of max_parallel_jobs slots.'"""),
+    # The service's prompts, the agent's own text over the bundle's standard:
+    # every saved version by key, one active, history immutable.
+    Step("0014-prompts", """
+CREATE TABLE slacker_prompts (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_id text NOT NULL CHECK (agent_id <> ''),
+  key text NOT NULL CHECK (key IN ('context', 'delegation', 'job-worker')),
+  body text NOT NULL,
+  active boolean NOT NULL DEFAULT true,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  created_by text NOT NULL CHECK (created_by <> ''),
+  note text);
+CREATE UNIQUE INDEX slacker_prompts_active ON slacker_prompts (agent_id, key)
+  WHERE active;
+CREATE INDEX slacker_prompts_by_key ON slacker_prompts (agent_id, key, created_at DESC);
+COMMENT ON TABLE slacker_prompts IS
+  'Every saved version of an agent''s slacker service prompts (context, delegation, job-worker); one active per key, a save clears it on the version it replaces.';
+COMMENT ON COLUMN slacker_prompts.body IS
+  'The prompt text byte for byte; it replaces the bundle''s standard text for its key.'"""),
+    # Every agent reference a foreign key in its class, and every job row
+    # keyed to its job; the prompts' guard keeps history immutable and admits
+    # the cascade of a deliberate delete and nothing else.
+    Step("0015-keys", r"""
+CREATE FUNCTION slacker_prompts_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+DECLARE
+    admitted boolean := false;
+BEGIN
+    IF tg_op IN ('DELETE', 'UPDATE')
+       AND coalesce(current_setting('store.deleting_agent', true), '')
+           || coalesce(current_setting('store.deleting_node', true), '')
+           || coalesce(current_setting('store.deleting_connection', true), '') <> '' THEN
+        EXECUTE format('SELECT %I.store_state_cascade($1, $2, $3, $4)', tg_table_schema)
+            INTO admitted USING tg_table_name, tg_op, to_jsonb(old),
+            CASE WHEN tg_op = 'UPDATE' THEN to_jsonb(new) END;
+        IF admitted THEN
+            RETURN CASE WHEN tg_op = 'DELETE' THEN old ELSE new END;
+        END IF;
+    END IF;
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'slacker_prompts keeps every version';
+  END IF;
+  IF new.id <> old.id OR new.agent_id <> old.agent_id OR new.key <> old.key
+     OR new.body <> old.body OR new.created_at <> old.created_at
+     OR new.created_by <> old.created_by OR new.note IS DISTINCT FROM old.note
+     OR (new.active AND NOT old.active) THEN
+    RAISE EXCEPTION 'a slacker_prompts version is immutable but for clearing active';
+  END IF;
+  RETURN new;
+END;
+$guard$;
+CREATE TRIGGER slacker_prompts_guard BEFORE UPDATE OR DELETE ON slacker_prompts
+  FOR EACH ROW EXECUTE FUNCTION slacker_prompts_guard();
+SELECT store_state_keys('slacker', ARRAY[
+    ARRAY['slacker_register', 'agent_id', 'agents', 'cascade'],
+    ARRAY['slacker_jobs', 'agent_id', 'agents', 'cascade'],
+    ARRAY['slacker_job_slots', 'agent_id', 'agents', 'cascade'],
+    ARRAY['slacker_job_slots', 'job_id', 'slacker_jobs', 'cascade'],
+    ARRAY['slacker_job_amendments', 'agent_id', 'agents', 'cascade'],
+    ARRAY['slacker_job_amendments', 'job_id', 'slacker_jobs', 'cascade'],
+    ARRAY['slacker_prompts', 'agent_id', 'agents', 'cascade']])""", core=(4, 0)),
+    # Nothing starts for an archived agent: entering a job of one is refused
+    # through the core's one guard, `agents_archived_refuse`; moving or ending
+    # one stays allowed.
+    Step("0016-jobs-unarchived", """
+CREATE FUNCTION slacker_jobs_unarchived() RETURNS trigger
+ LANGUAGE plpgsql SET search_path FROM CURRENT AS $guard$
+BEGIN
+ PERFORM agents_archived_refuse(NEW.agent_id);
+ RETURN NEW;
+END $guard$;
+CREATE TRIGGER slacker_jobs_unarchived BEFORE INSERT ON slacker_jobs
+ FOR EACH ROW EXECUTE FUNCTION slacker_jobs_unarchived();
+COMMENT ON TRIGGER slacker_jobs_unarchived ON slacker_jobs IS
+  'Refuses entering a job of an archived agent; moving or ending one stays allowed.'""",
+         core=(4, 2)),
 ]
 
 
@@ -1588,6 +1908,9 @@ class SlackClient:
 
     def user_info(self, user: str) -> dict:
         return self._call("users.info", user=user).get("user", {})
+
+    def conversation_info(self, channel: str) -> dict:
+        return self._call("conversations.info", channel=channel).get("channel", {})
 
     def conversations(self, types: str, limit: int = 1000):
         """The linked user's own conversations. users.conversations answers
@@ -2329,7 +2652,10 @@ def _service_home(cfg: dict) -> Path:
 
 
 def _service_write(home: Path, name: str, payload: dict) -> None:
-    (home / name).write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    """Replace one control file whole, so a reader never sees half of it."""
+    spare = home / f".{name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    spare.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    os.replace(spare, home / name)
 
 
 def _service_read(home: Path, name: str) -> dict | None:
@@ -2347,15 +2673,664 @@ _CAPTURE_STEADY_SECONDS = 30.0
 _WEB_ORIGIN = "https://app.slack.com"
 
 
+# --- The assistant: settings, prompts, profiles ------------------------------
+#
+# The listener answers the messages its settings admit with a dialogue turn on
+# callva-harness-runner, from the bundle's `service/` modules. The CLI does not
+# carry the runner in its dependency header: every read verb resolves that
+# header, and the runner is large. The listener runs itself again under `uv
+# run --with` the runner pinned in `service/profiles.py` when its settings admit
+# anyone; settings that admit nobody never need it, and capture exactly as
+# before.
+
+SERVICE_RUNNER_EXEC_ENV = "SLACKER_SERVICE_RUNNER_EXEC"
+SERVICE_DOCUMENTS = ("context", "delegation", "job-worker")
+_SERVICE_MODULES: dict[str, object] = {}
+
+
+def _service_bundle_dir() -> Path:
+    here = Path(__file__).resolve()
+    return here.parent.parent if here.parent.name == "bin" else here.parent
+
+
+def _service_template(name: str = "settings.json") -> Path:
+    return _service_bundle_dir() / "service" / "templates" / name
+
+
+def _service_module(name: str):
+    """One of the bundle's service modules, loaded from beside this file. They
+    import nothing of the CLI, so loading one costs nothing a verb would notice."""
+    if name not in _SERVICE_MODULES:
+        import importlib.util
+        path = _service_bundle_dir() / "service" / f"{name}.py"
+        spec = importlib.util.spec_from_file_location(f"slacker_service_{name}", path)
+        if spec is None or spec.loader is None or not path.is_file():
+            _refuse(3, "service_bundle_missing",
+                    f"the bundled service module is missing: {path}",
+                    f"reinstall {NAME} from a bundled source")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _SERVICE_MODULES[name] = module
+    return _SERVICE_MODULES[name]
+
+
+def _service_schema():
+    return _service_module("settings_schema")
+
+
+class _CliFacade:
+    """The CLI's own functions as the service modules reach them: read live
+    from this module, so the store and the Slack client the dialogue uses are
+    the ones every verb uses."""
+
+    __file__ = __file__
+
+    def __getattr__(self, name):
+        try:
+            return globals()[name]
+        except KeyError:
+            raise AttributeError(name) from None
+
+
+def _error_line(exc: BaseException) -> str:
+    if isinstance(exc, _Refusal):
+        return f"{exc.code}: {exc.message}"
+    return (f"{type(exc).__name__}: {exc}".strip().splitlines() or ["error"])[0][:300]
+
+
+def _service_settings() -> dict:
+    """The service's settings records, without the registry's own default; an
+    empty document where none were written."""
+    try:
+        rows = _records().resolve(NAME, "setting")
+    except StoreError as exc:
+        _refuse(6, exc.slug, exc.message, exc.hint)
+    return {key: row["value"] for key, row in rows.items()
+            if key != "connection.default"}
+
+
+def _validate_service_settings(data) -> dict:
+    """The closed settings surface: an unknown key is refused, never ignored.
+    The bundle's schema module owns the walk."""
+    return _service_schema().validate_settings(data)
+
+
+def _checked_service_settings() -> dict:
+    data = _service_settings()
+    try:
+        return _validate_service_settings(data)
+    except ValueError as exc:
+        _refuse(6, "service_settings_invalid", str(exc),
+                f"fix it with `{NAME} settings`; unsupported keys are never ignored")
+
+
+def _settings_merged(scope: str, document: dict) -> dict | None:
+    """The settings the service would load once `document` is written at
+    `scope`: the project's over the global one, key by key. None outside a
+    project, where there is nothing to merge it into."""
+    if _project_root() is None:
+        return None
+    other = "global" if scope == "project" else "project"
+    try:
+        held = {key: row["value"] for key, row in
+                _records().resolve_scope(NAME, "setting", other).items()
+                if key != "connection.default"}
+    except StoreError as exc:
+        return {"__error__": exc.message}
+    return {**held, **document} if scope == "project" else {**document, **held}
+
+
+def _settings_check(scope: str, document: dict) -> list:
+    """What the assistant service's schema finds wrong with this project's
+    settings once the contract's `settings` verb writes `document` at `scope`."""
+    if scope not in ("project", "global"):
+        return []
+    merged = _settings_merged(scope, document)
+    if merged is None:
+        merged = dict(document)
+    if "__error__" in merged:
+        return [merged["__error__"]]
+    try:
+        _validate_service_settings(merged)
+    except ValueError as exc:
+        return [str(exc)]
+    return []
+
+
+def _service_cfg(settings: dict, connection_flag: str | None) -> dict:
+    """The connection the service runs: the flag, else the settings' own, else
+    the registry's default."""
+    wanted = connection_flag or (settings or {}).get("connection") or None
+    reg, _ = _connections_registry()
+    cid, entry = _select_connection(reg, wanted)
+    cfg, problem = _build_cfg(cid, entry)
+    if problem:
+        _refuse(problem["exit"], problem["code"], problem["message"],
+                problem.get("hint"))
+    return cfg
+
+
+def _service_write_refusal(cfg: dict) -> str | None:
+    """Why the service may not post to Slack on this connection, or None. The
+    same two closures every write verb meets: the process's read-only switch
+    and the connection's own grant. Nothing here lifts either."""
+    if read_only_switch():
+        return "read_only_switch"
+    if not cfg.get("allow_write"):
+        return "read_only"
+    return None
+
+
+def _record_service_post(db: _Store, channel_id: str, message: dict) -> None:
+    """A post the service made, recorded as the capture records a sent
+    message, and marked as the service's own."""
+    with _writing(db):
+        _record_sent(db, channel_id, message)
+        db.execute("UPDATE slacker_messages SET sent_by_service = true"
+                   " WHERE account = %s AND channel_id = %s AND ts = %s",
+                   (db.account, channel_id, message.get("ts")))
+
+
+def _runner_importable() -> bool:
+    try:
+        import callva.harness_runner  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _service_module_pin() -> str:
+    """The runner pin, read from the profiles script's own header, so the
+    listener and the script cannot run different runners."""
+    text = (_service_bundle_dir() / "service" / "profiles.py").read_text()
+    found = re.search(r'"(callva-harness-runner==[^"]+)"', text)
+    return found.group(1) if found else "callva-harness-runner"
+
+
+def _rerun_with_runner(argv: list[str]) -> NoReturn:
+    """Run this CLI again on `argv` with the harness runner beside its own
+    dependencies."""
+    import shutil
+    if os.environ.get(SERVICE_RUNNER_EXEC_ENV):
+        _refuse(5, "harness_library_missing",
+                "this was started with the harness runner and still cannot "
+                "import it", f"check that uv can resolve {_service_module_pin()}")
+    uv = shutil.which("uv")
+    if uv is None:
+        _refuse(5, "harness_library_missing",
+                "the assistant runs on callva-harness-runner, and uv is not on "
+                "PATH to resolve it",
+                "put uv on PATH, where the CLI's own shebang finds it")
+    env = dict(os.environ)
+    env[SERVICE_RUNNER_EXEC_ENV] = "1"
+    command = [uv, "run", "--quiet", "--with", _service_module_pin(), "--script",
+               str(Path(__file__).resolve()), *argv]
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvpe(uv, command, env)
+
+
+def _service_project_id(root: Path) -> str:
+    """The id the register keys this agent's rows by."""
+    state = _project_id_state_at(root)
+    project_id = (state or {}).get("id")
+    if not project_id:
+        _refuse(6, "project_id_missing",
+                "the assistant keys what it answered by the project's id, and this "
+                "project declares none",
+                "run `capabilities init` so the project's id is recorded")
+    return str(project_id)
+
+
+def _stored_prompt(db, agent_id: str, key: str):
+    """The agent's active version of one prompt, read from the store now."""
+    return db.execute(
+        "SELECT id::text AS id, key, body, created_at, created_by, note"
+        " FROM slacker_prompts WHERE agent_id = %s AND key = %s AND active",
+        (agent_id, key)).fetchone()
+
+
+def _prompt(db, agent_id: str | None, key: str) -> dict:
+    """One prompt as the next turn reads it: {key, body, source, ...}, the
+    source `store` (with its version) or `bundle`."""
+    row = _stored_prompt(db, agent_id, key) if agent_id else None
+    if row is not None:
+        return {"key": key, "body": row["body"], "source": "store", "version": row["id"],
+                "created_at": row["created_at"], "created_by": row["created_by"]}
+    template = _service_template(f"{key}.md")
+    if template.is_file():
+        return {"key": key, "body": template.read_text(), "source": "bundle"}
+    return {"key": key, "body": "", "source": "none"}
+
+
+def _save_prompt(db, agent_id: str, key: str, body: str, by: str, *,
+                 base: str | None = None, note: str | None = None) -> dict:
+    """Add a version and make it active, clearing the one it replaces, in one
+    transaction. `base`, where given, must name the active version (its id or
+    six or more of its first characters), else exit 6 base_mismatch."""
+    with _writing(db):
+        found = db.execute(
+            "SELECT id::text AS id FROM slacker_prompts WHERE agent_id = %s AND key = %s"
+            " AND active FOR UPDATE", (agent_id, key)).fetchone()
+        current = found["id"] if found else None
+        if base is not None and not (current and len(base) >= 6
+                                     and current.startswith(base.lower())):
+            _refuse(6, "base_mismatch",
+                    f"the active version of {key!r} is {current}, not {base!r}",
+                    f"`{NAME} prompts show {key}` reads the active version")
+        if current:
+            db.execute("UPDATE slacker_prompts SET active = false WHERE id = %s",
+                       (current,))
+        row = db.execute(
+            "INSERT INTO slacker_prompts (agent_id, key, body, created_by, note)"
+            " VALUES (%s, %s, %s, %s, %s) RETURNING id::text AS id, created_at",
+            (agent_id, key, body, by, note)).fetchone()
+    return {"key": key, "version": row["id"], "replaced": current,
+            "created_at": row["created_at"]}
+
+
+def _project_store() -> tuple[Path, str, _Store]:
+    """The project, its id, and its store with the slacker tables migrated,
+    for the verbs whose rows are the agent's rather than an account's."""
+    root = _project_root()
+    if root is None:
+        _refuse(6, "no_project", "not inside a project",
+                f"run `{NAME}` from the project whose assistant it is")
+    agent_id = _service_project_id(root)
+    setting = _store_setting(root)
+    try:
+        conn = connect(application_name=NAME, setting=setting, transaction=True)
+    except DbError as exc:
+        _store_refusal(exc)
+    try:
+        migrate(conn, NAME, STORE_STEPS, major=STORE_SCHEMA_MAJOR,
+                minor=STORE_SCHEMA_MINOR)
+        conn.autocommit = True
+    except DbError as exc:
+        conn.close()
+        _store_refusal(exc)
+    return root, agent_id, _Store(conn, "", setting)
+
+
+def cmd_prompts(args) -> dict:
+    """The service's prompts: the agent's own text over the bundle's standard."""
+    action = args.prompts_command
+    if action in ("put", "retire"):
+        _read_only_gate(f"`{NAME} prompts {action}`")
+    if action != "list" and args.key not in SERVICE_DOCUMENTS:
+        _refuse(6, "invalid_arguments", f"no prompt {args.key!r}",
+                f"the prompts are {', '.join(SERVICE_DOCUMENTS)}")
+    root, agent_id, db = _project_store()
+    try:
+        if action == "list":
+            rows = []
+            for key in SERVICE_DOCUMENTS:
+                prompt = _prompt(db, agent_id, key)
+                rows.append({k: v for k, v in prompt.items() if k != "body"}
+                            | {"chars": len(prompt["body"])})
+            return {"project": str(root), "agent_id": agent_id, "prompts": rows}
+        key = args.key
+        if action == "show":
+            return _prompt(db, agent_id, key)
+        if action == "history":
+            rows = db.execute(
+                "SELECT id::text AS id, active, length(body) AS chars, created_at,"
+                " created_by, note FROM slacker_prompts WHERE agent_id = %s AND key = %s"
+                " ORDER BY created_at DESC", (agent_id, key)).fetchall()
+            return {"key": key, "versions": [dict(zip(row.keys(), row)) for row in rows]}
+        if action == "retire":
+            with _writing(db):
+                row = db.execute(
+                    "UPDATE slacker_prompts SET active = false WHERE agent_id = %s"
+                    " AND key = %s AND active RETURNING id::text AS id",
+                    (agent_id, key)).fetchone()
+            return {"key": key, "retired": row["id"] if row else None,
+                    "now": _prompt(db, agent_id, key)["source"]}
+        body = sys.stdin.read()
+        if not body.strip():
+            _refuse(6, "empty_prompt", "the prompt on stdin is empty",
+                    f"`{NAME} prompts retire {key}` leaves the key to the bundle's "
+                    "standard text")
+        user = os.environ.get("USER") or os.environ.get("LOGNAME") or "unknown"
+        return _save_prompt(db, agent_id, key, body, f"{user}@{node_name()}",
+                            base=args.base, note=args.note)
+    finally:
+        db.close()
+
+
+# --- Audio --------------------------------------------------------------------
+#
+# An audio clip's words reach a turn from Slack's own transcript of the clip
+# where Slack made one, else from Deepgram, with the key the credential cascade
+# resolves for DEEPGRAM_API_KEY. The clip is read the way the web client reads
+# it, over the session.
+
+DEEPGRAM_MODEL = "nova-3"
+AUDIO_LIMIT = 50 * 1024 * 1024     # the largest clip sent for transcription
+AUDIO_TIMEOUT = 120                # one transcription, per attempt
+
+
+def _slack_file_bytes(cfg: dict, url: str) -> bytes:
+    import urllib.request
+    request = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {cfg['token']}", "Cookie": f"d={cfg['cookie']}"})
+    with urllib.request.urlopen(request, timeout=AUDIO_TIMEOUT) as resp:
+        ctype = str(resp.headers.get("Content-Type") or "")
+        data = resp.read(AUDIO_LIMIT + 1)
+    if len(data) > AUDIO_LIMIT:
+        raise ValueError("the clip is larger than the service transcribes")
+    if ctype.startswith("text/html"):
+        raise ValueError("Slack answered the download with a page, not the clip")
+    return data
+
+
+def _deepgram_bytes(data: bytes, mimetype: str | None, key: str) -> str:
+    import urllib.request
+    url = ("https://api.deepgram.com/v1/listen?" f"model={DEEPGRAM_MODEL}"
+           "&detect_language=true&smart_format=true&punctuate=true&paragraphs=true")
+    request = urllib.request.Request(url, data=data, method="POST", headers={
+        "Authorization": f"Token {key}",
+        "Content-Type": mimetype or "application/octet-stream"})
+    with urllib.request.urlopen(request, timeout=AUDIO_TIMEOUT) as resp:
+        answer = json.loads(resp.read().decode("utf-8"))
+    channels = (answer.get("results") or {}).get("channels") or []
+    if not channels:
+        return ""
+    alt = (channels[0].get("alternatives") or [{}])[0]
+    return ((alt.get("paragraphs") or {}).get("transcript")
+            or alt.get("transcript") or "").strip()
+
+
+def _transcribe_message(client: "SlackClient", cfg: dict, db: _Store, channel_id: str,
+                        ts: str, files: list[dict]) -> dict:
+    """The words of one message's audio clips, written beside the message.
+    Answers {"ok": True, "text", "provider"} or {"ok": False, "error"}; a
+    failure is recorded and not tried again, and a transcript already stored
+    is answered without paying again."""
+    row = db.execute(
+        "SELECT transcript FROM slacker_messages WHERE account = %s AND channel_id = %s"
+        " AND ts = %s", (db.account, channel_id, ts)).fetchone()
+    if row and row["transcript"]:
+        return {"ok": True, "text": row["transcript"], "provider": "store"}
+    texts, errors, providers = [], [], []
+    for item in files:
+        transcription = item.get("transcription") or {}
+        preview = transcription.get("preview") or {}
+        if transcription.get("status") == "complete" and preview.get("content") \
+                and not preview.get("has_more"):
+            texts.append(str(preview["content"]).strip())
+            providers.append("slack")
+            continue
+        key, _tier, _source = _resolve_env_key("DEEPGRAM_API_KEY")
+        if not key:
+            errors.append("no Deepgram key; DEEPGRAM_API_KEY is not set")
+            continue
+        url = item.get("url_private_download") or item.get("url_private")
+        if not url:
+            errors.append("the clip carries no download link")
+            continue
+        try:
+            text = _deepgram_bytes(_slack_file_bytes(cfg, url), item.get("mimetype"), key)
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}"[:300])
+            continue
+        if text:
+            texts.append(text)
+            providers.append("deepgram")
+        else:
+            errors.append("no speech was recognised")
+    text = "\n".join(t for t in texts if t)
+    error = None if text else ("; ".join(errors) or "no speech was recognised")
+    with _writing(db):
+        db.execute("UPDATE slacker_messages SET transcript = %s, transcript_error = %s"
+                   " WHERE account = %s AND channel_id = %s AND ts = %s",
+                   (text or None, error, db.account, channel_id, ts))
+    if not text:
+        return {"ok": False, "error": error}
+    return {"ok": True, "text": text, "provider": ",".join(sorted(set(providers)))}
+
+
+# --- Jobs ----------------------------------------------------------------------
+
+JOBS_HELP = """slacker jobs — the register of work that outlives a conversation
+
+  jobs list [--state S] [--outcome O] [--limit N]   jobs in this project, newest first
+  jobs active [--limit N]                           only what is waiting or running
+  jobs show <id>                                    one job, staged amendments included
+  jobs register "<one-line outcome>"                write a draft; nothing runs it yet
+  jobs submit <id> --confirm-active-jobs-checked    hand a draft to the runner
+  jobs amend <id> "<what changed>"                  continue a job with added context
+  jobs discard <id>                                 drop a draft nobody will submit
+  jobs stop <id>                                    stop the work; it keeps its session
+  jobs resume <id>                                  continue a stopped job
+
+A job runs in arrival order within defaults.max_parallel_jobs, on the profile
+named by defaults.job_profile, and answers into the conversation it was
+registered from, in the thread its request was answered in. States: draft,
+waiting, running, stopped; a stopped job's outcome is succeeded, failed,
+cancelled, interrupted, quota or model_refused. Outside a worker, --chat narrows
+to one conversation and register takes --chat, --thread and --requested-by."""
+
+
+def _jobs_environment(settings: dict) -> str:
+    """The environment a job is filed under: the one the listener runs, which
+    it hands its workers, else the settings' own."""
+    return (os.environ.get("SLACKER_ENVIRONMENT", "").strip()
+            or settings.get("environment") or "production")
+
+
+def _job_scope(args) -> None:
+    """Hold a worker the service started to the conversation, requester and
+    origin it was started for. A terminal call is a maintainer's and stays
+    unscoped."""
+    if not os.environ.get("SLACKER_DAEMON_CHILD", "").strip():
+        return
+    chat = os.environ.get("SLACKER_AUTHORIZED_CHAT_ID", "").strip()
+    actor = os.environ.get("SLACKER_AUTHORIZED_REQUESTER", "").strip()
+    if not chat or not actor:
+        _refuse(4, "job_scope_missing",
+                "a worker the Slack service started reached the job register "
+                "without the conversation and requester it acts for",
+                "the service hands its workers SLACKER_AUTHORIZED_CHAT_ID and "
+                "SLACKER_AUTHORIZED_REQUESTER")
+    for name, given, wanted in (("conversation", args.chat, chat),
+                                ("actor", args.actor, actor)):
+        if given and str(given) != wanted:
+            _refuse(4, "job_scope_denied",
+                    f"a worker's job {name} differs from the one its turn was started for")
+    args.chat, args.actor = chat, actor
+    if args.jobs_command == "register":
+        thread = os.environ.get("SLACKER_AUTHORIZED_THREAD_TS", "").strip()
+        origin = os.environ.get("SLACKER_AUTHORIZED_ORIGIN_MESSAGE_ID", "").strip()
+        profile = os.environ.get("SLACKER_AUTHORIZED_JOB_PROFILE", "").strip()
+        for name, given, wanted in (("requester", args.requested_by, actor),
+                                    ("thread", args.thread, thread),
+                                    ("origin message", args.origin_message_id, origin),
+                                    ("profile", args.profile, profile)):
+            if given and wanted and str(given) != wanted:
+                _refuse(4, "job_scope_denied",
+                        f"a worker's job {name} differs from the one its turn was "
+                        "started for")
+        args.requested_by = actor
+        args.thread = thread or None
+        args.origin_message_id = origin or None
+        args.profile = profile or args.profile
+
+
+def _open_jobs(args):
+    """The project's job register on this account, and the module it lives in."""
+    root = _project_root()
+    if root is None:
+        _refuse(6, "no_project", "not inside a project",
+                f"run `{NAME} jobs` from the project whose assistant it is")
+    settings = _service_settings()
+    connection = (os.environ.get("SLACKER_AUTHORIZED_CONNECTION", "").strip()
+                  if os.environ.get("SLACKER_DAEMON_CHILD") else None) or args.connection
+    cfg = _service_cfg(settings, connection)
+    project_id = _service_project_id(root)
+    module = _service_module("jobs")
+    db = _open_store(cfg)
+    return module, module.JobRegister(_CliFacade(), db, project_id,
+                                      _jobs_environment(settings)), settings
+
+
+def _job_row(row: dict) -> dict:
+    out = {k: v for k, v in row.items()
+           if k not in ("attempt_token", "lease_owner", "agent_id")}
+    out["stopping"] = bool(out.pop("stop_requested", False))
+    return out
+
+
+def _require_job(register, job_id: str, chat: str | None, actor: str | None) -> dict:
+    row = register.get(job_id, actor_id=actor)
+    if row is None:
+        _refuse(2, "job_not_found", f"no job {job_id} in this project's register",
+                f"run `{NAME} jobs list` to see the ids")
+    if chat and row["chat_id"] != chat:
+        _refuse(4, "job_scope_denied", f"job {job_id} belongs to conversation "
+                f"{row['chat_id']}, not {chat}")
+    return row
+
+
+def cmd_jobs(args):
+    action = args.jobs_command
+    if action == "help":
+        sys.stdout.write(JOBS_HELP + "\n")
+        return None
+    _job_scope(args)
+    chat = args.chat
+    actor = args.actor
+    module, register, settings = _open_jobs(args)
+    try:
+        if action in ("list", "active"):
+            if action == "active":
+                rows = register.open_jobs(chat, actor_id=actor)[:args.limit]
+            else:
+                rows = register.list(limit=args.limit, state=args.state,
+                                     outcome=args.outcome, chat_id=chat, actor_id=actor)
+            return {"environment": register.environment, "account": register.account,
+                    "chat_id": chat, "counts": register.counts(actor_id=actor),
+                    "slots_in_use": register.slots_in_use(),
+                    "jobs": [_job_row(r) for r in rows]}
+        if action == "register":
+            if not chat:
+                _refuse(6, "no_chat", "a job needs the conversation it reports into",
+                        "pass --chat <conversation id>")
+            if not args.requested_by:
+                _refuse(6, "no_requester", "a job needs the person whose authority "
+                        "it carries", "pass --requested-by <Slack user id>")
+            profile = (args.profile or (settings.get("defaults") or {}).get("job_profile")
+                       or _service_module("profiles").DEFAULT_JOB_PROFILE)
+            row = register.register(chat_id=chat, requested_by=args.requested_by,
+                                    description=args.description,
+                                    origin_message_id=args.origin_message_id,
+                                    profile=profile, thread_ts=args.thread)
+            out = _job_row(row)
+            out["next"] = (f"submit it with `{NAME} jobs submit {row['id']} "
+                           "--confirm-active-jobs-checked` once its outcome line says "
+                           "what will be delivered")
+            return out
+        row = _require_job(register, args.id, chat, actor)
+        if action == "show":
+            out = _job_row(row)
+            out["pending_amendment"] = register.pending_amendment(args.id)
+            return out
+        if action == "submit":
+            if not args.confirm_active_jobs_checked:
+                _refuse(6, "active_jobs_unconfirmed",
+                        "submitting needs confirmation that the active jobs were read",
+                        f"read `{NAME} jobs active`, and if this outcome is not already "
+                        "among them pass --confirm-active-jobs-checked")
+            return _job_row(register.submit(args.id, actor_id=actor))
+        if action == "amend":
+            register.stage_amendment(args.id, args.text, actor_id=actor)
+            register.amend(args.id, actor_id=actor)
+            return {"id": args.id, "amendment": "staged",
+                    "pending_amendment": register.pending_amendment(args.id),
+                    "instruction": "Say the correction is folded into the job that "
+                                   "already exists. Do not register a new one."}
+        if action == "discard":
+            if row["state"] != module.DRAFT:
+                _refuse(6, "job_not_a_draft", f"job {args.id} is {row['state']}, not a "
+                        "draft", f"work that has started is stopped with `{NAME} jobs "
+                        "stop` and stays continuable")
+            register.discard(args.id, actor_id=actor)
+            return {"id": args.id, "discarded": True, "description": row["description"]}
+        if action == "stop":
+            if register.request_stop(args.id, actor_id=actor) is None:
+                _refuse(6, "job_not_running", f"job {args.id} is {row['state']}, so "
+                        "there is nothing to stop", f"`{NAME} jobs resume` continues a "
+                        "stopped job")
+            return {"id": args.id, "stopping": True,
+                    "instruction": "The listener ends the work on its next look at the "
+                                   "register. The job keeps its session and its place."}
+        if action == "resume":
+            return _job_row(register.resume(args.id, actor_id=actor))
+    except module.JobError as exc:
+        _refuse(6, exc.slug, exc.message, exc.hint)
+    finally:
+        register.db.close()
+    return None
+
+
+# --- The listener ----------------------------------------------------------------
+
+
+def _self_dm(db: _Store, client: "SlackClient", user_id: str | None) -> str | None:
+    """The account's own direct message with itself, read from Slack's list
+    of the account's direct messages."""
+    if not user_id:
+        return None
+    with contextlib.suppress(_Refusal):
+        for conv in client.conversations(types="im", limit=1000):
+            _upsert_conversation(db, conv)
+            if conv.get("user") == user_id:
+                return conv.get("id")
+    row = db.execute(
+        "SELECT id FROM slacker_conversations WHERE account = %s AND kind = 'im'"
+        " AND user_id = %s LIMIT 1", (db.account, user_id)).fetchone()
+    return row["id"] if row else None
+
+
+def _build_dialogue(cfg: dict, root: Path, settings: dict, home: Path,
+                    identity: dict, *, log=None):
+    """The listener's dialogue, its profiles resolved and fitted, and its job
+    runner. Needs the runner in this process."""
+    if not _runner_importable():
+        raise ValueError("the assistant needs callva-harness-runner in the "
+                         "listener; restart the service to enable it")
+    project_id = _service_project_id(root)
+    db = _open_store(cfg)
+    dialogue = _service_module("dialogue").Dialogue(
+        _CliFacade(), cfg=cfg, root=root, settings=settings, project_id=project_id,
+        db=db, state_dir=home, profiles=_service_module("profiles"),
+        client=SlackClient(cfg), identity=identity, log=log)
+    try:
+        dialogue.prepare()
+    except ValueError:
+        db.close()
+        raise
+    # The job runner has a store connection of its own: a job's claim waits
+    # on rows another listener holds, and the capture must never wait with it.
+    dialogue.jobs = _service_module("jobs").JobRunner(
+        _CliFacade(), dialogue=dialogue, db=_open_store(cfg))
+    return dialogue
+
+
 class _Capture:
     """The listener's state for one account: the store, the Slack client, the
     control files, and the backoff that closes a reconnect's gap through the
     sync cursor, so a drop doubles nothing and loses no channel message; a
     thread reply posted during the drop is not in Slack's channel history and
-    is read with `thread --fresh`."""
+    is read with `thread --fresh`. Where its settings admit anyone it also
+    runs the assistant's dialogue and job runner, and offers the dialogue
+    every message it captures live."""
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, settings: dict | None = None,
+                 root: Path | None = None):
         self.cfg = cfg
+        self.settings = settings or {}
+        self.root = root
         self.home = _service_home(cfg)
         self.db: _Store | None = None
         self.client: SlackClient | None = None
@@ -2364,13 +3339,29 @@ class _Capture:
         self.events = 0
         self.last_event_at: str | None = None
         self.state = "starting"
+        self.dialogue = None
+        self.identity: dict = {}
+        self.health_lock = threading.Lock()
+        self.reload_lock = threading.Lock()
+        self.reloads = 0
+        self.reload_error: str | None = None
+        self.reloaded_at: str | None = None
+        self.records_read_at = time.monotonic()
 
     def health(self, state: str, extra: dict | None = None) -> None:
-        self.state = state
-        _service_write(self.home, "health.json", {
-            "state": state, "pid": os.getpid(), "at": _iso_now(),
-            "events": self.events, "last_event_at": self.last_event_at,
-            **(extra or {})})
+        with self.health_lock:
+            self.state = state
+            payload = {"state": state, "pid": os.getpid(), "at": _iso_now(),
+                       "events": self.events, "last_event_at": self.last_event_at,
+                       "settings_reload_attempts": self.reloads,
+                       "settings_reload_error": self.reload_error,
+                       "settings_reloaded_at": self.reloaded_at,
+                       "allow_write": bool(self.cfg.get("allow_write"))}
+            if self.dialogue is not None:
+                with contextlib.suppress(Exception):
+                    payload["dialogue"] = self.dialogue.summary()
+            payload.update(extra or {})
+            _service_write(self.home, "health.json", payload)
 
     def _backfill(self) -> None:
         """Close any gap since the last covered ts on every member channel.
@@ -2407,11 +3398,94 @@ class _Capture:
         if change:
             self.events += 1
             self.last_event_at = _iso_now()
+            if self.dialogue is not None and event.get("type") == "message" \
+                    and change.get("change") in ("message", "message_update"):
+                self.dialogue.offer(event)
             self.health(self.state)
+
+    # -- the assistant --------------------------------------------------------
+
+    def _start_dialogue(self) -> None:
+        """Start the dialogue and its job runner for settings that admit
+        anyone. Raises ValueError, naming why, when it cannot."""
+        if self.root is None:
+            raise ValueError("the assistant answers for a project, and the service "
+                             "was started outside one")
+        if self.dialogue is None:
+            self.identity["self_dm"] = _self_dm(self.db, self.client,
+                                                self.identity.get("user_id"))
+            self.dialogue = _build_dialogue(self.cfg, self.root, self.settings,
+                                            self.home, self.identity, log=_log)
+            self.dialogue.start()
+            self.dialogue.jobs.start()
+            refusal = _service_write_refusal(self.cfg)
+            _log("assistant: started for " + ", ".join(
+                f"{k}={v}" for k, v in (("user", self.identity.get("user_id")),
+                                        ("self_dm", self.identity.get("self_dm")))))
+            if refusal:
+                _log(f"assistant: connection {self.cfg.get('id')!r} does not grant "
+                     f"writes ({refusal}); it answers nothing until a person grants "
+                     "them")
+
+    def _refresh_grant(self) -> None:
+        """Read the connection's write grant again, so a grant a person gave
+        or took back is the one the next post meets."""
+        reg, _ = _connections_registry()
+        entry = (reg.get("connections") or {}).get(self.cfg["id"])
+        if entry is not None:
+            self.cfg["allow_write"] = bool(entry.get("allow_write", WRITE_DEFAULT))
+
+    def reload(self) -> None:
+        """Re-read the settings and the write grant, validate them, fit their
+        profiles, and take them; a refused reload leaves the previous ones in
+        force. Answers through health, which `service reload` reads."""
+        with self.reload_lock:
+            # The records answer from a cache for STORE_READ_SECONDS after a
+            # read; a reload waits that out since its last read, so it reads
+            # what was written before it was asked for.
+            wait = STORE_READ_SECONDS - (time.monotonic() - self.records_read_at)
+            if wait > 0:
+                time.sleep(wait)
+            error = None
+            try:
+                settings = _validate_service_settings(_service_settings())
+                self._refresh_grant()
+                configured = _service_schema().dialogue_configured(settings)
+                if self.dialogue is not None:
+                    self.dialogue.update_settings(settings)
+                    self.settings = settings
+                elif configured:
+                    previous, self.settings = self.settings, settings
+                    try:
+                        self._start_dialogue()
+                    except BaseException:
+                        self.settings = previous
+                        raise
+                else:
+                    self.settings = settings
+            except _Refusal as refusal:
+                error = f"{refusal.code}: {refusal.message}"
+            except SystemExit:
+                error = "the settings or the connection could not be read"
+            except Exception as exc:
+                error = str(exc) or type(exc).__name__
+            self.records_read_at = time.monotonic()
+            self.reloads += 1
+            self.reload_error = error
+            self.reloaded_at = _iso_now()
+            _log(f"settings reload refused, the previous settings remain: {error}"
+                 if error else "settings reloaded")
+            self.health(self.state)
+
+    def _end(self, *_args) -> None:
+        self.stop.set()
+        with contextlib.suppress(Exception):
+            if self.ws is not None:
+                self.ws.close()
 
     def run(self) -> int:
         """Foreground capture with reconnect/backoff. Returns the process exit
-        code. SIGTERM ends it cleanly."""
+        code. SIGTERM ends it cleanly; SIGHUP reloads the settings."""
         try:
             import websocket  # noqa: F401  (websocket-client)
         except ImportError:
@@ -2420,36 +3494,53 @@ class _Capture:
                     f"run {NAME} through its own script header, which pins it")
         self.db = _open_store(self.cfg)
         self.client = SlackClient(self.cfg)
-        _identity(self.cfg, self.client, self.db)
-        signal.signal(signal.SIGTERM, lambda *_: self.stop.set())
-        signal.signal(signal.SIGINT, lambda *_: self.stop.set())
+        ident = _identity(self.cfg, self.client, self.db)
+        self.identity = {"user_id": ident.get("user_id"), "user": ident.get("user")}
+        signal.signal(signal.SIGTERM, self._end)
+        signal.signal(signal.SIGINT, self._end)
+        signal.signal(signal.SIGHUP, lambda *_: threading.Thread(
+            target=self.reload, name="reload", daemon=True).start())
+        if _service_schema().dialogue_configured(self.settings):
+            try:
+                self._start_dialogue()
+            except ValueError as exc:
+                self.db.close()
+                _refuse(6, "service_dialogue_invalid", str(exc),
+                        f"`{NAME} service doctor` names what the settings reach")
         backoff = 2.0
         self.health("starting")
-        while not self.stop.is_set():
-            try:
-                self._backfill()
-                self.health("connecting")
-                # Only a connection that held resets the backoff: a refused
-                # handshake or a socket closed at once keeps doubling it.
-                if self._listen() >= _CAPTURE_STEADY_SECONDS:
-                    backoff = 2.0
-            except _Refusal as refusal:
-                if refusal.exit_code == 2:
-                    self.health("unlinked", {"error": refusal.message})
-                    _log(f"session no longer valid: {refusal.message}")
-                    self.db.close()
-                    return 7
-                _log(f"capture error: {refusal.message}")
-            except Exception as exc:   # a dropped socket, a transient fault
-                _log(f"capture connection lost: {type(exc).__name__}: {exc}")
-            if self.stop.is_set():
-                break
-            self.health("reconnecting", {"backoff": backoff})
-            self.stop.wait(backoff)
-            backoff = min(backoff * 2, 60.0)
-        self.health("stopped")
-        self.db.close()
-        return 0
+        try:
+            while not self.stop.is_set():
+                try:
+                    self._backfill()
+                    self.health("connecting")
+                    # Only a connection that held resets the backoff: a refused
+                    # handshake or a socket closed at once keeps doubling it.
+                    if self._listen() >= _CAPTURE_STEADY_SECONDS:
+                        backoff = 2.0
+                except _Refusal as refusal:
+                    if refusal.exit_code == 2:
+                        self.health("unlinked", {"error": refusal.message})
+                        _log(f"session no longer valid: {refusal.message}")
+                        return 7
+                    _log(f"capture error: {refusal.message}")
+                except Exception as exc:   # a dropped socket, a transient fault
+                    _log(f"capture connection lost: {type(exc).__name__}: {exc}")
+                if self.stop.is_set():
+                    break
+                self.health("reconnecting", {"backoff": backoff})
+                self.stop.wait(backoff)
+                backoff = min(backoff * 2, 60.0)
+            return 0
+        finally:
+            if self.dialogue is not None:
+                with contextlib.suppress(Exception):
+                    self.dialogue.shutdown(5.0)
+                with contextlib.suppress(Exception):
+                    self.dialogue.jobs.shutdown(10.0)
+            if self.state != "unlinked":
+                self.health("stopped")
+            self.db.close()
 
     def _listen(self) -> float:
         """Hold the realtime socket until it closes or fails, and return the
@@ -2488,6 +3579,8 @@ class _Capture:
         self.ws = websocket.WebSocketApp(
             self._ws_url(), header=self._ws_header(), on_message=on_message,
             on_error=on_error)
+        if self.stop.is_set():
+            return 0.0
         # run_forever returns on close or error; the outer loop reconnects.
         # The origin goes through websocket-client's own option: an Origin in
         # the header list would be sent beside the one the library adds.
@@ -2531,46 +3624,173 @@ def _inventory(network: bool) -> dict:
     }
 
 
+def _listener_pid(home: Path) -> int | None:
+    """The pid of the listener that last wrote health here, when it is still a
+    running `service run`."""
+    health = _service_read(home, "health.json") or {}
+    pid = health.get("pid")
+    if not isinstance(pid, int) or health.get("state") in ("stopped", "unlinked"):
+        return None
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return None
+    with contextlib.suppress(OSError):
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        if b"service" not in cmdline or b"run" not in cmdline:
+            return None
+    return pid
+
+
+def _cmd_service_init(cfg: dict, home: Path, force: bool) -> dict:
+    """Seed the service's settings from the bundle's template where none are
+    written yet (or with --force), and its control files."""
+    _service_write(home, "owner.json", {"connection": cfg["id"], "at": _iso_now()})
+    existing = _service_settings()
+    out = {"ok": True, "initialized": str(home)}
+    if existing and not force:
+        out["settings"] = "kept"
+        return out
+    settings = json.loads(_service_template().read_text())
+    settings["connection"] = cfg["id"]
+    _validate_service_settings(settings)
+    adapter = _records()
+    try:
+        for key in set(existing) - set(settings):
+            adapter.delete(NAME, "setting", key)
+        for key, value in settings.items():
+            adapter.set(NAME, "setting", key, value, actor=f"{NAME} service init")
+    except StoreError as exc:
+        _refuse(6, exc.slug, exc.message, exc.hint)
+    out["settings"] = "seeded"
+    out["next"] = [f"name who may wake the assistant with `{NAME} settings`, then "
+                   f"`{NAME} service doctor`"]
+    return out
+
+
+def _cmd_service_doctor(cfg: dict, home: Path, settings: dict) -> dict:
+    """Prove the store opens and the session authorises, and say what the
+    assistant's settings reach: whether they admit anyone, whether the
+    connection grants the writes an answer needs, the profiles they name, and
+    where each prompt comes from."""
+    db = _open_store(cfg)
+    try:
+        client = SlackClient(cfg)
+        ident = _identity(cfg, client, db)
+        out = {"ok": True, "connection": cfg["id"], "store_opened": True,
+               "user": ident["user"], "team": ident["team"],
+               "health": _service_read(home, "health.json")}
+        configured = _service_schema().dialogue_configured(settings)
+        assistant = {"configured": configured}
+        if configured:
+            refusal = _service_write_refusal(cfg)
+            assistant["writes"] = "granted" if refusal is None else refusal
+            if refusal:
+                assistant["warning"] = (
+                    f"connection {cfg['id']!r} does not grant writes, so the assistant "
+                    "answers nothing; a person grants them with `capabilities set "
+                    f"{NAME} grant {cfg['id']} '{{\"allow_write\": true}}'`")
+            root = _project_root()
+            if root is None:
+                out["ok"] = False
+                assistant["error"] = "the assistant answers for a project; run it in one"
+            else:
+                agent_id = _service_project_id(root)
+                assistant["prompts"] = [{k: v for k, v in _prompt(db, agent_id, k2).items()
+                                         if k != "body"}
+                                        for k2 in SERVICE_DOCUMENTS]
+                names = list(_service_schema().profile_names(
+                    settings, "slacker-claude", "slacker-job-claude"))
+                if _runner_importable():
+                    profiles = _service_module("profiles")
+                    rows = profiles.check(names, profiles.stored(
+                        db.conn, agent_id, db.schema), agent_id)
+                    assistant["profiles"] = rows
+                    if not all(r.get("ok") for r in rows):
+                        out["ok"] = False
+                else:
+                    assistant["profiles"] = [{"name": n, "checked": False} for n in names]
+                    assistant["profiles_note"] = (
+                        "the harness runner is not in this process; `service run` "
+                        "resolves and fits every profile when it starts")
+            voice = _service_schema().voice_scopes(settings)
+            if voice and not _resolve_env_key("DEEPGRAM_API_KEY")[0]:
+                assistant["voice_warning"] = (
+                    "no Deepgram key: an audio clip Slack carries no transcript for "
+                    "is answered as untranscribed in " + ", ".join(voice))
+        out["assistant"] = assistant
+        return out
+    finally:
+        db.close()
+
+
+def _cmd_service_reload(cfg: dict, home: Path, timeout: float = 10.0) -> dict:
+    """Validate first, then ask the running listener to re-read. The signal goes
+    to the listener alone. A refused reload leaves its previous settings."""
+    pid = _listener_pid(home)
+    if pid is None:
+        _refuse(5, "service_not_running",
+                f"the {NAME} service is not running for connection {cfg['id']!r}",
+                f"run `{NAME} service run`")
+    before = _service_read(home, "health.json") or {}
+    attempts = int(before.get("settings_reload_attempts") or 0)
+    try:
+        os.kill(pid, signal.SIGHUP)
+    except ProcessLookupError:
+        _refuse(5, "service_not_running", "the service exited before the reload")
+    deadline = time.monotonic() + max(0.0, timeout)
+    while time.monotonic() < deadline:
+        health = _service_read(home, "health.json") or {}
+        if int(health.get("settings_reload_attempts") or 0) > attempts:
+            if health.get("settings_reload_error"):
+                _refuse(6, "service_reload_refused",
+                        str(health["settings_reload_error"]),
+                        "the previous settings remain active")
+            return {"reloaded": True, "pid": pid, "connection": cfg["id"],
+                    "settings_reloaded_at": health.get("settings_reloaded_at")}
+        time.sleep(0.1)
+    _refuse(5, "service_reload_timeout",
+            f"the service did not acknowledge the reload within {timeout:g}s",
+            f"read `{NAME} service logs`")
+
+
 def cmd_service(args) -> dict | None:
     sub = args.service_command
     if sub == "help":
         _emit(_SERVICE_HELP)
         return None
-    cfg = get_config(args)
+    if sub in ("init", "doctor", "run", "reload"):
+        settings = _checked_service_settings()
+    else:
+        settings = _service_settings()
+    cfg = _service_cfg(settings, getattr(args, "connection", None))
     home = _service_home(cfg)
     if sub == "init":
-        _service_write(home, "owner.json",
-                       {"connection": cfg["id"], "at": _iso_now()})
-        return {"ok": True, "initialized": str(home)}
+        return _cmd_service_init(cfg, home, getattr(args, "force", False))
     if sub == "doctor":
-        # Prove the store opens and the session authorises; report the last
-        # health the listener wrote. The deploy doctor fails on neither here
-        # because the pilot's `run` is foreground and self-checks at start.
-        db = _open_store(cfg)
-        client = SlackClient(cfg)
-        ident = _identity(cfg, client, db)
-        db.close()
-        return {"ok": True, "connection": cfg["id"],
-                "store_opened": True, "user": ident["user"],
-                "team": ident["team"],
-                "health": _service_read(home, "health.json")}
+        return _cmd_service_doctor(cfg, home, settings)
     if sub == "run":
-        _read_only_gate(f"`{NAME} service run`")  # defensive; capture never writes
-        code = _Capture(cfg).run()
+        _read_only_gate(f"`{NAME} service run`")
+        if _service_schema().dialogue_configured(settings) and not _runner_importable():
+            _rerun_with_runner(sys.argv[1:])
+        code = _Capture(cfg, settings, _project_root()).run()
         if code:
             sys.exit(code)
         return None
-    if sub in ("start", "stop", "reload", "status", "logs"):
-        health = _service_read(home, "health.json")
-        if sub == "status":
-            return {"connection": cfg["id"], "health": health,
-                    "state": (health or {}).get("state", "unknown")}
-        if sub == "logs":
-            log = home / "daemon.log"
-            return {"connection": cfg["id"],
-                    "log": log.read_text()[-4000:] if log.exists() else ""}
-        # start/stop/reload of a detached daemon is the deployment capability's
-        # job in this pilot; the foreground `run` is the deploy command.
+    if sub == "reload":
+        return _cmd_service_reload(cfg, home)
+    health = _service_read(home, "health.json")
+    if sub == "status":
+        return {"connection": cfg["id"], "health": health,
+                "state": (health or {}).get("state", "unknown"),
+                "dialogue": (health or {}).get("dialogue")}
+    if sub == "logs":
+        log = home / "daemon.log"
+        return {"connection": cfg["id"],
+                "log": log.read_text()[-4000:] if log.exists() else ""}
+    if sub in ("start", "stop"):
+        # start/stop of a detached daemon is the deployment capability's job;
+        # the foreground `run` is the deploy command.
         return {"ok": False, "connection": cfg["id"],
                 "note": f"`service {sub}` of a detached daemon is deferred; "
                         f"`service run` is the foreground deploy command, "
@@ -2579,15 +3799,23 @@ def cmd_service(args) -> dict | None:
 
 
 _SERVICE_HELP = (
-    "slacker service — the bundled live-capture listener\n\n"
-    "  service init [--connection ID]     Seed the service's control files\n"
+    "slacker service — the bundled listener: live capture, and the assistant\n\n"
+    "  service init [--force] [--connection ID]\n"
+    "                                     Seed the control files, and the\n"
+    "                                     assistant's settings from the bundle's\n"
+    "                                     template, which admits nobody\n"
     "  service run  [--connection ID]     Run the listener in the foreground\n"
     "                                     (the deploy command). Exit 7 when the\n"
     "                                     session is no longer linked.\n"
-    "  service status [--connection ID]   The last health the listener wrote\n"
+    "  service reload [--connection ID]   Make the running listener take the\n"
+    "                                     settings; a refused reload leaves the\n"
+    "                                     previous ones in force\n"
+    "  service status [--connection ID]   The last health the listener wrote,\n"
+    "                                     the assistant's counters with it\n"
     "  service logs   [--connection ID]   The tail of the listener's log\n"
-    "  service doctor [--connection ID]   Store and control-file readiness\n"
-    "  service start|stop|reload          Deferred to the deployment capability\n")
+    "  service doctor [--connection ID]   Store, session, and what the\n"
+    "                                     assistant's settings reach\n"
+    "  service start|stop                 Deferred to the deployment capability\n")
 
 
 # --- dispatch ----------------------------------------------------------------
@@ -2700,6 +3928,55 @@ def _build_parser() -> argparse.ArgumentParser:
     sv.add_argument("service_command",
                     choices=["init", "doctor", "run", "start", "stop", "reload",
                              "status", "logs", "help"])
+    sv.add_argument("--force", action="store_true",
+                    help="with init, reseed settings that already exist")
+
+    pr = _leaf("prompts")
+    pr.add_argument("prompts_command",
+                    choices=["list", "show", "put", "history", "retire"])
+    pr.add_argument("key", nargs="?", help="context, delegation or job-worker")
+    pr.add_argument("--base", help="with put: the active version it replaces")
+    pr.add_argument("--note", help="with put: why this version")
+
+    pj = _leaf("jobs")
+    jobs_sub = pj.add_subparsers(dest="jobs_command", required=True,
+                                 parser_class=_Parser)
+
+    def _job(name: str, *, needs_id: bool = True) -> argparse.ArgumentParser:
+        created = jobs_sub.add_parser(name, allow_abbrev=False)
+        created.add_argument("--connection", "-c")
+        if needs_id:
+            created.add_argument("id", help="the job id, from `jobs list`")
+        created.add_argument("--chat", help="only this conversation's jobs")
+        created.add_argument("--actor", help=argparse.SUPPRESS)
+        return created
+
+    jobs_sub.add_parser("help")
+    jl = _job("list", needs_id=False)
+    jl.add_argument("--state", choices=["draft", "waiting", "running", "stopped"])
+    jl.add_argument("--outcome", choices=["succeeded", "failed", "cancelled",
+                                          "interrupted", "quota", "model_refused"])
+    jl.add_argument("--limit", type=_positive_int, default=50)
+    ja = _job("active", needs_id=False)
+    ja.add_argument("--limit", type=_positive_int, default=50)
+    _job("show")
+    jr = _job("register", needs_id=False)
+    jr.add_argument("description", help="one line: the outcome, in the requester's terms")
+    jr.add_argument("--requested-by", dest="requested_by",
+                    help="the Slack user id whose authority the job carries")
+    jr.add_argument("--thread", help="the thread its result is posted in")
+    jr.add_argument("--origin-message-id", dest="origin_message_id",
+                    help="the ts of the message the job answers")
+    jr.add_argument("--profile", help="the job profile (default: defaults.job_profile)")
+    js = _job("submit")
+    js.add_argument("--confirm-active-jobs-checked", action="store_true",
+                    dest="confirm_active_jobs_checked",
+                    help="you read `jobs active` and this outcome is not there")
+    jm = _job("amend")
+    jm.add_argument("text", help="what changed, in the requester's terms")
+    _job("discard")
+    _job("stop")
+    _job("resume")
 
     ln = _leaf("link")
     ln.add_argument("id", nargs="?",
@@ -2766,6 +4043,7 @@ def main() -> None:
         "react": cmd_react, "unreact": cmd_react, "upload": cmd_upload,
         "mark": cmd_mark, "open": cmd_open,
         "service": cmd_service, "link": cmd_link,
+        "prompts": cmd_prompts, "jobs": cmd_jobs,
     }
     handler = handlers.get(args.command)
     if handler is None:
