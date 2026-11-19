@@ -15,6 +15,11 @@ set, and a call naming any of them itself is refused.
                                   at once into this chat
   history [--before ID] [--limit N]
   download <message> [--out PATH]
+  history <chat> [--topic ID] [--before ID] [--limit N]
+  download <chat> <message> [--out PATH]
+                                  another group or topic, only those the
+                                  sender's role names in roles.<role>.read_chats
+                                  (the turn's read reach); writing stays here
   react <message> [<emoji>]       this chat only
   jobs <verb> ...                 the register, scoped to this chat and requester
 
@@ -61,6 +66,68 @@ def refuse_scope_flags(args):
                  "the turn fixes it", "leave it out: the work reports into this chat")
 
 
+GENERAL_TOPIC = "1"
+
+
+def reach():
+    """The groups beside its own this turn may read: {chat: [topic, ...] | None}."""
+    raw = os.environ.get("TELEGRAMBOT_AUTHORIZED_READ_CHATS", "").strip()
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def take_topic(args):
+    """(topic or None, the args without --topic)."""
+    rest, topic, i = [], None, 0
+    while i < len(args):
+        item = args[i]
+        if item == "--topic":
+            if i + 1 >= len(args):
+                fail("worker_read_invalid", "--topic takes a topic id", exit_code=6)
+            topic, i = args[i + 1], i + 2
+            continue
+        if item.startswith("--topic="):
+            topic, i = item.split("=", 1)[1], i + 1
+            continue
+        rest.append(item)
+        i += 1
+    return topic, rest
+
+
+def reach_check(s, allowed, chat, topic, *, topical=True):
+    """Refuse a read outside the turn's own chat and topic and its read reach."""
+    if chat == s["chat"] and (not topical or (topic or GENERAL_TOPIC) ==
+                              (s["topic"] or GENERAL_TOPIC)):
+        return
+    if chat not in allowed:
+        if chat != s["chat"]:
+            fail("chat_scope_denied", "this turn reads its own chat and the groups its "
+                 "read reach names only", f"requested={chat}; authorized_chat_id={s['chat']}; "
+                 f"read_chats={','.join(sorted(allowed))}")
+        fail("topic_scope_denied", "this turn reads its own topic and the topics its read "
+             "reach names only", f"requested_topic={topic}; authorized_topic_id={s['topic']}")
+    topics = allowed[chat]
+    if topical and topics and str(topic or GENERAL_TOPIC) not in [str(t) for t in topics]:
+        fail("topic_scope_denied", f"this turn may read topics {', '.join(map(str, topics))} "
+             f"of chat {chat} only", f"requested_topic={topic or GENERAL_TOPIC}")
+
+
+def positionals(args, takes_value):
+    """[(index, value)] of the arguments that are neither a flag nor a flag's value."""
+    found, i = [], 0
+    while i < len(args):
+        if args[i] in takes_value:
+            i += 2
+            continue
+        if not args[i].startswith("--"):
+            found.append((i, args[i]))
+        i += 1
+    return found
+
+
 def outbox(kind, text, file=None):
     path = os.environ.get("TELEGRAMBOT_PROGRESS_OUTBOX", "").strip()
     if not path:
@@ -103,6 +170,10 @@ def main():
     if verb in ("progress", "send", "history", "download", "react", "jobs"):
         if verb == "jobs" and (args[1:2] in (["help"], []) or "--help" in args):
             real(args)
+        allowed = reach() if verb in ("history", "download") else {}
+        topic = None
+        if verb == "history" and allowed:
+            topic, args = take_topic(args)
         refuse_scope_flags(args[1:])
         s = scope()
         pinned = ["--connection", s["connection"]] if s["connection"] else []
@@ -128,9 +199,28 @@ def main():
             fail("chat_scope_denied", "a worker sends into the chat it acts for only",
                  f"requested={chat}; authorized_chat_id={s['chat']}")
         outbox("message", rest[1] if len(rest) == 2 else "", file)
+    if verb == "history" and allowed:
+        rest = args[1:]
+        named = positionals(rest, ("--before", "--limit"))
+        chat = s["chat"]
+        if named:
+            at, value = named[0]
+            chat = s["chat"] if value in ("current", "$current") else value
+            del rest[at]
+        if chat == s["chat"] and topic is None:
+            topic = s["topic"] or None
+        reach_check(s, allowed, chat, topic)
+        real(pinned + ["history", chat] + (["--topic", topic] if topic else []) + rest)
     if verb == "history":
         topic = ["--topic", s["topic"]] if s["topic"] else []
         real(pinned + ["history", s["chat"]] + topic + args[1:])
+    if verb == "download" and allowed and len(positionals(args[1:], ("--out",))) == 2:
+        rest = args[1:]
+        at, chat = positionals(rest, ("--out",))[0]
+        del rest[at]
+        chat = s["chat"] if chat in ("current", "$current") else chat
+        reach_check(s, allowed, chat, None, topical=False)
+        real(pinned + ["download", chat] + rest)
     if verb == "download":
         real(pinned + ["download", s["chat"]] + args[1:])
     if verb == "react":

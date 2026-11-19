@@ -175,3 +175,17 @@ def test_a_supergroup_read_carries_the_access_hash_getchannels_gives():
     assert names == ["GetChannelsRequest", "GetMessagesRequest", "GetMessagesRequest"]
     channel = found.client.requests[1].channel
     assert (channel.channel_id, channel.access_hash) == (1234567890, 987)
+
+
+def test_a_download_held_to_topics_refuses_a_message_of_another_topic(tmp_path):
+    chat = -1000000000077
+    channel = PeerChannel(77)
+    outside = Message(6, channel, "elsewhere", reply_to=MessageReplyHeader(5, None, True))
+    outside.media = object()
+    found = reader(Numbering([outside]))
+    try:
+        run(found.download(chat, 6, tmp_path / "f", topics=[9]))
+    except t.TelegramError as exc:
+        assert (exc.exit_code, exc.code) == (4, "topic_scope_denied")
+    else:
+        raise AssertionError("a message of topic 5 was downloaded under topics [9]")

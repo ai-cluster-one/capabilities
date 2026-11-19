@@ -15,7 +15,7 @@ Write the reply in Markdown, using only what Telegram renders: **bold**, *italic
 ## What you can see
 
 - The conversation shown is everything visible for this turn. `Channel state` says how many messages were read and why the read stopped short, if it did.
-- Older messages of this chat can be read with the history command named in `Channel state`, by message number. There is no search and no other chat.
+- Older messages of this chat can be read with the history command named in `Channel state`, by message number. There is no search, and no other chat unless `Channel state` names a read reach: then the groups and topics it names can be read too, with the reach commands it names, and nowhere else.
 - When something the request depends on is not visible, say so plainly. Look in the project's memory if it has one, or ask the person to reply to the message they mean or forward it. Never answer as if you remembered what you cannot see.
 - Attachments appear as `[attachment: <kind> <name> | msg <id>]`. That is a handle, not the file; fetch it with the download command only when you need it.
 - Voice messages arrive already transcribed, as `[voice] <text>`.
@@ -26,4 +26,4 @@ Send one short line with the progress command named in `Channel state` before yo
 
 ## Commands
 
-The commands for this channel - progress, history, download, reactions, sending a file - come from the telegrambot capability's own help (`telegrambot help`). Read them there rather than from memory. Reacting and sending a file are writes into this chat; do them when the request asks for them, and only in this chat.
+The commands for this channel - progress, history, download, reactions, sending a file - come from the telegrambot capability's own help (`telegrambot help`). Read them there rather than from memory. Reacting and sending a file are writes into this chat; do them when the request asks for them, and only in this chat. A read reach never carries a write: what you read elsewhere is answered here.

@@ -348,3 +348,37 @@ def test_why_a_bot_is_not_served_names_its_connection_by_its_label(cli, monkeypa
     refusal = cli._bot_refusal("0123456789ab", reg)
     for said in (problem["message"], refusal[1]):
         assert "'helper'" in said and "0123456789ab" not in said, said
+
+
+def test_inside_a_turn_a_read_reach_opens_reads_of_the_named_chats_only(
+        cli, project, capsys, telegram, monkeypatch):
+    add(cli, capsys, secret_env=TOKEN, api_id_env="1", api_hash_env="h" * 32)
+    path = project / "capabilities" / "telegrambot" / "connections.json"
+    data = json.loads(path.read_text())
+    data["connections"]["helper"]["allow_write"] = True
+    path.write_text(json.dumps(data))
+    monkeypatch.setenv("TELEGRAMBOT_TURN", "1")
+    monkeypatch.setenv("TELEGRAMBOT_AUTHORIZED_CHAT_ID", "-1001")
+    monkeypatch.setenv("TELEGRAMBOT_AUTHORIZED_TOPIC_ID", "7")
+    monkeypatch.setenv("TELEGRAMBOT_AUTHORIZED_READ_CHATS",
+                       json.dumps({"-1002": [9], "-1001": [8]}))
+    for argv, refusal in ((("history", "-1003", "--before", "10"), "chat_scope_denied"),
+                          (("download", "-1003", "5"), "chat_scope_denied"),
+                          (("history", "-1002", "--topic", "7", "--before", "10"),
+                           "topic_scope_denied"),
+                          (("history", "-1002", "--before", "10"), "topic_scope_denied"),
+                          (("history", "-1001", "--topic", "9", "--before", "10"),
+                           "topic_scope_denied"),
+                          (("send", "-1002", "hi", "--topic", "9"), "chat_scope_denied"),
+                          (("react", "-1002", "5"), "chat_scope_denied"),
+                          (("send", "-1001", "hi", "--topic", "8"), "topic_scope_denied")):
+        code, _out, err = run(cli, capsys, *argv)
+        assert code == 4 and err["error"]["code"] == refusal, argv
+    assert not [m for m, _b in telegram.requests if m in ("sendMessage", "getChat",
+                                                         "setMessageReaction")]
+    # Inside the reach the fence lets the read through to the chat itself, whose
+    # own answer (here: the bot does not see the group whole) is what comes back.
+    for argv in (("history", "-1002", "--topic", "9", "--before", "10"),
+                 ("history", "-1001", "--topic", "8", "--before", "10")):
+        code, _out, err = run(cli, capsys, *argv)
+        assert code == 4 and err["error"]["code"] == "group_not_visible", argv

@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-19 — A role can read named neighbouring groups and topics; writing stays in its own chat
+
+`roles.<role>.read_chats` gives a role a read reach: `{"<group id>": {"topics": [<topic id>, ...]}}`, each group named explicitly, `topics` narrowing it to those topics (without it, the whole group). A turn or job for a sender of that role may then read history (`telegrambot history <chat> [--topic ID]`) and download files (`telegrambot download <chat> <message id>`) there, through the worker's `telegrambot` and by the CLI's own path alike; a download of a message outside the named topics exits 4 `topic_scope_denied`. The turn's channel state names the reach and its commands. `send`, `react` and `jobs` stay on the turn's own chat and topic whatever the reach says. A role with no `read_chats` - every role until one is set - works exactly as before: another chat exits 4 `chat_scope_denied`, another topic 4 `topic_scope_denied`. No existing verb, flag or output key changes.
+
 ## 2026-11-17 — Turns run on callva-harness-runner 0.12.3
 
 Turns run on callva-harness-runner 0.12.3, in place of 0.12.2: finding the claude or codex executable no longer lists the fallback folders when `PATH` already has it. On a machine where fnm had left tens of thousands of per-shell folders, every turn's start spent over a second of CPU holding the interpreter on that list; it now takes well under a millisecond, and finds the same executable. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

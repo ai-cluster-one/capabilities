@@ -305,6 +305,14 @@ class Policy:
         rule = (self.settings.get("roles") or {}).get(self.role(chat_id, user_id)) or {}
         return rule.get("profile") or None
 
+    def read_reach(self, role) -> dict[str, list[int] | None]:
+        """The groups beside its own a turn of this role may read, each with the
+        topics it may read there (None: the whole group); {} for a role that
+        names none, whose turns read their own chat and topic only."""
+        rule = (self.settings.get("roles") or {}).get(role) or {}
+        return {str(int(chat)): (list(entry["topics"]) if (entry or {}).get("topics") else None)
+                for chat, entry in (rule.get("read_chats") or {}).items()}
+
     def channel(self, chat_id, topic_id, user_id, overrides=None) -> dict:
         """The effective settings of one channel: its `/set` overrides, then the
         topic, the group or the direct sender, then the defaults. A profile the
@@ -1541,7 +1549,25 @@ class Dialogue:
                "TELEGRAMBOT_SERVICE_PROJECT": str(self.root),
                "TELEGRAMBOT_REAL_CLI": str(self.cli_path or "telegrambot"),
                "PATH": os.pathsep.join([str(WORKER_BIN), self.turn_env.get("PATH", "")])}
+        reach = self.policy.read_reach(role)
+        if reach:
+            env["TELEGRAMBOT_AUTHORIZED_READ_CHATS"] = json.dumps(reach)
         return env
+
+    def reach_state(self, role) -> list[str]:
+        """The `Channel state` lines that name what else a turn of this role may read."""
+        reach = self.policy.read_reach(role)
+        if not reach:
+            return []
+        wrapper = WORKER_BIN / "telegrambot"
+        named = "; ".join(f"chat {chat}" + (f" topics {', '.join(map(str, topics))}"
+                                             if topics else "")
+                          for chat, topics in sorted(reach.items()))
+        return [f"Read reach: you may also read {named}, and nowhere else; replies, "
+                "reactions and jobs stay in this chat",
+                f"Reach history command: {wrapper} history <chat> [--topic ID] "
+                "[--before ID] [--limit N]",
+                f"Reach download command: {wrapper} download <chat> <message id>"]
 
     def write_authority(self, authority: dict, stem: str) -> str:
         folder = self.state_dir / "authority"
@@ -1630,6 +1656,7 @@ class Dialogue:
                  f"Progress command: {wrapper} progress <text>",
                  f"History command: {wrapper} history [--before ID] [--limit N]",
                  f"Download command: {wrapper} download <message id>",
+                 *self.reach_state(role),
                  "Delivery: the final answer is sent by the service "
                  + ("as a reply to the request" if self.reply_to_for(last) else
                     "as a new message")]
@@ -1865,6 +1892,7 @@ class Dialogue:
                      f"Progress command: {wrapper} progress <text>",
                      f"History command: {wrapper} history [--before ID] [--limit N]",
                      f"Download command: {wrapper} download <message id>",
+                     *self.reach_state(role),
                      f"Delivery: {delivery}"]
             request = ["--- Current request ---",
                        f"Message: #{row.get('origin_message_id')}",

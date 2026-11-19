@@ -1612,7 +1612,7 @@
       "level": 0,
       "lucide_icon": "bot-message-square",
       "path": "capabilities/telegrambot",
-      "payload_sha256": "ea297394e4c4eedae41db81381bfabda5d44f90051bfdf062b7d050bae3be8ef",
+      "payload_sha256": "0fc2f5e4de87a891d253e5d199075c43a06a72cee0ac7bc6bb4a5c9814d799d2",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation.",
@@ -1628,7 +1628,7 @@
           "title": "Telegram-бот"
         }
       },
-      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
+      "version": "2026-11-19 — A role can read named neighbouring groups and topics; writing stays in its own chat"
     },
     "vapic": {
       "executable": [

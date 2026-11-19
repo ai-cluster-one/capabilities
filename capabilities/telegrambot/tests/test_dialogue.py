@@ -558,6 +558,26 @@ def test_the_worker_is_handed_its_scope(tmp_path):
     assert not Path(env["TELEGRAMBOT_PROGRESS_OUTBOX"]).exists()   # removed after the turn
 
 
+def test_a_roles_read_reach_reaches_its_turns_and_no_other_roles(tmp_path):
+    settings = {"allowed_users": {str(ANN): {"name": "Ann", "role": "supervisor"}},
+                "allowed_groups": {str(GROUP): {"aliases": ["Helper"]}},
+                "roles": {"supervisor": {"read_chats": {"-1002": {"topics": [1, 9]},
+                                                        "-1003": {}}}}}
+    dialogue, store, api, runner, clock = make(tmp_path, settings)
+    assert dialogue.offer_update(update(1, "Helper, explain", sender=BOB, name="Bob",
+                                        chat=GROUP))["admit"]
+    drain(dialogue, clock)
+    assert dialogue.offer_update(update(2, "Helper, what was decided", chat=GROUP))["admit"]
+    drain(dialogue, clock)
+    member, supervisor = runner.calls
+    assert "TELEGRAMBOT_AUTHORIZED_READ_CHATS" not in member["extra_env"]
+    assert "Read reach" not in member["prompt"]
+    assert json.loads(supervisor["extra_env"]["TELEGRAMBOT_AUTHORIZED_READ_CHATS"]) == \
+        {"-1002": [1, 9], "-1003": None}
+    assert "Read reach: you may also read chat -1002 topics 1, 9; chat -1003" in \
+        supervisor["prompt"]
+
+
 def test_progress_lines_are_relayed_first_at_once_then_throttled(tmp_path):
     sent = []
     clock = [0.0]

@@ -25,7 +25,8 @@ def test_an_empty_document_and_a_full_one_hold():
             "agent_dialogue": {"max_turns": 0}, "context_prompt": "team",
             "topics": {"5": {"context": "API only", "context_mode": "exclusive"}}}},
         "agent_dialogue": {"max_turns": 4},
-        "roles": {"group_member": {"profile": "telegrambot-consult"}},
+        "roles": {"group_member": {"profile": "telegrambot-consult"},
+                  "operator": {"read_chats": {"-1002": {"topics": [1, 9]}, "-1003": {}}}},
         "control": {"roles": {"supervisor": {"commands": "*"}}},
         "authority": {"roles": {"group_member": {"allowed_capabilities": {
             "telegrambot": {"verbs": ["history"]}}}}},
@@ -46,6 +47,14 @@ def test_an_empty_document_and_a_full_one_hold():
      "settings.control.roles.x.commands[0]"),
     ({"roles": {"group_member": {"profile": "consult"}}}, "settings.roles.group_member.profile"),
     ({"roles": {"group_member": {"commands": "*"}}}, "settings.roles.group_member.commands"),
+    ({"roles": {"op": {"read_chats": "*"}}}, "settings.roles.op.read_chats"),
+    ({"roles": {"op": {"read_chats": {"42": {}}}}}, "settings.roles.op.read_chats.42"),
+    ({"roles": {"op": {"read_chats": {"-1002": {"topics": []}}}}},
+     "settings.roles.op.read_chats.-1002.topics"),
+    ({"roles": {"op": {"read_chats": {"-1002": {"topics": [0]}}}}},
+     "settings.roles.op.read_chats.-1002.topics[0]"),
+    ({"roles": {"op": {"read_chats": {"-1002": {"write": True}}}}},
+     "settings.roles.op.read_chats.-1002.write"),
 ])
 def test_a_wrong_key_is_refused_with_its_path(document, path):
     with pytest.raises(ValueError) as caught:

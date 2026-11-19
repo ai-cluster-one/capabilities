@@ -21,8 +21,10 @@ empty document is a bot that answers nobody yet and records who wrote to it.
                      agent_dialogue, topics}}
   agent_dialogue     {max_turns}: turns in a row other bots may start in one chat
                      before a person writes; 4 by default, 0 for no limit
-  roles              {<role>: {profile}}: the profile a sender's turn runs on when
-                     their role names one, in place of the chat's or topic's
+  roles              {<role>: {profile, read_chats}}: the profile a sender's turn
+                     runs on when their role names one, in place of the chat's or
+                     topic's; and the other groups, and topics within them, whose
+                     history the role's turns may read ({<chat id>: {topics}})
   control            {roles: {<role>: {commands}}}
   authority          {default, roles: {<role>: {allowed_capabilities}}}
   defaults           tail_size, history_requests, debounce, worker_timeout,
@@ -86,7 +88,8 @@ GROUP_KEYS = COMMON_KEYS | {"member_role", "members", "may_address", "aliases",
                             "require_reference", "triggers", "gate", "agent_dialogue",
                             "topics"}
 TOPIC_KEYS = {"name", "profile", "context", "context_prompt", "context_mode", "project"}
-ROLE_KEYS = {"profile"}
+ROLE_KEYS = {"profile", "read_chats"}
+READ_CHAT_KEYS = {"topics"}
 GATE_KEYS = {"enabled", "mode", "brief", "context_messages", "context_chars", "max_batch",
              "model", "effort"}
 
@@ -269,6 +272,23 @@ def _group(value, path):
             _common(topic, f"{path}.topics.{key}")
 
 
+def _read_chats(value, path):
+    """The groups a role's turns may read beside their own, each named, never all
+    of the bot's; `topics` narrows one to those topics, else the whole group."""
+    for key, entry in _object(value, path).items():
+        _id_key(key, path, -1)
+        entry = _object(entry, f"{path}.{key}")
+        _unknown(entry, READ_CHAT_KEYS, f"{path}.{key}")
+        if "topics" in entry:
+            topics = entry["topics"]
+            if not isinstance(topics, list) or not topics:
+                _fail(f"{path}.{key}.topics", "must be a non-empty JSON array of topic ids")
+            for index, topic in enumerate(topics):
+                if isinstance(topic, bool) or not isinstance(topic, int) or topic <= 0:
+                    _fail(f"{path}.{key}.topics[{index}]", "must be a topic id, a positive "
+                          "whole number (1 is a forum's General topic)")
+
+
 def _commands(value, path):
     if value == "*":
         return
@@ -359,6 +379,8 @@ def validate_settings(data) -> dict:
         _unknown(rule, ROLE_KEYS, f"settings.roles.{role}")
         if "profile" in rule:
             profile_name(rule["profile"], f"settings.roles.{role}.profile")
+        if "read_chats" in rule:
+            _read_chats(rule["read_chats"], f"settings.roles.{role}.read_chats")
     if "control" in data:
         control = _object(data["control"], "settings.control")
         _unknown(control, {"roles"}, "settings.control")

@@ -234,6 +234,9 @@ SERVICE
   member_role, direct_messages.default_role; authority.roles hands each turn
   its CAPABILITIES_AUTH_CONTEXT, and roles.<role>.profile names the profile
   the sender's turn runs on, over the chat's, the topic's and /set profile.
+  roles.<role>.read_chats {<chat id>: {topics [<topic id>]}} is the role's
+  read reach: the other groups, and topics within them, its turns may read
+  with history and download; writing stays in the turn's own chat.
 
   The reply gate (allowed_groups.<id>.gate {enabled, mode shadow|live,
   brief, context_messages, context_chars, max_batch, model, effort}): in a
@@ -246,7 +249,9 @@ SERVICE
   Inside a turn or a job the worker wrapper (service/worker-bin) is first on
   PATH: `telegrambot progress <text>`, `send current <text> [--file PATH]`,
   `history`, `download <message>`, `react <message> [<emoji>]` and `jobs`
-  act on this chat only; the channel state names each command.
+  act on this chat only; with a read reach, `history <chat> [--topic ID]`
+  and `download <chat> <message>` also read the groups and topics it names.
+  The channel state names each command.
 
 SETTINGS
   `telegrambot settings` reads and writes them (service/settings.json at the
@@ -264,7 +269,8 @@ SETTINGS
       context_mode, project, delegation, agent_dialogue {max_turns},
       topics {<topic id>: {name, profile, context, context_prompt,
       context_mode, project}}}}
-    agent_dialogue {max_turns}, roles {<role>: {profile}},
+    agent_dialogue {max_turns}, roles {<role>: {profile, read_chats {<chat id>:
+      {topics}}}},
     control {roles {<role>: {commands}}},
     authority {default, roles {<role>: {allowed_capabilities}}}
     defaults {tail_size 40, history_requests 5, debounce 2, worker_timeout
@@ -865,30 +871,59 @@ def _anchor(cfg: dict, chat_id: int, topic_id: int | None, before: int | None) -
     return top + 1
 
 
-def _turn_scope(chat_id: int, topic_id: int | None = None, *, topical: bool = True) -> None:
-    """Inside a turn the service started, the turn's chat and topic, whatever the call named.
+def _read_reach() -> dict[int, list[int] | None]:
+    """The groups beside its own a turn may read, as the service handed them over;
+    nothing it cannot read as that is a reach at all."""
+    raw = (os.environ.get("TELEGRAMBOT_AUTHORIZED_READ_CHATS") or "").strip()
+    try:
+        data = json.loads(raw) if raw else {}
+        return {int(chat): ([int(t) for t in topics] if topics else None)
+                for chat, topics in data.items()}
+    except (ValueError, TypeError, AttributeError):
+        return {}
+
+
+def _turn_scope(chat_id: int, topic_id: int | None = None, *, topical: bool = True,
+                read: bool = False) -> list[int] | None:
+    """Inside a turn the service started, the turn's chat and topic, whatever the call named;
+    a read (`read`) also reaches the groups and topics the sender's role names in
+    `roles.<role>.read_chats`. Returns the topics a read of another group is held to
+    (None: no narrower line than the one checked here).
 
     The worker-bin wrapper pins these verbs to the turn; this holds the same line
     for a call that reaches this CLI by its path. Outside a turn nothing changes.
     """
     if not os.environ.get("TELEGRAMBOT_TURN"):
-        return
+        return None
     env = os.environ
     raw = (env.get("TELEGRAMBOT_AUTHORIZED_CHAT_ID") or "").strip()
     if not raw:
         _die(4, "worker_authority_missing", "this turn carries no chat it acts for",
              "inside a telegrambot turn these verbs reach the turn's own chat only")
-    if chat_id != int(raw):
-        _die(4, "chat_scope_denied", f"this turn acts for chat {raw} only, not {chat_id}",
-             f"requested={chat_id}; authorized_chat_id={raw}")
-    if not topical:
-        return
-    allowed = int((env.get("TELEGRAMBOT_AUTHORIZED_TOPIC_ID") or "").strip() or 0) or None
+    reach = _read_reach() if read else {}
     t = _transport()
+    if chat_id != int(raw):
+        if chat_id not in reach:
+            _die(4, "chat_scope_denied", f"this turn acts for chat {raw} only, not {chat_id}",
+                 f"requested={chat_id}; authorized_chat_id={raw}"
+                 + (f"; read_chats={','.join(map(str, sorted(reach)))}" if reach else ""))
+        topics = reach[chat_id]
+        if topical and topics and (topic_id or t.GENERAL_TOPIC) not in topics:
+            _die(4, "topic_scope_denied", f"this turn may read topics "
+                 f"{', '.join(map(str, topics))} of chat {chat_id} only, not {topic_id}",
+                 f"requested_topic={topic_id}; read_topics={','.join(map(str, topics))}")
+        return topics
+    if not topical:
+        return None
+    allowed = int((env.get("TELEGRAMBOT_AUTHORIZED_TOPIC_ID") or "").strip() or 0) or None
     if (topic_id or t.GENERAL_TOPIC) != (allowed or t.GENERAL_TOPIC):
+        topics = reach.get(chat_id, ())
+        if chat_id in reach and (not topics or (topic_id or t.GENERAL_TOPIC) in topics):
+            return None
         _die(4, "topic_scope_denied", f"this turn acts for topic {allowed or 'none'} of chat "
              f"{raw} only, not {topic_id}",
              f"requested_topic={topic_id}; authorized_topic_id={allowed or ''}")
+    return None
 
 
 def cmd_history(cfg: dict, chat_raw: str, topic_id: int | None, before: int | None,
@@ -899,7 +934,7 @@ def cmd_history(cfg: dict, chat_raw: str, topic_id: int | None, before: int | No
         chat_id = t.parse_chat_id(chat_raw)
     except t.TelegramError as exc:
         _fail(exc)
-    _turn_scope(chat_id, topic_id)
+    _turn_scope(chat_id, topic_id, read=True)
     info = _chat_info(cfg, chat_id)
     if not info["visible"]:
         _die(4, "group_not_visible", f"the bot does not see every message of chat {chat_id} "
@@ -926,7 +961,7 @@ def cmd_download(cfg: dict, chat_raw: str, message_id: int, out: str | None) -> 
         chat_id = t.parse_chat_id(chat_raw)
     except t.TelegramError as exc:
         _fail(exc)
-    _turn_scope(chat_id, topical=False)
+    topics = _turn_scope(chat_id, topical=False, read=True)
     dest = Path(out).expanduser() if out else \
         _conn_state(cfg) / "files" / f"{chat_id}-{message_id}"
 
@@ -935,7 +970,7 @@ def cmd_download(cfg: dict, chat_raw: str, message_id: int, out: str | None) -> 
                                  _conn_state(cfg))
         try:
             await reader.open()
-            return await reader.download(chat_id, message_id, dest)
+            return await reader.download(chat_id, message_id, dest, topics=topics)
         except t.TelegramError:
             raise
         except Exception as exc:

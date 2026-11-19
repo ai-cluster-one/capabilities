@@ -64,6 +64,14 @@ Roles decide three things: which chat commands a person may run (`control.roles`
 telegrambot settings set roles '{"group_member": {"profile": "telegrambot-<read-only profile>"}}'
 ```
 
+A role can also be given a read reach: `roles.<role>.read_chats` names the other groups its senders' turns may read history and download files from, each by id, and with `topics` only those topics of it (`1` is a forum's General topic); a group named without `topics` is read whole. Nothing outside the list is readable, and there is no "every chat of the bot". Replies, reactions and jobs stay in the turn's own chat and topic whatever the reach says, and a role with no `read_chats` - every role by default - reads its own chat and topic only and is refused anything else as `chat_scope_denied` or `topic_scope_denied`. Give the reach to a role you trust with what is said in those chats, not to ordinary members:
+
+```sh
+telegrambot settings set roles '{"operator": {"read_chats": {"-100<other group>": {"topics": [1, <topic id>]}, "-100<third group>": {}}}}'
+```
+
+The turn's channel state names its reach and the commands that read it: `telegrambot history <chat> [--topic ID]` and `telegrambot download <chat> <message id>`.
+
 ## 5. Give the agent its voice
 
 The bot ships a standard prompt, read fresh on every turn, so improvements to it reach every bot. The agent adds one prompt of its own over it:
@@ -99,6 +107,7 @@ After changing settings, connections or profiles, run `telegrambot service reloa
 ## Things worth knowing
 
 - History reaches back by message number, and a bot's direct chats share one numbering. A busy bot therefore reaches back less far for the same number of messages; each turn's channel state says how many it read and why it stopped.
+- A read reach reaches only what the bot itself can read: a group the bot is a member of and sees whole (privacy mode off, or an admin), never one it has left or was never added to. It reads back by message number from the newest message the service has seen there, only a short way, so a quiet topic whose last message is far behind the group's newest may come back empty or not at all.
 - Telegram keeps a bot's undelivered updates for 24 hours. A service that was down longer misses older messages; they still show up in the history a later turn reads.
 - Other bots may start at most four turns in a row in a chat before a person writes (`agent_dialogue.max_turns`), so two bots cannot talk to each other forever. A message ending in `#noreply` is never answered; a request ending in `#external` is answered with `#noreply` on everything sent for it.
 - The service needs the project's store (the `AGENTKIT_DB_*` keys or `capabilities store set`): it keeps there whom the bot has seen, the chats' `/set` overrides, the agent's prompts and the background jobs - never the messages.

@@ -79,3 +79,34 @@ def test_reads_and_jobs_are_pinned_to_the_turn(turn):
                                "--profile", "telegrambot-job-claude", "make the report"]
     code, out, _err = run(env, "jobs", "help")
     assert out["argv"] == ["jobs", "help"]
+
+
+def test_a_read_reach_reads_only_what_it_names_and_never_writes_there(turn):
+    env, _tmp = turn
+    # Without a reach the turn's own chat and topic stay the only ones.
+    code, _out, err = run(env, "history", "--topic", "9")
+    assert code == 4 and err["error"]["code"] == "worker_scope_denied"
+    env["TELEGRAMBOT_AUTHORIZED_READ_CHATS"] = json.dumps({"-1002": [1, 9], "-1003": None})
+    code, out, err = run(env, "history", "-1002", "--topic", "9", "--before", "70")
+    assert code == 0 and out["argv"] == ["--connection", "helper", "history", "-1002",
+                                         "--topic", "9", "--before", "70"], err
+    code, out, err = run(env, "history", "-1003", "--limit", "5")
+    assert code == 0 and out["argv"] == ["--connection", "helper", "history", "-1003",
+                                         "--limit", "5"], err
+    code, out, _err = run(env, "history", "--before", "70")
+    assert out["argv"] == ["--connection", "helper", "history", "-1009", "--topic", "5",
+                           "--before", "70"]
+    code, out, err = run(env, "download", "-1003", "12")
+    assert code == 0 and out["argv"] == ["--connection", "helper", "download", "-1003",
+                                         "12"], err
+    code, out, _err = run(env, "download", "12")
+    assert out["argv"] == ["--connection", "helper", "download", "-1009", "12"]
+    for argv, refusal in ((("history", "-1004"), "chat_scope_denied"),
+                          (("history", "-1002", "--topic", "5"), "topic_scope_denied"),
+                          (("history", "--topic", "9"), "topic_scope_denied"),
+                          (("download", "-1004", "12"), "chat_scope_denied"),
+                          (("send", "-1002", "hi"), "chat_scope_denied"),
+                          (("react", "12", "--chat", "-1002"), "worker_scope_denied"),
+                          (("jobs", "list", "--chat", "-1002"), "worker_scope_denied")):
+        code, _out, err = run(env, *argv)
+        assert code == 4 and err["error"]["code"] == refusal, argv

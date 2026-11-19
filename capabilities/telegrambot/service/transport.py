@@ -1113,8 +1113,15 @@ class HistoryReader:
                 return message, from_mtproto(message, chat_id, users, self.bot_id, is_forum)
         return None, None
 
-    async def download(self, chat_id: int, message_id: int, dest: Path) -> Path:
+    async def download(self, chat_id: int, message_id: int, dest: Path,
+                       topics: list[int] | None = None) -> Path:
+        """The message's file into `dest`; with `topics`, only a message of one of them."""
         raw, _shaped = await self.one(chat_id, message_id)
+        if raw is not None and topics and _mt_topic(raw, True) not in topics:
+            raise TelegramError(4, "topic_scope_denied",
+                                f"message {message_id} of chat {chat_id} is in topic "
+                                f"{_mt_topic(raw, True)}, outside the topics this turn may "
+                                f"read ({', '.join(map(str, topics))})")
         if raw is None or getattr(raw, "media", None) is None:
             raise TelegramError(3, "no_attachment",
                                 f"message {message_id} in chat {chat_id} carries no file the "
