@@ -1252,13 +1252,20 @@ class VoiceCallSession:
     def line_quiet(self):
         """Whether nothing is under way on the line: no task running, handed
         over or held back, nothing waiting to be spoken, the voice silent and no
-        audio left to play. A hang-up waits for this, so it never cuts off what
-        is being said."""
+        speech left to play. A hang-up waits for this, so it never cuts off what
+        is being said.
+
+        The output stream never stops and carries the model's own silence, so
+        the send buffer is almost never empty; what is left to play counts as
+        quiet when no frame of it reaches the level that closes speech."""
         runner = self._task_runner
         if runner is not None and (runner.running or not runner.completions.empty()):
             return False
-        return (not self._delegations and not self._deferred and not self._speaking
-                and len(self._outbound) < AGENT_FRAME_BYTES)
+        if self._delegations or self._deferred or self._speaking:
+            return False
+        with memoryview(self._outbound) as queued:
+            return all(_rms(queued[at:at + AGENT_FRAME_BYTES]) < SPEECH_RMS_CLOSE
+                       for at in range(0, len(queued), AGENT_FRAME_BYTES))
 
     def conversation_tail(self, limit=60):
         """The call so far, shaped like the message tail a worker prompt renders.

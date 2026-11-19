@@ -240,6 +240,26 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(bytes(session._outbound), held)
         self.assertEqual(session.trimmed_silence_frames, 0)
 
+    def test_a_line_carrying_only_silence_is_quiet(self):
+        """Every GPT Live hang-up waited out its 30 s cap: the stream never
+        stops and the buffer is trimmed only to about 0.2 s of the model's own
+        silence, so a line that waited for an empty buffer never saw one."""
+        with fake_runtime_modules():
+            module = import_gptlive()
+            session = build_session(module)
+            session._outbound.extend(module.AGENT_SILENCE * 20)
+            self.assertTrue(session.line_quiet())
+
+    def test_a_line_with_speech_still_queued_is_not_quiet(self):
+        with fake_runtime_modules():
+            module = import_gptlive()
+            session = build_session(module)
+            frame = module.AGENT_FRAME_BYTES
+            session._outbound.extend(module.AGENT_SILENCE * 20)
+            session._outbound.extend(b"\x00\x40" * (frame // 2))
+            session._outbound.extend(module.AGENT_SILENCE * 5)
+            self.assertFalse(session.line_quiet())
+
     def test_a_held_loop_is_measured_and_named(self):
         """A GPT Live call sounded metallic, stuttered and answered seconds late
         while its recording, written at the moment of sending, was clean. What

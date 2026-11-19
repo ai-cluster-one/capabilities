@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-19 — `telegram call hangup` ends a GPT Live call about 2 s after the farewell instead of at its 30 s cap
+
+A GPT Live call's output stream never stops and carries the model's own silence, so the send buffer is almost never empty, and a hang-up that waited for an empty buffer never saw a quiet line: every `telegram call hangup` on a GPT Live call ran to its 30 s cap while the voice kept talking. The line now counts as quiet when nothing queued to play reaches the level that closes speech, so the call ends the quiet window after the farewell has played and no queued speech is ever cut off. Gemini calls are unchanged; no verb, flag, setting or JSON key changes.
+
 ## 2026-11-18 — A GPT Live call can be reached at the endpoint `OPENAI_BASE_URL` names, such as OpenAI's EU endpoint
 
 `OPENAI_BASE_URL`, resolved like `OPENAI_API_KEY` (the project's env files, the environment or the agent's vault), now sets the endpoint a GPT Live call is opened at: `https://eu.api.openai.com/v1` opens its socket on `eu.api.openai.com`, which answers only a key made in a project with EU data residency. The session logs `gpt-live: endpoint <host>`, the host alone. Unset, the client is built as before and nothing is logged. Gemini calls are unchanged; no verb, flag, setting or JSON key changes.
