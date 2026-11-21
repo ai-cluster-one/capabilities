@@ -1,5 +1,9 @@
 # callvatest — change log
 
+## 2026-11-21 — `--via test-panel` opens the room the way the dashboard's Test button does
+
+`run`, `suite`, `probe`, `explore` and `session start` take `--via connect|test-panel`. `connect`, the default, is the agent's public link as before. `test-panel` signs in as a dashboard user (`POST /auth/login`), finds the agent's tenant and project among that user's memberships, opens the room through `POST /agents/{id}/test-connect`, which marks it a preview, and revokes the session token straight after; the call then runs exactly as before, `--text` included. The user's sign-in is named on the connection by two new optional fields, `dashboard_email_env` and `dashboard_password_env`, because that surface takes a user's token and never a tenant API key. Reports and session meta record the path as `via`. Nothing changes for a run without the flag.
+
 ## 2026-11-16 — `callvatest` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Тест CallVA, and Estonian (`et`), CallVA test, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.

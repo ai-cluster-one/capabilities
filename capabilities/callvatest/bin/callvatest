@@ -44,7 +44,9 @@ CONNECTIONS
           "api_url": "https://api.example.com/api/v1",
           "secret_env": "CALLVA_<ID>_API_KEY",
           "allow_write": true,
-          "test_call_field": "test_call"
+          "test_call_field": "test_call",
+          "dashboard_email_env": "CALLVA_<ID>_DASHBOARD_EMAIL",
+          "dashboard_password_env": "CALLVA_<ID>_DASHBOARD_PASSWORD"
         }
       }
     }
@@ -345,6 +347,18 @@ GLOBAL OPTIONS
                       and it proves nothing about the speech path — checks that
                       need audio report as skipped. A scenario always describes
                       the spoken call; only this flag downgrades a run.
+  --via <path>        how the room is opened: `connect` (default) is the
+                      public link, a visitor's call; `test-panel` opens it as
+                      the dashboard's Test button does, as a signed-in owner
+                      or admin through test-connect, so the room is a preview
+                      and test-panel-only behaviour applies. It needs the
+                      connection's "dashboard_email_env" and
+                      "dashboard_password_env", naming the env vars holding
+                      that user's sign-in; the session token is minted for
+                      the one connect and revoked after it. The call is
+                      charged to the tenant's wallet; an empty one exits 4
+                      `test_credit_used_up`. Reports and session meta record
+                      the path as "via".
   --key-env <KEY>     resolve the API key from a different env/cred KEY
   --api-url <URL>     override the base URL for this invocation
   --json              machine-readable output where a verb has a prose default
@@ -487,7 +501,21 @@ CONN_FIELDS = [{'key': 'api_url',
   'help': "A boolean custom field on the tenant's calls, set to true on every test "
           'call.',
   'type': 'string',
-  'required': False}]
+  'required': False},
+ {'key': 'dashboard_email_env',
+  'label': 'Dashboard user email',
+  'help': 'The sign-in email of an owner or admin of the tenant, for `--via test-panel`.',
+  'type': 'string',
+  'secret': True,
+  'required': False,
+  'env': 'CALLVA_{ID}_DASHBOARD_EMAIL'},
+ {'key': 'dashboard_password_env',
+  'label': 'Dashboard user password',
+  'help': "That user's password, for `--via test-panel`.",
+  'type': 'string',
+  'secret': True,
+  'required': False,
+  'env': 'CALLVA_{ID}_DASHBOARD_PASSWORD'}]
 # What the machine is given once, before any connection; `setup` writes it.
 SETUP_FIELDS = [{'key': 'ANTHROPIC_API_KEY',
   'label': 'Anthropic key',
@@ -606,7 +634,8 @@ def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
                 or DEFAULT_API_URL)
         return {"id": cid, "allow_write": WRITE_DEFAULT, "key_env": key_env,
                 "api_key": api_key, "base": base.rstrip("/"),
-                "test_call_field": None}, None
+                "test_call_field": None, "dashboard_email_env": None,
+                "dashboard_password_env": None}, None
     key_env = key_env_override or entry.get("secret_env")
     if not key_env:
         return None, {"exit": 6, "code": "no_secret_env",
@@ -621,7 +650,9 @@ def _build_conn(cid: str, entry: dict | None, key_env_override: str | None,
     base = api_url_flag or entry.get("api_url") or DEFAULT_API_URL
     return {"id": cid, "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
             "key_env": key_env, "api_key": api_key, "base": base.rstrip("/"),
-            "test_call_field": (entry.get("test_call_field") or "").strip() or None}, None
+            "test_call_field": (entry.get("test_call_field") or "").strip() or None,
+            "dashboard_email_env": entry.get("dashboard_email_env") or None,
+            "dashboard_password_env": entry.get("dashboard_password_env") or None}, None
 
 
 def _connections_report() -> dict:
@@ -655,6 +686,10 @@ def _connections_report() -> dict:
             keys.append(_key_report(secret_env, True, True, value, tier, source))
         else:
             keys.append(_key_report("secret_env", False, True, None, None, None))
+        for field in ("dashboard_email_env", "dashboard_password_env"):
+            if entry.get(field):
+                value, tier, source = _resolve_env_key(entry[field])
+                keys.append(_key_report(entry[field], True, False, value, tier, source))
         report["connections"][cid] = {
             "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
             "keys": keys}
@@ -835,8 +870,9 @@ def _resolve_agent(ref: str) -> str:
 
 
 def platform_connect(agent_id: str, text_only: bool = False) -> dict:
-    """The ordinary WebRTC connect flow — the same endpoint the dashboard uses.
-    Public, so this is the one call that needs no credential.
+    """The ordinary WebRTC connect flow — the agent's public link, which needs
+    no credential. Under `--via test-panel` the dashboard's Test button flow
+    instead (`_test_panel_connect`); both answer the same connection details.
 
     `text_only` asks for a room carrying no audio in either direction: the
     worker publishes no track and never reaches for speech synthesis, so a turn
@@ -848,8 +884,11 @@ def platform_connect(agent_id: str, text_only: bool = False) -> dict:
     The room comes back named uniquely, so concurrent runs need no arranging
     here; that a room turns out to hold someone else is caught on joining it.
     """
-    r = api("POST", f"/agents/{agent_id}/connect",
-            data={"text_only": True} if text_only else None)
+    body = {"text_only": True} if text_only else None
+    if _STATE.get("via") == "test-panel":
+        r = _test_panel_connect(agent_id, body)
+    else:
+        r = api("POST", f"/agents/{agent_id}/connect", data=body)
     data = (r or {}).get("data") or {}
     for field in ("server_url", "room_name", "participant_token"):
         if not data.get(field):
@@ -858,6 +897,88 @@ def platform_connect(agent_id: str, text_only: bool = False) -> dict:
                  "the agent may be inactive or LiveKit may be unconfigured "
                  "for its tenant")
     return data
+
+
+def _test_panel_connect(agent_id: str, body: dict | None) -> dict:
+    """Open the room the way the dashboard's Test button does: as a signed-in
+    dashboard user, through `test-connect` on the project-context surface,
+    which marks the room a preview so test-panel-only behaviour applies.
+
+    That surface takes a user's session token, never a tenant API key, so the
+    connection names the user's email and password (`dashboard_email_env`,
+    `dashboard_password_env`). The token is minted for this one connect and
+    revoked straight after it. The agent's tenant and project are found among
+    the user's own memberships: the platform answers 404 for an agent outside
+    the project a request names, so the first project that answers otherwise
+    is the agent's."""
+    conn = _STATE["conn"]
+    creds = {}
+    for field in ("dashboard_email_env", "dashboard_password_env"):
+        env = conn.get(field)
+        value = _resolve_env_key(env)[0] if env else None
+        if not value:
+            _die(2, "missing_dashboard_credential",
+                 f"--via test-panel needs {field} on connection {conn['id']!r}"
+                 + (f"; {env} is unset" if env else ""),
+                 "name the env vars holding a tenant owner's or admin's sign-in "
+                 "email and password on the connection")
+        creds[field] = value
+    with httpx.Client(base_url=conn["base"], timeout=TIMEOUT,
+                      headers={"Accept": "application/json"}) as client:
+        try:
+            resp = client.post("/auth/login", json={
+                "email": creds["dashboard_email_env"],
+                "password": creds["dashboard_password_env"],
+                "device_name": f"callvatest-{os.getpid()}-{int(time.time())}"})
+            login = resp.json() if resp.content else {}
+        except (httpx.HTTPError, ValueError) as e:
+            _die(5, "network_error", f"dashboard login failed: {e}", "check connectivity")
+        if resp.status_code >= 500:
+            _die(5, "server_error", f"CallVA returned {resp.status_code} on login",
+                 None, status=resp.status_code)
+        data = (login or {}).get("data") if isinstance(login, dict) else None
+        token = (data or {}).get("token")
+        user = (data or {}).get("user") or {}
+        if resp.status_code >= 400 or not token:
+            _die(2, "dashboard_login_failed",
+                 _api_message(login) or f"HTTP {resp.status_code}",
+                 f"check {conn['dashboard_email_env']} and {conn['dashboard_password_env']}",
+                 status=resp.status_code)
+        client.headers["Authorization"] = f"Bearer {token}"
+        try:
+            for org in user.get("organizations") or []:
+                tenant = {"X-Tenant-ID": org["id"]}
+                listed = client.get("/projects", params={"per_page": 100},
+                                    headers=tenant)
+                if listed.status_code >= 400:
+                    continue
+                payload = listed.json()
+                projects = payload.get("data") if isinstance(payload, dict) else payload
+                if isinstance(projects, dict):
+                    projects = projects.get("data")
+                for project in projects or []:
+                    resp = client.post(f"/agents/{agent_id}/test-connect",
+                                       json=body or {},
+                                       headers={**tenant, "X-Project-ID": project["id"]})
+                    if resp.status_code in (403, 404):
+                        continue
+                    try:
+                        data = resp.json()
+                    except ValueError:
+                        data = resp.text
+                    if resp.status_code == 402:
+                        _die(4, "test_credit_used_up", _api_message(data) or "HTTP 402",
+                             "the tenant's wallet is empty; the test panel refuses "
+                             "until it is topped up", status=402)
+                    if resp.status_code >= 400:
+                        _map_4xx(resp.status_code, data, "test-connect", False)
+                    return data
+        finally:
+            with contextlib.suppress(httpx.HTTPError):
+                client.post("/auth/logout")
+    _die(3, "not_found",
+         f"agent {agent_id} is in no project the dashboard user may test in",
+         "sign in as an owner or admin of the agent's tenant")
 
 
 def platform_find_call_id(room_name: str, agent_id: str, deadline: float) -> str | None:
@@ -2176,6 +2297,7 @@ def build_report(scenario: dict, conn: dict, agent_id: str, conn_details: dict,
         "connection": conn["id"],
         "judge": _STATE.get("judge"),
         "mode": "text" if obs.text_only else "voice",
+        "via": _STATE.get("via"),
         "language": scenario.get("language"),
         "room": conn_details.get("room_name"),
         "call_id": evidence.get("call_id"),
@@ -2825,6 +2947,7 @@ def _explore_report(plan: dict, state: dict, agent_id: str, conn: dict,
         "agent": agent_id,
         "connection": conn["id"],
         "mode": "text" if text_only else "voice",
+        "via": _STATE.get("via"),
         "language": exploration.get("language"),
         "intent": exploration["intent"],
         "persona": plan["persona"],
@@ -3150,7 +3273,8 @@ def cmd_session_start(args) -> None:
     cmd = [sys.executable, script, "session", "hold", sid, "--agent", agent_id,
            "--timeout", str(args.timeout)]
     for flag, value in (("--connection", args.connection),
-                        ("--api-url", args.api_url), ("--key-env", args.key_env)):
+                        ("--api-url", args.api_url), ("--key-env", args.key_env),
+                        ("--via", args.via)):
         if value:
             cmd += [flag, value]
     if args.text:
@@ -3208,6 +3332,7 @@ def cmd_session_hold(args) -> None:
         meta = {"session": args.session, "agent": args.agent,
                 "connection": _STATE["conn"]["id"],
                 "mode": "text" if text_only else "voice",
+                "via": args.via,
                 "room": conn_details["room_name"],
                 "server_url": conn_details["server_url"],
                 "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -3295,6 +3420,7 @@ def _add_common(parser) -> None:
     parser.add_argument("--connection")
     parser.add_argument("--judge")
     parser.add_argument("--text", action="store_true")
+    parser.add_argument("--via", choices=("connect", "test-panel"), default="connect")
     parser.add_argument("--trace", action="store_true")
     parser.add_argument("--key-env", dest="key_env")
     parser.add_argument("--api-url", dest="api_url")
@@ -3403,6 +3529,7 @@ def main() -> None:
         _write_gate(cid, conn["allow_write"], verb)
         _STATE["client"] = _client(conn["api_key"], conn["base"])
         _STATE["conn"] = conn
+    _STATE["via"] = getattr(args, "via", "connect")
 
     args.func(args)
 
