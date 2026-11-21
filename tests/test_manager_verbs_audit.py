@@ -49,8 +49,8 @@ ANSWERS = {
 def _fixture(tmp_path: Path, answer: str) -> Path:
     text = M._capability_skeleton(NAME, False)
     text = text.replace(
-        f"  {NAME} inventory [--network]\n",
-        f"  {NAME} inventory [--network]\n  {NAME} node add <label> --server <uuid>\n", 1)
+        "\nVerbs:\n",
+        f"\nVerbs:\n  {NAME} node add <label> --server <uuid>\n", 1)
     text = text.replace('    if cleaned == ["doctor"]:',
                         ANSWERS[answer] + '    if cleaned == ["doctor"]:', 1)
     assert ANSWERS[answer] in text

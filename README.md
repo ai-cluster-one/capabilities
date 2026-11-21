@@ -13,7 +13,7 @@ A capability lives at two altitudes, and that split is the whole point:
 - **Global** — installed once per machine. The agent learns the tool *exists* and how to load its full contract on demand. Always-on cost: a single line of awareness.
 - **Project** — per consuming repo. How *this* project uses the tool: its identifiers, its config, its mappings. Loaded only when that project is open.
 
-And the tool describes itself. Every capability ships a CLI with two guarantees an agent can lean on: `<name> help` prints the full surface, and `<name> doctor` proves the credentials resolve and the service answers — readiness checked at use-time, never assumed. The agent *discovers* the tool; it isn't taught it.
+And the tool describes itself. Every capability ships a CLI with two guarantees an agent can lean on: `<name> help` is the menu of the whole surface and `<name> help <verb>` each verb's whole contract, and `<name> doctor` proves the credentials resolve and the service answers — readiness checked at use-time, never assumed. The agent *discovers* the tool; it isn't taught it.
 
 That "expose just enough, let the agent find the rest" instinct is borrowed from Claude Code skills — and generalized into a host-neutral discipline that also settles the three things a skill leaves open: a uniform executable contract, a deterministic credential model, and project-scoped configuration.
 

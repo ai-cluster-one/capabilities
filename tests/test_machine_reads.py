@@ -59,8 +59,8 @@ DOMAIN = '''    verb = " ".join(cleaned)
 def _fixture_text(machine_reads: str | None = "('connections', 'look')") -> str:
     text = M._capability_skeleton(NAME, False)
     text = text.replace(
-        f"  {NAME} inventory [--network]\n",
-        f"  {NAME} inventory [--network]\n  {NAME} look [push]\n"
+        "\nVerbs:\n",
+        f"\nVerbs:\n  {NAME} look [push]\n"
         f"  {NAME} peek\n  {NAME} push\n", 1)
     text = text.replace("WRITE_VERBS = set()\n",
                         'WRITE_VERBS = {"push", "look push"}\n', 1)

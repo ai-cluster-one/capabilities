@@ -26,7 +26,7 @@ Every script implements the same contract verbs alongside its domain verbs. This
 
 | Verb | Returns |
 |---|---|
-| `help` | The full usage contract (the module docstring), verbatim. |
+| `help` / `help <verb>` | The menu of every verb / one verb's whole contract ([agent-first help](#agent-first-help-is-the-surface)). |
 | `doctor` | The cheapest authenticated round-trip, per connection; proves credentials, reachability, identity. |
 | `connections` | The resolution report: every connection, every value, its winning tier and source, secrets masked. Local only — no call to any system a connection names; in store mode reading the store is the resolution. `connections show <id> --reveal <KEY>` prints one of those values in the clear ([revealing one value](#revealing-one-value)). |
 | `stub` | The one-line awareness text. |
@@ -72,16 +72,28 @@ REQUIRES_MANAGER = 0  # optional literal: the lowest manager level this release 
 
 ## Agent-first help is the surface
 
-`<name> help` prints a hand-written usage contract that is the **single source of truth** for the surface (DOCTRINE rule 3 — discoverable knowledge lives in the tool, not in docs that go stale). It is the module docstring, emitted verbatim:
+A capability's help is the **single source of truth** for its surface (DOCTRINE rule 3 — discoverable knowledge lives in the tool, not in docs that go stale), written *for an agent loading it on demand*: prescriptive, structured, never terse `--help` output. It is reached in layers, and each layer answers one question whole.
+
+- **`<name> help` is the menu** — short, complete, and read whole: every verb on one line saying what it answers, the service verbs where a service ships, and the guides. It is the single discovery point and carries no per-flag detail: no line of it describes a flag and no verb line names one. Rendered in a project that holds nothing for the capability, it is a few KB, within the ceiling the manager's audit holds, so it is read whole and cheaply. A stateful CLI (one with a login ceremony) opens it with the startup protocol the agent must follow (`<name> doctor` first, what each exit code means, how to recover).
+- **`<name> help <verb>` is required for every verb the menu names** and gives that verb's whole contract: its arguments, flags, output, exit codes and an example. It takes the whole verb path (`help cards create`); a path naming a group of verbs lists them.
+- **An unknown `help <x>` answers with the menu's pointer** — a refusal whose hint is `<name> help`, with nothing on stdout — and never a dump.
+- **Guides stay per topic**, `<name> guide <topic>` (see [Guides](#guides)).
+
+Nothing about a command is documented anywhere one of these layers could have answered. A capability gets the layers from the contract library: the menu is its `HELP` constant or, without one, the module docstring, and the verb pages are `HELP_VERBS`, a dict from each verb path to its whole contract text. The library dispatches `help` and `help <verb>`, renders the contract verbs' own menu lines and pages - a capability's `HELP_VERBS` entry for a contract verb follows the library's page - and appends the project's identifiers to the menu:
 
 ```python
-if args.cmd == "help":
-    sys.stdout.write((__doc__ or "").lstrip("\n")); return
+HELP = """mytool - ...
+
+  mytool send <to>              send one message
+  mytool cards list             the cards on the board
+"""
+HELP_VERBS = {
+    "send": "mytool send <to> [--urgent]\n\n  Sends one message. ...",
+    "cards list": "mytool cards list [--all]\n\n  ...",
+}
 ```
 
-The docstring carries everything an agent needs to drive the tool without reading the source: a one-line statement of what the CLI is and that it is agent-invoked, the credential keys it resolves, every subcommand with its arguments and flags — the contract verbs included — the I/O contract, and the exit-code table. It is written *for an agent loading it on demand* — prescriptive, exhaustive, structured with visual headers — not as terse `--help` output. A stateful CLI (one with a login ceremony) opens its help with the startup protocol the agent must follow (`<name> doctor` first, what each exit code means, how to recover).
-
-When the help text outgrows the docstring, it may live in a `HELP` constant printed the same way; the contract is identical — `<name> help` is the canonical surface, and nothing about a command is documented anywhere a `<name> help` could have answered.
+`capabilities audit` holds every capability to these layers (check `help`): the menu's size, a flag on any line of it, each verb it names answered by `help <verb>` with something other than the menu, and the pointer for an unknown verb. A catalogue bundle the manager names in `HELP_MENU_PENDING` predates this law and awaits its conversion: its findings are reported under `pending` rather than failing, it fails once it conforms until its name is taken out, and no name is ever added, so the set only shrinks.
 
 ## `stub` — the awareness line
 

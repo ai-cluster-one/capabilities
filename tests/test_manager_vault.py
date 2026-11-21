@@ -436,7 +436,8 @@ def test_setup_set_seals_a_secret_into_the_vault_and_machine_keeps_the_credentia
 
 
 def test_help_renders_where_a_secret_resolves_with_the_vault(lab):
-    text = _declfix(lab)("help").stdout
+    # The scaffold's help is layered: the cascade is on the connection page.
+    text = _declfix(lab)("help", "connection").stdout
     section = text[text.index("## Where a secret resolves"):]
     assert "the agent's vault" in section and "process environment" in section
     assert "--file" in text

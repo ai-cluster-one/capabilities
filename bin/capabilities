@@ -2986,7 +2986,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.49.1"
+CONTRACT_LIBRARY_RELEASE = "0.50.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -34256,6 +34256,105 @@ MANAGER_VERB_PROBES = {
 }
 
 
+# The layered help is the capability contract's law (SHEBANG.md, "Agent-first
+# help is the surface"): `<name> help` is a short complete menu and every verb
+# it names answers `<name> help <verb>` with its whole contract. The audit
+# holds a menu to this ceiling, in bytes, as the menu renders in a project
+# that holds nothing for the capability.
+HELP_MENU_CEILING = 8192
+
+# The catalogue bundles whose help predates the layered law, each awaiting its
+# own conversion. Their menu findings are reported under `pending` rather than
+# failing the audit, and a bundle named here whose help already conforms fails
+# until its name is taken out, so the set only shrinks. A name is never added:
+# every bundle outside it, a new capability included, is held to the whole law.
+HELP_MENU_PENDING = frozenset({
+    "agentrooms", "agenttemplates", "asana", "askproject", "assets", "automations",
+    "calcomc", "calendar", "callva", "callvatest", "clickup", "context", "coolify",
+    "deployment", "directo", "emta", "fathom", "geminitalk", "ical", "inbox",
+    "instagram", "journal", "macmail", "mailbox", "memory", "notion", "railwayc",
+    "rclonec", "resend", "routine", "signoz", "simplbooks", "skyscanner", "slack",
+    "slacker", "stripe", "tasks", "teams", "telegram", "telegrambot", "vapic",
+    "whatsapp", "windmill", "youtrack",
+})
+
+_HELP_FLAG = re.compile(r"(?<![\w-])--?[A-Za-z]")
+_HELP_WORD = re.compile(r"[a-z][a-z0-9-]*")
+
+
+def _help_menu_verbs(name: str, menu: str) -> list[str]:
+    """Each verb path a menu line names: the words after the capability's
+    name on a line that opens with it, up to the first that is not a word."""
+    paths: list[str] = []
+    for line in menu.splitlines():
+        words = line.split()
+        if len(words) < 2 or words[0] != name:
+            continue
+        path = []
+        for word in words[1:]:
+            if not _HELP_WORD.fullmatch(word):
+                break
+            path.append(word)
+        key = " ".join(path)
+        if key and key not in paths:
+            paths.append(key)
+    return paths
+
+
+def _help_menu_problems(name: str, script: Path, menu: str, cwd: Path,
+                        env: dict) -> list[str]:
+    """What keeps a capability's help from the layered law: a menu past the
+    ceiling, per-flag detail in it, a verb it names that `help <verb>` does
+    not answer, and an unknown `help <x>` answered with anything but the
+    pointer to the menu. The per-verb probes run once the menu itself holds."""
+    problems: list[str] = []
+    size = len(menu.encode())
+    if size > HELP_MENU_CEILING:
+        problems.append(f"menu is {size} bytes, past the {HELP_MENU_CEILING}-byte "
+                        f"ceiling; per-verb detail belongs in `{name} help <verb>`")
+    flagged = [line.strip() for line in menu.splitlines()
+               if line.strip().startswith("-") and _HELP_FLAG.match(line.strip())
+               or (line.split()[:1] == [name] and _HELP_FLAG.search(line))]
+    if flagged:
+        problems.append(f"menu carries per-flag detail on {len(flagged)} line(s), "
+                        f"first {flagged[0][:80]!r}; a verb's flags belong in "
+                        f"`{name} help <verb>`")
+    rc, out, errs = _run_script(script, ["help", "zz-no-such-verb"], cwd=cwd, env=env,
+                                timeout=30, input="")
+    hint = ""
+    for line in reversed((errs or "").strip().splitlines()):
+        try:
+            envelope = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(envelope, dict) and isinstance(envelope.get("error"), dict):
+            hint = str(envelope["error"].get("hint") or "")
+            break
+    if rc == 0 or out.strip() or f"{name} help" not in hint:
+        problems.append(f"`{name} help zz-no-such-verb` answered exit {rc} with "
+                        f"{len(out)} bytes on stdout; an unknown verb answers the "
+                        f"pointer to `{name} help` and prints nothing")
+    if problems:
+        return problems
+    paths = _help_menu_verbs(name, menu)
+    if not paths:
+        return [f"menu names no verb on a line opening with `{name}`"]
+
+    def probe(path: str) -> str | None:
+        rc, out, _errs = _run_script(script, ["help", *path.split()], cwd=cwd, env=env,
+                                     timeout=30, input="")
+        if rc != 0 or not out.strip() or out == menu:
+            return (f"`{name} help {path}` answered exit {rc} with "
+                    f"{'the menu' if out == menu else f'{len(out)} bytes'}; every "
+                    f"verb the menu names answers its whole contract")
+        return None
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        problems += [p for p in pool.map(probe, paths) if p]
+    return problems
+
+
 def _manager_verbs_problems(name: str, script: Path, help_text: str,
                             cwd: Path, env: dict) -> list[str]:
     """Each manager-owned form the capability's help names, asked in the
@@ -34287,7 +34386,8 @@ def _manager_verbs_problems(name: str, script: Path, help_text: str,
 
 
 def _audit_script(
-    name: str, script: Path, manifest_result: list[dict] | None = None
+    name: str, script: Path, manifest_result: list[dict] | None = None,
+    pending_result: list[str] | None = None,
 ) -> list[str]:
     failures: list[str] = []
     env = _snapshot_env()
@@ -34525,6 +34625,20 @@ def _audit_script(
         failures += [f"manager-verbs: {p}" for p in _manager_verbs_problems(
             name, script, help_text, sandbox, genv)]
 
+        # The layered help (SHEBANG.md, "Agent-first help is the surface"),
+        # judged on the menu as it renders in this project, which holds nothing.
+        rc, menu, _errs = _run_script(script, ["help"], cwd=sandbox, env=genv)
+        if rc == 0:
+            menu_problems = _help_menu_problems(name, script, menu, sandbox, genv)
+            if name not in HELP_MENU_PENDING:
+                failures += [f"help: {p}" for p in menu_problems]
+            elif not menu_problems:
+                failures.append(
+                    f"help: {name} answers the layered help; take it out of "
+                    "HELP_MENU_PENDING")
+            elif pending_result is not None:
+                pending_result += [f"help: {p}" for p in menu_problems]
+
         # inventory — the project self-report every reader renders the same way
         # (DOCTRINE rule 20). Bare, it costs nothing: the sandbox tree is
         # compared byte for byte across the call, so a report that writes into
@@ -34665,8 +34779,11 @@ def cmd_audit(name: str, from_ref: str | None) -> None:
         if not script.is_file():
             _die(3, "not_found", f"{name} is not installed",
                  f"`capabilities install {name}` or audit --from <path>")
-    failures = _audit_script(name, script)
+    pending: list[str] = []
+    failures = _audit_script(name, script, pending_result=pending)
     report = {"name": name, "ok": not failures, "failures": failures}
+    if pending:
+        report["pending"] = pending
     _emit(report)
     if failures:
         sys.exit(7)
@@ -36473,20 +36590,14 @@ def cmd_doctor(_wanted: str | None) -> None:
 # ///
 """{name} — managed capability scaffold.
 
-Contract:
-  {name} help
-  {name} doctor [--connection ID]
-  {name} connections
-  {name} stub
-  {name} manifest --json
-  {name} guide [topic]
-  {name} ids list|get|set|rm
-  {name} refs
-  {name} inventory [--network]
-
 Add the smallest useful domain verb surface below the shared contract code it
-binds. Success is JSON on stdout; errors are JSON on stderr. Exit 4 is policy
-refusal.
+binds. Give each verb one line under Verbs, saying what it answers, and its
+whole contract - arguments, flags, output, exit codes - under its path in
+HELP_VERBS, which `{name} help <verb>` prints; the contract verbs render
+themselves. Success is JSON on stdout; errors are JSON on stderr. Exit 4 is
+policy refusal.
+
+Verbs:
 """
 
 import json
@@ -36497,6 +36608,7 @@ from typing import NoReturn
 
 NAME = {name!r}
 TITLE = {name.replace("-", " ").title()!r}  # its human name, fixed here and never renamed
+HELP_VERBS: dict[str, str] = {{}}  # a verb path -> its whole contract, for `help <verb>`
 LUCIDE_ICON = None  # the Lucide name of its line icon, where it has one
 SUMMARY = "TODO: describe the capability's smallest useful surface."
 SCOPE = "project"

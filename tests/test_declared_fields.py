@@ -105,8 +105,8 @@ DOMAIN = '''    if cleaned[:1] == ["link"]:
 
 def _fixture_text(declared: bool = True) -> str:
     text = M._capability_skeleton(NAME, False)
-    text = text.replace(f"  {NAME} inventory [--network]\n",
-                        f"  {NAME} inventory [--network]\n  {NAME} link [--events]\n", 1)
+    text = text.replace("\nVerbs:\n",
+                        f"\nVerbs:\n  {NAME} link [--events]\n", 1)
     if declared:
         text = text.replace("CONN_FIELDS: list[dict] = []\n", DECLARATIONS, 1)
     text = text.replace('    if cleaned == ["doctor"]:', DOMAIN, 1)
@@ -866,7 +866,14 @@ def test_stdin_closing_while_an_answer_is_awaited_is_input_closed(lab):
 
 
 def test_help_ends_with_the_declared_verbs(lab):
-    text = _run(lab, "help").stdout
+    # The scaffold's help is layered: the menu names each declared verb and
+    # its page carries the whole of it.
+    menu = _run(lab, "help").stdout
+    for verb in ("connection add|remove|seal|rename", "setup [show]|set|unset",
+                 "settings [show]|get|set|unset|put"):
+        assert f"  {NAME} {verb} " in menu, verb
+    text = "".join(_run(lab, "help", verb).stdout
+                   for verb in ("connection", "setup", "settings", "connections"))
     for needle in ("connection add <id>", "--replace", "--machine", "setup set",
                    "setup [show] [--reveal <KEY>]", "connections show <id> --reveal <KEY>",
                    "settings put", "declfix link --events", "poll_seconds @project",
@@ -875,12 +882,12 @@ def test_help_ends_with_the_declared_verbs(lab):
 
 
 def test_help_names_where_this_project_keeps_its_connections(lab):
-    text = _run(lab, "help").stdout
+    text = _run(lab, "help", "connections").stdout
     home = text.split("═══ Where connections live", 1)[1]
     assert "This project keeps its connections in files" in home
     assert str(lab["project"] / "capabilities" / NAME / "connections.json") in home
     assert str(lab["config"] / NAME / "connections.json") in home
-    outside = _run(lab, "help", where="nowhere").stdout
+    outside = _run(lab, "help", "connections", where="nowhere").stdout
     assert "There is no project here" in outside
     assert str(lab["config"] / NAME / "connections.json") in outside
 

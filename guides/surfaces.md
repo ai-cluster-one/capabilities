@@ -94,7 +94,7 @@ A refusal is the recovery plan. The agent reading it has no session to reason fr
 
 ## The help body
 
-`SHEBANG.md` fixes what the body contains and that it is the single source of truth for the surface. What follows is how it is arranged.
+`SHEBANG.md` fixes the layers the help is reached in - the menu at `help`, each verb's whole contract at `help <verb>` - and that they are the single source of truth for the surface. What follows is how the menu is arranged; a verb's flags and full argument contract go to its page.
 
 **Recommended** — the order is: what the tool is and what it refuses to be, then the connection or startup facts, then the verbs, then the grammars shared across verbs, then the contract verbs, then the I/O contract and the exit codes. `resend`, `stripe`, `notion`, and `signoz` read in that order.
 
@@ -104,15 +104,13 @@ A refusal is the recovery plan. The agent reading it has no session to reason fr
 
 ## Layers
 
-The surface is reached in layers: the stub line, `help` (the entry menu — every verb with what it answers, plus the shared grammars), `help <verb>` (one verb's full argument contract), `guide <topic>`, `contract`, and `connections` and `doctor`.
+The surface is reached in layers: the stub line, `help`, `help <verb>`, `guide <topic>`, `contract`, and `connections` and `doctor`. What `help` and `help <verb>` each carry, and how an unknown verb is answered, is the law in `SHEBANG.md` ("Agent-first help is the surface"), checked by `capabilities audit`; read it there. What follows is how to arrange the layers well inside it.
 
 **Recommended** — a fact has one authoritative home among those layers and the others point at it. A per-verb page names the addressing or filter grammar it depends on, because a layer reached on purpose has to be usable on its own; it does not restate it.
 
-**Recommended** — every layer names the command that reaches the next. `clickup help [<command>]` is advertised in the body's first command line, so the third layer is discoverable rather than folklore.
+**Recommended** — every layer names the command that reaches the next. The contract renders the menu's pointer to `help <verb>`; a verb page that leans on a guide names `guide <topic>`, and a page whose answer feeds another verb names that verb.
 
-**Recommended** — open `help <verb>` on verb count, not on body length: once the surface carries more than roughly a dozen callable forms, the per-verb flags move down a layer and the entry menu keeps one line per verb saying what it answers. `clickup` is the instructive case — it has the third layer and still folds every flag of every verb into the second, so the same facts are printed twice.
-
-**Recommended** — `help` takes the whole verb path. Under a nested noun, `help cards create` prints that operation's arguments and `help cards` prints the noun's own verb list; a forwarding capability passes the rest through, as `railwayc help <cmd>` reaches the child's own help.
+**Recommended** — under a nested noun, `help cards` lists the noun's verbs and `help cards create` prints that operation's contract; a forwarding capability passes the rest through, as `railwayc help <cmd>` reaches the child's own help.
 
 ## When the capability is not a plain API wrapper
 
