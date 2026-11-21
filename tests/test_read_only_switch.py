@@ -291,6 +291,6 @@ def test_doctor_reports_the_switch_only_while_it_is_on(lab):
 
 
 def test_the_manager_help_names_the_variable():
-    help_text = subprocess.run([str(MANAGER), "help"], text=True,
+    help_text = subprocess.run([str(MANAGER), "help", "environment"], text=True,
                                capture_output=True, timeout=60).stdout
     assert SWITCH in help_text

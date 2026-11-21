@@ -20,13 +20,13 @@
     "guides/store-upgrade.md": "6f4e4325dab598c15afa5981008b371e953e315c24054f07c3f49c0fcfecdc74",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
     "guides/surfaces.md": "6873e85bcf63c38816b07ccee0cd7a4317b3a203830e947f7b00beca93aa1443",
-    "manager/CHANGELOG.md": "fa9cb904e9fa6c9946c69d8441deef142d4cc49d7417ca8636d2ad48614efbb0",
-    "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
+    "manager/CHANGELOG.md": "64c817a409350cd1dbc23d0120f49e6215edecab8bc3543fd9ce7799aedf6424",
+    "skill/SKILL.md": "fd59e0358e0635fa93da1be0fc3ebe2f163c8f79b96fa05bcbcf93a663b5ba31"
   },
   "level": 1,
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "8bec7cd0ff8eaa859d9c74f988ab13aa4256ccfe72bc143976714e4bead06959"
+    "sha256": "4318d2f125f82cbafc20946fe71ae69a39a59da9516cdd8d2efd1023c9c09ef0"
   },
   "requires": {
     "teams": 1

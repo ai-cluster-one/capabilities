@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -132,3 +134,34 @@ def test_the_pending_set_only_shrinks_and_names_bundles_that_exist():
         sorted(M.HELP_MENU_PENDING - PENDING_AT_INTRODUCTION)
     bundles = {p.name for p in (REPO / "capabilities").iterdir() if p.is_dir()}
     assert M.HELP_MENU_PENDING <= bundles, sorted(M.HELP_MENU_PENDING - bundles)
+
+
+def _manager(*args: str) -> subprocess.CompletedProcess:
+    return subprocess.run([str(MANAGER), *args], text=True, capture_output=True,
+                          timeout=120, stdin=subprocess.DEVNULL)
+
+
+def test_the_managers_own_help_holds_to_the_layered_law(isolated):
+    """The manager is no capability, but its help is the same menu: the check
+    the audit runs on a capability's help passes on the manager's."""
+    menu = M._help_menu()
+    assert M._help_menu_problems("capabilities", MANAGER, menu, isolated / "home",
+                                 dict(os.environ)) == []
+
+
+def test_every_page_of_the_managers_help_is_a_verb_its_menu_names():
+    named = set(M._help_menu_verbs("capabilities", M._help_menu()))
+    paged = {path for paths, _text in M._HELP_PAGES for path in paths}
+    assert paged == named, (sorted(paged - named), sorted(named - paged))
+
+
+def test_the_manager_answers_a_group_a_topic_and_an_unknown_path():
+    group = _manager("help", "node")
+    assert group.returncode == 0 and "  node add " in group.stdout
+    store = _manager("help", "store", "set")
+    assert store.returncode == 0 and store.stdout.startswith("STORE VERBS\n")
+    assert "--password-stdin" in store.stdout
+    unknown = _manager("help", "zz-no-such-verb")
+    assert unknown.returncode == 6 and unknown.stdout == ""
+    assert "capabilities help" in json.loads(unknown.stderr.strip().splitlines()[-1])["error"]["hint"]
+    assert _manager("--help").stdout == M._help_menu()

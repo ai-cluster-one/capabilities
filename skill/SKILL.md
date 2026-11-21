@@ -9,7 +9,7 @@ The `capabilities` manager installs and operates self-contained capability CLIs 
 
 Three commands reach everything:
 
-- `capabilities help` — the manager's full contract: every verb, the policy gate, the credential model, the exit taxonomy.
+- `capabilities help` — the manager's menu, every verb on one line with the exit taxonomy; `capabilities help <verb>` gives one verb's whole contract.
 - `capabilities list` — what is installed here and how each one is gated in this project; `capabilities search` finds what is not installed yet.
 - `<name> help` — one capability's own contract, once you have its name.
 
