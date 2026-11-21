@@ -68,7 +68,7 @@ def test_tracked_fields_are_exactly_these():
 
 def test_help_names_the_rule():
     for needle in ("--actor", "TASKS_EXECUTION", "TASKS_ACTOR", "created_by"):
-        assert needle in mod.__doc__
+        assert needle in mod.HELP_VERBS["activity"]
 
 
 def test_every_named_write_verb_accepts_the_flag():

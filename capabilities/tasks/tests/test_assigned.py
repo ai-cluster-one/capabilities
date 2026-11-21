@@ -69,7 +69,7 @@ def test_assigned_here_is_refused_beside_an_assignee_and_outside_a_project(
 
 
 def test_the_help_states_the_rule_with_its_one_exception_where_it_lives():
-    scope = mod.__doc__.split("\nPROJECT SCOPE\n")[1].split("\nWORKER SCOPE\n")[0]
+    scope = mod.HELP_VERBS["accepts"].split("\nPROJECT SCOPE\n")[1].split("\nWORKER SCOPE\n")[0]
     assert scope.startswith("  Reads cross the project boundary and writes never do, "
                             "with one exception")
     for said in ("exactly as that\n  project declares it",
@@ -77,9 +77,9 @@ def test_the_help_states_the_rule_with_its_one_exception_where_it_lives():
                  'tasks activity <uuid> "..."', "--assignee <who>",
                  "returns it to `todo`", "`origin_project`"):
         assert said in scope, said
-    filters = mod.__doc__.split("FILTERS  (")[1].split("PAGING")[0]
+    filters = mod.HELP_VERBS["list"].split("FILTERS  (")[1].split("PAGING")[0]
     assert "--assigned-here" in filters
-    workers = mod.__doc__.split("\nWORKERS\n")[1].split("\nADDRESSING\n")[0]
+    workers = mod.HELP_VERBS["workers save"].split("\nWORKERS\n")[1].split("\nADDRESSING\n")[0]
     assert "written_by_another_project" in workers
 
 

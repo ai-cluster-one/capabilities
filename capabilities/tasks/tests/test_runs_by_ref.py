@@ -58,7 +58,7 @@ def test_a_call_that_cannot_be_read_is_refused_before_the_store(args, capsys):
 
 
 def test_the_help_states_the_contract():
-    runs = " ".join(mod.__doc__.split("\nRUNS\n")[1].split("\nWATCH\n")[0].split())
+    runs = " ".join(mod.HELP_VERBS["runs"].split("\nRUNS\n")[1].split("\nWATCH\n")[0].split())
     for said in ("--run SYSTEM:REF", "--since WHEN", "--all-projects",
                  "--run claude:<session id>", "answers no row and is not an error",
                  "one query on one connection"):

@@ -145,7 +145,7 @@ def test_a_retry_window_that_is_not_whole_seconds_is_refused(monkeypatch, capsys
 
 
 def test_help_documents_the_window_the_beat_and_the_pass_over():
-    said = " ".join(mod.__doc__.split())
+    said = " ".join("\n".join([mod.__doc__, *mod.HELP_VERBS.values()]).split())
     assert "TASKS_STORE_RETRY_SECONDS - 180 unless set" in said
     assert "A turn proves it is alive." in said
     assert "`verdict` `held`" in said

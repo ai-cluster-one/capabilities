@@ -32,7 +32,7 @@ HERE, THERE = "prj_here", "prj_there"
 
 
 def test_the_help_states_the_fields():
-    said = " ".join(mod.__doc__.split("\nCOLLECTIONS\n")[1].split())
+    said = " ".join(mod.HELP_VERBS["list"].split("\nCOLLECTIONS\n")[1].split())
     for field in ("`runs`", "{count, by_worker, cost_usd, without_cost}",
                   "`blocked_by`", "`blocked_by_status`", "never one query per row"):
         assert field in said

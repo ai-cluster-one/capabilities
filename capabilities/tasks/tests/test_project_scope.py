@@ -285,21 +285,21 @@ def test_every_scan_takes_one(verb):
 def test_the_help_states_the_rule_and_files_the_filter_with_the_others():
     assert ("Reads cross the project boundary and writes never do, with one exception: "
             "the\n  project a task is assigned to may add to its trail and set its "
-            "assignee.") in mod.__doc__
-    filters = mod.__doc__.split("FILTERS  (list, ready, search, counts)")[1]
+            "assignee.") in mod.HELP_VERBS["accepts"]
+    filters = mod.HELP_VERBS["list"].split("FILTERS  (list, ready, search, counts)")[1]
     assert "--project ID" in filters.split("PAGING")[0]
     assert "--all-projects" in filters.split("PAGING")[0]
 
 
 def test_the_help_says_what_the_store_identity_is_for():
-    store = mod.__doc__.split("\nSTORE\n")[1].split("\nI/O\n")[0]
+    store = mod.HELP_VERBS["migrate"].split("\nSTORE\n")[1].split("\nI/O\n")[0]
     assert "`store`" in store and "asks each store once" in store
 
 
 def test_the_help_says_a_key_is_unique_within_a_project():
-    assert "unique within the project" in mod.__doc__
-    assert "unique across the store" not in mod.__doc__
-    addressing = mod.__doc__.split("ADDRESSING")[1].split("FIELDS")[0]
+    assert "unique within the project" in mod.HELP_VERBS["add"]
+    assert "unique across the store" not in "\n".join([mod.__doc__, *mod.HELP_VERBS.values()])
+    addressing = mod.HELP_VERBS["show"].split("ADDRESSING")[1].split("FIELDS")[0]
     assert "A key is unique within a project" in addressing
 
 
@@ -366,7 +366,7 @@ def test_a_store_it_cannot_prove_is_named_as_no_store(monkeypatch):
 
 
 def test_the_help_says_the_store_can_be_absent():
-    store = mod.__doc__.split("\nSTORE\n")[1].split("\nI/O\n")[0]
+    store = mod.HELP_VERBS["migrate"].split("\nSTORE\n")[1].split("\nI/O\n")[0]
     assert "null when" in store
 
 

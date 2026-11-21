@@ -182,10 +182,10 @@ def test_the_raise_is_read_once_however_often_it_is_asked_for():
 
 
 def test_help_names_the_scope():
-    assert "WORKER SCOPE" in mod.__doc__
+    assert "WORKER SCOPE" in mod.HELP_VERBS["workers save"]
     for needle in ("TASKS_EXECUTION", "coerced", "exit 4",
                    "draft, todo, waiting, complete or closed"):
-        assert needle in mod.__doc__
+        assert needle in mod.HELP_VERBS["workers save"]
 
 
 # --- The verb, with the two reads faked and no store -------------------------

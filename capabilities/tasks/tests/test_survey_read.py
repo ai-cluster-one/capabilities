@@ -162,9 +162,9 @@ def test_the_connection_flag_is_not_looked_for_past_the_end_of_the_flags(
 
 
 def test_the_help_documents_every_new_surface_beside_its_neighbours():
-    doc = mod.__doc__
-    reading = doc.split("READING")[1].split("WRITING")[0]
-    assert "tasks counts [filters]" in reading and "`--sort`" in reading
+    reading = mod.__doc__.split("READING")[1].split("WRITING")[0]
+    doc = mod.HELP_VERBS["list"]
+    assert "tasks counts [filters]" in reading and "`--sort`" in doc
     assert "FILTERS  (list, ready, search, counts)" in doc
     order = doc.split("ORDER  (list, search)")[1].split("PAGING")[0]
     for value in mod._SORTS:
@@ -175,7 +175,7 @@ def test_the_help_documents_every_new_surface_beside_its_neighbours():
     assert "`last_activity_at` is the newest trail entry" in collections
     paging = doc.split("PAGING  (list, ready, search)")[1].split("COLLECTIONS")[0]
     assert "1 or more" in paging and "every match" in paging
-    assert "tasks search -- --literal" in doc.split("ARGUMENTS")[1]
+    assert "tasks search -- --literal" in mod.HELP_VERBS["search"].split("ARGUMENTS")[1]
 
 
 # --- Store -------------------------------------------------------------------
@@ -696,7 +696,7 @@ def test_an_order_costs_no_more_questions(four_orders, capsys, statements):
 
 
 def test_the_help_files_order_beside_sort():
-    order = mod.__doc__.split("ORDER  (list, search)")[1].split("PAGING")[0]
+    order = mod.HELP_VERBS["list"].split("ORDER  (list, search)")[1].split("PAGING")[0]
     assert "--order asc|desc" in order and "Needs --sort" in order
     assert "no pickup stay last both ways" in order
 
@@ -723,7 +723,7 @@ def test_touched_filters_narrow_list_search_and_counts_by_last_touch(four_orders
 
 
 def test_the_help_documents_the_touched_filters_beside_updated():
-    filters = mod.__doc__.split("FILTERS  (list, ready, search, counts)")[1] \
+    filters = mod.HELP_VERBS["list"].split("FILTERS  (list, ready, search, counts)")[1] \
         .split("ORDER  (list, search)")[0]
     assert "--updated-after WHEN  --updated-before WHEN\n  --touched-after WHEN  " \
         "--touched-before WHEN" in filters and "last_touched_at" in filters

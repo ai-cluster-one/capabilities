@@ -61,7 +61,7 @@ def test_the_help_says_what_waiting_means():
     # Read with the wrapping taken out: the help is written to a column, and a
     # sentence that says the right thing must not fail for breaking in a new
     # place.
-    said = " ".join(mod.__doc__.split())
+    said = " ".join("\n".join([mod.__doc__, *mod.HELP_VERBS.values()]).split())
     for needle in ("`waiting` means the task is over to its assignee",
                    "a task that waits on nobody is a stall with a name missing",
                    "once its pickup moment has passed",

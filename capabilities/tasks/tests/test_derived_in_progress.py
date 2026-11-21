@@ -393,7 +393,7 @@ def test_a_running_raise_shows_its_model_and_turns_and_names_its_node(lab):
 # --- The contract --------------------------------------------------------------
 
 def test_help_states_the_derivation_and_the_one_lease_writer():
-    said = " ".join(mod.__doc__.split())
+    said = " ".join("\n".join([mod.__doc__, *mod.HELP_VERBS.values()]).split())
     for needle in ("`in_progress` is never stored, and no verb writes it.",
                    "Each raise has exactly one lease writer:",
                    "the turn's `run` writes nothing and reads the lease on the same beat",

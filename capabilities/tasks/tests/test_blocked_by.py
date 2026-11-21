@@ -80,7 +80,7 @@ def test_the_tables_declare_the_column():
 
 
 def test_the_help_states_the_field():
-    said = " ".join(mod.__doc__.split())
+    said = " ".join("\n".join([mod.__doc__, *mod.HELP_VERBS.values()]).split())
     for needle in ("--blocked-by TASK[,TASK...]",
                    "Clearable: objective, description, assignee, pickup, unique-key, "
                    "blocked-by",

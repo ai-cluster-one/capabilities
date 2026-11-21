@@ -140,7 +140,7 @@ def test_no_call_the_parser_admits_outgrows_one_statement(monkeypatch, capsys):
 
 
 def test_the_help_states_the_form():
-    said = " ".join(mod.__doc__.split())
+    said = " ".join("\n".join([mod.__doc__, *mod.HELP_VERBS.values()]).split())
     for needle in ("tasks meta set <task> <key> <value> [<key> <value>...]",
                    "every pair lands or none does",
                    "a key the call does not name is left as it was",

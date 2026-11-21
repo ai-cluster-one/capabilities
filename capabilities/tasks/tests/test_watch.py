@@ -43,9 +43,9 @@ OTHER = "prj_other"
 
 def test_the_help_documents_the_verb_every_line_and_the_exits():
     doc = mod.__doc__
-    reading = doc.split("READING")[1].split("WRITING")[0]
-    assert "tasks watch [--project ID | --all-projects]" in reading
-    watch = doc.split("\nWATCH\n")[1].split("\nCONTRACT\n")[0]
+    page = mod.HELP_VERBS["watch"]
+    assert "tasks watch [--project ID | --all-projects]" in page
+    watch = page.split("\nWATCH\n")[1].split("\nCONTRACT\n")[0]
     for shape in ('"event": "ready"', '"event": K, "task": ROW', '"event": "counts"',
                   '"event": "lost"', '"catch_up": true', '"event": "resync"'):
         assert shape in watch, shape
