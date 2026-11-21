@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """calcomc — Cal.com CLI over the Cal.com API v2: bookings, event types, slots,
@@ -12,160 +12,55 @@ of the API. Agent-invoked; every answer is JSON on stdout.
 
 USAGE
   calcomc <command> [options]     Run one verb against the selected connection.
-  calcomc help                    Print this contract.
 
 MODEL
-  calcomc talks to the Cal.com API v2 itself (https://api.cal.com/v2, Bearer
-  key); nothing else needs to be installed. Each named verb is one API call,
-  and its answer is Cal.com's own response body, passed through unchanged:
-  {"status": "success", "data": …} and, on `bookings list`, a "pagination"
-  object as well. Field names are Cal.com's (camelCase), never re-mapped.
+It talks to the Cal.com API v2 itself (https://api.cal.com/v2, Bearer key);
+nothing else needs to be installed. Each named verb is one API call, and its
+answer is Cal.com's own response body, passed through unchanged: {"status":
+"success", "data": …} and, on `bookings list`, a "pagination" object as well.
+Field names are Cal.com's (camelCase), never re-mapped.
 
-  Every request carries the cal-api-version header its endpoint documents,
-  because Cal.com silently serves a request without one as an older version
-  (2024-04-15) instead of refusing it. `api` sends no version header unless
-  --api-version names one.
+Every request carries the cal-api-version header its endpoint documents,
+because Cal.com silently serves a request without one as an older version
+(2024-04-15) instead of refusing it. `api` sends no version header unless
+asked for one (`calcomc help api`).
 
-  Which Cal.com account a command reaches is decided by the selected
-  connection alone: calcomc requires a resolved key and has no login of its
-  own and no ambient session to fall back to.
-
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one connection.
-  A connection is one Cal.com account: its API key (Settings → Developer → API keys),
-  optionally a self-hosted API base, optionally the account it is expected to resolve to.
-
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": { "secret_env": "CAL_API_KEY",
-                  "api_url": "https://api.cal.com",
-                  "expect_email": "<person@example.com>" }
-      }
-    }
-
-  Entry fields:
-    secret_env    REQUIRED — names the env var holding this connection's API key. The
-                  secret never sits in the registry; the key's VALUE resolves through
-                  the cascade below. A second account names its own var
-                  (e.g. "CALCOMC_<ID>_API_KEY").
-    api_url       optional — the API base for a self-hosted Cal.com, without the
-                  /v2 suffix. Default https://api.cal.com.
-    expect_email  optional — `doctor` asserts the key resolves to this account (email or
-                  username) and exits 7 on mismatch. The safety net against pasting one
-                  account's key under another's connection.
-
-  Writability is a grant, not part of the identity: `allow_write` resolves per project
-  from the grant, else calcomc's default, which is FALSE — a Cal.com write leaves the
-  system (a booking cancelled emails real attendees). Writing is granted deliberately,
-  per connection.
-
-  Selection: --connection <id> (accepted anywhere on the command line). Unflagged, the
-  registry's "default" pointer applies, else the sole entry; several entries without a
-  pointer is refused as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
-
-  The var named by secret_env resolves through the credential cascade (`Where a secret
-  resolves`, at the end of this help). There is deliberately no key flag — a secret
-  must not touch argv. A Cal.com API key is personal-account-scoped, so its home is
-  the user config; install scaffolds it there.
+Which Cal.com account a command reaches is decided by the selected connection
+alone: calcomc requires a resolved key and has no login of its own and no
+ambient session to fall back to. One connection is one Cal.com account; how
+it is declared, selected and granted writes is CONNECTIONS, on `calcomc help
+connections`.
 
 COMMANDS
-  Readiness
-    doctor [--connection <id>]
-        Per connection (every configured one bare; one with --connection): resolve its
-        key and call GET /v2/me. Emits {ok, connections: {<id>: {account: {id, email,
-        username, timeZone}, api_url}}}. Exit 0 all healthy / 2 key missing or
-        rejected / 5 unreachable / 7 key resolved to an account other than the
-        expected one.
-    connections
-        The resolution report — every connection, every value, its winning tier and
-        source, secrets masked. Local only: no network, no key use.
-
   Bookings
-    bookings list [--status S] [--after-start ISO] [--before-end ISO]
-                  [--attendee-email ADDR] [--attendee-name NAME]
-                  [--event-type-id ID] [--sort-start asc|desc]
-                  [--limit N] [--skip N] [--json]
-        Bookings of the account; --sort-start orders them by start time.
-        --status: upcoming | recurring | past | cancelled | unconfirmed, or several
-        comma-separated (upcoming,unconfirmed). --after-start / --before-end bound
-        the start and end time, ISO 8601 (2026-10-01 or 2026-10-01T09:00:00Z).
-        --limit is the page size (Cal.com's default 100), --skip the offset. The
-        answer carries Cal.com's "pagination" object (totalItems, remainingItems,
-        hasNextPage, …): read it, a full page is not the whole set.
-    bookings get <uid> [--json]
-        One booking by its uid. A recurring booking's own uid answers every
-        occurrence as an array.
-    bookings cancel <uid> [--reason TEXT] [--json]
-        WRITE. Cancel one booking; Cal.com notifies its attendees. A cancelled
-        booking stays cancelled, so repeating the call cancels nothing twice.
+  bookings list               the account's bookings, one page at a time
+  bookings get <uid>          one booking by its uid
+  bookings cancel <uid>       WRITE. cancel one booking; Cal.com notifies its attendees
 
   Scheduling
-    event-types list [--json]
-        The account's own event types, hidden ones included.
-    event-types get <id> [--json]
-        One event type by its numeric id.
-    slots available --event-type-id ID --start ISO --end ISO
-                    [--timezone TZ] [--duration MIN] [--json]
-        Bookable slots for an event type between --start and --end (ISO 8601; a
-        bare date means the start or end of that day). --timezone is an IANA name
-        (America/New_York), default UTC. data maps each date to its slots; an empty
-        object means nothing is free in the range.
-    schedules list [--json]
-        Availability schedules: name, timeZone, availability, overrides, isDefault.
-    schedules get <id> [--json]
-        One schedule by its numeric id.
-    calendars list [--json]
-        Connected calendars, each with the credentialId and the calendars' externalId
-        values that `calendars busy-times` takes, plus the destination calendar.
-    calendars busy-times --date-from YYYY-MM-DD --date-to YYYY-MM-DD --timezone TZ
-                         --credential-id ID --external-id ID [--json]
-        Busy blocks in one connected calendar, each with its start and end. Take
-        the two ids from `calendars list`.
+  event-types list            the account's own event types, hidden ones included
+  event-types get <id>        one event type by its numeric id
+  slots available             bookable slots for an event type in a time range
+  schedules list              the availability schedules
+  schedules get <id>          one schedule by its numeric id
+  calendars list              connected calendars, with the ids busy-times takes
+  calendars busy-times        busy blocks in one connected calendar
 
   Escape hatch
-    api <METHOD> <path> [--query KEY=VALUE ...] [--body JSON|-] [--api-version V]
-        Any Cal.com API v2 call the named verbs do not cover. <path> is relative to
-        /v2 (`/me`, `/event-types/123`; a leading /v2 is accepted too). --query
-        repeats; --body is a JSON object literal or `-` for stdin, sent only on a
-        method that is not GET. --api-version sets the cal-api-version header —
-        look up the value the endpoint documents
-        (https://cal.com/docs/api-reference/v2); without it Cal.com serves the
-        oldest version. METHOD is GET, POST, PUT, PATCH or DELETE. GET is a read;
-        every other method is a WRITE and is refused on a read-only connection.
-        A write is never retried after a timeout or a 5xx: the outcome is reported
-        as unknown (exit 5, outcome_unknown) and is checked with a read.
-
-  Every verb accepts --json for compatibility with earlier calls; output is JSON
-  with or without it.
-
-Contract commands (the same on every capability):
-  calcomc stub                                  One-line awareness text.
-  calcomc manifest --json                       Machine-readable declaration.
-  calcomc guide [<topic>]                       Guide topics / one guide body.
-  calcomc ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope.
-           [--note <text>]
-  calcomc refs                                  Menu of the project's reference files.
-  calcomc inventory [--network]                 What this capability holds in
-                                                this project (--network adds
-                                                remote detail).
+  api <METHOD> <path>         any Cal.com API v2 call the named verbs do not cover
 
 THE WRITE GATE
-  Writes are `bookings cancel` and `api` with any method but GET. On a connection
-  that does not allow writes they exit 4 before the key resolves or any request is
-  made. No flag and no env var lifts it: granting is `allow_write: true` on that
-  connection. Ask the user; never lift it yourself.
+Writes are `bookings cancel` and `api` with any method but GET. On a
+connection that does not allow writes they exit 4 before the key resolves or
+any request is made. No flag and no env var lifts it: granting is
+`allow_write: true` on that connection. Ask the user; never lift it yourself.
 
 QUIRKS WORTH KNOWING
-  Cal.com limits an API key to 120 requests a minute; calcomc backs off and retries
-  a 429 on its own and exits 5 rate_limited when retries run out.
-  Creating, rescheduling and editing (bookings, profile, schedules, event types,
-  selected calendars) have no named verb: use `api` with the endpoint's documented
-  method, path and cal-api-version.
+Cal.com limits an API key to 120 requests a minute; calcomc backs off and
+retries a 429 on its own and exits 5 rate_limited when retries run out.
+Creating, rescheduling and editing (bookings, profile, schedules, event types,
+selected calendars) have no named verb: use `api` with the endpoint's
+documented method, path and cal-api-version.
 
 EXIT CODES
   0 success · 2 auth (key missing or rejected) · 3 not found (404) · 4 policy refusal
@@ -175,15 +70,6 @@ EXIT CODES
   arguments, an unknown or ambiguous connection, a request Cal.com refused as
   invalid) · 7 wrong account (doctor: the key resolves to an account other than the
   expected one).
-
-EXAMPLES
-  calcomc doctor
-  calcomc bookings list --status upcoming --json
-  calcomc bookings list --status past --after-start 2026-09-01 --limit 20
-  calcomc slots available --event-type-id <ID> --start <ISO> --end <ISO> --timezone <TZ>
-  calcomc --connection <id> event-types list
-  calcomc bookings cancel <BOOKING_UID> --reason "<text>"
-  calcomc api GET /bookings/<BOOKING_UID>/recordings --api-version 2024-08-13
 """
 
 from __future__ import annotations
@@ -280,6 +166,280 @@ V_BOOKINGS = "2024-08-13"
 V_EVENT_TYPES = "2024-06-14"
 V_SLOTS = "2024-09-04"
 V_SCHEDULES = "2024-06-11"
+
+# The verb pages `calcomc help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor and connections follow. A text
+# several verbs own is one constant, added to each of their pages.
+_HELP_JSON = """
+  Every verb accepts --json for compatibility with earlier calls; output is JSON
+  with or without it.
+"""
+_HELP_WRITE_GATE = """
+  THE WRITE GATE
+  Writes are `bookings cancel` and `api` with any method but GET. On a connection
+  that does not allow writes they exit 4 before the key resolves or any request is
+  made. No flag and no env var lifts it: granting is `allow_write: true` on that
+  connection. Ask the user; never lift it yourself.
+"""
+_HELP_TAIL = """
+  Connection: --connection <id> (accepted anywhere on the command line) selects
+  it; unflagged, the registry's "default" pointer applies, else the sole entry
+  (`calcomc help connections`). Outside any project this verb is refused: only
+  connections and doctor read the machine's own connections there.
+
+  Output: Cal.com's own response body, passed through unchanged: {"status":
+  "success", "data": …}. Field names are Cal.com's (camelCase), never
+  re-mapped. Cal.com limits an API key to 120 requests a minute; calcomc backs
+  off and retries a 429 on its own and exits 5 rate_limited when retries run
+  out.
+
+  EXIT CODES
+  0 success · 2 auth (key missing or rejected) · 3 not found (404) · 4 policy refusal
+  — the project gate (store rows once the agent moved, else capabilities/settings.json) on any verb, or a write on a
+  read-only connection; ask the user, never lift a gate yourself · 5 server/network
+  (timeout, 5xx, 429 after retries, a write whose outcome is unknown) · 6 input (bad
+  arguments, an unknown or ambiguous connection, a request Cal.com refused as
+  invalid) · 7 wrong account (doctor: the key resolves to an account other than the
+  expected one).
+"""
+HELP_VERBS = {
+    "doctor": """\
+  doctor [--connection <id>]
+      Per connection (every configured one bare; one with --connection): resolve its
+      key and call GET /v2/me. Emits {ok, connections: {<id>: {account: {id, email,
+      username, timeZone}, api_url}}}. Exit 0 all healthy / 2 key missing or
+      rejected / 5 unreachable / 7 key resolved to an account other than the
+      expected one (the connection's expect_email). It takes no argument but
+      --connection (exit 6 invalid_arguments otherwise), and no --json. Outside
+      any project it is a machine read: it uses the machine's own connections
+      read-only, unless a grant switched one off.
+
+  Examples:
+    calcomc doctor
+    calcomc --connection <id> doctor
+""",
+    "connections": """\
+  connections
+      The resolution report — every connection, every value, its winning tier and
+      source, secrets masked. Local only: no network, no key use.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one connection.
+  A connection is one Cal.com account: its API key (Settings → Developer → API keys),
+  optionally a self-hosted API base, optionally the account it is expected to resolve to.
+
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "CAL_API_KEY",
+                  "api_url": "https://api.cal.com",
+                  "expect_email": "<person@example.com>" }
+      }
+    }
+
+  Entry fields:
+    secret_env    REQUIRED — names the env var holding this connection's API key. The
+                  secret never sits in the registry; the key's VALUE resolves through
+                  the cascade above. A second account names its own var
+                  (e.g. "CALCOMC_<ID>_API_KEY").
+    api_url       optional — the API base for a self-hosted Cal.com, without the
+                  /v2 suffix. Default https://api.cal.com.
+    expect_email  optional — `doctor` asserts the key resolves to this account (email or
+                  username) and exits 7 on mismatch. The safety net against pasting one
+                  account's key under another's connection.
+
+  Writability is a grant, not part of the identity: `allow_write` resolves per project
+  from the grant, else calcomc's default, which is FALSE — a Cal.com write leaves the
+  system (a booking cancelled emails real attendees). Writing is granted deliberately,
+  per connection.
+
+  Selection: --connection <id> (accepted anywhere on the command line). Unflagged, the
+  registry's "default" pointer applies, else the sole entry; several entries without a
+  pointer is refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  The var named by secret_env resolves through the credential cascade (`Where a secret
+  resolves`, above). There is deliberately no key flag — a secret
+  must not touch argv. A Cal.com API key is personal-account-scoped, so its home is
+  the user config; install scaffolds it there. A connection is written with
+  `calcomc connection add` (`calcomc help connection`).
+
+  Example: calcomc connections
+""",
+    "bookings list": """\
+calcomc bookings list [--status S] [--after-start ISO] [--before-end ISO]
+                      [--attendee-email ADDR] [--attendee-name NAME]
+                      [--event-type-id ID] [--sort-start asc|desc]
+                      [--limit N] [--skip N] [--json]
+
+  Bookings of the account; --sort-start orders them by start time.
+  --status: upcoming | recurring | past | cancelled | unconfirmed, or several
+  comma-separated (upcoming,unconfirmed). --after-start / --before-end bound
+  the start and end time, ISO 8601 (2026-10-01 or 2026-10-01T09:00:00Z).
+  --attendee-email and --attendee-name keep the bookings with that attendee,
+  --event-type-id those of one event type. --limit is the page size (Cal.com's
+  default 100), --skip the offset; both are whole numbers. The answer carries
+  Cal.com's "pagination" object (totalItems, remainingItems, hasNextPage, …):
+  read it, a full page is not the whole set. One GET /v2/bookings.
+
+  Exit codes: 0; 2 key missing or rejected; 4 policy; 5 server/network; 6 a
+  status, number or sort it does not take, or a connection it cannot select.
+
+  Examples:
+    calcomc bookings list --status upcoming --json
+    calcomc bookings list --status past --after-start 2026-09-01 --limit 20
+""" + _HELP_JSON + _HELP_TAIL,
+    "bookings get": """\
+calcomc bookings get <uid> [--json]
+
+  One booking by its uid. A recurring booking's own uid answers every
+  occurrence as an array. One GET /v2/bookings/<uid>.
+
+  Exit codes: 0; 2 key missing or rejected; 3 no booking with that uid; 4
+  policy; 5 server/network; 6 input.
+
+  Example: calcomc bookings get <BOOKING_UID>
+""" + _HELP_JSON + _HELP_TAIL,
+    "bookings cancel": """\
+calcomc bookings cancel <uid> [--reason TEXT] [--json]
+
+  WRITE. Cancel one booking; Cal.com notifies its attendees. --reason is the
+  cancellation reason Cal.com records with it. A cancelled booking stays
+  cancelled, so repeating the call cancels nothing twice. One POST
+  /v2/bookings/<uid>/cancel.
+
+  Exit codes: 0; 2 key missing or rejected; 3 no booking with that uid; 4
+  policy, or a connection that does not allow writes; 5 server/network; 6
+  input.
+
+  Example: calcomc bookings cancel <BOOKING_UID> --reason "<text>"
+""" + _HELP_WRITE_GATE + _HELP_JSON + _HELP_TAIL,
+    "event-types list": """\
+calcomc event-types list [--json]
+
+  The account's own event types, hidden ones included. One GET
+  /v2/event-types.
+
+  Exit codes: 0; 2 key missing or rejected; 4 policy; 5 server/network; 6
+  input.
+
+  Example: calcomc --connection <id> event-types list
+""" + _HELP_JSON + _HELP_TAIL,
+    "event-types get": """\
+calcomc event-types get <id> [--json]
+
+  One event type by its numeric id. One GET /v2/event-types/<id>.
+
+  Exit codes: 0; 2 key missing or rejected; 3 no event type with that id; 4
+  policy; 5 server/network; 6 an id that is not a whole number, or other
+  input.
+
+  Example: calcomc event-types get <ID>
+""" + _HELP_JSON + _HELP_TAIL,
+    "slots available": """\
+calcomc slots available --event-type-id ID --start ISO --end ISO
+                        [--timezone TZ] [--duration MIN] [--json]
+
+  Bookable slots for an event type between --start and --end (ISO 8601; a
+  bare date means the start or end of that day). --event-type-id, --start
+  and --end are required. --timezone is an IANA name (America/New_York),
+  default UTC. --duration MIN, a whole number of minutes, is passed to
+  Cal.com as the slot duration. data maps each date to its slots; an empty
+  object means nothing is free in the range. One GET /v2/slots.
+
+  Exit codes: 0; 2 key missing or rejected; 3 not found; 4 policy; 5
+  server/network; 6 a required option missing, or a request Cal.com refused
+  as invalid.
+
+  Example:
+    calcomc slots available --event-type-id <ID> --start <ISO> --end <ISO> --timezone <TZ>
+""" + _HELP_JSON + _HELP_TAIL,
+    "schedules list": """\
+calcomc schedules list [--json]
+
+  Availability schedules: name, timeZone, availability, overrides, isDefault.
+  One GET /v2/schedules.
+
+  Exit codes: 0; 2 key missing or rejected; 4 policy; 5 server/network; 6
+  input.
+
+  Example: calcomc schedules list
+""" + _HELP_JSON + _HELP_TAIL,
+    "schedules get": """\
+calcomc schedules get <id> [--json]
+
+  One schedule by its numeric id. One GET /v2/schedules/<id>.
+
+  Exit codes: 0; 2 key missing or rejected; 3 no schedule with that id; 4
+  policy; 5 server/network; 6 an id that is not a whole number, or other
+  input.
+
+  Example: calcomc schedules get <ID>
+""" + _HELP_JSON + _HELP_TAIL,
+    "calendars list": """\
+calcomc calendars list [--json]
+
+  Connected calendars, each with the credentialId and the calendars' externalId
+  values that `calendars busy-times` takes, plus the destination calendar.
+  One GET /v2/calendars.
+
+  Exit codes: 0; 2 key missing or rejected; 4 policy; 5 server/network; 6
+  input.
+
+  Example: calcomc calendars list
+""" + _HELP_JSON + _HELP_TAIL,
+    "calendars busy-times": """\
+calcomc calendars busy-times --date-from YYYY-MM-DD --date-to YYYY-MM-DD --timezone TZ
+                             --credential-id ID --external-id ID [--json]
+
+  Busy blocks in one connected calendar, each with its start and end. Take
+  the two ids from `calendars list`. Every option but --json is required;
+  --timezone is an IANA name. One GET /v2/calendars/busy-times.
+
+  Exit codes: 0; 2 key missing or rejected; 3 not found; 4 policy; 5
+  server/network; 6 a required option missing, or a request Cal.com refused
+  as invalid.
+
+  Example:
+    calcomc calendars busy-times --date-from 2026-10-01 --date-to 2026-10-07 --timezone UTC --credential-id <ID> --external-id <ID>
+""" + _HELP_JSON + _HELP_TAIL,
+    "api": """\
+calcomc api <METHOD> <path> [--query KEY=VALUE ...] [--body JSON|-] [--api-version V]
+
+  Any Cal.com API v2 call the named verbs do not cover. <path> is relative to
+  /v2 (`/me`, `/event-types/123`; a leading /v2 is accepted too). --query
+  repeats; --body is a JSON object literal or `-` for stdin, sent only on a
+  method that is not GET. --api-version sets the cal-api-version header —
+  look up the value the endpoint documents
+  (https://cal.com/docs/api-reference/v2); without it Cal.com serves the
+  oldest version: `api` sends no version header unless --api-version names
+  one. METHOD is GET, POST, PUT, PATCH or DELETE, in any case. GET is a read;
+  every other method is a WRITE and is refused on a read-only connection.
+  A write is never retried after a timeout or a 5xx: the outcome is reported
+  as unknown (exit 5, outcome_unknown) and is checked with a read. It takes
+  no --json.
+
+  Creating, rescheduling and editing (bookings, profile, schedules, event
+  types, selected calendars) have no named verb: use `api` with the
+  endpoint's documented method, path and cal-api-version.
+
+  Output: Cal.com's response body for the call, passed through unchanged.
+
+  Exit codes: 0; 2 key missing or rejected; 3 not found (404); 4 policy, or
+  a method but GET on a connection that does not allow writes; 5
+  server/network, outcome_unknown for a write that timed out or met a 5xx; 6
+  a METHOD it does not take, a --query that is not KEY=VALUE, --body on GET,
+  a --body that is not JSON (invalid_body), or a request Cal.com refused as
+  invalid.
+
+  Example: calcomc api GET /bookings/<BOOKING_UID>/recordings --api-version 2024-08-13
+""" + _HELP_WRITE_GATE + _HELP_TAIL,
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

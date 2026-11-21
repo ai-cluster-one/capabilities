@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "httpx>=0.27",
 #     "psycopg[binary]>=3.2",
 # ]
@@ -25,13 +25,17 @@ the project's .env.local / .env, then the process environment, then the
 machine's store setting written by `capabilities store set`). Without a store
 every verb but the contract's own exits 6 `store_not_configured`.
 
+Only the file verbs need a file store connection, an S3-compatible bucket:
+what it holds, how it is declared and selected, and how it is used without
+one is THE FILE STORE CONNECTION, on `assets help connection`.
+
 ADDRESSING
   A document is named by its path under the project's assets/ folder without
   `.md`: `plans/2026-10-20_rollout` is assets/plans/2026-10-20_rollout.md. The
   top folder gives the kind: plans -> plan, research -> research, sessions ->
   session, meetings -> meeting, journal -> journal, digests -> digest,
   reports -> report; any other folder, or none, -> note. A name is one or more
-  `/`-separated segments, none empty, `.` or `..`, with no backslash or
+  segments separated by `/`, none empty, `.` or `..`, with no backslash or
   control character, and it does not end in `.md`.
   The body is stored byte for byte as UTF-8 text, so `export` writes back
   exactly the file that was saved. A version's title is the body's first
@@ -42,178 +46,34 @@ ADDRESSING
   `research/x/crash.ips` is assets/research/x/crash.ips. The segments follow
   the document rule, and a name ending in `.md` is a document's, not a file's.
 
-THE FILE STORE CONNECTION
-  Only the file verbs need it: without one every documents verb works as it
-  does with one, `import` lists every file that is not markdown as skipped
-  with the reason, `export` writes the documents and lists the files it could
-  not fetch, and `doctor` proves the store alone. A connection is any
-  S3-compatible bucket (Cloudflare R2, AWS S3, Backblaze B2, MinIO and the
-  like), addressed path-style (<endpoint>/<bucket>/<key>) and signed with AWS
-  Signature Version 4. Declare one with `assets connection add <id>`; its
-  entry, kept where `capabilities` keeps the project's connections, holds:
-    endpoint               the store's S3 API URL, e.g.
-                           https://<account>.r2.cloudflarestorage.com
-    region                 the region requests are signed for: auto for R2,
-                           the bucket's region for AWS S3, us-east-1 for most
-                           others
-    bucket                 the bucket, e.g. example-bucket
-    access_key_id_env      the env key holding the access key id
-    secret_access_key_env  the env key holding the secret access key
-  The two keys never sit in the entry and have no flag: each resolves through
-  the credential cascade (`Where a secret resolves`, at the end of this help).
-  `connection add` takes them on stdin as ASSETS_<ID>_ACCESS_KEY_ID and
-  ASSETS_<ID>_SECRET_ACCESS_KEY and stores them as that section says;
-  keys already set elsewhere are named instead, with --env
-  access_key_id_env=<KEY> --env secret_access_key_env=<KEY>, and nothing is
-  copied.
-  A file of the project is the object <project id>/<file id>/<name> in the
-  bucket; its record carries its size and sha256, and every read checks both.
-  Selection: --connection <id> on the verbs that reach the bucket; unflagged,
-  the default pointer, else the sole connection. Writing to the bucket is a
-  write: a connection whose allow_write is false refuses `files add`,
-  `files link`, `files rm` and an `import` that has files to keep with exit 4
-  `read_only`.
-
 READING
-  assets list
-      Every unretired document of this project, by name: its kind, the active
-      version's id and title, and when the document was created and last saved.
-  assets show <name> [--version ID]
-      One document and its active version with the body whole, and under
-      `files` the names of the unretired files that belong to it; --version
-      answers any version of the document, a retired one's included.
-  assets history <name>
-      Every version of the document, newest first: id, title, whether it is
-      active, who saved it, when, its note and its size. No bodies.
-  assets diff <name> [A] [B]
-      A unified diff between two versions of the document, in `diff`. Bare,
-      the version before the active one against the active one; with A, A
-      against the active one; with A and B, A against B. A document with one
-      version is diffed against nothing (`from` is null).
-  assets search <terms> [--limit N]
-      Full-text search over the active versions of this project's unretired
-      documents: PostgreSQL full text in the `simple` configuration (no
-      stemming, any language; quoted phrases, `or` and `-` exclusion work as
-      in a web search) over title and body, best match first, each with a
-      headline of the matching text. --limit defaults to 20; `matched` says
-      how many matched in all.
+  assets list                     every unretired document of this project
+  assets show <name>              one document, a version's body whole, its files
+  assets history <name>           every version of a document, newest first
+  assets diff <name> [A] [B]      a unified diff between two of its versions
+  assets search <terms>           full-text search over the active versions
 
 WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
-  assets save <name> --from FILE|- [--base ID] [--note TEXT]
-      Save FILE (`-` reads stdin) as the document's new active version, in one
-      transaction that clears `active` on the version it replaces. A new name
-      creates the document. --base names the version the writer read: when it
-      is no longer the active version, because another save came first, the
-      save is refused with exit 7 `stale_base`, naming the active version, and
-      nothing changes. Without --base the save replaces whatever version is
-      active when it runs. --note says why it changed. Safe to repeat: a body
-      identical to the active version's saves nothing and answers
-      `"created": false`.
-  assets retire <name>
-      Retire the document: it leaves list, search and export, its versions stay
-      readable through `show --version`, and its name is free for a new
-      document. Not idempotent: a repeat finds no unretired document (exit 3).
-  assets import [DIR] [--connection ID]
-      Read an agent's assets folder (DIR, default the project's assets/) into
-      the store: every `.md` file becomes the document its path names, saved
-      as `save` saves it, in one transaction; with a file store connection
-      every other file is kept as `files add` keeps it, its bytes put in the
-      bucket before that transaction and its record written in it. Without a
-      connection, every file that is not markdown is listed under `skipped`
-      with the reason, as is a markdown file that is not UTF-8 text or a path
-      no name can carry; `.DS_Store` and `.gitkeep` are always skipped. Each outcome is reported: a document `created`,
-      `saved` (a new version) or `unchanged`; a file `created`, `replaced` (a
-      new record, the old one retired) or `unchanged` (the same sha256), with
-      the document it belongs to: the one document that links to it by a
-      relative path, else the one document in its folder, else the document
-      its folder is named after, else none. Safe to repeat.
-  assets files add <name> --from FILE|- [--document NAME] [--connection ID]
-      Keep FILE (`-` reads stdin) as the file <name>: its bytes are put in the
-      bucket under a new key and its record written, retiring the record of
-      the file it replaces. --document names the document it belongs to.
-      Safe to repeat: bytes identical to the current file's put nothing and
-      answer `"outcome": "unchanged"`, the record and its document as they
-      were. A single put carries at most 5 GiB.
-  assets files link <name> (--document NAME | --none) [--connection ID]
-      Set the document the file belongs to, or with --none clear it. Recorded
-      as any change to a file is: its bytes are copied in the bucket to a new
-      key and a new record is written, retiring the current one, the bytes
-      checked against their record on the way. Answers `linked`, `unlinked`,
-      or `unchanged` - already so, nothing read or written - with the record
-      it `replaced`.
-  assets files rm <name> [--yes] [--connection ID]
-      Delete the file: the object of every record the name has had, the
-      current one and those it replaced, is deleted from the bucket, then the
-      current record is retired, so the name leaves `files list`, export and
-      its document's `files`, and is free for a new file. The records stay,
-      retired, saying what was kept and when; no bytes do. Asks on the
-      terminal before deleting; without a terminal it is refused (exit 6
-      `confirmation_required`) unless --yes. Answers `removed` with the
-      record it `retired` and the storage keys it `deleted`. Not idempotent:
-      a repeat finds no unretired file (exit 3).
+  assets save <name>              a file or stdin as the document's new version
+  assets retire <name>            retire a document; its versions stay readable
+  assets import [DIR]             an assets folder into the store and the bucket
+  assets files add <name>         keep a file: its bytes in the bucket
+  assets files link <name>        set or clear the document a file belongs to
+  assets files rm <name>          delete a file's bytes, retire its record
 
 FILES  (reading; `files list` reads the store only)
-  assets files list
-      Every unretired file of this project, by name: media type, size,
-      sha256, storage key, the document it belongs to, who kept it and when.
-  assets files log [<name>] [--limit N]
-      The log of writes to this project's file records, newest first (at most
-      N, default 100), or only those of the file <name>, a removed one's
-      included: each `created` or `replaced` (files add, import), `linked` or
-      `unlinked` (files link) or `removed` (files rm), with the record it
-      wrote or retired - its name, size, sha256 and document - and who did it
-      and when. An `unchanged` answer writes nothing and logs nothing. The
-      log starts when the store's assets tables reached schema 1.2, and holds
-      only the writes of an `assets` that has this verb: an older `assets`
-      still writes to a store at 1.2, and its writes are not in the log.
-  assets files get <name> --out PATH|- [--connection ID]
-      Fetch the file from the bucket, check its size and sha256 against its
-      record, and write it to PATH (`-` writes the bytes alone to stdout, with
-      no JSON). A mismatch writes nothing and exits 8. A PATH that already
-      holds those bytes is `unchanged`; one holding anything else is refused
-      (exit 6 `output_exists`) and left as it is.
+  assets files list               every unretired file of this project
+  assets files log [<name>]       the log of writes to the file records
+  assets files get <name>         fetch a file, checked against its record
 
 EXPORT  (writes no store record and puts nothing in the bucket, so it runs
   under the read-only switch)
-  assets export [DIR] [--connection ID]
-      Write the active version of every unretired document to DIR (default the
-      project's assets/) as <DIR>/<name>.md, and every unretired file to
-      <DIR>/<name>, byte for byte, each file's size and sha256 checked before
-      it is written. A path already holding those bytes is `unchanged`; one
-      holding anything else is `kept` and left as it is (save it, or move it
-      away, then export again), and `complete` is false. Without a connection
-      a file is `skipped` with the reason and `complete` is false. Paths the
-      store does not hold are left alone.
-
-CONTRACT
-  assets doctor [--connection ID]
-      Proves the store: the setting in force (secrets redacted), whether the
-      tables are current, the project id and how many documents it holds; and
-      with a file store connection, each connection's bucket (or the one
-      named) by a put, head and delete of one throwaway object under the
-      project's prefix - by an authenticated listing where the connection may
-      not be written, under the read-only switch, or without a project id. A
-      connection this project may not use is named `connection_not_granted`
-      with the grant it needs, and fails nothing. Without a connection
-      `connections` is {} and the store alone decides.
-  assets migrate [status]
-      Apply pending steps to the assets_* tables / report where they stand.
-  assets connections
-      Where each file store connection's values resolve from, secrets masked;
-      exit 6 `connections_required` when the project declares none.
-  assets connection add|remove <id> [--project|--global] [--default]
-      [--replace] [--field KEY=VALUE ...] [--stdin]   (also --machine)
-      Write or remove a file store connection from its declared fields; the
-      two keys only in the JSON object on stdin.
-  assets stub | assets manifest --json | assets help
-  assets guide [topic]          how-to guides: authoring
-  assets ids list|get|set|rm    the project identifiers envelope
-  assets refs                   the project's reference menu
-  assets inventory              empty: what assets holds is the store's
+  assets export [DIR]             every document and file, out to a folder
 
 I/O CONTRACT
-  Success is JSON on stdout (`files get --out -` writes the file's bytes
-  instead); failure is {"error": {"code", "message", "hint"?}} on stderr.
+  Success is JSON on stdout (`files get` asked to write to stdout writes the
+  file's bytes instead); failure is {"error": {"code", "message", "hint"?}}
+  on stderr.
 
 EXIT CODES
   0 success
@@ -226,9 +86,9 @@ EXIT CODES
   6 input: a malformed name or version, a body that is not UTF-8 text, no
     project, no store configured, no file store connection
     (`connections_required`), an incomplete connection, `files rm` without a
-    terminal or --yes (`confirmation_required`)
-  7 stale_base: the version --base names is no longer the active one, or
-    another write of the same name came first
+    terminal or a yes given up front (`confirmation_required`)
+  7 stale_base: the version a save names as its base is no longer the active
+    one, or another write of the same name came first
   8 the bucket does not hold what the record says: `object_missing`, or
     `sha256_mismatch` when the bytes it returns differ in size or sha256
 """
@@ -307,6 +167,423 @@ CONN_FIELDS: list[dict] = [
      "help": "The S3 secret access key.", "type": "string", "secret": True,
      "required": True, "env": "ASSETS_{ID}_SECRET_ACCESS_KEY"},
 ]
+
+# The verb pages `assets help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which an entry here for doctor, connections, connection, migrate
+# or inventory follows. A text several verbs share is one constant.
+_HELP_NAME = """
+  <name> is a document's name, as ADDRESSING, on `assets help`, says.
+"""
+_HELP_FILE_NAME = """
+  <name> is a file's whole path under assets/, extension included, as
+  ADDRESSING, on `assets help`, says.
+"""
+_HELP_VERSION = """
+  A version ID is the whole id or its first 6 or more characters, as
+  `history` shows it, resolved among the document's own versions.
+"""
+_HELP_SELECT = """
+  --connection ID       the file store connection to reach the bucket through;
+                        unflagged, the default pointer, else the sole
+                        connection (THE FILE STORE CONNECTION, on `assets help
+                        connection`)
+"""
+_HELP_READ_ONLY = """
+  A write: exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY.
+"""
+_HELP_BUCKET_WRITE = """
+  Writing to the bucket is a write: a connection whose allow_write is false
+  refuses it with exit 4 `read_only`.
+"""
+_HELP_BUCKET_EXITS = """
+  2 the file store refused the connection's keys, or a key is unset; 3 no
+  such bucket; 4 a connection not granted here; 5 the file store cannot be
+  reached; 6 `connections_required` with no file store connection, or an
+  incomplete connection
+"""
+HELP_VERBS = {
+    "list": """\
+assets list
+
+  Every unretired document of this project, by name: its kind, the active
+  version's id and title, and when the document was created and last saved.
+  Takes no argument.
+
+  Output: {project, count, documents}; each document {name, kind, title,
+  version, created_at, saved_at}.
+  Exit codes: 0; 4 policy; 5 the store cannot be reached; 6 no project, no
+  store configured.
+
+  Example: assets list
+""",
+    "show": """\
+assets show <name> [--version ID]
+""" + _HELP_NAME + """
+  One document and its active version with the body whole, and under
+  `files` the names of the unretired files that belong to it; --version
+  answers any version of the document, a retired one's included.
+""" + _HELP_VERSION + """
+  --version ID          that version instead of the active one
+
+  Output: {document, version, files}: the document {id, name, kind,
+  created_at, created_by, retired_at}, the version {id, short, title, active,
+  created_at, created_by, note, bytes, body}, and the names of its files.
+  Exit codes: 0; 3 no unretired document of that name, no such version; 5
+  store; 6 a malformed name or version (`bad_name`, `bad_version`), a version
+  prefix that names more than one (`ambiguous_version`), no project.
+
+  Example: assets show plans/2026-10-20_rollout --version 3f2a9c
+""",
+    "history": """\
+assets history <name>
+""" + _HELP_NAME + """
+  Every version of the document, newest first: id, title, whether it is
+  active, who saved it, when, its note and its size. No bodies.
+
+  Output: {document, count, versions}; each version {id, short, title,
+  active, created_at, created_by, note, bytes}.
+  Exit codes: 0; 3 no unretired document of that name; 5 store; 6 a
+  malformed name, no project.
+
+  Example: assets history plans/2026-10-20_rollout
+""",
+    "diff": """\
+assets diff <name> [A] [B]
+""" + _HELP_NAME + """
+  A unified diff between two versions of the document, in `diff`. Bare,
+  the version before the active one against the active one; with A, A
+  against the active one; with A and B, A against B. A document with one
+  version is diffed against nothing (`from` is null).
+""" + _HELP_VERSION + """
+  Output: {name, from, to, changed, diff}: `from` and `to` are the two
+  versions as `history` shows them, `changed` whether body or title differ.
+  Exit codes: 0; 3 no unretired document of that name, no such version; 5
+  store; 6 a malformed name or version, an ambiguous version prefix.
+
+  Example: assets diff plans/2026-10-20_rollout 3f2a9c
+""",
+    "search": """\
+assets search <terms> [--limit N]
+
+  Full-text search over the active versions of this project's unretired
+  documents: PostgreSQL full text in the `simple` configuration (no
+  stemming, any language; quoted phrases, `or` and `-` exclusion work as
+  in a web search) over title and body, best match first, each with a
+  headline of the matching text. --limit defaults to 20; `matched` says
+  how many matched in all.
+
+  --limit N             at most N results, a whole number of 1 or more
+
+  Output: {terms, matched, count, results}; each result {name, kind, title,
+  version, saved_at, rank, headline}.
+  Exit codes: 0; 5 store; 6 empty terms, a --limit that is not a positive
+  whole number, no project.
+
+  Example: assets search '"rollout plan" -draft' --limit 5
+""",
+    "save": """\
+assets save <name> --from FILE|- [--base ID] [--note TEXT]
+""" + _HELP_NAME + """
+  Save FILE (`-` reads stdin) as the document's new active version, in one
+  transaction that clears `active` on the version it replaces. A new name
+  creates the document. --base names the version the writer read: when it
+  is no longer the active version, because another save came first, the
+  save is refused with exit 7 `stale_base`, naming the active version, and
+  nothing changes. Without --base the save replaces whatever version is
+  active when it runs. --note says why it changed. Safe to repeat: a body
+  identical to the active version's saves nothing and answers
+  `"created": false`.
+
+  --from FILE|-         the body, from FILE or from stdin; required
+  --base ID             the version the writer read, as `history` shows it
+  --note TEXT           why it changed; not empty
+""" + _HELP_READ_ONLY + """
+  Output: {document, version, created, document_created, replaced}: the
+  version saved (or the active one, when nothing was saved), whether a
+  version and the document were created, and the id of the version it
+  replaced.
+  Exit codes: 0; 3 no FILE; 4 the read-only switch; 5 store; 6 a malformed
+  name or version, a body that is not UTF-8 text, an empty note, no project;
+  7 stale_base: the version --base names is no longer the active one, or
+  another write of the same name came first.
+
+  Example: assets save plans/2026-10-20_rollout --from plan.md --base 3f2a9c --note "dates moved"
+""",
+    "retire": """\
+assets retire <name>
+""" + _HELP_NAME + """
+  Retire the document: it leaves list, search and export, its versions stay
+  readable through `show --version`, and its name is free for a new
+  document. Not idempotent: a repeat finds no unretired document (exit 3).
+""" + _HELP_READ_ONLY + """
+  Output: {retired}: the document as it now stands, `retired_at` set.
+  Exit codes: 0; 3 no unretired document of that name; 4 the read-only
+  switch; 5 store; 6 a malformed name, no project.
+
+  Example: assets retire plans/2026-10-20_rollout
+""",
+    "import": """\
+assets import [DIR] [--connection ID]
+
+  Read an agent's assets folder (DIR, default the project's assets/) into
+  the store: every `.md` file becomes the document its path names, saved
+  as `save` saves it, in one transaction; with a file store connection
+  every other file is kept as `files add` keeps it, its bytes put in the
+  bucket before that transaction and its record written in it. Without a
+  connection, every file that is not markdown is listed under `skipped`
+  with the reason, as is a markdown file that is not UTF-8 text or a path
+  no name can carry; `.DS_Store` and `.gitkeep` are always skipped. Each
+  outcome is reported: a document `created`, `saved` (a new version) or
+  `unchanged`; a file `created`, `replaced` (a new record, the old one
+  retired) or `unchanged` (the same sha256), with the document it belongs
+  to: the one document that links to it by a relative path, else the one
+  document in its folder, else the document its folder is named after,
+  else none. Safe to repeat.
+""" + _HELP_SELECT + _HELP_READ_ONLY + """
+  An import that has files to keep writes to the bucket, and that is a
+  write: a connection whose allow_write is false refuses it with exit 4
+  `read_only`.
+
+  Output: {dir, project, documents, files, skipped, counts, file_counts,
+  file_store}: each document {path, name, kind, outcome, version}, each file
+  {path, name, outcome, id, bytes, sha256, document, replaced}, each skipped
+  path with its reason; `counts` {created, saved, unchanged, skipped},
+  `file_counts` {created, replaced, unchanged}, and the connection used.
+  Exit codes: 0; 3 no DIR; 4 the read-only switch, a connection without
+  allow_write; 5 the store or the file store; 7 another write came first;
+  and the file store's own:
+""" + _HELP_BUCKET_EXITS + """
+  Example: assets import --connection files
+""",
+    "export": """\
+assets export [DIR] [--connection ID]
+
+  Writes no store record and puts nothing in the bucket, so it runs under
+  the read-only switch.
+
+  Write the active version of every unretired document to DIR (default the
+  project's assets/) as <DIR>/<name>.md, and every unretired file to
+  <DIR>/<name>, byte for byte, each file's size and sha256 checked before
+  it is written. A path already holding those bytes is `unchanged`; one
+  holding anything else is `kept` and left as it is (save it, or move it
+  away, then export again), and `complete` is false. Without a connection
+  a file is `skipped` with the reason and `complete` is false. Paths the
+  store does not hold are left alone.
+""" + _HELP_SELECT + """
+  Output: {dir, project, documents, counts, files, file_counts, complete}:
+  each document and file {name, path, outcome, reason?}, `counts` {written,
+  unchanged, kept, failed}, `file_counts` {written, unchanged, kept, skipped,
+  failed}.
+  Exit codes: 0, `complete` saying whether everything was written; 6 DIR is
+  not a folder, or a path could not be written; 8 a file the bucket does
+  not hold as its record says (the answer is printed first); and the file
+  store's own:
+""" + _HELP_BUCKET_EXITS + """
+  Example: assets export /tmp/assets-copy
+""",
+    "files add": """\
+assets files add <name> --from FILE|- [--document NAME] [--connection ID]
+""" + _HELP_FILE_NAME + """
+  Keep FILE (`-` reads stdin) as the file <name>: its bytes are put in the
+  bucket under a new key and its record written, retiring the record of
+  the file it replaces. --document names the document it belongs to.
+  Safe to repeat: bytes identical to the current file's put nothing and
+  answer `"outcome": "unchanged"`, the record and its document as they
+  were. A single put carries at most 5 GiB.
+
+  --from FILE|-         the bytes, from FILE or from stdin; required
+  --document NAME       the document it belongs to
+""" + _HELP_SELECT + _HELP_READ_ONLY + _HELP_BUCKET_WRITE + """
+  Output: {file, outcome, replaced, file_store}: the file {id, name,
+  media_type, bytes, sha256, storage_key, document, document_id, created_at,
+  created_by, retired_at}, `created`, `replaced` or `unchanged`, the record
+  it replaced, and the connection used.
+  Exit codes: 0; 3 no FILE, no unretired document NAME; 4 the read-only
+  switch, a connection without allow_write; 6 a malformed name, more than
+  one put carries (`too_large`); 7 another write of the same name came
+  first; and the file store's own:
+""" + _HELP_BUCKET_EXITS + """
+  Example: assets files add research/x/crash.ips --from ./crash.ips --document research/x
+""",
+    "files link": """\
+assets files link <name> (--document NAME | --none) [--connection ID]
+""" + _HELP_FILE_NAME + """
+  Set the document the file belongs to, or with --none clear it. Recorded
+  as any change to a file is: its bytes are copied in the bucket to a new
+  key and a new record is written, retiring the current one, the bytes
+  checked against their record on the way. Answers `linked`, `unlinked`,
+  or `unchanged` - already so, nothing read or written - with the record
+  it `replaced`.
+
+  --document NAME       the document it belongs to from now on
+  --none                it belongs to no document; one of the two is required
+""" + _HELP_SELECT + _HELP_READ_ONLY + _HELP_BUCKET_WRITE + """
+  Output: {file, outcome, replaced, file_store}, the file as `files add`
+  answers it.
+  Exit codes: 0; 3 no unretired file of that name, no unretired document
+  NAME; 4 the read-only switch, a connection without allow_write; 6 a
+  malformed name; 7 another write of the same name came first; 8 the bucket
+  does not hold what the record says; and the file store's own:
+""" + _HELP_BUCKET_EXITS + """
+  Example: assets files link research/x/crash.ips --document research/x
+""",
+    "files rm": """\
+assets files rm <name> [--yes] [--connection ID]
+""" + _HELP_FILE_NAME + """
+  Delete the file: the object of every record the name has had, the
+  current one and those it replaced, is deleted from the bucket, then the
+  current record is retired, so the name leaves `files list`, export and
+  its document's `files`, and is free for a new file. The records stay,
+  retired, saying what was kept and when; no bytes do. Asks on the
+  terminal before deleting; without a terminal it is refused (exit 6
+  `confirmation_required`) unless --yes. Answers `removed` with the
+  record it `retired` and the storage keys it `deleted`. Not idempotent:
+  a repeat finds no unretired file (exit 3).
+
+  --yes                 delete without asking on the terminal
+""" + _HELP_SELECT + _HELP_READ_ONLY + _HELP_BUCKET_WRITE + """
+  Output: {file, outcome, retired, deleted, file_store}, the file as `files
+  add` answers it, now retired.
+  Exit codes: 0; 3 no unretired file of that name; 4 the read-only switch, a
+  connection without allow_write; 6 a malformed name, no terminal and no
+  --yes (`confirmation_required`), a no on the terminal (`not_confirmed`);
+  7 another write of the same name came first; and the file store's own:
+""" + _HELP_BUCKET_EXITS + """
+  Example: assets files rm research/x/crash.ips --yes
+""",
+    "files list": """\
+assets files list
+
+  Reads the store only. Every unretired file of this project, by name:
+  media type, size, sha256, storage key, the document it belongs to, who
+  kept it and when. Takes no argument.
+
+  Output: {project, count, files}, each file as `files add` answers it.
+  Exit codes: 0; 5 store; 6 no project, no store configured.
+
+  Example: assets files list
+""",
+    "files log": """\
+assets files log [<name>] [--limit N]
+
+  The log of writes to this project's file records, newest first (at most
+  N, default 100), or only those of the file <name>, a removed one's
+  included: each `created` or `replaced` (files add, import), `linked` or
+  `unlinked` (files link) or `removed` (files rm), with the record it
+  wrote or retired - its name, size, sha256 and document - and who did it
+  and when. An `unchanged` answer writes nothing and logs nothing. The
+  log starts when the store's assets tables reached schema 1.2, and holds
+  only the writes of an `assets` that has this verb: an older `assets`
+  still writes to a store at 1.2, and its writes are not in the log.
+""" + _HELP_FILE_NAME + """
+  --limit N             at most N entries, a whole number of 1 or more
+
+  Output: {project, name, count, operations}; each operation {id, operation,
+  name, file, bytes, sha256, document, at, by}.
+  Exit codes: 0; 5 store; 6 a malformed name or --limit, no project.
+
+  Example: assets files log research/x/crash.ips --limit 10
+""",
+    "files get": """\
+assets files get <name> --out PATH|- [--connection ID]
+""" + _HELP_FILE_NAME + """
+  Fetch the file from the bucket, check its size and sha256 against its
+  record, and write it to PATH (`-` writes the bytes alone to stdout, with
+  no JSON). A mismatch writes nothing and exits 8. A PATH that already
+  holds those bytes is `unchanged`; one holding anything else is refused
+  (exit 6 `output_exists`) and left as it is.
+
+  --out PATH|-          where to write it; required. `files get --out -`
+                        writes the file's bytes on stdout instead of JSON
+""" + _HELP_SELECT + """
+  Output: {file, path, outcome}: the file as `files add` answers it, and
+  `written` or `unchanged`; with --out - the bytes alone.
+  Exit codes: 0; 3 no unretired file of that name; 6 a malformed name,
+  `output_exists`, a PATH that cannot be written; 8 the bucket does not hold
+  what the record says: `object_missing`, or `sha256_mismatch`; and the file
+  store's own:
+""" + _HELP_BUCKET_EXITS + """
+  Example: assets files get research/x/crash.ips --out ./crash.ips
+""",
+    "doctor": """\
+For assets:
+  Proves the store: the setting in force (secrets redacted), whether the
+  tables are current, the project id and how many documents it holds; and
+  with a file store connection, each connection's bucket (or the one
+  named) by a put, head and delete of one throwaway object under the
+  project's prefix - by an authenticated listing where the connection may
+  not be written, under the read-only switch, or without a project id. A
+  connection this project may not use is named `connection_not_granted`
+  with the grant it needs, and fails nothing. Without a connection
+  `connections` is {} and the store alone decides.
+
+  Output: {ok, project, store, connections}. Exit 6 also for a project with
+  no durable id, no store configured, or tables this version cannot read.
+
+  Example: assets doctor --connection files
+""",
+    "connections": """\
+For assets:
+  Where each file store connection's values resolve from, secrets masked;
+  exit 6 `connections_required` when the project declares none.
+
+  Example: assets connections
+""",
+    "connection": """\
+For assets:
+  assets connection add|remove <id> [--project|--global] [--default]
+      [--replace] [--field KEY=VALUE ...] [--stdin]   (also --machine)
+      Write or remove a file store connection from its declared fields; the
+      two keys only in the JSON object on stdin.
+
+THE FILE STORE CONNECTION
+  Only the file verbs need it: without one every documents verb works as it
+  does with one, `import` lists every file that is not markdown as skipped
+  with the reason, `export` writes the documents and lists the files it could
+  not fetch, and `doctor` proves the store alone. A connection is any
+  S3-compatible bucket (Cloudflare R2, AWS S3, Backblaze B2, MinIO and the
+  like), addressed path-style (<endpoint>/<bucket>/<key>) and signed with AWS
+  Signature Version 4. Declare one with `assets connection add <id>`; its
+  entry, kept where `capabilities` keeps the project's connections, holds:
+    endpoint               the store's S3 API URL, e.g.
+                           https://<account>.r2.cloudflarestorage.com
+    region                 the region requests are signed for: auto for R2,
+                           the bucket's region for AWS S3, us-east-1 for most
+                           others
+    bucket                 the bucket, e.g. example-bucket
+    access_key_id_env      the env key holding the access key id
+    secret_access_key_env  the env key holding the secret access key
+  The two keys never sit in the entry and have no flag: each resolves through
+  the credential cascade (`Where a secret resolves`, above on this page).
+  `connection add` takes them on stdin as ASSETS_<ID>_ACCESS_KEY_ID and
+  ASSETS_<ID>_SECRET_ACCESS_KEY and stores them as that section says;
+  keys already set elsewhere are named instead, with --env
+  access_key_id_env=<KEY> --env secret_access_key_env=<KEY>, and nothing is
+  copied.
+  A file of the project is the object <project id>/<file id>/<name> in the
+  bucket; its record carries its size and sha256, and every read checks both.
+  Selection: --connection <id> on the verbs that reach the bucket; unflagged,
+  the default pointer, else the sole connection. Writing to the bucket is a
+  write: a connection whose allow_write is false refuses `files add`,
+  `files link`, `files rm` and an `import` that has files to keep with exit 4
+  `read_only`.
+
+  Example: echo '{"access_key_id_env": "...", "secret_access_key_env": "..."}' | assets connection add files --field endpoint=https://<account>.r2.cloudflarestorage.com --field region=auto --field bucket=example-bucket --stdin
+""",
+    "migrate": """\
+For assets:
+  Apply pending steps to the assets_* tables / report where they stand.
+
+  Example: assets migrate status
+""",
+    "inventory": """\
+For assets:
+  Empty: what assets holds is the store's; reading it is `assets list` and
+  `assets files list`.
+""",
+}
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"

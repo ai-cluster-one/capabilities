@@ -79,7 +79,7 @@
       "level": 0,
       "lucide_icon": "layout-template",
       "path": "capabilities/agenttemplates",
-      "payload_sha256": "345b1e8f16177ee88e4558dad3a6e40570181f0703fe9cd28694531230089f5a",
+      "payload_sha256": "17b8f3623356737fa35186a21db44563e70cb0a57c4a8650c678e9b7f4a85f46",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "The agent templates a new agent is made from - the starter context files and each agent template (its manifest, icon, context, routines) - carried as files in this capability's bundle; list them and show one, and the manager's `templates` and `init --template` read them from here.",
@@ -95,7 +95,7 @@
           "title": "Шаблоны агентов"
         }
       },
-      "version": "2026-11-16 — `agenttemplates` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-21 — `agenttemplates help` is the menu, and `agenttemplates help <verb>` one verb's whole contract"
     },
     "asana": {
       "executable": [
@@ -109,7 +109,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/asana",
-      "payload_sha256": "e15af78329a97fc68e76e552edfeed99da95b4d1a67395b3d02700ba10f4424a",
+      "payload_sha256": "9d2d993db9100b2ab2c0b7d8a0b0300c51e04e5e854006ac843f0839549c9733",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Asana CLI over the REST API — read/create/comment-on tasks and subtasks, @mention, manage tags, board sections, dependencies, and the API-only machine-state field.",
@@ -125,7 +125,7 @@
           "title": "Asana"
         }
       },
-      "version": "2026-11-16 — `asana` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-21 — `asana help` is the menu, and every verb answers `asana help <verb>` with its whole contract"
     },
     "askproject": {
       "executable": [
@@ -150,7 +150,7 @@
       "level": 0,
       "lucide_icon": "message-circle-question-mark",
       "path": "capabilities/askproject",
-      "payload_sha256": "756f33a75436c23848c317867b2e54f2a360048f73c3b0693b4fee442ced9b3a",
+      "payload_sha256": "8a2bb854fa2057c7877f9d03a92a9fa7e509200fbb2859bc87e7a71c275a2526",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Bridge to a coding agent in ANOTHER project — spawn a headless peer (claude or codex) in a target project under a read or act profile, and return its answer with cost, token, and files-changed traceability.",
@@ -166,7 +166,7 @@
           "title": "Вопрос проекту"
         }
       },
-      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
+      "version": "2026-11-21 — `askproject help` is the menu, and `askproject help <verb>` one verb's whole contract"
     },
     "assets": {
       "executable": [
@@ -186,7 +186,7 @@
       "level": 0,
       "lucide_icon": "archive",
       "path": "capabilities/assets",
-      "payload_sha256": "94b18df3281ce5e477a12949d2993f0adee003b58b2a9cfe7ab7a82a62563c3d",
+      "payload_sha256": "37f2957cba85d94c2205a6e3406cab074c917f58d887ef3f1a767cc81b072c9a",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder.",
@@ -202,7 +202,7 @@
           "title": "Материалы"
         }
       },
-      "version": "2026-11-16 — `assets` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-21 — `assets help` is the menu, and every verb answers `assets help <verb>` with its whole contract"
     },
     "automations": {
       "executable": [
@@ -229,7 +229,7 @@
       "level": 0,
       "lucide_icon": "timer",
       "path": "capabilities/automations",
-      "payload_sha256": "3fc3b94dfe0a2d0ec72ed366c29621424d9fda1771e3f2a4186ad2995fc66430",
+      "payload_sha256": "d7ecfa4214bedd7dbd590d5d5bfdf2e47125ad3654618aa955edf4923cfd1362",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
@@ -245,7 +245,7 @@
           "title": "Автоматизации"
         }
       },
-      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
+      "version": "2026-11-21 — `automations help` is the menu, and `automations help <verb>` one verb's whole contract"
     },
     "calcomc": {
       "executable": [
@@ -259,7 +259,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/calcomc",
-      "payload_sha256": "4da93ad5231abfeb4ef795ae9d071c1af6771c262bef4d8853f329669d3f8ad6",
+      "payload_sha256": "33d10099b0e7c06d2b94d72a9779637181a1639926ccbee6e411256d9775344c",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Cal.com CLI over the Cal.com API v2 — list, read and cancel bookings, read event types, available slots, schedules, connected calendars and their busy times, and reach any other endpoint through `api`; writes are refused unless the connection grants them, and `doctor` proves the key and the account it resolves to.",
@@ -275,7 +275,7 @@
           "title": "Cal.com"
         }
       },
-      "version": "2026-11-16 — `calcomc` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-21 — `calcomc help` is the menu, and `calcomc help <verb>` one verb's whole contract"
     },
     "calendar": {
       "executable": [

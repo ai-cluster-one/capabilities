@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "callva-harness-runner==0.12.3",
 # ]
 # ///
@@ -11,18 +11,128 @@
 Automations keeps each automation as a definition in the capabilities store,
 scheduled where the project's automations service is placed or on the one
 node it names, runs the same way on a developer machine
-and in an agent container, and records its runs in the same store.
+and in an agent container, and records its runs in the same store. Run
+`automations doctor` first.
 
-Configuration:
-  capabilities/automations/service/config.toml holds the scheduler's own
-  [engine] settings and the [agents] profiles. The automations are not in it.
-  For an agent whose records moved into the store (`capabilities migrate`)
-  no file holds them: the [engine] settings and agents.default are rows of
-  its `automations` settings document (`automations settings`), and each
-  profile of [agents.workers] is a harness profile `automations-<name>` in
-  harness_profile_versions, at the agent's scope.
+While config.toml still declares [[automations]], every command that reads
+the declaration refuses with exit 6 `definitions_not_imported`, naming the
+import; `import`, `agents` and `agent` still answer.
 
-Definitions:
+Readiness
+  automations doctor                  config, definitions, scripts, store and daemon
+
+Definitions (what one holds, its script and its schedule: `automations help set`)
+  automations list                    the automations, as their active versions say
+  automations set <automation>        save a new version of one, or create it
+  automations remove <automation>     clear its active version, keeping its history
+  automations history <automation>    every version of one, oldest first
+  automations import                  move config.toml's [[automations]] into the store
+
+Runs
+  automations run <automation-id>     enqueue one manual run
+  automations runs                    recent run records from the run ledger
+  automations show <run-id>           one run record
+  automations logs <run-id>           the captured stdout and stderr of one run
+  automations cancel <run-id>         cancel a pending run, or end a running one
+  automations retry <run-id>          enqueue a new attempt for a completed run
+  automations result <text|->         from inside a job: record its run's result
+
+Agents (profiles and their modes: `automations help agents`)
+  automations agents                  the agent profiles and the default
+  automations agent <prompt|->        one agent turn in this project, its answer as JSON
+
+Service (the bundled scheduler; init, doctor, run, start, reload, stop,
+status and logs also take its machine form, one process serving every
+project on this machine, each on its own page)
+  automations service init            write the project's config and an example script
+  automations service doctor          the same checks as `automations doctor`
+  automations service run             the scheduler in the foreground
+  automations service start           the scheduler in the background
+  automations service reload          hand the running daemon an edited config.toml
+  automations service stop            stop the scheduler
+  automations service status          the daemon, its node, its store and its runs
+  automations service logs            the service's log lines
+  automations service pause           hold this project: no firing, no new run
+  automations service resume          lift the pause
+  automations service launch          how the machine process starts a job; not for direct use
+  automations service declaration     the declaration the scheduler loads; not for direct use
+
+Where each part of the reference is
+  Configuration: `automations help settings`. Definitions, Scripts and
+  Scheduling: `automations help set`. Run ledger: `automations help migrate`.
+  Agents: `automations help agents`. Inventory: `automations help inventory`.
+  Machine mode: `automations help service run`; the machine settings:
+  `automations help service init`.
+
+Environment:
+  AGENT_NODE_ID            The node this machine schedules for, overriding the id
+                           it resolves for itself (`capabilities node id`),
+                           matched against each definition's node.
+  AUTOMATIONS_NAMESPACE    Handed to every job as AUTOMATION_NAMESPACE (default:
+                           project directory name).
+  AUTOMATIONS_CONFIG       Optional config path override; ignored, with a
+                           notice, for an agent whose records moved into the
+                           store.
+  AUTOMATIONS_STATE_DIR    Optional state root override. By default project runtime
+                           state lives under $XDG_STATE_HOME/capabilities/projects/
+                           <project-slug>/automations.
+  AUTOMATIONS_BIN          Absolute path of this CLI, exported into every job so
+                           a script can call `automations agent` without
+                           resolving anything itself.
+  AUTOMATIONS_NAMESPACE, AUTOMATIONS_CONFIG and AUTOMATIONS_STATE_DIR are read
+  from the process environment first and then from the project's .env and
+  .env.local (.local wins), so a project declares one for every invocation made
+  in it, `service status` included, without a shell export.
+  AUTOMATIONS_ENVIRONMENT is retired: nothing reads it, and `doctor` names it
+  under `retired` wherever it is still set, so it can be removed.
+
+I/O contract:
+  Success is JSON on stdout. Failure is {"error": {"code", "message", "hint"?}}
+  on stderr with a non-zero exit code.
+
+Exit codes:
+  0 success · 3 not found · 4 disabled by project policy · 5 runtime failure ·
+  6 malformed input, invalid config, or missing project setup
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import copy
+import hashlib
+import importlib.util
+import io
+import json
+import os
+import signal
+import shutil
+import stat
+import tempfile
+import subprocess
+import sys
+import time
+import tomllib
+import unicodedata
+from pathlib import Path
+from typing import Any, NoReturn
+
+# The verb pages `automations help <verb>` answers (SHEBANG.md, "Agent-first
+# help is the surface"): each verb's whole contract, the module docstring being
+# the menu. The contract library dispatches both and renders the contract
+# verbs' own pages, which an entry here for doctor, settings, migrate or
+# inventory follows. A text several verbs own is one constant, added to each
+# of their pages.
+_HELP_PROJECT_EXITS = """
+  Exit codes every verb in a project shares: 6 `no_project` outside a
+  project and `no_envelope` before `capabilities init`; 6
+  `definitions_not_imported` or `invalid_config` where the declaration it
+  reads does not load; 6 `store_not_configured` (or another refusal of the
+  store setting) where the project resolves no store (Run ledger, on
+  `automations help migrate`), and 5 where the store cannot be reached.
+"""
+_HELP_DEFINITIONS = """
+  Definitions:
   An automation is a row of automations_definition_versions in the store the project
   resolves (Run ledger), kept as versions: a change saves a new version and
   the old one stays as history, so a run names the exact version it ran and
@@ -57,11 +167,7 @@ Definitions:
   not validate is skipped and named by `list` and `doctor`, and the others
   run.
 
-  While config.toml still declares [[automations]], every command that reads
-  the declaration refuses with exit 6 `definitions_not_imported`, naming the
-  import; `import`, `agents` and `agent` still answer.
-
-Scripts:
+  Scripts:
   A path script is a file in the project; Python files may be ordinary scripts
   or executable PEP-723/shebang scripts. A body is written once under the
   state root to a file named by its digest (the shared contract's
@@ -79,186 +185,444 @@ Scripts:
   the same automation recorded, on whichever node it ran, and none when no
   run of it has recorded one.
 
-Commands:
-  automations help
-  automations doctor [--repair]
-      Validate config, definitions, scripts, state storage, and daemon
-      status. Fails with `invalid_definitions` naming each stored definition
-      that does not validate, and with `missing_scripts` for a script path
-      missing on this node. Fails with `config_stale` when the running daemon
-      loaded a declaration that has changed since and it has not taken up.
-      Fails with `node_idle` when the running daemon's node schedules none
-      of the enabled automations - none names it, and none follows the
-      service onto it - so a daemon that is alive and scheduling nothing stops
-      reading as healthy; `node_idle.placed_on` is where the service is
-      placed, null where the store records no placement. `daemon_node` is the node that daemon
-      published, null when it published none; `node` is this invocation's.
-      `retired` names each retired selector still set (AUTOMATIONS_ENVIRONMENT)
-      with `key`, `set_in` (the process environment, or the project's .env or
-      .env.local), `message` and `hint`; it has no effect and fails nothing.
-      Exits 6 `store_not_configured` when the machine has no store to keep
-      the definitions and runs in, and 5 when the store cannot be reached.
-      `--repair` is accepted and repairs nothing: the tables are created whole
-      by their own migration.
-  automations list
-      The project's automations as their active versions say, each with
-      `id`, `version`, `description`, `enabled`, `node`, `follows_service`
-      (whether it runs where the service is placed rather than on `node`),
-      `scheduled_here` (whether this invocation's node schedules it),
-      `script` (its path, or
-      null for a body), `body` (whether it is one), `arguments`, `schedule`,
-      `timezone`, `timeout_seconds`, `retries`, `created_at` and `created_by`;
-      `placed_on`, the nodes the service is placed on (null where the store
-      records no placement); and `invalid_definitions` when a row is skipped.
-  automations set <automation> [--description TEXT] [--enabled true|false]
-                  [--node NODE] [--schedule CRON] [--timezone ZONE]
-                  [--timeout SEC] [--retries N] [--script PATH | --body FILE|-]
-                  [--arguments JSON] [--base VERSION]
-      Save a new version of the automation with the named fields changed, or
-      create it when it has no active version and --script or --body is given
-      (exit 3 otherwise). At least one field is required; `--flag=VALUE` also
-      works. --script makes the script that path and --body the content of
-      FILE, or of stdin for `-`, each clearing the other. An empty --node,
-      --schedule or --description clears it. --arguments takes a JSON array of
-      strings. --description is single-line text of at most 500 characters.
-      --base names the version the writer read, refused with exit 6
-      `conflict` when another is active now. The whole definition is judged
-      before anything is saved (exit 6 `invalid_definition`), and a request
-      that changes nothing saves no version. Saving requires an explicit
-      project enable, as `service init` does (exit 4 otherwise), and the
-      read-only switch refuses it. The answer is
-      {"automation", "version", "created", "changed": [fields that moved],
-       "item": <as `list` reports it>}.
-  automations remove <automation> [--base VERSION]
-      Clear the active version, leaving the automation's history and no
-      successor. Exit 3 when it has no active version. Gated as `set` is.
-  automations history <automation>
-      Every version of the automation, oldest first, each whole with
-      `version`, `active`, `created_at` and `created_by`.
-  automations import [--apply] [--node LABEL=NODE ...]
-      Move config.toml's [[automations]] into the store, all or none, each as
-      a definition whose script stays the file it was. `id` becomes the slug,
-      `name` and `description` the description, `every_seconds` the cron that
-      fires at that rate (a whole number of minutes under an hour, of hours
-      under a day, or one day; anything else is refused), [engine] timezone
-      the definition's timezone, and the old `environments` labels the one
-      node: the file's own label (its engine.environment, else development)
-      is this machine's node, and --node maps another; an empty node leaves
-      it on none. An enabled automation whose labels reach no node, or two,
-      refuses the import
-      (exit 6 `definitions_not_importable`), as does an automation the store
-      already holds differently (`definition_differs`). `max_parallel`,
-      `max_pending` and `overlap` are dropped: one run at a time is fixed. With
-      --apply the definitions are saved and the [[automations]] tables and
-      engine.timezone are removed from the file, every other byte kept; without
-      it nothing is written. Answers {"applied", "node", "environment" (the
-      file's own label),
-      "config", "automations": [{"automation", "outcome", "node", "schedule",
-      "script", "version"?}], "config_rewritten"?}. --apply is gated as `set`
-      is.
-  automations run <automation-id>
-      Enqueue one manual run, for the node the automation is pinned to, or,
-      for one that follows the service, for this machine where the service is
-      placed here or nowhere recorded, else the first node it is placed on.
-      The daemon of that node dispatches it.
-  automations runs [--limit N] [--status STATUS]
-      List recent run records from the run ledger.
-  automations show <run-id>
-      Show one run record.
-  automations logs <run-id> [--tail N]
-      Read the captured stdout/stderr for one run.
-  automations cancel <run-id>
-      Cancel a pending run or request termination of a running process.
-  automations retry <run-id>
-      Enqueue a new attempt for a completed run, as `run` places it.
-  automations result <text|->
-      From inside a job: record a result on the job's own run (AUTOMATION_RUN_ID),
-      handed to the next run of the automation as AUTOMATION_LAST_RESULT. `-`
-      reads it from stdin, kept exactly as given. It is non-empty text of at
-      most 65536 bytes (exit 6 `invalid_result`); recording again replaces
-      it. Exit 6 `not_in_a_run` outside a job and `run_not_active` when the
-      run is no longer starting or running; refused by the read-only switch.
-      Answers {"recorded", "run_id", "automation", "bytes"}; `show` and
-      `runs` carry it as `result`.
-  automations agents
-      List agent profiles and which one is the default.
-  automations agent <prompt|-> [--profile NAME] [--schema PATH] [--timeout SEC]
-                    [--resume SESSION [--fork]]
-      Run one agent turn in this project and return its answer as JSON. `-`
-      reads the prompt from stdin. --schema names a JSON Schema file and makes
-      `answer` a parsed object instead of prose. --resume continues the engine
-      session a previous answer named as `session_id`; with --fork the turn
-      runs in a new session branched from it and leaves that session as it
-      was, so one prepared session can seed many turns (claude --resume
-      --fork-session, codex exec resume or fork). `session_id` names the
-      session the turn ran in. `tokens` carries input, output, cache_read and
-      cache_creation for the whole turn, and first_call, the same four for its
-      first model call, null for codex, which reports usage per turn only.
-  automations service init [--force]
-      Create project-local config and an example script; the example is
-      defined in the store with `set`.
-  automations service doctor|run|start|stop|status|logs
-      Manage the bundled scheduler service. `run` stays in the foreground for
-      Docker Compose; `start` is the local background convenience. `run` and
-      `start` refuse with exit 6 `store_not_configured` while the project
-      resolves no store (Run ledger), and `status` names the store in force:
-      `store`, the level that answered (`project`, `environment` or
-      `machine`), `store_sources`, the files or variables it came from, and
-      `schema`; or `store` null with `store_error`.
-  automations service reload [--timeout SEC]
-      Publish an edited config.toml to the daemon already running, without
-      stopping the jobs it is running; definitions saved in the store need no
-      reload. The configuration is validated first, and a daemon that rejects
-      it keeps the one it has. Returns once the daemon publishes the new
-      declaration as loaded, so a success is demonstrated rather than assumed.
-      Changing the state root or the records backend still needs a real
-      restart.
-  automations service pause [--reason TEXT]
-      Hold this project: its scheduler registers no firing and starts no run
-      until resumed, in either mode, and running jobs finish; a manual run
-      enqueued meanwhile waits. The pause is paused.json in the project's state
-      root, so it outlives a restart, and `service status` reports it as
-      `paused`. Answers {"paused", "pause": {"reason", "at", "by"}, "pause_file"}.
-  automations service resume
-      Lift the pause. Answers {"resumed", "pause_file"}, `resumed` false when
-      the project was not paused.
-
-Machine mode:
+  Scheduling:
+  Each definition carries a numeric five-field cron `schedule` read in its
+  timezone, or none (manual only). The ticker only registers due runs and
+  dispatches subprocesses; job logic never runs inside the ticker. A firing
+  that finds a run of the automation active on any node is recorded skipped.
+"""
+_HELP_NOT_IMPORTED = """
+  While config.toml still declares [[automations]], every command that reads
+  the declaration refuses with exit 6 `definitions_not_imported`, naming the
+  import; `import`, `agents` and `agent` still answer.
+"""
+_HELP_MACHINE_INTRO = """
+  Machine mode:
   The same scheduler also runs once per machine, serving every project on its
   list, so the projects on one machine share one process, one store
   connection per distinct store and an optional cap on the jobs they run at
   once. A project that is not on it keeps its own daemon exactly as above.
+  The machine settings are on `automations help service init`; each machine
+  form (`--machine`) is on the page of its verb.
+"""
+_HELP_MACHINE_GATE = """
+  The machine verbs are the one operational use of automations that resolves
+  no project and reads no policy row: the process checks each project's own
+  explicit enable itself. The read-only switch refuses `pause` and `resume`
+  as it refuses `init`, `start`, `run` and `reload`.
+"""
+_HELP_JOINED = """
+  In a joined project `service start` and `run` exit 4
+  `joined_to_machine_service`, naming `capabilities service stop`, and `service stop`
+  exits 4 while the machine process serves it, naming `service pause` and
+  `service stop --machine`; a project-mode daemon still serving a project that
+  joined may be stopped as ever, and the machine process takes the project at
+  its next pass.
+"""
+_HELP_STORE_IN_FORCE = """
+  `run` and `start` refuse with exit 6 `store_not_configured` while the
+  project resolves no store (Run ledger), and `status` names the store in
+  force: `store`, the level that answered (`project`, `environment` or
+  `machine`), `store_sources`, the files or variables it came from, and
+  `schema`; or `store` null with `store_error`.
+"""
+HELP_VERBS = {
+    "doctor": """\
+automations doctor [--repair]
 
-  automations service init --machine [--force]
-      Write the machine settings from the template.
-  automations service run --machine
-      The machine process in the foreground, for a supervisor.
-  automations service start --machine [--detached]
-      Start the machine process: through the launchd job that supervises it
-      when there is one, else detached; --detached starts a copy by hand even
-      then.
-  automations service status --machine
-      The process, its cap and stores, and every project on the list with its
-      state.
-  automations service doctor --machine
-      The supervision probe; a project's own trouble is reported and fails
-      nothing.
-  automations service reload --machine [--timeout 20]
-      Hand it the machine settings on disk, and each project its own
-      declaration.
-  automations service stop --machine [--timeout 30] [--force]
-      Stop it; every project's running jobs are interrupted within that
-      project's shutdown grace, as a stop of its own daemon interrupts them.
-  automations service logs --machine [--project <id-or-slug>] [--tail 100]
-      The machine log, or one project's lines in it.
-  automations service launch -- <command...>
-      What the machine process starts each job through, in the job's project;
-      not for direct use.
-  automations service declaration
-      The project's declaration as the scheduler loads it - its settings and
-      its agent profiles - as JSON; what the daemon of an agent whose settings
-      are in the store reads at start and on every reload. Not for direct use.
+  Validate config, definitions, scripts, state storage, and daemon
+  status. Fails with `invalid_definitions` naming each stored definition
+  that does not validate, and with `missing_scripts` for a script path
+  missing on this node. Fails with `config_stale` when the running daemon
+  loaded a declaration that has changed since and it has not taken up.
+  Fails with `node_idle` when the running daemon's node schedules none
+  of the enabled automations - none names it, and none follows the
+  service onto it - so a daemon that is alive and scheduling nothing stops
+  reading as healthy; `node_idle.placed_on` is where the service is
+  placed, null where the store records no placement. `daemon_node` is the node that daemon
+  published, null when it published none; `node` is this invocation's.
+  `retired` names each retired selector still set (AUTOMATIONS_ENVIRONMENT)
+  with `key`, `set_in` (the process environment, or the project's .env or
+  .env.local), `message` and `hint`; it has no effect and fails nothing.
+  Exits 6 `store_not_configured` when the machine has no store to keep
+  the definitions and runs in, and 5 when the store cannot be reached.
+  `--repair` is accepted and repairs nothing: the tables are created whole
+  by their own migration.
 
+  Output: {"ok", "project", "node", "daemon_node", "namespace",
+  "automations" (how many it loaded), "missing_scripts", "service" (as
+  `service status` answers it), "invalid_definitions"?, "config_stale"?,
+  "node_idle"?, "retired"?, "repaired"? (with --repair: {"repaired": false,
+  "reason"})}. Exit codes: 0 ok; 6 with the answer on stdout when `ok` is
+  false; 5 `state_unavailable` when the store does not open.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations doctor
+""",
+    "list": """\
+automations list
+
+  The project's automations as their active versions say, each with
+  `id`, `version`, `description`, `enabled`, `node`, `follows_service`
+  (whether it runs where the service is placed rather than on `node`),
+  `scheduled_here` (whether this invocation's node schedules it),
+  `script` (its path, or
+  null for a body), `body` (whether it is one), `arguments`, `schedule`,
+  `timezone`, `timeout_seconds`, `retries`, `created_at` and `created_by`;
+  `placed_on`, the nodes the service is placed on (null where the store
+  records no placement); and `invalid_definitions` when a row is skipped.
+
+  Output: {"node" (this invocation's), "placed_on", "automations": [...],
+  "invalid_definitions"?}. Exit code 0.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations list
+""",
+    "set": """\
+automations set <automation> [--description TEXT] [--enabled true|false]
+                [--node NODE] [--schedule CRON] [--timezone ZONE]
+                [--timeout SEC] [--retries N] [--script PATH | --body FILE|-]
+                [--arguments JSON] [--base VERSION]
+
+  Save a new version of the automation with the named fields changed, or
+  create it when it has no active version and --script or --body is given
+  (exit 3 otherwise). At least one field is required; `--flag=VALUE` also
+  works. --script makes the script that path and --body the content of
+  FILE, or of stdin for `-`, each clearing the other. An empty --node,
+  --schedule or --description clears it. --arguments takes a JSON array of
+  strings. --description is single-line text of at most 500 characters.
+  --base names the version the writer read, refused with exit 6
+  `conflict` when another is active now. The whole definition is judged
+  before anything is saved (exit 6 `invalid_definition`), and a request
+  that changes nothing saves no version. Saving requires an explicit
+  project enable, as `service init` does (exit 4 otherwise), and the
+  read-only switch refuses it. The answer is
+  {"automation", "version", "created", "changed": [fields that moved],
+   "item": <as `list` reports it>}.
+
+  Exit codes: 0 saved, or nothing to change; 3 `not_found` for an
+  automation with no active version and neither --script nor --body; 4
+  `project_enable_required`, or the read-only switch; 6 `input` (an
+  unknown, repeated or valueless option, no field, both --script and
+  --body), `invalid_text`, `too_long`, `invalid_enabled`,
+  `invalid_definition`, `conflict`, `no_project_identity`.
+"""
+    + _HELP_PROJECT_EXITS
+    + _HELP_DEFINITIONS
+    + """\
+
+  Example: automations set nightly --script scripts/nightly.py --schedule '0 3 * * *' --timezone Europe/Tallinn
+""",
+    "remove": """\
+automations remove <automation> [--base VERSION]
+
+  Clear the active version, leaving the automation's history and no
+  successor. Exit 3 when it has no active version. Gated as `set` is.
+  --base names the version the writer read, refused with exit 6
+  `conflict` when another is active now.
+
+  Output: {"automation", "removed" (the version cleared)}. Exit codes: 0;
+  3 `not_found`; 4 `project_enable_required`, or the read-only switch; 6
+  `conflict`, `no_project_identity`.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations remove nightly
+""",
+    "history": """\
+automations history <automation>
+
+  Every version of the automation, oldest first, each whole with
+  `version`, `active`, `created_at` and `created_by`.
+
+  Output: {"automation", "versions": [...]}. Exit codes: 0; 3 `not_found`
+  for an automation never saved here.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations history nightly
+""",
+    "import": """\
+automations import [--apply] [--node LABEL=NODE ...]
+
+  Move config.toml's [[automations]] into the store, all or none, each as
+  a definition whose script stays the file it was. `id` becomes the slug,
+  `name` and `description` the description, `every_seconds` the cron that
+  fires at that rate (a whole number of minutes under an hour, of hours
+  under a day, or one day; anything else is refused), [engine] timezone
+  the definition's timezone, and the old `environments` labels the one
+  node: the file's own label (its engine.environment, else development)
+  is this machine's node, and --node maps another; an empty node leaves
+  it on none. An enabled automation whose labels reach no node, or two,
+  refuses the import
+  (exit 6 `definitions_not_importable`), as does an automation the store
+  already holds differently (`definition_differs`). `max_parallel`,
+  `max_pending` and `overlap` are dropped: one run at a time is fixed. With
+  --apply the definitions are saved and the [[automations]] tables and
+  engine.timezone are removed from the file, every other byte kept; without
+  it nothing is written. Answers {"applied", "node", "environment" (the
+  file's own label),
+  "config", "automations": [{"automation", "outcome", "node", "schedule",
+  "script", "version"?}], "config_rewritten"?}. --apply is gated as `set`
+  is.
+"""
+    + _HELP_NOT_IMPORTED
+    + """\
+
+  Exit codes: 0; 4 with --apply, as `set` is gated; 6
+  `definitions_not_importable`, `definition_differs`, `conflict`,
+  `invalid_config` where config.toml is missing or unreadable.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations import --node staging=server-1
+""",
+    "run": """\
+automations run <automation-id>
+
+  Enqueue one manual run, for the node the automation is pinned to, or,
+  for one that follows the service, for this machine where the service is
+  placed here or nowhere recorded, else the first node it is placed on.
+  The daemon of that node dispatches it. Refused by the read-only switch.
+  How the run's script is started is Scripts, on `automations help set`.
+
+  Output: {"queued": true, "run": <the run record>, "service": <as
+  `service status` answers it>}. Exit codes: 0; 3 `not_found` for an
+  unknown automation; 4 `agent_archived` where the agent is archived, or
+  the read-only switch; 6 `not_runnable`.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations run nightly
+""",
+    "runs": """\
+automations runs [--limit N] [--status STATUS]
+
+  List recent run records from the run ledger. --limit is how many
+  (default 50, at least 1); --status keeps one status: pending, starting,
+  running, succeeded, failed, canceled, interrupted or skipped.
+
+  Output: {"runs": [...]}, each run as `show` answers it, its `result`
+  included. Exit codes: 0; 6 `invalid_limit`, `invalid_status`.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations runs --status failed --limit 10
+""",
+    "show": """\
+automations show <run-id>
+
+  Show one run record; `result` is the result the run recorded with
+  `automations result`.
+
+  Output: the run record, as JSON. Exit codes: 0; 3 `not_found` for an
+  unknown run.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations show 42
+""",
+    "logs": """\
+automations logs <run-id> [--tail N]
+
+  Read the captured stdout/stderr for one run. --tail is how many of the
+  last lines (default 100). The log is a file on the host that ran it.
+
+  Output: {"run_id", "log_file", "lines": [...]}. Exit codes: 0; 3
+  `not_found` for an unknown run, `logs_not_found` where its log does not
+  exist yet.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations logs 42 --tail 20
+""",
+    "cancel": """\
+automations cancel <run-id>
+
+  Cancel a pending run or request termination of a running process.
+  Refused by the read-only switch.
+
+  Output: {"cancel_requested", "run": <the run record>}. Exit codes: 0; 3
+  `not_found` for an unknown run; 4 the read-only switch.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations cancel 42
+""",
+    "retry": """\
+automations retry <run-id>
+
+  Enqueue a new attempt for a completed run, as `run` places it. Refused
+  by the read-only switch.
+
+  Output: {"queued": true, "run": <the new run record>}. Exit codes: 0; 3
+  `not_found` for an unknown run; 4 `agent_archived`, or the read-only
+  switch; 6 `not_retryable`.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations retry 42
+""",
+    "result": """\
+automations result <text|->
+
+  From inside a job: record a result on the job's own run (AUTOMATION_RUN_ID),
+  handed to the next run of the automation as AUTOMATION_LAST_RESULT. `-`
+  reads it from stdin, kept exactly as given. It is non-empty text of at
+  most 65536 bytes (exit 6 `invalid_result`); recording again replaces
+  it. Exit 6 `not_in_a_run` outside a job and `run_not_active` when the
+  run is no longer starting or running; refused by the read-only switch.
+  Answers {"recorded", "run_id", "automation", "bytes"}; `show` and
+  `runs` carry it as `result`.
+
+  Exit codes: 0; 3 `not_found` for a run the store does not hold; 4 the
+  read-only switch; 6 `not_in_a_run`, `invalid_result`, `run_not_active`.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: echo '{"cursor": 1834}' | automations result -
+""",
+    "agents": """\
+automations agents
+
+  List agent profiles and which one is the default.
+
+  Output: {"default", "workers": {<name>: <profile>}}. Exit codes: 0; 6
+  `no_project`, `no_envelope`, `invalid_config`. It answers while
+  config.toml still declares [[automations]].
+
+  Agents:
+  A script that needs judgement rather than computation runs one agent turn
+  through `automations agent`. Profiles live in config.toml under [agents]
+  (harness profiles `automations-<name>` once the agent moved, see
+  Configuration, on `automations help settings`);
+  `sonnet`, `opus` and `haiku` ship with the capability and a project adds its
+  own, including codex profiles, under [agents.workers.<name>]. A profile names
+  engine, model, effort, mode and timeout_seconds. `mode = "read"` fences the
+  turn to reading the project; `mode = "write"` lets it change files; `mode =
+  "act"` drops the sandbox entirely, for a worker whose job is to operate tools
+  that reach the network and write outside the project. Neither of the last two
+  is a shipped default: a scheduled job runs unattended, so the authority it
+  holds is declared per profile and read at a glance.
+
+  Example: automations agents
+""",
+    "agent": """\
+automations agent <prompt|-> [--profile NAME] [--schema PATH] [--timeout SEC]
+                  [--resume SESSION [--fork]]
+
+  Run one agent turn in this project and return its answer as JSON. `-`
+  reads the prompt from stdin. --schema names a JSON Schema file and makes
+  `answer` a parsed object instead of prose. --resume continues the engine
+  session a previous answer named as `session_id`; with --fork the turn
+  runs in a new session branched from it and leaves that session as it
+  was, so one prepared session can seed many turns (claude --resume
+  --fork-session, codex exec resume or fork). `session_id` names the
+  session the turn ran in. `tokens` carries input, output, cache_read and
+  cache_creation for the whole turn, and first_call, the same four for its
+  first model call, null for codex, which reports usage per turn only.
+  --profile names the profile, else the default (`automations agents`;
+  profiles and modes are Agents, on `automations help agents`); --timeout
+  overrides its timeout_seconds. A profile whose mode is not `read` is
+  refused by the read-only switch. It answers while config.toml still
+  declares [[automations]].
+
+  Output: {"ok", "profile", "engine", "model", "effort", "mode", "answer",
+  "cost_usd", "duration_ms", "num_turns", "session_id", "tokens"}. Exit
+  codes: 0; 3 `unknown_agent`; 4 the read-only switch; 5 `agent_timeout`,
+  `agent_failed`; 6 `schema_not_found`, `invalid_timeout`,
+  `invalid_resume`, `fork_needs_resume`, `no_project`, `no_envelope`,
+  `invalid_config`.
+
+  Example: automations agent "Summarise today's failed runs" --profile sonnet
+""",
+    "service init": """\
+automations service init [--force]
+automations service init --machine [--force]
+
+  Create project-local config and an example script; the example is
+  defined in the store with `set`. For an agent whose records moved into
+  the store the config is written as its settings rows. --force writes
+  over what is there; without it an existing file or document is skipped.
+
+  With --machine: write the machine settings from the template.
+
+  The machine settings are $XDG_CONFIG_HOME/automations/service/config.toml,
+  written by `init --machine`:
+
+    version = 1
+    max_parallel = 8   # jobs running at once across every joined project;
+                       # absent, only each project's own limits apply
+
+  Any other key is refused, and no file is no cap. Their fingerprint is what
+  `reload --machine` and `doctor --machine` compare; the list is not part of
+  it. Under the cap, projects with work are dealt one start each in turn, from
+  the project after the last one dealt, each start chosen by that project's
+  own queue and limits, so with a cap of one starts go round the projects.
+  Machine settings that do not read or check exit 6 `service_invalid`
+  wherever they are read.
+
+  Output: {"initialized", "project", "config", "written", "skipped",
+  "next"}; with --machine {"initialized", "mode": "machine", "config",
+  "written", "skipped", "next"}. Exit codes: 0; 3 `service_bundle_missing`
+  when the shipped templates are missing; 6 `no_project`, `no_envelope`.
+"""
+    + _HELP_MACHINE_GATE
+    + """\
+
+  Example: automations service init
+""",
+    "service doctor": """\
+automations service doctor
+automations service doctor --machine
+
+  In a project: the checks of `automations doctor`, with its answer and
+  its exit codes (`automations help doctor`).
+
+  With --machine: the supervision probe; a project's own trouble is
+  reported and fails nothing. `doctor --machine` exits 0
+  while the process holds its lock, published its status within twice its
+  publish interval, runs the machine settings on disk and holds a connection
+  to at least one of the stores it opened; a store that is not connected
+  while another is, and a project in `error` or `refused`, fail it not, since
+  restarting the process cannot repair a project. While no machine process
+  runs it repeats the `hint` of `status --machine`.
+
+  Output with --machine: {"ok", "mode": "machine", "machine": <as `status
+  --machine` answers it>, "projects": [{"project", "project_id",
+  "present", "enabled_explicitly", "state", "reason"}], "problems"?}.
+  Exit codes: 0 ok; 6 with the answer on stdout when `ok` is false.
+
+  Example: automations service doctor --machine
+""",
+    "service run": """\
+automations service run
+automations service run --machine
+
+  The scheduler in the foreground: `run` stays in the foreground for
+  Docker Compose; this process becomes the daemon and runs until stopped.
+
+  With --machine: the machine process in the foreground, for a supervisor.
+  Only one runs per machine; another exits 5 `service_running`.
+"""
+    + _HELP_STORE_IN_FORCE
+    + _HELP_JOINED
+    + _HELP_MACHINE_INTRO
+    + """
   The list is $XDG_CONFIG_HOME/automations/service/projects.toml, keyed by
   each project's durable id, with its root, its slug and when and by whom it
   was put there. The node manager writes it (`capabilities node supervise
@@ -304,47 +668,34 @@ Machine mode:
   again every second. `error`: its folder is gone, or its declaration does not
   load, which holds the lock and serves nothing until `service reload` there,
   or `reload --machine`, takes one. `paused` while it is paused, `served`
-  otherwise. In a joined project `service start` and `run` exit 4
-  `joined_to_machine_service`, naming `capabilities service stop`, and `service stop`
-  exits 4 while the machine process serves it, naming `service pause` and
-  `service stop --machine`; a project-mode daemon still serving a project that
-  joined may be stopped as ever, and the machine process takes the project at
-  its next pass. A project taken off has its running jobs interrupted, as a
+  otherwise. A project taken off has its running jobs interrupted, as a
   stop of its own daemon would, and is let go once they have ended.
+"""
+    + _HELP_MACHINE_GATE
+    + """\
 
-  The machine settings are $XDG_CONFIG_HOME/automations/service/config.toml,
-  written by `init --machine`:
+  Output: none on success; it runs until stopped. Exit codes: 4
+  `joined_to_machine_service`, or the read-only switch; 5
+  `service_running` with --machine; 6 `store_not_configured`,
+  `not_runnable`, `state_migration_failed`, `service_invalid`.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
 
-    version = 1
-    max_parallel = 8   # jobs running at once across every joined project;
-                       # absent, only each project's own limits apply
+  Example: automations service run
+""",
+    "service start": """\
+automations service start
+automations service start --machine [--detached]
 
-  Any other key is refused, and no file is no cap. Their fingerprint is what
-  `reload --machine` and `doctor --machine` compare; the list is not part of
-  it. Under the cap, projects with work are dealt one start each in turn, from
-  the project after the last one dealt, each start chosen by that project's
-  own queue and limits, so with a cap of one starts go round the projects.
+  The scheduler as a background daemon: `start` is the local background
+  convenience. It answers once the daemon says it is running, or exits 5
+  `service_start_failed` with the tail of its log; a daemon already
+  running answers `already_running`.
 
-  Every line the service writes, in either mode, reads `<moment> automations
-  service [<project-slug>]: <what happened>`. The machine process tags its own
-  lines `[machine]`, writes every line to its log, and writes a project's
-  lines to that project's daemon.log too. `status --machine` answers `mode`,
-  `running`, `pid`, `started_at`, `published_at`, `fingerprint` and
-  `current`, `projects_file` (its path and how many joined), `cap`
-  (`max_parallel`, `running`, `binding`), `stores` while it runs (for each
-  store its projects resolve: `store`, `schema`, `connected`, `error`), and
-  `projects`: for every project on the list its slug as `project`,
-  `project_id`, `root`, `joined_at`, `joined_by`,
-  `present`, `enabled_explicitly`, `state` (`served`, `paused`, `refused`,
-  `error`, or null with no machine process) and `reason`, and while it is held
-  its `node`, `fingerprint`, `reload_error`, `automations`,
-  `running` and `pause`. `service status` in a joined project answers `mode` "machine"
-  and the machine's word on it under `machine`. `doctor --machine` exits 0
-  while the process holds its lock, published its status within twice its
-  publish interval, runs the machine settings on disk and holds a connection
-  to at least one of the stores it opened; a store that is not connected
-  while another is, and a project in `error` or `refused`, fail it not, since
-  restarting the process cannot repair a project.
+  With --machine: start the machine process: through the launchd job that
+  supervises it when there is one, else detached; --detached starts a copy
+  by hand even then. --detached without --machine exits 6 `input`.
 
   Under launchd, the machine process writes the job launchd started it as
   into `launchd.json` in its state root: the label XPC_SERVICE_NAME names,
@@ -359,35 +710,204 @@ Machine mode:
   naming how to start it, which `doctor --machine` repeats. `stop --machine`
   stops whichever process runs, and launchd restarts none that exits cleanly,
   so a stopped service stays stopped until it is started again.
+"""
+    + _HELP_STORE_IN_FORCE
+    + _HELP_JOINED
+    + """\
 
-  The machine verbs are the one operational use of automations that resolves
-  no project and reads no policy row: the process checks each project's own
-  explicit enable itself. The read-only switch refuses `pause` and `resume`
-  as it refuses `init`, `start`, `run` and `reload`.
+  Output: as `service status` answers it, with "started": true (and
+  "state_record_error"?, "state_migration"?), or "already_running": true;
+  with --machine as `service status --machine` answers it. Exit codes: 0;
+  4 `joined_to_machine_service`, or the read-only switch; 5
+  `service_start_failed`; 6 `store_not_configured`, `not_runnable`,
+  `state_migration_failed`, `input`, `service_invalid`.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
 
-Environment:
-  AGENT_NODE_ID            The node this machine schedules for, overriding the id
-                           it resolves for itself (`capabilities node id`),
-                           matched against each definition's node.
-  AUTOMATIONS_NAMESPACE    Handed to every job as AUTOMATION_NAMESPACE (default:
-                           project directory name).
-  AUTOMATIONS_CONFIG       Optional config path override; ignored, with a
-                           notice, for an agent whose records moved into the
-                           store.
-  AUTOMATIONS_STATE_DIR    Optional state root override. By default project runtime
-                           state lives under $XDG_STATE_HOME/capabilities/projects/
-                           <project-slug>/automations.
-  AUTOMATIONS_BIN          Absolute path of this CLI, exported into every job so
-                           a script can call `automations agent` without
-                           resolving anything itself.
-  AUTOMATIONS_NAMESPACE, AUTOMATIONS_CONFIG and AUTOMATIONS_STATE_DIR are read
-  from the process environment first and then from the project's .env and
-  .env.local (.local wins), so a project declares one for every invocation made
-  in it, `service status` included, without a shell export.
-  AUTOMATIONS_ENVIRONMENT is retired: nothing reads it, and `doctor` names it
-  under `retired` wherever it is still set, so it can be removed.
+  Example: automations service start
+""",
+    "service reload": """\
+automations service reload [--timeout SEC]
+automations service reload --machine [--timeout 20]
 
-Run ledger:
+  Publish an edited config.toml to the daemon already running, without
+  stopping the jobs it is running; definitions saved in the store need no
+  reload. The configuration is validated first, and a daemon that rejects
+  it keeps the one it has. Returns once the daemon publishes the new
+  declaration as loaded, so a success is demonstrated rather than assumed.
+  Changing the state root or the records backend still needs a real
+  restart. --timeout is how long it waits, in seconds (default 20).
+
+  With --machine: hand it the machine settings on disk, and each project
+  its own declaration.
+
+  Output: {"reloaded", "running", "pid", "automations", "reason"?}
+  (`reloaded` false, with the reason, when the daemon already runs this
+  declaration); with --machine {"reloaded", "running", "pid",
+  "fingerprint", "changed", "projects": [{"project", "state", "reason",
+  "reload_error"}]}. Exit codes: 0; 4 the read-only switch; 5
+  `service_not_running`, `service_reload_failed`; 6 `invalid_config`,
+  `definitions_not_imported`, `service_reload_failed` where the daemon
+  cannot be signalled, `service_invalid`.
+"""
+    + _HELP_PROJECT_EXITS
+    + """\
+
+  Example: automations service reload
+""",
+    "service stop": """\
+automations service stop [--timeout SEC] [--force]
+automations service stop --machine [--timeout 30] [--force]
+
+  Stop the project's daemon: it is sent SIGTERM and waited for, --timeout
+  seconds (default 15); --force kills it once that has passed. A daemon
+  that does not stop in time without --force exits 5
+  `service_stop_timeout`.
+
+  With --machine: stop it; every project's running jobs are interrupted
+  within that project's shutdown grace, as a stop of its own daemon
+  interrupts them. `stop --machine` stops whichever process runs, launchd's
+  included (`automations help service start`).
+"""
+    + _HELP_JOINED
+    + """\
+
+  Output: {"stopped", "running": false, "pid", "killed"?,
+  "state_record_error"?}; with --machine {"stopped", "running": false,
+  "pid", "mode": "machine", "waited_seconds"?, "killed"?}. `stopped` is
+  false where nothing ran. Exit codes: 0; 4 `joined_to_machine_service`;
+  5 `service_stop_timeout`; 6 `no_project`, `no_envelope`.
+
+  Example: automations service stop --timeout 30
+""",
+    "service status": """\
+automations service status
+automations service status --machine
+
+  The project's daemon: whether it is `initialized` and `running`, its
+  `pid`, `stale_pid`, `mode` (`project`, or `machine` with the machine's
+  word on it under `machine`), `paused`, `project`, `node` (this
+  invocation's) and `daemon_node` (the running daemon's), `config`,
+  `state_dir` with `state_dir_source` and `state_dirs_considered`,
+  `state_record_error`?, the store in force, `pid_file`, `log_file`, and
+  `counts` of its runs by status (`counts_error`? where they could not be
+  counted).
+"""
+    + _HELP_STORE_IN_FORCE
+    + """
+  With --machine: the process, its cap and stores, and every project on
+  the list with its state.
+
+  `status --machine` answers `mode`,
+  `running`, `pid`, `started_at`, `published_at`, `fingerprint` and
+  `current`, `projects_file` (its path and how many joined), `cap`
+  (`max_parallel`, `running`, `binding`), `stores` while it runs (for each
+  store its projects resolve: `store`, `schema`, `connected`, `error`), and
+  `projects`: for every project on the list its slug as `project`,
+  `project_id`, `root`, `joined_at`, `joined_by`,
+  `present`, `enabled_explicitly`, `state` (`served`, `paused`, `refused`,
+  `error`, or null with no machine process) and `reason`, and while it is held
+  its `node`, `fingerprint`, `reload_error`, `automations`,
+  `running` and `pause`. `service status` in a joined project answers `mode` "machine"
+  and the machine's word on it under `machine`. It carries `supervisor`
+  and, while no machine process runs, a `hint` (`automations help service
+  start`). What each project `state` means is on `automations help
+  service run`.
+
+  Exit codes: 0; 6 `no_project`, `no_envelope`.
+
+  Example: automations service status
+""",
+    "service logs": """\
+automations service logs [--tail N]
+automations service logs --machine [--project <id-or-slug>] [--tail 100]
+
+  The project service's log lines, the last --tail of them (default 100).
+
+  With --machine: the machine log, or one project's lines in it.
+  --project without --machine exits 6 `input`.
+
+  Every line the service writes, in either mode, reads `<moment> automations
+  service [<project-slug>]: <what happened>`. The machine process tags its own
+  lines `[machine]`, writes every line to its log, and writes a project's
+  lines to that project's daemon.log too.
+
+  Output: {"log_file", "lines": [...]}; with --project also "project".
+  Exit codes: 0; 3 `logs_not_found` where the log does not exist yet; 6
+  `input`, `no_project`, `no_envelope`.
+
+  Example: automations service logs --machine --project my-project --tail 50
+""",
+    "service pause": """\
+automations service pause [--reason TEXT]
+
+  Hold this project: its scheduler registers no firing and starts no run
+  until resumed, in either mode, and running jobs finish; a manual run
+  enqueued meanwhile waits. The pause is paused.json in the project's state
+  root, so it outlives a restart, and `service status` reports it as
+  `paused`. Answers {"paused", "pause": {"reason", "at", "by"}, "pause_file"}.
+"""
+    + _HELP_MACHINE_GATE
+    + """\
+
+  Exit codes: 0; 4 the read-only switch; 6 `no_project`, `no_envelope`.
+
+  Example: automations service pause --reason "migrating the store"
+""",
+    "service resume": """\
+automations service resume
+
+  Lift the pause. Answers {"resumed", "pause_file"}, `resumed` false when
+  the project was not paused (with a `reason`).
+"""
+    + _HELP_MACHINE_GATE
+    + """\
+
+  Exit codes: 0; 4 the read-only switch; 6 `no_project`, `no_envelope`.
+
+  Example: automations service resume
+""",
+    "service launch": """\
+automations service launch -- <command...>
+
+  What the machine process starts each job through, in the job's project;
+  not for direct use. It puts the project's .env and .env.local under the
+  job in the job's own process, with the AUTOMATION_* variables and
+  AUTOMATIONS_BIN it was handed, and execs the command in its place.
+
+  Output: none of its own; the job's. Exit codes: the job's; 4 where the
+  project does not enable automations explicitly; 5 `launch_failed`; 6
+  `input` without a command.
+
+  Example: automations service launch -- python3 scripts/nightly.py
+""",
+    "service declaration": """\
+automations service declaration
+
+  The project's declaration as the scheduler loads it - its settings and
+  its agent profiles - as JSON; what the daemon of an agent whose settings
+  are in the store reads at start and on every reload. Not for direct use.
+
+  Output: the declaration, as JSON. Exit codes: 0; 6 `invalid_config`,
+  `no_project`, `no_envelope`.
+
+  Example: automations service declaration
+""",
+    "settings": """\
+  Configuration:
+  capabilities/automations/service/config.toml holds the scheduler's own
+  [engine] settings and the [agents] profiles. The automations are not in it.
+  For an agent whose records moved into the store (`capabilities migrate`)
+  no file holds them: the [engine] settings and agents.default are rows of
+  its `automations` settings document (`automations settings`), and each
+  profile of [agents.workers] is a harness profile `automations-<name>` in
+  harness_profile_versions, at the agent's scope.
+
+  Example: automations settings get engine.max_parallel
+""",
+    "migrate": """\
+  Run ledger:
   Definitions live in the table automations_definition_versions, and runs, the queue
   and their history in automations_runs, of the PostgreSQL the shared
   capabilities-contract library resolves for the project: the AGENTKIT_DB_*
@@ -402,41 +922,10 @@ Run ledger:
   interrupted when the automation next fires, so a node that went away holds
   nothing.
 
-Scheduling:
-  Each definition carries a numeric five-field cron `schedule` read in its
-  timezone, or none (manual only). The ticker only registers due runs and
-  dispatches subprocesses; job logic never runs inside the ticker. A firing
-  that finds a run of the automation active on any node is recorded skipped.
-
-Agents:
-  A script that needs judgement rather than computation runs one agent turn
-  through `automations agent`. Profiles live in config.toml under [agents]
-  (harness profiles `automations-<name>` once the agent moved, see
-  Configuration);
-  `sonnet`, `opus` and `haiku` ship with the capability and a project adds its
-  own, including codex profiles, under [agents.workers.<name>]. A profile names
-  engine, model, effort, mode and timeout_seconds. `mode = "read"` fences the
-  turn to reading the project; `mode = "write"` lets it change files; `mode =
-  "act"` drops the sandbox entirely, for a worker whose job is to operate tools
-  that reach the network and write outside the project. Neither of the last two
-  is a shipped default: a scheduled job runs unattended, so the authority it
-  holds is declared per profile and read at a glance.
-
-I/O contract:
-  Success is JSON on stdout. Failure is {"error": {"code", "message", "hint"?}}
-  on stderr with a non-zero exit code.
-
-Contract commands:
-  automations stub
-  automations manifest --json
-  automations connections
-  automations guide [<topic>]
-  automations ids list|get|set|rm
-  automations refs
-  automations inventory [--network]
-  automations migrate [status]
-
-Inventory:
+  Example: automations migrate status
+""",
+    "inventory": """\
+  Inventory:
   `automations inventory` reports one item per automation, by slug, read from
   the store, with where the service is placed. `name` is the slug; `state`
   is disabled | active | other node | enabled, judged by the running daemon's
@@ -456,32 +945,9 @@ Inventory:
   invalid_definitions, config_stale, node_idle - or why the definitions did
   not load, and none of the run ledger's.
 
-Exit codes:
-  0 success · 3 not found · 4 disabled by project policy · 5 runtime failure ·
-  6 malformed input, invalid config, or missing project setup
-"""
-
-from __future__ import annotations
-
-import argparse
-import contextlib
-import copy
-import hashlib
-import importlib.util
-import io
-import json
-import os
-import signal
-import shutil
-import stat
-import tempfile
-import subprocess
-import sys
-import time
-import tomllib
-import unicodedata
-from pathlib import Path
-from typing import Any, NoReturn
+  Example: automations inventory
+""",
+}
 
 
 NAME = "automations"
@@ -661,7 +1127,7 @@ def _inventory_item(runtime, item: dict, node: str | None,
 
     The contract's item has no field for an id, a description or a schedule
     as data, so they ride in `attributes` under fixed labels (documented in
-    `automations help`), and `detail` stays the schedule as display text."""
+    `automations help inventory`), and `detail` stays the schedule as display text."""
     attributes = [{"label": "id", "value": item["id"]}]
     if item["description"]:
         attributes.append({"label": "description", "value": item["description"]})

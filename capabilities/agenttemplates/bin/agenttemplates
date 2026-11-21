@@ -2,53 +2,32 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """agenttemplates — the agent templates a new agent is made from.
 
 The templates are files carried in this capability's own bundle, under
-`templates/`: `context/` holds the starter context files that `capabilities
-init --with-template` lays into a project, and `agents/<id>/` each agent
-template that `capabilities init --template <id>` creates a ready agent from -
-its `template.toml`, its icon, and the files of its body layers (`context/`,
-`assets/`, `routines/`). The manager reads them from here when this capability
-is installed: `capabilities help` describes `init --with-template`, `init
---template` and `templates`. Nothing is written: both verbs only read the
-bundle.
+`templates/`: `context/` holds the starter context files the manager lays into
+a new project, and `agents/<id>/` each agent template the manager creates a
+ready agent from - its `template.toml`, its icon, and the files of its body
+layers (`context/`, `assets/`, `routines/`). The manager reads them from here
+when this capability is installed: `capabilities help` describes its init
+from a template and its `templates` verb. Nothing is written: both verbs only
+read the bundle. `agenttemplates help list` and `agenttemplates help show`
+name the manager's verbs that read them.
 
 USAGE
   agenttemplates <command> [options]
 
-Commands:
-  agenttemplates help
-      Print this contract.
-  agenttemplates doctor
-      Report whether the bundle's templates folder is there, with the number
-      of starter files and agent templates it holds. No network, no mutation.
-  agenttemplates list
-      Every template the bundle carries: {source, starter [{path, title,
-      description}], agents [{id, name, description, path}]}. `source` is the
-      templates folder; a starter `path` is relative to it, an agent `path`
-      is its folder. Title and description come from each starter file's
-      front matter and each agent template's `template.toml`.
-  agenttemplates show <id|path>
-      An agent template by its id (`personal-agent`): {id, path, manifest,
-      files}, where `manifest` is its `template.toml` as read and `files`
-      every file it carries, relative to its folder. Or one file by its path
-      relative to the templates folder (`context/identity/AGENT.md`,
-      `agents/personal-agent/routines/onboarding.md`): {path, text}. A path
-      holds a `/`, an id never does. Exit 3 not_found, naming what there is,
-      when neither names anything the bundle carries.
+Commands
+  doctor                      is the bundle's templates folder there, and what it holds
+  list                        every starter file and agent template the bundle carries
+  show <id|path>              one agent template by its id, or one file by its path
 
-Contract commands:
-  agenttemplates stub
-  agenttemplates manifest --json
-  agenttemplates guide [<topic>]
-  agenttemplates connections
-  agenttemplates ids list|get|set|rm
-  agenttemplates refs
-  agenttemplates inventory [--network]
+I/O
+Success is JSON on stdout; failure is {"error": {"code", "message", "hint"?}}
+on stderr.
 
 Exit codes:
   0 success · 3 not found · 4 disabled by project policy · 6 input/validation
@@ -107,6 +86,77 @@ _contract_bind(globals(), "core")
 _contract_bind(globals(), "store")
 
 TEMPLATE_MANIFEST = "template.toml"
+
+# The verb pages `agenttemplates help <verb>` answers (SHEBANG.md, "Agent-first
+# help is the surface"): each verb's whole contract, the module docstring being
+# the menu. The contract library dispatches both and renders the contract
+# verbs' own pages, which the entry here for doctor follows.
+_HELP_BUNDLE = """
+  The templates are files carried in this capability's own bundle, under
+  `templates/`: `context/` holds the starter context files that `capabilities
+  init --with-template` lays into a project, and `agents/<id>/` each agent
+  template that `capabilities init --template <id>` creates a ready agent from -
+  its `template.toml`, its icon, and the files of its body layers (`context/`,
+  `assets/`, `routines/`). The manager reads them from here when this capability
+  is installed: `capabilities help` describes `init --with-template`, `init
+  --template` and `templates`. Nothing is written: both verbs only read the
+  bundle.
+"""
+HELP_VERBS = {
+    "doctor": """\
+  agenttemplates has no connections, so its doctor takes no arguments (a
+  --connection is refused, exit 6 input) and reaches no system: it reports whether the bundle's templates folder is
+  there, with the number of starter files and agent templates it holds. No
+  network, no mutation.
+
+  Output: {ok: true, templates, starter, agents}, where `templates` is the
+  folder, `starter` the number of starter files and `agents` the number of
+  agent templates. Where the folder is missing: {ok: false, templates,
+  problem, hint}, the hint naming `capabilities install agenttemplates`.
+
+  Exit codes: 0 the folder is there; 1 it is missing; 4 disabled by project
+  policy; 6 input for any argument.
+
+  Example: agenttemplates doctor
+""",
+    "list": """\
+agenttemplates list
+
+  Every template the bundle carries. Takes no arguments; reads only the
+  bundle.
+
+  Output: {source, starter [{path, title, description}], agents [{id, name,
+  description, path}]}. `source` is the templates folder; a starter `path`
+  is relative to it, an agent `path` is its folder. Title and description
+  come from each starter file's front matter and each agent template's
+  `template.toml`; a starter file without a title is titled by its file
+  name.
+
+  Exit codes: 0 success; 4 disabled by project policy; 6 template_invalid
+  when an agent template's `template.toml` cannot be read.
+
+  Example: agenttemplates list
+""" + _HELP_BUNDLE,
+    "show": """\
+agenttemplates show <id|path>
+
+  An agent template by its id (`personal-agent`): {id, path, manifest,
+  files}, where `manifest` is its `template.toml` as read and `files`
+  every file it carries, relative to its folder. Or one file by its path
+  relative to the templates folder (`context/identity/AGENT.md`,
+  `agents/personal-agent/routines/onboarding.md`): {path, text}. A path
+  holds a `/`, an id never does. Reads only the bundle.
+
+  Exit codes: 0 success; 3 not_found, naming what there is, when neither
+  names anything the bundle carries; 4 disabled by project policy; 6 input
+  when the path names a file that is not text, template_invalid when the
+  template's `template.toml` cannot be read.
+
+  Examples:
+    agenttemplates show personal-agent
+    agenttemplates show context/identity/AGENT.md
+""" + _HELP_BUNDLE,
+}
 
 
 def _cmd_connections() -> None:

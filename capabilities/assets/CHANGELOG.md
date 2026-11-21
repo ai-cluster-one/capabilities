@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-11-21 — `assets help` is the menu, and every verb answers `assets help <verb>` with its whole contract
+
+`assets help` printed the whole reference, about 22 KB with the connection and secret sections the library appends, and `assets help <anything>`, an unknown word included, printed it again. `assets help` is now a menu under 6 KB: what an asset is and where it lives, ADDRESSING, every verb on one line saying what it answers, under READING, WRITING, FILES and EXPORT, the I/O and the exit codes, then the contract verbs and the guides, with no flag on any line. `assets help <verb>` takes the whole verb path, `assets help files link`, and prints that verb's whole contract from `HELP_VERBS`: its synopsis with every flag, the text the old help held for it, its output, its exit codes and an example. THE FILE STORE CONNECTION moved to `assets help connection`, after the library's page for the connection verbs and the secret cascade; the assets text for doctor, connections, migrate and inventory follows the library's page for each. A path that names a group, `assets help files`, lists its verbs, and a path that names no verb exits 6 `unknown_verb`, with nothing on stdout and a hint naming `assets help`. Nothing the old help said is gone; it is on the menu or on the page that owns it. The capability binds `capabilities-contract` 0.50 or later, which dispatches the layered help. Only the shape of help changes: no verb, flag, answer, JSON key or exit code changes.
+
 ## 2026-11-16 — `assets` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Материалы, and Estonian (`et`), Materjalid, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.

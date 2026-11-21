@@ -1,5 +1,9 @@
 # calcomc — change log
 
+## 2026-11-21 — `calcomc help` is the menu, and `calcomc help <verb>` one verb's whole contract
+
+`calcomc help` is the short complete menu of SHEBANG.md, "Agent-first help is the surface": the model, every verb on one line under Bookings, Scheduling and Escape hatch, the write gate, the quirks and the exit codes, then the contract verbs the library renders, with no flag on any line. `calcomc help <verb>` takes the whole verb path (`help bookings list`, `help calendars busy-times`, `help api`) and prints that verb's whole contract from `HELP_VERBS` - its synopsis with every flag, what it does, its output, its exit codes and its example - with connection selection, the output shape, the rate limit and the exit-code table on each; a group (`help bookings`) lists its verbs, and an unknown path exits 6 `unknown_verb` with nothing on stdout and the hint to run `calcomc help`. CONNECTIONS moved verbatim to `help connections`, after the library's connections home and secret cascade, and doctor's text to `help doctor`; the write gate is on `help bookings cancel` and `help api` as well as the menu, `api`'s version-header sentence on `help api`, the `--json` compatibility sentence on the pages of the verbs that take it, and each example on its verb's page; the declared connection fields are the library's `help connection`. The capability binds `capabilities-contract` 0.50 or later, which dispatches the layered help. No verb, flag, JSON key, output or exit code changes.
+
 ## 2026-11-16 — `calcomc` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Cal.com, and Estonian (`et`), Cal.com, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.

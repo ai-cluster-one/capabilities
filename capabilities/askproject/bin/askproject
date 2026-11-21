@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "callva-harness-runner==0.12.3",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
@@ -17,6 +17,61 @@ that peer reads whatever project context is compiled on disk there at that
 moment (Claude reads CLAUDE.md, Codex reads AGENTS.md) / settings / rights —
 then hands back the answer with cost, token, and files-changed data.
 
+Two engines (harnesses) drive the peer: claude, the default, runs Claude Code,
+and codex runs Codex, each through the callva-harness-runner library and the
+CLI installed on this machine. What the peer may do, and on which model, is the
+profile the call runs, and a profile names its engine. A call runs in read
+mode (research, the default) or act mode (the peer may edit, test, commit and
+push inside the target). This capability has NO connections and no
+credentials: it drives the local claude/codex CLI.
+
+Run `askproject help` to (re)load this contract on demand — do not rely on
+memorised knowledge of its surface.
+
+VERBS
+  askproject <target> "<question>"   ask the peer in <target>, give it a task there, or continue the last conversation with it; its page is `askproject help ask`
+  askproject targets                 the targets this project has talked to, each with its last session
+  askproject profiles                every profile in sight (JSON): name, where it comes from, the same-named files it shadows
+  askproject profiles show <name>    print the file <name> resolves to, verbatim, to copy and edit
+
+<target> is the other project's directory, never your own project root. The
+session map (which target, which session) belongs to the project you call
+from and lives in its PostgreSQL store.
+
+OUTPUT
+  An ask prints one JSON object on stdout, or the answer alone when asked for
+  text, and streams concise progress to stderr. profiles and doctor print JSON;
+  targets prints text or JSON; profiles show prints the profile file. A refusal
+  from a contract verb is {"error": {"code", "message", "hint"?}} on stderr.
+
+EXIT CODES
+  0 success · 1 an ask failed or was refused, a read call that changed the
+  target included · 2 doctor is not ready, or the arguments do not parse ·
+  3 profiles show names no profile · 4 policy (not enabled in this project,
+  or act under CAPABILITIES_READ_ONLY - ask the user, never lift a gate
+  yourself) · 5 the session store does not answer · 6 input
+  (store_not_configured, unknown_verb, a usage error).
+"""
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import NoReturn
+
+# The verb pages `askproject help <verb>` answers (SHEBANG.md, "Agent-first
+# help is the surface"): each verb's whole contract, the module docstring being
+# the menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which an entry here for doctor, connections, guide or migrate
+# follows. The asking form has no verb word; its page is `help ask`. A section
+# several verbs own is one constant, added to each of their pages.
+_HELP_ENGINES = """\
 Two engines (harnesses) drive the peer, and the profile a call runs names its
 engine: `--engine` picks the shipped profile of that engine, and `--profile`
 names a file that names its own. Each is launched through the
@@ -28,26 +83,9 @@ tokens and the session id back out of what the harness reported:
   codex             Codex. No USD cost is reported under ChatGPT auth, so
                     cost_usd stays null.
 What the peer may do, and on which model, is its profile — see PROFILES.
+"""
 
-Run `askproject help` to (re)load this contract on demand — do not rely on
-memorised knowledge of its surface.
-
-────────────────────────────────────────────────────────────────────────────
-COMMANDS
-  askproject <target> "<question>"        Ask the peer (read-only research).
-  askproject <target> --act "<task>"      Let the peer modify its own project.
-  askproject <target> -c "<follow-up>"    Continue the last conversation with
-                                          that target (resumes its session).
-  askproject targets [--json]              List targets you've talked to (this
-                                          project) + their last session. Add
-                                          --json for machine-readable output.
-  askproject profiles                      List every profile in sight (JSON):
-                                          name, where it comes from, and the
-                                          same-named files it shadows.
-  askproject profiles show <name>          Print the file <name> resolves to,
-                                          verbatim, to copy and edit.
-  askproject help                          Print this document.
-
+_HELP_TARGET = """\
 <target> is a path to the other project: absolute, ~-expanded, or relative to
 your cwd. YOU decide which project to talk to and pass its path. It must be a
 directory (a git repo is strongly recommended — see snapshots below), and it
@@ -55,8 +93,9 @@ must not be your OWN project root: that call is refused before any peer starts,
 because you already stand there with the context loaded and a peer would only
 re-read what you can read yourself. A subdirectory of your project, and a git
 worktree of your repository at another path, are other projects and are fine.
+"""
 
-────────────────────────────────────────────────────────────────────────────
+_HELP_COMPILED = """\
 COMPILED PROJECT CONTEXT
   Some targets do not author the file the peer reads — a tool compiles it from
   that project's own sources. The peer then reads the snapshot sitting on disk
@@ -67,8 +106,9 @@ COMPILED PROJECT CONTEXT
   is — a fact, not a verdict: a build legitimately leaves an unchanged file
   alone, so older does not mean behind. Run the target's own build yourself
   before asking when the difference matters.
+"""
 
-────────────────────────────────────────────────────────────────────────────
+_HELP_MODES = """\
 MODES
   read  (default;   Research. The engine's read profile, claude-read or
         --read)     codex-read, holds the peer to reading by instruction alone:
@@ -97,8 +137,9 @@ MODES
   way — a read call that changed the target returns ok=false. A peer started
   while you run under CAPABILITIES_READ_ONLY carries the switch whatever its
   profile.
+"""
 
-────────────────────────────────────────────────────────────────────────────
+_HELP_PROFILES = """\
 PROFILES
   A profile is a TOML file, <name>.toml, holding one callva-harness-runner
   profile: a top-level `harness = "claude"` or `harness = "codex"`, and that
@@ -149,7 +190,9 @@ PROFILES
   the peer name on claude; the --schema as codex's output schema. The peer
   starts in the target with CLAUDE_PROJECT_DIR naming it, and without the
   caller's envelope handoff or ingress worker keys.
+"""
 
+_HELP_OVERRIDES = """\
 OVERRIDES
   --model, --effort and --timeout override the chosen profile's values for the
   engine that runs, and so do their environment variables. Each resolves in
@@ -174,8 +217,9 @@ OVERRIDES
 
   On claude the `haiku`/`sonnet`/`opus` aliases resolve to known-good full ids;
   on codex a model is passed verbatim. --effort takes low|medium|high|xhigh|max.
+"""
 
-────────────────────────────────────────────────────────────────────────────
+_HELP_SESSIONS = """\
 SESSION CONTINUITY  (state belongs to the project you call from)
   The map of "which target → which session" lives in the table
   askproject_sessions of the calling project's PostgreSQL database: the first
@@ -207,8 +251,9 @@ SESSION CONTINUITY  (state belongs to the project you call from)
   name are announced on stderr as the run begins, because stdout carries the
   result only once the process exits. codex reports its own thread id when it
   is done, and takes no name.
+"""
 
-────────────────────────────────────────────────────────────────────────────
+_HELP_OUTPUT = """\
 OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   {
     "ok": bool, "error": str|null,
@@ -235,7 +280,9 @@ OUTPUT  (stdout = one JSON object; use --text to get just the answer)
   commands, command output, reasoning, and the final answer. This keeps stdout
   machine-parseable while letting an invoking agent see that work is moving.
   Pass --quiet to suppress these updates for callers that require silent stderr.
+"""
 
+_HELP_FLAGS = """\
 FLAGS
   --engine <claude|codex>  Which peer engine to spawn (default: claude, or
                         $ASKPROJECT_ENGINE): its read profile, or its act
@@ -279,44 +326,137 @@ FLAGS
                         target's basename plus the session's own prefix, which
                         is what keeps two peers in one target from sharing a
                         name. A claude-engine control; codex refuses it.
+"""
 
+_HELP_EXAMPLES = """\
 EXAMPLES
   askproject ../shop "Which file defines the pricing taxonomy?"
   askproject ~/dev/api --act "Add a --json flag to the export command"
   askproject ../shop -c "And where is it consumed?"
   askproject ../shop --engine codex "Trace the checkout flow end to end"
-
-────────────────────────────────────────────────────────────────────────────
-CONTRACT  (self-description an agent loads on demand; this capability has NO
-           connections — it drives the local `claude`/`codex` CLI, no creds)
-  askproject doctor        Readiness — reports which engine CLIs are on PATH
-                           and whether the session store can be used.
-  askproject stub          One-line awareness text.
-  askproject manifest      Machine-readable declaration (JSON).
-  askproject guide [topic] How-to guides — none ship; the menu is empty.
-  askproject ids …         Project identifier store (list/get/set/rm).
-  askproject refs          Project references menu.
-  askproject inventory [--network]
-                           What this capability holds in this project
-                           (--network adds remote detail).
-  askproject migrate [status]
-                           Apply the session map's pending steps to the
-                           machine's store; `status` reports where its
-                           tables stand, without a lock, changing nothing.
-  askproject connections   Connections report — empty; this capability has none.
 """
 
-import argparse
-import json
-import os
-import shutil
-import socket
-import subprocess
-import sys
-import time
-import uuid
-from pathlib import Path
-from typing import NoReturn
+_HELP_ASK = """\
+askproject <target> "<question>" [--read | --act] [--engine claude|codex]
+           [--profile <name>] [--model <m>] [--effort <level>]
+           [--timeout <seconds>] [--schema <file|json>] [--append <text>]
+           [--name <name>] [--text] [--quiet]
+askproject <target> -c "<follow-up>" [--read | --act] [--fork] [the flags above]
+
+  The asking form. It has no verb word - the first argument is the target -
+  and `askproject help ask` is its page.
+
+  askproject <target> "<question>"        Ask the peer (read-only research).
+  askproject <target> --act "<task>"      Let the peer modify its own project.
+  askproject <target> -c "<follow-up>"    Continue the last conversation with
+                                          that target (resumes its session).
+"""
+
+_HELP_ASK_EXIT = """\
+EXIT CODES
+  0  the peer answered (ok true); in read mode it changed nothing.
+  1  ok false: the peer reported an error, or a read call changed the target;
+     or the call was refused or failed - <target> not a directory or your own
+     project root, contradictory or refused flags or values, no session to
+     continue, the engine CLI not on PATH, a profile the library refuses, the
+     peer failed or timed out. Under JSON output the refusal is
+     {"ok": false, "error": "<message>"} on stdout; with --text it is one line
+     on stderr.
+  2  the arguments do not parse (usage on stderr).
+  4  policy: askproject is not enabled in this project, or --act under
+     CAPABILITIES_READ_ONLY (read_only_switch). Ask the user; never lift a
+     gate yourself.
+  5  the session store does not answer.
+  6  store_not_configured (no store), or a store setting the store refuses.
+"""
+
+HELP_VERBS = {
+    "ask": "\n".join((_HELP_ASK, _HELP_ENGINES, _HELP_TARGET, _HELP_COMPILED,
+                      _HELP_MODES, _HELP_PROFILES, _HELP_OVERRIDES, _HELP_SESSIONS,
+                      _HELP_OUTPUT, _HELP_FLAGS, _HELP_ASK_EXIT, _HELP_EXAMPLES)),
+    "targets": """\
+askproject targets [--json]
+
+  List targets you've talked to (this project) + their last session. Add
+  --json for machine-readable output.
+
+  Output: without --json, plain text: each target's path, then indented its
+  last_session, engine, model, effort, interactions and last_used (UTC), or
+  "no targets recorded for this project" when there are none. With --json,
+  {"targets": [{target, last_session_id, engine, model, effort, profile,
+  interactions, last_used_at?, last_used_iso?}]}, last_used_at in epoch
+  seconds and last_used_iso its UTC ISO 8601 form, each where recorded.
+
+  Exit codes: 0; 4 policy - not enabled in this project; 5 the session store
+  does not answer; 6 store_not_configured, or a store setting the store
+  refuses.
+
+  Example: askproject targets --json
+
+""" + _HELP_SESSIONS,
+    "profiles": """\
+askproject profiles
+askproject profiles show <name>
+
+  askproject profiles                      List every profile in sight (JSON):
+                                           name, where it comes from, and the
+                                           same-named files it shadows.
+  askproject profiles show <name>          Print the file <name> resolves to,
+                                           verbatim, to copy and edit.
+
+  Output: `profiles` prints {"profiles": [{name, source, path, harness,
+  shadows}], "lookup": [{source, dir}]}, the lookup naming where a name is
+  looked for, in order. `profiles show` prints a comment line naming the
+  file's source and path, then the file.
+
+  Exit codes: 0; 1 the harness library is not importable; 3 not_found for a
+  name no profile answers; 6 input for a usage error or a profile the library
+  refuses.
+
+  Example: askproject profiles show claude-read
+
+""" + _HELP_PROFILES,
+    "profiles show": """\
+askproject profiles show <name>
+
+  Print the file <name> resolves to, verbatim, to copy and edit: a comment
+  line naming its source and path, then the file. A name is found as PROFILES
+  below states.
+
+  Exit codes: 0; 1 the harness library is not importable; 3 not_found for a
+  name no profile answers, with the hint that `askproject profiles` lists the
+  ones that exist; 6 input for a usage error (exactly one name) or a profile
+  the library refuses.
+
+  Example: askproject profiles show codex-read
+
+""" + _HELP_PROFILES,
+    "doctor": """\
+  askproject's readiness: which engine CLIs are on PATH and whether the
+  session store can be used. It takes no connection - askproject has none.
+  ok requires the default engine (ASKPROJECT_ENGINE's, else claude) on PATH
+  and the store; either engine covers its own --engine calls.
+
+  Output: {ok, engines: {claude, codex}, each the CLI's path or null,
+  default_engine, store, the store setting that answered, store_error:
+  {code, message, hint?} or null, error}. Exit codes: 0 ready; 2 not ready -
+  the default engine is not on PATH or the session store cannot be used.
+
+  Example: askproject doctor
+""",
+    "connections": """\
+  askproject has NO connections — it drives the local `claude`/`codex` CLI,
+  no creds — so the report is empty.
+""",
+    "guide": """\
+  askproject ships no guides; the menu is empty.
+""",
+    "migrate": """\
+  askproject's tables are the session map, askproject_sessions: `migrate`
+  applies the session map's pending steps to the machine's store; `status`
+  reports where its tables stand, without a lock, changing nothing.
+""",
+}
 
 # --- Capability declaration — one home for every contract fact ---------------
 
@@ -1888,7 +2028,7 @@ def main():
     _gate()              # disabled in this project → exit 4
     _contract(argv)      # stub/manifest/guide/ids/refs/connections → emit + exit; else return
     if not argv or argv[0] in ("help", "-h", "--help"):
-        print(__doc__)
+        _cmd_help()
         return
     if argv[0] == "doctor":
         cmd_doctor()

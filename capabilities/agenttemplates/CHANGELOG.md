@@ -1,5 +1,9 @@
 # agenttemplates — change log
 
+## 2026-11-21 — `agenttemplates help` is the menu, and `agenttemplates help <verb>` one verb's whole contract
+
+`agenttemplates help` is the short complete menu of SHEBANG.md, "Agent-first help is the surface": what the templates are and where the manager reads them, `doctor`, `list` and `show` each on one line, the I/O and the exit codes, then the contract verbs the library renders, with no flag on any line. `agenttemplates help <verb>` prints that verb's whole contract from `HELP_VERBS` - what it does, its output, its exit codes and an example - and an unknown verb exits 6 `unknown_verb` with nothing on stdout and the hint to run `agenttemplates help`. The paragraph naming the manager's `init --with-template` and `init --template` moved verbatim to the `list` and `show` pages; `help doctor` follows the library's page with what this doctor checks, that it takes no arguments, and its exit 1 for a missing templates folder; the contract commands are the library's own pages. The capability binds `capabilities-contract` 0.50 or later, which dispatches the layered help. No verb, flag, JSON key, output or exit code changes.
+
 ## 2026-11-16 — `agenttemplates` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Шаблоны агентов, and Estonian (`et`), Agendimallid, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.

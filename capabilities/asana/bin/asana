@@ -3,307 +3,101 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
 asana — agent-first CLI for Asana projects & tasks.
 
-This tool is designed to be invoked by agents. Run `asana help` to load
-the full usage contract on demand — do not rely on memorised knowledge of
-its surface.
+This tool is designed to be invoked by agents. Run `asana help` to load this
+menu and `asana help <verb>` for one verb's whole contract, on demand — do not
+rely on memorised knowledge of its surface. Run `asana doctor` first.
 
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. Its ASANA_TOKEN (an Asana Personal Access Token) is
-  resolved through the credential cascade (`Where a secret resolves`, at
-  the end of this help). Never pass the token on the command line.
+One connection is one Asana identity: its Personal Access Token resolves
+through the credential cascade and never travels on the command line. An
+explicit connections registry is required, even for one connection; how a
+connection is declared and selected, and how to act as another identity, is
+CONNECTIONS, on `asana help connections`. A WRITE verb is refused (exit 4) on
+a read-only connection. A task, project, workspace or user reference takes a
+bare GID or a full Asana URL. Project and workspace ids that are stable for a
+repo belong in that repo's own reference file, not here.
 
-  A project that acts as several Asana identities declares them as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": { "secret_env": "ASANA_<ID>_TOKEN", "allow_write": true }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
+Account
+  whoami                          confirm the token and its identity
+  workspaces                      the workspaces the token sees
+  users                           the users in a workspace
 
-  The entry names the env var holding its PAT ("secret_env"); the value
-  resolves through the cascade above. "allow_write": false makes the
-  connection read-only: every mutating verb exits 4, and no flag lifts
-  the gate. Writes default to allowed (a workspace the consumer owns).
+Projects
+  projects                        the projects in a workspace
+  project-create                  WRITE. create a project in a workspace
+  project-add-member <p> <user>   WRITE. add a member, so it is in their sidebar
 
-  Selection: --connection <id> (accepted anywhere on the command line).
-  Unflagged, the registry's "default" pointer applies, else the sole entry;
-  several entries without a pointer is refused as ambiguous.
+Tasks
+  tasks                           a project's tasks, incomplete only by default
+  task <task>                     one task in full, with its section membership
+  task-context <task>             the task and everything adjacent, one envelope
+  create                          WRITE. create a task, or a dual-member subtask
+  update <task>                   WRITE. change fields on an existing task
+  complete <task>                 WRITE. complete (or reopen), with the roll-up
+  subtasks <parent>               a parent's subtasks: are all children done?
+  deliverable                     WRITE. a human request + its dependent agent task
 
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
+Comments and followers
+  comment <task>                  WRITE. add a comment, markdown made rich text
+  comments <task>                 the most recent comments, from the full thread
+  follower-add <task> <user>...   WRITE. subscribe users: what notifies them
+  follower-remove <task> <user>...  WRITE. unsubscribe users
 
-Global option (accepted after any subcommand):
-  --token-env <KEY>   Act as a different identity by naming the env/cred KEY
-                      that holds the PAT (default ASANA_TOKEN; with a registry
-                      connection it overrides that entry's secret_env). The
-                      value never touches the command line — only the key name.
-                      Drop the alternate PAT in the env/credentials (e.g.
-                      ASANA_ALT_TOKEN=…) and pass --token-env ASANA_ALT_TOKEN
-                      to comment/operate as that user (e.g. posting a
-                      teammate's reply on their behalf). It never lifts a
-                      connection's write gate.
+Tags (the claim/status labels)
+  tags                            a workspace's tags, name + gid
+  tag-create                      WRITE. create a tag in a workspace
+  tag-add <task> <tag>            WRITE. add a tag to a task
+  tag-remove <task> <tag>         WRITE. remove a tag from a task
 
-Commands:
-  asana help                                  Print this document.
-  asana connections                           Where every connection's values
-                                              resolve from (tier, source,
-                                              secrets masked). Local only.
-  asana doctor [--connection <id>]            Health check — resolve token,
-                                              confirm identity, list
-                                              workspaces — every connection,
-                                              or one.
+Machine state (the API-only, UI-invisible `external` field)
+  external-get <task>             read a task's external {gid, data}
+  external-set <task>             WRITE. set external gid and/or data, merged
+  external-find <gid>             the task carrying an external gid: dedup check
 
-Contract commands (the same on every capability):
-  asana stub                                  One-line awareness text.
-  asana manifest --json                       Machine-readable declaration.
-  asana guide [<topic>]                       Guide topics / one guide body,
-                                              fetched live from the docs base.
-  asana ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope
-        [--note <text>]                       (capabilities/asana/identifiers.json,
-                                               or store rows once the agent moved).
-  asana refs                                  Menu of the project's reference
-                                              files for this capability.
-  asana inventory [--network]                 What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
-  asana whoami                                Confirm token + identity.
-  asana workspaces                            List workspaces the token sees.
-  asana users [--workspace GID]               List users in a workspace.
-  asana projects [--workspace GID]            List projects in a workspace.
-  asana project-create --name NAME            Create a project in a workspace.
-        [--workspace GID] [--notes TEXT]
-  asana project-add-member <project> <user>   Add a member to a project (so
-                                              they see it in their sidebar).
-  asana tasks --project P [--all] [--limit N] List tasks in a project
-        [--with-state] [--with-notes]         (incomplete only unless --all).
-                                              --with-state adds tags + external +
-                                              section membership (the runner reads
-                                              task state in one list call).
-                                              --with-notes adds each task's body —
-                                              one call to dedup a board by full text.
-  asana task <task> [--with-subtasks]         Show one task in full (incl. its
-        [--with-deps]                         section membership); the flags attach
-                                              its subtasks and/or its dependencies +
-                                              dependents inline.
-  asana task-context <task> [--json]          One call → the task plus everything
-                                              adjacent: description, comment
-                                              thread, attachment pointers,
-                                              dependencies one level deep (each
-                                              with its own description, thread,
-                                              attachments), dependents as state
-                                              lines. Emits a prompt-ready
-                                              markdown envelope stamped with its
-                                              assembly time (UTC); --json emits
-                                              the same tree structured. Built for
-                                              dispatch engines that hand a worker
-                                              its context instead of having it
-                                              discover the task by hand.
-  asana create --name NAME --project P [...]  Create a task.
-        [--project P ...]                     Add to more projects (repeatable).
-        [--notes TEXT|-] [--assignee GID]     --notes '-' reads the body from
-        [--follower GID ...] [--due-on DATE]  stdin (use for multi-line prompts —
-        [--due-at ISO8601]                    avoids the two-shell-layer quoting
-        [--external-gid STR]                  footgun). --external-gid sets the
-        [--external-data STR]                 dedup key (unique → duplicate
-        [--section GID]                        create returns 400). --section
-        [--parent GID] [--plain] [--html]      places the task in a board column
-                                              (needs exactly one --project). Due
-                                              date+time UTC; not both due flags.
-                                              --parent makes it a SUBTASK while
-                                              keeping section membership (dual-
-                                              membership), so the pickup pipeline
-                                              still sees it. Use for fan-out.
-                                              --notes is converted markdown ->
-                                              Asana's rich-text subset by default
-                                              (Asana does NOT render raw markdown);
-                                              --plain stores literal text, --html
-                                              if it's already Asana-subset HTML.
-  asana comment <task> [--text TEXT|-]        Add a comment (story) to a task.
-        [--mention GID ...]                   @mention users (sends rich text
-        [--plain] [--html]                    so they get notified). Markdown is
-                                              converted to Asana's comment rich-
-                                              text subset by default (Asana does
-                                              NOT render raw markdown). --plain
-                                              posts literal text; --html if the
-                                              body is already Asana-subset HTML.
-  asana comments <task> [--limit N]           List a task's comment stories
-                                              (text + created_at + author gid):
-                                              the N most recent, in chronological
-                                              order, from a walk of the FULL
-                                              story thread. The "did they reply?"
-                                              read for the HITL resume check.
-  asana follower-add <task> <user> [<user>…]  Subscribe users to a task (Asana
-                                              `addFollowers`). This is what
-                                              actually NOTIFIES them — adding a
-                                              collaborator sends an "added you"
-                                              notification, whereas a comment
-                                              @mention does NOT (it neither
-                                              notifies nor follows via the API).
-                                              To reliably reach someone: follower-add
-                                              them, then comment. <user> is a gid/URL.
-  asana follower-remove <task> <user> […]     Unsubscribe users from a task
-                                              (Asana `removeFollowers`).
-  asana complete <task> [--reopen]            Mark a task complete (or reopen).
-        [--force] [--no-rollup]               REFUSES (exit 7) if the task has
-                                              open dependencies — pass --force to
-                                              override. On success it cascades:
-                                              auto-completes any parent whose
-                                              subtasks are now all done (recursing
-                                              up), and reports dependents this
-                                              just unblocked. --no-rollup skips
-                                              the cascade.
-  asana update <task> [--name N] [--notes T]  Update fields on an existing task.
-        [--due-on YYYY-MM-DD] [--due-at ISO]  --due-at carries time-of-day;
-        [--assignee GID] [--plain] [--html]   do not pass both due flags. --notes
-                                              takes inline text, a file, or '-'
-                                              (stdin) and is converted markdown ->
-                                              rich text by default; --plain /
-                                              --html as for create / comment.
-  asana tags [--workspace GID]                List tags in a workspace (name+gid;
-                                              resolve a status label to its gid).
-  asana tag-create --name NAME                Create a tag in a workspace.
-        [--workspace GID]
-  asana tag-add <task> <tag>                  Add a tag (the claim/status label)
-                                              to a task. <tag> is a gid.
-  asana tag-remove <task> <tag>               Remove a tag from a task.
-  asana external-get <task>                   Read the API-only `external`
-                                              field ({gid, data}) — UI-invisible
-                                              machine-state home. Null if unset.
-  asana external-set <task>                   Set external.gid and/or
-        [--gid STR] [--data STR|-]            external.data (read-merge-write so
-                                              the other key is preserved). --data
-                                              accepts inline, a file, or '-'.
-  asana external-find <gid>                   Resolve the task carrying this
-                                              external.gid (O(1) point lookup via
-                                              Asana's `external:` addressing) —
-                                              the deterministic dedup check. Task
-                                              JSON on a hit, `null` + exit 0 on a
-                                              miss (absence is not an error).
-  asana sections --project P                  List a project's sections (board
-                                              columns; name+gid).
-  asana section-create --project P            Create a section in a project.
-        --name NAME
-  asana section-move <task> <section>         Move a task into a section (the
-                                              visible status column). The section
-                                              must belong to a project the task
-                                              is in. <section> is a gid.
-  asana section-tasks <section>               List tasks currently in a section.
-        [--limit N] [--with-state]            Section-scoped — the reliable read
-                                              for "what's in the Ready column?"
-                                              (the project task-list lags tags /
-                                              external / memberships; this does
-                                              not). --with-state adds tags +
-                                              external + section membership.
-  asana subtasks <parent>                     List a parent task's subtasks.
-        [--limit N] [--with-state]            The roll-up read for fan-out: are
-                                              all children complete? (Subtasks
-                                              have no project/section unless added
-                                              via `create --parent` dual-member.)
-  asana deps <task> [--dependents]            List what <task> depends on (or, with
-                                              --dependents, what depends on it).
-  asana dep-add <task> --on GID [--on ...]    Mark <task> as depending on each --on
-                                              task. ADVISORY only — Asana warns but
-                                              does not hard-block completion.
-  asana dep-remove <task> --on GID [...]      Remove dependency links from <task>.
-  asana deliverable                           Atomically emit a human-owned REQUEST
-        --request-name N --request-notes T    + its dependent agent task (the
-        --agent-name N --agent-notes T        contract's fan-out pair for a human
-        --supervisor GID --agent GID          deliverable). The request is assigned
-        --project GID --waiting GID           to + @mentions --supervisor and is born
-        [--parent GID] [--actor A]            in Waiting; the dependent task is
-        [--request-gid K] [--agent-gid K]     assigned to --agent, born in Waiting, and
-        [--request-plain] [--agent-plain]     DEPENDS ON the request. Completing the
-                                              request clears the dependency, so the
-                                              runner resumes the dependent (pickup
-                                              §2b). One call → a request can never be
-                                              created without its agent half. --parent
-                                              makes the agent task a subtask (roll-up);
-                                              --request-gid/--agent-gid are external
-                                              dedup keys (idempotent retry). Notes T =
-                                              inline | file path | '-' (stdin); at most
-                                              one '-'.
-  asana attach <task> [FILE]                  Attach a local FILE to a task
-        [--url LINK] [--name NAME]            (multipart upload), or --url LINK
-                                              for an external link attachment.
-                                              --name overrides the display name.
-                                              Use to enrich a task with a doc /
-                                              PDF / markdown while working it.
-  asana attachments <task>                    List a task's attachments (gid,
-                                              name, subtype, size, permanent_url).
-  asana attachment <attachment>               Show one attachment's metadata
-                                              (incl. download_url). <attachment>
-                                              is an attachment GID.
-  asana download <attachment> [--out PATH]    Download a file attachment to disk
-                                              (default: its name in cwd). Errors
-                                              on external (link) attachments.
-  asana attachment-delete <attachment> --yes  Delete an attachment. IRREVERSIBLE
-                                              — refuses without --yes (the gate;
-                                              confirm with the human first).
-  asana webhooks [--workspace GID]            List webhooks (defaults to the token's
-        [--resource GID]                      first workspace; --resource filters to
-                                              one watched resource).
-  asana webhook <webhook>                     Show one webhook (target, active,
-                                              filters, last success/failure).
-  asana webhook-create --resource P           Register a webhook on a project/task
-        --target URL [--filter F ...]         delivering to the public HTTPS URL.
-                                              Asana runs the X-Hook-Secret handshake
-                                              against --target synchronously inside
-                                              this call — the target must answer 200
-                                              and echo the secret or the create is
-                                              rejected (a failed handshake surfaces as
-                                              exit 6 invalid_request; check the target
-                                              answers 200 and echoes X-Hook-Secret).
-                                              --filter is repeatable, form
-                                              resource_type:action[:fields] (e.g.
-                                              task:changed:assignee  task:added
-                                              story:added); omit for all events.
-  asana webhook-delete <webhook> --yes        Delete a webhook. IRREVERSIBLE (stops
-                                              event delivery) — refuses without --yes
-                                              (the gate; confirm with the human first).
+Board sections (the visible status columns)
+  sections                        a project's sections, name + gid
+  section-create                  WRITE. create a section in a project
+  section-move <task> <section>   WRITE. move a task into a section
+  section-tasks <section>         the tasks in a section now: the reliable read
 
-References:
-  <task>, --project, --workspace, --assignee, --follower, --mention all
-  accept a bare GID (numeric id) OR a full Asana URL — the trailing numeric
-  id is extracted from URLs automatically.
+Dependencies
+  deps <task>                     what a task depends on, or what depends on it
+  dep-add <task>                  WRITE. make a task depend on others (advisory)
+  dep-remove <task>               WRITE. remove dependency links from a task
 
-Input:
-  `comment --text` accepts inline text, "-" for stdin, or omit it to read
-  stdin. Project/workspace ids that are stable for a repo belong in that
-  repo's own reference file, not here.
+Attachments
+  attach <task> [FILE]            WRITE. attach a local file or an external link
+  attachments <task>              a task's attachments
+  attachment <attachment>         one attachment's metadata
+  download <attachment>           download a file attachment to disk
+  attachment-delete <attachment>  WRITE. delete an attachment; irreversible
 
-I/O contract:
-  - Success: JSON on stdout, exit 0.
-  - Error:   {"error": {"code", "message", "hint", "status"}} on stderr,
-             non-zero exit.
+Webhooks
+  webhooks                        the webhooks in a workspace
+  webhook <webhook>               one webhook: target, active, filters, health
+  webhook-create                  WRITE. register a webhook (live handshake)
+  webhook-delete <webhook>        WRITE. delete a webhook; irreversible
 
-Exit codes:
+I/O
+  Success is JSON on stdout, exit 0 (`task-context` prints markdown unless
+  asked for JSON). An error is {"error": {"code", "message", "hint",
+  "status"}} on stderr, non-zero exit.
+
+Exit codes
   0  success
   2  auth (unauthorized / forbidden / missing credentials)
   3  not found
-  4  policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
-     verb, or a write verb on a read-only connection (allow_write: false).
-     Ask the user; never lift a gate yourself.
+  4  policy refusal: the project gate (store rows once the agent moved, else
+     capabilities/settings.json) on any verb, or a write verb on a read-only
+     connection (allow_write: false). Ask the user; never lift a gate yourself.
   5  server / network (5xx, timeout, rate-limit exhausted)
   6  input / validation
-  7  blocked (task has open dependencies; see `complete`)
-
-Notes:
-  - @mentions: Asana only delivers a notification when the mention is sent
-    as rich text. `comment --mention <gid>` builds the html_text for you;
-    adding the user as a task --follower also surfaces it to them.
-  - Listing is single-page (uses --limit, default 100). There is no
-    automatic pagination yet; raise --limit or filter by project.
+  7  blocked (task has open dependencies; see `asana help complete`)
 """
 
 import argparse
@@ -318,6 +112,744 @@ from pathlib import Path
 from typing import NoReturn
 
 import httpx
+
+# The verb pages `asana help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which an entry here for doctor, connections or ids follows. A text
+# several verbs share is one constant, added to each of their pages.
+_HELP_TAIL = """
+References
+  <task>, --project, --workspace, --assignee, --follower, --mention all
+  accept a bare GID (numeric id) OR a full Asana URL — the trailing numeric
+  id is extracted from URLs automatically. A reference no GID can be
+  extracted from exits 6 bad_reference.
+
+Global options (accepted anywhere on the command line, after any subcommand)
+  --connection <id>   Select the connection; unflagged, the registry's
+                      "default" pointer applies, else the sole entry
+                      (`asana help connections`).
+  --token-env <KEY>   Act as a different identity by naming the env/cred KEY
+                      that holds the PAT (default ASANA_TOKEN; with a registry
+                      connection it overrides that entry's secret_env). It
+                      never lifts a connection's write gate; a KEY that
+                      resolves nowhere exits 2 missing_token
+                      (`asana help connections`).
+
+I/O contract
+  - Success: JSON on stdout, exit 0.
+  - Error:   {"error": {"code", "message", "hint", "status"}} on stderr,
+             non-zero exit. Arguments the parser refuses (a missing required
+             flag, an unknown option) exit 2 with its usage on stderr.
+
+Exit codes
+  0  success
+  2  auth (unauthorized / forbidden / missing credentials)
+  3  not found
+  4  policy refusal — the project gate (store rows once the agent moved, else
+     capabilities/settings.json) on any verb, or a write verb on a read-only
+     connection (allow_write: false). Ask the user; never lift a gate yourself.
+  5  server / network (5xx, timeout, rate-limit exhausted)
+  6  input / validation
+  7  blocked (task has open dependencies; see `complete`)
+"""
+_HELP_WRITE = """
+  WRITE: refused with exit 4 on a read-only connection (allow_write: false);
+  no flag lifts the gate.
+"""
+_HELP_SINGLE_PAGE = """
+  Listing is single-page (uses --limit, default 100). There is no automatic
+  pagination yet; raise --limit or filter by project.
+"""
+_HELP_RICH_TEXT = """
+  Markdown is converted to Asana's rich-text subset by default (Asana does
+  NOT render raw markdown): --plain stores literal text, --html takes a body
+  that is already Asana-subset HTML (--html wins when both are given).
+"""
+_HELP_MENTIONS = """
+  @mentions: Asana only delivers a notification when the mention is sent as
+  rich text. `comment --mention <gid>` builds the html_text for you; adding
+  the user as a task --follower also surfaces it to them. A comment @mention
+  sent through the API neither notifies nor follows reliably: to reliably
+  reach someone, `follower-add` them, then comment.
+"""
+_HELP_STATE = """
+  --with-state adds tags + external + section membership (the runner reads
+  task state in one list call).
+"""
+HELP_VERBS = {
+    'doctor': """\
+  asana doctor answers the health check: it resolves the token, confirms the
+  identity and lists the workspaces - for every connection bare, or the one
+  --connection names. --token-env <KEY> checks the PAT under that key
+  instead.
+  Outside any project, doctor is a machine read: it uses the machine's own
+  connections read-only, unless a grant switched one off.
+
+  Output: {ok, connections: {<id>: {ok: true, whoami, workspaces: [name]} |
+  {ok: false, error}}}. Exit 0 only when every examined connection is
+  healthy, else the first failure's category: 2 the token is missing or
+  refused, 5 Asana did not answer or answered badly, 6 a connection is
+  missing 'secret_env'.
+
+  Example: asana doctor --connection work
+""",
+    'connections': """\
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. Its ASANA_TOKEN (an Asana Personal Access Token) is resolved
+  through the credential cascade (`Where a secret resolves`, above). Never
+  pass the token on the command line.
+
+  A project that acts as several Asana identities declares them as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "ASANA_<ID>_TOKEN", "allow_write": true }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  The entry names the env var holding its PAT ("secret_env"); the value
+  resolves through the cascade above. "allow_write": false makes the
+  connection read-only: every mutating verb exits 4, and no flag lifts the
+  gate. Writes default to allowed (a workspace the consumer owns).
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use
+  the machine's own connections read-only, unless a grant switched one off;
+  every other verb that needs a connection is refused there.
+
+  Global option (accepted after any subcommand):
+  --token-env <KEY>   Act as a different identity by naming the env/cred KEY
+                      that holds the PAT (default ASANA_TOKEN; with a registry
+                      connection it overrides that entry's secret_env). The
+                      value never touches the command line — only the key name.
+                      Drop the alternate PAT in the env/credentials (e.g.
+                      ASANA_ALT_TOKEN=…) and pass --token-env ASANA_ALT_TOKEN
+                      to comment/operate as that user (e.g. posting a
+                      teammate's reply on their behalf). It never lifts a
+                      connection's write gate.
+
+  Example: asana connections
+""",
+    'ids': """\
+  For asana the envelope is capabilities/asana/identifiers.json, or store
+  rows once the agent moved.
+""",
+    'whoami': """\
+asana whoami
+
+  Confirm the token + identity: the user the PAT acts as.
+
+  Output: {gid, name, email, workspaces: [{gid, name}]}.
+
+  Example: asana whoami
+""" + _HELP_TAIL,
+    'workspaces': """\
+asana workspaces
+
+  List the workspaces the token sees.
+
+  Output: [{gid, name, is_organization}].
+
+  Example: asana workspaces
+""" + _HELP_TAIL,
+    'users': """\
+asana users [--workspace GID]
+
+  List users in a workspace.
+
+  --workspace GID   workspace GID or URL.
+
+  Output: [{gid, name, email}].
+
+  Example: asana users --workspace <WORKSPACE>
+""" + _HELP_TAIL,
+    'projects': """\
+asana projects [--workspace GID] [--limit N]
+
+  List projects in a workspace.
+
+  --workspace GID   workspace GID or URL.
+  --limit N         at most N projects (default 100).
+""" + _HELP_SINGLE_PAGE + """
+  Output: [{gid, name, archived, team: {name}}].
+
+  Example: asana projects --workspace <WORKSPACE>
+""" + _HELP_TAIL,
+    'project-create': """\
+asana project-create --name NAME [--workspace GID] [--notes TEXT]
+
+  Create a project in a workspace.
+
+  --name NAME       the project's name (required).
+  --workspace GID   workspace GID or URL.
+  --notes TEXT      the project's description, as literal text.
+""" + _HELP_WRITE + """
+  Output: {gid, name, permalink_url, workspace: {name}}.
+
+  Example: asana project-create --name "Launch" --workspace <WORKSPACE>
+""" + _HELP_TAIL,
+    'project-add-member': """\
+asana project-add-member <project> <user>
+
+  Add a member to a project (so they see it in their sidebar). <project> and
+  <user> are each a GID or URL.
+""" + _HELP_WRITE + """
+  Output: the project {gid, name, members: [{gid, name}]}.
+
+  Example: asana project-add-member <PROJECT> <USER>
+""" + _HELP_TAIL,
+    'tasks': """\
+asana tasks --project P [--all] [--limit N] [--with-state] [--with-notes]
+
+  List tasks in a project (incomplete only unless --all).
+
+  --project P      project GID or URL (required).
+  --all            include completed tasks.
+  --limit N        at most N tasks (default 100).
+  --with-state     include tags + external + section membership.
+  --with-notes     adds each task's body — one call to dedup a board by full
+                   text.
+""" + _HELP_STATE + _HELP_SINGLE_PAGE + """
+  Output: [{gid, name, completed, assignee: {gid, name}, due_on}], each with
+  tags, external and memberships [{project, section}] under --with-state and
+  notes under --with-notes.
+
+  Example: asana tasks --project <PROJECT> --with-state
+""" + _HELP_TAIL,
+    'task': """\
+asana task <task> [--with-subtasks] [--with-deps]
+
+  Show one task in full (incl. its section membership); the flags attach its
+  subtasks and/or its dependencies + dependents inline.
+
+  --with-subtasks   attach the task's subtasks (name/completed/completed_at).
+  --with-deps       attach the task's dependencies + dependents.
+
+  Output: {gid, name, notes, completed, completed_at, assignee: {name},
+  due_on, due_at, projects: [{name}], followers: [{name}], permalink_url,
+  created_at, modified_at, memberships: [{project, section}]}, plus
+  subtasks: [...] under --with-subtasks and dependencies: [...] and
+  dependents: [...] under --with-deps.
+
+  Example: asana task <TASK> --with-deps
+""" + _HELP_TAIL,
+    'task-context': """\
+asana task-context <task> [--json]
+
+  One call → the task plus everything adjacent: description, comment thread,
+  attachment pointers, dependencies one level deep (each with its own
+  description, thread, attachments), dependents as state lines. Emits a
+  prompt-ready markdown envelope stamped with its assembly time (UTC); --json
+  emits the same tree structured. Built for dispatch engines that hand a
+  worker its context instead of having it discover the task by hand.
+  Verbatim and complete by design: descriptions and comments are never
+  truncated; attachments are pointers (gid · name · uploaded), never content;
+  a blocker's own blockers are out of scope.
+
+  --json   emit the assembled tree as JSON instead of markdown.
+
+  Output: markdown on stdout by default; with --json {assembled_at, task},
+  the task carrying comments, attachments, dependencies (each with its own
+  comments and attachments) and dependents.
+
+  Example: asana task-context <TASK>
+""" + _HELP_TAIL,
+    'create': """\
+asana create --name NAME --project P [--project P ...] [--notes TEXT|-]
+             [--assignee GID] [--follower GID ...] [--due-on DATE]
+             [--due-at ISO8601] [--external-gid STR] [--external-data STR]
+             [--section GID] [--parent GID] [--plain] [--html]
+
+  Create a task.
+
+  --name NAME           the task's name (required).
+  --project P           project GID or URL (required); repeat it to add the
+                        task to more projects.
+  --notes TEXT|-        the description; '-' reads the body from stdin (use
+                        for multi-line prompts — avoids the two-shell-layer
+                        quoting footgun).
+  --assignee GID        assignee GID or URL.
+  --follower GID        follower GID or URL (repeatable).
+  --due-on DATE         YYYY-MM-DD.
+  --due-at ISO8601      ISO8601 UTC datetime, e.g. 2026-05-30T16:00:00.000Z.
+                        Due date+time UTC; not both due flags (exit 6
+                        conflicting_due).
+  --external-gid STR    sets the dedup key (globally unique → a duplicate
+                        create returns 400, exit 6 invalid_request).
+  --external-data STR   machine-state blob stored in the UI-invisible
+                        external field.
+  --section GID         places the task in a board column (needs exactly one
+                        --project, else exit 6 section_needs_one_project).
+  --parent GID          makes it a SUBTASK while keeping section membership
+                        (dual-membership: subtask of the parent AND a section
+                        member), so the pickup pipeline still sees it. Use for
+                        fan-out.
+  --plain               store --notes as literal text (no markdown conversion).
+  --html                --notes is already Asana-subset rich-text HTML.
+""" + _HELP_RICH_TEXT + _HELP_WRITE + """
+  Output: {gid, name, permalink_url, assignee: {name}, due_at, due_on,
+  external}.
+
+  Example: echo "Body" | asana create --name "Draft" --project <PROJECT> --notes -
+""" + _HELP_TAIL,
+    'update': """\
+asana update <task> [--name N] [--notes T] [--due-on YYYY-MM-DD] [--due-at ISO]
+             [--assignee GID] [--plain] [--html]
+
+  Update fields on an existing task. At least one field is required (exit 6
+  no_changes).
+
+  --name N              the new name.
+  --notes T             new description; takes inline text, a file path, or
+                        '-' (stdin).
+  --due-on YYYY-MM-DD   date only.
+  --due-at ISO          carries time-of-day: ISO8601 UTC datetime, e.g.
+                        2026-05-30T16:00:00.000Z. Do not pass both due flags
+                        (exit 6 conflicting_due).
+  --assignee GID        assignee GID or URL.
+  --plain / --html      as for create / comment.
+""" + _HELP_RICH_TEXT + _HELP_WRITE + """
+  Output: {gid, name, notes, due_on, due_at, assignee: {name}}.
+
+  Example: asana update <TASK> --due-on 2026-12-01
+""" + _HELP_TAIL,
+    'complete': """\
+asana complete <task> [--reopen] [--force] [--no-rollup]
+
+  Mark a task complete (or reopen). REFUSES (exit 7 blocked_by_dependencies)
+  if the task has open dependencies — pass --force to override. On success it
+  cascades: auto-completes any parent whose subtasks are now all done and
+  whose own dependencies are satisfied (recursing up), and reports dependents
+  this just unblocked (reported, not completed: unblocked is not done).
+
+  --reopen      mark incomplete instead.
+  --force       complete even if the task has open dependencies.
+  --no-rollup   skip the parent roll-up + unblocked-dependent report.
+""" + _HELP_WRITE + """
+  Output: {completed: {gid, name, completed, completed_at}, rolled_up?:
+  [{gid, name}], unblocked?: [{gid, name}]}; with --reopen the task {gid,
+  name, completed, completed_at}.
+
+  Example: asana complete <TASK>
+""" + _HELP_TAIL,
+    'subtasks': """\
+asana subtasks <parent> [--limit N] [--with-state]
+
+  List a parent task's subtasks. The roll-up read for fan-out: are all
+  children complete? (Subtasks have no project/section unless added via
+  `create --parent` dual-member.)
+
+  --limit N      at most N subtasks (default 100).
+  --with-state   include external + section membership.
+""" + _HELP_SINGLE_PAGE + """
+  Output: [{gid, name, completed, completed_at, assignee: {gid, name}}], with
+  external and memberships under --with-state.
+
+  Example: asana subtasks <TASK>
+""" + _HELP_TAIL,
+    'deliverable': """\
+asana deliverable --request-name N --request-notes T --agent-name N
+                  --agent-notes T --supervisor GID --agent GID --project GID
+                  --waiting GID [--parent GID] [--actor A] [--request-gid K]
+                  [--agent-gid K] [--request-plain] [--agent-plain]
+
+  Atomically emit a human-owned REQUEST + its dependent agent task (the
+  contract's fan-out pair for a human deliverable). The request is assigned
+  to + followed by + @mentions --supervisor and is born in Waiting; the
+  dependent task is assigned to --agent, born in Waiting, and DEPENDS ON the
+  request. Completing the request clears the dependency, so the runner
+  resumes the dependent (pickup §2b). One call → a request can never be
+  created without its agent half. Both tasks' external.data are stamped
+  {phase: "waiting", last_seen}, the request's with owner (the supervisor),
+  and both with actor where --actor is given. The @mention comment is posted
+  only when the request is created, so a retry does not stack pings.
+
+  --request-name N     title of the human-owned request task (required).
+  --request-notes T    request body (default '-').
+  --agent-name N       title of the dependent agent task (required).
+  --agent-notes T      dependent-task body (default '-').
+  --supervisor GID     assigned + followed + @mentioned on the request
+                       (required).
+  --agent GID          assigned the dependent task (required).
+  --project GID        board project GID or URL (required).
+  --waiting GID        Waiting section GID; both tasks are born here
+                       (required).
+  --parent GID         makes the agent task a subtask of this task (roll-up).
+  --actor A            actor string stamped into both tasks' external.data.
+  --request-gid K      external dedup key for the request (idempotent retry).
+  --agent-gid K        external dedup key for the agent task (idempotent
+                       retry). A key that already resolves a task reuses it.
+  --request-plain      store request notes as literal text (no markdown
+                       conversion).
+  --agent-plain        store agent notes as literal text (no markdown
+                       conversion).
+
+  Notes T = inline | file path | '-' (stdin); at most one '-' (both exit 6
+  two_stdin).
+""" + _HELP_WRITE + """
+  Output: {request: {...}, agent: {...}, dependency: {dependent, on}}.
+
+  Example: asana deliverable --request-name "Approve copy" --request-notes req.md --agent-name "Publish copy" --agent-notes - --supervisor <USER> --agent <AGENT_USER> --project <PROJECT> --waiting <SECTION>
+""" + _HELP_TAIL,
+    'comment': """\
+asana comment <task> [--text TEXT|-] [--mention GID ...] [--plain] [--html]
+
+  Add a comment (story) to a task.
+
+  --text TEXT|-     comment text: inline text, a file path, "-" for stdin, or
+                    omit it to read stdin.
+  --mention GID     @mention users (repeatable; sends rich text so they get
+                    notified). A mention with --plain still sends rich text,
+                    the body escaped.
+  --plain           post literal text (no markdown conversion).
+  --html            the body is already Asana-subset rich-text HTML.
+
+  Markdown is converted to Asana's comment rich-text subset by default (Asana
+  does NOT render raw markdown). --plain posts literal text; --html if the
+  body is already Asana-subset HTML.
+""" + _HELP_MENTIONS + _HELP_WRITE + """
+  Output: the story {gid, text, created_at, created_by: {name}}.
+
+  Example: asana comment <TASK> --text "Done, see attachment" --mention <USER>
+""" + _HELP_TAIL,
+    'comments': """\
+asana comments <task> [--limit N]
+
+  List a task's comment stories (text + created_at + author gid): the N most
+  recent, in chronological order, from a walk of the FULL story thread. The
+  "did they reply?" read for the HITL resume check.
+
+  --limit N   the N most recent (default 100; 0 or less, all of them).
+
+  Output: [{gid, text, created_at, created_by: {gid, name}, type}].
+
+  Example: asana comments <TASK> --limit 5
+""" + _HELP_TAIL,
+    'follower-add': """\
+asana follower-add <task> <user> [<user>…]
+
+  Subscribe users to a task (Asana `addFollowers`). This is what actually
+  NOTIFIES them — adding a collaborator sends an "added you" notification,
+  whereas a comment @mention does NOT (it neither notifies nor follows via the
+  API). To reliably reach someone: follower-add them, then comment. <user> is
+  a gid/URL, one or more.
+""" + _HELP_WRITE + """
+  Output: {task, followers: [{gid, name}]}, the task's resulting followers.
+
+  Example: asana follower-add <TASK> <USER>
+""" + _HELP_TAIL,
+    'follower-remove': """\
+asana follower-remove <task> <user> [<user>…]
+
+  Unsubscribe users from a task (Asana `removeFollowers`). <user> is a
+  gid/URL, one or more.
+""" + _HELP_WRITE + """
+  Output: {task, followers: [{gid, name}]}, the task's resulting followers.
+
+  Example: asana follower-remove <TASK> <USER>
+""" + _HELP_TAIL,
+    'tags': """\
+asana tags --workspace GID [--limit N]
+
+  List tags in a workspace (name+gid; resolve a status label to its gid).
+  Tags are workspace-scoped: without --workspace it exits 6
+  missing_workspace.
+
+  --workspace GID   workspace GID or URL.
+  --limit N         at most N tags (default 100).
+""" + _HELP_SINGLE_PAGE + """
+  Output: [{gid, name, color}].
+
+  Example: asana tags --workspace <WORKSPACE>
+""" + _HELP_TAIL,
+    'tag-create': """\
+asana tag-create --name NAME --workspace GID
+
+  Create a tag in a workspace. Without --workspace it exits 6
+  missing_workspace.
+
+  --name NAME       the tag's name (required).
+  --workspace GID   workspace GID or URL.
+""" + _HELP_WRITE + """
+  Output: {gid, name, color}.
+
+  Example: asana tag-create --name claimed --workspace <WORKSPACE>
+""" + _HELP_TAIL,
+    'tag-add': """\
+asana tag-add <task> <tag>
+
+  Add a tag (the claim/status label) to a task. <tag> is a gid.
+""" + _HELP_WRITE + """
+  Output: the empty object Asana answers, {}.
+
+  Example: asana tag-add <TASK> <TAG>
+""" + _HELP_TAIL,
+    'tag-remove': """\
+asana tag-remove <task> <tag>
+
+  Remove a tag from a task. <tag> is a gid.
+""" + _HELP_WRITE + """
+  Output: the empty object Asana answers, {}.
+
+  Example: asana tag-remove <TASK> <TAG>
+""" + _HELP_TAIL,
+    'external-get': """\
+asana external-get <task>
+
+  Read the API-only `external` field ({gid, data}) — UI-invisible
+  machine-state home. Null if unset.
+
+  Output: {gid, data}, or null.
+
+  Example: asana external-get <TASK>
+""" + _HELP_TAIL,
+    'external-set': """\
+asana external-set <task> [--gid STR] [--data STR|-]
+
+  Set external.gid and/or external.data (read-merge-write so the other key is
+  preserved). At least one is required (exit 6 no_external).
+
+  --gid STR      the external dedup key.
+  --data STR|-   the external data blob; accepts inline, a file path, or '-'
+                 (stdin). An empty payload is refused (exit 6
+                 empty_external_data) rather than wiping external.data; omit
+                 --data to leave it unchanged.
+""" + _HELP_WRITE + """
+  Output: {gid, external: {gid, data}}.
+
+  Example: asana external-set <TASK> --data '{"phase": "working"}'
+""" + _HELP_TAIL,
+    'external-find': """\
+asana external-find <gid>
+
+  Resolve the task carrying this external.gid (O(1) point lookup via Asana's
+  `external:` addressing) — the deterministic dedup check. Task JSON on a
+  hit, `null` + exit 0 on a miss (absence is not an error). <gid> is the
+  external dedup key to look up.
+
+  Output: {gid, name, completed, external, permalink_url, assignee: {name},
+  memberships: [{section: {name}}]}, or null.
+
+  Example: asana external-find intake-2026-11-21-7
+""" + _HELP_TAIL,
+    'sections': """\
+asana sections --project P [--limit N]
+
+  List a project's sections (board columns; name+gid).
+
+  --project P   project GID or URL (required).
+  --limit N     at most N sections (default 100).
+""" + _HELP_SINGLE_PAGE + """
+  Output: [{gid, name}].
+
+  Example: asana sections --project <PROJECT>
+""" + _HELP_TAIL,
+    'section-create': """\
+asana section-create --project P --name NAME
+
+  Create a section in a project.
+
+  --project P   project GID or URL (required).
+  --name NAME   the section's name (required).
+""" + _HELP_WRITE + """
+  Output: {gid, name}.
+
+  Example: asana section-create --project <PROJECT> --name Waiting
+""" + _HELP_TAIL,
+    'section-move': """\
+asana section-move <task> <section>
+
+  Move a task into a section (the visible status column). The section must
+  belong to a project the task is in. <section> is a gid.
+""" + _HELP_WRITE + """
+  Output: the empty object Asana answers, {}.
+
+  Example: asana section-move <TASK> <SECTION>
+""" + _HELP_TAIL,
+    'section-tasks': """\
+asana section-tasks <section> [--limit N] [--with-state]
+
+  List tasks currently in a section. Section-scoped — the reliable read for
+  "what's in the Ready column?" (the project task-list lags tags / external /
+  memberships; this does not). <section> is a gid.
+
+  --limit N      at most N tasks (default 100).
+  --with-state   adds tags + external + section membership.
+""" + _HELP_SINGLE_PAGE + """
+  Output: [{gid, name, completed, assignee: {gid, name}, due_on}], with
+  tags, external and memberships under --with-state.
+
+  Example: asana section-tasks <SECTION> --with-state
+""" + _HELP_TAIL,
+    'deps': """\
+asana deps <task> [--dependents]
+
+  List what <task> depends on (or, with --dependents, what depends on it).
+
+  --dependents   list what depends on this task instead of what it depends
+                 on.
+
+  Output: [{gid, name, completed, completed_at, assignee: {name}}].
+
+  Example: asana deps <TASK> --dependents
+""" + _HELP_TAIL,
+    'dep-add': """\
+asana dep-add <task> --on GID [--on ...]
+
+  Mark <task> (the dependent task) as depending on each --on task. ADVISORY
+  only — Asana warns but does not hard-block completion; `complete` refuses
+  it (exit 7) until they are done unless forced.
+
+  --on GID   task GID or URL this task depends on (required, repeatable).
+""" + _HELP_WRITE + """
+  Output: the object Asana answers.
+
+  Example: asana dep-add <TASK> --on <OTHER_TASK>
+""" + _HELP_TAIL,
+    'dep-remove': """\
+asana dep-remove <task> --on GID [...]
+
+  Remove dependency links from <task> (the dependent task) to each --on task.
+
+  --on GID   task GID or URL to unlink (required, repeatable).
+""" + _HELP_WRITE + """
+  Output: the object Asana answers.
+
+  Example: asana dep-remove <TASK> --on <OTHER_TASK>
+""" + _HELP_TAIL,
+    'attach': """\
+asana attach <task> [FILE] [--url LINK] [--name NAME]
+
+  Attach a local FILE to a task (multipart upload), or --url LINK for an
+  external link attachment. --name overrides the display name. Use to enrich
+  a task with a doc / PDF / markdown while working it. Neither FILE nor --url
+  exits 6 nothing_to_attach; a FILE that is not a readable file exits 6
+  file_not_found.
+
+  --url LINK    attach an external link instead of a file.
+  --name NAME   override the attachment display name.
+""" + _HELP_WRITE + """
+  Output: {gid, name, resource_subtype, created_at, size, host,
+  permanent_url, parent: {gid, name}}.
+
+  Example: asana attach <TASK> report.pdf
+""" + _HELP_TAIL,
+    'attachments': """\
+asana attachments <task>
+
+  List a task's attachments (gid, name, subtype, size, permanent_url).
+
+  Output: [{gid, name, resource_subtype, created_at, size, host,
+  permanent_url}].
+
+  Example: asana attachments <TASK>
+""" + _HELP_TAIL,
+    'attachment': """\
+asana attachment <attachment>
+
+  Show one attachment's metadata (incl. download_url). <attachment> is an
+  attachment GID.
+
+  Output: {gid, name, resource_subtype, created_at, size, host,
+  permanent_url, parent: {gid, name}, download_url}.
+
+  Example: asana attachment <ATTACHMENT>
+""" + _HELP_TAIL,
+    'download': """\
+asana download <attachment> [--out PATH]
+
+  Download a file attachment to disk (default: its name in cwd). Errors on
+  external (link) attachments (exit 6 external_attachment, the link in the
+  hint). An attachment with no download_url exits 5 no_download_url (re-run;
+  Asana mints it fresh on each read); a failed fetch exits 5
+  download_failed.
+
+  --out PATH   output path (default: the attachment's name in cwd).
+
+  Output: {downloaded, bytes, name, attachment_gid}.
+
+  Example: asana download <ATTACHMENT> --out /tmp/report.pdf
+""" + _HELP_TAIL,
+    'attachment-delete': """\
+asana attachment-delete <attachment> --yes
+
+  Delete an attachment. IRREVERSIBLE — refuses without --yes (exit 6
+  delete_requires_confirmation; the gate: confirm with the human first).
+
+  --yes   confirm the irreversible delete.
+""" + _HELP_WRITE + """
+  Output: {deleted: <attachment gid>}.
+
+  Example: asana attachment-delete <ATTACHMENT> --yes
+""" + _HELP_TAIL,
+    'webhooks': """\
+asana webhooks [--workspace GID] [--resource GID]
+
+  List webhooks (defaults to the token's first workspace, exit 6
+  no_workspace where it sees none; --resource filters to one watched
+  resource).
+
+  --workspace GID   workspace GID (default: the token's first).
+  --resource GID    filter to webhooks on this resource GID.
+
+  Output: [{gid, resource: {name}, target, active, filters, last_success_at,
+  last_failure_at, last_failure_content}].
+
+  Example: asana webhooks --resource <PROJECT>
+""" + _HELP_TAIL,
+    'webhook': """\
+asana webhook <webhook>
+
+  Show one webhook (target, active, filters, last success/failure).
+  <webhook> is a webhook GID.
+
+  Output: {gid, resource: {name}, target, active, filters, last_success_at,
+  last_failure_at, last_failure_content}.
+
+  Example: asana webhook <WEBHOOK>
+""" + _HELP_TAIL,
+    'webhook-create': """\
+asana webhook-create --resource P --target URL [--filter F ...]
+
+  Register a webhook on a project/task delivering to the public HTTPS URL.
+  Asana runs the X-Hook-Secret handshake against --target synchronously
+  inside this call — the target must answer 200 and echo the secret or the
+  create is rejected (a failed handshake surfaces as exit 6 invalid_request;
+  check the target answers 200 and echoes X-Hook-Secret).
+
+  --resource P    project/task GID or URL to watch (required).
+  --target URL    public HTTPS URL Asana delivers to (required).
+  --filter F      repeatable, form resource_type:action[:fields] (e.g.
+                  task:changed:assignee  task:added  story:added); omit for
+                  all events. A malformed one exits 6 bad_filter.
+""" + _HELP_WRITE + """
+  Output: {gid, resource: {name}, target, active, filters, last_success_at,
+  last_failure_at, last_failure_content}.
+
+  Example: asana webhook-create --resource <PROJECT> --target https://hooks.example.org/asana --filter task:added
+""" + _HELP_TAIL,
+    'webhook-delete': """\
+asana webhook-delete <webhook> --yes
+
+  Delete a webhook. IRREVERSIBLE (stops event delivery) — refuses without
+  --yes (exit 6 delete_requires_confirmation; the gate: confirm with the
+  human first).
+
+  --yes   confirm the irreversible delete.
+""" + _HELP_WRITE + """
+  Output: {webhook, deleted: true}.
+
+  Example: asana webhook-delete <WEBHOOK> --yes
+""" + _HELP_TAIL,
+}
 
 API_BASE = "https://app.asana.com/api/1.0"
 TIMEOUT = httpx.Timeout(30.0)
@@ -1449,7 +1981,7 @@ def main() -> None:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("help", help="print the full usage contract")
+    sub.add_parser("help", help="print the menu; `asana help <verb>` gives one verb's contract")
     sub.add_parser("doctor", help="health check — resolve token, confirm identity")
     sub.add_parser("whoami", help="confirm token and return identity")
     sub.add_parser("workspaces", help="list workspaces")
@@ -1726,7 +2258,9 @@ def main() -> None:
     args = p.parse_args(cleaned)
 
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        # `help` after `--connection <id>` or `--token-env <KEY>`: the
+        # contract's menu, as bare.
+        _cmd_help()
         return
 
     reg, _ = _connections_registry()
