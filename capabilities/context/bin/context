@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -14,13 +14,13 @@ the front matter's title, description, load and order and the body, with who
 saved it, when, and why. One version of a document is active; a save adds a
 new version and never changes an old one, and retiring a document deletes
 nothing, so every edit stays readable and diffable.
-Agent-invoked: reads answer plain text by default and JSON with --json;
-writes answer JSON.
+Agent-invoked: reads answer plain text by default and JSON on request (each
+reading verb's page says how); writes answer JSON.
 
 A document belongs to the project the command runs in, by the project's
-durable id. --global addresses the global documents instead, which belong to
-no project and reach one only once it enables them (GLOBAL DOCUMENTS below);
-every reading and writing verb takes it.
+durable id. Every reading and writing verb can address the global documents
+instead, which belong to no project and reach one only once it enables them
+(GLOBAL DOCUMENTS below); each verb's page says how.
 
 Documents live in the PostgreSQL the project resolves (STORE). Without a
 store there are none: every verb that reads or writes them exits 6
@@ -43,98 +43,39 @@ THE FILE FORM
   `not_canonical`, naming the line), so a document exported is the file
   imported. Values are taken as written: a quoted value keeps its quotes.
 
-READING  (plain text by default; --json gives the structured answer)
-  context list [--global] [--json]
-      Every document of the project with its active version: name, load,
-      order, title - and every global document it has enabled, marked global
-      with its author, unless a document of its own has the same name: that
-      one is listed instead, marked as shadowing it. --json gives each its
-      `origin`, `own` or `global`. With --global, every global document with
-      its author; run in a project, --json marks each `enabled` or not for it.
-  context show <name> [--version ID] [--global] [--json]
-      The active version, or the version ID names, in the file form. --json
-      adds the version id, who saved it, when, and its note; the version id
-      is what `save --base` names.
-  context history <name> [--global] [--json]
-      Every version, newest first: id, when, by whom, the note, and which one
-      is active.
-  context diff <name> [A] [B] [--global]
-      A unified diff of two versions in the file form. Bare: the active
-      version against the one saved before it (against nothing when it is the
-      only one). With A alone: A against the active version.
+READING  (plain text by default; JSON on request)
+  context list                  every document with its active version
+  context show <name>           the active version, or another, in the file form
+  context history <name>        every version, newest first
+  context diff <name> [A] [B]   a unified diff of two versions in the file form
 
   ID, A and B are a version's whole id or a prefix of six or more characters
   that names one version of the document.
 
 WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY, and exit 4
   `system_agent` in a system agent, whose doctrine no edit changes)
-  context save <name> --from FILE|- [--base ID] [--note TEXT] [--global]
-      Save the file form read from FILE, or stdin with `-`, as the document's
-      new active version; a name not in use starts a new document. --base
-      names the version the edit was made from: the save is refused (exit 7
-      `stale_base`, naming the active version) when it is no longer the
-      active one, because another save came first. Without --base the active
-      version at the time of the save is the base. --note says why. Safe to
-      repeat: content equal to the active version's adds no version and
-      answers `"changed": false`.
-  context retire <name> [--global]
-      Retire the document: it leaves list, show and export, its versions
-      stay in the store, and its name is free for a new document. Not
-      idempotent: a repeat finds no document of that name and exits 3.
-  context import [DIR] [--global]
-      Read every `*.md` file under DIR into the store, each as the document
-      its path names: a new document with one version, a new version where
-      the document's active version differs, nothing where it is equal. DIR
-      defaults to the project's context layer, as `capabilities path --json`
-      names it under layers.context; with --global, DIR is required. Every
-      file is read and checked before anything is written, and all of it is
-      written in one transaction; any file that does not read refuses the
-      whole import, naming each one. Other files are reported as skipped.
-      Documents in the store with no file in DIR are left as they are. Safe
-      to repeat.
+  context save <name>           the file form as the document's new active version
+  context retire <name>         retire a document; its versions stay in the store
+  context import [DIR]          every *.md file under DIR into the store, at once
 
 GLOBAL DOCUMENTS
   A global document belongs to no project: it is written once for every
   agent in the store, and reaches a project only once that project enables
-  it. The project that first saves it with --global is its author, and only
-  the current author saves or imports a new version of it, retires it, or
-  hands it on; any other project is refused (exit 4 `not_author`). A global
-  document saved before documents had authors has none until a project
-  writes it, which makes that project its author. Writing a global document
-  needs a project, its author; reading one needs none. A project that
-  enables one composes its active version into the context the manager
-  builds, and a document of its own with the same name shadows it.
+  it. The project that first saves it as a global document is its author,
+  and only the current author writes, retires or hands it on; a project
+  that enables one composes its active version into the context the manager
+  builds, and a document of its own with the same name shadows it. Text that
+  looks like a secret is refused in a global document.
 
-  Every agent that enables a global document reads it, so a --global save
-  or import refuses text that looks like a secret - a private key, a
-  provider's key or token, a JSON web token, a password in a URL, or a
-  password, secret, token or key assigned a value - naming the line and the
-  kind, never the value (exit 6 `secret_like_text`). Personal data is not
-  detected: keeping it out stays with the author.
-
-  context transfer <name> --to PROJECT_ID
-      Make the project PROJECT_ID the global document's author. Run by its
-      current author alone; the receiver cannot take it.
-  context enable <name>
-  context disable <name>
-      Switch the global document of that name on or off for this agent.
-      Enabled, it is in `list` and in the context `capabilities build`
-      composes, at its active version, unless a document of the agent's own
-      has the same name; recorded with who enabled it and when, and
-      disabling removes the record. Answers `enabled`, the author, and
-      `shadowed_by_project_document` where a document of its own shadows
-      it. Safe to repeat: answers `"changed": false`.
+  context transfer <name>       hand a global document to another author project
+  context enable <name>         switch a global document on for this agent
+  context disable <name>        switch it off again
 
   transfer, enable and disable are writes (exit 4 `read_only_switch` under
   CAPABILITIES_READ_ONLY).
 
 EXPORTING
-  context export [DIR] [--global]
-      Write each document's active version into DIR as <name>.md in the file
-      form, creating folders as needed; a file already equal is left alone.
-      DIR defaults as for import; with --global, DIR is required. Files in
-      DIR that hold no document are reported and left alone. Export reads
-      the store and writes only DIR.
+  context export [DIR]          each document's active version, out to DIR
 
   Every write and export reports each document's outcome.
 
@@ -149,18 +90,6 @@ STORE
   store set` writes. One version per document is active, which the store
   enforces; it refuses any change to a version other than clearing `active`,
   and any delete.
-
-CONTRACT VERBS
-  context help                  this text
-  context doctor                the store, the tables, and this project's identity
-  context connections           none: context reaches no system of its own
-  context stub                  the one-line awareness text
-  context manifest --json       the declaration
-  context guide [<topic>]       how-to guides: authoring, groom
-  context ids list|get|set|rm   this project's identifiers
-  context refs                  this project's references
-  context inventory [--network] empty: the documents are the store's (`context list`)
-  context migrate [status]      bring the tables up to this version / report
 
 I/O
   Success is plain text or JSON on stdout; failure is
@@ -224,6 +153,312 @@ POST_INSTALL: list[dict] = []
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# The verb pages `context help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, inventory and
+# migrate follow. A text several verbs own is one constant, added to each of
+# their pages.
+_HELP_GLOBAL = """
+  A document belongs to the project the command runs in, by the project's
+  durable id. --global addresses the global documents instead, which belong to
+  no project and reach one only once it enables them (GLOBAL DOCUMENTS, on
+  `context help`); every reading and writing verb takes it.
+"""
+_HELP_IDS = """
+  ID, A and B are a version's whole id or a prefix of six or more characters
+  that names one version of the document.
+"""
+_HELP_WRITE = """
+  A write: exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY, and exit 4
+  `system_agent` in a system agent, whose doctrine no edit changes.
+"""
+_HELP_GLOBAL_DOCS = """
+  GLOBAL DOCUMENTS
+  A global document belongs to no project: it is written once for every
+  agent in the store, and reaches a project only once that project enables
+  it. The project that first saves it with --global is its author, and only
+  the current author saves or imports a new version of it, retires it, or
+  hands it on; any other project is refused (exit 4 `not_author`). A global
+  document saved before documents had authors has none until a project
+  writes it, which makes that project its author. Writing a global document
+  needs a project, its author; reading one needs none. A project that
+  enables one composes its active version into the context the manager
+  builds, and a document of its own with the same name shadows it.
+"""
+_HELP_SECRET = """
+  Every agent that enables a global document reads it, so a --global save
+  or import refuses text that looks like a secret - a private key, a
+  provider's key or token, a JSON web token, a password in a URL, or a
+  password, secret, token or key assigned a value - naming the line and the
+  kind, never the value (exit 6 `secret_like_text`). Personal data is not
+  detected: keeping it out stays with the author.
+"""
+_HELP_TAIL = """
+  I/O
+  Success is plain text or JSON on stdout; failure is
+  {"error": {"code", "message", "hint"?}} on stderr. An unknown flag or a
+  missing argument exits 6 `input`.
+
+  EXIT CODES
+  0 success
+  3 not found - no document of that name, no version of that id
+  4 policy - context not enabled, the read-only switch, a change to a global
+    document by a project that is not its author
+  5 store - unreachable or busy
+  6 input - a malformed argument or file, no store configured, no project or
+    project identity, a folder that does not resolve, text that looks like a
+    secret in a global document
+  7 stale - the base a save names is no longer the active version
+"""
+_HELP_SWITCH = """\
+context enable <name>
+context disable <name>
+
+  Switch the global document of that name on or off for this agent.
+  Enabled, it is in `list` and in the context `capabilities build`
+  composes, at its active version, unless a document of the agent's own
+  has the same name; recorded with who enabled it and when, and
+  disabling removes the record. Answers `enabled`, the author, and
+  `shadowed_by_project_document` where a document of its own shadows
+  it. Safe to repeat: answers `"changed": false`. --global is accepted
+  and changes nothing: the document is always a global one.
+
+  Output: {name, scope, project, enabled, changed, author,
+  shadowed_by_project_document?}.
+
+  Exit codes: 0; 3 no global document of that name; 4 policy, the
+  read-only switch, system_agent; 5 store; 6 a malformed name, no project.
+
+  Examples:
+    context enable guidelines/SHARED
+    context disable guidelines/SHARED
+""" + _HELP_WRITE + _HELP_GLOBAL_DOCS + _HELP_TAIL
+HELP_VERBS = {
+    "doctor": """\
+For context:
+  The store, the tables, and this project's identity: the store setting in
+  force (its level and schema), whether the context tables are current, the
+  project's root and durable id, and how many unretired documents the
+  project and the store's global documents hold. It takes no --connection
+  and no other argument (exit 6 `input`): context has no connections.
+
+  Output: {ok, project: {root, id}, store: {level, schema, error?}, tables:
+  {state, pending, changed, warnings}, documents: {project, global}, hint?}.
+  ok is true when the tables are current or only pending. Exit codes: 0; 5
+  the store did not answer; 6 no store configured, or a setting it cannot
+  use; 7 tables this version does not match.
+
+  Example: context doctor
+""",
+    "connections": """\
+For context:
+  None: context reaches no system of its own. The store is the project's,
+  resolved through the shared library (STORE, on `context help`), so its
+  report holds no connection: {"default": null, "connections": {}}, with the
+  policy state the library adds beside it.
+""",
+    "inventory": """\
+For context:
+  Empty: the documents are the store's; reading them is `context list`.
+""",
+    "migrate": """\
+For context:
+  Brings the context tables up to this version, or reports where they stand.
+  The tables and the ledger are STORE, on `context help`; any other verb
+  that reaches the store migrates them too.
+""",
+    "list": """\
+context list [--global] [--json]
+
+  Every document of the project with its active version: name, load,
+  order, title - and every global document it has enabled, marked global
+  with its author, unless a document of its own has the same name: that
+  one is listed instead, marked as shadowing it. --json gives each its
+  `origin`, `own` or `global`. With --global, every global document with
+  its author; run in a project, --json marks each `enabled` or not for it.
+
+  --global   the global documents instead of the project's
+  --json     the structured answer
+
+  Output: plain text, one line per document - name, load, order, title, and
+  `(global, by <author>)`, `(shadows a global document)` or `(enabled)`
+  where they apply - or `no project documents` / `no global documents`.
+  With --json: {scope, project, count, documents: [{name, version, title,
+  load, order, saved_at, origin, author?, enabled?, shadows_global?}]}.
+
+  Exit codes: 0; 4 policy; 5 store; 6 no store configured, no project.
+
+  Examples:
+    context list
+    context list --global --json
+""" + _HELP_GLOBAL + _HELP_TAIL,
+    "show": """\
+context show <name> [--version ID] [--global] [--json]
+
+  The active version, or the version ID names, in the file form. --json
+  adds the version id, who saved it, when, and its note; the version id
+  is what `save --base` names.
+
+  --version ID   a version other than the active one
+  --global       the global document of that name
+  --json         the structured answer
+
+  Output: the version in the file form (THE FILE FORM, on `context help`).
+  With --json: {name, scope, project, version, active, title, description,
+  load, order, created_at, created_by, note, body, rendered}.
+
+  Exit codes: 0; 3 no document of that name, no version of that id; 4
+  policy; 5 store; 6 a malformed name or version.
+
+  Example: context show identity/MISSION --json
+""" + _HELP_IDS + _HELP_GLOBAL + _HELP_TAIL,
+    "history": """\
+context history <name> [--global] [--json]
+
+  Every version, newest first: id, when, by whom, the note, and which one
+  is active.
+
+  --global   the global document of that name
+  --json     the structured answer
+
+  Output: plain text, one line per version - id, when, by whom, `(active)`
+  and ` - <note>` where they apply. With --json: {name, scope, project,
+  count, versions: [{version, active, title, description, load, order,
+  created_at, created_by, note}]}.
+
+  Exit codes: 0; 3 no document of that name; 4 policy; 5 store; 6 a
+  malformed name.
+
+  Example: context history identity/MISSION
+""" + _HELP_GLOBAL + _HELP_TAIL,
+    "diff": """\
+context diff <name> [A] [B] [--global]
+
+  A unified diff of two versions in the file form. Bare: the active
+  version against the one saved before it (against nothing when it is the
+  only one). With A alone: A against the active version. With A and B: A
+  against B.
+
+  --global   the global document of that name
+
+  Output: the unified diff as plain text, or `no difference between <A> and
+  <B>`.
+
+  Exit codes: 0; 3 no document of that name, no version of that id; 4
+  policy; 5 store; 6 a malformed name or version.
+
+  Example: context diff identity/MISSION 3f2a9c
+""" + _HELP_IDS + _HELP_GLOBAL + _HELP_TAIL,
+    "save": """\
+context save <name> --from FILE|- [--base ID] [--note TEXT] [--global]
+
+  Save the file form read from FILE, or stdin with `-`, as the document's
+  new active version; a name not in use starts a new document. --base
+  names the version the edit was made from: the save is refused (exit 7
+  `stale_base`, naming the active version) when it is no longer the
+  active one, because another save came first. Without --base the active
+  version at the time of the save is the base. --note says why. Safe to
+  repeat: content equal to the active version's adds no version and
+  answers `"changed": false`.
+
+  --from FILE|-   the document in the file form, from FILE or stdin; required
+  --base ID       the version the edit was made from
+  --note TEXT     why it changed
+  --global        save the global document of that name, as its author
+
+  Output: {scope, project, changed, name, outcome, version, base?,
+  author?}: outcome `created`, `versioned` or `unchanged`.
+
+  Exit codes: 0; 3 a --base that names no version; 4 policy, the read-only
+  switch, system_agent, not_author; 5 store; 6 input, not_canonical,
+  secret_like_text; 7 stale_base.
+
+  Example: context save identity/MISSION --from MISSION.md --base 3f2a9c --note "scope widened"
+""" + _HELP_IDS + _HELP_WRITE + _HELP_GLOBAL + _HELP_GLOBAL_DOCS + _HELP_SECRET + _HELP_TAIL,
+    "retire": """\
+context retire <name> [--global]
+
+  Retire the document: it leaves list, show and export, its versions
+  stay in the store, and its name is free for a new document. Not
+  idempotent: a repeat finds no document of that name and exits 3.
+
+  --global   retire the global document of that name, as its author
+
+  Output: {name, scope, project, retired, document}.
+
+  Exit codes: 0; 3 no document of that name; 4 policy, the read-only
+  switch, system_agent, not_author; 5 store; 6 a malformed name.
+
+  Example: context retire guidelines/OLD-RULE
+""" + _HELP_WRITE + _HELP_GLOBAL + _HELP_GLOBAL_DOCS + _HELP_TAIL,
+    "import": """\
+context import [DIR] [--global]
+
+  Read every `*.md` file under DIR into the store, each as the document
+  its path names: a new document with one version, a new version where
+  the document's active version differs, nothing where it is equal. DIR
+  defaults to the project's context layer, as `capabilities path --json`
+  names it under layers.context; with --global, DIR is required. Every
+  file is read and checked before anything is written, and all of it is
+  written in one transaction; any file that does not read refuses the
+  whole import, naming each one. Other files are reported as skipped.
+  Documents in the store with no file in DIR are left as they are. Safe
+  to repeat.
+
+  --global   import into the global documents, as their author
+
+  Output: {scope, project, folder, counts, documents, skipped}: each
+  document's outcome (`created`, `versioned`, `unchanged`), each other file
+  skipped. A refused import also writes {"refused": [{path, reason}]} on
+  stderr before its error.
+
+  Exit codes: 0; 4 policy, the read-only switch, system_agent, not_author;
+  5 store; 6 DIR not a folder, no context layer, not_canonical,
+  secret_like_text.
+
+  Example: context import
+""" + _HELP_WRITE + _HELP_GLOBAL + _HELP_GLOBAL_DOCS + _HELP_SECRET + _HELP_TAIL,
+    "transfer": """\
+context transfer <name> --to PROJECT_ID
+
+  Make the project PROJECT_ID the global document's author. Run by its
+  current author alone; the receiver cannot take it.
+
+  --to PROJECT_ID   the receiving project's declared id, as `capabilities
+                    path --json` shows it; required
+
+  Output: {name, scope, from, author, changed}.
+
+  Exit codes: 0; 3 no global document of that name; 4 policy, the
+  read-only switch, system_agent, not_author; 5 store; 6 a --to that is no
+  project id, no project.
+
+  Example: context transfer guidelines/SHARED --to <PROJECT_ID>
+""" + _HELP_WRITE + _HELP_GLOBAL_DOCS + _HELP_TAIL,
+    "enable": _HELP_SWITCH,
+    "disable": _HELP_SWITCH,
+    "export": """\
+context export [DIR] [--global]
+
+  Write each document's active version into DIR as <name>.md in the file
+  form, creating folders as needed; a file already equal is left alone.
+  DIR defaults as for import; with --global, DIR is required. Files in
+  DIR that hold no document are reported and left alone. Export reads
+  the store and writes only DIR.
+
+  --global   export the global documents
+
+  Output: {scope, project, folder, counts, documents, not_in_store}: each
+  document's outcome (`written`, `unchanged`, or `error` with the reason).
+
+  Exit codes: 0; 4 policy; 5 store; 6 no context layer, a file it could
+  not write.
+
+  Example: context export /tmp/context-copy
+""" + _HELP_GLOBAL + _HELP_TAIL,
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

@@ -5,15 +5,15 @@
 #     "httpx>=0.27",
 #     "python-dateutil>=2.9",   # RFC 5545 recurrence rules, evaluated here
 #     "tzdata>=2024.1",   # a slim host carries no system zone database
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
 calendar — agent-first CalDAV CLI for remote calendars.
 
-This tool is designed to be invoked by agents. Run `calendar help` to load the
-full usage contract on demand — do not rely on memorised knowledge of its
-surface.
+This tool is designed to be invoked by agents. Run `calendar help` to load
+this menu, and `calendar help <verb>` for one verb's whole contract, on
+demand — do not rely on memorised knowledge of its surface.
 
 This is a THIN, project-agnostic adapter over CalDAV (RFC 4791,
 https://www.rfc-editor.org/rfc/rfc4791): read calendars, read and search
@@ -23,184 +23,58 @@ operation layer that reads this tool's JSON. The tool knows nothing about who
 owns a calendar; that lives in the consuming project.
 
 CONFERENCING BOUNDARY — read this before promising a video link:
-  Creating an event over CalDAV attaches NO conferencing. This CLI can CARRY a
-  meeting URL and cannot MINT one, so `create` reports "conferencing": null on
-  every event it books, whatever URL it carried. Run
-  `calendar guide conferencing` for where a room should come from instead.
+Creating an event over CalDAV attaches NO conferencing. This CLI can CARRY a
+meeting URL and cannot MINT one, so `create` reports "conferencing": null on
+every event it books, whatever URL it carried. Run
+`calendar guide conferencing` for where a room should come from instead.
 
 CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  calendar. Where this project keeps its entries, and the machine-level ones it
-  inherits, "Where connections live" below says; a project entry replaces that id
-  whole, and ids it does not declare are inherited:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": {
-          "backend":     "caldav",
-          "address":     "user@example.com",
-          "base_url":    "https://caldav.example.com/dav/",
-          "secret_env":  "CALENDAR_<ID>_APP_PASSWORD",
-          "timezone":    "Europe/Berlin",
-          "meeting_url": "https://example.com/room/standing",
-          "calendars":   [],
-          "allow_write": false
-        }
-      }
-    }
+A connection is one principal: its address, its CalDAV entry point, the env
+key holding its password, and optionally its timezone, a standing meeting URL
+and the calendars it is scoped to. Configuration requires an explicit
+connections registry, even for one calendar. Its entry fields, how a
+connection is selected and where the entries live are CONNECTIONS, on
+`calendar help connections`; `calendar guide endpoints` carries the
+per-provider wiring.
 
-  backend      Transport. "caldav" is the only value that ships; it is stated
-               per connection so another transport is a value, not a rename.
-  address      The principal's address — the mailbox the calendar belongs to.
-               Also selects the connection: --connection user@example.com.
-  username     Optional. The Basic-auth login, when the server authenticates
-               on something other than the address. Defaults to `address`.
-  base_url     The CalDAV entry point. The principal URL is base_url + the
-               URL-encoded address + "/". Never hardcoded: it is the one value
-               that changes when a provider moves its endpoint.
-  principal_url  Optional. The exact principal collection URL, used verbatim
-               when a server does not compose one from base_url + address.
-  secret_env   The env key holding the password. Absent, CALENDAR_APP_PASSWORD
-               is used. The KEY is named here; the VALUE resolves through the
-               credential cascade (`Where a secret resolves`, at the end of
-               this help). A secret never sits in the
-               registry and never on argv.
-  timezone     Optional IANA zone. See TIME.
-  meeting_url  Optional standing room URL, attached by `create` when no --url
-               is passed.
-  calendars    Scope. Empty means every calendar; non-empty restricts both
-               reads and writes to those calendars, by display name or href.
-               A verb aimed outside the scope exits 4 (out_of_scope).
-  allow_write  The write gate, below.
-
-  `calendar guide endpoints` carries the per-provider wiring: which endpoint to
-  configure, what credential it takes, and what to do when one is withdrawn.
-
-  Selection: --connection <id|address>, accepted before or after the
-  subcommand. Unflagged, the registry's "default" pointer applies, else the
-  sole entry; several entries without a pointer is refused as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
-
-  WRITES ARE OFF BY DEFAULT: a calendar write leaves the system — it creates
-  an event other people see and, where the server schedules, mails a real
-  invitation to a real human. create/update/delete exit 4 unless the
-  connection carries an explicit "allow_write": true. No flag lifts the gate;
-  granting it is a deliberate registry edit, made after asking the user.
+WRITES ARE OFF BY DEFAULT: a calendar write leaves the system — it creates
+an event other people see and, where the server schedules, mails a real
+invitation to a real human. create/update/delete exit 4 unless the
+connection carries an explicit "allow_write": true. No flag lifts the gate;
+granting it is a deliberate registry edit, made after asking the user.
 
 TIME
-  One internal representation: UTC. Every timestamp this CLI emits is UTC with
-  an explicit +00:00 offset, so two readings are always comparable.
-  Every timestamp it accepts is ISO 8601. An input carrying an offset (or a
-  trailing Z) is taken as given. An input WITHOUT one — "2026-09-01T10:00" or
-  a bare "2026-09-01" — resolves in the connection's `timezone`, and is
-  refused (exit 6, naive_datetime) when the connection declares none. A zone
-  is never inferred from the host. A default window starts at midnight in that
-  same zone, and ends the stated number of days after whatever start applies.
-  All-day events are the exception: they carry a bare date in `startDate` /
-  `endDate` with "allDay": true, and their end is EXCLUSIVE, as iCalendar
-  defines it. An all-day boundary needs no zone, so `create --all-day` takes a
-  bare date from any connection.
-  A stored event whose zone this host cannot resolve — a proprietary TZID, or
-  a floating time — is placed in the connection's zone and carries
-  "zoneFallback" naming what could not be resolved. That instant is an
-  assumption; `freebusy` lists every such event under `unresolved_zones`.
+Every timestamp this CLI emits is UTC with an explicit +00:00 offset; every
+one it accepts is ISO 8601, and one without an offset resolves in the
+connection's `timezone`, or is refused when it declares none. All-day events
+carry a bare date and an EXCLUSIVE end. TIME, on the page of each verb that
+reads or writes events, is the whole rule.
 
 RECURRENCE
-  Reads are expanded: `events`, `search` and `freebusy` return one entry per
-  occurrence inside the window, so a weekly meeting occupies every one of its
-  slots and `freebusy` is safe to book against. Each occurrence carries
-  "recurrenceId"; its `uid` is the series' uid, and an occurrence the series
-  moved or changed carries that revision rather than the series' detail.
-  The expansion happens HERE, not on the server. CalDAV has an expand
-  extension and this CLI asks for it, but a server may accept the request and
-  answer it unexpanded — which looks exactly like a calendar with no
-  recurrence until the missing occupancy books a meeting on top of a real
-  meeting. Every reply is therefore expanded locally, so the same window gives
-  the same answer whichever server served it.
-  Writes are single events only. `create` authors no RRULE, and `update` /
-  `delete` address the whole stored object — the series, not one occurrence.
-  Updating an object that carries per-occurrence overrides is refused (exit 6,
-  recurring_event) rather than silently flattening it.
+Reads are expanded, here rather than on the server: `events`, `search` and
+`freebusy` return one entry per occurrence inside the window, so `freebusy`
+is safe to book against. Writes are single events only, and `update` and
+`delete` address the whole series. RECURRENCE, on each of those verbs' pages,
+is the whole rule.
 
-Commands:
-  calendar help                               Print this document.
-  calendar connections                        Where every connection's values
-                                              resolve from (tier, source,
-                                              secrets masked). Local only.
-  calendar doctor [--connection <id>]         Prove the credential, the
-                                              endpoint and the principal —
-                                              every connection, or one.
-  calendar calendars                          The calendars in scope: href,
-                                              name, color, writable.
-  calendar events [--calendar C]              Events in a window, occurrences
-        [--from ISO] [--to ISO] [--limit N]   expanded. Default window: today
-                                              .. +7d.
-  calendar show <uid|href>                    One event in full: description,
-        [--scan-from ISO] [--scan-to ISO]     url, organizer, attendees with
-                                              their PARTSTAT. See UID LOOKUP.
-  calendar search <query> [--calendar C]      Substring match over an expanded
-        [--from ISO] [--to ISO]               window, client-side. Default
-        [--field title|notes|any] [--limit N] window: today .. +30d.
-  calendar freebusy --from ISO --to ISO       Merged busy blocks across the
-        [--calendars A,B]                     scope. Cancelled events,
-                                              TRANSP:TRANSPARENT events and
-                                              invitations this address has
-                                              DECLINED are not busy.
-  calendar create --calendar C --title T      Book an event (write-gated).
-        --from ISO --to ISO [--all-day]       Attendees are invited by the
-        [--location L] [--notes N] [--url U]  server where it schedules.
-        [--invitee EMAIL ...] [--alarm SPEC]  --url defaults to the
-                                              connection's meeting_url.
-  calendar update <uid|href> [--title T]      Change an event (write-gated).
-        [--from ISO] [--to ISO]               Only the flags you pass change;
-        [--all-day | --no-all-day]            SEQUENCE is bumped so attendees
-        [--location L] [--notes N] [--url U]  see the revision. Guarded by
-        [--add-invitee EMAIL ...]             If-Match: a concurrent change
-        [--alarm SPEC ...]                    exits 6 (etag_conflict). Moving
-        [--scan-from ISO] [--scan-to ISO]     one boundary keeps the other.
-  calendar delete <uid|href>                  Remove an event (write-gated).
-        [--scan-from ISO] [--scan-to ISO]
+COMMANDS
+  calendar calendars             the calendars in scope: href, name, color, writable
+  calendar events                events in a window, occurrences expanded
+  calendar show <uid|href>       one event in full, attendees with their PARTSTAT
+  calendar search <query>        substring match over an expanded window
+  calendar freebusy              merged busy blocks across the scope
+  calendar create                WRITE. book an event; the server invites attendees
+  calendar update <uid|href>     WRITE. change an event; only what is passed changes
+  calendar delete <uid|href>     WRITE. remove an event
+  calendar context list|show|edit|put <key>  the versioned project documents behind `refs`
 
-  SPEC for --alarm is relative (-15m, -1h, -1h30m, -1d) or an absolute ISO
-  datetime. Pass it as --alarm=-15m: a value opening with a minus reads as
-  another flag in the separated form. Repeating the flag sets several; on
-  `update` the flag replaces the event's whole alarm set.
-
-UID LOOKUP
-  `show`, `update` and `delete` take either an href — the exact address
-  `events` reports, and the fast path — or a uid. A uid is resolved by a
-  server-side UID query; a server that refuses one is answered with a scan of
-  a window, which --scan-from / --scan-to set (default -180d .. +365d). An
-  href outside the connection's calendars is refused (exit 4) before any
-  request is sent.
-
-  Every event carries both `uid` and `id`, the same value under both names, so
-  a consumer reading this tool and a local-calendar sibling can use one key.
+`show`, `update` and `delete` take an href or a uid (UID LOOKUP, on each one's
+page). Every event carries both `uid` and `id`, the same value under both
+names.
 
 I/O contract:
   - Success: JSON on stdout, exit 0.
   - Error:   {"error": {"code", "message", "hint"}} on stderr, non-zero exit.
-
-Contract commands (the same on every capability):
-  calendar stub                               One-line awareness text.
-  calendar manifest --json                    Machine-readable declaration.
-  calendar guide [<topic>]                    Guide topics / one guide body,
-                                              fetched live from the docs base.
-  calendar ids list|get <l>|set <l> <v>|rm <l>  The project identifiers
-          [--note <text>]                     envelope — where discovered
-                                              calendar hrefs belong, so a
-                                              consumer stops re-discovering
-                                              the calendar it books into.
-  calendar refs                               Menu of the project's reference
-                                              files for this capability.
-  calendar inventory [--network]              What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
-  calendar context list|show|edit|put <key>   The versioned project documents
-                                              behind `refs`.
 
 Exit codes:
   0  success
@@ -329,6 +203,402 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 BACKENDS = ("caldav",)          # the transports this executable speaks
 DEFAULT_SECRET_ENV = CRED_KEYS[0]["key"]   # what a connection naming no secret_env uses
 
+
+# The verb pages `calendar help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor and connections follow. A text
+# several verbs own is one constant, added to each of their pages.
+_HELP_TIME = """
+  TIME
+  One internal representation: UTC. Every timestamp this CLI emits is UTC with
+  an explicit +00:00 offset, so two readings are always comparable.
+  Every timestamp it accepts is ISO 8601. An input carrying an offset (or a
+  trailing Z) is taken as given. An input WITHOUT one — "2026-09-01T10:00" or
+  a bare "2026-09-01" — resolves in the connection's `timezone`, and is
+  refused (exit 6, naive_datetime) when the connection declares none. A zone
+  is never inferred from the host. A default window starts at midnight in that
+  same zone, and ends the stated number of days after whatever start applies.
+  All-day events are the exception: they carry a bare date in `startDate` /
+  `endDate` with "allDay": true, and their end is EXCLUSIVE, as iCalendar
+  defines it. An all-day boundary needs no zone, so `create --all-day` takes a
+  bare date from any connection.
+  A stored event whose zone this host cannot resolve — a proprietary TZID, or
+  a floating time — is placed in the connection's zone and carries
+  "zoneFallback" naming what could not be resolved. That instant is an
+  assumption; `freebusy` lists every such event under `unresolved_zones`.
+"""
+_HELP_RECURRENCE = """
+  RECURRENCE
+  Reads are expanded: `events`, `search` and `freebusy` return one entry per
+  occurrence inside the window, so a weekly meeting occupies every one of its
+  slots and `freebusy` is safe to book against. Each occurrence carries
+  "recurrenceId"; its `uid` is the series' uid, and an occurrence the series
+  moved or changed carries that revision rather than the series' detail.
+  The expansion happens HERE, not on the server. CalDAV has an expand
+  extension and this CLI asks for it, but a server may accept the request and
+  answer it unexpanded — which looks exactly like a calendar with no
+  recurrence until the missing occupancy books a meeting on top of a real
+  meeting. Every reply is therefore expanded locally, so the same window gives
+  the same answer whichever server served it.
+  Writes are single events only. `create` authors no RRULE, and `update` /
+  `delete` address the whole stored object — the series, not one occurrence.
+  Updating an object that carries per-occurrence overrides is refused (exit 6,
+  recurring_event) rather than silently flattening it.
+"""
+_HELP_UID = """
+  UID LOOKUP
+  `show`, `update` and `delete` take either an href — the exact address
+  `events` reports, and the fast path — or a uid. A uid is resolved by a
+  server-side UID query; a server that refuses one is answered with a scan of
+  a window, which --scan-from / --scan-to set (default -180d .. +365d). An
+  href outside the connection's calendars is refused (exit 4) before any
+  request is sent.
+
+  Every event carries both `uid` and `id`, the same value under both names, so
+  a consumer reading this tool and a local-calendar sibling can use one key.
+"""
+_HELP_ALARM = """
+  SPEC for --alarm is relative (-15m, -1h, -1h30m, -1d) or an absolute ISO
+  datetime. Pass it as --alarm=-15m: a value opening with a minus reads as
+  another flag in the separated form. Repeating the flag sets several; on
+  `update` the flag replaces the event's whole alarm set.
+"""
+_HELP_CONFERENCING = """
+  CONFERENCING BOUNDARY — read this before promising a video link:
+  Creating an event over CalDAV attaches NO conferencing. This CLI can CARRY a
+  meeting URL and cannot MINT one, so `create` reports "conferencing": null on
+  every event it books, whatever URL it carried. Run
+  `calendar guide conferencing` for where a room should come from instead.
+"""
+_HELP_WRITE_GATE = """
+  WRITES ARE OFF BY DEFAULT: a calendar write leaves the system — it creates
+  an event other people see and, where the server schedules, mails a real
+  invitation to a real human. create/update/delete exit 4 unless the
+  connection carries an explicit "allow_write": true. No flag lifts the gate;
+  granting it is a deliberate registry edit, made after asking the user.
+"""
+_HELP_TAIL = """
+  Connection: --connection <id|address>, accepted before or after the
+  subcommand, selects it; unflagged, the registry's "default" pointer applies,
+  else the sole entry (`calendar help connections`). Outside any project this
+  verb is refused: only connections and doctor read the machine's own
+  connections there.
+
+  I/O contract:
+    - Success: JSON on stdout, exit 0.
+    - Error:   {"error": {"code", "message", "hint"}} on stderr, non-zero exit.
+  A usage error - an unknown flag, a missing argument - exits 6 bad_usage.
+
+  Exit codes:
+    0  success
+    2  auth — an unresolved credential, a 401/403 from the server, or a calendar
+       this account may not write
+    3  not found (no such event, calendar or collection)
+    4  policy refusal — the capability gate, a write verb on a read-only
+       connection, or a calendar outside the connection's scope. Ask the user;
+       never lift a gate yourself.
+    5  server / network — unreachable, timeout, 5xx after retries
+    6  input / validation (bad datetime, naive datetime with no connection
+       timezone, unknown backend, etag conflict, a URL that serves no CalDAV)
+"""
+HELP_VERBS = {
+    "doctor": """\
+  doctor [--connection <id|address>]
+      Prove the credential, the endpoint and the principal — every connection
+      bare, or the one --connection names (by its id or its address). Per
+      connection it resolves the password, finds the principal and its
+      calendar home, and lists the calendars in scope. Emits {ok,
+      connections: {<id>: {ok, address, backend, principal, displayname,
+      calendar_home, home_discovered, calendars, scope, allow_write,
+      timezone}}}; a connection that fails carries {ok: false, error, hint?}
+      instead, and the others are still examined. Exit 0 only when every
+      examined connection is healthy, else the first failure's category, as
+      the exit codes on `calendar help` read it. Outside any project
+      it is a machine read: it uses the machine's own connections read-only,
+      unless a grant switched one off.
+
+  Examples:
+    calendar doctor
+    calendar doctor --connection user@example.com
+""",
+    "connections": """\
+  connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked). Local only: no CalDAV request, no password use.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  calendar. Where this project keeps its entries, and the machine-level ones it
+  inherits, "Where connections live" above says; a project entry replaces that id
+  whole, and ids it does not declare are inherited:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "backend":     "caldav",
+          "address":     "user@example.com",
+          "base_url":    "https://caldav.example.com/dav/",
+          "secret_env":  "CALENDAR_<ID>_APP_PASSWORD",
+          "timezone":    "Europe/Berlin",
+          "meeting_url": "https://example.com/room/standing",
+          "calendars":   [],
+          "allow_write": false
+        }
+      }
+    }
+
+  backend      Transport. "caldav" is the only value that ships; it is stated
+               per connection so another transport is a value, not a rename.
+  address      The principal's address — the mailbox the calendar belongs to.
+               Also selects the connection: --connection user@example.com.
+  username     Optional. The Basic-auth login, when the server authenticates
+               on something other than the address. Defaults to `address`.
+  base_url     The CalDAV entry point. The principal URL is base_url + the
+               URL-encoded address + "/". Never hardcoded: it is the one value
+               that changes when a provider moves its endpoint.
+  principal_url  Optional. The exact principal collection URL, used verbatim
+               when a server does not compose one from base_url + address.
+  secret_env   The env key holding the password. Absent, CALENDAR_APP_PASSWORD
+               is used. The KEY is named here; the VALUE resolves through the
+               credential cascade (`Where a secret resolves`, above). A secret
+               never sits in the registry and never on argv.
+  timezone     Optional IANA zone. See TIME (`calendar help events`).
+  meeting_url  Optional standing room URL, attached by `create` when no --url
+               is passed.
+  calendars    Scope. Empty means every calendar; non-empty restricts both
+               reads and writes to those calendars, by display name or href.
+               A verb aimed outside the scope exits 4 (out_of_scope).
+  allow_write  The write gate, below.
+
+  `calendar guide endpoints` carries the per-provider wiring: which endpoint to
+  configure, what credential it takes, and what to do when one is withdrawn.
+
+  Selection: --connection <id|address>, accepted before or after the
+  subcommand. Unflagged, the registry's "default" pointer applies, else the
+  sole entry; several entries without a pointer is refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+""" + _HELP_WRITE_GATE + """
+  A connection is written with `calendar connection add` (`calendar help
+  connection`).
+
+  Example: calendar connections
+""",
+    "calendars": """\
+calendar calendars
+
+  The calendars in scope: href, name, color, writable. The scope is the
+  connection's `calendars` list; empty means every VEVENT calendar in the
+  principal's home. `writable` is what the server grants this account, null
+  where it states no privileges.
+
+  Output: {connection, scope, calendars: [{href, name, color, writable,
+  components}]}.
+
+  Exit codes: 0; 2 auth; 3 no calendar home, or no calendar in scope; 4
+  policy; 5 server/network; 6 input.
+
+  Example: calendar calendars --connection user@example.com
+""" + _HELP_TAIL,
+    "events": """\
+calendar events [--calendar C] [--from ISO] [--to ISO] [--limit N]
+
+  Events in a window, occurrences expanded. Default window: today .. +7d.
+
+  --calendar C   restrict to one calendar, by display name or href; it must be
+                 in the connection's scope
+  --from ISO     start of the window; default midnight today in the
+                 connection's zone
+  --to ISO       end of the window; default --from + 7 days
+  --limit N      cap the results (0, the default, is no cap)
+
+  Output: {from, to, timezone, calendars, count, events}: each event
+  {id, uid, title, startDate, endDate, allDay, calendar, calendarHref, href,
+  etag, location, status, transparent, recurring, recurrenceId,
+  zoneFallback, …}. `href` is the fast path for show, update and delete.
+
+  Exit codes: 0; 2 auth; 3 an unknown calendar, or none in scope; 4 a
+  calendar outside the scope; 5 server/network; 6 a bad or naive datetime,
+  --to not after --from.
+
+  Example: calendar events --from 2026-09-01 --to 2026-09-08 --calendar Work
+""" + _HELP_TIME + _HELP_RECURRENCE + _HELP_TAIL,
+    "show": """\
+calendar show <uid|href> [--scan-from ISO] [--scan-to ISO]
+
+  One event in full: description, url, organizer, attendees with their
+  PARTSTAT. See UID LOOKUP, below.
+
+  --scan-from ISO   start of the window the uid scan fallback reads
+  --scan-to ISO     end of that window
+
+  Output: the event's whole payload - the fields `events` gives, plus notes,
+  url, organizer and attendees - with `overrides`, how many per-occurrence
+  overrides the stored object carries, and the connection's `timezone`.
+
+  Exit codes: 0; 2 auth; 3 no event with that uid in scope; 4 an href
+  outside the connection's calendars; 5 server/network; 6 a bad datetime.
+
+  Example: calendar show <UID>
+""" + _HELP_UID + _HELP_TIME + _HELP_TAIL,
+    "search": """\
+calendar search <query> [--calendar C] [--from ISO] [--to ISO]
+                [--field title|notes|any] [--limit N]
+
+  Substring match over an expanded window, client-side, case-insensitive.
+  Default window: today .. +30d.
+
+  --calendar C     restrict to one calendar, by display name or href
+  --from ISO       start of the window; default midnight today
+  --to ISO         end of the window; default --from + 30 days
+  --field F        title, notes, or any (the default: title, notes or
+                   location)
+  --limit N        stop after N hits (0, the default, is no cap)
+
+  Output: {query, field, from, to, timezone, calendars, count, events}, each
+  event with its whole detail: notes, url, organizer and attendees too.
+
+  Exit codes: 0; 2 auth; 3 an unknown calendar, or none in scope; 4 a
+  calendar outside the scope; 5 server/network; 6 a bad or naive datetime,
+  a --field it does not take.
+
+  Example: calendar search "standup" --field title --from 2026-09-01
+""" + _HELP_TIME + _HELP_RECURRENCE + _HELP_TAIL,
+    "freebusy": """\
+calendar freebusy --from ISO --to ISO [--calendars A,B]
+
+  Merged busy blocks across the scope. Cancelled events, TRANSP:TRANSPARENT
+  events and invitations this address has DECLINED are not busy. Blocks are
+  clipped to the window, and overlapping or touching ones merge.
+
+  --from ISO       start of the window; required
+  --to ISO         end of the window; required
+  --calendars A,B  comma-separated calendar names or hrefs; default: every
+                   calendar in the connection scope
+
+  Output: {from, to, timezone, calendars, considered, unresolved_zones,
+  busy}: `busy` the merged blocks, `considered` how many occurrences were
+  read, `unresolved_zones` each event whose zone was assumed ({uid, tzid}).
+
+  Exit codes: 0; 2 auth; 3 an unknown calendar, or none in scope; 4 a
+  calendar outside the scope; 5 server/network; 6 --from or --to missing,
+  bad or naive, --to not after --from.
+
+  Example: calendar freebusy --from 2026-09-01T00:00:00Z --to 2026-09-02T00:00:00Z
+""" + _HELP_TIME + _HELP_RECURRENCE + _HELP_TAIL,
+    "create": """\
+calendar create --calendar C --title T --from ISO --to ISO [--all-day]
+                [--location L] [--notes N] [--url U]
+                [--invitee EMAIL ...] [--alarm SPEC]
+
+  Book an event (write-gated). Attendees are invited by the server where it
+  schedules. --url defaults to the connection's meeting_url.
+
+  --calendar C      target calendar, by name or href; it must be in scope
+  --title T         the event's title
+  --from ISO        start; with --all-day, a bare date
+  --to ISO          end; with --all-day, a bare date, EXCLUSIVE (an end not
+                    after the start books one day)
+  --all-day         an all-day event
+  --location L      the location
+  --notes N         description / notes
+  --url U           meeting or reference URL; defaults to the connection's
+                    meeting_url. Carried, not minted
+  --invitee EMAIL   attendee address or `Name <address>` (repeatable)
+  --alarm SPEC      an alarm (repeatable; SPEC below)
+
+  Output: {created, uid, href, etag, calendar, calendarHref, startDate,
+  endDate, allDay, url, invitees, conferencing}; conferencing is always null.
+
+  Exit codes: 0; 2 auth, or a calendar the server grants this account no
+  write on; 3 an unknown calendar; 4 a connection without allow_write, or a
+  calendar outside the scope; 5 server/network; 6 a bad or naive datetime,
+  --to not after --from, a bad --alarm, a value carrying a control
+  character.
+
+  Example:
+    calendar create --calendar Work --title "Review" --from 2026-09-01T10:00 --to 2026-09-01T10:30 --invitee user@example.com --alarm=-15m
+""" + _HELP_ALARM + _HELP_CONFERENCING + _HELP_WRITE_GATE + _HELP_TIME + _HELP_RECURRENCE + _HELP_TAIL,
+    "update": """\
+calendar update <uid|href> [--title T] [--from ISO] [--to ISO]
+                [--all-day | --no-all-day]
+                [--location L] [--notes N] [--url U]
+                [--add-invitee EMAIL ...] [--alarm SPEC ...]
+                [--scan-from ISO] [--scan-to ISO]
+
+  Change an event (write-gated). Only the flags you pass change; SEQUENCE is
+  bumped so attendees see the revision. Guarded by If-Match: a concurrent
+  change exits 6 (etag_conflict). Moving one boundary keeps the other.
+
+  --title T             a new title
+  --from ISO            a new start
+  --to ISO              a new end
+  --all-day             make it an all-day event
+  --no-all-day          make it a timed event
+  --location L          a new location
+  --notes N             new notes
+  --url U               a new URL
+  --add-invitee EMAIL   add an attendee (repeatable); existing ones stay
+  --alarm SPEC          replace the alarm set (repeatable; SPEC below)
+  --scan-from ISO       start of the uid scan fallback window
+  --scan-to ISO         end of that window
+
+  At least one field flag is needed (exit 6 nothing_to_update otherwise).
+
+  Output: {updated, uid, href, etag, calendar, allDay, sequence}.
+
+  Exit codes: 0; 2 auth; 3 no event with that uid in scope; 4 a connection
+  without allow_write, or an event outside the scope; 5 server/network; 6 a
+  bad or naive datetime, nothing_to_update, recurring_event, etag_conflict.
+
+  Example: calendar update <UID> --from 2026-09-01T11:00 --to 2026-09-01T11:30
+""" + _HELP_ALARM + _HELP_CONFERENCING + _HELP_WRITE_GATE + _HELP_UID + _HELP_TIME + _HELP_RECURRENCE + _HELP_TAIL,
+    "delete": """\
+calendar delete <uid|href> [--scan-from ISO] [--scan-to ISO]
+
+  Remove an event (write-gated): the whole stored object, guarded by
+  If-Match.
+
+  --scan-from ISO   start of the uid scan fallback window
+  --scan-to ISO     end of that window
+
+  Output: {deleted, uid, href, calendar}.
+
+  Exit codes: 0; 2 auth; 3 no event with that uid in scope; 4 a connection
+  without allow_write, or an event outside the scope; 5 server/network; 6 a
+  bad datetime.
+
+  Example: calendar delete <HREF>
+""" + _HELP_WRITE_GATE + _HELP_UID + _HELP_TIME + _HELP_RECURRENCE + _HELP_TAIL,
+    "context": """\
+calendar context list
+calendar context show <key>
+calendar context edit <key>
+calendar context put <key>
+
+  The versioned project documents behind `refs`. Bare `context` is `context
+  list`, which answers {documents, records}; `show` prints one document's
+  body; `edit` checks one out to a path to edit and answers {key, path, base,
+  records, next}; `put` writes the edited path back as the document's new
+  version and answers {put, version, records}. edit and put are writes: exit
+  4 under CAPABILITIES_READ_ONLY.
+
+  Exit codes: 0; 3 not_found for a key `show` does not find; 4 the read-only
+  switch; 6 input, edit_not_started for a put with no edit checkout.
+
+  Example: calendar context show <key>
+""",
+    "ids": """\
+For calendar:
+  The project identifiers envelope is where discovered calendar hrefs belong,
+  so a consumer stops re-discovering the calendar it books into.
+
+  Example: calendar ids set work-calendar <HREF> --note "the calendar meetings are booked into"
+""",
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").
@@ -2025,7 +2295,7 @@ def main() -> None:
     p.set_defaults(_parser_class=_Parser)
     sub = p.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
 
-    sub.add_parser("help", help="Print the full usage contract.")
+    sub.add_parser("help", help="Print the menu; `calendar help <verb>` gives one verb's contract.")
     sub.add_parser("doctor", help="Prove the credential, endpoint and principal.")
     sub.add_parser("calendars", help="List the calendars in scope.")
 

@@ -87,6 +87,6 @@ def test_ability_probe_stays_on_the_non_mutating_get_route():
 
 
 def test_help_does_not_claim_a_get_deployment():
-    help_text = coolify_module.__doc__ or ""
+    help_text = (coolify_module.__doc__ or "") + "".join(coolify_module.HELP_VERBS.values())
     assert "(POST /deploy)" in help_text
     assert "(GET /deploy)" not in help_text

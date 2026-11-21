@@ -294,7 +294,7 @@
       "level": 0,
       "lucide_icon": "calendar",
       "path": "capabilities/calendar",
-      "payload_sha256": "1a713c7d9a391f85b8cbf5a59cb8c902f680c55f7170e6f1c50b59566f67f77d",
+      "payload_sha256": "dc95e9595712c454a9d107616cbf3d2cf72ba0f4f9f6717a6a1161bb96b78fac",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "CalDAV CLI for remote calendars — list calendars, read, search and check busy blocks, and book events on a principal.",
@@ -310,7 +310,7 @@
           "title": "Календарь"
         }
       },
-      "version": "2026-11-16 — `calendar` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-21 — `calendar help` is the menu, and `calendar help <verb>` one verb's whole contract"
     },
     "callva": {
       "executable": [
@@ -336,7 +336,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/callva",
-      "payload_sha256": "f8e723f0636f392ed053a7bbc50c9a4defe3eace8e9d89c56ee1c9bccb9c1944",
+      "payload_sha256": "fbe0247b6525e5bedc9e595c598a35cf2102be7b295f48c9e17ddc4dac16e454",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "CallVA voice-AI platform CLI over the External API — read/create/update/delete agents, the speech-stack presets they run on and the tools they call, assets (prompts), calls, transcripts, recordings, call analytics, custom fields, webhook schedules, automations (Windmill scripts), webhook logs, record actions, saved calls-list views, issues, knowledge, variables, settings, projects, phone numbers, and providers.",
@@ -352,7 +352,7 @@
           "title": "CallVA"
         }
       },
-      "version": "2026-11-21 — `callva` reaches a call's tool calls, the call allowance, the LiveKit connection and webhook-secret rotation, and schedules use their canonical path"
+      "version": "2026-11-21 — `callva help` is the menu, and `callva help <verb>` one verb's whole contract"
     },
     "callvatest": {
       "executable": [
@@ -370,7 +370,7 @@
       "icon": false,
       "level": 0,
       "path": "capabilities/callvatest",
-      "payload_sha256": "06b6840e6a88e4d8ac843bdcd7abf5c87b60b03c4fd2e6b77f564b372426098f",
+      "payload_sha256": "164f153711f7e8a63e72733410aee69463314654e62fbf5031d900588088afc3",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "CallVA agent test harness — drives a deployed voice agent through a real LiveKit room over text, then asserts the transcript, the tools it called, the arguments it generated, the results it answered from, and the fields stored after the call.",
@@ -386,7 +386,7 @@
           "title": "Тест CallVA"
         }
       },
-      "version": "2026-11-21 — `--via test-panel` opens the room the way the dashboard's Test button does"
+      "version": "2026-11-21 — `callvatest help` is the menu, and `callvatest help <verb>` one verb's whole contract"
     },
     "clickup": {
       "executable": [
@@ -401,7 +401,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/clickup",
-      "payload_sha256": "8a72ba30413c6d58206eafa01bf77914cb16e77b036bef51eec33ae1a392a16c",
+      "payload_sha256": "da6a849bb6122be9f014dfc38d93c671a41663e3ce76de50eb170e3985b2bdb6",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "ClickUp CLI over the REST API — read/create/update/comment-on tasks and subtasks, complete via status, manage assignees, tags, dependencies, custom fields, attachments, and webhooks across spaces and lists.",
@@ -417,7 +417,7 @@
           "title": "ClickUp"
         }
       },
-      "version": "2026-11-16 — `clickup` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-21 — `clickup help` is the menu, and `clickup help <verb>` one verb's whole contract"
     },
     "context": {
       "executable": [
@@ -435,7 +435,7 @@
       "level": 0,
       "lucide_icon": "book-open",
       "path": "capabilities/context",
-      "payload_sha256": "6c1ab375aa19fa4844cb638b67dc0cce5af805bffd503be64ebc03c5bc3e39fb",
+      "payload_sha256": "7c45e3ee47ada0a1e305a909f6039b9d8b5cdd4819a3a1c3a823bdbaa324d9e7",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte.",
@@ -451,7 +451,7 @@
           "title": "Контекст"
         }
       },
-      "version": "2026-11-16 — `context` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-21 — `context help` is the menu, and `context help <verb>` one verb's whole contract"
     },
     "coolify": {
       "executable": [
@@ -509,7 +509,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/coolify",
-      "payload_sha256": "88fadf675f22c4e2cfcee923910a06a1eb29ea09509e97b9536330bde98cba9e",
+      "payload_sha256": "f53ebceceb5f5c5254e6da63f8a4196cfab9c8ff9305a5edbcb043d6dddc9f7a",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Coolify CLI over the REST API — list projects/resources/servers, read application & service status and logs, and deploy/restart/stop/start them on a self-hosted Coolify instance.",
@@ -525,7 +525,7 @@
           "title": "Coolify"
         }
       },
-      "version": "2026-11-16 — `coolify` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-21 — `coolify help` is the menu, and every verb answers `coolify help <verb>` with its whole contract"
     },
     "deployment": {
       "executable": [

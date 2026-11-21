@@ -99,6 +99,8 @@ def test_rollback_images_reads_what_a_rollback_can_return_to(capsys, name):
 
 
 def test_the_help_names_both_verbs_where_deployment_looks_for_them():
-    help_text = m.__doc__ or ''
+    # deployment reads the bare menu for the verb; its synopsis is on the page
+    assert 'app rollback' in (m.__doc__ or '')
+    help_text = (m.__doc__ or '') + ''.join(m.HELP_VERBS.values())
     assert 'app rollback <uuid> --to <commit|image-tag>' in help_text
     assert 'app rollback-images <uuid>' in help_text

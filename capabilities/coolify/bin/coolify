@@ -3,13 +3,14 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """coolify — Coolify CLI over the REST API. Drives a self-hosted Coolify
 instance: list projects, resources, servers, applications, services and
 databases; read their status and an application's logs; and deploy, restart,
-stop or start them. Agent-invoked — run `coolify help` to reload this contract.
+stop or start them. Agent-invoked — run `coolify help` to reload this menu and
+`coolify help <verb>` for one verb's whole contract, on demand.
 
 USAGE
   coolify <command> [options]
@@ -20,327 +21,75 @@ addressed by its Coolify `uuid` (never a name or slug); a project's
 environments come back inside the project object. Structured reads emit JSON
 to stdout.
 
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. A flag wins (--base-url / --token); otherwise COOLIFY_BASE_URL /
-  COOLIFY_TOKEN resolve through the credential cascade (`Where a secret
-  resolves`, at the end of this help). A secret never has a flag of its own
-  that puts it on argv; --token exists for parity but prefer config/env.
-  COOLIFY_BASE_URL is the instance root WITHOUT the /api/v1 suffix (e.g.
-  https://coolify.example.com); the CLI appends it.
-
-  More than one instance or team is declared as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": { "base_url": "https://coolify.example.com",
-                  "secret_env": "COOLIFY_<ID>_TOKEN",
-                  "allow_write": true }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below. The entry
-  names the env var holding its token ("secret_env"); the value resolves through
-  the credential cascade above. "base_url" sits literally in the entry.
-
-  `coolify connect` (below) writes one entry and its token in one act.
-
-  Selection: --connection <id> (accepted anywhere on the command line).
-  Unflagged, the registry's "default" pointer applies, else the sole entry;
-  several entries without a pointer is refused as ambiguous.
-
-  A lent connection: a caller holding a Coolify connection of its own may lend
-  it to one process, through that process's environment alone -
-  COOLIFY_LENT_BASE_URL (the instance root) and COOLIFY_LENT_TOKEN - as
-  `deployment node --coolify-stdin` does for each coolify it runs. While both
-  are set they are the run's only connection, writable unless the read-only
-  switch is on: no registry is read and no grant is asked for, --connection
-  beside them is refused (exit 6 lent_connection), and one set without the
-  other is refused (exit 6 lent_connection_incomplete). Nothing is written.
-
-  Inside a project, a connection declared in ~/.config/coolify/ is usable once
-  the project grants it. Outside any project, connections, doctor and servers
-  are machine reads: they use the machine's own connections read-only, unless
-  a grant switched one off; every other verb that needs a connection is
-  refused there.
-
-  A Coolify API token is team-scoped and carries explicit abilities (read,
-  read:sensitive, write, deploy, root). A connection without "allow_write": true
-  resolves writability from WRITE_DEFAULT (true — deploys stay inside an instance
-  the consumer owns); a connection set to false refuses deploy/start/stop/restart
-  with exit 4.
+One connection is one Coolify instance and team. How connections are
+declared, selected, lent and granted writes is CONNECTIONS, on `coolify help
+connections`. A WRITE verb mutates the instance and requires allow_write; a
+connection set to false refuses it with exit 4.
 
 COMMANDS
-  connections
-      Where every connection's values resolve from (tier, source, secrets
-      masked). Local only — no network.
+  Pairing
+  connect <name>                  pair an instance: write a connection and its token, then probe it
 
-  connect <name> --url <url> (--token-stdin | --token-file <path> |
-                              --token-env <KEY>)
-          [--global | --project] [--default] [--ssh-key <path>]
-      Pair an instance: write the connection entry and its token in one act,
-      then run the doctor probe on it. The entry holds only non-secret values:
-      "base_url", "secret_env" (COOLIFY_<NAME>_TOKEN, the key holding the
-      token) and, with --ssh-key, "ssh": {"user": "root", "key_path": <path>}
-      for reaching the instance's servers. The token is written to the
-      credentials file of the same scope, mode 0600, single-quoted so the
-      parser reads it back whole: --project (the default) writes this
-      project's connection record ("Where connections live" below) and the
-      project's .env.local; --global writes ~/.config/coolify/connections.json
-      (the store's global rows inside an agent whose records moved there) and
-      ~/.config/coolify/credentials.env. Other entries and other lines are
-      kept; an existing entry of the same name is replaced, its grant fields
-      kept. --default points the scope's default at it. --url is the instance
-      root, http(s)://host[:port], without /api/v1. --token-stdin reads the
-      token from standard input (no echo on a terminal), --token-file from a
-      file, --token-env resolves an env key through the cascade above. The
-      token is never printed. Answers the entry's paths and the probe's
-      result (version, team, abilities); a failed probe keeps the entry and
-      the token and exits with the probe's category (2 or 5), so a fix needs
-      `coolify --connection <name> doctor`, not a second pairing. A global
-      connection used inside a project still needs that project's grant; the
-      answer says so with the command. Outside any project the answer says
-      "usable_here": true: the machine reads use it there, read-only.
-      Repeating it is safe: it rewrites the same entry and the same line.
+  Projects and reads
+  projects [<uuid>]               list projects, or get one with its environments
+  projects create <name>          WRITE. create a project and its default environment
+  projects environment create <uuid> <name>  WRITE. create an environment in a project
+  projects delete <uuid>          WRITE. delete an empty project
+  resources                       every deployable resource: uuid, name, type, status
+  sources                         GitHub Apps and deploy keys app create takes; no key material
+  applications [<uuid>]           list applications, or get one in full detail
+  services [<uuid>]               list services, or get one
+  databases [<uuid>]              list databases, or get one
+  servers [<uuid>]                list servers, or get one, each with its memory
+  deployments [<uuid>]            active and queued deployments, or one deployment
+  logs <uuid>                     an application's runtime logs
 
-  doctor [--connection <id>]
-      Validate token + reachability (GET /version, GET /teams/current), report
-      the Coolify version, token team, and effective token abilities — every
-      connection, or one. Ability checks are non-mutating; read:sensitive can
-      be unknown when the team has no secret-bearing resource to inspect.
-      Exit 0 all healthy / 2 missing-or-rejected token / 5 unreachable.
+  Applications
+  app create                      WRITE. create an application from git, an image or a Dockerfile
+  app update <uuid>               WRITE. patch only the supplied application fields
+  app rollback <uuid>             WRITE. queue a rollback to a previous commit or image tag
+  app rollback-images <uuid>      the image tags a rollback can start again; reads only
+  app delete <uuid>               WRITE. delete an application
+  storage add <uuid>              WRITE. add a named volume or a host path to an application
 
-  projects [<uuid>]
-      List projects, or get one project (its environments come inside it).
-  projects create <name> [--description <text>]
-      Create a new project. Returns the project_uuid and default environment.
-      `projects create --name <name>` still works for one release, with a
-      warning on stderr. Write verb - requires allow_write.
-  projects environment create <uuid> <name>
-      Create the environment <name> in project <uuid> (POST
-      /projects/{uuid}/environments). Returns the new environment's uuid.
-      Write verb - requires allow_write.
-  resources
-      Flat list of every deployable resource (uuid, name, type, status) —
-      the lookup an agent runs to find the uuid to act on.
-  sources
-      List GitHub Apps and private/deploy keys with the UUIDs accepted by
-      `app create --github-app` and `--private-deploy-key`. Secret key
-      material is never emitted.
-  applications [<uuid>]            List applications, or get one (full detail).
-  services [<uuid>]               List services, or get one.
-  databases [<uuid>]              List databases, or get one.
-  servers [<uuid>]                List servers, or get one.
-      Resource and server records from these reads and `resources` carry
-      "dashboard_url", the record's page in the Coolify dashboard, built
-      from the connection's base_url (resources read the projects for their
-      environment path); it is absent when the page cannot be resolved.
-      Server records also carry "memory", read over the connection's SSH
-      access (coolify connect --ssh-key) from the server's /proc/meminfo:
-      {"total_bytes", "available_bytes"} from MemTotal and MemAvailable, and
-      "total" and "available" in human units (e.g. "7.6 GiB"). A server that
-      cannot be read - no SSH access on the connection, unreachable, key
-      refused, unknown host key - carries {"error": <reason>} instead, and the
-      read still succeeds. The Coolify host itself (ip host.docker.internal)
-      is reached at the connection's base_url host.
-  deployments [<uuid>]            List active/queued deployments, or get one
-                                  deployment by its uuid.
-  logs <uuid> [--lines N]         An application's runtime logs (default 100).
+  Services
+  service create                  WRITE. create a service from a docker-compose file
+  service set-image <uuid>        WRITE. replace one Compose service's image, nothing else
+  service set-compose <uuid>      WRITE. replace a service's whole Compose document
+  service delete <uuid>           WRITE. delete a service
 
-  app create --project <uuid> --server <uuid> --environment <name>
-      Create an application. Source-selecting flags (mutually exclusive):
-      --git-repository <url> --git-branch <branch>  (public git)
-          [--build-pack nixpacks|railpack|static|dockerfile|dockercompose]
-          [--docker-compose-location <path>] [--dockerfile-location <path>]
-      --private-deploy-key <uuid> (+ git flags above for private git with key)
-      --github-app <uuid> (+ git flags above for private git with GitHub app)
-      --image <registry/name:tag>  (registry image)
-      --dockerfile <file|->  (inline dockerfile, raw content)
-      Common optional: --name, --domains, --ports-exposes, --instant-deploy,
-      --destination <uuid>, --base-directory, --watch-paths, --limits-memory,
-      and the health-check flags accepted by `app update`.
-      --no-autogenerate-domain keeps an application with no --domains without
-      one; Coolify otherwise generates a domain from the server's wildcard
-      domain or sslip.io. Returns the application uuid.
-      Write verb - requires allow_write.
+  Databases
+  database create                 WRITE. create a standalone database of one engine
+  database delete <uuid>          WRITE. delete a database
 
-      --instant-deploy creates without queuing, then deploys once, returning
-      deployment_uuid and deployments alongside the new application's uuid.
-      If deployment fails, the created application remains for inspection.
+  Lifecycle
+  deploy [<uuid>]                 WRITE. trigger a deployment of one resource, or of every resource with a tag
+  wait <uuid>                     poll until a resource runs healthy; reads only
+  start <uuid>                    WRITE. start a resource in place
+  stop <uuid>                     WRITE. stop a resource in place
+  restart <uuid>                  WRITE. restart a resource in place
 
-  app update <uuid> [options]
-      Patch only the supplied application fields:
-      --name --domains --ports-exposes --base-directory
-      --dockerfile-location --docker-compose-location --build-pack
-      --git-repository --git-branch --watch-paths
-      --limits-memory <size>  (the container's memory limit, e.g. 2g or 1536m)
-      --auto-deploy-enabled / --no-auto-deploy-enabled
-      --health-check-enabled / --no-health-check-enabled
-      --health-check-path --health-check-port --health-check-host
-      --health-check-scheme --health-check-return-code
-      --health-check-interval --health-check-timeout --health-check-retries
-      --health-check-start-period
-      --watch-paths accepts newline-separated glob patterns that filter which
-      repository changes trigger a webhook deploy (e.g. "backend/**"). Pass an
-      empty string to clear the field (deploy on all changes).
-      Write verb - requires allow_write.
-
-  app rollback <uuid> --to <commit|image-tag>
-      Queue a rollback deployment of the application to a previous commit or
-      image tag (POST /applications/<uuid>/rollback). An application built from
-      an image Coolify tags per commit starts that image again; a Docker
-      Compose application is built again from that commit. Returns the
-      deployment_uuid to give `wait --deployment`; Coolify answers without one
-      when it skips the request as a duplicate of a queued deployment. The ref
-      takes letters, digits, '.', '-', '_' and '/', and does not start with
-      '-'. Write verb - requires allow_write.
-  app rollback-images <uuid>
-      What a rollback can start again: the image tags Coolify finds on the
-      server for the application, each with its created_at and is_current, and
-      the current tag. Coolify lists only images named after the application's
-      uuid (or its registry image name), so a Compose application that names
-      its own images lists none and rolls back by commit. Reads only.
-
-  storage add <uuid> (--volume <name> | --host-path <path>) --mount-path <path>
-      Add one storage to an application; it takes effect at the next deploy.
-      --volume adds a named volume (Coolify prefixes the name with the
-      application uuid) and `app delete --delete-volumes` removes it.
-      --host-path binds an absolute path on the server - a directory or a
-      file such as /var/run/docker.sock - at --mount-path as it is: Coolify
-      never creates, writes or deletes that path, also when the application
-      is deleted, and a path missing on the server is created by Docker,
-      empty and owned by root. Not idempotent: each call adds a storage.
-      Write verb - requires allow_write.
-
-  service create --compose <file|-> --project <uuid> --server <uuid>
-                 --environment <name> [--name <name>] [--instant-deploy]
-                 [--destination <uuid>]
-      Create a service from a docker-compose file. The compose file is
-      base64-encoded before sending. Returns the service uuid.
-      Write verb - requires allow_write.
-  service set-image <uuid> --image <registry/name:tag>
-                    [--compose-service <name>]
-      Replace the image of one service in the service's Compose document
-      (PATCH /services/<uuid>), naming it by --compose-service, which a
-      document of one service may leave out. Only that `image:` line
-      changes; the rest of the document, its volumes included, stays as
-      Coolify holds it, and nothing restarts: `coolify deploy <uuid>` starts
-      the service on the new image, keeping its volumes. Answers uuid,
-      compose_service, image, previous_image and changed (false, and no
-      request sent, when the image is already that one). Reading the
-      document needs the token's read:sensitive ability (exit 2
-      compose_hidden without it); a service or image line it cannot find
-      exits 6. Write verb - requires allow_write.
-  service set-compose <uuid> --compose <file|->
-      Replace a service's whole Compose document with the one given (a
-      file, or '-' for stdin) through PATCH /services/<uuid>, base64-encoded,
-      without reading the stored one - so it needs no read:sensitive. The
-      caller owns the document: what it leaves out, a volume included, is
-      gone from the service. Nothing restarts: `coolify deploy <uuid>`
-      starts the service from the new document; named volumes keep their
-      data when the document keeps their names. Answers uuid, written and
-      next. An empty document exits 6. Write verb - requires allow_write.
-
-  database create --engine <engine> --project <uuid> --server <uuid>
-                  (--environment <name> | --environment-uuid <uuid>)
-      Create a standalone database. --engine picks the endpoint
-      (POST /databases/<engine>) and is one of:
-        postgresql  mysql  mariadb  mongodb  redis  keydb  dragonfly  clickhouse
-      Coolify accepts an environment by name or by uuid; supply at least one.
-      Named optional flags: --name, --description, --image, --instant-deploy,
-      --destination <uuid>.
-      Every other body field is a pass-through, applied after the named flags:
-        --set KEY=VALUE       sends VALUE as a JSON string
-        --set-json KEY=JSON   sends a parsed JSON value (boolean, number, array)
-      Both repeat. A secret field takes its value off the command line:
-        --set-stdin KEY       reads VALUE from standard input (once)
-        --set-file KEY=PATH   reads VALUE from a file
-        --set-env KEY=ENV_KEY reads VALUE from an env key (cascade above)
-      each sent as a JSON string. --set or --set-json on a password field
-      (any name containing "password") still works for one release, with a
-      warning on stderr. The capability sends these names and values as given
-      and validates neither against the engine — Coolify answers an unknown or
-      malformed field with 422 naming it. The engine credentials and tuning live
-      here and differ per engine (postgres_user/postgres_password/postgres_db,
-      mysql_root_password, mariadb_database, mongo_initdb_root_username,
-      redis_password, keydb_password, dragonfly_password, clickhouse_admin_user
-      and their neighbours), next to the fields every engine shares (is_public,
-      public_port, tags, the limits_* set). Coolify wants each *_conf field
-      base64-encoded, and silently drops is_public when public_port is absent.
-      Returns the database uuid, with internal_db_url on every engine except
-      dragonfly, and external_db_url only on a public database, their
-      passwords redacted (see SECRETS); --reveal prints them to a terminal.
-      Write verb - requires allow_write.
-
-  app|service|database delete <uuid> --yes [--delete-volumes]
-      [--delete-configurations] [--docker-cleanup] [--delete-connected-networks]
-      Delete a resource. Cleanup options default to false, including volumes;
-      each option explicitly opts into that cleanup. Requires allow_write.
-  projects delete <uuid> --yes
-      Delete an empty project. Requires allow_write; remove its resources first.
-
-  deploy [<uuid>] [--force] [--tag T]
-      Trigger a deployment (POST /deploy). Returns deployments with resource_uuid
-      and deployment_uuid (applications; Coolify returns no deployment uuid for
-      services or databases). --force rebuilds without cache; --tag deploys
-      every resource with a tag, rather than selecting an image tag.
-  wait <uuid> [--deployment <uuid>] [--timeout <s>]
-      Poll until the resource reports running:healthy and, when specified, the
-      deployment reports finished. Default timeout: 600 seconds, poll: 5 seconds.
-      Starting/exited states are retried. Failed/cancelled deployments exit 5;
-      timeout exits 5 wait_timeout with the last resource and deployment states.
-      Reads only. A missing resource exits 3.
-  start <uuid>   --type application|service|database
-  stop <uuid>    --type application|service|database
-  restart <uuid> --type application|service|database
-      In-place lifecycle on a running resource. --type selects the endpoint
-      family (defaults to application).
-
-  env list <uuid> [--type application|service]
-      List environment variables for an application or service. Every row has
-      `value_hidden`; true means Coolify redacted the value (normally because
-      the token lacks effective read:sensitive access), not that it is empty.
-  env set <uuid> <KEY> [--value-stdin | --value-file <path> |
-                        --value-env <ENV_KEY>] [--type application|service]
-      Set or update an environment variable. The value comes from standard
-      input (the default, no echo on a terminal, one trailing newline
-      dropped), a file, or an env key resolved through the cascade above.
-      `env set <uuid> <KEY> <VALUE>` still works for one release, with a
-      warning on stderr. Write verb - requires allow_write.
-  env rm <uuid> <KEY> [--type application|service]
-      Remove an environment variable. Write verb - requires allow_write.
-  env bulk <uuid> [--type application|service]
-      Bulk update environment variables (PATCH). Reads KEY=VALUE pairs from
-      stdin, one per line. Write verb - requires allow_write.
+  Environment variables
+  env list <uuid>                 an application's or service's environment variables
+  env set <uuid> <KEY>            WRITE. set or update one variable, its value off the command line
+  env rm <uuid> <KEY>             WRITE. remove one variable
+  env bulk <uuid>                 WRITE. update many variables from stdin
 
 SECRETS
-  A secret never goes on the command line: every verb that takes one reads it
-  from standard input, a file or an env key. Nothing prints one: every answer
-  redacts the password in a connection URL (scheme://user:<redacted>@host) and
-  the value of every field whose name contains "password". --reveal, on the
-  reads (projects, resources, applications, services, databases, servers,
-  deployments, logs, env list) and on database create, prints them in full,
-  and is refused with exit 4 unless stdout is a terminal.
-
-Contract commands (the same on every capability):
-  coolify stub                                 One-line awareness text.
-  coolify manifest --json                      Machine-readable declaration.
-  coolify guide [bootstrap|headless-apps]      Guide topics / one guide body.
-  coolify ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-              [--note <text>]                   (capabilities/coolify/identifiers.json,
-                                                 or store rows once the agent moved).
-  coolify refs                                 Menu of the project's reference files.
-  coolify inventory [--network]                What this capability holds in
-                                               this project (--network adds
-                                               remote detail).
+A secret never goes on the command line: every verb that takes one reads it
+from standard input, a file or an env key. Nothing prints one: every answer
+redacts the password in a connection URL (scheme://user:<redacted>@host) and
+the value of every field whose name contains "password"; the reads and
+database create print them in full only to a terminal, and refuse with exit 4
+otherwise, as their pages say.
 
 EXIT CODES
   0 success · 2 auth/credentials (401/403, missing token) · 3 not found (404) ·
-  4 policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
-  verb, a write verb on a read-only connection, or --reveal without a
-  terminal; ask the user, never lift a gate yourself · 5 server/network (timeout, 429 after retries, 5xx) ·
-  6 input (a malformed argument, an unknown/ambiguous connection)
+  4 policy refusal — the project gate (store rows once the agent moved, else
+  capabilities/settings.json) on any verb, a write verb on a read-only
+  connection, or a reveal without a terminal; ask the user, never lift a gate
+  yourself · 5 server/network (timeout, 429 after retries, 5xx) · 6 input (a
+  malformed argument, an unknown/ambiguous connection)
 """
 
 from __future__ import annotations
@@ -426,6 +175,766 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / "coolify" / "credentials.env"
+
+# The verb pages `coolify help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections and ids follow. A
+# text several verbs own is one constant, added to each of their pages.
+_HELP_CONNECTION = """
+  Connection: --connection <id> (accepted anywhere on the command line) selects
+  it; unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous. A flag wins over
+  the connection's values: --base-url <url> (Coolify instance base URL,
+  overrides env/config) and --token <token> (API token; prefer config/env,
+  avoid on CLI). A lent connection (COOLIFY_LENT_BASE_URL and
+  COOLIFY_LENT_TOKEN) is the run's only connection. Outside any project,
+  connections, doctor and servers are machine reads; every other verb that
+  needs a connection is refused there (`coolify help connections`).
+
+  Output: one JSON document on stdout; a refusal is a JSON error envelope on
+  stderr, with nothing on stdout.
+"""
+_HELP_WRITE = """
+  Write verb - requires allow_write. A connection without "allow_write": true
+  resolves writability from WRITE_DEFAULT (true — deploys stay inside an
+  instance the consumer owns); a connection set to false refuses it with exit
+  4 before any request is made.
+"""
+_HELP_SECRETS = """
+  SECRETS
+  A secret never goes on the command line: every verb that takes one reads it
+  from standard input, a file or an env key. Nothing prints one: every answer
+  redacts the password in a connection URL (scheme://user:<redacted>@host) and
+  the value of every field whose name contains "password". --reveal, on the
+  reads (projects, resources, applications, services, databases, servers,
+  deployments, logs, env list) and on database create, prints them in full,
+  and is refused with exit 4 unless stdout is a terminal.
+"""
+_HELP_RECORDS = """
+  Resource and server records from these reads and `resources` carry
+  "dashboard_url", the record's page in the Coolify dashboard, built
+  from the connection's base_url (resources read the projects for their
+  environment path); it is absent when the page cannot be resolved.
+"""
+_HELP_TYPE = """
+  --type application|service|database selects the endpoint family (defaults to
+  application).
+"""
+_HELP_ENV_TYPE = """
+  --type application|service selects the resource kind (defaults to
+  application).
+"""
+_HELP_DELETE = """
+  --yes confirms the deletion (exit 6 confirmation_required without it).
+  Cleanup options default to false, including volumes; each option explicitly
+  opts into that cleanup: --delete-volumes, --delete-configurations,
+  --docker-cleanup, --delete-connected-networks. One DELETE; answers Coolify's
+  reply.
+"""
+_HELP_EXIT = """
+  EXIT CODES
+  0 success · 2 auth/credentials (401/403, missing token) · 3 not found (404) ·
+  4 policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
+  verb, a write verb on a read-only connection, or --reveal without a
+  terminal; ask the user, never lift a gate yourself · 5 server/network (timeout, 429 after retries, 5xx) ·
+  6 input (a malformed argument, an unknown/ambiguous connection)
+"""
+_HELP_READ_TAIL = _HELP_SECRETS + _HELP_CONNECTION + _HELP_EXIT
+_HELP_WRITE_TAIL = _HELP_WRITE + _HELP_CONNECTION + _HELP_EXIT
+HELP_VERBS = {
+    "connections": """\
+  connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked). Local only — no network.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. A flag wins (--base-url / --token); otherwise COOLIFY_BASE_URL /
+  COOLIFY_TOKEN resolve through the credential cascade (`Where a secret
+  resolves`, above). A secret never has a flag of its own
+  that puts it on argv; --token exists for parity but prefer config/env.
+  COOLIFY_BASE_URL is the instance root WITHOUT the /api/v1 suffix (e.g.
+  https://coolify.example.com); the CLI appends it.
+
+  More than one instance or team is declared as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "base_url": "https://coolify.example.com",
+                  "secret_env": "COOLIFY_<ID>_TOKEN",
+                  "allow_write": true }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above. The entry
+  names the env var holding its token ("secret_env"); the value resolves through
+  the credential cascade above. "base_url" sits literally in the entry.
+
+  `coolify connect` (`coolify help connect`) writes one entry and its token in
+  one act; `coolify connection add` (`coolify help connection`) writes one from
+  its declared fields.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+  A lent connection: a caller holding a Coolify connection of its own may lend
+  it to one process, through that process's environment alone -
+  COOLIFY_LENT_BASE_URL (the instance root) and COOLIFY_LENT_TOKEN - as
+  `deployment node --coolify-stdin` does for each coolify it runs. While both
+  are set they are the run's only connection, writable unless the read-only
+  switch is on: no registry is read and no grant is asked for, --connection
+  beside them is refused (exit 6 lent_connection), and one set without the
+  other is refused (exit 6 lent_connection_incomplete). Nothing is written.
+
+  Inside a project, a connection declared in ~/.config/coolify/ is usable once
+  the project grants it. Outside any project, connections, doctor and servers
+  are machine reads: they use the machine's own connections read-only, unless
+  a grant switched one off; every other verb that needs a connection is
+  refused there.
+
+  A Coolify API token is team-scoped and carries explicit abilities (read,
+  read:sensitive, write, deploy, root). A connection without "allow_write": true
+  resolves writability from WRITE_DEFAULT (true — deploys stay inside an instance
+  the consumer owns); a connection set to false refuses deploy/start/stop/restart
+  with exit 4.
+
+  Example: coolify connections
+""",
+    "connect": """\
+coolify connect <name> --url <url> (--token-stdin | --token-file <path> |
+                                    --token-env <KEY>)
+                [--global | --project] [--default] [--ssh-key <path>]
+
+  Pair an instance: write the connection entry and its token in one act,
+  then run the doctor probe on it. <name> is the connection's label: the
+  connection whose id or label it is is paired again, keeping the token
+  variable its spec names; otherwise one labelled <name> is added, whose id
+  the store mints (in a files project the name stays its key). The entry holds only non-secret values:
+  "base_url", "secret_env" (COOLIFY_<NAME>_TOKEN, the key holding the
+  token) and, with --ssh-key, "ssh": {"user": "root", "key_path": <path>}
+  for reaching the instance's servers. The token is written to the
+  credentials file of the same scope, mode 0600, single-quoted so the
+  parser reads it back whole: --project (the default) writes this
+  project's connection record ("Where connections live", `coolify help
+  connections`) and the
+  project's .env.local; --global writes ~/.config/coolify/connections.json
+  (the store's global rows inside an agent whose records moved there) and
+  ~/.config/coolify/credentials.env. Other entries and other lines are
+  kept; an existing entry of the same name is replaced, its grant fields
+  kept. --default points the scope's default at it. --url is the instance
+  root, http(s)://host[:port], without /api/v1. --token-stdin reads the
+  token from standard input (no echo on a terminal), --token-file from a
+  file, --token-env resolves an env key through the cascade
+  (`coolify help connections`). The
+  token is never printed. Answers the entry's paths and the probe's
+  result (version, team, abilities); a failed probe keeps the entry and
+  the token and exits with the probe's category (2 or 5), so a fix needs
+  `coolify --connection <name> doctor`, not a second pairing. A global
+  connection used inside a project still needs that project's grant; the
+  answer says so with the command. Outside any project the answer says
+  "usable_here": true: the machine reads use it there, read-only.
+  Repeating it is safe: it rewrites the same entry and the same line.
+
+  Output: {ok, connection (its id), label, scope, base_url, secret_env,
+  credentials, registry, default, ssh (with --ssh-key), doctor (the probe:
+  base_url, version, team, abilities, or error)}, and usable_here with a
+  hint or machine_reads where the grant decides it.
+
+  Exit codes: 0 paired and the probe answered; 2 or 5 the probe's category,
+  the entry and token kept; 5 credentials_write_failed; 6 input - a --url
+  that is not http(s)://host[:port] or carries credentials or /api/v1, an
+  empty or malformed token, a name the registry does not take, --project
+  with no project (no_project) or no capabilities/ envelope (no_envelope),
+  an --ssh-key that is not a file.
+
+  Examples:
+    coolify connect <name> --url https://coolify.example.com --token-env <ENV_KEY>
+    coolify connect <name> --url https://coolify.example.com --token-stdin --global --default
+""" + _HELP_EXIT,
+    "doctor": """\
+  doctor [--connection <id>]
+      Validate token + reachability (GET /version, GET /teams/current), report
+      the Coolify version, token team, and effective token abilities — every
+      connection, or one. Ability checks are non-mutating; read:sensitive can
+      be unknown when the team has no secret-bearing resource to inspect.
+      Exit 0 all healthy / 2 missing-or-rejected token / 5 unreachable.
+
+  Output: {ok, connections: {<id>: {ok, base_url, version, team: {id, name},
+  abilities: {read, read:sensitive, write, deploy, root, detection}}}}; a
+  connection that fails carries ok false and its error, and the exit is the
+  first failure's category. Outside any project it is a machine read: it uses
+  the machine's own connections read-only, unless a grant switched one off.
+
+  Examples:
+    coolify doctor
+    coolify --connection <name> doctor
+""",
+    "ids": """\
+  The envelope is capabilities/coolify/identifiers.json, or store rows once
+  the agent moved.
+""",
+    "projects": """\
+coolify projects [<uuid>] [--reveal]
+
+  List projects, or get one project (its environments come inside it).
+  Creating, adding an environment and deleting are `coolify help projects
+  create`, `coolify help projects environment create` and `coolify help
+  projects delete`. One GET /projects or /projects/<uuid>.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no project with that uuid;
+  4 policy; 5 server/network; 6 input.
+
+  Examples:
+    coolify projects
+    coolify projects <UUID>
+""" + _HELP_READ_TAIL,
+    "projects create": """\
+coolify projects create <name> [--description <text>]
+
+  Create a new project. Returns the project_uuid and default environment.
+  `projects create --name <name>` still works for one release, with a
+  warning on stderr. Quote a name with spaces. One POST /projects.
+
+  Exit codes: 0; 2 token missing or rejected; 4 policy, or a read-only
+  connection; 5 server/network; 6 input - no name, more than one, or two
+  different names.
+
+  Example: coolify projects create "<name>" --description "<text>"
+""" + _HELP_WRITE_TAIL,
+    "projects environment create": """\
+coolify projects environment create <uuid> <name>
+
+  Create the environment <name> in project <uuid> (POST
+  /projects/{uuid}/environments). Returns the new environment's uuid.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no project with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Example: coolify projects environment create <UUID> staging
+""" + _HELP_WRITE_TAIL,
+    "projects delete": """\
+coolify projects delete <uuid> --yes
+
+  Delete an empty project. Requires allow_write; remove its resources first.
+  --yes confirms the deletion (exit 6 confirmation_required without it). A
+  project takes no cleanup options: the cleanup flags of `app delete` are
+  refused here (exit 6). One DELETE /projects/<uuid>.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no project with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Example: coolify projects delete <UUID> --yes
+""" + _HELP_WRITE_TAIL,
+    "resources": """\
+coolify resources [--reveal]
+
+  Flat list of every deployable resource (uuid, name, type, status) —
+  the lookup an agent runs to find the uuid to act on. One GET /resources.
+""" + _HELP_RECORDS + """
+  Exit codes: 0; 2 token missing or rejected; 4 policy; 5 server/network;
+  6 input.
+
+  Example: coolify resources
+""" + _HELP_READ_TAIL,
+    "sources": """\
+coolify sources
+
+  List GitHub Apps and private/deploy keys with the UUIDs accepted by
+  `app create --github-app` and `--private-deploy-key`. Secret key
+  material is never emitted. Answers {github_apps: [...],
+  private_deploy_keys: [...]}, each entry its uuid, name and the other
+  fields that identify it.
+
+  Exit codes: 0; 2 token missing or rejected; 4 policy; 5 server/network.
+
+  Example: coolify sources
+""" + _HELP_CONNECTION + _HELP_EXIT,
+    "applications": """\
+coolify applications [<uuid>] [--reveal]
+
+  List applications, or get one (full detail). A list is slimmed to the
+  fields that scan; one by uuid is Coolify's whole record.
+""" + _HELP_RECORDS + """
+  Exit codes: 0; 2 token missing or rejected; 3 no application with that
+  uuid; 4 policy; 5 server/network; 6 input.
+
+  Examples:
+    coolify applications
+    coolify applications <UUID>
+""" + _HELP_READ_TAIL,
+    "services": """\
+coolify services [<uuid>] [--reveal]
+
+  List services, or get one.
+""" + _HELP_RECORDS + """
+  Exit codes: 0; 2 token missing or rejected; 3 no service with that uuid;
+  4 policy; 5 server/network; 6 input.
+
+  Example: coolify services <UUID>
+""" + _HELP_READ_TAIL,
+    "databases": """\
+coolify databases [<uuid>] [--reveal]
+
+  List databases, or get one.
+""" + _HELP_RECORDS + """
+  Exit codes: 0; 2 token missing or rejected; 3 no database with that uuid;
+  4 policy; 5 server/network; 6 input.
+
+  Example: coolify databases
+""" + _HELP_READ_TAIL,
+    "servers": """\
+coolify servers [<uuid>] [--reveal]
+
+  List servers, or get one.
+""" + _HELP_RECORDS + """
+  Server records also carry "memory", read over the connection's SSH
+  access (coolify connect --ssh-key) from the server's /proc/meminfo:
+  {"total_bytes", "available_bytes"} from MemTotal and MemAvailable, and
+  "total" and "available" in human units (e.g. "7.6 GiB"). A server that
+  cannot be read - no SSH access on the connection, unreachable, key
+  refused, unknown host key - carries {"error": <reason>} instead, and the
+  read still succeeds. The Coolify host itself (ip host.docker.internal)
+  is reached at the connection's base_url host. Outside any project it is a
+  machine read on the machine's own connections, read-only.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no server with that uuid;
+  4 policy; 5 server/network; 6 input.
+
+  Example: coolify servers <UUID>
+""" + _HELP_READ_TAIL,
+    "deployments": """\
+coolify deployments [<uuid>] [--reveal]
+
+  List active/queued deployments, or get one deployment by its uuid.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no deployment with that
+  uuid; 4 policy; 5 server/network; 6 input.
+
+  Example: coolify deployments <DEPLOYMENT_UUID>
+""" + _HELP_READ_TAIL,
+    "logs": """\
+coolify logs <uuid> [--lines N] [--reveal]
+
+  An application's runtime logs (default 100). --lines is how many lines,
+  a whole number. One GET /applications/<uuid>/logs.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no application with that
+  uuid; 4 policy; 5 server/network; 6 input.
+
+  Example: coolify logs <UUID> --lines 200
+""" + _HELP_READ_TAIL,
+    "app create": """\
+coolify app create --project <uuid> --server <uuid> --environment <name>
+                   (--git-repository <url> --git-branch <branch>
+                    [--private-deploy-key <uuid> | --github-app <uuid>]
+                    | --image <registry/name:tag> | --dockerfile <file|->)
+                   [--build-pack nixpacks|railpack|static|dockerfile|dockercompose]
+                   [--docker-compose-location <path>] [--dockerfile-location <path>]
+                   [--name <name>] [--domains <urls>] [--ports-exposes <ports>]
+                   [--base-directory <path>] [--watch-paths <globs>]
+                   [--limits-memory <size>] [--destination <uuid>]
+                   [--instant-deploy] [--autogenerate-domain | --no-autogenerate-domain]
+                   [--health-check-enabled | --no-health-check-enabled]
+                   [--health-check-path P] [--health-check-port P]
+                   [--health-check-host H] [--health-check-scheme S]
+                   [--health-check-return-code N] [--health-check-interval N]
+                   [--health-check-timeout N] [--health-check-retries N]
+                   [--health-check-start-period N]
+
+  Create an application. Source-selecting flags (mutually exclusive):
+  --git-repository <url> --git-branch <branch>  (public git)
+      [--build-pack nixpacks|railpack|static|dockerfile|dockercompose]
+      [--docker-compose-location <path>] [--dockerfile-location <path>]
+  --private-deploy-key <uuid> (+ git flags above for private git with key)
+  --github-app <uuid> (+ git flags above for private git with GitHub app)
+  --image <registry/name:tag>  (registry image)
+  --dockerfile <file|->  (inline dockerfile, raw content)
+  Take the deploy key and GitHub App uuids from `coolify sources`.
+  Common optional: --name, --domains, --ports-exposes, --instant-deploy,
+  --destination <uuid>, --base-directory, --watch-paths, --limits-memory,
+  and the health-check flags accepted by `app update` (`coolify help app
+  update`, which says what each field takes).
+  --no-autogenerate-domain keeps an application with no --domains without
+  one; Coolify otherwise generates a domain from the server's wildcard
+  domain or sslip.io. Returns the application uuid.
+
+  --instant-deploy creates without queuing, then deploys once, returning
+  deployment_uuid and deployments alongside the new application's uuid.
+  If deployment fails, the created application remains for inspection.
+
+  Exit codes: 0; 2 token missing or rejected; 4 policy, or a read-only
+  connection; 5 server/network; 6 input - no source flag, or a field
+  Coolify refuses.
+
+  Examples:
+    coolify app create --project <UUID> --server <UUID> --environment production --image <registry/name:tag> --domains https://app.example.com
+    coolify app create --project <UUID> --server <UUID> --environment production --git-repository https://example.com/<org>/<repo>.git --git-branch main --build-pack dockerfile --instant-deploy
+""" + _HELP_WRITE_TAIL,
+    "app update": """\
+coolify app update <uuid> [--name <name>] [--domains <urls>]
+                   [--ports-exposes <ports>] [--base-directory <path>]
+                   [--dockerfile-location <path>] [--docker-compose-location <path>]
+                   [--build-pack nixpacks|railpack|static|dockerfile|dockercompose]
+                   [--git-repository <url>] [--git-branch <branch>]
+                   [--watch-paths <globs>] [--limits-memory <size>]
+                   [--auto-deploy-enabled | --no-auto-deploy-enabled]
+                   [--health-check-enabled | --no-health-check-enabled]
+                   [--health-check-path P] [--health-check-port P]
+                   [--health-check-host H] [--health-check-scheme S]
+                   [--health-check-return-code N] [--health-check-interval N]
+                   [--health-check-timeout N] [--health-check-retries N]
+                   [--health-check-start-period N]
+
+  Patch only the supplied application fields:
+  --name --domains --ports-exposes --base-directory
+  --dockerfile-location --docker-compose-location --build-pack
+  --git-repository --git-branch --watch-paths
+  --limits-memory <size>  (the container's memory limit, e.g. 2g or 1536m)
+  --auto-deploy-enabled / --no-auto-deploy-enabled
+  --health-check-enabled / --no-health-check-enabled
+  --health-check-path --health-check-port --health-check-host
+  --health-check-scheme --health-check-return-code
+  --health-check-interval --health-check-timeout --health-check-retries
+  --health-check-start-period
+  --watch-paths accepts newline-separated glob patterns that filter which
+  repository changes trigger a webhook deploy (e.g. "backend/**"). Pass an
+  empty string to clear the field (deploy on all changes).
+  --domains is comma-separated application URLs (an empty string clears
+  them), --ports-exposes comma-separated container ports, --base-directory
+  the repository subdirectory used as build context (for example
+  /mcp-server), --dockerfile-location the Dockerfile path relative to it
+  (for example /Dockerfile), --docker-compose-location the Docker Compose
+  path relative to it. --auto-deploy-enabled turns on automatic deployments
+  from source webhooks. --health-check-return-code, -interval, -timeout,
+  -retries and -start-period take whole numbers. One PATCH
+  /applications/<uuid>; answers Coolify's reply.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no application with that
+  uuid; 4 policy, or a read-only connection; 5 server/network; 6 input -
+  no field flag, or a field Coolify refuses.
+
+  Example: coolify app update <UUID> --limits-memory 2g --health-check-path /health
+""" + _HELP_WRITE_TAIL,
+    "app rollback": """\
+coolify app rollback <uuid> --to <commit|image-tag>
+
+  Queue a rollback deployment of the application to a previous commit or
+  image tag (POST /applications/<uuid>/rollback). An application built from
+  an image Coolify tags per commit starts that image again; a Docker
+  Compose application is built again from that commit. Returns the
+  deployment_uuid to give `wait --deployment`; Coolify answers without one
+  when it skips the request as a duplicate of a queued deployment. The ref
+  takes letters, digits, '.', '-', '_' and '/', and does not start with
+  '-'. What it can return to is `coolify help app rollback-images`.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no application with that
+  uuid; 4 policy, or a read-only connection; 5 server/network; 6 input - a
+  ref it does not take.
+
+  Example: coolify app rollback <UUID> --to <COMMIT_SHA>
+""" + _HELP_WRITE_TAIL,
+    "app rollback-images": """\
+coolify app rollback-images <uuid>
+
+  What a rollback can start again: the image tags Coolify finds on the
+  server for the application, each with its created_at and is_current, and
+  the current tag. Coolify lists only images named after the application's
+  uuid (or its registry image name), so a Compose application that names
+  its own images lists none and rolls back by commit. Reads only, so a
+  read-only connection takes it. One GET /applications/<uuid>/rollback-images.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no application with that
+  uuid; 4 policy; 5 server/network; 6 input.
+
+  Example: coolify app rollback-images <UUID>
+""" + _HELP_CONNECTION + _HELP_EXIT,
+    "app delete": """\
+coolify app delete <uuid> --yes [--delete-volumes] [--delete-configurations]
+                   [--docker-cleanup] [--delete-connected-networks]
+
+  Delete an application. Requires allow_write.
+""" + _HELP_DELETE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no application with that
+  uuid; 4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Example: coolify app delete <UUID> --yes --delete-volumes
+""" + _HELP_WRITE_TAIL,
+    "storage add": """\
+coolify storage add <uuid> (--volume <name> | --host-path <path>) --mount-path <path>
+
+  Add one storage to an application; it takes effect at the next deploy.
+  --volume adds a named volume (Coolify prefixes the name with the
+  application uuid) and `app delete --delete-volumes` removes it.
+  --host-path binds an absolute path on the server - a directory or a
+  file such as /var/run/docker.sock - at --mount-path as it is: Coolify
+  never creates, writes or deletes that path, also when the application
+  is deleted, and a path missing on the server is created by Docker,
+  empty and owned by root. Not idempotent: each call adds a storage.
+  --mount-path is the absolute path in the container. One POST
+  /applications/<uuid>/storages; answers Coolify's reply.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no application with that
+  uuid; 4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Examples:
+    coolify storage add <UUID> --volume data --mount-path /data
+    coolify storage add <UUID> --host-path /var/run/docker.sock --mount-path /var/run/docker.sock
+""" + _HELP_WRITE_TAIL,
+    "service create": """\
+coolify service create --compose <file|-> --project <uuid> --server <uuid>
+                       --environment <name> [--name <name>] [--instant-deploy]
+                       [--destination <uuid>]
+
+  Create a service from a docker-compose file. The compose file is
+  base64-encoded before sending. Returns the service uuid. --compose is a
+  file path, or '-' for stdin; --destination a destination uuid. One POST
+  /services.
+
+  Exit codes: 0; 2 token missing or rejected; 4 policy, or a read-only
+  connection; 5 server/network; 6 input - a field Coolify refuses.
+
+  Example: coolify service create --compose - --project <UUID> --server <UUID> --environment production --name <name> < docker-compose.yml
+""" + _HELP_WRITE_TAIL,
+    "service set-image": """\
+coolify service set-image <uuid> --image <registry/name:tag>
+                          [--compose-service <name>]
+
+  Replace the image of one service in the service's Compose document
+  (PATCH /services/<uuid>), naming it by --compose-service, which a
+  document of one service may leave out. Only that `image:` line
+  changes; the rest of the document, its volumes included, stays as
+  Coolify holds it, and nothing restarts: `coolify deploy <uuid>` starts
+  the service on the new image, keeping its volumes. Answers uuid,
+  compose_service, image, previous_image and changed (false, and no
+  request sent, when the image is already that one), and next, the deploy
+  command. Reading the
+  document needs the token's read:sensitive ability (exit 2
+  compose_hidden without it); a service or image line it cannot find
+  exits 6.
+
+  Exit codes: 0; 2 token missing or rejected, or compose_hidden; 3 no
+  service with that uuid; 4 policy, or a read-only connection; 5
+  server/network; 6 input - an image that is not an image reference, a
+  Compose service it cannot find or that names no image, several services
+  and no --compose-service, compose_unreadable.
+
+  Example: coolify service set-image <UUID> --image <registry/name:tag> --compose-service app
+""" + _HELP_WRITE_TAIL,
+    "service set-compose": """\
+coolify service set-compose <uuid> --compose <file|->
+
+  Replace a service's whole Compose document with the one given (a
+  file, or '-' for stdin) through PATCH /services/<uuid>, base64-encoded,
+  without reading the stored one - so it needs no read:sensitive. The
+  caller owns the document: what it leaves out, a volume included, is
+  gone from the service. Nothing restarts: `coolify deploy <uuid>`
+  starts the service from the new document; named volumes keep their
+  data when the document keeps their names. Answers uuid, written and
+  next. An empty document exits 6.
+
+  Exit codes: 0; 2 token missing or rejected; 3 no service with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input - an
+  empty document, or one Coolify refuses.
+
+  Example: coolify service set-compose <UUID> --compose - < docker-compose.yml
+""" + _HELP_WRITE_TAIL,
+    "service delete": """\
+coolify service delete <uuid> --yes [--delete-volumes] [--delete-configurations]
+                       [--docker-cleanup] [--delete-connected-networks]
+
+  Delete a service. Requires allow_write.
+""" + _HELP_DELETE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no service with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Example: coolify service delete <UUID> --yes
+""" + _HELP_WRITE_TAIL,
+    "database create": """\
+coolify database create --engine <engine> --project <uuid> --server <uuid>
+                        (--environment <name> | --environment-uuid <uuid>)
+                        [--name <name>] [--description <text>] [--image <image>]
+                        [--instant-deploy] [--destination <uuid>]
+                        [--set KEY=VALUE ...] [--set-json KEY=JSON ...]
+                        [--set-stdin KEY] [--set-file KEY=PATH ...]
+                        [--set-env KEY=ENV_KEY ...] [--reveal]
+
+  Create a standalone database. --engine picks the endpoint
+  (POST /databases/<engine>) and is one of:
+    postgresql  mysql  mariadb  mongodb  redis  keydb  dragonfly  clickhouse
+  Coolify accepts an environment by name or by uuid; supply at least one.
+  Named optional flags: --name, --description, --image, --instant-deploy,
+  --destination <uuid>. --image is the database docker image, tag included
+  (e.g. postgres:16).
+  Every other body field is a pass-through, applied after the named flags:
+    --set KEY=VALUE       sends VALUE as a JSON string
+    --set-json KEY=JSON   sends a parsed JSON value (boolean, number, array)
+  Both repeat. A secret field takes its value off the command line:
+    --set-stdin KEY       reads VALUE from standard input (once)
+    --set-file KEY=PATH   reads VALUE from a file
+    --set-env KEY=ENV_KEY reads VALUE from an env key (`coolify help connections`)
+  each sent as a JSON string. --set or --set-json on a password field
+  (any name containing "password") still works for one release, with a
+  warning on stderr. The capability sends these names and values as given
+  and validates neither against the engine — Coolify answers an unknown or
+  malformed field with 422 naming it. The engine credentials and tuning live
+  here and differ per engine (postgres_user/postgres_password/postgres_db,
+  mysql_root_password, mariadb_database, mongo_initdb_root_username,
+  redis_password, keydb_password, dragonfly_password, clickhouse_admin_user
+  and their neighbours), next to the fields every engine shares (is_public,
+  public_port, tags, the limits_* set). Coolify wants each *_conf field
+  base64-encoded, and silently drops is_public when public_port is absent.
+  Returns the database uuid, with internal_db_url on every engine except
+  dragonfly, and external_db_url only on a public database, their
+  passwords redacted (see SECRETS); --reveal prints them to a terminal.
+
+  Exit codes: 0; 2 token missing or rejected; 4 policy, a read-only
+  connection, or --reveal without a terminal; 5 server/network; 6 input -
+  no environment, a malformed --set form, a field given twice, a secret
+  source that is empty or unreadable, or a field Coolify refuses (422).
+
+  Example: coolify database create --engine postgresql --project <UUID> --server <UUID> --environment production --set postgres_user=app --set-stdin postgres_password
+""" + _HELP_WRITE + _HELP_SECRETS + _HELP_CONNECTION + _HELP_EXIT,
+    "database delete": """\
+coolify database delete <uuid> --yes [--delete-volumes] [--delete-configurations]
+                        [--docker-cleanup] [--delete-connected-networks]
+
+  Delete a database. Requires allow_write.
+""" + _HELP_DELETE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no database with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Example: coolify database delete <UUID> --yes
+""" + _HELP_WRITE_TAIL,
+    "deploy": """\
+coolify deploy [<uuid>] [--force] [--tag T]
+
+  Trigger a deployment (POST /deploy). Returns deployments with resource_uuid
+  and deployment_uuid (applications; Coolify returns no deployment uuid for
+  services or databases). --force rebuilds without cache; --tag deploys
+  every resource with a tag, rather than selecting an image tag. A uuid or
+  --tag is required. Follow it with `coolify wait <uuid> --deployment
+  <deployment_uuid>` (`coolify help wait`).
+
+  Exit codes: 0; 2 token missing or rejected; 3 no resource with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input - neither
+  a uuid nor --tag.
+
+  Examples:
+    coolify deploy <UUID>
+    coolify deploy --tag <tag> --force
+""" + _HELP_WRITE_TAIL,
+    "wait": """\
+coolify wait <uuid> [--deployment <uuid>] [--timeout <s>]
+
+  Poll until the resource reports running:healthy and, when specified, the
+  deployment reports finished. Default timeout: 600 seconds, poll: 5 seconds.
+  Starting/exited states are retried. Failed/cancelled deployments exit 5;
+  timeout exits 5 wait_timeout with the last resource and deployment states.
+  Reads only. A missing resource exits 3. Answers {resource_uuid, status,
+  deployment_uuid, deployment_status}.
+
+  Exit codes: 0 healthy (and the deployment finished); 2 token missing or
+  rejected; 3 no resource with that uuid; 4 policy; 5 deployment_failed,
+  wait_timeout, server/network; 6 input - a --timeout that is not a
+  positive finite number of seconds.
+
+  Example: coolify wait <UUID> --deployment <DEPLOYMENT_UUID> --timeout 900
+""" + _HELP_CONNECTION + _HELP_EXIT,
+    "start": """\
+coolify start <uuid> [--type application|service|database]
+
+  In-place lifecycle on a running resource: start it (POST
+  /<family>/<uuid>/start).
+""" + _HELP_TYPE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no resource with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Example: coolify start <UUID> --type service
+""" + _HELP_WRITE_TAIL,
+    "stop": """\
+coolify stop <uuid> [--type application|service|database]
+
+  In-place lifecycle on a running resource: stop it (POST
+  /<family>/<uuid>/stop).
+""" + _HELP_TYPE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no resource with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Example: coolify stop <UUID>
+""" + _HELP_WRITE_TAIL,
+    "restart": """\
+coolify restart <uuid> [--type application|service|database]
+
+  In-place lifecycle on a running resource: restart it (POST
+  /<family>/<uuid>/restart).
+""" + _HELP_TYPE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no resource with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input.
+
+  Example: coolify restart <UUID> --type database
+""" + _HELP_WRITE_TAIL,
+    "env list": """\
+coolify env list <uuid> [--type application|service] [--reveal]
+
+  List environment variables for an application or service. Every row has
+  `value_hidden`; true means Coolify redacted the value (normally because
+  the token lacks effective read:sensitive access), not that it is empty.
+  Reads only, so a read-only connection takes it.
+""" + _HELP_ENV_TYPE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no resource with that uuid;
+  4 policy; 5 server/network; 6 input.
+
+  Example: coolify env list <UUID> --type service
+""" + _HELP_READ_TAIL,
+    "env set": """\
+coolify env set <uuid> <KEY> [--value-stdin | --value-file <path> |
+                              --value-env <ENV_KEY>] [--type application|service]
+
+  Set or update an environment variable. The value comes from standard
+  input (the default, no echo on a terminal, one trailing newline
+  dropped), a file, or an env key resolved through the cascade
+  (`coolify help connections`).
+  `env set <uuid> <KEY> <VALUE>` still works for one release, with a
+  warning on stderr. Updates every entry with this key (preview and
+  non-preview) where one exists, answering {updated, key, results}, and
+  creates it where none does, answering Coolify's reply.
+""" + _HELP_ENV_TYPE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no resource with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input - the
+  value given twice, or a file or env key that does not give one.
+
+  Examples:
+    coolify env set <UUID> <KEY> --value-env <ENV_KEY>
+    coolify env set <UUID> <KEY> --value-file <path> --type service
+""" + _HELP_WRITE_TAIL,
+    "env rm": """\
+coolify env rm <uuid> <KEY> [--type application|service]
+
+  Remove an environment variable: every entry with this key (preview and
+  non-preview). Answers {deleted, key, entries}, naming what was deleted.
+""" + _HELP_ENV_TYPE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no resource with that uuid,
+  or no variable with that key; 4 policy, or a read-only connection; 5
+  server/network; 6 input.
+
+  Example: coolify env rm <UUID> <KEY>
+""" + _HELP_WRITE_TAIL,
+    "env bulk": """\
+coolify env bulk <uuid> [--type application|service]
+
+  Bulk update environment variables (PATCH). Reads KEY=VALUE pairs from
+  stdin, one per line. Answers Coolify's reply.
+""" + _HELP_ENV_TYPE + """
+  Exit codes: 0; 2 token missing or rejected; 3 no resource with that uuid;
+  4 policy, or a read-only connection; 5 server/network; 6 input - no
+  KEY=VALUE pair in the input.
+
+  Example: coolify env bulk <UUID> < <file-of-KEY=VALUE-lines>
+""" + _HELP_WRITE_TAIL,
+}
 
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -2299,7 +2808,8 @@ def main() -> None:
 
     args = p.parse_args()
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n")); return
+        # `help` after `--connection <id>`: the contract's menu, as bare.
+        _cmd_help(); return
     if args.cmd == "doctor":
         cmd_doctor(args); return
     if args.cmd == "connect":

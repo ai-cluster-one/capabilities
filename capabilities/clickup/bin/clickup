@@ -3,304 +3,105 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
 clickup — agent-first CLI for ClickUp spaces, lists & tasks.
 
 This tool is designed to be invoked by agents. Run `clickup help` to load
-the full usage contract on demand — do not rely on memorised knowledge of
-its surface.
+this menu and `clickup help <verb>` for one verb's whole contract on demand —
+do not rely on memorised knowledge of its surface.
 
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. Its CLICKUP_API_TOKEN (a ClickUp personal API token,
-  `pk_…`) resolved through the credential cascade (`Where a secret
-  resolves`, at the end of this help). Never pass the token on the command
-  line.
+USAGE
+  clickup <command> [options]     Run one verb against the selected connection.
 
-  A project that acts as several ClickUp identities declares them as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": {
-          "secret_env": "CLICKUP_<ID>_TOKEN",
-          "allow_write": true,
-          "workspace_id": "123",
-          "external_id_field": "external_id"
-        }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
-
-  The entry names the env var holding its token ("secret_env"); the value
-  resolves through the cascade above. "allow_write": false makes the
-  connection read-only: every mutating verb exits 4, and no flag lifts the
-  gate. Writes default to allowed (a workspace the consumer owns). Optional
-  non-secret settings can live on the entry too: "workspace_id" is the default
-  workspace/team for dedup queries; "external_id_field" (alias "external_id")
-  is the custom field UUID or field name used as the settable external-id key.
-
-  Selection: --connection <id> (accepted anywhere on the command line).
-  Unflagged, the registry's "default" pointer applies, else the sole entry;
-  several entries without a pointer is refused as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
-
-Global option (accepted after any subcommand):
-  --token-env <KEY>   Act as a different identity by naming the env/cred KEY
-                      that holds the token (default CLICKUP_API_TOKEN; with a
-                      registry connection it overrides that entry's secret_env).
-                      The value never touches the command line — only the key
-                      name. Drop the alternate token in the env/credentials
-                      (e.g. CLICKUP_ALT_TOKEN=…) and pass
-                      --token-env CLICKUP_ALT_TOKEN. It never lifts a
-                      connection's write gate.
-
-  CLICKUP_WORKSPACE_ID and CLICKUP_EXTERNAL_ID_FIELD (alias CLICKUP_EXTERNAL_ID)
-  can also be set through the same cascade. Connection entry values win
-  over env files. The external-id field may be a UUID or a field name resolvable
-  from the target list.
+MODEL
+It talks to the ClickUp REST API v2 itself with a ClickUp personal API token
+(`pk_…`), resolved through the credential cascade and never passed on the
+command line. Which ClickUp identity a command acts as is decided by the
+selected connection: a project that acts as several ClickUp identities
+declares them as connections, and one call can act as another identity by
+naming the key that holds its token. How connections are declared, selected,
+made read-only and given a default workspace and external-id field is
+CONNECTIONS, on `clickup help connections`.
 
 THE HIERARCHY
-  ClickUp nests Workspace (the API calls it a "team") > Space > Folder > List
-  > Task > Subtask. A List is the task container (the Asana "project" analog);
-  board columns are STATUSES set on the task (there is no section object);
-  tags are space-scoped and addressed by name.
+ClickUp nests Workspace (the API calls it a "team") > Space > Folder > List
+> Task > Subtask. A List is the task container (the Asana "project" analog);
+board columns are STATUSES set on the task (there is no section object);
+tags are space-scoped and addressed by name.
 
-Commands:
-  clickup help [<command>]                    Print this document, or one
-                                              subcommand's syntax.
-  clickup connections                         Where every connection's values
-                                              resolve from (tier, source,
-                                              secrets masked). Local only.
-  clickup doctor [--connection <id>]          Health check — resolve token,
-                                              confirm identity, list
-                                              workspaces — every connection,
-                                              or one.
+COMMANDS
+  Identity and hierarchy
+  whoami                      confirm token + identity
+  workspaces                  the workspaces (teams) the token sees
+  members                     a workspace's members (id + username + email)
+  spaces                      the spaces in a workspace
+  folders                     the folders in a space
+  lists                       a folder's lists, or a space's folderless lists
+  statuses                    a list's statuses: the board columns, each with its type
+  tags                        a space's tags (name + colours)
+  fields                      a list's custom fields (id + name + type)
 
-Contract commands (the same on every capability):
-  clickup stub                                One-line awareness text.
-  clickup manifest --json                     Machine-readable declaration.
-  clickup guide [<topic>]                     Guide topics / one guide body,
-                                              fetched live from the docs base.
-  clickup ids list|get <l>|set <l> <v>|rm <l> The project identifiers envelope
-        [--note <text>]                       (capabilities/clickup/identifiers.json,
-                                               or store rows once the agent moved).
-  clickup refs                                Menu of the project's reference
-                                              files for this capability.
-  clickup inventory [--network]               What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
+  Task reads
+  tasks                       the tasks in a list, paginated
+  task <task>                 one task in full
+  task-context <task>         the task plus everything adjacent, in one envelope
+  comments <task>             a task's comments, the most recent in order
+  subtasks <task>             a task's subtasks
+  deps <task>                 what a task waits on, or what waits on it
+  attachments <task>          a task's attachments (id + title + url)
+  find                        resolve a task by a dedup key or Custom Task ID
+  field-get <task> [<field>]  a task's custom field values, all or one
+  assigned                    tasks assigned to you, stalest first, with idle age
 
-Read:
-  clickup whoami                              Confirm token + identity.
-  clickup workspaces                          List workspaces (teams) the token sees.
-  clickup members [--workspace ID]            List a workspace's members (id +
-                                              username + email). Defaults to the
-                                              sole workspace when only one exists.
-  clickup spaces --workspace ID               List spaces in a workspace.
-  clickup folders --space ID                  List folders in a space.
-  clickup lists [--folder ID] [--space ID]    List lists. --folder lists a
-                                              folder's lists; --space lists the
-                                              folderless lists directly under a
-                                              space (they appear ONLY here).
-  clickup statuses --list ID                  List a list's statuses — the board
-                                              columns, each with its type
-                                              (open|custom|done|closed). The
-                                              "what columns exist?" read; moving
-                                              a task between columns is `update --status`.
-  clickup tags --space ID                     List a space's tags (name + colours).
-  clickup fields --list ID                    List a list's custom fields (id +
-                                              name + type) — resolve a field's
-                                              UUID before `field-set`.
-  clickup tasks --list ID [--all] [--archived]   List tasks in a list. Incomplete
-        [--subtasks] [--status NAME ...]      only unless --all (closed statuses
-        [--limit N] [--page N]                included). --status filters to named
-                                              statuses (repeatable). --subtasks
-                                              includes subtasks. Paginates to
-                                              --limit (default 100); --page reads
-                                              a single 0-indexed page of 100.
-  clickup task <task> [--with-subtasks]       Show one task in full (status,
-        [--custom-id --workspace ID]          assignees, tags, custom_fields,
-                                              dependencies, linked_tasks, url).
-                                              --with-subtasks attaches its
-                                              subtasks. --custom-id resolves
-                                              <task> as a Custom Task ID (needs
-                                              --workspace).
-  clickup task-context <task> [--json]        One call → the task plus everything
-                                              adjacent: description (markdown),
-                                              comment thread, attachment
-                                              pointers, dependencies one level
-                                              deep (each with its own description,
-                                              thread, attachments), dependents as
-                                              state lines. Emits a prompt-ready
-                                              markdown envelope stamped with its
-                                              assembly time (UTC); --json emits
-                                              the same tree structured.
-  clickup comments <task> [--limit N]         List a task's comments (text +
-                                              date + author), the N most recent
-                                              in chronological order.
-  clickup subtasks <task>                     List a task's subtasks.
-  clickup deps <task> [--dependents]          List what <task> waits on (or, with
-                                              --dependents, what waits on it).
-  clickup attachments <task>                  List a task's attachments (id +
-                                              title + url; read from the task).
-  clickup find [--workspace ID] [--list ID]   Resolve a task by a dedup key —
-        --field UUID --value V                task JSON on a hit, null + exit 0 on
-        | --external-id V [--field FIELD]     a miss. --external-id uses the
-                                             configured external_id custom field
-                                             (or --field override, UUID/name);
-                                             --list resolves field names.
-        | <custom-task-id>                     a miss. Two modes: --field/--value
-                                              matches a custom field workspace-wide
-                                              (the SETTABLE external-ID key — set it
-                                              with `create --external-id`,
-                                              `create --field`, or `field-set`);
-                                              a bare <custom-task-id> is the ClickApp
-                                              Custom Task ID lookup (read-only —
-                                              ClickUp assigns those, the API cannot
-                                              set them). Use --field for dedup.
-  clickup field-get <task> [<field>]          Read a task's custom field values —
-                                              all, or one addressed by UUID or name.
-  clickup assigned --workspace ID             The "what's waiting on my input, and
-        [--assignee ID] [--all]               for how long?" read: tasks assigned
-        [--status NAME ...] [--limit N]       to you (or --assignee), incomplete
-                                              unless --all, stalest first — each with
-                                              its last-touch timestamp and idle age.
+  Task writes
+  create                      WRITE. create a task (or subtask) in a list
+  update <task>               WRITE. update fields on a task, or archive it
+  comment <task>              WRITE. add a comment, optionally assigned or mentioning
+  comment-resolve <comment_id>  WRITE. mark a comment resolved
+  complete <task>             WRITE. complete via status, gated on dependencies
+  assign <task>               WRITE. add and/or remove assignees
+  watch <task>                WRITE. add and/or remove watchers
+  deliverable                 WRITE. a paired request + dependent agent task
+  task-delete <task>          WRITE. delete a task; irreversible, needs confirmation
+  attach <task> FILE          WRITE. upload a local file to a task
 
-Write:
-  clickup create --list ID --name NAME        Create a task in a list.
-        [--desc TEXT|-] [--markdown TEXT|-]    --markdown (default) stores a
-        [--assignee ID ...] [--status NAME]   markdown body (ClickUp renders it);
-        [--tag NAME ...] [--priority N]        --desc stores literal plain text.
-        [--due-on YYYY-MM-DD]                  Pass at most one. '-' reads stdin.
-        [--due-at ISO8601]                     --assignee repeatable (user id).
-        [--start-on D] [--start-at ISO]        --start-* mirrors --due-*: the
-        [--parent ID]                          scheduled begin, all-day or timed.
-        [--external-id V] [--workspace ID]     --external-id enforces a best-effort
-                                              dedup preflight against the configured
-                                              external_id custom field, then stamps
-                                              that field during creation. Requires
-                                              --workspace unless CLICKUP_WORKSPACE_ID
-                                              or connection workspace_id is set.
-        [--field UUID=VALUE ...]              --priority 1=Urgent 2=High 3=Normal
-                                              4=Low. --due-on is all-day; --due-at
-                                              carries time-of-day; not both.
-                                              --parent makes it a SUBTASK (parent
-                                              must be in the same list). --field
-                                              sets a custom field at creation
-                                              (repeatable) — stamp an external-ID
-                                              key here, then `find --field` it.
-  clickup update <task> [--name N]            Update fields on a task. --markdown/
-        [--desc T|-] [--markdown T|-]          --desc as for create. --status moves
-        [--status NAME] [--priority N]         the column. --add-assignee /
-        [--due-on D] [--due-at ISO]            --rem-assignee add or remove
-        [--start-on D] [--start-at ISO]        assignees (ClickUp updates use an
-        [--add-assignee ID ...]
-        [--rem-assignee ID ...] [--archive]    add/remove set, not a replace).
-                                              --archive archives the task.
-  clickup comment <task> [--text TEXT|-]      Add a comment to a task. --assignee
-        [--assignee ID] [--notify-all]        assigns + notifies that user (an
-        [--mention USER ...]                  ASSIGNED comment — carries a
-                                              resolved state, see comment-resolve);
-                                              --notify-all notifies everyone on
-                                              the task; --mention @-mentions a
-                                              user id (repeatable) and fires the
-                                              "Mentioning me" inbox notification
-                                              without the assigned-comment baggage.
-                                              --text composes with --mention; with
-                                              only --mention the text is omitted.
-  clickup comment-resolve <comment_id>        Mark a comment resolved (clears the
-                                              Incomplete Warning ClickApp nag for
-                                              ASSIGNED comments). Get <comment_id>
-                                              from `comments <task>`.
-  clickup complete <task> [--reopen]          Mark a task complete by setting its
-        [--force] [--no-rollup]               list's closed status (--reopen sets
-                                              the first open status). REFUSES
-                                              (exit 7) if the task has incomplete
-                                              dependencies — pass --force to
-                                              override. On success it cascades:
-                                              auto-completes any parent whose
-                                              subtasks are now all done, and
-                                              reports dependents this unblocked.
-                                              --no-rollup skips the cascade.
-                                              (To move a task to an arbitrary
-                                              column, use `update --status`.)
-  clickup assign <task> [--add ID ...]        Add and/or remove assignees on a
-        [--rem ID ...]                        task. <ID> is a user id.
-  clickup watch <task> [--add ID ...]         Add and/or remove watchers — the
-        [--rem ID ...]                        follower analog; a watcher is
-                                              notified of the task's activity.
-  clickup tag-create --space ID --name NAME   Create a tag in a space.
-        [--fg HEX] [--bg HEX]
-  clickup tag-add <task> <tag>                Add a tag to a task. <tag> is a
-                                              tag NAME (tags are name-addressed).
-  clickup tag-remove <task> <tag>             Remove a tag from a task.
-  clickup dep-add <task> --on ID [--on ...]   Mark <task> as depending on each
-                                              --on task (waits on them).
-  clickup dep-remove <task> --on ID [...]     Remove dependency links from <task>.
-  clickup field-set <task> <field> --value V  Set a custom field on a task.
-        [--json]                              <field> is the field UUID (`fields`
-                                              lists them). --value is the literal
-                                              value; --json parses it as JSON
-                                              first (for typed/relationship fields).
-  clickup field-clear <task> <field>          Clear a custom field on a task.
-  clickup deliverable --list ID               Create a PAIRED request + dependent:
-        --request-name N --agent-name N        a request task assigned to
-        --supervisor USER --agent USER         --supervisor (the human whose input
-        [--request-markdown T|-]               is needed) and an agent task assigned
-        [--agent-markdown T|-]                 to --agent that DEPENDS ON it, so
-        [--status NAME] [--parent ID]          completing the request unblocks the
-        [--state-field UUID]                   agent task. --state-field stamps
-                                              {phase,last_touch} JSON into a (UI-
-                                              created) custom field on both tasks.
-                                              Not idempotent — ClickUp has no
-                                              settable dedup key.
-  clickup task-delete <task> --yes            Delete a task. IRREVERSIBLE — refuses
-        [--custom-id --workspace ID]           without --yes (the gate; confirm with
-                                              the human first).
-  clickup attach <task> FILE [--name NAME]    Upload a local FILE to a task
-                                              (multipart). --name overrides the
-                                              display name. (File upload only —
-                                              ClickUp has no attach-by-URL.)
-  clickup list-create --name NAME             Create a list. --folder makes it a
-        [--folder ID] [--space ID]            folder list; --space makes it a
-        [--content TEXT]                      folderless list under the space.
-  clickup webhooks --workspace ID             List a workspace's webhooks.
-  clickup webhook-create --workspace ID       Register a webhook delivering to the
-        --endpoint URL [--event E ...]        HTTPS endpoint. --event is repeatable
-        [--space ID] [--folder ID]            (e.g. taskCreated taskStatusUpdated
-        [--list ID] [--task ID]               taskCommentPosted); omit for all
-                                              events. The scope flags narrow it to
-                                              one space/folder/list/task. The
-                                              response carries the signing secret
-                                              once — capture it. (No handshake.)
-  clickup webhook-delete <webhook> --yes      Delete a webhook (stops deliveries).
-                                              IRREVERSIBLE — refuses without --yes
-                                              (the gate; confirm with the human first).
+  Tags, dependencies and custom fields
+  tag-create                  WRITE. create a tag in a space
+  tag-add <task> <tag>        WRITE. add a tag (by name) to a task
+  tag-remove <task> <tag>     WRITE. remove a tag from a task
+  dep-add <task>              WRITE. mark a task as waiting on others
+  dep-remove <task>           WRITE. remove dependency links from a task
+  field-set <task> <field>    WRITE. set a custom field on a task
+  field-clear <task> <field>  WRITE. clear a custom field on a task
 
-References:
-  <task> accepts a bare task id OR a full ClickUp URL (the id after /t/ is
-  extracted). User ids and the like are bare numeric ids.
+  Lists and webhooks
+  list-create                 WRITE. create a list in a folder or a space
+  webhooks                    a workspace's webhooks
+  webhook-create              WRITE. register a webhook to an HTTPS endpoint
+  webhook-delete <webhook>    WRITE. delete a webhook; needs confirmation
 
-Input:
-  `comment --text`, `create/update --desc|--markdown` accept inline text, a
-  file path, or "-" for stdin (one '-' per command). List/space/folder/team
-  ids that are stable for a repo belong in that repo's own reference file, not
-  here, or in `clickup ids`.
+THE WRITE GATE
+Every verb marked WRITE is refused with exit 4 on a connection whose
+"allow_write" is false, before its token resolves; no flag lifts the gate.
+Writes default to allowed (a workspace the consumer owns). Ask the user;
+never lift a gate yourself.
 
-I/O contract:
-  - Success: JSON on stdout, exit 0.
+REFERENCES
+<task> accepts a bare task id OR a full ClickUp URL (the id after /t/ is
+extracted). User ids and the like are bare numeric ids. List/space/folder/team
+ids that are stable for a repo belong in that repo's own reference file, or in
+`clickup ids`.
+
+I/O CONTRACT
+  - Success: JSON on stdout, exit 0 (task-context answers markdown unless
+    asked for JSON).
   - Error:   {"error": {"code", "message", "hint", "status"}} on stderr,
              non-zero exit.
 
-Exit codes:
+EXIT CODES
   0  success
   2  auth (unauthorized / forbidden / missing credentials)
   3  not found
@@ -311,34 +112,14 @@ Exit codes:
   6  input / validation
   7  blocked (task has incomplete dependencies; see `complete`)
 
-Notes:
-  - Dates are epoch milliseconds on the wire; pass --due-on / --start-on
-    (all-day) or --due-at / --start-at (ISO8601, time-of-day) and the CLI
-    converts. Due is the deadline; start is the scheduled begin.
+NOTES
   - Completion is status-based: a task is "done" when its status type is
     `done` or `closed`. `complete` discovers the list's closed status and sets
     it; there is no boolean done flag.
-  - Board columns ARE statuses (no section object) — `statuses` lists them,
-    `update --status` moves a task. Statuses are UI-only: the API cannot create,
-    edit, or delete a status, so there is no status-management surface here.
-  - Custom field DEFINITIONS are UI-only too: the API reads them (`fields`,
-    `field-get`) and reads/writes their VALUES (`field-set`, `field-clear`) but
-    cannot create, retype, or delete the field itself. Provision a field once in
-    the UI, then drive its value from here (e.g. a machine-state field for
-    `deliverable --state-field`).
-  - External-ID / dedup parity: ClickUp Custom Task IDs are read-only via the
-    API, so the settable dedup key is a (UI-created) text custom field. Stamp it
-    at creation with `create --external-id <key>` after configuring
-    CLICKUP_EXTERNAL_ID_FIELD (or connection external_id_field), and resolve it
-    with `find --external-id <key>`. This is a best-effort create preflight, not
-    server-side uniqueness; concurrent producers can still race.
-  - Tags are space-scoped and addressed by name (no tag ids).
-  - Custom Task IDs are assigned by ClickUp's ClickApp and are read-only via
-    the API: `find`/`task --custom-id` resolve by them, nothing sets them.
+  - Board columns ARE statuses and tags are space-scoped and addressed by name
+    (no tag ids). Statuses and custom field definitions are UI-only.
   - Rate limit is per token (100 req/min on most plans); a 429 is absorbed by
     waiting for the reset, then retried.
-  - Listing paginates to --limit (default 100). Raise --limit or filter by
-    --status to read more.
 """
 
 import argparse
@@ -418,6 +199,692 @@ DOCS_BASE = ""      # upstream guides base URL; "" while no guides ship
 STATE = False       # True when the capability writes session/cache state
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL: list = []
+
+# The verb pages `clickup help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor and connections follow. A text
+# several verbs own is one constant, added to each of their pages.
+_HELP_WRITE = """
+  THE WRITE GATE
+  This is a WRITE verb. On a connection whose "allow_write" is false (or under
+  the read-only switch) it exits 4 before the token resolves or any
+  request is made; no flag lifts the gate, --token-env included. Writes
+  default to allowed (a workspace the consumer owns). Ask the user; never
+  lift a gate yourself.
+"""
+_HELP_INPUT = """
+  Input: `comment --text`, `create/update --desc|--markdown` (and
+  `deliverable --request-markdown|--agent-markdown`) accept inline text, a
+  file path, or "-" for stdin (one '-' per command).
+"""
+_HELP_DATES = """
+  Dates are epoch milliseconds on the wire; pass --due-on / --start-on
+  (all-day) or --due-at / --start-at (ISO8601, time-of-day) and the CLI
+  converts. Due is the deadline; start is the scheduled begin. A bad date
+  exits 6 bad_date / bad_datetime; both forms of one date exit 6
+  conflicting_due / conflicting_start. ClickUp silently drops a start date
+  later than the task's due date, so the CLI compares what was stored and
+  exits 6 start_not_stored when it was not.
+"""
+_HELP_COLUMNS = """
+  Board columns ARE statuses (no section object) — `statuses` lists them,
+  `update --status` moves a task. Statuses are UI-only: the API cannot create,
+  edit, or delete a status, so there is no status-management surface here.
+"""
+_HELP_FIELD_DEFS = """
+  Custom field DEFINITIONS are UI-only: the API reads them (`fields`,
+  `field-get`) and reads/writes their VALUES (`field-set`, `field-clear`) but
+  cannot create, retype, or delete the field itself. Provision a field once in
+  the UI, then drive its value from here (e.g. a machine-state field for
+  `deliverable --state-field`).
+"""
+_HELP_EXTERNAL_ID = """
+  External-ID / dedup parity: ClickUp Custom Task IDs are read-only via the
+  API, so the settable dedup key is a (UI-created) text custom field. Stamp it
+  at creation with `create --external-id <key>` after configuring
+  CLICKUP_EXTERNAL_ID_FIELD (or connection external_id_field), and resolve it
+  with `find --external-id <key>`. This is a best-effort create preflight, not
+  server-side uniqueness; concurrent producers can still race.
+
+  CLICKUP_WORKSPACE_ID and CLICKUP_EXTERNAL_ID_FIELD (alias CLICKUP_EXTERNAL_ID)
+  can also be set through the same cascade as the token. Connection entry
+  values win over env files. The external-id field may be a UUID or a field
+  name resolvable from the target list.
+"""
+_HELP_CUSTOM_TASK_ID = """
+  Custom Task IDs are assigned by ClickUp's ClickApp and are read-only via
+  the API: `find`/`task --custom-id` resolve by them, nothing sets them.
+"""
+_HELP_PAGINATE = """
+  Listing paginates to --limit (default 100). Raise --limit or filter by
+  --status to read more.
+"""
+_HELP_TAIL = """
+  References: <task> accepts a bare task id OR a full ClickUp URL (the id
+  after /t/ is extracted). User ids and the like are bare numeric ids.
+
+  Global options (accepted anywhere on the command line, after the verb too):
+    --connection <id>   Select the connection; unflagged, the registry's
+                        "default" pointer applies, else the sole entry
+                        (`clickup help connections`).
+    --token-env <KEY>   Act as a different identity by naming the env/cred KEY
+                        that holds the token; it never lifts a connection's
+                        write gate.
+  Outside any project this verb is refused: only connections and doctor read
+  the machine's own connections there.
+
+  I/O contract:
+    - Success: JSON on stdout, exit 0.
+    - Error:   {"error": {"code", "message", "hint", "status"}} on stderr,
+               non-zero exit.
+    A command line the parser refuses (a missing required flag, an unknown
+    option, a value of the wrong type) exits 2 with its usage on stderr.
+
+  Exit codes:
+    0  success
+    2  auth (unauthorized / forbidden / missing credentials)
+    3  not found
+    4  policy refusal — the project gate (store rows once the agent moved, else
+       capabilities/settings.json) on any verb, or a write verb on a read-only
+       connection (allow_write: false). Ask the user; never lift a gate yourself.
+    5  server / network (5xx, timeout, rate-limit exhausted; a 429 is absorbed
+       by waiting for the reset, then retried — 100 req/min per token on most
+       plans)
+    6  input / validation
+    7  blocked (task has incomplete dependencies; see `complete`)
+"""
+HELP_VERBS = {
+    "doctor": """\
+  clickup doctor [--connection <id>] [--token-env <KEY>]
+      Health check — resolve token, confirm identity, list workspaces — every
+      connection, or one. Per connection it calls GET /user and GET /team with
+      that connection's token. Emits {ok, connections: {<id>: {ok, whoami,
+      workspaces}}}: whoami is the username (else the email), workspaces the
+      names the token sees; a failing connection is {ok: false, error}. Exit 0
+      only when every examined connection is healthy, else the first failure's
+      category: 2 token missing or refused, 5 unreachable or a bad response, 6
+      a connection missing 'secret_env'. --token-env reads the token from that
+      key instead, for every examined connection. Outside any project it is a
+      machine read: it uses the machine's own connections read-only, unless a
+      grant switched one off.
+
+  Examples:
+    clickup doctor
+    clickup doctor --connection <id>
+""",
+    "connections": """\
+  clickup connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked), with its allow_write and its workspace_id and external_id_field
+      settings, each with the tier it resolved from. Local only.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. Its CLICKUP_API_TOKEN (a ClickUp personal API token,
+  `pk_…`) resolved through the credential cascade (`Where a secret
+  resolves`, above). Never pass the token on the command line.
+
+  A project that acts as several ClickUp identities declares them as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "secret_env": "CLICKUP_<ID>_TOKEN",
+          "allow_write": true,
+          "workspace_id": "<workspace-id>",
+          "external_id_field": "external_id"
+        }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  The entry names the env var holding its token ("secret_env"); the value
+  resolves through the cascade above. "allow_write": false makes the
+  connection read-only: every mutating verb exits 4, and no flag lifts the
+  gate. Writes default to allowed (a workspace the consumer owns). Optional
+  non-secret settings can live on the entry too: "workspace_id" is the default
+  workspace/team for dedup queries; "external_id_field" (alias "external_id")
+  is the custom field UUID or field name used as the settable external-id key.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  Global option (accepted after any subcommand):
+    --token-env <KEY>   Act as a different identity by naming the env/cred KEY
+                        that holds the token (default CLICKUP_API_TOKEN; with a
+                        registry connection it overrides that entry's secret_env).
+                        The value never touches the command line — only the key
+                        name. Drop the alternate token in the env/credentials
+                        (e.g. CLICKUP_ALT_TOKEN=…) and pass
+                        --token-env CLICKUP_ALT_TOKEN. It never lifts a
+                        connection's write gate.
+
+  CLICKUP_WORKSPACE_ID and CLICKUP_EXTERNAL_ID_FIELD (alias CLICKUP_EXTERNAL_ID)
+  can also be set through the same cascade. Connection entry values win
+  over env files. The external-id field may be a UUID or a field name resolvable
+  from the target list. A connection is written with `clickup connection add`
+  (`clickup help connection`).
+
+  Example: clickup connections
+""",
+    "whoami": """\
+clickup whoami
+
+  Confirm token + identity: the ClickUp user the token acts as. One GET /user.
+
+  Output: ClickUp's user object (id, username, email, …).
+
+  Example: clickup whoami
+""" + _HELP_TAIL,
+    "workspaces": """\
+clickup workspaces
+
+  List workspaces (teams) the token sees. One GET /team.
+
+  Output: a JSON array of ClickUp's team objects (id, name, members, …).
+
+  Example: clickup workspaces
+""" + _HELP_TAIL,
+    "members": """\
+clickup members [--workspace ID]
+
+  List a workspace's members (id + username + email). Defaults to the sole
+  workspace when only one exists. Read from GET /team.
+
+  Output: a JSON array of ClickUp's user objects. Exit 3 not_found when the
+  token sees no workspace with that id; exit 6 ambiguous_workspace when
+  --workspace is omitted and the token does not see exactly one workspace
+  (the hint names the known ones).
+
+  Example: clickup members --workspace <WORKSPACE>
+""" + _HELP_TAIL,
+    "spaces": """\
+clickup spaces --workspace ID
+
+  List spaces in a workspace (the non-archived ones).
+
+  Output: a JSON array of ClickUp's space objects.
+
+  Example: clickup spaces --workspace <WORKSPACE>
+""" + _HELP_TAIL,
+    "folders": """\
+clickup folders --space ID
+
+  List folders in a space (the non-archived ones).
+
+  Output: a JSON array of ClickUp's folder objects.
+
+  Example: clickup folders --space <SPACE>
+""" + _HELP_TAIL,
+    "lists": """\
+clickup lists [--folder ID] [--space ID]
+
+  List lists. --folder lists a folder's lists; --space lists the folderless
+  lists directly under a space (they appear ONLY here). With both, --folder
+  wins. Non-archived lists only.
+
+  Output: a JSON array of ClickUp's list objects. Exit 6 missing_parent with
+  neither flag.
+
+  Examples:
+    clickup lists --folder <FOLDER>
+    clickup lists --space <SPACE>
+""" + _HELP_TAIL,
+    "statuses": """\
+clickup statuses --list ID
+
+  List a list's statuses — the board columns, each with its type
+  (open|custom|done|closed). The "what columns exist?" read; moving a task
+  between columns is `update --status`.
+
+  Output: a JSON array of ClickUp's status objects (status, type, orderindex,
+  color, …), read from GET /list/<id>.
+
+  Example: clickup statuses --list <LIST>
+""" + _HELP_COLUMNS + _HELP_TAIL,
+    "tags": """\
+clickup tags --space ID
+
+  List a space's tags (name + colours). Tags are space-scoped and addressed by
+  name (no tag ids).
+
+  Output: a JSON array of ClickUp's tag objects (name, tag_fg, tag_bg).
+
+  Example: clickup tags --space <SPACE>
+""" + _HELP_TAIL,
+    "fields": """\
+clickup fields --list ID
+
+  List a list's custom fields (id + name + type) — resolve a field's UUID
+  before `field-set`.
+
+  Output: a JSON array of ClickUp's custom field definitions.
+
+  Example: clickup fields --list <LIST>
+""" + _HELP_FIELD_DEFS + _HELP_TAIL,
+    "tasks": """\
+clickup tasks --list ID [--all] [--archived] [--subtasks]
+              [--status NAME ...] [--limit N] [--page N]
+
+  List tasks in a list. Incomplete only unless --all (closed statuses
+  included). --archived includes archived tasks. --status filters to named
+  statuses (repeatable). --subtasks includes subtasks. Paginates to --limit
+  (default 100); --page reads a single 0-indexed page of 100 instead, and
+  --limit does not apply to it.
+
+  Output: a JSON array of ClickUp's task objects.
+
+  Example: clickup tasks --list <LIST> --status "in progress" --limit 200
+""" + _HELP_PAGINATE + _HELP_TAIL,
+    "task": """\
+clickup task <task> [--with-subtasks] [--custom-id --workspace ID]
+
+  Show one task in full (status, assignees, tags, custom_fields,
+  dependencies, linked_tasks, url), its markdown description included.
+  --with-subtasks attaches its subtasks. --custom-id resolves <task> as a
+  Custom Task ID (needs --workspace; exit 6 missing_workspace without it), and
+  <task> is then taken as written rather than as a URL.
+
+  Output: ClickUp's task object.
+
+  Examples:
+    clickup task <TASK>
+    clickup task https://app.clickup.com/t/<TASK> --with-subtasks
+    clickup task <CUSTOM_TASK_ID> --custom-id --workspace <WORKSPACE>
+""" + _HELP_CUSTOM_TASK_ID + _HELP_TAIL,
+    "task-context": """\
+clickup task-context <task> [--json]
+
+  One call → the task plus everything adjacent: description (markdown),
+  comment thread, attachment pointers, dependencies one level deep (each with
+  its own description, thread, attachments), dependents as state lines. Up to
+  100 comments per task.
+
+  Output: a prompt-ready markdown envelope on stdout (not JSON), stamped with
+  its assembly time (UTC); --json emits the same tree structured, as
+  {assembled_at, task}, the task carrying comments, _dependencies_full and
+  _dependent_ids.
+
+  Example: clickup task-context <TASK>
+""" + _HELP_TAIL,
+    "comments": """\
+clickup comments <task> [--limit N]
+
+  List a task's comments (text + date + author), the N most recent in
+  chronological order. --limit defaults to 100.
+
+  Output: a JSON array of ClickUp's comment objects (id, comment_text, user,
+  date, resolved, …), oldest first.
+
+  Example: clickup comments <TASK> --limit 20
+""" + _HELP_TAIL,
+    "subtasks": """\
+clickup subtasks <task>
+
+  List a task's subtasks.
+
+  Output: a JSON array of ClickUp's subtask objects.
+
+  Example: clickup subtasks <TASK>
+""" + _HELP_TAIL,
+    "deps": """\
+clickup deps <task> [--dependents]
+
+  List what <task> waits on (or, with --dependents, what waits on it).
+
+  Output: {task, relation: "dependencies"|"dependents", task_ids,
+  linked_tasks}.
+
+  Example: clickup deps <TASK> --dependents
+""" + _HELP_TAIL,
+    "attachments": """\
+clickup attachments <task>
+
+  List a task's attachments (id + title + url; read from the task).
+
+  Output: a JSON array of ClickUp's attachment objects.
+
+  Example: clickup attachments <TASK>
+""" + _HELP_TAIL,
+    "find": """\
+clickup find [--workspace ID] [--list ID] --field UUID --value V
+clickup find [--workspace ID] [--list ID] --external-id V [--field FIELD]
+clickup find [--workspace ID] <custom-task-id>
+
+  Resolve a task by a dedup key — task JSON on a hit, null + exit 0 on a miss.
+  Two modes: --field/--value matches a custom field workspace-wide (the
+  SETTABLE external-ID key — set it with `create --external-id`,
+  `create --field`, or `field-set`); a bare <custom-task-id> is the ClickApp
+  Custom Task ID lookup (read-only — ClickUp assigns those, the API cannot set
+  them). Use --field for dedup. --external-id uses the configured external_id
+  custom field (or --field override, UUID/name). --list resolves field names
+  to UUIDs. --workspace defaults to the connection's workspace_id or
+  CLICKUP_WORKSPACE_ID. The custom-field lookup includes closed tasks and
+  subtasks, and a text field must hold the value exactly; a dedup-key field is
+  meant to be unique, and only the first match is returned.
+
+  Output: ClickUp's task object, or null. Exit 6 missing_workspace without a
+  workspace; 6 input for --external-id with --value, --field without --value,
+  or no mode at all; 6 missing_field (no external-id field configured),
+  field_name_needs_list (a field name without --list) or ambiguous_field; 3
+  field_not_found for a field name the list does not have.
+
+  Examples:
+    clickup find --workspace <WORKSPACE> --field <FIELD_UUID> --value <KEY>
+    clickup find --external-id <KEY> --list <LIST>
+    clickup find --workspace <WORKSPACE> <CUSTOM_TASK_ID>
+""" + _HELP_EXTERNAL_ID + _HELP_CUSTOM_TASK_ID + _HELP_TAIL,
+    "field-get": """\
+clickup field-get <task> [<field>]
+
+  Read a task's custom field values — all, or one addressed by UUID or name.
+
+  Output: a JSON array of {id, name, type, value}, or that one object for
+  <field>. Exit 3 not_found when the task has no such field.
+
+  Example: clickup field-get <TASK> <FIELD_UUID>
+""" + _HELP_FIELD_DEFS + _HELP_TAIL,
+    "assigned": """\
+clickup assigned --workspace ID [--assignee ID] [--all] [--status NAME ...]
+                 [--limit N]
+
+  The "what's waiting on my input, and for how long?" read: tasks assigned to
+  you (or --assignee, a user id), incomplete unless --all, stalest first —
+  each with its last-touch timestamp and idle age. --status filters to named
+  statuses (repeatable); --limit defaults to 100.
+
+  Output: a JSON array of {id, name, status, list, last_touch, idle, url},
+  last_touch as "YYYY-MM-DD HH:MMZ" and idle as e.g. "3d4h".
+
+  Example: clickup assigned --workspace <WORKSPACE>
+""" + _HELP_PAGINATE + _HELP_TAIL,
+    "create": """\
+clickup create --list ID --name NAME [--desc TEXT|-] [--markdown TEXT|-]
+               [--assignee ID ...] [--status NAME] [--tag NAME ...]
+               [--priority N] [--due-on YYYY-MM-DD] [--due-at ISO8601]
+               [--start-on D] [--start-at ISO] [--parent ID]
+               [--external-id V] [--external-id-field FIELD] [--workspace ID]
+               [--field UUID=VALUE ...]
+
+  Create a task in a list. --markdown (default) stores a markdown body
+  (ClickUp renders it); --desc stores literal plain text. Pass at most one
+  (exit 6 conflicting_body). '-' reads stdin. --assignee repeatable (user id).
+  --tag repeatable (tag name). --start-* mirrors --due-*: the scheduled begin,
+  all-day or timed. --priority 1=Urgent 2=High 3=Normal 4=Low. --due-on is
+  all-day; --due-at carries time-of-day; not both. --parent makes it a SUBTASK
+  (parent must be in the same list). --field sets a custom field at creation
+  (repeatable) — stamp an external-ID key here, then `find --field` it.
+
+  --external-id enforces a best-effort dedup preflight against the configured
+  external_id custom field, then stamps that field during creation. Requires
+  --workspace unless CLICKUP_WORKSPACE_ID or connection workspace_id is set.
+  --external-id-field overrides the configured field (UUID or name).
+
+  Output: ClickUp's created task object; with --external-id, {deduped,
+  external_id, external_id_field, task}, deduped true and task the existing
+  one when the key already holds. Exit 6 also for an empty --external-id, a
+  non-numeric --assignee, or a --field that is not UUID=VALUE (bad_field).
+
+  Examples:
+    clickup create --list <LIST> --name "<title>" --markdown - --priority 2
+    clickup create --list <LIST> --name "<title>" --external-id <KEY> --workspace <WORKSPACE>
+""" + _HELP_INPUT + _HELP_DATES + _HELP_EXTERNAL_ID + _HELP_WRITE + _HELP_TAIL,
+    "update": """\
+clickup update <task> [--name N] [--desc T|-] [--markdown T|-]
+               [--status NAME] [--priority N] [--due-on D] [--due-at ISO]
+               [--start-on D] [--start-at ISO] [--add-assignee ID ...]
+               [--rem-assignee ID ...] [--archive]
+
+  Update fields on a task. --markdown/--desc as for create. --status moves
+  the column. --priority 1=Urgent 2=High 3=Normal 4=Low. --add-assignee /
+  --rem-assignee add or remove assignees (ClickUp updates use an add/remove
+  set, not a replace). --archive archives the task.
+
+  Output: ClickUp's updated task object. Exit 6 no_changes when nothing is
+  given to change, conflicting_body for both --desc and --markdown.
+
+  Example: clickup update <TASK> --status "in review" --add-assignee <USER>
+""" + _HELP_INPUT + _HELP_DATES + _HELP_COLUMNS + _HELP_WRITE + _HELP_TAIL,
+    "comment": """\
+clickup comment <task> [--text TEXT|-] [--assignee ID] [--notify-all]
+                [--mention USER ...]
+
+  Add a comment to a task. --assignee assigns + notifies that user (an
+  ASSIGNED comment — carries a resolved state, see comment-resolve);
+  --notify-all notifies everyone on the task; --mention @-mentions a user id
+  (repeatable) and fires the "Mentioning me" inbox notification without the
+  assigned-comment baggage. --text composes with --mention; with only
+  --mention the text is omitted. Without --text and --mention the text is
+  read from stdin.
+
+  Output: ClickUp's answer for the new comment (id, hist_id, date). Exit 6
+  empty_comment with neither text nor a mention, invalid_mention for a
+  non-numeric --mention.
+
+  Examples:
+    clickup comment <TASK> --text "<text>"
+    clickup comment <TASK> --text "<text>" --mention <USER>
+""" + _HELP_INPUT + _HELP_WRITE + _HELP_TAIL,
+    "comment-resolve": """\
+clickup comment-resolve <comment_id>
+
+  Mark a comment resolved (clears the Incomplete Warning ClickApp nag for
+  ASSIGNED comments). Get <comment_id> from `comments <task>`.
+
+  Output: {comment_id, resolved: true}.
+
+  Example: clickup comment-resolve <COMMENT>
+""" + _HELP_WRITE + _HELP_TAIL,
+    "complete": """\
+clickup complete <task> [--reopen] [--force] [--no-rollup]
+
+  Mark a task complete by setting its list's closed status (--reopen sets the
+  first open status). REFUSES (exit 7 blocked_by_dependencies) if the task has
+  incomplete dependencies — pass --force to override. On success it cascades:
+  auto-completes any parent whose subtasks are now all done, and reports
+  dependents this unblocked. --no-rollup skips the cascade. (To move a task to
+  an arbitrary column, use `update --status`.)
+
+  Completion is status-based: a task is "done" when its status type is `done`
+  or `closed`. `complete` discovers the list's closed status and sets it;
+  there is no boolean done flag.
+
+  Output: {completed: {id, status}, task}, plus rolled_up [{id, name}] and
+  unblocked [{id, name}] when the cascade did something; with --reopen,
+  {reopened: {id, status}, task}. Exit 6 no_list, no_done_status or
+  no_open_status when the list has no status to move into.
+
+  Example: clickup complete <TASK>
+""" + _HELP_WRITE + _HELP_TAIL,
+    "assign": """\
+clickup assign <task> [--add ID ...] [--rem ID ...]
+
+  Add and/or remove assignees on a task. <ID> is a user id; both flags
+  repeat.
+
+  Output: ClickUp's updated task object. Exit 6 no_assignees with neither
+  flag, bad_user_id for a non-numeric id.
+
+  Example: clickup assign <TASK> --add <USER> --rem <USER>
+""" + _HELP_WRITE + _HELP_TAIL,
+    "watch": """\
+clickup watch <task> [--add ID ...] [--rem ID ...]
+
+  Add and/or remove watchers — the follower analog; a watcher is notified of
+  the task's activity. <ID> is a user id; both flags repeat.
+
+  Output: ClickUp's updated task object. Exit 6 no_watchers with neither
+  flag, bad_user_id for a non-numeric id.
+
+  Example: clickup watch <TASK> --add <USER>
+""" + _HELP_WRITE + _HELP_TAIL,
+    "tag-create": """\
+clickup tag-create --space ID --name NAME [--fg HEX] [--bg HEX]
+
+  Create a tag in a space. --fg and --bg are the foreground and background
+  colour hex.
+
+  Output: {space, tag, created: true}.
+
+  Example: clickup tag-create --space <SPACE> --name "<tag>" --bg "#ff0000"
+""" + _HELP_WRITE + _HELP_TAIL,
+    "tag-add": """\
+clickup tag-add <task> <tag>
+
+  Add a tag to a task. <tag> is a tag NAME (tags are name-addressed).
+
+  Output: {task, tag, added: true}.
+
+  Example: clickup tag-add <TASK> "<tag>"
+""" + _HELP_WRITE + _HELP_TAIL,
+    "tag-remove": """\
+clickup tag-remove <task> <tag>
+
+  Remove a tag from a task. <tag> is a tag NAME.
+
+  Output: {task, tag, removed: true}.
+
+  Example: clickup tag-remove <TASK> "<tag>"
+""" + _HELP_WRITE + _HELP_TAIL,
+    "dep-add": """\
+clickup dep-add <task> --on ID [--on ...]
+
+  Mark <task> as depending on each --on task (waits on them). --on takes a
+  task id or URL and repeats.
+
+  Output: {task, depends_on: [ids]}.
+
+  Example: clickup dep-add <TASK> --on <TASK>
+""" + _HELP_WRITE + _HELP_TAIL,
+    "dep-remove": """\
+clickup dep-remove <task> --on ID [...]
+
+  Remove dependency links from <task>: each --on task (repeatable) it no
+  longer waits on.
+
+  Output: {task, removed: [ids]}.
+
+  Example: clickup dep-remove <TASK> --on <TASK>
+""" + _HELP_WRITE + _HELP_TAIL,
+    "field-set": """\
+clickup field-set <task> <field> --value V [--json]
+
+  Set a custom field on a task. <field> is the field UUID (`fields` lists
+  them). --value is the literal value; --json parses it as JSON first (for
+  typed/relationship fields).
+
+  Output: {task, field, set: true}. Exit 6 bad_json when --json is given and
+  --value is not valid JSON.
+
+  Example: clickup field-set <TASK> <FIELD_UUID> --value "<value>"
+""" + _HELP_FIELD_DEFS + _HELP_WRITE + _HELP_TAIL,
+    "field-clear": """\
+clickup field-clear <task> <field>
+
+  Clear a custom field on a task. <field> is the field UUID.
+
+  Output: {task, field, cleared: true}.
+
+  Example: clickup field-clear <TASK> <FIELD_UUID>
+""" + _HELP_FIELD_DEFS + _HELP_WRITE + _HELP_TAIL,
+    "deliverable": """\
+clickup deliverable --list ID --request-name N --agent-name N
+                    --supervisor USER --agent USER [--request-markdown T|-]
+                    [--agent-markdown T|-] [--status NAME] [--parent ID]
+                    [--state-field UUID]
+
+  Create a PAIRED request + dependent: a request task assigned to
+  --supervisor (the human whose input is needed) and an agent task assigned
+  to --agent that DEPENDS ON it, so completing the request unblocks the agent
+  task. Both start in --status when given; --parent makes the agent task a
+  subtask of that task. --state-field stamps {phase,last_touch} JSON into a
+  (UI-created) custom field on both tasks. Not idempotent — ClickUp has no
+  settable dedup key, so a re-run makes a fresh pair.
+
+  Output: {request: {id, name, url}, agent: {id, name, url}, dependency:
+  {dependent, on}}, plus state_field when stamped. Exit 6 two_stdin when both
+  bodies are '-'.
+
+  Example: clickup deliverable --list <LIST> --request-name "<ask>" --agent-name "<work>" --supervisor <USER> --agent <USER>
+""" + _HELP_INPUT + _HELP_FIELD_DEFS + _HELP_WRITE + _HELP_TAIL,
+    "task-delete": """\
+clickup task-delete <task> --yes [--custom-id --workspace ID]
+
+  Delete a task. IRREVERSIBLE — refuses without --yes (exit 6
+  delete_requires_confirmation; the gate; confirm with the human first).
+  --custom-id resolves <task> as a Custom Task ID (needs --workspace; exit 6
+  missing_workspace without it).
+
+  Output: {task, deleted: true}.
+
+  Example: clickup task-delete <TASK> --yes
+""" + _HELP_CUSTOM_TASK_ID + _HELP_WRITE + _HELP_TAIL,
+    "attach": """\
+clickup attach <task> FILE [--name NAME]
+
+  Upload a local FILE to a task (multipart). --name overrides the display
+  name. (File upload only — ClickUp has no attach-by-URL.)
+
+  Output: ClickUp's attachment object (id, url, …). Exit 6 file_not_found
+  when FILE is not a readable local file.
+
+  Example: clickup attach <TASK> ./report.pdf --name "<name>"
+""" + _HELP_WRITE + _HELP_TAIL,
+    "list-create": """\
+clickup list-create --name NAME [--folder ID] [--space ID] [--content TEXT]
+
+  Create a list. --folder makes it a folder list; --space makes it a
+  folderless list under the space; with both, --folder wins. --content is the
+  list description.
+
+  Output: ClickUp's created list object. Exit 6 missing_parent with neither
+  --folder nor --space.
+
+  Example: clickup list-create --folder <FOLDER> --name "<name>"
+""" + _HELP_WRITE + _HELP_TAIL,
+    "webhooks": """\
+clickup webhooks --workspace ID
+
+  List a workspace's webhooks.
+
+  Output: a JSON array of ClickUp's webhook objects.
+
+  Example: clickup webhooks --workspace <WORKSPACE>
+""" + _HELP_TAIL,
+    "webhook-create": """\
+clickup webhook-create --workspace ID --endpoint URL [--event E ...]
+                       [--space ID] [--folder ID] [--list ID] [--task ID]
+
+  Register a webhook delivering to the HTTPS endpoint. --event is repeatable
+  (e.g. taskCreated taskStatusUpdated taskCommentPosted); omit for all
+  events. The scope flags narrow it to one space/folder/list/task. The
+  response carries the signing secret once — capture it. (No handshake.)
+
+  Output: ClickUp's answer: the webhook's id and the webhook, its secret
+  included.
+
+  Example: clickup webhook-create --workspace <WORKSPACE> --endpoint https://example.com/hook --event taskCreated
+""" + _HELP_WRITE + _HELP_TAIL,
+    "webhook-delete": """\
+clickup webhook-delete <webhook> --yes
+
+  Delete a webhook (stops deliveries). IRREVERSIBLE — refuses without --yes
+  (exit 6 delete_requires_confirmation; the gate; confirm with the human
+  first).
+
+  Output: {webhook, deleted: true}.
+
+  Example: clickup webhook-delete <WEBHOOK> --yes
+""" + _HELP_WRITE + _HELP_TAIL,
+}
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CONFIG_DIR = _CONFIG_HOME / "clickup"
@@ -1668,10 +2135,8 @@ def main() -> None:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("help", help="print the full usage contract, "
-                                    "or `help <command>` for one subcommand's syntax")
-    sp.add_argument("topic", nargs="?", default=None,
-                    help="subcommand name; prints its --help instead of the full contract")
+    sp = sub.add_parser("help", help="print the menu; `clickup help <verb>` gives one verb's contract")
+    sp.add_argument("topic", nargs="*", help="a verb path; prints that verb's whole contract")
     sub.add_parser("doctor", help="health check — resolve token, confirm identity")
     sub.add_parser("whoami", help="confirm token and return identity")
     sub.add_parser("workspaces", help="list workspaces (teams)")
@@ -1960,20 +2425,9 @@ def main() -> None:
     args = p.parse_args(cleaned)
 
     if args.cmd == "help":
-        topic = getattr(args, "topic", None)
-        if topic:
-            # `help <cmd>` is an ergonomic alias for `<cmd> --help`. Look up the
-            # subparser and print its usage — argparse exits 0 on --help itself,
-            # so we invoke it directly rather than through parse_args recursion.
-            choices = sub.choices  # type: ignore[attr-defined]
-            if topic not in choices:
-                known = ", ".join(sorted(choices))
-                _die(6, "unknown_help_topic",
-                     f"no such command: {topic!r}",
-                     f"known commands: {known}")
-            choices[topic].print_help()
-            return
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        # `help` after `--connection <id>` or `--token-env <KEY>`: the
+        # contract's layered help, as bare.
+        _cmd_help_verb(args.topic) if args.topic else _cmd_help()
         return
 
     reg, reg_file = _connections_registry()

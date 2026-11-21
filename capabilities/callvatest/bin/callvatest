@@ -5,13 +5,14 @@
 #     "httpx>=0.27",
 #     "livekit>=1.1,<2",
 #     "pyyaml>=6",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """callvatest — agent-first CLI that regression-tests a deployed CallVA voice agent.
 
-This tool is designed to be invoked by agents. Run `callvatest help` to load the
-full usage contract on demand — do not rely on memorised knowledge of its surface.
+This tool is designed to be invoked by agents. Run `callvatest help` to load this
+menu and `callvatest help <verb>` for one verb's whole contract, on demand — do
+not rely on memorised knowledge of its surface.
 
 It joins a real LiveKit room as a headless participant through the ordinary CallVA
 WebRTC connect flow, drives the conversation over text, and then asserts what the
@@ -25,350 +26,31 @@ Placing a call costs money and creates a real call record. `run`, `suite`,
 `probe`, `explore`, and `session start` are therefore write verbs: a connection
 with "allow_write": false refuses them, and no flag lifts that gate.
 
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. A flag wins (--api-url, non-secret only; a secret never has a
-  flag); otherwise its values resolve through the credential cascade (`Where a
-  secret resolves`, at the end of this help).
-  The key is only ever named, never passed on argv.
-    CALLVA_API_KEY=<CallVA API key>        secret — the tenant that owns the agent
-    CALLVA_API_URL=<base URL>              optional; default
-                                           https://api.callva.one/api/v1
-
-  A project that tests several CallVA tenants declares them as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": {
-          "api_url": "https://api.example.com/api/v1",
-          "secret_env": "CALLVA_<ID>_API_KEY",
-          "allow_write": true,
-          "test_call_field": "test_call",
-          "dashboard_email_env": "CALLVA_<ID>_DASHBOARD_EMAIL",
-          "dashboard_password_env": "CALLVA_<ID>_DASHBOARD_PASSWORD"
-        }
-      }
-    }
-  "secret_env" names the environment variable holding the key; naming a variable
-  the project already defines keeps one home for the secret. "allow_write": false
-  makes a connection observation-only — useful for pointing at a live tenant you
-  must not place calls into.
-
-  "test_call_field" names a boolean custom field on the tenant's calls, set to
-  true on every call this harness places. The platform stores a harness call
-  exactly like a caller's, so without it a tenant's own reporting counts the
-  testing as traffic. Declare it only where that field exists — `doctor` proves
-  it does. Absent, nothing is written.
-
-  Selection: --connection <id>. Unflagged, the registry's "default" pointer
-  applies, else the sole entry; several entries without a pointer is refused.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
-
-JUDGES
-  A `semantic` assertion is settled by a judge model. A judge is this harness's
-  own configuration rather than a CallVA tenant, so the roster is the "judges"
-  setting, written like any other setting record:
-
-    capabilities set callvatest setting judges '{
-      "default": "haiku",
-      "connections": {
-        "haiku":   {"provider": "anthropic",
-                    "model": "claude-haiku-4-5-20251001",
-                    "secret_env": "ANTHROPIC_API_KEY"},
-        "gpt-oss": {"provider": "cerebras", "model": "gpt-oss-120b",
-                    "secret_env": "CEREBRAS_API_KEY",
-                    "reasoning_effort": "low"},
-        "terra":   {"provider": "azure", "model": "gpt-5.6-terra",
-                    "endpoint": "my-resource.openai.azure.com",
-                    "api_version": "2025-04-01-preview",
-                    "secret_env": "AZURE_OPENAI_API_KEY"}
-      }
-    }'
-
-  It resolves project-then-global like every setting, so a machine-wide roster
-  is declared once and a project overrides it by declaring its own.
-  `callvatest connections` reports every judge it resolved, its model, the
-  address it composed, and where its key came from, without calling anything.
-
-  Providers are "anthropic", "cerebras" and "azure"; the model is named per
-  judge, so a backend is switched in the roster or per invocation with
-  --judge <id>, never in a scenario. Keys resolve by the same cascade as the API
-  key and are never passed on argv. A judge is resolved only when a scenario
-  actually declares a `semantic` claim.
-
-  An azure model is a deployment inside one resource, so an azure judge names
-  its own "endpoint" and the model is the deployment name; "api_version" is
-  optional and defaults to a version this harness pins. "reasoning_effort" is
-  optional on the providers that read it, and refused on the ones that do not.
-
-  A steady verdict is asked for by constraint rather than by sampling: the judge
-  is given the tool results as ground truth and must answer with a two-field
-  JSON object, and a reply it cannot be parsed from fails the assertion instead
-  of passing it. Temperature 0 is sent where the provider takes it, and the
-  newest Azure families refuse every value but their own. `fixtures` is how a
-  judge is shown to be steady on the claims this project actually asserts.
-
-  A judge runs after the call has ended, so its accuracy decides the choice and
-  its latency does not.
-
-SCENARIOS
-  Project-owned CallVA artefacts live under `callva/` in the project, by kind.
-  Scenarios are one kind:
-
-    <project>/callva/tests/<agent>/<language>/<scenario>.yaml
-
-  `run` and `suite` walk up from the working directory to find `callva/tests`.
-  --path overrides the search entirely.
-
-  A scenario is YAML:
-
-    id: earliest-slot
-    agent: <agent-label>          # ids label, or an agent uuid
-    language: en
-    turns:
-      - say: "I would like to book an appointment."
-        pause_after_reply: 2       # optional extra silence before the next turn
-        expect:
-          tools_not_called: ["Availability Lookup"]
-          reply_not_matches: "(?i)cannot help"
-      - say: "Tell me the earliest time you have."
-        expect:
-          tool_called: "Availability Lookup"
-          tool_args:
-            service_id: "<service-id>"
-          semantic: "The agent offers the earliest slot from the result."
-    expect:                       # evaluated once the call has settled
-      audio_observed: true
-      assistant_turn_after_tool: true
-      no_internal_ids: true
-      tool_call_count:
-        "Availability Lookup": 1
-      post_call:
-        status: completed
-
-  A tool is named by a case-insensitive substring of its automation name, or by
-  an automation uuid. Times, dates, and slots are never pinned as literals — they
-  are asserted against the tool result the agent actually received.
-
-  `post_call` reads the call record the platform stored once the call settled:
-  its own outcome fields, and any custom field the tenant defines on a call.
-  Each named field is compared as a string, so a scenario asserts the tenant's
-  own schema without this harness knowing it.
-
-  `semantic` states one claim in prose and hands it to a judge model together
-  with the tool results of that turn and what the agent said; a call-level
-  `semantic` is given the whole transcript and every run. Use it where the
-  medium defeats matching in code — an agent speaks "kell kümme", never 10:00,
-  and no regular expression will call that the same time. Everything structured
-  (which tool ran, its arguments, counts, leaked ids) stays deterministic: code
-  is exact, free, and never flickers. A judge that cannot answer fails the
-  check; it never passes it.
+One connection is one CallVA tenant, the one that owns the agent under test;
+how it is declared, selected and kept is CONNECTIONS, on `callvatest help
+connections`. A scenario is YAML the project keeps under callva/tests
+(SCENARIOS, on `callvatest help run`); a `semantic` claim in it is settled by a
+judge model from the "judges" setting (JUDGES, on `callvatest help fixtures`);
+an exploration lets a model play the caller (EXPLORING, on `callvatest help
+explore`). Every verb takes the same options - text-only calls, how the room
+is opened, timeouts, the trace - and each verb's page lists them. Against a
+new agent, `probe` is the first thing to run.
 
 COMMANDS
-  probe [--agent <id|label>] [--say TEXT ...] [--turns N]
-        One diagnostic call with no assertions: connect, join, drive the turns
-        given by --say, then print everything observed — transcript with
-        timings, agent state changes, audio frames, the resolved call id, tool
-        runs with their arguments, and tool results. This is the first thing to
-        run against a new agent, and the first thing to run when a scenario
-        fails for reasons the report does not explain.
+  Calls (each one places a real, billable call)
+  probe                       WRITE. one diagnostic call, no assertions; everything observed
+  run <scenario>              WRITE. execute one scenario and print its verdict
+  suite [<path>]              WRITE. execute every scenario under a path
+  explore <exploration>       WRITE. a model plays the caller; reports what it found
 
-  run <scenario> [--agent <id|label>] [--report FILE]
-        Execute one scenario and print its verdict. Exit 1 when it fails.
+  Sessions (one call held open across invocations, decided turn by turn)
+  session start               WRITE. place a call and leave it open
+  session say <id> "<line>"   send one caller line and wait for the agent's answer
+  session end <id>            hang up and report what the call held
+  session list                every session this machine holds
 
-  suite [<path>] [--agent <id|label>] [--jobs N] [--report FILE]
-        Execute every scenario under a path. Exit 1 if any fails. --jobs runs N
-        calls at once, and reports keep scenario order however the runs finish.
-        A scenario that collapses is counted as a failure and named, and the
-        rest of the suite continues.
-
-  fixtures [<path>] [--judge <id>] [--all-judges] [--report FILE]
-        Judge the judge, without placing a call. Each fixture case freezes tool
-        results, what an agent said, a claim, and the verdict a competent judge
-        must reach; the run reports every disagreement. Exit 1 when any case
-        disagrees. Fixtures live in <project>/callva/judge/:
-
-          id: et-times
-          cases:
-            - claim: "Every time the agent speaks appears in the tool result."
-              results: ['{"earliest": "reede, 4. september 09:00"}']
-              said: "Kõige varasem vaba aeg on reedel kell üheksa."
-              expect: true
-
-        Half the cases must expect false, or the run cannot tell a judge that
-        reads from one that agrees with everything. --all-judges runs the whole
-        set past every declared judge, which is how backends are compared on
-        material that matters rather than on a benchmark.
-
-        `known_gap: true` marks a case every judge already fails — a measured
-        limit rather than a regression. It still runs and is still reported, but
-        it does not fail the run, because a set that is permanently red gates
-        nothing; the day a judge starts getting it right is reported too.
-
-  doctor
-        Per connection: prove the key resolves and reaches the API, and that the
-        LiveKit RTC stack imports. Names the agents the key can see, proves a
-        declared "test_call_field" exists on the tenant's calls, and asks each
-        declared judge to settle a trivial claim.
-
-SESSIONS
-  A scenario is written before the call; a session is decided during it. One
-  call is held open across separate invocations, so the next line is chosen
-  after reading the reply to the last one — which is how a person, or an agent
-  acting as one, actually talks.
-
-  session start [--agent <id|label>] [--text]
-        Place a call and leave it open. Billable, exactly as `run` is: this is
-        the write verb of the four. It returns
-        {"session","room","agent","mode","log","greeting","turns"} — the id
-        every other session verb takes, and the greeting already spoken.
-
-  session say <id> "<line>" [--timeout <s>]
-        Send one caller line and wait for the agent to finish answering it.
-        Returns {"session","turn","reply","elapsed"}: `reply` is what the agent
-        said in that turn alone. A turn that times out is reported as an error
-        and leaves the call up, so the next line — or `end` — still works.
-
-  session end <id>
-        Hang up and report. Returns the same object `run` produces —
-        transcript, events, tool runs with their arguments, the resolved call
-        id, and the post-call record once it settles — with "verdict":
-        "observed", because a session asserts nothing.
-
-  session list
-        Every session this machine holds: id, agent, room, mode, turns so far,
-        age, whether its holder is alive, and whether it has ended.
-
-  The call lives in a holder process that `start` leaves behind, and each event
-  is written to <session>/log.jsonl the moment it happens. So if the call drops
-  or the holder dies, nothing is lost: `say` then refuses by naming the log, and
-  `end` still reports from it plus whatever the platform can still be asked.
-
-EXPLORING
-  A scenario says every caller line in advance, so it can gate: red means the
-  agent changed. An exploration says only where the call must go and lets a
-  model play the caller, so it can find: the wording is invented on the spot,
-  a persona makes the caller unclear, wandering or insistent, and the run
-  reports what it saw instead of passing or failing.
-
-  explore <exploration> [--persona <id>] [--driver <id>] [--agent <id|label>]
-          [--report FILE]
-        Let the driver model choose every caller line until every stage is
-        reached, a budget is spent, or the caller gives up. Billable, exactly
-        as `run` is, and it may place more than one call: a call that ends
-        under the caller before the stages are done is followed by another
-        while the budget allows. Prints the exploratory report; --json for the
-        whole record. Exit 0 whatever was found; 5 only when the driver itself
-        could not answer, which is a fault of the run and not a finding.
-
-  Explorations, personas, the driver and the budget are one setting,
-  "explore", declared beside "judges" and resolved the same way, project then
-  global:
-
-    capabilities set callvatest setting explore '{
-      "driver": "gpt-oss",
-      "budget": {"turns": 12, "calls": 1},
-      "personas": {
-        "mumbler": "You speak in fragments, trail off mid-sentence, and about
-                    half the time answer a different question than the one
-                    you were asked.",
-        "insister": "You want the earliest possible slot and push back on
-                     every alternative twice before accepting anything."
-      },
-      "explorations": {
-        "books-any-afternoon": {
-          "agent": "<agent-label>",
-          "language": "en",
-          "intent": "Book a consultation next week, any afternoon, as a
-                     returning caller.",
-          "stages": ["state the reason for calling",
-                     "give a preferred day and time when asked",
-                     "confirm the details the agent reads back",
-                     "say goodbye"],
-          "persona": "mumbler"
-        }
-      }
-    }'
-
-  "driver" names an entry of the judges roster — the same providers, models
-  and keys, so no new account or key is needed; gpt-oss-120b on Cerebras is a
-  fitting one. --driver <id> switches it for one run. The driver answers while
-  the agent waits, so a fast model matters here where it does not for a judge.
-  A setting that names no driver is refused; nothing falls back to the judges
-  default.
-
-  "budget" is counted in what this harness can count. "turns" is the most
-  caller lines one run may send, across every call it places; "calls" is the
-  most calls it may place. Both are required, and the run stops at whichever
-  is spent first. The whole-call --budget in seconds still bounds each call
-  on its own. The price of a call is the tenant's to know, never this
-  harness's to guess, so no budget is money.
-
-  An exploration's "intent" is the caller's purpose and the facts they hold;
-  "stages" are the points the call must pass through, in order. The driver
-  invents the wording inside that direction and says which stages the
-  conversation has completed. "agent" and "language" are optional and read as
-  a scenario's are; "persona" names the persona this exploration plays by
-  default, and --persona <id> overrides it for one run.
-
-  "personas" are prose, one paragraph each, describing how a caller speaks
-  and behaves; a persona changes nothing about what the caller wants. They
-  are the project's own: this harness ships none and plays no particular
-  caller.
-
-  The report is its own shape, "kind": "exploration": the intent, each stage
-  with the call and turn that reached it, the persona, the driver, the budget
-  and what was spent of it, what stopped the run, one record per call placed
-  — room, call id, transcript, events, tool runs and post-call fields, what a
-  `run` report holds without its checks — and the driver's notes: one
-  sentence per turn where the agent did something a caller would find wrong,
-  odd or unhelpful. The verdict is one of:
-    explored   every stage was reached
-    stalled    a budget was spent first — turns or calls
-    dropped    the caller gave up first: the driver ended the call with
-               stages still to go
-    aborted    the driver could not answer; nothing about the agent is claimed
-  None of these is pass or fail, and none gates anything: a finding is turned
-  into a scenario, and the scenario is what gates.
-
-  Contract verbs: help, doctor, connections, stub, manifest --json,
-  guide [<topic>], ids list|get|set|rm, refs, inventory [--network].
-
-GLOBAL OPTIONS
-  --connection <id>   select a registry connection
-  --judge <id>        select a judge for this run's semantic assertions
-  --text              run the call over text alone: the room carries no audio,
-                      the agent never synthesizes speech, and a turn ends when
-                      its text is complete. Several times faster and cheaper,
-                      and it proves nothing about the speech path — checks that
-                      need audio report as skipped. A scenario always describes
-                      the spoken call; only this flag downgrades a run.
-  --via <path>        how the room is opened: `connect` (default) is the
-                      public link, a visitor's call; `test-panel` opens it as
-                      the dashboard's Test button does, as a signed-in owner
-                      or admin through test-connect, so the room is a preview
-                      and test-panel-only behaviour applies. It needs the
-                      connection's "dashboard_email_env" and
-                      "dashboard_password_env", naming the env vars holding
-                      that user's sign-in; the session token is minted for
-                      the one connect and revoked after it. The call is
-                      charged to the tenant's wallet; an empty one exits 4
-                      `test_credit_used_up`. Reports and session meta record
-                      the path as "via".
-  --key-env <KEY>     resolve the API key from a different env/cred KEY
-  --api-url <URL>     override the base URL for this invocation
-  --json              machine-readable output where a verb has a prose default
-  --timeout <S>       per-turn timeout in seconds (default 45)
-  --budget <S>        whole-call budget in seconds (default 300)
-  --trace             write the run's own instrument to stderr: every room
-                      lifecycle event, each send and its outcome, and the SDK's
-                      internals, on one clock. Reach for it when a run times out
-                      and the report cannot say why. Output on stdout is
-                      unaffected, so a report stays machine-readable.
+  Judges
+  fixtures [<path>]           judge the judge on frozen cases, without placing a call
 
 EXIT CODES
   0 ok · 1 assertion failed · 2 credentials · 3 not found · 4 policy
@@ -597,6 +279,538 @@ def _tr(event: str, **fields) -> None:
     detail = " ".join(f"{k}={v!r}" for k, v in fields.items())
     sys.stderr.write(f"[{at:8.3f}] {event} {detail}\n")
     sys.stderr.flush()
+
+# The verb pages `callvatest help <verb>` answers (SHEBANG.md, "Agent-first
+# help is the surface"): each verb's whole contract, the module docstring being
+# the menu. The contract library dispatches both and renders the contract
+# verbs' own pages, which the entries here for doctor, connections and settings
+# follow. A text several verbs own is one constant, added to each of their
+# pages.
+_HELP_SYNOPSIS_OPTIONS = """\
+        [--connection <id>] [--judge <id>] [--text] [--via connect|test-panel]
+        [--key-env <KEY>] [--api-url <URL>] [--json] [--timeout <S>]
+        [--budget <S>] [--trace] [--with-results]
+"""
+_HELP_OPTIONS = """
+  GLOBAL OPTIONS (every verb takes them)
+  --connection <id>   select a registry connection
+  --judge <id>        select a judge for this run's semantic assertions
+  --text              run the call over text alone: the room carries no audio,
+                      the agent never synthesizes speech, and a turn ends when
+                      its text is complete. Several times faster and cheaper,
+                      and it proves nothing about the speech path — checks that
+                      need audio report as skipped. A scenario always describes
+                      the spoken call; only this flag downgrades a run.
+  --via <path>        how the room is opened: `connect` (default) is the
+                      public link, a visitor's call; `test-panel` opens it as
+                      the dashboard's Test button does, as a signed-in owner
+                      or admin through test-connect, so the room is a preview
+                      and test-panel-only behaviour applies. It needs the
+                      connection's "dashboard_email_env" and
+                      "dashboard_password_env", naming the env vars holding
+                      that user's sign-in; the session token is minted for
+                      the one connect and revoked after it. The call is
+                      charged to the tenant's wallet; an empty one exits 4
+                      `test_credit_used_up`. Reports and session meta record
+                      the path as "via".
+  --key-env <KEY>     resolve the API key from a different env/cred KEY
+  --api-url <URL>     override the base URL for this invocation
+  --json              machine-readable output where a verb has a prose default
+  --timeout <S>       per-turn timeout in seconds (default 45)
+  --budget <S>        whole-call budget in seconds (default 300)
+  --trace             write the run's own instrument to stderr: every room
+                      lifecycle event, each send and its outcome, and the SDK's
+                      internals, on one clock. Reach for it when a run times out
+                      and the report cannot say why. Output on stdout is
+                      unaffected, so a report stays machine-readable.
+  --with-results      put each tool run's result in the report. By default the
+                      results stay out — they carry whatever personal data the
+                      caller gave — and their shape is reported instead, which
+                      is what an assertion failure needs to be read; this is
+                      for debugging a specific mismatch.
+"""
+_HELP_WRITE = """
+  Placing a call costs money and creates a real call record. `run`, `suite`,
+  `probe`, `explore`, and `session start` are therefore write verbs: a connection
+  with "allow_write": false refuses them, and no flag lifts that gate.
+"""
+_HELP_TAIL = """
+  Connection: --connection <id>. Unflagged, the registry's "default" pointer
+  applies, else the sole entry; several entries without a pointer is refused
+  (`callvatest help connections`). Outside any project, connections and doctor
+  are machine reads; every other verb that needs a connection is refused there.
+
+  EXIT CODES
+  0 ok · 1 assertion failed · 2 credentials · 3 not found · 4 policy
+  5 upstream/transport · 6 room shared with another caller, or invalid input
+  7 timeout waiting on the agent
+"""
+_HELP_SCENARIOS = """
+  SCENARIOS
+  Project-owned CallVA artefacts live under `callva/` in the project, by kind.
+  Scenarios are one kind:
+
+    <project>/callva/tests/<agent>/<language>/<scenario>.yaml
+
+  `run` and `suite` walk up from the working directory to find `callva/tests`.
+  --path overrides the search entirely.
+
+  A scenario is YAML:
+
+    id: earliest-slot
+    agent: <agent-label>          # ids label, or an agent uuid
+    language: en
+    turns:
+      - say: "I would like to book an appointment."
+        pause_after_reply: 2       # optional extra silence before the next turn
+        expect:
+          tools_not_called: ["Availability Lookup"]
+          reply_not_matches: "(?i)cannot help"
+      - say: "Tell me the earliest time you have."
+        expect:
+          tool_called: "Availability Lookup"
+          tool_args:
+            service_id: "<service-id>"
+          semantic: "The agent offers the earliest slot from the result."
+    expect:                       # evaluated once the call has settled
+      audio_observed: true
+      assistant_turn_after_tool: true
+      no_internal_ids: true
+      tool_call_count:
+        "Availability Lookup": 1
+      post_call:
+        status: completed
+
+  A tool is named by a case-insensitive substring of its automation name, or by
+  an automation uuid. Times, dates, and slots are never pinned as literals — they
+  are asserted against the tool result the agent actually received.
+
+  `post_call` reads the call record the platform stored once the call settled:
+  its own outcome fields, and any custom field the tenant defines on a call.
+  Each named field is compared as a string, so a scenario asserts the tenant's
+  own schema without this harness knowing it.
+
+  `semantic` states one claim in prose and hands it to a judge model together
+  with the tool results of that turn and what the agent said; a call-level
+  `semantic` is given the whole transcript and every run. Use it where the
+  medium defeats matching in code — an agent speaks "kell kümme", never 10:00,
+  and no regular expression will call that the same time. Everything structured
+  (which tool ran, its arguments, counts, leaked ids) stays deterministic: code
+  is exact, free, and never flickers. A judge that cannot answer fails the
+  check; it never passes it. The judge is chosen with --judge <id>, else the
+  roster's default (JUDGES, on `callvatest help fixtures`).
+"""
+_HELP_JUDGES = """
+  JUDGES
+  A `semantic` assertion is settled by a judge model. A judge is this harness's
+  own configuration rather than a CallVA tenant, so the roster is the "judges"
+  setting, written like any other setting record:
+
+    capabilities set callvatest setting judges '{
+      "default": "haiku",
+      "connections": {
+        "haiku":   {"provider": "anthropic",
+                    "model": "claude-haiku-4-5-20251001",
+                    "secret_env": "ANTHROPIC_API_KEY"},
+        "gpt-oss": {"provider": "cerebras", "model": "gpt-oss-120b",
+                    "secret_env": "CEREBRAS_API_KEY",
+                    "reasoning_effort": "low"},
+        "terra":   {"provider": "azure", "model": "gpt-5.6-terra",
+                    "endpoint": "my-resource.openai.azure.com",
+                    "api_version": "2025-04-01-preview",
+                    "secret_env": "AZURE_OPENAI_API_KEY"}
+      }
+    }'
+
+  It resolves project-then-global like every setting, so a machine-wide roster
+  is declared once and a project overrides it by declaring its own.
+  `callvatest connections` reports every judge it resolved, its model, the
+  address it composed, and where its key came from, without calling anything.
+
+  Providers are "anthropic", "cerebras" and "azure"; the model is named per
+  judge, so a backend is switched in the roster or per invocation with
+  --judge <id>, never in a scenario. Keys resolve by the same cascade as the API
+  key and are never passed on argv. A judge is resolved only when a scenario
+  actually declares a `semantic` claim.
+
+  An azure model is a deployment inside one resource, so an azure judge names
+  its own "endpoint" and the model is the deployment name; "api_version" is
+  optional and defaults to a version this harness pins. "reasoning_effort" is
+  optional on the providers that read it, and refused on the ones that do not.
+
+  A steady verdict is asked for by constraint rather than by sampling: the judge
+  is given the tool results as ground truth and must answer with a two-field
+  JSON object, and a reply it cannot be parsed from fails the assertion instead
+  of passing it. Temperature 0 is sent where the provider takes it, and the
+  newest Azure families refuse every value but their own. `fixtures` is how a
+  judge is shown to be steady on the claims this project actually asserts.
+
+  A judge runs after the call has ended, so its accuracy decides the choice and
+  its latency does not.
+"""
+_HELP_EXPLORE_SETTING = """
+  Explorations, personas, the driver and the budget are one setting,
+  "explore", declared beside "judges" and resolved the same way, project then
+  global:
+
+    capabilities set callvatest setting explore '{
+      "driver": "gpt-oss",
+      "budget": {"turns": 12, "calls": 1},
+      "personas": {
+        "mumbler": "You speak in fragments, trail off mid-sentence, and about
+                    half the time answer a different question than the one
+                    you were asked.",
+        "insister": "You want the earliest possible slot and push back on
+                     every alternative twice before accepting anything."
+      },
+      "explorations": {
+        "books-any-afternoon": {
+          "agent": "<agent-label>",
+          "language": "en",
+          "intent": "Book a consultation next week, any afternoon, as a
+                     returning caller.",
+          "stages": ["state the reason for calling",
+                     "give a preferred day and time when asked",
+                     "confirm the details the agent reads back",
+                     "say goodbye"],
+          "persona": "mumbler"
+        }
+      }
+    }'
+
+  "driver" names an entry of the judges roster — the same providers, models
+  and keys, so no new account or key is needed; gpt-oss-120b on Cerebras is a
+  fitting one. --driver <id> switches it for one run. The driver answers while
+  the agent waits, so a fast model matters here where it does not for a judge.
+  A setting that names no driver is refused; nothing falls back to the judges
+  default.
+
+  "budget" is counted in what this harness can count. "turns" is the most
+  caller lines one run may send, across every call it places; "calls" is the
+  most calls it may place. Both are required, and the run stops at whichever
+  is spent first. The whole-call --budget in seconds still bounds each call
+  on its own. The price of a call is the tenant's to know, never this
+  harness's to guess, so no budget is money.
+
+  An exploration's "intent" is the caller's purpose and the facts they hold;
+  "stages" are the points the call must pass through, in order. The driver
+  invents the wording inside that direction and says which stages the
+  conversation has completed. "agent" and "language" are optional and read as
+  a scenario's are; "persona" names the persona this exploration plays by
+  default, and --persona <id> overrides it for one run.
+
+  "personas" are prose, one paragraph each, describing how a caller speaks
+  and behaves; a persona changes nothing about what the caller wants. They
+  are the project's own: this harness ships none and plays no particular
+  caller.
+"""
+_HELP_SESSIONS = """
+  SESSIONS
+  A scenario is written before the call; a session is decided during it. One
+  call is held open across separate invocations, so the next line is chosen
+  after reading the reply to the last one — which is how a person, or an agent
+  acting as one, actually talks. The four session verbs are start, say, end
+  and list; only `start` places a call.
+
+  The call lives in a holder process that `start` leaves behind, and each event
+  is written to <session>/log.jsonl the moment it happens. So if the call drops
+  or the holder dies, nothing is lost: `say` then refuses by naming the log, and
+  `end` still reports from it plus whatever the platform can still be asked.
+"""
+HELP_VERBS = {
+    "probe": """\
+callvatest probe [--agent <id|label>] [--say TEXT ...] [--turns N]
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  One diagnostic call with no assertions: connect, join, drive the turns
+  given by --say, then print everything observed — transcript with
+  timings, agent state changes, audio frames, the resolved call id, tool
+  runs with their arguments, and tool results. This is the first thing to
+  run against a new agent, and the first thing to run when a scenario
+  fails for reasons the report does not explain. --say repeats, one caller
+  line each, in order. --agent is an ids label or an agent uuid.
+
+  Output: the run's report as one JSON object on stdout, with "verdict":
+  "observed" and no checks, whatever --json says.
+
+  Exit codes: 0 the call was observed; 2 the key missing or refused; 3 an
+  agent the key cannot see; 4 policy, or a connection that does not allow
+  writes; 5 the platform or the room did not answer; 6 input, or the room
+  was shared with another caller; 7 the agent did not join or answer in time.
+
+  Examples:
+    callvatest probe --agent <agent-label> --say "Hello." --text
+    callvatest probe --agent <agent-label> --say "I would like to book an appointment." --say "Tell me the earliest time you have." --trace
+""" + _HELP_WRITE + _HELP_OPTIONS + _HELP_TAIL,
+    "run": """\
+callvatest run <scenario> [--agent <id|label>] [--report FILE]
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  Execute one scenario and print its verdict. Exit 1 when it fails.
+  <scenario> is the path of one scenario file; --agent overrides the
+  scenario's own `agent`. --report FILE writes the whole report there as
+  JSON as well.
+
+  Output: the verdict in prose, each failing or skipped check on its own
+  line and the tools that ran; with --json the whole report as one JSON
+  object instead.
+
+  Exit codes: 0 every check passed; 1 an assertion failed; 2 the key missing
+  or refused; 3 no such scenario, or an agent the key cannot see; 4 policy,
+  or a connection that does not allow writes; 5 upstream/transport; 6 a
+  scenario that does not parse (bad_scenario), the room shared with another
+  caller, or other input; 7 timeout waiting on the agent.
+
+  Examples:
+    callvatest run callva/tests/<agent>/en/earliest-slot.yaml
+    callvatest run callva/tests/<agent>/en/earliest-slot.yaml --text --json --report <FILE>
+""" + _HELP_WRITE + _HELP_SCENARIOS + _HELP_OPTIONS + _HELP_TAIL,
+    "suite": """\
+callvatest suite [<path>] [--path <path>] [--agent <id|label>] [--jobs N] [--report FILE]
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  Execute every scenario under a path. Exit 1 if any fails. --jobs runs N
+  calls at once, and reports keep scenario order however the runs finish.
+  A scenario that collapses is counted as a failure and named, and the
+  rest of the suite continues. <path>, or --path, is the directory or file
+  to run; without one the suite walks up to `callva/tests`. --report FILE
+  writes the summary there as JSON as well.
+
+  Output: each scenario's verdict in prose and then "<passed>/<total>
+  passed"; with --json one JSON object {root, jobs, total, passed, failed,
+  runs}, each run a `run` report.
+
+  Exit codes: 0 every scenario passed; 1 any failed; 2 the key missing or
+  refused; 3 no such path, or no scenarios under it (no_scenarios); 4
+  policy, or a connection that does not allow writes; 5 upstream/transport;
+  6 a scenario that does not parse, or other input.
+
+  Examples:
+    callvatest suite
+    callvatest suite callva/tests/<agent> --jobs 4 --text --report <FILE>
+""" + _HELP_WRITE + _HELP_SCENARIOS + _HELP_OPTIONS + _HELP_TAIL,
+    "fixtures": """\
+callvatest fixtures [<path>] [--judge <id>] [--all-judges] [--report FILE]
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  Judge the judge, without placing a call. Each fixture case freezes tool
+  results, what an agent said, a claim, and the verdict a competent judge
+  must reach; the run reports every disagreement. Exit 1 when any case
+  disagrees. Fixtures live in <project>/callva/judge/:
+
+    id: et-times
+    cases:
+      - claim: "Every time the agent speaks appears in the tool result."
+        results: ['{"earliest": "reede, 4. september 09:00"}']
+        said: "Kõige varasem vaba aeg on reedel kell üheksa."
+        expect: true
+
+  Half the cases must expect false, or the run cannot tell a judge that
+  reads from one that agrees with everything. --all-judges runs the whole
+  set past every declared judge, which is how backends are compared on
+  material that matters rather than on a benchmark.
+
+  `known_gap: true` marks a case every judge already fails — a measured
+  limit rather than a regression. It still runs and is still reported, but
+  it does not fail the run, because a set that is permanently red gates
+  nothing; the day a judge starts getting it right is reported too.
+
+  <path> is a fixture file or a directory of them. --judge <id> picks one
+  judge, else the roster's default. It resolves no CallVA connection and
+  needs no CallVA key; only the judges' keys. --report FILE writes the
+  result there as JSON as well.
+
+  Output: per judge, PASS or FAIL with cases agreed of cases and its model,
+  then each disagreement, known gap and closed gap on its own line; with
+  --json one JSON object {root, judges: {<id>: {ok, provider, model, cases,
+  agreed, known_gaps, gaps_closed, results}}}.
+
+  Exit codes: 0 every judge agreed on every case; 1 any case disagreed, or a
+  judge could not be selected; 3 no such path, or no fixture files under it
+  (no_fixtures); 6 a fixture that does not parse (bad_fixture), or no judges
+  declared for --all-judges (no_judges).
+
+  Examples:
+    callvatest fixtures
+    callvatest fixtures callva/judge --all-judges --json
+""" + _HELP_JUDGES + _HELP_OPTIONS,
+    "explore": """\
+callvatest explore <exploration> [--persona <id>] [--driver <id>] [--agent <id|label>]
+                   [--report FILE]
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  EXPLORING
+  A scenario says every caller line in advance, so it can gate: red means the
+  agent changed. An exploration says only where the call must go and lets a
+  model play the caller, so it can find: the wording is invented on the spot,
+  a persona makes the caller unclear, wandering or insistent, and the run
+  reports what it saw instead of passing or failing.
+
+  Let the driver model choose every caller line until every stage is
+  reached, a budget is spent, or the caller gives up. Billable, exactly
+  as `run` is, and it may place more than one call: a call that ends
+  under the caller before the stages are done is followed by another
+  while the budget allows. Prints the exploratory report; --json for the
+  whole record. Exit 0 whatever was found; 5 only when the driver itself
+  could not answer, which is a fault of the run and not a finding.
+  <exploration> names an entry of the setting's "explorations". --report
+  FILE writes the whole record there as JSON as well.
+""" + _HELP_EXPLORE_SETTING + """
+  The report is its own shape, "kind": "exploration": the intent, each stage
+  with the call and turn that reached it, the persona, the driver, the budget
+  and what was spent of it, what stopped the run, one record per call placed
+  — room, call id, transcript, events, tool runs and post-call fields, what a
+  `run` report holds without its checks — and the driver's notes: one
+  sentence per turn where the agent did something a caller would find wrong,
+  odd or unhelpful. The verdict is one of:
+    explored   every stage was reached
+    stalled    a budget was spent first — turns or calls
+    dropped    the caller gave up first: the driver ended the call with
+               stages still to go
+    aborted    the driver could not answer; nothing about the agent is claimed
+  None of these is pass or fail, and none gates anything: a finding is turned
+  into a scenario, and the scenario is what gates.
+
+  Exit codes: 0 explored, stalled or dropped; 2 the key missing or refused;
+  3 an agent the key cannot see; 4 policy, or a connection that does not
+  allow writes; 5 aborted, or upstream/transport; 6 no "explore" setting,
+  an exploration, persona or driver it does not declare, a setting without
+  a budget, or other input; 7 timeout waiting on the agent.
+
+  Examples:
+    callvatest explore books-any-afternoon
+    callvatest explore books-any-afternoon --persona insister --driver gpt-oss --text --report <FILE>
+""" + _HELP_WRITE + _HELP_OPTIONS + _HELP_TAIL,
+    "session start": """\
+callvatest session start [--agent <id|label>] [--text]
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  Place a call and leave it open. Billable, exactly as `run` is: this is
+  the write verb of the four. It returns
+  {"session","room","agent","mode","log","greeting","turns"} — the id
+  every other session verb takes, and the greeting already spoken.
+  --timeout <S> is the per-turn timeout the held call answers each later
+  `say` within.
+
+  Output: that object as JSON on stdout.
+
+  Exit codes: 0 the call is up; 2 the key missing or refused; 3 an agent the
+  key cannot see; 4 policy, or a connection that does not allow writes; 5
+  the holder exited before the call was up (holder_died), or
+  upstream/transport; 6 the room shared with another caller, or input; 7
+  the call was not up in time (session_start_timeout), or the agent did not
+  join.
+
+  Example: callvatest session start --agent <agent-label> --text
+""" + _HELP_SESSIONS + _HELP_WRITE + _HELP_OPTIONS + _HELP_TAIL,
+    "session say": """\
+callvatest session say <id> "<line>" [--timeout <s>]
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  Send one caller line and wait for the agent to finish answering it.
+  Returns {"session","turn","reply","elapsed"}: `reply` is what the agent
+  said in that turn alone. A turn that times out is reported as an error
+  and leaves the call up, so the next line — or `end` — still works.
+
+  Output: that object as JSON on stdout.
+
+  Exit codes: 0 answered; 3 no live session with that id (unknown_session);
+  5 the call is over and the holder gone (session_gone); 6 an id that is not
+  a session id (bad_session_id); 7 the turn or the holder timed out.
+
+  Example: callvatest session say <SESSION_ID> "I would like to book an appointment."
+""" + _HELP_SESSIONS + _HELP_OPTIONS + _HELP_TAIL,
+    "session end": """\
+callvatest session end <id>
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  Hang up and report. Returns the same object `run` produces —
+  transcript, events, tool runs with their arguments, the resolved call
+  id, and the post-call record once it settles — with "verdict":
+  "observed", because a session asserts nothing.
+
+  Output: that report as JSON on stdout; it is also kept as report.json in
+  the session's directory.
+
+  Exit codes: 0 reported; 3 no session with that id (unknown_session); 5
+  upstream/transport; 6 an id that is not a session id (bad_session_id).
+
+  Example: callvatest session end <SESSION_ID>
+""" + _HELP_SESSIONS + _HELP_OPTIONS + _HELP_TAIL,
+    "session list": """\
+callvatest session list
+""" + _HELP_SYNOPSIS_OPTIONS + """
+  Every session this machine holds: id, agent, room, mode, turns so far,
+  age, whether its holder is alive, and whether it has ended.
+
+  Output: one JSON object {root, sessions: [{session, agent, room, mode,
+  turns, age, alive, ended, dir}]}.
+
+  Exit codes: 0; 2 the key missing; 4 policy; 6 input.
+
+  Example: callvatest session list
+""" + _HELP_SESSIONS + _HELP_OPTIONS + _HELP_TAIL,
+    "doctor": """\
+  Per connection: prove the key resolves and reaches the API, and that the
+  LiveKit RTC stack imports. Names the agents the key can see, proves a
+  declared "test_call_field" exists on the tenant's calls, and asks each
+  declared judge to settle a trivial claim.
+
+  Examples:
+    callvatest doctor
+    callvatest doctor --connection <id>
+""",
+    "connections": """\
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. A flag wins (--api-url, non-secret only; a secret never has a
+  flag); otherwise its values resolve through the credential cascade (`Where a
+  secret resolves`, above).
+  The key is only ever named, never passed on argv.
+    CALLVA_API_KEY=<CallVA API key>        secret — the tenant that owns the agent
+    CALLVA_API_URL=<base URL>              optional; default
+                                           https://api.callva.one/api/v1
+
+  A project that tests several CallVA tenants declares them as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "api_url": "https://api.example.com/api/v1",
+          "secret_env": "CALLVA_<ID>_API_KEY",
+          "allow_write": true,
+          "test_call_field": "test_call",
+          "dashboard_email_env": "CALLVA_<ID>_DASHBOARD_EMAIL",
+          "dashboard_password_env": "CALLVA_<ID>_DASHBOARD_PASSWORD"
+        }
+      }
+    }
+  "secret_env" names the environment variable holding the key; naming a variable
+  the project already defines keeps one home for the secret. "allow_write": false
+  makes a connection observation-only — useful for pointing at a live tenant you
+  must not place calls into.
+
+  "test_call_field" names a boolean custom field on the tenant's calls, set to
+  true on every call this harness places. The platform stores a harness call
+  exactly like a caller's, so without it a tenant's own reporting counts the
+  testing as traffic. Declare it only where that field exists — `doctor` proves
+  it does. Absent, nothing is written.
+
+  Selection: --connection <id>. Unflagged, the registry's "default" pointer
+  applies, else the sole entry; several entries without a pointer is refused.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  `callvatest connections` also reports every judge it resolved, its model, the
+  address it composed, and where its key came from, without calling anything
+  (JUDGES, on `callvatest help fixtures`). A connection is written with
+  `callvatest connection add` (`callvatest help connection`).
+
+  Example: callvatest connections
+""",
+    "settings": """\
+  callvatest declares two settings, "judges" and "explore"; this is what each
+  holds.
+""" + _HELP_JUDGES + """
+  EXPLORE""" + _HELP_EXPLORE_SETTING + """
+  `callvatest help explore` gives the verb that reads it.
+""",
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

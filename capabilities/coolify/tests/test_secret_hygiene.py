@@ -366,7 +366,7 @@ def test_projects_create_obeys_a_read_only_connection():
 
 
 def test_help_documents_the_new_surface():
-    help_text = coolify_module.__doc__ or ""
+    help_text = (coolify_module.__doc__ or "") + "".join(coolify_module.HELP_VERBS.values())
     for phrase in ("connect <name> --url <url>", "--token-stdin", "projects create <name>",
                    "--set-stdin KEY", "--set-file KEY=PATH", "--set-env KEY=ENV_KEY",
                    "--value-stdin", "SECRETS", "--reveal"):

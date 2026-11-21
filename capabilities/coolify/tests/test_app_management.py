@@ -285,7 +285,7 @@ def test_app_update_clears_watch_paths_with_empty_string():
 
 
 def test_help_and_manifest_declare_new_surface():
-    help_text = coolify_module.__doc__ or ""
+    help_text = (coolify_module.__doc__ or "") + "".join(coolify_module.HELP_VERBS.values())
     assert "sources" in help_text
     assert "app update <uuid>" in help_text
     assert "--base-directory" in help_text

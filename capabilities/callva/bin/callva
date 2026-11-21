@@ -3,19 +3,15 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """callva — agent-first CLI for the CallVA voice-AI platform.
 
-This tool is designed to be invoked by agents. Run `callva help` to load the
-full usage contract on demand — do not rely on memorised knowledge of its
-surface. It is a pure CRUD / I/O adapter over the CallVA External API: voice
-agents, assets (prompts), calls, transcripts, recordings, analytics, custom
-fields, webhook schedules, automations (Windmill scripts), webhook logs, record
-actions, saved calls-list views, variables, settings, projects, phone numbers,
-providers, the tools an agent called in a call, the call allowance and the
-LiveKit connection.
+This tool is designed to be invoked by agents. Run `callva help` to load this
+menu and `callva help <verb>` for one verb's whole contract, on demand — do
+not rely on memorised knowledge of its surface. Run `callva doctor` first. It
+is a pure CRUD / I/O adapter over the CallVA External API.
 
 `agents config` is the one place callva reaches outside the External API: it
 calls the platform's call-configuration endpoint, POST /config/livekit, on the
@@ -24,454 +20,98 @@ platform's voice-worker authentication: where the platform has a worker key
 configured, it may refuse an ordinary tenant API key there (exit 2), and the
 External API offers no replacement route.
 
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. A flag wins (--api-url, non-secret only; a secret never has a
-  flag); otherwise its values resolve through the credential cascade (`Where a
-  secret resolves`, at the end of this help). Same CALLVA_* keys at every
-  tier; the project you're in wins, so a deployed host's injected env governs
-  when no config file is present. Never pass the key on the command line.
-    CALLVA_API_KEY=<your CallVA API key>   secret — never passed on argv
-    CALLVA_API_URL=<base URL>              optional; default
-                                           https://api.callva.one/api/v1
-
-  A project that talks to several CallVA tenants declares them as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": {
-          "api_url": "https://api.example.com/api/v1",
-          "secret_env": "CALLVA_<ID>_API_KEY",
-          "allow_write": true
-        }
-      }
-    }
-  Only the API key is secret: the entry names the env var holding it
-  ("secret_env"); the value resolves through the credential cascade above.
-  "api_url" is optional — absent, the
-  default base URL applies. "allow_write": false makes the connection
-  read-only: every mutating verb (the create/update/put/delete/batch/store/
-  reorder/deploy/run actions on agents, assets, calls, transcripts, fields,
-  field-groups, schedules, automations, actions, ui-views, issues, knowledge,
-  projects, phone-numbers, and variables, the add/update/remove/toggle trigger
-  actions on automations, `recordings purge`, `calls run-action`, `ui-views
-  set-default`, `phone-numbers bind`, `settings rotate-webhook-secret`, the
-  outbound `call`, and `agents config`, which runs the agent's start-of-call
-  automation) exits 4, and no flag lifts the gate. `settings reveal` writes
-  nothing but prints a secret, so a read-only connection refuses it the same way.
-
-  Selection: --connection <id> (accepted anywhere on the command line).
-  Unflagged, the registry's "default" pointer applies, else the sole entry;
-  several entries without a pointer is refused as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off. routes
-  is one too, and uses no connection at all. Every other verb that needs a
-  connection is refused there.
-
-HEADLESS (one credential, no project, no store, no manager)
-  A process handed exactly one credential runs with:
-    CALLVA_HEADLESS=read-only | read-write
-    CALLVA_API_KEY=<the credential>
-    CALLVA_API_URL=<base URL>              optional; the default above applies
-  Only the process environment is read: no policy, registry, vault or file.
-  read-only serves help, stub, manifest, routes, doctor and every verb `routes`
-  marks neither `writes` nor `secret`. read-write serves those and the verbs
-  marked `writes`: the credential's own scopes bound them, the platform refuses
-  what it does not allow, and CAPABILITIES_READ_ONLY still closes them. Every
-  other verb exits 4, no flag or env value lifts that, and --connection,
-  --key-env and --api-url are refused. So is every flag naming a local path
-  (--prompt-file, --config-file, --content-file, --inputs-file, --data-file,
-  --file, --args-file, --output): content travels inline, and a recording goes
-  to stdout. The mode exits 4 headless_refused wherever a project, a machine's
-  capability configuration or a store resolves, and for any other value of
-  CALLVA_HEADLESS.
-
-Global options (accepted anywhere on the line — before or after the command):
-  --full              return the full, unfiltered API response (list endpoints
-                      are slimmed to the agent-useful fields by default)
-  --connection <id>   select a registry connection (optional with a default
-                      pointer or a sole entry)
-  --key-env <KEY>     resolve the API key from a different env/cred KEY (default
-                      CALLVA_API_KEY; with a registry connection it overrides
-                      that entry's secret_env) — act as a different CallVA
-                      account/tenant. Only the key NAME travels; the value
-                      never touches argv. It never lifts a connection's write
-                      gate.
-  --api-url <URL>     override the base URL for this invocation
+One connection is one CallVA tenant's API key, which never travels on the
+command line, and its base URL. An explicit connections registry is required,
+even for one connection; how a connection is declared, selected and made
+read-only is CONNECTIONS, on `callva help connections`, and the options every
+verb takes anywhere on the line are on each verb's page. A WRITE verb is
+refused (exit 4) on a read-only connection, and so is `settings reveal`, which
+writes nothing but prints a secret. A process handed exactly one credential
+and nothing else runs HEADLESS: `callva help headless`.
 
 Output is JSON on stdout. List endpoints are slimmed to the fields an agent
-needs; pass --full for the raw API response. `get` / detail commands always
-return the full resource. `recordings stream` writes binary audio and `settings
-reveal` one raw value.
+needs unless the raw response is asked for; `get` / detail commands always
+return the full resource. `recordings stream` writes binary audio and
+`settings reveal` one raw value.
 
-Commands (`-f key=value` is repeatable for list filters):
+Agents and their speech stack
+  routes                              every API verb, its route, writes, secret
+  agents list|get <id>                the agents, or one as stored
+  agents default                      the project's default agent, else oldest
+  agents create|update|clone|delete   WRITE. make, change, copy, delete one
+  agents config <id>                  WRITE. the configuration a call starts from
+  presets catalog|describe <preset>   the platform's presets, what one takes
+  presets list|get <agent-id>         the presets an agent has configured
+  presets set|patch|activate          WRITE. replace, merge, run the next call on
+  tools list|get <agent-id>           what an agent can call, one record per tool
+  tools set|patch|delete              WRITE. replace, merge into, remove one tool
+  assets list|get                     prompts, schemas and payloads
+  assets create|update|delete         WRITE. make, change, delete one
 
-  connections                         where every connection's values resolve
-                                      from (tier, source, secrets masked).
-                                      Local only — no network.
-  doctor [--connection <id>]          authenticated round-trip — proves the key
-                                      resolves, the API is reachable, and what
-                                      project the key sees — every connection,
-                                      or one
-  help                                print this contract
-  routes                              JSON map of every API verb: its verb, HTTP
-                                      method, path template, whether it writes
-                                      and whether it prints a secret. Local only
-                                      — no network, no connection.
+Calls
+  calls list|get                      call records, or one in full
+  calls create|update|delete|batch    WRITE. one call record, or many at once
+  calls webhook-logs|automation-runs  the webhooks and automation runs of a call
+  calls actions|action-runs           the actions that apply now, those pressed
+  calls run-action                    WRITE. press one action on a call
+  calls tool-calls <call_id>          the tools the voice agent called in it
+  transcripts get|url <call_id>       a call's transcript, or its download URL
+  transcripts store|delete            WRITE. store or delete a transcript
+  recordings stream <call_id>         a call's recording, as binary audio
+  recordings purge <call_id>          WRITE. drop the platform's cached copy
+  call <destination>                  WRITE. place an outbound call
+  stats aggregate|trends              call analytics and daily trends
 
-  agents list [--is-active B]
-  agents default                      (reads only: the project's default agent,
-                                       else its oldest; exit 3 when it has none)
-  agents get <id>
-  agents create                       (takes no fields: an active agent named
-                                       "Untitled agent" in the project; set the
-                                       rest with `agents update`)
-  agents update <id> [--name N] [--prompt T | --prompt-file F]
-                     [--greeting-type prompt|exact|instruction]
-                     [--greeting-exact T] [--greeting-instruction T]
-                     [--agent-speaks-first B]
-                     [--custom-webhook-events E1,E2] [--config JSON] [--data JSON]
-                     (--custom-webhook-events replaces the event types the
-                      custom webhook forwards; "" forwards nothing. The API
-                      names them call.dialing, call.started, call.ended and
-                      call.recording.)
-  agents clone <id> [--name N]
-  agents delete <id>
-  agents config <id> [--direction inbound|outbound]
+Records
+  actions list|get                    record action definitions
+  actions create|update|put|delete    WRITE. make, change, delete one
+  ui-views list|get                   the project's saved calls-list views
+  ui-views create|update|put|delete   WRITE. make, change, delete one
+  ui-views set-default <id>           WRITE. make a view the project's default
+  issues list|get                     what works and what does not on calls
+  issues create|update|put|delete     WRITE. make, change, delete one
+  knowledge list|get                  what the project holds true or must not do
+  knowledge create|update|put|delete  WRITE. make, change, delete one
+  fields list|impact|extraction-schema  custom fields, a delete's impact, schema
+  fields create|update|delete         WRITE. make, change, delete one
+  field-groups list                   the field groups, with their fields
+  field-groups create|update|delete|reorder  WRITE. the groups themselves
+  field-groups add-field|remove-field|reorder-fields|update-field  WRITE.
 
-  --data is the base object of an update and every flag above writes over it
-  under that flag's own key: pass --data and --prompt together and the prompt
-  is the one from --prompt, and --config beats a `config` key inside --data.
-  Keys --data carries that no flag names are sent as given; test_variables,
-  {"mode": ..., "rows": [{"name", "value", "enabled"}]}, is one.
+An issue's stack is a plain string, preset/model/speech/worker:
+gpt_live/gpt-5.6-terra/callva-worker, pipeline/gpt-5.4-mini/azure-azure/callva-worker.
 
-  An agent owns the conversation; a preset owns the speech stack it runs on.
-  Voice, model, temperature, transcriber and languages live on the preset, not
-  on the agent, and `agents update` refuses them. An agent holds at most one
-  configuration per preset and keeps the ones it is not running, so switching
-  stacks loses nothing — and comparing two configurations of one stack means
-  two agents, which is what `agents clone` is for.
+Automations and schedules
+  schedules list|get|preview|executions  webhook schedules and their history
+  schedules create|update|delete      WRITE. make, change, delete one
+  automations list|get|code           Windmill scripts, one, its deployed code
+  automations create|update|delete|deploy  WRITE. one automation or its code
+  automations run <id>                WRITE. trigger one execution
+  automations runs|all-runs|run-detail|runtime-info  runs, one run, runtime
+  automations triggers <id>           the HTTP triggers that call one
+  automations add-trigger|update-trigger|remove-trigger|toggle-trigger  WRITE.
+  webhook-logs list|get|filters       inbound webhook activity
 
-  `agents get` and `presets get` show what is stored; `agents config` shows
-  what a call actually starts from — the configuration the voice worker is
-  handed for a call in that direction (default inbound): the agent, its active
-  preset including backend_instructions, every {{prompt:...}} reference
-  resolved, and whatever the agent's custom_config_url automation returned.
-  Producing it runs that automation and files a call record on the platform,
-  left in status `starting`, so the verb is write-gated; run it only against an
-  agent whose start-of-call automation is safe to fire. A tenant API key may be
-  refused there (exit 2) where the platform has a worker key configured; see
-  the top of this help.
+Project and tenant
+  variables list                      the project's variables
+  variables create|update|delete      WRITE. make, change, delete one
+  settings list|get <key>             project-level settings
+  settings reveal <definition_id>     one setting's value in the clear; secret
+  settings rotate-webhook-secret      WRITE. a new agent webhook signing secret
+  allowance                           the tenant's monthly call allowance
+  livekit connection                  whether the tenant's LiveKit is reachable
+  projects list|get                   the projects the key sees
+  projects create|update|put|delete   WRITE. tenant-wide key only
+  phone-numbers list|get              phone numbers
+  phone-numbers create|update|delete|bind  WRITE. one number, or its agent
+  providers list|types                phone provider credentials, their types
 
-  presets catalog
-  presets describe <preset> [--group G]
-  presets list <agent-id>
-  presets get <agent-id> <preset>
-  presets set <agent-id> <preset> (--config JSON | --config-file F)
-  presets patch <agent-id> <preset> (--config JSON | --config-file F)
-  presets activate <agent-id> <preset>
-
-  `catalog` names the presets this platform offers; `describe` is the one that
-  says what a preset takes — every field, its type, its bounds, and whether a
-  list is closed or merely suggested. Read it before writing a configuration:
-  it is the same declaration the platform validates against, so a write it
-  refuses is a write the API refuses.
-
-  `set` replaces the configuration; `patch` merges into it. Prefer `set` when
-  removing a key, because a merge has no way to express one. `activate` is what
-  makes a preset the stack the agent's next call runs on.
-
-  tools list <agent-id>
-  tools get <agent-id> <key>
-  tools set <agent-id> <key> (--config JSON | --config-file F)
-            [--type end_call|http_request] [--is-enabled B] [--position N]
-  tools patch <agent-id> <key> [--config JSON | --config-file F]
-            [--type end_call|http_request] [--is-enabled B] [--position N]
-  tools delete <agent-id> <key>
-
-  A tool is a record of its own, addressed by the name it carries, so an edit
-  reaches only the tool it names and no stale copy of the others can remove one.
-  The name is case-sensitive and is written exactly as typed. `agents update`
-  refuses a `tools` key inside --config for the same reason.
-
-  `set` states the whole record: the body is stored as sent and every field left
-  out takes its default — no type, enabled, position 0 — which is the only way a
-  leaf inside the body, or the type itself, is removed. `patch` writes only the
-  fields the command names and deep-merges the body, replacing lists whole, so
-  toggling `--is-enabled` leaves the type, the position and the body as they
-  were. Either creates the tool when the agent has none. `delete` leaves the
-  agent with no tool by that name, whether or not it had one.
-
-  assets list [--type prompt|schema|payload] [--per-page N]
-  assets get <id>
-  assets create --name N --type T (--content C | --content-file F) [--inactive]
-  assets update <id> [--name N] [--content C | --content-file F] [--is-active B]
-  assets delete <id>
-
-  calls list [--per-page N] [--page N] [--sort F] [-f k=v ...]
-  calls get <id>
-  calls create --data JSON
-  calls update <id> --data JSON
-  calls delete <id>
-  calls batch <id> [<id> ...] --data JSON
-  calls webhook-logs <call_id> [--per-page N] [--page N] [--sort F] [-f k=v ...]
-  calls automation-runs <call_id> [--per-page N] [--page N] [-f k=v ...]
-                        [--no-include-args]
-                        (the prepared view for runs whose args carry the id as a
-                         nested call object, {"call":{"id":"<call_id>"}}; for any
-                         other args shape use `automations all-runs --args-filter`)
-  calls actions <call_id>             (the actions that apply to this call now)
-  calls run-action <call_id> <action_id> [--inputs JSON | --inputs-file F]
-  calls action-runs <call_id> [--per-page N] [--page N]
-  calls tool-calls <call_id>          (the tools the voice agent called in this
-                                       call, read from its transcript; the key
-                                       needs the tool_calls.read permission, and
-                                       one without it exits 2)
-
-  actions list [--entity-type T]
-  actions get <id>
-  actions create (--data JSON | --data-file F)
-  actions update <id> (--data JSON | --data-file F)     (PATCH)
-  actions put <id> (--data JSON | --data-file F)        (PUT)
-  actions delete <id>
-
-  ui-views list
-  ui-views get <id>
-  ui-views create (--data JSON | --data-file F)
-  ui-views update <id> (--data JSON | --data-file F)    (PATCH)
-  ui-views put <id> (--data JSON | --data-file F)       (PUT)
-  ui-views delete <id>
-  ui-views set-default <id>
-
-  ui-views are the project's saved calls-list views. On both resources the API
-  treats PUT and PATCH alike, as a partial update: a field left out keeps its
-  value, so `put` replaces no more than `update` does.
-
-  issues list [-f k=v ...] [--per-page N] [--page N]
-  issues get <id>
-  issues create (--data JSON | --data-file F)
-  issues update <id> (--data JSON | --data-file F)      (PATCH)
-  issues put <id> (--data JSON | --data-file F)         (PUT)
-  issues delete <id>
-
-  Issues are the project's journal of what works and what does not on calls.
-  create requires kind (defect|limitation), title and problem; status
-  (open|fixed|closed), solution, implemented_at, proven_by, agent_id, call_id
-  and stack are optional. list filters: status, kind, agent_id, call_id, stack,
-  search, sort, and the list summary shows stack.
-  stack is a plain string: preset/model/speech/worker, for example gpt_live/gpt-5.6-terra/callva-worker and pipeline/gpt-5.4-mini/azure-azure/callva-worker.
-
-  knowledge list [-f k=v ...] [--per-page N] [--page N]
-  knowledge get <id>
-  knowledge create (--data JSON | --data-file F)
-  knowledge update <id> (--data JSON | --data-file F)   (PATCH)
-  knowledge put <id> (--data JSON | --data-file F)      (PUT)
-  knowledge delete <id>
-
-  Knowledge is what the project holds true or must not do. create requires
-  content; kind (fact|restriction), status (draft|active|outdated|wrong),
-  agent_id, source and source_call_id are optional. list filters: status (comma
-  separated), kind, agent_id, search, sort.
-
-  On both resources the API treats PUT and PATCH alike, as a partial update.
-
-  transcripts get <call_id>
-  transcripts store <call_id> (--data JSON | --data-file F)
-  transcripts delete <call_id>
-  transcripts url <call_id>
-
-  A version-2 transcript carries the tool calls the agent made only for a key
-  holding tool_calls.read; any other key gets the messages alone.
-
-  call <destination> --agent-id ID [--phone-number-id ID] [--call-id ID]
-                     [--overrides JSON]
-
-  stats aggregate --op count|sum|avg|min|max [--field F] [--group-by F]
-                  [--interval day|week|month] [-f k=v ...]
-  stats trends --from DATE --to DATE
-
-  recordings stream <call_id> --url URL [--output FILE]   (binary; stdout if no
-                                                           --output)
-  recordings purge <call_id>          (drops the platform's cached copy, so the
-                                       next stream fetches it afresh; the
-                                       recording itself stays)
-
-  fields list [--entity-type T]
-  fields create --data JSON
-  fields update <id> --data JSON
-  fields delete <id>
-  fields impact <id>
-  fields extraction-schema [--entity-type T]   (JSON Schema of the project's
-                                                extraction fields; default call)
-
-  field-groups list
-  field-groups create --data JSON
-  field-groups update <id> --data JSON
-  field-groups delete <id>
-  field-groups reorder --data JSON
-  field-groups add-field <id> <field_id> [--position N]
-  field-groups remove-field <id> <field_id>
-  field-groups reorder-fields <id> --data JSON
-  field-groups update-field <id> <field_id> --data JSON
-
-  schedules list
-  schedules get <id>
-  schedules create --data JSON
-  schedules update <id> --data JSON      (full PUT — send the complete payload,
-                                          all rules included)
-  schedules delete <id>
-  schedules preview <id> <datetime>
-  schedules executions <id> [--per-page N]
-
-  automations list [--per-page N]
-  automations get <id>
-  automations create --name N [--description D]
-  automations update <id> [--name N] [--description D] [--is-active B]
-                          [--settings JSON] [--data JSON]
-                          (--data is the base; each flag above writes over it
-                           under its own key, and --settings beats a `settings`
-                           key inside --data)
-  automations delete <id>
-  automations code <id>
-  automations deploy <id> (--file F | --code C)
-                          [--language bun|deno|python3|bash|go|nativets]
-  automations run <id> [--args JSON | --args-file F]
-  automations runs <id> [--per-page N]
-  automations all-runs [--per-page N] [--page N] [-f k=v ...]
-                       [--args-filter JSON] [--result-filter JSON]
-                       [--include-args]
-  automations run-detail <id> <job_id>
-  automations runtime-info
-
-  automations triggers <id>
-  automations add-trigger <id> --method get|post --mode async|sync
-                          --auth none|signature [--secret S] [--route-path P]
-  automations update-trigger <id> <trigger_path> [--method M] [--mode M]
-                             [--auth A] [--secret S] [--route-path P]
-  automations remove-trigger <id> <trigger_path>
-  automations toggle-trigger <id> <trigger_path> --enabled B
-                          (HTTP triggers put an automation behind a URL. Each
-                           trigger's `webhook_url` is the value an agent's
-                           custom_config_url / custom_webhook_url takes.
-                           <trigger_path> is the trigger's `path` — its Windmill
-                           identifier, not its URL. Read it from `automations
-                           triggers` and pass it whole: it may carry slashes
-                           (`f/proj_ab12cd34/trigger_e5f6a7b8c9d0`) and they are
-                           sent literally, not escaped.
-                           --route-path is the other field, the URL tail after
-                           /api/r/. The platform accepts only a single
-                           [a-z0-9_-] segment there, so a trigger whose
-                           route_path already carries slashes — Windmill permits
-                           those, the platform does not mint them — can be
-                           listed, toggled and otherwise changed here, but
-                           neither created nor re-pathed. Omit --route-path on
-                           add and the platform derives one from the automation
-                           id. Whether the workspace name sits in the URL is the
-                           trigger's own `workspaced_route`, set in Windmill and
-                           read back, never sent.
-                           --secret is required by --auth signature, min 8
-                           chars; it is stored as a workspace variable and is
-                           never read back.)
-
-  webhook-logs list [--per-page N] [--page N] [--sort F] [-f k=v ...]
-  webhook-logs get <id>
-  webhook-logs filters
-
-  variables list
-  variables create --name N --value V [--description D] [--is-secret B]
-  variables update <path> --value V
-  variables delete <path>
-
-  settings list
-  settings get <key>
-  settings reveal <definition_id>     (prints one setting's value in the clear,
-                                       raw on stdout with a trailing newline and
-                                       nothing else; exit 3 `not_set` when it
-                                       holds none, exit 4 on a read-only
-                                       connection. definition_id comes from
-                                       `settings get`. The platform logs each
-                                       reveal of a secret.)
-  settings rotate-webhook-secret      (replaces the project's agent webhook
-                                       signing secret with a newly generated
-                                       one; the answer may carry it. Write-
-                                       gated, and refused under CALLVA_HEADLESS)
-
-  allowance                           (the tenant's monthly call allowance:
-                                       limit, used, percent, period, and state
-                                       unlimited|within|warning|refused)
-
-  livekit connection                  (whether the tenant's LiveKit is reachable
-                                       and its URL, never its key; answered only
-                                       for a manually issued tenant-wide key,
-                                       and rate-limited per key)
-
-  projects list [--is-active B] [--per-page N]
-  projects get <id>
-  projects create [--name N] [--description T] [--is-active B] [--data JSON]
-  projects update <id> [--name N] [--description T] [--is-active B] [--data JSON]   (PATCH)
-  projects put <id> [--name N] [--description T] [--is-active B] [--data JSON]      (PUT)
-  projects delete <id>                (deletes everything in the project; the
-                                       default project is refused)
-
-  create, update, put and delete need a tenant-wide key: a key bound to one
-  project is refused. The API treats PUT and PATCH alike, as a partial update.
-  Read with a tenant-wide key, `projects list`, `phone-numbers list` and
-  `providers list` answer for the whole tenant.
-
-  phone-numbers list [--is-active B] [--per-page N]
-  phone-numbers get <id>
-  phone-numbers create [--phone-number E164] [--number-type provider|personal|manual]
-                       [--provider-credential-id ID] [--provider-phone-id ID] [--data JSON]
-  phone-numbers update <id> [--label T] [--is-active B] [--status S] [--data JSON]
-  phone-numbers delete <id>           (an assigned number is refused; unbind it first)
-  phone-numbers bind <id> (<agent_id> | --unbind)
-
-  create needs a tenant-wide key; --provider-credential-id is required for
-  --number-type provider. --status is pending|active|suspended|error.
-
-  providers list [--is-active B] [--provider-type T] [--per-page N]
-  providers types
-
-Conventions:
-  - Filtering on list/stats commands is always `-f key=value` (repeatable):
-    e.g. `calls list -f status=complete -f result=confirmed`. There are no bare
-    per-field flags like `--status`.
-  - `stats aggregate` filters dates with `-f created_at_gte=<date>`; `--from` /
-    `--to` belong to `stats trends` only.
-  - Use file flags (`--content-file`, `--prompt-file`, `--file`, `--data-file`,
-    `--args-file`, `--inputs-file`) for large content; `-` reads stdin.
-  - `--data` / `--overrides` / `--settings` take a JSON object.
-
-Contract commands (the same on every capability):
-  callva stub                                 One-line awareness text.
-  callva manifest --json                      Machine-readable declaration.
-  callva guide [<topic>]                      Guide topics / one guide body,
-                                              fetched live from the docs base.
-  callva ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-         [--note <text>]                      (capabilities/callva/identifiers.json,
-                                               or store rows once the agent moved).
-  callva refs                                 Menu of the project's reference
-                                              files for this capability.
-  callva inventory [--network]                What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
-
-I/O contract:
-  - Success: JSON on stdout, exit 0.
-  - Error:   {"error": {"code", "message", "hint"?, "status"?}} on stderr,
-             non-zero exit.
-
-Exit codes:
-  0  success
-  2  auth (missing / rejected credentials, 401 / 403)
-  3  not found (404)
-  4  policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
-     verb, or a write verb on a read-only connection (allow_write: false).
-     Ask the user; never lift a gate yourself.
-  5  server / network (timeout, connection error, 429 after retries, 5xx)
-  6  input / validation (malformed argument, bad payload, 400 / 422)
+I/O and exit codes
+  Success is JSON on stdout, exit 0; an error is {"error": {"code",
+  "message", "hint"?, "status"?}} on stderr, non-zero exit. 2 auth (401 /
+  403) · 3 not found (404) · 4 policy refusal: the project gate, or a write
+  verb on a read-only connection; ask the user, never lift a gate yourself ·
+  5 server / network · 6 input / validation (400 / 422).
 """
 
 import argparse
@@ -744,6 +384,1135 @@ FULL = False
 
 # Holds the live client + resolved base URL, so handlers call api() freely.
 _STATE: dict = {}
+
+
+# The verb pages `callva help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections and ids follow. A
+# text several verbs own is one constant, added to each of their pages, and
+# each domain verb's page names the route `callva routes` declares for it.
+_HELP_TAIL = """
+  Conventions:
+    - Filtering on list/stats commands is always `-f key=value` (repeatable):
+      e.g. `calls list -f status=complete -f result=confirmed`. There are no bare
+      per-field flags like `--status`.
+    - `stats aggregate` filters dates with `-f created_at_gte=<date>`; `--from` /
+      `--to` belong to `stats trends` only.
+    - Use file flags (`--content-file`, `--prompt-file`, `--file`, `--data-file`,
+      `--args-file`, `--inputs-file`) for large content; `-` reads stdin.
+    - `--data` / `--overrides` / `--settings` take a JSON object.
+    - A boolean B is true or false (1 / 0 and yes / no are taken too).
+
+  Global options (accepted anywhere on the line — before or after the command):
+    --full              return the full, unfiltered API response (list endpoints
+                        are slimmed to the agent-useful fields by default)
+    --connection <id>   select a registry connection (optional with a default
+                        pointer or a sole entry)
+    --key-env <KEY>     resolve the API key from a different env/cred KEY (default
+                        CALLVA_API_KEY; with a registry connection it overrides
+                        that entry's secret_env) — act as a different CallVA
+                        account/tenant. Only the key NAME travels; the value
+                        never touches argv. It never lifts a connection's write
+                        gate.
+    --api-url <URL>     override the base URL for this invocation
+  How connections are declared and selected: `callva help connections`.
+  Outside any project this verb is refused: only connections, doctor and
+  routes are machine reads.
+
+  Output is JSON on stdout. List endpoints are slimmed to the fields an agent
+  needs; pass --full for the raw API response. `get` / detail commands always
+  return the full resource. `recordings stream` writes binary audio and `settings
+  reveal` one raw value.
+
+  I/O contract:
+    - Success: JSON on stdout, exit 0.
+    - Error:   {"error": {"code", "message", "hint"?, "status"?}} on stderr,
+               non-zero exit.
+
+  Exit codes:
+    0  success
+    2  auth (missing / rejected credentials, 401 / 403)
+    3  not found (404)
+    4  policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
+       verb, or a write verb on a read-only connection (allow_write: false).
+       Ask the user; never lift a gate yourself.
+    5  server / network (timeout, connection error, 429 after retries, 5xx)
+    6  input / validation (malformed argument, bad payload, 400 / 422)
+"""
+_X_READ = ("Exit codes: 0; 2 key missing or rejected; 3 not found (404); 4 policy;\n"
+           "  5 server/network; 6 input.")
+_X_WRITE = ("Exit codes: 0; 2 key missing or rejected; 3 not found (404); 4 policy, or\n"
+            "  this write on a read-only connection; 5 server/network; 6 input, or a\n"
+            "  payload the API refused (400 / 422).")
+_X_DATA = ("Exit codes: 0; 2 key missing or rejected; 3 not found (404); 4 policy, or\n"
+           "  this write on a read-only connection; 5 server/network; 6 missing_payload\n"
+           "  without a JSON object, other input, or a payload the API refused (400 / 422).")
+
+
+def _help_page(verb: str, synopsis: str, body: str, exits: str, example: str,
+               *notes: str) -> str:
+    """One domain verb's page: its synopsis, what it does, the route and gate
+    `callva routes` declares for it, its exit codes and example, the notes it
+    shares with its neighbours, then the options and codes every verb shares."""
+    out = synopsis.strip("\n") + "\n\n" + body.strip("\n") + "\n"
+    if verb in ROUTES:
+        method, path = ROUTES[verb]
+        out += f"\n  Route: {method} {path}.\n"
+    if verb in WRITE_VERBS and verb in SECRET_VERBS:
+        out += ("  WRITE, and its answer may carry a secret: refused (exit 4) on a\n"
+                "  read-only connection, and under CALLVA_HEADLESS in either mode.\n")
+    elif verb in WRITE_VERBS:
+        out += ("  WRITE: refused (exit 4) on a read-only connection (allow_write: false),\n"
+                "  and under CALLVA_HEADLESS=read-only; no flag lifts the gate.\n")
+    elif verb in SECRET_VERBS:
+        out += ("  Writes nothing but prints a secret: refused (exit 4) on a read-only\n"
+                "  connection, and under CALLVA_HEADLESS in either mode.\n")
+    out += "\n  " + exits.strip() + "\n\n  " + example.strip() + "\n"
+    for note in notes:
+        out += note
+    return out + _HELP_TAIL
+
+
+_HELP_AGENT_MODEL = """
+  An agent owns the conversation; a preset owns the speech stack it runs on.
+  Voice, model, temperature, transcriber and languages live on the preset, not
+  on the agent, and `agents update` refuses them. An agent holds at most one
+  configuration per preset and keeps the ones it is not running, so switching
+  stacks loses nothing — and comparing two configurations of one stack means
+  two agents, which is what `agents clone` is for.
+"""
+_HELP_STORED_VS_CONFIG = """
+  `agents get` and `presets get` show what is stored; `agents config` shows
+  what a call actually starts from — the configuration the voice worker is
+  handed for a call in that direction (default inbound): the agent, its active
+  preset including backend_instructions, every {{prompt:...}} reference
+  resolved, and whatever the agent's custom_config_url automation returned.
+  Producing it runs that automation and files a call record on the platform,
+  left in status `starting`, so the verb is write-gated; run it only against an
+  agent whose start-of-call automation is safe to fire. A tenant API key may be
+  refused there (exit 2) where the platform has a worker key configured.
+"""
+_HELP_PRESETS = """
+  `catalog` names the presets this platform offers; `describe` is the one that
+  says what a preset takes — every field, its type, its bounds, and whether a
+  list is closed or merely suggested. Read it before writing a configuration:
+  it is the same declaration the platform validates against, so a write it
+  refuses is a write the API refuses.
+
+  `set` replaces the configuration; `patch` merges into it. Prefer `set` when
+  removing a key, because a merge has no way to express one. `activate` is what
+  makes a preset the stack the agent's next call runs on.
+"""
+_HELP_TOOLS = """
+  A tool is a record of its own, addressed by the name it carries, so an edit
+  reaches only the tool it names and no stale copy of the others can remove one.
+  The name is case-sensitive and is written exactly as typed. `agents update`
+  refuses a `tools` key inside --config for the same reason.
+
+  `set` states the whole record: the body is stored as sent and every field left
+  out takes its default — no type, enabled, position 0 — which is the only way a
+  leaf inside the body, or the type itself, is removed. `patch` writes only the
+  fields the command names and deep-merges the body, replacing lists whole, so
+  toggling `--is-enabled` leaves the type, the position and the body as they
+  were. Either creates the tool when the agent has none. `delete` leaves the
+  agent with no tool by that name, whether or not it had one.
+"""
+_HELP_PUT_PATCH = """
+  ui-views are the project's saved calls-list views. On both resources, record
+  actions and ui-views, the API treats PUT and PATCH alike, as a partial update:
+  a field left out keeps its value, so `put` replaces no more than `update` does.
+"""
+_HELP_ISSUES = """
+  Issues are the project's journal of what works and what does not on calls.
+  create requires kind (defect|limitation), title and problem; status
+  (open|fixed|closed), solution, implemented_at, proven_by, agent_id, call_id
+  and stack are optional. list filters: status, kind, agent_id, call_id, stack,
+  search, sort, and the list summary shows stack.
+  stack is a plain string: preset/model/speech/worker, for example gpt_live/gpt-5.6-terra/callva-worker and pipeline/gpt-5.4-mini/azure-azure/callva-worker.
+
+  On both resources, issues and knowledge, the API treats PUT and PATCH alike,
+  as a partial update.
+"""
+_HELP_KNOWLEDGE = """
+  Knowledge is what the project holds true or must not do. create requires
+  content; kind (fact|restriction), status (draft|active|outdated|wrong),
+  agent_id, source and source_call_id are optional. list filters: status (comma
+  separated), kind, agent_id, search, sort.
+
+  On both resources, issues and knowledge, the API treats PUT and PATCH alike,
+  as a partial update.
+"""
+_HELP_TRANSCRIPTS = """
+  A version-2 transcript carries the tool calls the agent made only for a key
+  holding tool_calls.read; any other key gets the messages alone.
+"""
+_HELP_TRIGGERS = """
+  HTTP triggers put an automation behind a URL. Each trigger's `webhook_url` is
+  the value an agent's custom_config_url / custom_webhook_url takes.
+  <trigger_path> is the trigger's `path` — its Windmill identifier, not its
+  URL. Read it from `automations triggers` and pass it whole: it may carry
+  slashes (`f/proj_ab12cd34/trigger_e5f6a7b8c9d0`) and they are sent
+  literally, not escaped.
+
+  --route-path is the other field, the URL tail after /api/r/. The platform
+  accepts only a single [a-z0-9_-] segment there, so a trigger whose
+  route_path already carries slashes — Windmill permits those, the platform
+  does not mint them — can be listed, toggled and otherwise changed here, but
+  neither created nor re-pathed. Omit --route-path on add and the platform
+  derives one from the automation id. Whether the workspace name sits in the
+  URL is the trigger's own `workspaced_route`, set in Windmill and read back,
+  never sent.
+
+  --secret is required by --auth signature, min 8 chars; it is stored as a
+  workspace variable and is never read back.
+"""
+_HELP_TENANT = """
+  Projects: create, update, put and delete need a tenant-wide key: a key bound
+  to one project is refused. The API treats PUT and PATCH alike, as a partial
+  update. Read with a tenant-wide key, `projects list`, `phone-numbers list`
+  and `providers list` answer for the whole tenant.
+"""
+_HELP_PHONE = """
+  Phone numbers: create needs a tenant-wide key; --provider-credential-id is
+  required for --number-type provider. --status is
+  pending|active|suspended|error.
+"""
+
+HELP_VERBS = {
+    "connections": """\
+  connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked). Local only — no network.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. A flag wins (--api-url, non-secret only; a secret never has a
+  flag); otherwise its values resolve through the credential cascade (`Where a
+  secret resolves`, above). Same CALLVA_* keys at every
+  tier; the project you're in wins, so a deployed host's injected env governs
+  when no config file is present. Never pass the key on the command line.
+    CALLVA_API_KEY=<your CallVA API key>   secret — never passed on argv
+    CALLVA_API_URL=<base URL>              optional; default
+                                           https://api.callva.one/api/v1
+
+  A project that talks to several CallVA tenants declares them as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "api_url": "https://api.example.com/api/v1",
+          "secret_env": "CALLVA_<ID>_API_KEY",
+          "allow_write": true
+        }
+      }
+    }
+  Only the API key is secret: the entry names the env var holding it
+  ("secret_env"); the value resolves through the credential cascade above.
+  "api_url" is optional — absent, the
+  default base URL applies. "allow_write": false makes the connection
+  read-only: every mutating verb (the create/update/put/delete/batch/store/
+  reorder/deploy/run actions on agents, assets, calls, transcripts, fields,
+  field-groups, schedules, automations, actions, ui-views, issues, knowledge,
+  projects, phone-numbers, and variables, the add/update/remove/toggle trigger
+  actions on automations, `recordings purge`, `calls run-action`, `ui-views
+  set-default`, `phone-numbers bind`, `settings rotate-webhook-secret`, the
+  outbound `call`, and `agents config`, which runs the agent's start-of-call
+  automation) exits 4, and no flag lifts the gate. `settings reveal` writes
+  nothing but prints a secret, so a read-only connection refuses it the same way.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous. --key-env <KEY>
+  resolves the API key from another KEY instead of the entry's secret_env, and
+  --api-url <URL> overrides the base URL for one invocation; neither lifts a
+  connection's write gate.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off. routes
+  is one too, and uses no connection at all. Every other verb that needs a
+  connection is refused there.
+
+  Example: callva connections
+""",
+    "doctor": """\
+  doctor [--connection <id>] [--key-env <KEY>] [--api-url <URL>]
+      Authenticated round-trip — proves the key resolves, the API is
+      reachable, and what project the key sees — every connection, or one.
+      Emits {ok, connections: {<id>: {base_url, key_env, ok,
+      projects_visible, sample_project}}}, each from one GET
+      /external/projects?per_page=1, or {ok: false, error} for a connection
+      that failed; exit 0 only when every examined connection is healthy,
+      else the first failure's code (2 a key missing or refused with 401 /
+      403, 5 unreachable or another error status). --key-env and --api-url
+      apply to each connection it examines. Outside any project it is a
+      machine read, and under CALLVA_HEADLESS it proves the one credential
+      the environment holds (`callva help headless`).
+
+  Examples:
+    callva doctor
+    callva --connection <id> doctor
+""",
+    "ids": """\
+  The envelope is capabilities/callva/identifiers.json, or store rows once the
+  agent moved.
+""",
+    "headless": """\
+callva help headless
+
+  HEADLESS (one credential, no project, no store, no manager)
+  A process handed exactly one credential runs with:
+    CALLVA_HEADLESS=read-only | read-write
+    CALLVA_API_KEY=<the credential>
+    CALLVA_API_URL=<base URL>              optional; the default above applies
+  Only the process environment is read: no policy, registry, vault or file.
+  read-only serves help, stub, manifest, routes, doctor and every verb `routes`
+  marks neither `writes` nor `secret`. read-write serves those and the verbs
+  marked `writes`: the credential's own scopes bound them, the platform refuses
+  what it does not allow, and CAPABILITIES_READ_ONLY still closes them. Every
+  other verb exits 4, no flag or env value lifts that, and --connection,
+  --key-env and --api-url are refused. So is every flag naming a local path
+  (--prompt-file, --config-file, --content-file, --inputs-file, --data-file,
+  --file, --args-file, --output): content travels inline, and a recording goes
+  to stdout. The mode exits 4 headless_refused wherever a project, a machine's
+  capability configuration or a store resolves, and for any other value of
+  CALLVA_HEADLESS.
+
+  The default base URL is https://api.callva.one/api/v1.
+
+  Example: CALLVA_HEADLESS=read-only CALLVA_API_KEY=<key> callva agents list
+""",
+    "routes": """\
+callva routes
+
+  JSON map of every API verb: its verb, HTTP method, path template, whether it
+  writes and whether it prints a secret. Local only — no network, no
+  connection. Placeholders carry the name the product's route file gives them.
+  The `writes` and `secret` marks are what a read-only connection and
+  CALLVA_HEADLESS refuse (`callva help headless`). Outside any project it is a
+  machine read.
+
+  Exit codes: 0; 4 policy.
+
+  Example: callva routes
+""",
+
+    # --- agents ---
+    "agents list": _help_page(
+        "agents list", "callva agents list [--is-active B]", """
+  The agents the key sees. --is-active true keeps the active ones, false the
+  inactive ones. Slimmed to id, name, project_name, is_active, is_default.
+""", _X_READ, "Example: callva agents list --is-active true", _HELP_AGENT_MODEL),
+    "agents default": _help_page(
+        "agents default", "callva agents default", """
+  Reads only: the project's default agent, else its oldest; exit 3 when it has
+  none. Answers the agent whole.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 the project has no agent; 4\n"
+      "  policy; 5 server/network; 6 input."), "Example: callva agents default"),
+    "agents get": _help_page(
+        "agents get", "callva agents get <id>", """
+  One agent by its id, whole: what is stored.
+""", _X_READ, "Example: callva agents get <AGENT_ID>", _HELP_STORED_VS_CONFIG),
+    "agents create": _help_page(
+        "agents create", "callva agents create", """
+  Takes no fields: an active agent named "Untitled agent" in the project; set
+  the rest with `agents update`. Answers the new agent.
+""", _X_WRITE, "Example: callva agents create"),
+    "agents update": _help_page(
+        "agents update", """\
+callva agents update <id> [--name N] [--prompt T | --prompt-file F]
+                   [--greeting-type prompt|exact|instruction]
+                   [--greeting-exact T] [--greeting-instruction T]
+                   [--agent-speaks-first B]
+                   [--custom-webhook-events E1,E2] [--config JSON] [--data JSON]""", """
+  Change an agent. --name names it; --prompt is the prompt text inline, and
+  --prompt-file reads it from a file. --greeting-type picks the greeting,
+  --greeting-exact is the exact greeting text and --greeting-instruction the
+  instruction it is made from; --agent-speaks-first says who opens the call.
+  --custom-webhook-events replaces the event types the custom webhook
+  forwards, comma-separated; "" forwards nothing. The API names them
+  call.dialing, call.started, call.ended and call.recording. --config is a
+  config JSON object, merged in part.
+
+  --data is the base object of an update and every flag above writes over it
+  under that flag's own key: pass --data and --prompt together and the prompt
+  is the one from --prompt, and --config beats a `config` key inside --data.
+  Keys --data carries that no flag names are sent as given; test_variables,
+  {"mode": ..., "rows": [{"name", "value", "enabled"}]}, is one.
+
+  --voice is refused before any request (exit 6 moved_to_preset): voice
+  belongs to the preset the agent runs, written with `presets patch`. A
+  `tools` key inside the config is refused (exit 6 moved_to_tools): tools are
+  records of their own, written with `callva tools`. Nothing to change exits 6
+  nothing_to_update. Answers the agent as it now stands.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 no agent with that id; 4\n"
+      "  policy, or this write on a read-only connection; 5 server/network; 6\n"
+      "  nothing_to_update, moved_to_preset, moved_to_tools, a JSON argument that\n"
+      "  does not parse, or a payload the API refused (400 / 422)."),
+        "Example: callva agents update <AGENT_ID> --prompt-file prompt.md --greeting-type exact --greeting-exact \"<text>\"",
+        _HELP_AGENT_MODEL),
+    "agents clone": _help_page(
+        "agents clone", "callva agents clone <id> [--name N]", """
+  Copy an agent with every preset row it holds. --name names the copy; it is
+  derived from the source when omitted. Answers the copy.
+""", _X_WRITE, "Example: callva agents clone <AGENT_ID> --name \"<name>\"", _HELP_AGENT_MODEL),
+    "agents delete": _help_page(
+        "agents delete", "callva agents delete <id>", """
+  Delete one agent. Answers {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva agents delete <AGENT_ID>"),
+    "agents config": _help_page(
+        "agents config", "callva agents config <id> [--direction inbound|outbound]", """
+  The configuration a call starts from, for a call in --direction (default
+  inbound), returned as the platform composed it.
+
+  `agents config` is the one place callva reaches outside the External API: it
+  calls the platform's call-configuration endpoint, POST /config/livekit, on the
+  same base URL with the same key. Since 2026-11-04 that endpoint sits behind the
+  platform's voice-worker authentication: where the platform has a worker key
+  configured, it may refuse an ordinary tenant API key there (exit 2), and the
+  External API offers no replacement route.
+""", ("Exit codes: 0; 2 key missing or rejected, or a tenant key the worker\n"
+      "  authentication refuses; 3 not found; 4 policy, or this write on a\n"
+      "  read-only connection; 5 server/network; 6 input."),
+        "Example: callva agents config <AGENT_ID> --direction outbound", _HELP_STORED_VS_CONFIG),
+
+    # --- presets ---
+    "presets catalog": _help_page(
+        "presets catalog", "callva presets catalog", """
+  List the presets this platform offers: id, label, description, strict and
+  schema_version each; --full gives the whole declarations.
+""", _X_READ, "Example: callva presets catalog", _HELP_PRESETS),
+    "presets describe": _help_page(
+        "presets describe", "callva presets describe <preset> [--group G]", """
+  What one preset takes, field by field: <preset> is a preset id from `presets
+  catalog`, and --group G keeps only the fields in one group. A preset it does
+  not offer exits 3 preset_not_found, naming those it does; a group the
+  preset does not declare exits 3 group_not_found. --full gives the whole
+  declaration.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 preset_not_found,\n"
+      "  group_not_found; 4 policy; 5 server/network; 6 input."),
+        "Example: callva presets describe <PRESET> --group <GROUP>", _HELP_PRESETS),
+    "presets list": _help_page(
+        "presets list", "callva presets list <agent-id>", """
+  The presets an agent has configured: preset, is_active and updated_at each.
+""", _X_READ, "Example: callva presets list <AGENT_ID>", _HELP_PRESETS),
+    "presets get": _help_page(
+        "presets get", "callva presets get <agent-id> <preset>", """
+  One agent's configuration of one preset, whole: what is stored.
+""", _X_READ, "Example: callva presets get <AGENT_ID> <PRESET>",
+        _HELP_PRESETS, _HELP_STORED_VS_CONFIG),
+    "presets set": _help_page(
+        "presets set", "callva presets set <agent-id> <preset> (--config JSON | --config-file F)", """
+  Replace the configuration: --config is the whole configuration as JSON, and
+  --config-file reads it from a file (- for stdin). A key that was stored and
+  is not sent is gone, which is the only way a leaf is removed at all. A
+  config file that is not JSON exits 6 invalid_json.
+""", _X_WRITE, "Example: callva presets set <AGENT_ID> <PRESET> --config-file config.json", _HELP_PRESETS),
+    "presets patch": _help_page(
+        "presets patch", "callva presets patch <agent-id> <preset> (--config JSON | --config-file F)", """
+  Merge into the configuration: --config is the keys to change, as JSON, and
+  --config-file reads them from a file (- for stdin). A key left out keeps
+  whatever it held, so a merge cannot express a removal; use `presets set` to
+  drop one. A config file that is not JSON exits 6 invalid_json.
+""", _X_WRITE, "Example: callva presets patch <AGENT_ID> <PRESET> --config '{\"voice\": \"<voice>\"}'", _HELP_PRESETS),
+    "presets activate": _help_page(
+        "presets activate", "callva presets activate <agent-id> <preset>", """
+  Run the agent's next call on this preset. There is no separate confirming
+  act, so an activation changes live behaviour immediately.
+""", _X_WRITE, "Example: callva presets activate <AGENT_ID> <PRESET>", _HELP_PRESETS),
+
+    # --- tools ---
+    "tools list": _help_page(
+        "tools list", "callva tools list <agent-id>", """
+  Every tool this agent holds: key, type, is_enabled, position and updated_at
+  each.
+""", _X_READ, "Example: callva tools list <AGENT_ID>", _HELP_TOOLS),
+    "tools get": _help_page(
+        "tools get", "callva tools get <agent-id> <key>", """
+  One tool, whole. <key> is the tool name, exactly as stored (case-sensitive).
+""", _X_READ, "Example: callva tools get <AGENT_ID> <TOOL_KEY>", _HELP_TOOLS),
+    "tools set": _help_page(
+        "tools set", """\
+callva tools set <agent-id> <key> (--config JSON | --config-file F)
+          [--type end_call|http_request] [--is-enabled B] [--position N]""", """
+  Replace the record; fields left out take their defaults. <key> is the tool
+  name, exactly as the worker reads it (case-sensitive). --config is the tool
+  body as a JSON object, --config-file reads it from a file (- for stdin);
+  --type is the tool type, which a tool found by module name carries none of;
+  --is-enabled says whether the agent is offered it; --position orders the
+  tools offered (>= 0). Without a body it exits 6 missing_config: `tools patch`
+  changes named fields and leaves the rest.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 not found; 4 policy, or this\n"
+      "  write on a read-only connection; 5 server/network; 6 missing_config,\n"
+      "  invalid_json, or a body the API refused (400 / 422)."),
+        "Example: callva tools set <AGENT_ID> <TOOL_KEY> --config-file tool.json --type http_request",
+        _HELP_TOOLS),
+    "tools patch": _help_page(
+        "tools patch", """\
+callva tools patch <agent-id> <key> [--config JSON | --config-file F]
+          [--type end_call|http_request] [--is-enabled B] [--position N]""", """
+  Write only the fields named here; the body is deep-merged into what is
+  stored, with lists replaced whole, so a merge cannot express a removal (use
+  `tools set` to drop one). The flags are those of `tools set`. Naming none
+  exits 6 nothing_to_update.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 not found; 4 policy, or this\n"
+      "  write on a read-only connection; 5 server/network; 6 nothing_to_update,\n"
+      "  invalid_json, or a body the API refused (400 / 422)."),
+        "Example: callva tools patch <AGENT_ID> <TOOL_KEY> --is-enabled false", _HELP_TOOLS),
+    "tools delete": _help_page(
+        "tools delete", "callva tools delete <agent-id> <key>", """
+  Remove one tool, leaving the rest. Answers {"deleted": "<key>", "agent_id":
+  "<agent-id>"}.
+""", _X_WRITE, "Example: callva tools delete <AGENT_ID> <TOOL_KEY>", _HELP_TOOLS),
+
+    # --- assets ---
+    "assets list": _help_page(
+        "assets list", "callva assets list [--type prompt|schema|payload] [--per-page N]", """
+  Assets (prompts, schemas, payloads); --type keeps one type, --per-page sets
+  the page size. Slimmed to id, name, type, is_active, created_at, updated_at.
+""", _X_READ, "Example: callva assets list --type prompt"),
+    "assets get": _help_page(
+        "assets get", "callva assets get <id>", """
+  One asset by its id, whole, content included.
+""", _X_READ, "Example: callva assets get <ASSET_ID>"),
+    "assets create": _help_page(
+        "assets create", "callva assets create --name N --type T (--content C | --content-file F) [--inactive]", """
+  Create an asset. --name and --type (prompt|schema|payload) are required; the
+  content is --content inline or --content-file read from a file (- for
+  stdin). It is active unless --inactive is given. Answers the new asset.
+""", _X_WRITE, "Example: callva assets create --name \"<name>\" --type prompt --content-file prompt.md"),
+    "assets update": _help_page(
+        "assets update", "callva assets update <id> [--name N] [--content C | --content-file F] [--is-active B]", """
+  Change an asset's name, content (--content inline, --content-file from a
+  file, - for stdin) or active flag. Naming none exits 6 nothing_to_update.
+""", _X_WRITE, "Example: callva assets update <ASSET_ID> --content-file prompt.md"),
+    "assets delete": _help_page(
+        "assets delete", "callva assets delete <id>", """
+  Delete one asset. Answers {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva assets delete <ASSET_ID>"),
+
+    # --- calls ---
+    "calls list": _help_page(
+        "calls list", "callva calls list [--per-page N] [--page N] [--sort F] [-f k=v ...]", """
+  Call records. --per-page and --page page them; --sort is the sort field,
+  prefixed - for descending (default -created_at); -f key=value filters
+  (repeatable), e.g. -f status=complete. Each call is slimmed to id, name,
+  phone, status, result, direction, duration, created_at, company_name,
+  invoice_amount and every other field it holds a value for.
+""", _X_READ, "Example: callva calls list -f status=complete -f result=confirmed --per-page 20"),
+    "calls get": _help_page(
+        "calls get", "callva calls get <id>", """
+  One call's details, the full payload with its dynamic fields.
+""", _X_READ, "Example: callva calls get <CALL_ID>"),
+    "calls create": _help_page(
+        "calls create", "callva calls create --data JSON", """
+  Create a call record from the call fields in --data, a JSON object.
+""", _X_WRITE, "Example: callva calls create --data '{\"<field>\": \"<value>\"}'"),
+    "calls update": _help_page(
+        "calls update", "callva calls update <id> --data JSON", """
+  Update a call with the fields in --data, a JSON object.
+""", _X_DATA, "Example: callva calls update <CALL_ID> --data '{\"<field>\": \"<value>\"}'"),
+    "calls delete": _help_page(
+        "calls delete", "callva calls delete <id>", """
+  Delete one call. Answers {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva calls delete <CALL_ID>"),
+    "calls batch": _help_page(
+        "calls batch", "callva calls batch <id> [<id> ...] --data JSON", """
+  Update several calls at once: every call id named gets the fields in --data,
+  a JSON object.
+""", _X_DATA, "Example: callva calls batch <CALL_ID> <CALL_ID> --data '{\"<field>\": \"<value>\"}'"),
+    "calls webhook-logs": _help_page(
+        "calls webhook-logs", "callva calls webhook-logs <call_id> [--per-page N] [--page N] [--sort F] [-f k=v ...]", """
+  The webhook logs received for one call. --sort defaults to -received_at;
+  -f key=value adds a filter (repeatable), and related_call_id is forced from
+  the route.
+""", _X_READ, "Example: callva calls webhook-logs <CALL_ID> --per-page 10"),
+    "calls automation-runs": _help_page(
+        "calls automation-runs", """\
+callva calls automation-runs <call_id> [--per-page N] [--page N] [-f k=v ...]
+                      [--no-include-args]""", """
+  The prepared view for runs whose args carry the id as a nested call object,
+  {"call":{"id":"<call_id>"}}; for any other args shape use `automations
+  all-runs --args-filter`. -f key=value filters (repeatable), e.g. -f
+  status=success -f triggered_by=webhook. Each run carries its args
+  (include_args=true) unless --no-include-args. Slimmed to id, automation_id,
+  automation_name, status, triggered_by, duration_ms, started_at, args.
+""", _X_READ, "Example: callva calls automation-runs <CALL_ID> -f status=success"),
+    "calls actions": _help_page(
+        "calls actions", "callva calls actions <call_id>", """
+  The actions that apply to this call now: id, key, label, description,
+  confirm_text and inputs each.
+""", _X_READ, "Example: callva calls actions <CALL_ID>"),
+    "calls run-action": _help_page(
+        "calls run-action", "callva calls run-action <call_id> <action_id> [--inputs JSON | --inputs-file F]", """
+  Press one action on this call. --inputs is the action's inputs as JSON, and
+  --inputs-file reads them from a JSON file (- for stdin).
+""", _X_WRITE, "Example: callva calls run-action <CALL_ID> <ACTION_ID> --inputs '{\"note\": \"<text>\"}'"),
+    "calls action-runs": _help_page(
+        "calls action-runs", "callva calls action-runs <call_id> [--per-page N] [--page N]", """
+  The history of actions pressed on this call; --per-page is at most 100.
+""", _X_READ, "Example: callva calls action-runs <CALL_ID>"),
+    "calls tool-calls": _help_page(
+        "calls tool-calls", "callva calls tool-calls <call_id>", """
+  The tools the voice agent called in this call, read from its transcript; the
+  key needs the tool_calls.read permission, and one without it exits 2.
+""", ("Exit codes: 0; 2 key missing or rejected, or a key without\n"
+      "  tool_calls.read; 3 not found; 4 policy; 5 server/network; 6 input."),
+        "Example: callva calls tool-calls <CALL_ID>", _HELP_TRANSCRIPTS),
+
+    # --- actions ---
+    "actions list": _help_page(
+        "actions list", "callva actions list [--entity-type T]", """
+  Record action definitions; --entity-type keeps one entity type. Slimmed to
+  id, entity_type, key, label, style, sort_order, is_active.
+""", _X_READ, "Example: callva actions list --entity-type call", _HELP_PUT_PATCH),
+    "actions get": _help_page(
+        "actions get", "callva actions get <id>", """
+  One action definition, whole.
+""", _X_READ, "Example: callva actions get <ACTION_ID>", _HELP_PUT_PATCH),
+    "actions create": _help_page(
+        "actions create", "callva actions create (--data JSON | --data-file F)", """
+  Create an action definition: key, label and steps are required. --data is
+  the definition as JSON, --data-file reads it from a JSON file (- for stdin).
+""", _X_DATA, "Example: callva actions create --data-file action.json", _HELP_PUT_PATCH),
+    "actions update": _help_page(
+        "actions update", "callva actions update <id> (--data JSON | --data-file F)", """
+  Change fields of a definition (PATCH): --data is the fields to change as
+  JSON, --data-file reads them from a JSON file (- for stdin).
+""", _X_DATA, "Example: callva actions update <ACTION_ID> --data '{\"label\": \"<label>\"}'", _HELP_PUT_PATCH),
+    "actions put": _help_page(
+        "actions put", "callva actions put <id> (--data JSON | --data-file F)", """
+  Change fields of a definition (PUT, which the API treats as PATCH): --data
+  is the fields to change as JSON, --data-file reads them from a JSON file (-
+  for stdin).
+""", _X_DATA, "Example: callva actions put <ACTION_ID> --data-file action.json", _HELP_PUT_PATCH),
+    "actions delete": _help_page(
+        "actions delete", "callva actions delete <id>", """
+  Delete an action definition. Answers {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva actions delete <ACTION_ID>", _HELP_PUT_PATCH),
+
+    # --- ui-views ---
+    "ui-views list": _help_page(
+        "ui-views list", "callva ui-views list", """
+  The project's views: id, entity_type, name, scope, is_default and sort_order
+  each.
+""", _X_READ, "Example: callva ui-views list", _HELP_PUT_PATCH),
+    "ui-views get": _help_page(
+        "ui-views get", "callva ui-views get <id>", """
+  One view, whole.
+""", _X_READ, "Example: callva ui-views get <VIEW_ID>", _HELP_PUT_PATCH),
+    "ui-views create": _help_page(
+        "ui-views create", "callva ui-views create (--data JSON | --data-file F)", """
+  Create a project view: name and preferences are required. --data is the
+  view as JSON, --data-file reads it from a JSON file (- for stdin).
+""", _X_DATA, "Example: callva ui-views create --data-file view.json", _HELP_PUT_PATCH),
+    "ui-views update": _help_page(
+        "ui-views update", "callva ui-views update <id> (--data JSON | --data-file F)", """
+  Change fields of a view (PATCH): --data is the fields to change as JSON,
+  --data-file reads them from a JSON file (- for stdin).
+""", _X_DATA, "Example: callva ui-views update <VIEW_ID> --data '{\"name\": \"<name>\"}'", _HELP_PUT_PATCH),
+    "ui-views put": _help_page(
+        "ui-views put", "callva ui-views put <id> (--data JSON | --data-file F)", """
+  Change fields of a view (PUT, which the API treats as PATCH): --data is the
+  fields to change as JSON, --data-file reads them from a JSON file (- for
+  stdin).
+""", _X_DATA, "Example: callva ui-views put <VIEW_ID> --data-file view.json", _HELP_PUT_PATCH),
+    "ui-views delete": _help_page(
+        "ui-views delete", "callva ui-views delete <id>", """
+  Delete a view. Answers {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva ui-views delete <VIEW_ID>", _HELP_PUT_PATCH),
+    "ui-views set-default": _help_page(
+        "ui-views set-default", "callva ui-views set-default <id>", """
+  Make a view the project's default.
+""", _X_WRITE, "Example: callva ui-views set-default <VIEW_ID>", _HELP_PUT_PATCH),
+}
+
+# Issues and knowledge share one shape, as the parser declares them.
+for _resource, _note, _create, _slim, _status in (
+        ("issues", _HELP_ISSUES, "kind, title and problem are required; stack is a\n"
+                                 "  plain string, preset/model/speech/worker",
+         "id, kind, status, title, agent_id, call_id, stack, created_at", "open"),
+        ("knowledge", _HELP_KNOWLEDGE, "content is required",
+         "id, kind, status, content, agent_id, created_at", "active")):
+    _id = "<ISSUE_ID>" if _resource == "issues" else "<KNOWLEDGE_ID>"
+    HELP_VERBS[f"{_resource} list"] = _help_page(
+        f"{_resource} list", f"callva {_resource} list [-f k=v ...] [--per-page N] [--page N]", f"""
+  List {_resource}: -f key=value filters (repeatable), --per-page and --page page
+  them. Slimmed to {_slim}.
+""", _X_READ, f"Example: callva {_resource} list -f status={_status} --per-page 20", _note)
+    HELP_VERBS[f"{_resource} get"] = _help_page(
+        f"{_resource} get", f"callva {_resource} get <id>", """
+  Get one by its id, whole.
+""", _X_READ, f"Example: callva {_resource} get {_id}", _note)
+    HELP_VERBS[f"{_resource} create"] = _help_page(
+        f"{_resource} create", f"callva {_resource} create (--data JSON | --data-file F)", f"""
+  Create one: --data is its fields as JSON, --data-file reads them from a
+  JSON file (- for stdin); {_create}.
+""", _X_DATA, f"Example: callva {_resource} create --data-file {_resource}.json", _note)
+    for _verb, _how in (("update", "(PATCH)"), ("put", "(PUT, which the API treats as PATCH)")):
+        HELP_VERBS[f"{_resource} {_verb}"] = _help_page(
+            f"{_resource} {_verb}", f"callva {_resource} {_verb} <id> (--data JSON | --data-file F)", f"""
+  Change fields {_how}: --data is the fields to change as JSON,
+  --data-file reads them from a JSON file (- for stdin).
+""", _X_DATA, f"Example: callva {_resource} {_verb} {_id} --data '{{\"status\": \"<status>\"}}'", _note)
+    HELP_VERBS[f"{_resource} delete"] = _help_page(
+        f"{_resource} delete", f"callva {_resource} delete <id>", """
+  Delete one. Answers {"deleted": "<id>"}.
+""", _X_WRITE, f"Example: callva {_resource} delete {_id}", _note)
+del _resource, _note, _create, _slim, _status, _id, _verb, _how
+
+HELP_VERBS.update({
+    # --- transcripts ---
+    "transcripts get": _help_page(
+        "transcripts get", "callva transcripts get <call_id>", """
+  A call's transcript (messages).
+""", _X_READ, "Example: callva transcripts get <CALL_ID>", _HELP_TRANSCRIPTS),
+    "transcripts store": _help_page(
+        "transcripts store", "callva transcripts store <call_id> (--data JSON | --data-file F)", """
+  Store or update a call's transcript: --data is the transcript JSON,
+  --data-file reads it from a JSON file (- for stdin). Answers {"stored":
+  "<call_id>"}.
+""", _X_DATA, "Example: callva transcripts store <CALL_ID> --data-file transcript.json", _HELP_TRANSCRIPTS),
+    "transcripts delete": _help_page(
+        "transcripts delete", "callva transcripts delete <call_id>", """
+  Delete a call's transcript. Answers {"deleted": "<call_id>"}.
+""", _X_WRITE, "Example: callva transcripts delete <CALL_ID>", _HELP_TRANSCRIPTS),
+    "transcripts url": _help_page(
+        "transcripts url", "callva transcripts url <call_id>", """
+  A presigned download URL for a call's transcript.
+""", _X_READ, "Example: callva transcripts url <CALL_ID>", _HELP_TRANSCRIPTS),
+
+    # --- call (outbound) ---
+    "call": _help_page(
+        "call", """\
+callva call <destination> --agent-id ID [--phone-number-id ID] [--call-id ID]
+                   [--overrides JSON]""", """
+  Initiate an outbound call to <destination>, a phone number in E.164 format,
+  run by the agent --agent-id names (required). --phone-number-id is the
+  phone number to call from, --call-id an existing call to reuse, and
+  --overrides agent overrides as a JSON object. Answers the call the platform
+  started.
+""", _X_WRITE, "Example: callva call <E164> --agent-id <AGENT_ID> --overrides '{\"<key>\": \"<value>\"}'"),
+
+    # --- stats ---
+    "stats aggregate": _help_page(
+        "stats aggregate", """\
+callva stats aggregate --op count|sum|avg|min|max [--field F] [--group-by F]
+                [--interval day|week|month] [-f k=v ...]""", """
+  Aggregate operations on calls. --op is required; --field is the field to
+  aggregate, required for sum, avg, min and max; --group-by groups the result
+  by a field and --interval by a time interval. -f key=value filters
+  (repeatable); dates filter with -f created_at_gte=<date>.
+""", _X_READ, "Example: callva stats aggregate --op count --group-by result -f created_at_gte=2026-01-01"),
+    "stats trends": _help_page(
+        "stats trends", "callva stats trends --from DATE --to DATE", """
+  Daily call trend data between --from and --to, both ISO dates and both
+  required; the range is at most 365 days.
+""", _X_READ, "Example: callva stats trends --from 2026-01-01 --to 2026-01-31"),
+
+    # --- recordings ---
+    "recordings stream": _help_page(
+        "recordings stream", "callva recordings stream <call_id> --url URL [--output FILE]", """
+  Download a call's recording, binary: to --output FILE, else to stdout. --url
+  is the recording URL, from the call's recording_url field, and is required.
+  Saved to a file it answers JSON; streamed to stdout it writes the audio and
+  nothing else.
+""", _X_READ, "Example: callva recordings stream <CALL_ID> --url <RECORDING_URL> --output call.mp3"),
+    "recordings purge": _help_page(
+        "recordings purge", "callva recordings purge <call_id>", """
+  Drops the platform's cached copy, so the next stream fetches it afresh; the
+  recording itself stays.
+""", _X_WRITE, "Example: callva recordings purge <CALL_ID>"),
+
+    # --- fields ---
+    "fields list": _help_page(
+        "fields list", "callva fields list [--entity-type T]", """
+  Custom field definitions; --entity-type keeps one entity type (default:
+  all). Slimmed to id, field_key, field_label, field_type, is_required,
+  is_system, and each option's {value, label}.
+""", _X_READ, "Example: callva fields list --entity-type call"),
+    "fields create": _help_page(
+        "fields create", "callva fields create --data JSON", """
+  Create a custom field from the field definition in --data, a JSON object.
+""", _X_DATA, "Example: callva fields create --data '{\"field_key\": \"<key>\", \"field_label\": \"<label>\"}'"),
+    "fields update": _help_page(
+        "fields update", "callva fields update <id> --data JSON", """
+  Update a custom field with the fields in --data, a JSON object.
+""", _X_DATA, "Example: callva fields update <FIELD_ID> --data '{\"field_label\": \"<label>\"}'"),
+    "fields delete": _help_page(
+        "fields delete", "callva fields delete <id>", """
+  Delete a custom field; `fields impact` previews what that touches. Answers
+  {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva fields delete <FIELD_ID>"),
+    "fields impact": _help_page(
+        "fields impact", "callva fields impact <id>", """
+  Preview what deleting a custom field would touch.
+""", _X_READ, "Example: callva fields impact <FIELD_ID>"),
+    "fields extraction-schema": _help_page(
+        "fields extraction-schema", "callva fields extraction-schema [--entity-type T]", """
+  JSON Schema of the project's extraction fields; --entity-type picks the
+  entity type, default call.
+""", _X_READ, "Example: callva fields extraction-schema --entity-type call"),
+
+    # --- field-groups ---
+    "field-groups list": _help_page(
+        "field-groups list", "callva field-groups list", """
+  Field groups with their fields: id, name, entity_type, sort_order and
+  show_title each.
+""", _X_READ, "Example: callva field-groups list"),
+    "field-groups create": _help_page(
+        "field-groups create", "callva field-groups create --data JSON", """
+  Create a field group from the group definition in --data, a JSON object.
+""", _X_DATA, "Example: callva field-groups create --data '{\"name\": \"<name>\"}'"),
+    "field-groups update": _help_page(
+        "field-groups update", "callva field-groups update <id> --data JSON", """
+  Update a field group with the fields in --data, a JSON object.
+""", _X_DATA, "Example: callva field-groups update <GROUP_ID> --data '{\"name\": \"<name>\"}'"),
+    "field-groups delete": _help_page(
+        "field-groups delete", "callva field-groups delete <id>", """
+  Delete a field group. Answers {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva field-groups delete <GROUP_ID>"),
+    "field-groups reorder": _help_page(
+        "field-groups reorder", "callva field-groups reorder --data JSON", """
+  Reorder the groups: --data is the order as JSON, {"groups": [{"id": "...",
+  "sort_order": 0}]}. Answers {"reordered": true}.
+""", _X_DATA, "Example: callva field-groups reorder --data '{\"groups\": [{\"id\": \"<GROUP_ID>\", \"sort_order\": 0}]}'"),
+    "field-groups add-field": _help_page(
+        "field-groups add-field", "callva field-groups add-field <id> <field_id> [--position N]", """
+  Add a custom field to a group; --position is its slot within the group
+  (default: append). Answers {"group": "<id>", "added_field": "<field_id>"}.
+""", _X_WRITE, "Example: callva field-groups add-field <GROUP_ID> <FIELD_ID> --position 0"),
+    "field-groups remove-field": _help_page(
+        "field-groups remove-field", "callva field-groups remove-field <id> <field_id>", """
+  Remove a custom field from a group. Answers {"group": "<id>",
+  "removed_field": "<field_id>"}.
+""", _X_WRITE, "Example: callva field-groups remove-field <GROUP_ID> <FIELD_ID>"),
+    "field-groups reorder-fields": _help_page(
+        "field-groups reorder-fields", "callva field-groups reorder-fields <id> --data JSON", """
+  Reorder the fields within a group: --data is the order as JSON, {"fields":
+  [{"id": "...", "sort_order": 0}]}. Answers {"group": "<id>", "reordered":
+  true}.
+""", _X_DATA, "Example: callva field-groups reorder-fields <GROUP_ID> --data '{\"fields\": [{\"id\": \"<FIELD_ID>\", \"sort_order\": 0}]}'"),
+    "field-groups update-field": _help_page(
+        "field-groups update-field", "callva field-groups update-field <id> <field_id> --data JSON", """
+  Update a field's display settings in a group, from --data, a JSON object.
+  Answers {"group": "<id>", "updated_field": "<field_id>"}.
+""", _X_DATA, "Example: callva field-groups update-field <GROUP_ID> <FIELD_ID> --data '{\"<setting>\": \"<value>\"}'"),
+
+    # --- schedules ---
+    "schedules list": _help_page(
+        "schedules list", "callva schedules list", """
+  Webhook schedules with their rules: id, name, webhook_url, webhook_method,
+  is_active and each rule's summary.
+""", _X_READ, "Example: callva schedules list"),
+    "schedules get": _help_page(
+        "schedules get", "callva schedules get <id>", """
+  One schedule with its rules, whole.
+""", _X_READ, "Example: callva schedules get <SCHEDULE_ID>"),
+    "schedules create": _help_page(
+        "schedules create", "callva schedules create --data JSON", """
+  Create a schedule from the schedule definition in --data, a JSON object.
+""", _X_DATA, "Example: callva schedules create --data '{\"name\": \"<name>\", \"rules\": []}'"),
+    "schedules update": _help_page(
+        "schedules update", "callva schedules update <id> --data JSON", """
+  Full PUT — send the complete payload, all rules included: the rules are
+  synced to what --data, a JSON object, holds.
+""", _X_DATA, "Example: callva schedules update <SCHEDULE_ID> --data '{\"name\": \"<name>\", \"rules\": []}'"),
+    "schedules delete": _help_page(
+        "schedules delete", "callva schedules delete <id>", """
+  Delete a schedule. Answers {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva schedules delete <SCHEDULE_ID>"),
+    "schedules preview": _help_page(
+        "schedules preview", "callva schedules preview <id> <datetime>", """
+  Preview how the schedule's rules evaluate at <datetime>, an ISO datetime.
+""", _X_READ, "Example: callva schedules preview <SCHEDULE_ID> 2026-01-05T09:30:00Z"),
+    "schedules executions": _help_page(
+        "schedules executions", "callva schedules executions <id> [--per-page N]", """
+  A schedule's execution history; --per-page sets the page size.
+""", _X_READ, "Example: callva schedules executions <SCHEDULE_ID> --per-page 20"),
+
+    # --- automations ---
+    "automations list": _help_page(
+        "automations list", "callva automations list [--per-page N]", """
+  Automations (Windmill scripts); --per-page sets the page size. Slimmed to
+  the fields an agent needs, windmill_path among them.
+""", _X_READ, "Example: callva automations list"),
+    "automations get": _help_page(
+        "automations get", "callva automations get <id>", """
+  One automation's details, whole.
+""", _X_READ, "Example: callva automations get <AUTOMATION_ID>"),
+    "automations create": _help_page(
+        "automations create", "callva automations create --name N [--description D]", """
+  Create an automation: --name is required, --description optional. Deploy
+  its code with `automations deploy`.
+""", _X_WRITE, "Example: callva automations create --name \"<name>\" --description \"<text>\""),
+    "automations update": _help_page(
+        "automations update", """\
+callva automations update <id> [--name N] [--description D] [--is-active B]
+                        [--settings JSON] [--data JSON]""", """
+  Update an automation's metadata: --name, --description, --is-active, and
+  --settings as a JSON object. --data is the base; each flag above writes
+  over it under its own key, and --settings beats a `settings` key inside
+  --data. Naming nothing exits 6 nothing_to_update.
+""", _X_WRITE, "Example: callva automations update <AUTOMATION_ID> --is-active false"),
+    "automations delete": _help_page(
+        "automations delete", "callva automations delete <id>", """
+  Delete an automation. Answers {"deleted": "<id>"}.
+""", _X_WRITE, "Example: callva automations delete <AUTOMATION_ID>"),
+    "automations code": _help_page(
+        "automations code", "callva automations code <id>", """
+  The automation's deployed script code.
+""", _X_READ, "Example: callva automations code <AUTOMATION_ID>"),
+    "automations deploy": _help_page(
+        "automations deploy", """\
+callva automations deploy <id> (--file F | --code C)
+                        [--language bun|deno|python3|bash|go|nativets]""", """
+  Deploy new script code: --file reads the script from a file (- for stdin),
+  --code takes it inline; neither exits 6 missing_code. --language is the
+  script language (default: deno).
+""", ("Exit codes: 0; 2 key missing or rejected; 3 not found; 4 policy, or this\n"
+      "  write on a read-only connection; 5 server/network; 6 missing_code, or\n"
+      "  code the API refused (400 / 422)."),
+        "Example: callva automations deploy <AUTOMATION_ID> --file script.ts --language deno"),
+    "automations run": _help_page(
+        "automations run", "callva automations run <id> [--args JSON | --args-file F]", """
+  Trigger one execution. --args is the input parameters as JSON, whose keys
+  must match the script's main() parameter names; --args-file reads them from
+  a JSON file (- for stdin).
+""", _X_WRITE, "Example: callva automations run <AUTOMATION_ID> --args '{\"<param>\": \"<value>\"}'"),
+    "automations runs": _help_page(
+        "automations runs", "callva automations runs <id> [--per-page N]", """
+  The completed runs of one automation: id, success, duration_ms, job_kind
+  and created_at each.
+""", _X_READ, "Example: callva automations runs <AUTOMATION_ID> --per-page 10"),
+    "automations all-runs": _help_page(
+        "automations all-runs", """\
+callva automations all-runs [--per-page N] [--page N] [-f k=v ...]
+                     [--args-filter JSON] [--result-filter JSON]
+                     [--include-args]""", """
+  Runs across all automations, with scalar and JSONB filters. --per-page is
+  default 30, max 1000. -f key=value is a scalar filter (repeatable):
+  automation, status, triggered_by, started_after, started_before.
+  --args-filter is a JSONB containment filter on the triggering payload — any
+  key at any shape, e.g. {"call_id":"<id>"}; --result-filter one on the run
+  result. --include-args includes the full args payload in each run.
+""", _X_READ, "Example: callva automations all-runs --args-filter '{\"call_id\": \"<CALL_ID>\"}' --include-args"),
+    "automations run-detail": _help_page(
+        "automations run-detail", "callva automations run-detail <id> <job_id>", """
+  One run's detail: its result and logs.
+""", _X_READ, "Example: callva automations run-detail <AUTOMATION_ID> <JOB_ID>"),
+    "automations runtime-info": _help_page(
+        "automations runtime-info", "callva automations runtime-info", """
+  The runtime environment the automations run in.
+""", _X_READ, "Example: callva automations runtime-info"),
+    "automations triggers": _help_page(
+        "automations triggers", "callva automations triggers <id>", """
+  The HTTP triggers that call one automation, each with its webhook_url and
+  its path.
+""", _X_READ, "Example: callva automations triggers <AUTOMATION_ID>", _HELP_TRIGGERS),
+    "automations add-trigger": _help_page(
+        "automations add-trigger", """\
+callva automations add-trigger <id> --method get|post --mode async|sync
+                        --auth none|signature [--secret S] [--route-path P]""", """
+  Put an automation behind a webhook URL. --method is the HTTP method the
+  webhook accepts; --mode async returns a job id at once, sync holds the
+  request for the result; --auth is the caller authentication, and signature
+  requires --secret, the HMAC secret (min 8 chars). --route-path is the URL
+  tail after /api/r/. A --secret without --auth signature, a short secret, or
+  a route path the platform cannot mint exits 6.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 not found; 4 policy, or this\n"
+      "  write on a read-only connection; 5 server/network; 6 missing_secret,\n"
+      "  secret_too_short, secret_without_signature, invalid_route_path, or a\n"
+      "  request the API refused (400 / 422)."),
+        "Example: callva automations add-trigger <AUTOMATION_ID> --method post --mode async --auth signature --secret <SECRET>",
+        _HELP_TRIGGERS),
+    "automations update-trigger": _help_page(
+        "automations update-trigger", """\
+callva automations update-trigger <id> <trigger_path> [--method M] [--mode M]
+                           [--auth A] [--secret S] [--route-path P]""", """
+  Change an existing trigger: the flags are those of `automations
+  add-trigger`, each optional, and only those named are sent; naming none
+  exits 6 nothing_to_update.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 not found; 4 policy, or this\n"
+      "  write on a read-only connection; 5 server/network; 6 nothing_to_update,\n"
+      "  missing_secret, secret_too_short, secret_without_signature,\n"
+      "  invalid_route_path, or a request the API refused (400 / 422)."),
+        "Example: callva automations update-trigger <AUTOMATION_ID> <TRIGGER_PATH> --mode sync",
+        _HELP_TRIGGERS),
+    "automations remove-trigger": _help_page(
+        "automations remove-trigger", "callva automations remove-trigger <id> <trigger_path>", """
+  Delete a trigger and its stored secret. Answers {"deleted":
+  "<trigger_path>"}.
+""", _X_WRITE, "Example: callva automations remove-trigger <AUTOMATION_ID> <TRIGGER_PATH>", _HELP_TRIGGERS),
+    "automations toggle-trigger": _help_page(
+        "automations toggle-trigger", "callva automations toggle-trigger <id> <trigger_path> --enabled B", """
+  Enable or disable a trigger without deleting it: --enabled true serves the
+  webhook, false refuses it.
+""", _X_WRITE, "Example: callva automations toggle-trigger <AUTOMATION_ID> <TRIGGER_PATH> --enabled false",
+        _HELP_TRIGGERS),
+
+    # --- webhook-logs ---
+    "webhook-logs list": _help_page(
+        "webhook-logs list", "callva webhook-logs list [--per-page N] [--page N] [--sort F] [-f k=v ...]", """
+  Inbound webhook activity. --per-page is default 30, max 100; --sort
+  defaults to -received_at. -f key=value filters (repeatable): search, type
+  (call|config_request), event_type, processing_status, agent_id,
+  related_call_id, received_from, received_to, response_status,
+  response_time_min, response_time_max; `webhook-logs filters` names the
+  values the project holds.
+""", _X_READ, "Example: callva webhook-logs list -f type=call -f processing_status=<status>"),
+    "webhook-logs get": _help_page(
+        "webhook-logs get", "callva webhook-logs get <id>", """
+  One webhook log with its full payload.
+""", _X_READ, "Example: callva webhook-logs get <WEBHOOK_LOG_ID>"),
+    "webhook-logs filters": _help_page(
+        "webhook-logs filters", "callva webhook-logs filters", """
+  The filter values available for the project's webhook logs.
+""", _X_READ, "Example: callva webhook-logs filters"),
+
+    # --- variables ---
+    "variables list": _help_page(
+        "variables list", "callva variables list", """
+  The project's variables (secrets among them), slimmed to the fields an
+  agent needs.
+""", _X_READ, "Example: callva variables list"),
+    "variables create": _help_page(
+        "variables create", "callva variables create --name N --value V [--description D] [--is-secret B]", """
+  Create a variable: --name (UPPERCASE, e.g. MY_API_KEY) and --value are
+  required; --is-secret true marks it secret, encrypted at rest.
+""", _X_WRITE, "Example: callva variables create --name MY_API_KEY --value <value> --is-secret true"),
+    "variables update": _help_page(
+        "variables update", "callva variables update <path> --value V", """
+  Update a variable's value. <path> is its full path (e.g.
+  f/proj_xxx/MY_VAR). Answers {"updated": "<path>"}.
+""", _X_WRITE, "Example: callva variables update f/<PROJECT>/MY_VAR --value <value>"),
+    "variables delete": _help_page(
+        "variables delete", "callva variables delete <path>", """
+  Delete a variable by its full path (e.g. f/proj_xxx/MY_VAR). Answers
+  {"deleted": "<path>"}.
+""", _X_WRITE, "Example: callva variables delete f/<PROJECT>/MY_VAR"),
+
+    # --- settings ---
+    "settings list": _help_page(
+        "settings list", "callva settings list", """
+  All project-level settings: key, label, category, effective_value and
+  inherited_from each.
+""", _X_READ, "Example: callva settings list"),
+    "settings get": _help_page(
+        "settings get", "callva settings get <key>", """
+  A single setting by its key (e.g. timezone, date_format), whole, with the
+  definition_id `settings reveal` takes; a key it does not hold exits 3
+  not_found.
+""", _X_READ, "Example: callva settings get timezone"),
+    "settings reveal": _help_page(
+        "settings reveal", "callva settings reveal <definition_id>", """
+  Prints one setting's value in the clear, raw on stdout with a trailing
+  newline and nothing else; exit 3 `not_set` when it holds none, exit 4 on a
+  read-only connection. definition_id comes from `settings get`. The platform
+  logs each reveal of a secret.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 not_set, or not found; 4\n"
+      "  policy, or a read-only connection; 5 server/network; 6 input."),
+        "Example: callva settings reveal <DEFINITION_ID>"),
+    "settings rotate-webhook-secret": _help_page(
+        "settings rotate-webhook-secret", "callva settings rotate-webhook-secret", """
+  Replaces the project's agent webhook signing secret with a newly generated
+  one; the answer may carry it.
+""", _X_WRITE, "Example: callva settings rotate-webhook-secret"),
+
+    # --- allowance, livekit ---
+    "allowance": _help_page(
+        "allowance", "callva allowance", """
+  The tenant's monthly call allowance: limit, used, percent, period, and
+  state unlimited|within|warning|refused.
+""", _X_READ, "Example: callva allowance"),
+    "livekit connection": _help_page(
+        "livekit connection", "callva livekit connection", """
+  Whether the tenant's LiveKit is reachable and its URL, never its key;
+  answered only for a manually issued tenant-wide key, and rate-limited per
+  key.
+""", _X_READ, "Example: callva livekit connection"),
+
+    # --- projects ---
+    "projects list": _help_page(
+        "projects list", "callva projects list [--is-active B] [--per-page N]", """
+  The projects the key sees; --is-active keeps the active or inactive ones.
+  Slimmed to id, name, description, is_active, is_default.
+""", _X_READ, "Example: callva projects list --is-active true", _HELP_TENANT),
+    "projects get": _help_page(
+        "projects get", "callva projects get <id>", """
+  One project's details, whole.
+""", _X_READ, "Example: callva projects get <PROJECT_ID>", _HELP_TENANT),
+    "projects create": _help_page(
+        "projects create", "callva projects create [--name N] [--description T] [--is-active B] [--data JSON]", """
+  Create a project (name required; tenant-wide key). --name is unique in the
+  tenant; --data is the base payload as JSON, and the flags write over it.
+""", _X_WRITE, "Example: callva projects create --name \"<name>\" --description \"<text>\"", _HELP_TENANT),
+    "projects update": _help_page(
+        "projects update", "callva projects update <id> [--name N] [--description T] [--is-active B] [--data JSON]", """
+  Change a project (PATCH; tenant-wide key). --data is the base payload as
+  JSON, and the flags write over it.
+""", _X_WRITE, "Example: callva projects update <PROJECT_ID> --is-active false", _HELP_TENANT),
+    "projects put": _help_page(
+        "projects put", "callva projects put <id> [--name N] [--description T] [--is-active B] [--data JSON]", """
+  Change a project (PUT, which the API treats as PATCH; tenant-wide key).
+  --data is the base payload as JSON, and the flags write over it.
+""", _X_WRITE, "Example: callva projects put <PROJECT_ID> --name \"<name>\"", _HELP_TENANT),
+    "projects delete": _help_page(
+        "projects delete", "callva projects delete <id>", """
+  Deletes everything in the project; the default project is refused. Needs a
+  tenant-wide key.
+""", _X_WRITE, "Example: callva projects delete <PROJECT_ID>", _HELP_TENANT),
+
+    # --- phone-numbers ---
+    "phone-numbers list": _help_page(
+        "phone-numbers list", "callva phone-numbers list [--is-active B] [--per-page N]", """
+  Phone numbers; --is-active keeps the active or inactive ones.
+""", _X_READ, "Example: callva phone-numbers list --is-active true", _HELP_PHONE, _HELP_TENANT),
+    "phone-numbers get": _help_page(
+        "phone-numbers get", "callva phone-numbers get <id>", """
+  One phone number's details, whole.
+""", _X_READ, "Example: callva phone-numbers get <PHONE_NUMBER_ID>", _HELP_PHONE),
+    "phone-numbers create": _help_page(
+        "phone-numbers create", """\
+callva phone-numbers create [--phone-number E164] [--number-type provider|personal|manual]
+                     [--provider-credential-id ID] [--provider-phone-id ID] [--data JSON]""", """
+  Add a phone number (tenant-wide key). --phone-number is the number,
+  --number-type its kind; --provider-credential-id is required for
+  --number-type provider, and --provider-phone-id is the provider's id for
+  the number. --data is the base payload as JSON, and the flags write over it.
+""", _X_WRITE, "Example: callva phone-numbers create --phone-number <E164> --number-type manual", _HELP_PHONE),
+    "phone-numbers update": _help_page(
+        "phone-numbers update", "callva phone-numbers update <id> [--label T] [--is-active B] [--status S] [--data JSON]", """
+  Change a phone number's label, active flag or status (--status
+  pending|active|suspended|error). --data is the base payload as JSON, and the
+  flags write over it.
+""", _X_WRITE, "Example: callva phone-numbers update <PHONE_NUMBER_ID> --label \"<label>\"", _HELP_PHONE),
+    "phone-numbers delete": _help_page(
+        "phone-numbers delete", "callva phone-numbers delete <id>", """
+  Delete a phone number; an assigned number is refused, so unbind it first
+  (`phone-numbers bind <id> --unbind`).
+""", _X_WRITE, "Example: callva phone-numbers delete <PHONE_NUMBER_ID>", _HELP_PHONE),
+    "phone-numbers bind": _help_page(
+        "phone-numbers bind", "callva phone-numbers bind <id> (<agent_id> | --unbind)", """
+  Bind a phone number to an agent, or with --unbind leave it bound to no
+  agent. Naming both, or neither, exits 6 bind_target.
+""", ("Exit codes: 0; 2 key missing or rejected; 3 not found; 4 policy, or this\n"
+      "  write on a read-only connection; 5 server/network; 6 bind_target, or a\n"
+      "  request the API refused (400 / 422)."),
+        "Example: callva phone-numbers bind <PHONE_NUMBER_ID> <AGENT_ID>", _HELP_PHONE),
+
+    # --- providers ---
+    "providers list": _help_page(
+        "providers list", "callva providers list [--is-active B] [--provider-type T] [--per-page N]", """
+  Phone provider credentials; --is-active keeps the active or inactive ones
+  and --provider-type one provider type.
+""", _X_READ, "Example: callva providers list --provider-type <TYPE>", _HELP_TENANT),
+    "providers types": _help_page(
+        "providers types", "callva providers types", """
+  The supported phone provider types.
+""", _X_READ, "Example: callva providers types"),
+})
 
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -2607,7 +3376,7 @@ def build_parser():
     )
     subs = parser.add_subparsers(dest="resource", required=True)
 
-    subs.add_parser("help", help="Print the full usage contract")
+    subs.add_parser("help", help="Print the menu; `callva help <verb>` gives one verb's contract")
     subs.add_parser("doctor", help="Authenticated round-trip — prove readiness")
     subs.add_parser("routes", help="JSON map of every API verb and its route (local, no network)")
 
@@ -3369,8 +4138,8 @@ def _headless_main(mode: str) -> None:
         _headless_refused("--connection, --key-env and --api-url are refused: the connection is the environment's")
     first = cleaned[0] if cleaned else "help"
     if first == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
-        return
+        # The contract's layered help: the menu bare, one verb's page with a path.
+        _contract(cleaned or ["help"])
     if first in ("stub", "manifest"):
         _contract(cleaned)
     if first not in {"routes", "doctor", *(verb.split()[0] for verb in ROUTES)}:
@@ -3411,8 +4180,8 @@ def main():
     cleaned, FULL, key_env, api_url, wanted_conn = _extract_globals(sys.argv[1:])
 
     if not cleaned or cleaned[0] == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
-        return
+        # Bare, or `help` after a global option: the contract's layered help.
+        _contract(cleaned or ["help"])
 
     args = build_parser().parse_args(cleaned)
 

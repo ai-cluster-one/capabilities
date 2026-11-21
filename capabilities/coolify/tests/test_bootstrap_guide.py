@@ -194,7 +194,7 @@ def test_the_parser_check_catches_a_misplaced_connection_flag():
 
 
 def test_the_help_gives_connection_before_the_verb_in_connect():
-    help_text = coolify_module.__doc__ or ""
+    help_text = (coolify_module.__doc__ or "") + "".join(coolify_module.HELP_VERBS.values())
     assert "`coolify --connection <name> doctor`" in help_text
     assert "`coolify doctor --connection" not in help_text
 

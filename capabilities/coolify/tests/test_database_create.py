@@ -331,7 +331,7 @@ def test_reading_databases_stays_open_on_a_read_only_connection():
 
 
 def test_help_documents_the_verb_its_engines_and_the_pass_through():
-    help_text = coolify_module.__doc__ or ""
+    help_text = (coolify_module.__doc__ or "") + "".join(coolify_module.HELP_VERBS.values())
     assert "database create --engine <engine>" in help_text
     for engine in coolify_module.DATABASE_ENGINES:
         assert engine in help_text
