@@ -34283,15 +34283,25 @@ _HELP_WORD = re.compile(r"[a-z][a-z0-9-]*")
 
 
 def _help_menu_verbs(name: str, menu: str) -> list[str]:
-    """Each verb path a menu line names: the words after the capability's
-    name on a line that opens with it, up to the first that is not a word."""
+    """Each verb path a menu line names. A verb line is read by its left
+    column, the text before its first gap of two or more spaces: a line that
+    opens with the capability's name names the words after it, and an indented
+    line that opens with a lowercase word and carries a description column or
+    an argument placeholder names its own leading words, up to the first that
+    is not a word."""
     paths: list[str] = []
     for line in menu.splitlines():
-        words = line.split()
-        if len(words) < 2 or words[0] != name:
+        left = re.split(r"\s{2,}", line.strip(), maxsplit=1)
+        words = left[0].split()
+        if not words:
+            continue
+        if words[0] == name:
+            words = words[1:]
+        elif not (line[:1].isspace() and _HELP_WORD.fullmatch(words[0])
+                  and (len(left) > 1 or re.search(r"[<\[|]", left[0]))):
             continue
         path = []
-        for word in words[1:]:
+        for word in words:
             if not _HELP_WORD.fullmatch(word):
                 break
             path.append(word)
@@ -34312,9 +34322,7 @@ def _help_menu_problems(name: str, script: Path, menu: str, cwd: Path,
     if size > HELP_MENU_CEILING:
         problems.append(f"menu is {size} bytes, past the {HELP_MENU_CEILING}-byte "
                         f"ceiling; per-verb detail belongs in `{name} help <verb>`")
-    flagged = [line.strip() for line in menu.splitlines()
-               if line.strip().startswith("-") and _HELP_FLAG.match(line.strip())
-               or (line.split()[:1] == [name] and _HELP_FLAG.search(line))]
+    flagged = [line.strip() for line in menu.splitlines() if _HELP_FLAG.search(line)]
     if flagged:
         problems.append(f"menu carries per-flag detail on {len(flagged)} line(s), "
                         f"first {flagged[0][:80]!r}; a verb's flags belong in "
@@ -34338,7 +34346,7 @@ def _help_menu_problems(name: str, script: Path, menu: str, cwd: Path,
         return problems
     paths = _help_menu_verbs(name, menu)
     if not paths:
-        return [f"menu names no verb on a line opening with `{name}`"]
+        return ["menu names no verb line"]
 
     def probe(path: str) -> str | None:
         rc, out, _errs = _run_script(script, ["help", *path.split()], cwd=cwd, env=env,

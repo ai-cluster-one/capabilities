@@ -62,6 +62,11 @@ def _fixture(tmp_path: Path, break_: str | None = None) -> Path:
         page = "HELP_VERBS: dict[str, str] = {}"
     elif break_ == "flag in the menu":
         line = MENU_LINE + "      --loud                  shout it\n"
+    elif break_ == "verb line without the name and no page":
+        line, page = MENU_LINE.replace(f"{NAME} greet", f"greet{' ' * (len(NAME) + 1)}"), \
+            "HELP_VERBS: dict[str, str] = {}"
+    elif break_ == "flag in a prose line":
+        line = MENU_LINE + "  Options: pass --loud to shout it.\n"
     elif break_ == "past the ceiling":
         line = MENU_LINE + "".join(f"  {NAME} greet <who>  hello once more, {i}\n"
                                    for i in range(200))
@@ -102,6 +107,8 @@ def test_a_capability_whose_help_is_layered_passes(isolated):
 @pytest.mark.parametrize("break_, says", [
     ("no page", f"`{NAME} help greet`"),
     ("flag in the menu", "per-flag detail"),
+    ("verb line without the name and no page", f"`{NAME} help greet`"),
+    ("flag in a prose line", "per-flag detail"),
     ("past the ceiling", "ceiling"),
 ])
 def test_each_departure_from_the_layered_law_fails(isolated, break_, says):

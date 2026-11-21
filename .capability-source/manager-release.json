@@ -2,7 +2,7 @@
   "assets": {
     "DOCTRINE.md": "ec97a3db62521c82d2103595883575b8822e69a54fb1abfce5ec96468352fd7d",
     "ROUTINES.md": "6b6bee889e347d73745d0e404829376cd5f4b2838d1c9be1fc9ded25c017e46e",
-    "SHEBANG.md": "de90076f383e2254c93c8259b51ff6d872b81b8cb1c638e40bb43a0f79f461fa",
+    "SHEBANG.md": "12355fa6d64ce4c4a59a5f0267001157f0a26e23c33fe28e859f872003399ea8",
     "SOURCES.md": "0f7680ad11f43c628eb8d9b21c23456c8081fe6a61b30e8bca9bac5e6d8c492d",
     "TEMPLATE.md": "3d815f02a99716ee174cf512ede0951ade110a6cc0a8c91cf520bf63fc521f72",
     "contract/CHANGELOG.md": "005dcb70a1593bf1d71aa6fe49be2e5024a010574cdccf4b99f93d612c43fc68",
@@ -19,14 +19,14 @@
     "guides/store-connections.md": "6ee909e85f6d46d2b179959a9cec1d27f19691a5869a0320f9543a1210defbc6",
     "guides/store-upgrade.md": "6f4e4325dab598c15afa5981008b371e953e315c24054f07c3f49c0fcfecdc74",
     "guides/supabase.md": "69a0646cef54fad80ba7ddd68179612ce80d0aa79d9dd25a54c8bdf7043b5aaa",
-    "guides/surfaces.md": "0c0b21f29b4a99a1b133be2db6054c9fc5d119958a3d1178dd00ead29eb4ad6d",
+    "guides/surfaces.md": "6873e85bcf63c38816b07ccee0cd7a4317b3a203830e947f7b00beca93aa1443",
     "manager/CHANGELOG.md": "fa9cb904e9fa6c9946c69d8441deef142d4cc49d7417ca8636d2ad48614efbb0",
     "skill/SKILL.md": "e6ff760f6c9838e7651e9eeae5ef758d10bfcabc1f7daefc56be251131de8dc4"
   },
   "level": 1,
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "b7889e5475bb444d9ce58804a3b1dc176e8f37ba78529ca7846474daabd653c4"
+    "sha256": "8bec7cd0ff8eaa859d9c74f988ab13aa4256ccfe72bc143976714e4bead06959"
   },
   "requires": {
     "teams": 1

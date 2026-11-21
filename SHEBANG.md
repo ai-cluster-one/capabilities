@@ -93,7 +93,7 @@ HELP_VERBS = {
 }
 ```
 
-`capabilities audit` holds every capability to these layers (check `help`): the menu's size, a flag on any line of it, each verb it names answered by `help <verb>` with something other than the menu, and the pointer for an unknown verb. A catalogue bundle the manager names in `HELP_MENU_PENDING` predates this law and awaits its conversion: its findings are reported under `pending` rather than failing, it fails once it conforms until its name is taken out, and no name is ever added, so the set only shrinks.
+`capabilities audit` holds every capability to these layers (check `help`): the menu's size, a flag on any line of it, each verb it names answered by `help <verb>` with something other than the menu - a line names a verb when it opens with the capability's name, or when it is indented and opens with a lowercase verb path followed by its description or its arguments - and the pointer for an unknown verb. A catalogue bundle the manager names in `HELP_MENU_PENDING` predates this law and awaits its conversion: its findings are reported under `pending` rather than failing, it fails once it conforms until its name is taken out, and no name is ever added, so the set only shrinks.
 
 ## `stub` — the awareness line
 

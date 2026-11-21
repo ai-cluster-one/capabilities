@@ -110,7 +110,7 @@ The surface is reached in layers: the stub line, `help`, `help <verb>`, `guide <
 
 **Recommended** — every layer names the command that reaches the next. The contract renders the menu's pointer to `help <verb>`; a verb page that leans on a guide names `guide <topic>`, and a page whose answer feeds another verb names that verb.
 
-**Recommended** — under a nested noun, `help cards` lists the noun's verbs and `help cards create` prints that operation's contract; a forwarding capability passes the rest through, as `railwayc help <cmd>` reaches the child's own help.
+**Recommended** — a forwarding capability passes the rest of a `help <path>` through to the tool it wraps, as `railwayc help <cmd>` reaches the child's own help.
 
 ## When the capability is not a plain API wrapper
 
