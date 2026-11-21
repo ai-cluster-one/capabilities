@@ -14,7 +14,8 @@ surface. It is a pure CRUD / I/O adapter over the CallVA External API: voice
 agents, assets (prompts), calls, transcripts, recordings, analytics, custom
 fields, webhook schedules, automations (Windmill scripts), webhook logs, record
 actions, saved calls-list views, variables, settings, projects, phone numbers,
-and providers.
+providers, the tools an agent called in a call, the call allowance and the
+LiveKit connection.
 
 `agents config` is the one place callva reaches outside the External API: it
 calls the platform's call-configuration endpoint, POST /config/livekit, on the
@@ -52,10 +53,10 @@ CONNECTIONS
   field-groups, schedules, automations, actions, ui-views, issues, knowledge,
   projects, phone-numbers, and variables, the add/update/remove/toggle trigger
   actions on automations, `recordings purge`, `calls run-action`, `ui-views
-  set-default`, `phone-numbers bind`, the outbound `call`, and `agents config`,
-  which runs the agent's start-of-call automation) exits 4, and no
-  flag lifts the gate. `settings reveal` writes nothing but prints a secret, so
-  a read-only connection refuses it the same way.
+  set-default`, `phone-numbers bind`, `settings rotate-webhook-secret`, the
+  outbound `call`, and `agents config`, which runs the agent's start-of-call
+  automation) exits 4, and no flag lifts the gate. `settings reveal` writes
+  nothing but prints a secret, so a read-only connection refuses it the same way.
 
   Selection: --connection <id> (accepted anywhere on the command line).
   Unflagged, the registry's "default" pointer applies, else the sole entry;
@@ -140,7 +141,8 @@ Commands (`-f key=value` is repeatable for list filters):
   --data is the base object of an update and every flag above writes over it
   under that flag's own key: pass --data and --prompt together and the prompt
   is the one from --prompt, and --config beats a `config` key inside --data.
-  Keys --data carries that no flag names are sent as given.
+  Keys --data carries that no flag names are sent as given; test_variables,
+  {"mode": ..., "rows": [{"name", "value", "enabled"}]}, is one.
 
   An agent owns the conversation; a preset owns the speech stack it runs on.
   Voice, model, temperature, transcriber and languages live on the preset, not
@@ -218,6 +220,10 @@ Commands (`-f key=value` is repeatable for list filters):
   calls actions <call_id>             (the actions that apply to this call now)
   calls run-action <call_id> <action_id> [--inputs JSON | --inputs-file F]
   calls action-runs <call_id> [--per-page N] [--page N]
+  calls tool-calls <call_id>          (the tools the voice agent called in this
+                                       call, read from its transcript; the key
+                                       needs the tool_calls.read permission, and
+                                       one without it exits 2)
 
   actions list [--entity-type T]
   actions get <id>
@@ -270,6 +276,9 @@ Commands (`-f key=value` is repeatable for list filters):
   transcripts store <call_id> (--data JSON | --data-file F)
   transcripts delete <call_id>
   transcripts url <call_id>
+
+  A version-2 transcript carries the tool calls the agent made only for a key
+  holding tool_calls.read; any other key gets the messages alone.
 
   call <destination> --agent-id ID [--phone-number-id ID] [--call-id ID]
                      [--overrides JSON]
@@ -379,6 +388,19 @@ Commands (`-f key=value` is repeatable for list filters):
                                        connection. definition_id comes from
                                        `settings get`. The platform logs each
                                        reveal of a secret.)
+  settings rotate-webhook-secret      (replaces the project's agent webhook
+                                       signing secret with a newly generated
+                                       one; the answer may carry it. Write-
+                                       gated, and refused under CALLVA_HEADLESS)
+
+  allowance                           (the tenant's monthly call allowance:
+                                       limit, used, percent, period, and state
+                                       unlimited|within|warning|refused)
+
+  livekit connection                  (whether the tenant's LiveKit is reachable
+                                       and its URL, never its key; answered only
+                                       for a manually issued tenant-wide key,
+                                       and rate-limited per key)
 
   projects list [--is-active B] [--per-page N]
   projects get <id>
@@ -390,6 +412,8 @@ Commands (`-f key=value` is repeatable for list filters):
 
   create, update, put and delete need a tenant-wide key: a key bound to one
   project is refused. The API treats PUT and PATCH alike, as a partial update.
+  Read with a tenant-wide key, `projects list`, `phone-numbers list` and
+  `providers list` answer for the whole tenant.
 
   phone-numbers list [--is-active B] [--per-page N]
   phone-numbers get <id>
@@ -548,8 +572,12 @@ WRITE_VERBS = {     # domain verbs (resource [+ action]) that mutate the platfor
     "projects create", "projects update", "projects put", "projects delete",
     "phone-numbers create", "phone-numbers update", "phone-numbers delete",
     "phone-numbers bind",
+    "settings rotate-webhook-secret",
 }
 SECRET_READS = {"settings reveal"}   # write nothing, print a secret: a read-only connection refuses them too
+# Every verb whose answer may carry a secret: `callva routes` marks them and no
+# headless mode runs them. The ones that also write sit in WRITE_VERBS.
+SECRET_VERBS = SECRET_READS | {"settings rotate-webhook-secret"}
 # The one API route each domain verb calls, which `callva routes` prints and the
 # product's checks compare against its route export. Placeholders carry the name
 # the product's route file gives them. tests/test_routes.py runs every verb and
@@ -591,6 +619,7 @@ ROUTES = {
     "calls actions": ("GET", "/external/calls/{call}/actions"),
     "calls run-action": ("POST", "/external/calls/{call}/actions/{action}"),
     "calls action-runs": ("GET", "/external/calls/{call}/action-runs"),
+    "calls tool-calls": ("GET", "/external/calls/{call}/tool-calls"),
     "actions list": ("GET", "/external/actions"),
     "actions get": ("GET", "/external/actions/{action}"),
     "actions create": ("POST", "/external/actions"),
@@ -640,13 +669,13 @@ ROUTES = {
     "field-groups remove-field": ("DELETE", "/external/custom-field-groups/{groupId}/fields/{fieldId}"),
     "field-groups reorder-fields": ("POST", "/external/custom-field-groups/{groupId}/fields/reorder"),
     "field-groups update-field": ("PATCH", "/external/custom-field-groups/{groupId}/fields/{fieldId}"),
-    "schedules list": ("GET", "/external/webhook-schedule"),
-    "schedules get": ("GET", "/external/webhook-schedule/{id}"),
-    "schedules create": ("POST", "/external/webhook-schedule"),
-    "schedules update": ("PUT", "/external/webhook-schedule/{id}"),
-    "schedules delete": ("DELETE", "/external/webhook-schedule/{id}"),
-    "schedules preview": ("POST", "/external/webhook-schedule/{id}/preview"),
-    "schedules executions": ("GET", "/external/webhook-schedule/{id}/execution"),
+    "schedules list": ("GET", "/external/schedules"),
+    "schedules get": ("GET", "/external/schedules/{id}"),
+    "schedules create": ("POST", "/external/schedules"),
+    "schedules update": ("PUT", "/external/schedules/{id}"),
+    "schedules delete": ("DELETE", "/external/schedules/{id}"),
+    "schedules preview": ("POST", "/external/schedules/{id}/preview"),
+    "schedules executions": ("GET", "/external/schedules/{id}/executions"),
     "automations list": ("GET", "/external/automations"),
     "automations get": ("GET", "/external/automations/{id}"),
     "automations create": ("POST", "/external/automations"),
@@ -674,6 +703,9 @@ ROUTES = {
     "settings list": ("GET", "/external/settings/project"),
     "settings get": ("GET", "/external/settings/project"),
     "settings reveal": ("GET", "/external/settings/project/{definitionId}/reveal"),
+    "settings rotate-webhook-secret": ("POST", "/external/settings/project/agent-webhook-secret/generate"),
+    "allowance": ("GET", "/external/call-allowance"),
+    "livekit connection": ("GET", "/external/livekit/connection"),
     "projects list": ("GET", "/external/projects"),
     "projects get": ("GET", "/external/projects/{id}"),
     "projects create": ("POST", "/external/projects"),
@@ -780,7 +812,7 @@ def _routes_report() -> dict:
     """The declared map of API verbs. Local only: no connection, no network."""
     return {"routes": [
         {"verb": verb, "method": method, "path": path,
-         "writes": verb in WRITE_VERBS, "secret": verb in SECRET_READS}
+         "writes": verb in WRITE_VERBS, "secret": verb in SECRET_VERBS}
         for verb, (method, path) in ROUTES.items()]}
 
 
@@ -1596,6 +1628,11 @@ def calls_action_runs(args):
     return api("GET", f"/external/calls/{args.call_id}/action-runs", query=query)
 
 
+def calls_tool_calls(args):
+    r = api("GET", f"/external/calls/{args.call_id}/tool-calls")
+    return r.get("data", r)
+
+
 # ===================================================================
 # ACTIONS
 # ===================================================================
@@ -1963,7 +2000,7 @@ def field_groups_update_field(args):
 
 
 def schedules_list(_args):
-    result = api("GET", "/external/webhook-schedule")
+    result = api("GET", "/external/schedules")
 
     def slim_schedule(s):
         slimmed = _pick(s, ["id", "name", "webhook_url", "webhook_method", "is_active"])
@@ -1978,27 +2015,27 @@ def schedules_list(_args):
 
 
 def schedules_get(args):
-    r = api("GET", f"/external/webhook-schedule/{args.id}")
+    r = api("GET", f"/external/schedules/{args.id}")
     return r.get("data", r)
 
 
 def schedules_create(args):
-    r = api("POST", "/external/webhook-schedule", _data(args.payload))
+    r = api("POST", "/external/schedules", _data(args.payload))
     return r.get("data", r)
 
 
 def schedules_update(args):
-    r = api("PUT", f"/external/webhook-schedule/{args.id}", _data(args.payload))
+    r = api("PUT", f"/external/schedules/{args.id}", _data(args.payload))
     return r.get("data", r)
 
 
 def schedules_delete(args):
-    api("DELETE", f"/external/webhook-schedule/{args.id}")
+    api("DELETE", f"/external/schedules/{args.id}")
     return {"deleted": args.id}
 
 
 def schedules_preview(args):
-    r = api("POST", f"/external/webhook-schedule/{args.id}/preview",
+    r = api("POST", f"/external/schedules/{args.id}/preview",
             {"datetime": args.datetime})
     return r.get("data", r)
 
@@ -2007,7 +2044,7 @@ def schedules_executions(args):
     query = {}
     if args.per_page:
         query["per_page"] = str(args.per_page)
-    return api("GET", f"/external/webhook-schedule/{args.id}/execution", query=query)
+    return api("GET", f"/external/schedules/{args.id}/executions", query=query)
 
 
 # ===================================================================
@@ -2330,6 +2367,26 @@ def settings_reveal(args):
         _die(3, "not_set", f"setting {args.definition_id} holds no value")
     text = value if isinstance(value, str) else json.dumps(value)
     sys.stdout.write(text + "\n")
+
+
+def settings_rotate_webhook_secret(_args):
+    r = api("POST", "/external/settings/project/agent-webhook-secret/generate")
+    return r.get("data", r)
+
+
+# ===================================================================
+# CALL ALLOWANCE AND LIVEKIT CONNECTION
+# ===================================================================
+
+
+def allowance(_args):
+    r = api("GET", "/external/call-allowance")
+    return r.get("data", r)
+
+
+def livekit_connection(_args):
+    r = api("GET", "/external/livekit/connection")
+    return r.get("data", r)
 
 
 # ===================================================================
@@ -2709,6 +2766,8 @@ def build_parser():
     cl_arn.add_argument("call_id", help="Call UUID")
     cl_arn.add_argument("--per-page", type=int, help="Results per page (max 100)")
     cl_arn.add_argument("--page", type=int, help="Page number")
+    cl_tc = cl_sub.add_parser("tool-calls", help="The tools the voice agent called in this call, read from its transcript (the key needs tool_calls.read)")
+    cl_tc.add_argument("call_id", help="Call UUID")
 
     # --- actions ---
     act = subs.add_parser("actions", help="Manage record action definitions")
@@ -3014,6 +3073,15 @@ def build_parser():
     stg_get.add_argument("key", help="Setting key (e.g. timezone, date_format)")
     stg_rev = stg_sub.add_parser("reveal", help="Print one setting's value in the clear (refused on a read-only connection)")
     stg_rev.add_argument("definition_id", help="The setting's definition_id, from `settings get`")
+    stg_sub.add_parser("rotate-webhook-secret", help="Replace the project's agent webhook signing secret with a new one; the answer may carry it (refused on a read-only connection)")
+
+    # --- allowance ---
+    subs.add_parser("allowance", help="The tenant's monthly call allowance: limit, used, percent, period and state")
+
+    # --- livekit ---
+    lk = subs.add_parser("livekit", help="The tenant's LiveKit connection")
+    lk_sub = lk.add_subparsers(dest="action", required=True)
+    lk_sub.add_parser("connection", help="Whether the tenant's LiveKit is reachable, and its URL (a manually issued tenant-wide key only)")
 
     # --- projects ---
     proj = subs.add_parser("projects", help="Manage projects")
@@ -3103,7 +3171,7 @@ DISPATCH = {
         "update": calls_update, "delete": calls_delete, "batch": calls_batch,
         "webhook-logs": calls_webhook_logs, "automation-runs": calls_automation_runs,
         "actions": calls_actions, "run-action": calls_run_action,
-        "action-runs": calls_action_runs,
+        "action-runs": calls_action_runs, "tool-calls": calls_tool_calls,
     },
     "actions": {
         "list": actions_list, "get": actions_get, "create": actions_create,
@@ -3165,7 +3233,10 @@ DISPATCH = {
         "list": variables_list, "create": variables_create,
         "update": variables_update, "delete": variables_delete,
     },
-    "settings": {"list": settings_list, "get": settings_get, "reveal": settings_reveal},
+    "settings": {"list": settings_list, "get": settings_get, "reveal": settings_reveal,
+                 "rotate-webhook-secret": settings_rotate_webhook_secret},
+    "allowance": allowance,
+    "livekit": {"connection": livekit_connection},
     "projects": {
         "list": projects_list, "get": projects_get, "create": projects_create,
         "update": projects_update, "put": projects_put, "delete": projects_delete,
@@ -3245,14 +3316,14 @@ def _headless_managed_here() -> str | None:
 
 
 def _headless_verb_gate(verb: str, mode: str) -> None:
+    if verb in SECRET_VERBS:
+        _die(4, "secret_refused", f"{verb!r} prints a secret, and {HEADLESS_ENV} hands none out",
+             "Do not lift the gate yourself — ask the user; no flag or env value lifts it.")
     if verb in WRITE_VERBS:
         if mode != HEADLESS_READ_WRITE:
             _die(4, "read_only", f"{verb!r} writes, and {HEADLESS_ENV} is read-only",
                  "Do not lift the gate yourself — ask the user; no flag or env value lifts it.")
         _read_only_gate(f"write verb {verb!r}")
-    if verb in SECRET_READS:
-        _die(4, "secret_refused", f"{verb!r} prints a secret, and {HEADLESS_ENV} hands none out",
-             "Do not lift the gate yourself — ask the user; no flag or env value lifts it.")
 
 
 def _headless_close_local_paths(parser: argparse.ArgumentParser) -> None:

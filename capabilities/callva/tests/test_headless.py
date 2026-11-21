@@ -172,7 +172,7 @@ class HeadlessTest(HeadlessCase):
     def test_schedules_preview_stays_a_read(self):
         proc = self.run_cli("schedules", "preview", "S1", "2026-01-01T00:00:00Z")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.server.seen[0][:2], ("POST", "/api/v1/external/webhook-schedule/S1/preview"))
+        self.assertEqual(self.server.seen[0][:2], ("POST", "/api/v1/external/schedules/S1/preview"))
 
     # Each spelling argparse accepts for a flag naming a local path, on a verb the mode
     # would otherwise reach; `-` is stdin, and the file named here exists to be read.
@@ -239,6 +239,7 @@ class HeadlessReadWriteTest(HeadlessCase):
 
     def test_a_secret_verb_exits_4(self):
         self.assert_refused(self.run_cli("settings", "reveal", "D1"), "secret_refused")
+        self.assert_refused(self.run_cli("settings", "rotate-webhook-secret"), "secret_refused")
 
     def test_the_read_only_switch_closes_writes(self):
         proc = self.run_cli("agents", "delete", "A1", env=self.env(CAPABILITIES_READ_ONLY="1"))

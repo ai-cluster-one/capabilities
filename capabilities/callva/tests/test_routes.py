@@ -84,6 +84,7 @@ ARGV = {
     "calls actions": ["calls", "actions", "{call}"],
     "calls run-action": ["calls", "run-action", "{call}", "{action}"],
     "calls action-runs": ["calls", "action-runs", "{call}"],
+    "calls tool-calls": ["calls", "tool-calls", "{call}"],
     "actions list": ["actions", "list"],
     "actions get": ["actions", "get", "{action}"],
     "actions create": ["actions", "create", *DATA],
@@ -167,6 +168,9 @@ ARGV = {
     "settings list": ["settings", "list"],
     "settings get": ["settings", "get", "K"],
     "settings reveal": ["settings", "reveal", "{definitionId}"],
+    "settings rotate-webhook-secret": ["settings", "rotate-webhook-secret"],
+    "allowance": ["allowance"],
+    "livekit connection": ["livekit", "connection"],
     "projects list": ["projects", "list"],
     "projects get": ["projects", "get", "{id}"],
     "projects create": ["projects", "create", "--name", "N"],
@@ -247,10 +251,19 @@ class RoutesTest(unittest.TestCase):
             if route["method"] == "GET":
                 self.assertFalse(route["writes"], route["verb"])
 
-    def test_only_reveal_is_marked_secret(self):
+    def test_reveal_and_webhook_secret_rotation_are_the_secret_verbs(self):
         report = callva._routes_report()["routes"]
-        self.assertEqual([r["verb"] for r in report if r["secret"]], ["settings reveal"])
+        self.assertEqual({r["verb"] for r in report if r["secret"]},
+                         {"settings reveal", "settings rotate-webhook-secret"})
         self.assertEqual(callva.SECRET_READS, {"settings reveal"})
+        self.assertIn("settings rotate-webhook-secret", callva.WRITE_VERBS)
+
+    def test_schedules_call_the_canonical_path(self):
+        for verb, (_method, path) in callva.ROUTES.items():
+            if verb.startswith("schedules "):
+                self.assertTrue(path.startswith("/external/schedules"), (verb, path))
+        self.assertEqual(callva.ROUTES["schedules executions"],
+                         ("GET", "/external/schedules/{id}/executions"))
 
 
 class _Main:
@@ -333,6 +346,24 @@ class WriteGateTest(unittest.TestCase):
                 self.assertEqual(code, 4)
                 self.assertEqual(json.loads(err)["error"]["code"], "read_only")
                 self.assertEqual(main.requests, [])
+
+
+class RotateWebhookSecretTest(unittest.TestCase):
+    PATH = "/api/v1/external/settings/project/agent-webhook-secret/generate"
+
+    def test_posts_to_the_generate_route_and_prints_the_answer(self):
+        main = _Main(respond=lambda r: httpx.Response(200, json={"data": {"secret": "new"}}))
+        code, out, err = main.run("settings", "rotate-webhook-secret")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((main.requests[0].method, main.requests[0].url.path), ("POST", self.PATH))
+        self.assertEqual(json.loads(out), {"secret": "new"})
+
+    def test_read_only_connection_refuses_before_any_request(self):
+        main = _Main(allow_write=False)
+        code, out, err = main.run("settings", "rotate-webhook-secret")
+        self.assertEqual((code, out), (4, ""))
+        self.assertEqual(json.loads(err)["error"]["code"], "read_only")
+        self.assertEqual(main.requests, [])
 
 
 class RevealTest(unittest.TestCase):

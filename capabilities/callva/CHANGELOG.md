@@ -1,5 +1,9 @@
 # callva — change log
 
+## 2026-11-21 — `callva` reaches a call's tool calls, the call allowance, the LiveKit connection and webhook-secret rotation, and schedules use their canonical path
+
+New verbs: `calls tool-calls <call_id>` lists the tools the voice agent called in a call, read from its transcript, for a key holding the `tool_calls.read` permission; `allowance` answers the tenant's monthly call allowance; `livekit connection` answers whether the tenant's LiveKit is reachable and its URL, for a manually issued tenant-wide key; `settings rotate-webhook-secret` replaces the project's agent webhook signing secret. The rotation is write-gated, and `callva routes` marks it `secret`, so no `CALLVA_HEADLESS` mode runs it. Every `schedules` verb now calls `/external/schedules`, and `schedules executions` calls `/executions`; arguments and output are unchanged. The help says that a version-2 transcript carries tool calls only for a key holding `tool_calls.read`, that `agents update --data` carries `test_variables`, and that `projects list`, `phone-numbers list` and `providers list` answer for the whole tenant when read with a tenant-wide key.
+
 ## 2026-11-16 — `callva` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), CallVA, and Estonian (`et`), CallVA, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.
