@@ -26,7 +26,7 @@
       "level": 0,
       "lucide_icon": "messages-square",
       "path": "capabilities/agentrooms",
-      "payload_sha256": "5265a05d0729b7e7142d44dd4177ebd3f2ace72917762b0db58ac58bd6f565f6",
+      "payload_sha256": "1c39e25a7c04ac390c21f0731cbe92f32bf13e6a0ee2e672d238d43743f7d061",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room.",
@@ -42,7 +42,7 @@
           "title": "Комнаты агентов"
         }
       },
-      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
+      "version": "2026-11-21 — `agentrooms help` is the menu, and `agentrooms help <verb>` one verb's whole contract"
     },
     "agenttemplates": {
       "executable": [
