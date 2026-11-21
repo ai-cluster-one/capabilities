@@ -19,7 +19,10 @@ LiveKit connection.
 
 `agents config` is the one place callva reaches outside the External API: it
 calls the platform's call-configuration endpoint, POST /config/livekit, on the
-same base URL with the same key.
+same base URL with the same key. Since 2026-11-04 that endpoint sits behind the
+platform's voice-worker authentication: where the platform has a worker key
+configured, it may refuse an ordinary tenant API key there (exit 2), and the
+External API offers no replacement route.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
@@ -158,7 +161,9 @@ Commands (`-f key=value` is repeatable for list filters):
   resolved, and whatever the agent's custom_config_url automation returned.
   Producing it runs that automation and files a call record on the platform,
   left in status `starting`, so the verb is write-gated; run it only against an
-  agent whose start-of-call automation is safe to fire.
+  agent whose start-of-call automation is safe to fire. A tenant API key may be
+  refused there (exit 2) where the platform has a worker key configured; see
+  the top of this help.
 
   presets catalog
   presets describe <preset> [--group G]
