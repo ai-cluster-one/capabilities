@@ -1,5 +1,9 @@
 # macmail — change log
 
+## 2026-11-22 — `macmail help` is the menu, and `macmail help <verb>` one verb's whole contract
+
+`macmail help` printed the whole reference, about 4 KB with flags on 20 of its lines, and `macmail help <anything>` was refused by the parser with exit 2. It is now the short complete menu of SHEBANG.md, "Agent-first help is the surface", about 2.6 KB: the Automation grant macmail needs, every verb on one line saying what it answers, how an account is matched and the exit codes, then the contract verbs and guides the library renders, with no flag on any line. `macmail help <verb>` prints that verb's whole contract from `HELP_VERBS` - its synopsis with every flag, what each flag does and its default, the text the old help held for it, its output in text and with `--json`, its exit codes and an example - for accounts, mailboxes, read, search, show, links, attachments, fetch, draft and export, with the account and mailbox matching, the Automation grant and the read-only switch on the pages they govern. The old contract commands table is the library's, and macmail's own text for doctor, connections, guide, ids, refs and inventory follows the library's page for each. An unknown path exits 6 `unknown_verb` with nothing on stdout and the hint to run `macmail help`. The capability binds `capabilities-contract` 0.50 or later, which dispatches the layered help. No verb, flag, answer, JSON key or exit code changes.
+
 ## 2026-11-16 — `macmail` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Почта Apple, and Estonian (`et`), Apple'i Mail, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.

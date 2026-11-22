@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
@@ -13,74 +13,23 @@ No credentials on disk. Uses Mail.app's already-configured accounts. First
 invocation requires a one-time macOS Automation grant:
   System Settings → Privacy & Security → Automation → your terminal → Mail
 
-Commands:
-  macmail help
-      Print this document.
+Commands (human-readable by default, JSON on request):
+  macmail accounts                        the accounts Mail.app knows about
+  macmail mailboxes <account>             the mailboxes (folders) of an account
+  macmail read <account>                  recent messages from a mailbox, newest first
+  macmail search <account> <query>        messages in an account that match a query
+  macmail show <account> <message-id>     one message by Message-ID, headers and body
+  macmail links <account> <message-id>    the hyperlinks in a message's HTML body
+  macmail attachments <account> <message-id>  a message's attachments, listed or saved
+  macmail fetch <url>                     download a URL to disk, following redirects
+  macmail draft <account>                 compose a draft into Drafts; NO SEND
+  macmail export <account>                dump a mailbox to JSON
 
-  macmail doctor
-      Readiness — proves the macOS Automation grant by listing accounts.
-
-  macmail accounts [--json]
-      List accounts Mail.app knows about.
-
-  macmail mailboxes <account> [--json]
-      List mailboxes (folders) for an account.
-
-  macmail read <account> [--mailbox NAME] [--limit N] [--since ISO] [--json]
-      Read recent messages from a mailbox (newest first).
-
-  macmail search <account> <query> [--mailbox NAME]
-       [--field subject|sender|content|any] [--limit N] [--json]
-      Search within an account. Default field is 'any' (subject OR sender).
-      Content search is supported but slow.
-
-  macmail show <account> <message-id> [--json] [--html] [--raw]
-      Show one message by RFC-822 Message-ID, including headers + body.
-      --html prints the HTML body (link URLs intact); --raw prints the
-      full RFC-822 source.
-
-  macmail links <account> <message-id> [--match TEXT] [--json]
-      List hyperlinks (anchor text + URL) from a message's HTML body.
-      --match filters to links whose text or URL contains TEXT.
-
-  macmail attachments <account> <message-id> [--save DIR] [--index N] [--json]
-      List a message's attachments, or save them to DIR. --index N saves
-      only the attachment at that index.
-
-  macmail fetch <url> --out PATH [--header 'Name: value' ...] [--timeout SEC]
-      Download a URL to disk (follows redirects). Use to pull a PDF behind
-      a 'Download receipt' link surfaced by `mail links`.
-
-  macmail draft <account> --to ADDR [--to ADDR ...] [--cc ADDR] [--bcc ADDR]
-       --subject TEXT [--in-reply-to MESSAGE-ID] [--body TEXT | --body -]
-      Compose a draft and save it to the account's Drafts folder.
-      NO SEND. Use '--body -' to read body from stdin.
-
-  macmail export <account> --mailbox NAME --out PATH [--limit N] [--since ISO]
-      Dump a mailbox to JSON (for .assets/messages/email/<conv>/messages.json).
+  `macmail doctor` (below) is the readiness check: it proves the macOS
+  Automation grant by listing accounts.
 
 <account> matches case-insensitively against the account's Mail.app name or
 any of its configured email addresses.
-
-Contract commands (the same on every capability):
-  macmail stub                                 One-line awareness text.
-  macmail manifest --json                      Machine-readable declaration.
-  macmail connections                          Connection resolution report. macmail
-                                            drives the host's own Mail.app and
-                                            resolves nothing — no credential, no
-                                            endpoint — so the report is an empty
-                                            connections map, and no registry is
-                                            read or required.
-  macmail guide [<topic>]                      Guide topics / one guide body,
-                                            fetched live from the docs base.
-  macmail ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-       [--note <text>]                      (capabilities/macmail/identifiers.json,
-                                             or store rows once the agent moved).
-  macmail refs                                 Menu of the project's reference
-                                            files for this capability.
-  macmail inventory [--network]                What this capability holds in
-                                               this project (--network adds
-                                               remote detail).
 
 Exit codes:
   0  success
@@ -227,6 +176,287 @@ POST_INSTALL: list = []
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / "macmail" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+# The verb pages `macmail help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being
+# the menu. The contract library dispatches both and renders the contract
+# verbs' own pages, which the entries here for doctor, connections, guide,
+# ids, refs and inventory follow. A text several verbs own is one constant,
+# added to each of their pages.
+_HELP_ACCOUNT = """
+  <account>   matches case-insensitively against the account's Mail.app name
+              or any of its configured email addresses (a part of either
+              matches; the first account that matches is taken). No account
+              matching exits 1 (`jxa_failed`, "No Mail.app account matching").
+"""
+_HELP_MAILBOX = """
+  A mailbox NAME matches a mailbox of the account by its whole name,
+  case-insensitively, else by a part of it; no mailbox matching exits 1
+  (`jxa_failed`).
+"""
+_HELP_JSON = """
+  --json      the structured answer instead of the human-readable one
+"""
+_HELP_MESSAGE_ID = """
+  <message-id>  the message's RFC-822 Message-ID, as read and search print
+                it after `id:`; it is looked for in every mailbox of the
+                account. No message of that id exits 1 (`jxa_failed`,
+                "Message not found"), and so does a mailbox the search could
+                not read, since the message cannot then be known absent.
+"""
+_HELP_SOURCE = """
+  It reads the message's raw RFC-822 source through Mail.app; a source it
+  cannot read exits 1 with "Could not read raw source for message" on
+  stderr.
+"""
+_HELP_SUMMARY = """
+  A message summary is {id, messageId, subject, sender, dateReceived,
+  dateSent, readStatus, mailbox}, dates as ISO 8601.
+"""
+_HELP_JXA = """
+  Every Mail.app call runs through osascript (JXA) and needs the macOS
+  Automation grant (System Settings → Privacy & Security → Automation →
+  your terminal → Mail): without it exit 2 `automation_denied`; osascript
+  missing (not macOS) is exit 2 `osascript_missing`. A call that takes past
+  120 seconds exits 1 `jxa_timeout` - the request was not completed; do not
+  read it as an empty result, and narrow the mailbox, limit or date range.
+  Any other osascript failure exits 1 `jxa_failed`.
+"""
+_HELP_TAIL = """
+  Exit codes:
+  0  success
+  1  a domain failure - a message on stderr (deviations.md)
+  2  auth — the macOS Automation grant is missing; also an argument the
+     parser refuses, with its usage on stderr
+  3  not found (contract verbs)
+  4  policy refusal — effective project/global capability policy denies it;
+     ask the user which scope to enable, never enable it yourself
+  5  server / network (contract verbs)
+  6  input / validation
+"""
+HELP_VERBS = {
+    "doctor": """\
+For macmail:
+  Readiness — proves the macOS Automation grant by listing accounts through
+  Mail.app itself. It takes no connection: macmail has no credential.
+
+  Output: {ok: true, accounts: <the number of accounts>}.
+
+  Exit codes: 0 ready; 2 automation_denied (System Settings → Privacy &
+  Security → Automation → your terminal → Mail), osascript_missing; 1
+  jxa_timeout, jxa_failed; 4 policy.
+""",
+    "connections": """\
+For macmail:
+  Connection resolution report. macmail drives the host's own Mail.app and
+  resolves nothing — no credential, no endpoint — so the report is an empty
+  connections map, and no registry is read or required.
+""",
+    "guide": """\
+For macmail:
+  Guide topics / one guide body, fetched live from the docs base. None ship
+  yet.
+""",
+    "ids": """\
+For macmail:
+  The project identifiers envelope (capabilities/macmail/identifiers.json,
+  or store rows once the agent moved); `set` takes [--note <text>].
+""",
+    "refs": """\
+For macmail:
+  Menu of the project's reference files for this capability.
+""",
+    "inventory": """\
+For macmail:
+  What this capability holds in this project (--network adds remote
+  detail). macmail declares no inventory of its own.
+""",
+    "accounts": """\
+macmail accounts [--json]
+
+  List accounts Mail.app knows about.
+""" + _HELP_JSON + """
+  Output: `# N account(s) in Mail.app`, then per account its name
+  (`[disabled]` marking one that is not enabled), its full name and its
+  email(s). With --json: [{name, id, enabled, emailAddresses, userName,
+  fullName}].
+""" + _HELP_JXA + """
+  Example: macmail accounts --json
+""" + _HELP_TAIL,
+    "mailboxes": """\
+macmail mailboxes <account> [--json]
+
+  List mailboxes (folders) for an account.
+""" + _HELP_ACCOUNT + _HELP_JSON + """
+  Output: `# <account>  (N mailboxes)`, then one mailbox per line with
+  `[N unread]` where it holds unread mail. With --json: {account,
+  mailboxes: [{name, unreadCount}]}.
+""" + _HELP_JXA + """
+  Example: macmail mailboxes work --json
+""" + _HELP_TAIL,
+    "read": """\
+macmail read <account> [--mailbox NAME] [--limit N] [--since ISO] [--json]
+
+  Read recent messages from a mailbox (newest first).
+""" + _HELP_ACCOUNT + """
+  --mailbox NAME   the mailbox to read (default INBOX)
+  --limit N        at most N messages (default 50)
+  --since ISO      ISO datetime; stop at this date - reading ends at the
+                   first message received before it
+""" + _HELP_JSON + _HELP_MAILBOX + """
+  Output: `# <account>:<mailbox>  (N messages)`, then per message
+  `[received] sender` (● marking it unread), its subject and `id:
+  <Message-ID>`. With --json: [<message summary>, ...].
+""" + _HELP_SUMMARY + _HELP_JXA + """
+  Example: macmail read work --mailbox INBOX --limit 20 --since 2026-11-01
+""" + _HELP_TAIL,
+    "search": """\
+macmail search <account> <query> [--mailbox NAME]
+     [--field subject|sender|content|any] [--limit N] [--json]
+
+  Search within an account. Default field is 'any' (subject OR sender).
+  Content search is supported but slow.
+""" + _HELP_ACCOUNT + """
+  <query>                           the text a message's field contains
+  --mailbox NAME                    restrict to one mailbox (default: all)
+  --field subject|sender|content|any  which field to match (default any)
+  --limit N                         at most N hits (default 100)
+""" + _HELP_JSON + _HELP_MAILBOX + """
+  A mailbox the search fails on makes the whole search fail: exit 1
+  `incomplete_search`, naming the mailboxes, since missing messages cannot
+  be told from search failures. Narrow scope with --mailbox, or check
+  mailbox access.
+
+  Output: `# search '<query>' in <account>:<mailbox or all mailboxes>  (N
+  hits)`, then per hit `[received] (mailbox) sender`, its subject and `id:
+  <Message-ID>`. With --json: [<message summary>, ...].
+""" + _HELP_SUMMARY + _HELP_JXA + """
+  Example: macmail search work invoice --field subject --limit 10
+""" + _HELP_TAIL,
+    "show": """\
+macmail show <account> <message-id> [--json] [--html] [--raw]
+
+  Show one message by RFC-822 Message-ID, including headers + body.
+  --html prints the HTML body (link URLs intact); --raw prints the full
+  RFC-822 source.
+""" + _HELP_ACCOUNT + _HELP_MESSAGE_ID + _HELP_JSON + """
+  --html        print the raw HTML body (preserves link URLs), or `(no HTML
+                body in this message)`
+  --raw         print the full raw RFC-822 source
+  --raw is taken over --html, and either prints its text whatever --json
+  says.
+
+  Output: From, To, Cc (where there is one), Subject, Date, Id and Mailbox
+  lines, a blank line, then the body. With --json: the message summary with
+  toRecipients and ccRecipients ([{address, name}]), replyTo, content and
+  allHeaders.
+""" + _HELP_SUMMARY + _HELP_SOURCE + _HELP_JXA + """
+  Example: macmail show work '<abc123@example.com>' --html
+""" + _HELP_TAIL,
+    "links": """\
+macmail links <account> <message-id> [--match TEXT] [--json]
+
+  List hyperlinks (anchor text + URL) from a message's HTML body.
+  --match filters to links whose text or URL contains TEXT.
+""" + _HELP_ACCOUNT + _HELP_MESSAGE_ID + """
+  --match TEXT   only links whose text or URL contains TEXT, case-insensitively
+""" + _HELP_JSON + """
+  Output: per link `[i] text` and its URL, or `(no links found)`. With
+  --json: [{text, url}].
+""" + _HELP_SOURCE + _HELP_JXA + """
+  Example: macmail links work '<abc123@example.com>' --match receipt
+""" + _HELP_TAIL,
+    "attachments": """\
+macmail attachments <account> <message-id> [--save DIR] [--index N] [--json]
+
+  List a message's attachments, or save them to DIR. --index N saves only
+  the attachment at that index.
+""" + _HELP_ACCOUNT + _HELP_MESSAGE_ID + """
+  --save DIR    save attachments to this directory instead of listing; it
+                is made where missing, and each file is named from the
+                attachment's filename, made safe (attachment-<i> where it
+                has none)
+  --index N     with --save, only save the attachment at this index; without
+                --save it changes nothing
+""" + _HELP_JSON + """
+  Output, listing: per attachment `[i] filename  content-type  N bytes
+  (disposition)`, or `(no attachments)`; with --json [{index, filename,
+  content_type, disposition, size}]. Saving: `saved [i] → path  (N bytes)`
+  per file, or `(no matching attachments to save)`; with --json [{index,
+  path, size}].
+""" + _HELP_SOURCE + _HELP_JXA + """
+  Example: macmail attachments work '<abc123@example.com>' --save ~/Downloads/receipts --index 0
+""" + _HELP_TAIL,
+    "fetch": """\
+macmail fetch <url> --out PATH [--header 'Name: value' ...] [--timeout SEC]
+
+  Download a URL to disk (follows redirects). Use to pull a PDF behind a
+  'Download receipt' link surfaced by `mail links`. It does not touch
+  Mail.app.
+
+  <url>                    the URL to download
+  --out PATH               where to write it; required, its folder made where
+                           missing
+  --header 'Name: value'   extra request header; repeat for many (a value
+                           with no colon is ignored)
+  --timeout SEC            seconds to wait for the server (default 60)
+
+  Output: `Fetched N bytes → path`, then `(final URL: ...)` where it was
+  redirected and `content-type: ...` where the server named one. A download
+  that fails exits 1 with `fetch failed: <reason>` on stderr.
+
+  Example: macmail fetch https://example.com/receipt.pdf --out ~/Downloads/receipt.pdf
+""" + _HELP_TAIL,
+    "draft": """\
+macmail draft <account> --to ADDR [--to ADDR ...] [--cc ADDR] [--bcc ADDR]
+     --subject TEXT [--in-reply-to MESSAGE-ID] [--body TEXT | --body -]
+
+  Compose a draft and save it to the account's Drafts folder. NO SEND. Use
+  '--body -' to read body from stdin.
+""" + _HELP_ACCOUNT + """
+  --to ADDR                  recipient address; required, repeat for
+                             multiple
+  --cc ADDR                  Cc address; repeatable
+  --bcc ADDR                 Bcc address; repeatable
+  --subject TEXT             the subject; required
+  --in-reply-to MESSAGE-ID   Message-ID to thread this as a reply to; the
+                             draft is Mail.app's reply to that message (not
+                             to all), and no message of that id exits 1
+  --body TEXT | --body -     body text; '-' reads it from stdin; without it
+                             the body is empty
+
+  A new draft's sender is the account's first email address, with its full
+  name where it has one, and the From line names it; an account with no
+  email address exits 1.
+
+  Output: `Draft saved to <account> Drafts folder.`, its From, To, Subject
+  lines (Cc, Bcc and Reply to where given), and `Review in Mail.app →
+  Drafts. No email was sent.`
+
+  A draft lands in the account's Drafts folder, a change to the mail
+  system, so the read-only switch refuses it (exit 4).
+""" + _HELP_JXA + """
+  Example: macmail draft work --to someone@example.com --subject "Re: invoice" --body -
+""" + _HELP_TAIL,
+    "export": """\
+macmail export <account> --mailbox NAME --out PATH [--limit N] [--since ISO]
+
+  Dump a mailbox to JSON (for .assets/messages/email/<conv>/messages.json).
+""" + _HELP_ACCOUNT + """
+  --mailbox NAME   the mailbox to export; required
+  --out PATH       the JSON file to write; required, its folder made where
+                   missing
+  --limit N        at most N messages (default 0, every one)
+  --since ISO      ISO datetime; stop at this date
+""" + _HELP_MAILBOX + """
+  The file holds {account, mailbox, exported_at, message_count, messages:
+  [...]}, each message as `show --json` gives it. Output: `Exported N
+  messages from <account>:<mailbox> → path`.
+""" + _HELP_JXA + """
+  Example: macmail export work --mailbox INBOX --out .assets/messages/email/work/messages.json --limit 200
+""" + _HELP_TAIL,
+}
 
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -831,7 +1061,7 @@ def main():
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("help", help="Print the full usage contract.")
+    sub.add_parser("help", help="Print the menu; `macmail help <verb>` gives one verb's contract.")
     sub.add_parser("doctor", help="Prove the macOS Automation grant.")
 
     pa = sub.add_parser("accounts", help="List Mail.app accounts.")
@@ -909,7 +1139,8 @@ def main():
     args = p.parse_args()
 
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        # The contract dispatches `help` and `help <verb>` before the parser.
+        _cmd_help()
         return
     if args.cmd == "doctor":
         cmd_doctor()

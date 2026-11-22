@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.12.3",
 # ]
@@ -18,217 +18,55 @@ constant block that says how to record and how to search; no entry is in it,
 and every one is one search away.
 Agent-invoked: every answer is JSON or plain lines on stdout.
 
-Memory lives in the PostgreSQL the project resolves (STORE). Without a store
-there is no memory: every verb that reads or writes it exits 6
-`store_not_configured`, and nothing is kept aside to send later.
+Memory lives in the PostgreSQL the project resolves (STORE, on `memory help
+migrate`). Without a store there is no memory: every verb that reads or
+writes it exits 6 `store_not_configured`, and nothing is kept aside to send
+later.
 
 WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
-  memory add <text|-> --title TEXT [--pin] [--scope NAME]
-      Record one entry; `-` reads the text from stdin. The title is one line of
-      at most 200 characters; the text at most 20000. --pin keeps it out of
-      every grooming pass, never merged or dropped by one; a rule every
-      session must hold belongs in the project's doctrine, since a session
-      reaches an entry through search. --scope names a narrower audience (a
-      room, a person); the window and grooming take project-wide entries
-      only. Safe to repeat: an active entry with the same title, text and scope is
-      answered with `"created": false`.
-  memory supersede <id> [<id>...] --with <text|-> --title TEXT
-                   [--with <text> --title TEXT ...] [--reason TEXT] [--pin]
-      Replace entries with new ones, paired --with/--title in order. Each
-      replaced entry turns `superseded` and points at the first new entry. A
-      replaced pin carries over to the new entries; --pin pins them anyway.
-      Not idempotent: a repeat finds the old entries already superseded and
-      exits 6 `not_active`.
-  memory drop <id> --reason TEXT [--to REF] [--purge]
-      Retire an entry that no longer holds; --to names where its content went
-      (a doctrine file, a routine, a task) when it was promoted. It stays in
-      the store and in `list --status dropped`. --purge is the one hard
-      delete, for a secret written by mistake: it takes the whole id, never a
-      prefix, removes the text for good and leaves the trail an event without
-      it.
-  memory pin <id> | memory unpin <id>
-      Pin or unpin an active entry, which keeps it out of grooming passes or
-      returns it to them; repeating it changes nothing.
+  memory add <text|->           record one entry
+  memory supersede <id> [<id>...]  replace entries with new ones
+  memory drop <id>              retire an entry that no longer holds
+  memory pin <id>               keep an active entry out of grooming passes
+  memory unpin <id>             return a pinned entry to grooming passes
 
   An entry's text is never edited in place; the store refuses it. An id is the
   whole id or its first six or more characters, as `list` shows it. A write
   touches only this project's memory: an entry of another project exits 4
   `foreign_project`.
 
-READING  (plain lines by default; --json gives the stable structured answer)
-  memory list [--status active|superseded|dropped|all] [--pinned|--unpinned]
-              [--scope NAME|-] [--since WHEN] [--limit N] [--project ID] [--json]
-      Index lines, newest first: `[id] date · title`, with (pinned), a scope,
-      or what replaced it. Active entries by default; --scope - is the
-      project-wide ones. --limit defaults to 50; a capped answer says how many
-      matched.
-  memory show <id> [--project ID] [--json]
-      One entry whole, with its trail.
-  memory search <terms> [--all] [--limit N] [--project ID] [--json]
-      Index lines for every active entry matching the terms, best match first:
-      PostgreSQL full-text search over title and text in the `simple`
-      configuration (no stemming, any language; quoted phrases, `or` and `-`
-      exclusion work as in a web search), plus a plain substring match. --all
-      includes superseded and dropped entries.
-  memory log [--since WHEN] [--limit N] [--project ID] [--json]
-      The trail, newest first: every add, supersede, drop, reactivation, pin,
-      purge, grooming pass and its undo, with who, on which node, and why.
-  memory status [--json]
-      Counts by status, writes in the last 7 and 30 days (so a drop in writing
-      shows), and grooming passes.
-
-  WHEN is a date (2026-10-01), a moment (2026-10-01T12:00:00Z), or an age:
-  30m, 12h, 7d, 2w. --project reads another project's memory by its id; it is
-  refused on every write.
-
-THE BLOCK
-  The manifest's `contribution` carries the block itself, and the capabilities
-  manager composes it after this capability's stub line where memory is
-  enabled, from the manifest it recorded at install. The block is constant:
-  no entry, title, count or moment is in it, nothing renders it, and every
-  session of every project carries the same bytes. In this order:
-    1. A directive: this memory takes the place of the harness's built-in
-       memory in the project.
-    2. How to record, with `memory add`, and what belongs in an entry and
-       what does not.
-    3. How to search, with `memory search`, before relying on what seems
-       known.
-    4. How to search deeply: a broad question handed to a subagent that
-       returns only its conclusion.
-    5. Reading one entry with `memory show`, and `memory help` for every
-       command.
+READING  (plain lines by default, the stable structured answer as JSON on
+          request; each read may name another project's memory by its id)
+  memory list                   index lines of the entries, newest first
+  memory show <id>              one entry whole, with its trail
+  memory search <terms>         index lines of every active match, best first
+  memory log                    the trail of every change, newest first
+  memory status                 counts, recent writes and grooming passes
 
 CONSOLIDATION
-  memory groom [--apply | --if-due | --undo <pass>] [--trigger TEXT]
-      One grooming pass over the active, unpinned project-wide entries of the
-      window, through one agent turn on the harness runner with the project's
-      groom_profile, groom_budget_usd, groom_max_turns and
-      groom_timeout_seconds. The turn reads the entries and answers a plan; it
-      has no tools and writes nothing. The plan merges related or
-      contradicting entries into one entry that supersedes its sources, and
-      drops what no longer holds. Every operation is checked before anything
-      is applied: a merge takes two or more sources, keeps every quotation of
-      its sources word for word, and touches no pinned entry; a drop names an
-      entry the pass may touch; nothing is in two operations. What fails a
-      check is refused and said; nothing is ever deleted and no single entry
-      is rewritten. Bare, the pass is a dry run: it prints the plan and
-      changes nothing, and still spends the model turn. --apply applies the
-      checked plan in one transaction under one pass id, holding the store's
-      lease that keeps a second pass for the project out on every machine
-      (exit 7 `groom_running`); it needs no session connection, and a store
-      reached through a transaction pooler alone serves it. --undo <pass> drops what the pass made and
-      reactivates what it superseded or dropped, unless a later change
-      overtook it (exit 6 `pass_overtaken`, naming the pass to undo first).
-      A model that is not logged in exits 2 `model_not_authenticated`.
-      --trigger TEXT records why the pass ran on its trail event.
-  memory groom --if-due
-      The scheduled form: a pass applied as --apply applies it, run only when
-      one is due, and otherwise exit 0 with {"due": false, "why", "window"}
-      naming the reason and the window's measure. A pass is due when
-      consolidate is true, the window no longer fits (SETTINGS), no pass ran
-      for the project within groom_interval_hours on any machine, nothing was
-      written for quiet_minutes, no other pass holds the project, and the
-      profile's harness is installed and logged in headless. A run that is
-      not due spends no model turn. Its trail event says "scheduled: the
-      window no longer fits" unless --trigger names another reason. Entries
-      that age out of the window are not touched: they stay active and
-      searchable.
+  memory groom                  one grooming pass: a dry run, applied, run
+                                when due on a schedule, or undone
 
-  Schedule the scheduled form as an automation of the project, hourly for
-  instance; `memory guide service` walks it through:
-    printf '#!/bin/sh\\nexec memory groom --if-due\\n' > memory-groom.sh
-    automations set memory-groom --body memory-groom.sh \\
-        --schedule "0 * * * *" --timezone UTC \\
-        --description "consolidate memory when its window no longer fits"
-  Every machine may run it: the store's lease keeps a second pass out, and
-  the interval counts passes on every machine.
+  Schedule the pass as an automation of the project, hourly for instance;
+  `memory help groom` gives the automation and `memory guide service` walks
+  it through.
 
 MOVING IN AND OUT
-  memory adopt [ROOT...] [--apply] [--pin-titles REGEX] [--timezone ZONE]
-      Carry existing memory folders into the store. ROOTs are project roots;
-      with none, the project roots named by the machine service opt-in lists
-      under $XDG_CONFIG_HOME/*/service/projects.{json,toml}. A root's memory
-      folder is `memory` inside the body root `capabilities path --json` names
-      in a folder with a legacy binding, else <root>/memory. Every file is one day of
-      `## [HH:MM — ]title` sections. The day and the HH:MM are read in the
-      machine's local zone, or in the IANA zone --timezone names (each date
-      taking that zone's offset on it), and every entry's dated_from says which.
-      A `<!-- contextkit-memory-id: <hex> -->`
-      line names the id of the section after it: it is never an entry nor part
-      of one, and the id, recorded on the carried entry, is what makes it the
-      same entry on every machine whatever its heading says by then. The
-      answer gives every parse decision per entry, every file not read, and
-      what it carried, and claims nothing more. A project whose
-      policy disables memory is skipped; one without a durable id is skipped
-      naming `capabilities init`. Bare, a dry run. --apply enables memory for
-      each other project with `capabilities enable memory --project` and
-      carries each entry with its original date. Idempotent across machines:
-      an entry carried once is answered `already` everywhere after.
-      --pin-titles pins the entries whose title matches. The folder itself is
-      left as it is.
-  memory export [--out PATH] [--project ID]
-      Every entry of the project, in every status, with the whole trail, as
-      one JSON document; --out writes it to PATH instead.
+  memory adopt [ROOT...]        carry existing memory folders into the store
+  memory export                 every entry and the whole trail, as JSON
 
-SETTINGS  (capabilities/memory/service/settings.json, project over global
-           $XDG_CONFIG_HOME/memory/service/settings.json, key by key; for an
-           agent whose records moved into the store, its rows and the global
-           rows, read and written with `memory settings`)
-  The window is the active, unpinned project-wide entries of the last
-  window_days, topped up to min_entries with older ones; it fits while it
-  holds at most max_entries and, each entry written out at entry_chars, at
-  most block_chars characters. A window that no longer fits is what a
-  grooming pass is for.
-  window_days 30 (1-3650)       entries this recent are the window
-  min_entries 5 (0-200)         a dormant project's window still holds its newest five
-  max_entries 30 (1-500)        the most entries the window holds and still fits
-  block_chars 12000 (2000-16000)  the most characters the window takes and still fits
-  entry_chars 1200 (200-8000, at most half of block_chars)  one entry's text, as measured
-  consolidate true              grooming passes by `memory groom --if-due`
-  quiet_minutes 30 (0-1440)     no pass until the project is this quiet
-  groom_interval_hours 24 (1-720)  at most one pass per project in this time
-  groom_profile "claude-read"   the harness profile a pass runs on
-  groom_budget_usd 1.0 (0.01-50), groom_max_turns 4 (1-50) on claude
-  groom_timeout_seconds 900 (60-7200)
-  "version": 1 may stand beside them; any other key is refused (exit 6
-  `settings_invalid`).
+THE BLOCK
+  The constant block the manager composes after this capability's stub line,
+  from the manifest's `contribution`: what it holds and in what order is on
+  `memory help manifest`.
 
-STORE
-  The tables are memory_entries and memory_events in the schema the
-  project's store setting names, migrated under the `memory` ledger: the
-  AGENTKIT_DB_* keys in the project's .env.local and .env, then the same keys
-  in the environment, then the machine's store setting that `capabilities
-  store set` writes; the first level that answers is used whole. The store
-  refuses an edit of an entry's text, a status move other than active to
-  superseded or dropped and back, any change to the trail, and a delete other
-  than `drop --purge`. Every change raises the project's version of the
-  channel `memory_changed` in the store's change versions (schema_channel,
-  scope the project id) in the writer's own transaction, so a reader follows
-  the version rather than listening. For a reader of an earlier release the
-  store also sends the notification `memory_changed` as the change commits,
-  with the payload {"schema", "agent_id", "kind", "entry", "event"} - ids
-  only, never text.
-
-CONTRACT VERBS
-  memory help                  this text
-  memory doctor                store, tables, identity, settings and
-                               consolidation, in this project;
-                               until 2027-01-05 it warns (`earlier_release`,
-                               exit unchanged) of an earlier release grooming
-                               against the store, naming its machine
-  memory connections           none: memory reaches no system of its own
-  memory stub                  the one-line awareness text
-  memory manifest --json       the declaration, with `contribution`
-  memory guide [<topic>]       how-to guides
-  memory ids list|get|set|rm   this project's identifiers
-  memory refs                  this project's references
-  memory inventory [--network] the empty answer: memory keeps nothing on
-                               this machine; the entries are the store's
-                               (`memory status`)
-  memory migrate [status]      bring the tables up to this version / report
+SETTINGS
+  The window and the grooming pass are set per project over the global
+  settings, key by key: every key, its default and its range is on `memory
+  help settings`.
 
 I/O
-  Success is JSON on stdout, or plain lines for a read without --json;
+  Success is JSON on stdout, or plain lines for a read not asked for JSON;
   failure is {"error": {"code", "message", "hint"?}} on stderr.
 
 EXIT CODES
@@ -379,6 +217,466 @@ CONTRIBUTION = {"markdown": BLOCK}
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# The verb pages `memory help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, manifest, guide,
+# ids, refs, inventory, settings and migrate follow. A text several verbs own
+# is one constant, added to each of their pages.
+_HELP_WRITE = """
+  A write: refused, exit 4 `read_only_switch`, under CAPABILITIES_READ_ONLY.
+  An entry's text is never edited in place; the store refuses it. A write
+  touches only this project's memory: an entry of another project exits 4
+  `foreign_project`. It needs the project's durable id (exit 6
+  `no_project_identity` without one; run `capabilities init`).
+"""
+_HELP_ID = """
+  An id is the whole id or its first six or more characters, as `list` shows
+  it: exit 6 `input` for what is no id, 3 `not_found` where no entry of this
+  project starts with it, 6 `ambiguous_id` where it names more than one.
+"""
+_HELP_ENTRY = """
+  An entry in an answer is {id, short, seq, project_id, scope, title, pinned,
+  status, superseded_by, destination, created_at, created_by, node, origin},
+  with `chars` (the text's length) in an index answer, or `body` and
+  `body_hash` where the entry is answered whole, and `merged` for an entry a
+  grooming pass made.
+"""
+_HELP_READ = """
+  --json            the stable structured answer instead of plain lines
+  --project ID      read another project's memory by its id; it is refused
+                    on every write (exit 6 `input` for an empty one)
+"""
+_HELP_WHEN = """
+  WHEN is a date (2026-10-01), a moment (2026-10-01T12:00:00Z), or an age:
+  30m, 12h, 7d, 2w; anything else exits 6 `input`. --limit takes a whole
+  number from 1 to 1000 (exit 6 `invalid_arguments` otherwise).
+"""
+_HELP_STORE = """
+  Without a store there is no memory: exit 6 `store_not_configured`, and
+  nothing is kept aside to send later; a store that stops answering exits 5
+  `store_unreachable`, and a change the store refuses exits 6
+  `refused_by_store`.
+"""
+_HELP_TAIL = """
+I/O
+  Success is JSON on stdout, or plain lines for a read without --json;
+  failure is {"error": {"code", "message", "hint"?}} on stderr. Every verb
+  exits 4 when memory is not enabled in the project; an argument the parser
+  refuses exits 6 `invalid_arguments`.
+"""
+HELP_VERBS = {
+    "doctor": """\
+For memory:
+  Store, tables, identity, settings and consolidation, in this project. It
+  takes no connection: memory has none. Until 2027-01-05 it warns
+  (`earlier_release`, exit unchanged) of an earlier release grooming against
+  the store, naming its machine.
+
+  Output: {ok, project: {ok, id, identity}, settings: {ok, path, values},
+  store: {ok, setting, tables, pending, note?}, earlier_release?: {ok,
+  holders, retires, warning, hint}, consolidation: {ok, on, profile?,
+  reason?}}; a finding that fails carries error and hint.
+
+  Exit codes: 0 ready; the first failing finding's: 6 no project identity,
+  settings that do not load, no store configured or tables not current; 5
+  the store does not answer.
+
+  Example: memory doctor
+""",
+    "connections": """\
+For memory:
+  None: memory reaches no system of its own. The store is the project's,
+  resolved through the shared library, so the answer is {"default": null,
+  "connections": {}}.
+""",
+    "manifest": """\
+For memory:
+  The declaration, with `contribution`: the block itself, as
+  {"markdown": ...}.
+
+  THE BLOCK
+  The manifest's `contribution` carries the block itself, and the capabilities
+  manager composes it after this capability's stub line where memory is
+  enabled, from the manifest it recorded at install. The block is constant:
+  no entry, title, count or moment is in it, nothing renders it, and every
+  session of every project carries the same bytes. In this order:
+    1. A directive: this memory takes the place of the harness's built-in
+       memory in the project.
+    2. How to record, with `memory add`, and what belongs in an entry and
+       what does not.
+    3. How to search, with `memory search`, before relying on what seems
+       known.
+    4. How to search deeply: a broad question handed to a subagent that
+       returns only its conclusion.
+    5. Reading one entry with `memory show`, and `memory help` for every
+       command.
+
+  Example: memory manifest --json
+""",
+    "guide": """\
+For memory:
+  How-to guides: adoption (moving a memory folder into the store with
+  `memory adopt`), service (consolidating memory and scheduling the grooming
+  pass), writing (writing memory entries).
+
+  Example: memory guide service
+""",
+    "ids": """\
+For memory:
+  This project's identifiers.
+""",
+    "refs": """\
+For memory:
+  This project's references.
+""",
+    "inventory": """\
+For memory:
+  The empty answer: memory keeps nothing on this machine; the entries are
+  the store's (`memory status`).
+""",
+    "migrate": """\
+For memory:
+  Bring the tables up to this version / report.
+
+  STORE
+  The tables are memory_entries and memory_events in the schema the
+  project's store setting names, migrated under the `memory` ledger: the
+  AGENTKIT_DB_* keys in the project's .env.local and .env, then the same keys
+  in the environment, then the machine's store setting that `capabilities
+  store set` writes; the first level that answers is used whole. The store
+  refuses an edit of an entry's text, a status move other than active to
+  superseded or dropped and back, any change to the trail, and a delete other
+  than `drop --purge`. Every change raises the project's version of the
+  channel `memory_changed` in the store's change versions (schema_channel,
+  scope the project id) in the writer's own transaction, so a reader follows
+  the version rather than listening. For a reader of an earlier release the
+  store also sends the notification `memory_changed` as the change commits,
+  with the payload {"schema", "agent_id", "kind", "entry", "event"} - ids
+  only, never text.
+
+  Example: memory migrate status
+""",
+    "settings": """\
+For memory:
+  SETTINGS  (capabilities/memory/service/settings.json, project over global
+             $XDG_CONFIG_HOME/memory/service/settings.json, key by key; for an
+             agent whose records moved into the store, its rows and the global
+             rows, read and written with `memory settings`)
+  The window is the active, unpinned project-wide entries of the last
+  window_days, topped up to min_entries with older ones; it fits while it
+  holds at most max_entries and, each entry written out at entry_chars, at
+  most block_chars characters. A window that no longer fits is what a
+  grooming pass is for.
+  window_days 30 (1-3650)       entries this recent are the window
+  min_entries 5 (0-200)         a dormant project's window still holds its newest five
+  max_entries 30 (1-500)        the most entries the window holds and still fits
+  block_chars 12000 (2000-16000)  the most characters the window takes and still fits
+  entry_chars 1200 (200-8000, at most half of block_chars)  one entry's text, as measured
+  consolidate true              grooming passes by `memory groom --if-due`
+  quiet_minutes 30 (0-1440)     no pass until the project is this quiet
+  groom_interval_hours 24 (1-720)  at most one pass per project in this time
+  groom_profile "claude-read"   the harness profile a pass runs on
+  groom_budget_usd 1.0 (0.01-50), groom_max_turns 4 (1-50) on claude
+  groom_timeout_seconds 900 (60-7200)
+  "version": 1 may stand beside them; any other key is refused (exit 6
+  `settings_invalid`).
+
+  Example: memory settings set window_days 60
+""",
+    "add": """\
+memory add <text|-> --title TEXT [--pin] [--scope NAME]
+
+  Record one entry; `-` reads the text from stdin.
+
+  --title TEXT      required: one line of at most 200 characters, the line
+                    the index shows
+  --pin             keeps it out of every grooming pass, never merged or
+                    dropped by one; a rule every session must hold belongs in
+                    the project's doctrine, since a session reaches an entry
+                    through search
+  --scope NAME      a narrower audience (a room, a person); the window and
+                    grooming take project-wide entries only
+
+  The text is at most 20000 characters; an empty title or text, a title of
+  more than one line, or either past its length exits 6 `input`. Safe to
+  repeat: an active entry with the same title, text and scope is answered
+  with `"created": false`.
+
+  Output: {created, entry}.
+""" + _HELP_ENTRY + _HELP_WRITE + _HELP_STORE + """
+  Example: memory add "Deploys go through the release routine; a hand deploy skipped the checks" --title "Deploy only through the release routine"
+""" + _HELP_TAIL,
+    "supersede": """\
+memory supersede <id> [<id>...] --with <text|-> --title TEXT
+                 [--with <text> --title TEXT ...] [--reason TEXT] [--pin]
+
+  Replace entries with new ones, paired --with/--title in order: each new
+  entry is one --with (its text; `-` reads stdin) and one --title, and a
+  count that differs exits 6 `input`. Each replaced entry turns `superseded`
+  and points at the first new entry. A replaced pin carries over to the new
+  entries; --pin pins them anyway. --reason TEXT says why, on each replaced
+  entry's trail event. The new entries keep the replaced entries' scope
+  where they all share one.
+
+  Not idempotent: a repeat finds the old entries already superseded and
+  exits 6 `not_active`.
+
+  Output: {superseded: [entry...], created: [entry...]}, each created entry
+  whole.
+""" + _HELP_ID + _HELP_ENTRY + _HELP_WRITE + _HELP_STORE + """
+  Example: memory supersede 3f2a9c --with "Deploys go through the release routine, also for hotfixes" --title "Deploy only through the release routine" --reason "hotfixes included"
+""" + _HELP_TAIL,
+    "drop": """\
+memory drop <id> --reason TEXT [--to REF] [--purge]
+
+  Retire an entry that no longer holds.
+
+  --reason TEXT     required: why it no longer holds (an empty one exits 6
+                    `input`)
+  --to REF          where its content went (a doctrine file, a routine, a
+                    task) when it was promoted
+  --purge           the one hard delete, for a secret written by mistake: it
+                    takes the whole id, never a prefix (exit 6
+                    `purge_needs_id`), removes the text for good and leaves
+                    the trail an event without it
+
+  A dropped entry stays in the store and in `list --status dropped`. An
+  entry that is not active exits 6 `not_active`.
+
+  Output: {dropped: entry}; with --purge {purged, short, note}.
+""" + _HELP_ID + _HELP_ENTRY + _HELP_WRITE + _HELP_STORE + """
+  Example: memory drop 3f2a9c --reason "promoted into the deploy routine" --to routines/deploy.md
+""" + _HELP_TAIL,
+    "pin": """\
+memory pin <id>
+
+  Pin an active entry, which keeps it out of grooming passes; repeating it
+  changes nothing. An entry that is not active exits 6 `not_active`.
+
+  Output: {changed, entry}; changed is false where it was pinned already.
+""" + _HELP_ID + _HELP_ENTRY + _HELP_WRITE + _HELP_STORE + """
+  Example: memory pin 3f2a9c
+""" + _HELP_TAIL,
+    "unpin": """\
+memory unpin <id>
+
+  Unpin an active entry, which returns it to grooming passes; repeating it
+  changes nothing. An entry that is not active exits 6 `not_active`.
+
+  Output: {changed, entry}; changed is false where it was not pinned.
+""" + _HELP_ID + _HELP_ENTRY + _HELP_WRITE + _HELP_STORE + """
+  Example: memory unpin 3f2a9c
+""" + _HELP_TAIL,
+    "list": """\
+memory list [--status active|superseded|dropped|all] [--pinned|--unpinned]
+            [--scope NAME|-] [--since WHEN] [--limit N] [--project ID] [--json]
+
+  Index lines, newest first: `[id] date · title`, with (pinned), a scope,
+  or what replaced it.
+
+  --status S        active (the default), superseded, dropped or all
+  --pinned          only pinned entries
+  --unpinned        only unpinned entries (not with --pinned)
+  --scope NAME|-    only the entries of that scope; - is the project-wide ones
+  --since WHEN      only entries written since then
+  --limit N         at most N lines, 50 by default; a capped answer says how
+                    many matched
+""" + _HELP_READ + _HELP_WHEN + """
+  Output: plain lines, closed by `(showing N of M; --limit raises it)` when
+  capped or `(no <status> entries)` when none; with --json {project, status,
+  total, shown, entries}.
+""" + _HELP_ENTRY + _HELP_STORE + """
+  Example: memory list --status all --since 7d
+""" + _HELP_TAIL,
+    "show": """\
+memory show <id> [--project ID] [--json]
+
+  One entry whole, with its trail.
+""" + _HELP_READ + _HELP_ID + """
+  Output: the index line, the id, status, pin, when, who, node, origin and
+  scope, what replaced it or where it went, the text, then `Trail:` and one
+  line per event; with --json {entry, trail: [event...]}.
+""" + _HELP_ENTRY + """
+  An event is {seq, kind, entry_id, actor, node, at, reason, pass_id,
+  detail}.
+""" + _HELP_STORE + """
+  Example: memory show 3f2a9c
+""" + _HELP_TAIL,
+    "search": """\
+memory search <terms> [--all] [--limit N] [--project ID] [--json]
+
+  Index lines for every active entry matching the terms, best match first:
+  PostgreSQL full-text search over title and text in the `simple`
+  configuration (no stemming, any language; quoted phrases, `or` and `-`
+  exclusion work as in a web search), plus a plain substring match.
+
+  --all             includes superseded and dropped entries
+  --limit N         at most N lines, 20 by default
+""" + _HELP_READ + _HELP_WHEN + """
+  Empty terms exit 6 `input`.
+
+  Output: plain lines, closed by `(showing N of M matches; --limit raises
+  it)` when capped or `(nothing matches ...)` when none; with --json
+  {project, query, total, shown, entries}, each entry with its `rank`.
+""" + _HELP_ENTRY + _HELP_STORE + """
+  Example: memory search "deploy hotfix"
+""" + _HELP_TAIL,
+    "log": """\
+memory log [--since WHEN] [--limit N] [--project ID] [--json]
+
+  The trail, newest first: every add, supersede, drop, reactivation, pin,
+  purge, grooming pass and its undo, with who, on which node, and why.
+
+  --since WHEN      only events since then
+  --limit N         at most N lines, 50 by default
+""" + _HELP_READ + _HELP_WHEN + """
+  Output: one line per event, `<at> <kind> [<id>] <title> - <actor> on
+  <node>: <reason> (pass <id>)`, closed by `(showing N of M events; --limit
+  raises it)` when capped or `(no events)`; with --json {project, total,
+  shown, events}, each event {seq, kind, entry_id, actor, node, at, reason,
+  pass_id, detail}.
+""" + _HELP_STORE + """
+  Example: memory log --since 2w
+""" + _HELP_TAIL,
+    "status": """\
+memory status [--json]
+
+  Counts by status, writes in the last 7 and 30 days (so a drop in writing
+  shows), and grooming passes. --json is accepted; the answer is JSON either
+  way.
+
+  Output: {project, store, entries: {active, pinned, superseded, dropped,
+  scoped, merged}, writes: {last_7_days, last_30_days, last_write},
+  grooming: {passes, last_pass}, last_event}. It needs the project's durable
+  id (exit 6 `no_project_identity`).
+""" + _HELP_STORE + """
+  Example: memory status
+""" + _HELP_TAIL,
+    "groom": """\
+memory groom [--apply | --if-due | --undo <pass>] [--trigger TEXT]
+
+  One grooming pass over the active, unpinned project-wide entries of the
+  window, through one agent turn on the harness runner with the project's
+  groom_profile, groom_budget_usd, groom_max_turns and
+  groom_timeout_seconds. The turn reads the entries and answers a plan; it
+  has no tools and writes nothing. The plan merges related or
+  contradicting entries into one entry that supersedes its sources, and
+  drops what no longer holds. Every operation is checked before anything
+  is applied: a merge takes two or more sources, keeps every quotation of
+  its sources word for word, and touches no pinned entry; a drop names an
+  entry the pass may touch; nothing is in two operations. What fails a
+  check is refused and said; nothing is ever deleted and no single entry
+  is rewritten. Bare, the pass is a dry run: it prints the plan and
+  changes nothing, and still spends the model turn.
+
+  --apply           applies the checked plan in one transaction under one
+                    pass id, holding the store's lease that keeps a second
+                    pass for the project out on every machine (exit 7
+                    `groom_running`); it needs no session connection, and a
+                    store reached through a transaction pooler alone serves it
+  --undo <pass>     drops what the pass made and reactivates what it
+                    superseded or dropped, unless a later change overtook it
+                    (exit 6 `pass_overtaken`, naming the pass to undo first;
+                    6 `already_undone`, 3 `not_found` for no such pass); not
+                    with --apply or --if-due (exit 6 `input`)
+  --trigger TEXT    records why the pass ran on its trail event
+  --if-due          the scheduled form, below
+
+  memory groom --if-due
+      The scheduled form: a pass applied as --apply applies it, run only when
+      one is due, and otherwise exit 0 with {"due": false, "why", "window"}
+      naming the reason and the window's measure. A pass is due when
+      consolidate is true, the window no longer fits (`memory help
+      settings`), no pass ran for the project within groom_interval_hours on
+      any machine, nothing was written for quiet_minutes, no other pass holds
+      the project, and the profile's harness is installed and logged in
+      headless. A run that is not due spends no model turn. Its trail event
+      says "scheduled: the window no longer fits" unless --trigger names
+      another reason. Entries that age out of the window are not touched:
+      they stay active and searchable.
+
+  Schedule the scheduled form as an automation of the project, hourly for
+  instance; `memory guide service` walks it through:
+    printf '#!/bin/sh\\nexec memory groom --if-due\\n' > memory-groom.sh
+    automations set memory-groom --body memory-groom.sh \\
+        --schedule "0 * * * *" --timezone UTC \\
+        --description "consolidate memory when its window no longer fits"
+  Every machine may run it: the store's lease keeps a second pass out, and
+  the interval counts passes on every machine.
+
+  --apply, --if-due and --undo are writes: refused, exit 4
+  `read_only_switch`, under CAPABILITIES_READ_ONLY.
+
+  Output: {project, mode: "dry-run"|"apply", due?, candidates, pinned,
+  model: {harness, model, cost_usd, duration_ms}, plan, refused}, with
+  `next` on a dry run and `applied` {pass, merges, drops, skipped} when
+  applied; {..., nothing_to_do} where fewer than two unpinned entries are in
+  the window; with --undo {undone, dropped, reactivated}.
+
+  Exit codes: 2 `model_not_authenticated` (a model that is not logged in); 5
+  `groom_turn_failed` (nothing was changed); 6 `groom_profile` for a profile
+  the harness runner does not resolve or that cannot run a pass; 7
+  `groom_running`.
+""" + _HELP_STORE + """
+  Example: memory groom --apply --trigger "after the release review"
+""" + _HELP_TAIL,
+    "adopt": """\
+memory adopt [ROOT...] [--apply] [--pin-titles REGEX] [--timezone ZONE]
+
+  Carry existing memory folders into the store. ROOTs are project roots;
+  with none, the project roots named by the machine service opt-in lists
+  under $XDG_CONFIG_HOME/*/service/projects.{json,toml}. A root's memory
+  folder is `memory` inside the body root `capabilities path --json` names
+  in a folder with a legacy binding, else <root>/memory. Every file is one day of
+  `## [HH:MM — ]title` sections. The day and the HH:MM are read in the
+  machine's local zone, or in the IANA zone --timezone names (each date
+  taking that zone's offset on it), and every entry's dated_from says which.
+  A `<!-- contextkit-memory-id: <hex> -->`
+  line names the id of the section after it: it is never an entry nor part
+  of one, and the id, recorded on the carried entry, is what makes it the
+  same entry on every machine whatever its heading says by then. The
+  answer gives every parse decision per entry, every file not read, and
+  what it carried, and claims nothing more. A project whose
+  policy disables memory is skipped; one without a durable id is skipped
+  naming `capabilities init`. Bare, a dry run. --apply enables memory for
+  each other project with `capabilities enable memory --project` and
+  carries each entry with its original date. Idempotent across machines:
+  an entry carried once is answered `already` everywhere after.
+  --pin-titles pins the entries whose title matches. The folder itself is
+  left as it is.
+
+  --apply           carry the entries (a write: refused, exit 4
+                    `read_only_switch`, under CAPABILITIES_READ_ONLY)
+  --pin-titles REGEX  pin the entries whose title matches (exit 6 `input`
+                    for no regular expression)
+  --timezone ZONE   the IANA zone the day and the HH:MM are read in (exit 6
+                    `input` for no IANA zone)
+
+  Output: {mode: "dry-run"|"apply", roots_from, projects: [{root,
+  project_id, memory_folder, folder_from, not_read, decision, why?,
+  entries, counts, enabled?, store?}], lists?, note?, next?}; a project
+  skipped says why in `why`.
+
+  Example: memory adopt ~/work/site --timezone UTC
+""" + _HELP_TAIL,
+    "export": """\
+memory export [--out PATH] [--project ID]
+
+  Every entry of the project, in every status, with the whole trail, as
+  one JSON document.
+
+  --out PATH        writes it to PATH instead (exit 6 `input` where it
+                    cannot be written)
+  --project ID      export another project's memory by its id
+
+  Output: {capability, project, exported_at, store, entries, events}; with
+  --out {written, entries, events}, the counts.
+""" + _HELP_STORE + """
+  Example: memory export --out memory-export.json
+""" + _HELP_TAIL,
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

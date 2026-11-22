@@ -5,15 +5,15 @@
 #     "imap-tools>=1.13",
 #     "httpx>=0.27",
 #     "fpdf2>=2.7",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
 mailbox — agent-first IMAP/SMTP CLI for mailboxes.
 
 This tool is designed to be invoked by agents. Run `mailbox help` to load
-the full usage contract on demand — do not rely on memorised knowledge of
-its surface.
+this menu, and `mailbox help <verb>` for one verb's whole usage contract, on
+demand — do not rely on memorised knowledge of its surface.
 
 This is a THIN, project-agnostic adapter: read, fetch attachments, flag, send.
 Any orchestration (invoice-drain, triage, routing) is a CONSUMER's operation
@@ -22,140 +22,33 @@ nothing about who owns a mailbox; that lives in the consuming project.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
-  mailbox. A project with several mailboxes declares them as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": {
-          "address":    "user@example.com",
-          "imap_host":  "mail.example.com", "imap_port": 993,
-          "smtp_host":  "mail.example.com", "smtp_port": 587,
-          "secret_env": "MAILBOX_<ID>_APP_PASSWORD",
-          "allow_write": true
-        }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
-
-  Only the password is secret: the entry names the env var holding it
-  ("secret_env"); the value resolves through the credential cascade
-  (`Where a secret resolves`, at the end of this help).
+  mailbox: one connection per mailbox. Its shape, the credential keys, where
+  it lives and how a verb selects one are on `mailbox help connections`;
+  every verb takes the connection to use anywhere on the line, and its page
+  says how.
 
   WRITES ARE OFF BY DEFAULT: mailbox writes leave the system (mail reaches
-  real people), so send/draft/move/seen (and fetch --mark-seen) exit 4 unless the
-  connection carries an explicit "allow_write": true. No flag lifts the
-  gate; granting it is a deliberate registry edit, made after asking the
-  user.
+  real people), so send, draft, move and seen (and fetch when it marks a
+  message seen) exit 4 unless the connection carries an explicit
+  "allow_write": true. No flag lifts the gate; granting it is a deliberate
+  registry edit, made after asking the user.
 
-  Selection: --connection <id|address> accepted before or after the
-  subcommand (--mailbox is an alias). Unflagged, the registry's "default"
-  pointer applies, else the sole entry; several entries without a pointer
-  is refused as ambiguous.
+Read commands:
+  mailbox list                  messages in a folder, headers only
+  mailbox search                server-side IMAP SEARCH, the shape list answers
+  mailbox show <uid>            one message by uid or Message-ID: headers, text
+                                body, attachment manifest
+  mailbox fetch <uid>           save a message's attachments to a folder
+  mailbox pdf <uid>             render a message as a self-contained PDF
+  mailbox eml <uid>             save the raw RFC822 source (.eml) as it sits
+                                on the server
+  mailbox folders               the IMAP folders (find Archive)
 
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
-
-  Credential keys a connection may resolve through the cascade:
-    MAILBOX_ADDRESS       mailbox address                  (required)
-    MAILBOX_IMAP_HOST     IMAP host                        (required)
-    MAILBOX_IMAP_PORT     IMAP port                        (default 993)
-    MAILBOX_SMTP_HOST     SMTP host                        (required)
-    MAILBOX_SMTP_PORT     SMTP port                        (default 587)
-    MAILBOX_APP_PASSWORD  app password (secret)            (required)
-
-Commands:
-  mailbox help                                Print this document.
-  mailbox connections                         Where every connection's values
-                                              resolve from (tier, source,
-                                              secrets masked). Local only.
-  mailbox mailboxes                           Alias of `mailbox connections`.
-  mailbox doctor [--connection <id>]          Validate IMAP + SMTP login —
-                                              every connection, or one.
-  mailbox list [--unread] [--folder F]        List messages (headers only).
-        [--since YYYY-MM-DD] [--limit N]      JSON: uid, message_id, date,
-                                              from, subject, seen.
-  mailbox search [--from EMAIL]               Server-side IMAP SEARCH; same
-        [--subject S] [--text T]              output shape as `list`.
-        [--since YYYY-MM-DD] [--folder F]
-        [--limit N]
-  mailbox show <uid> | --message-id <id>      One message: headers, text body,
-        [--folder F]                          attachment manifest (no payloads).
-                                              --message-id locates it across ALL
-                                              folders (folder-agnostic; survives an
-                                              INBOX -> Archive move) and reports the
-                                              folder it now lives in.
-  mailbox fetch <uid> | --message-id <id>     Save attachments to DIR.
-        --save-dir DIR [--folder F]           JSON: saved paths + content types.
-        [--mark-seen]                         mark-seen is OFF by default.
-                                              --message-id as for show.
-  mailbox pdf <uid> | --message-id <id>       Render the message as a self-
-        --save-dir DIR [--folder F]           contained PDF: headers, the FULL
-                                              text body (wraps long lines and
-                                              paginates), attachment manifest.
-                                              UTF-8 safe (Cyrillic, Estonian, ...).
-                                              JSON: saved path + attachment
-                                              manifest. --message-id as for show.
-  mailbox eml <uid> | --message-id <id>       Save the raw RFC822 source (.eml)
-        --save-dir DIR [--folder F]           exactly as it sits on the server
-                                              (BODY.PEEK[], all headers and MIME
-                                              parts preserved) — the archival
-                                              original for authenticity proofs.
-                                              JSON: saved path. --message-id as
-                                              for show.
-  mailbox seen <uid> [--unsee] [--folder F]   Flag / unflag \\Seen.
-  mailbox folders                             List IMAP folders (find Archive).
-  mailbox move <uid> --to-folder F            Move a message to another folder
-        [--folder F]                          (e.g. INBOX -> Archive).
-  mailbox send --to A [--to B ...] --subject S
-        [--body TEXT|- | --body-file F|-]     Send a message. Body from
-        [--cc A ...] [--attach FILE ...]      --body text, a file, or stdin
-                                              ('-' in either flag, or piping
-                                              with neither flag, reads stdin;
-                                              a missing --body-file path is
-                                              refused rather than sent).
-        [--bcc A ...]                         --bcc recipients receive the
-                                              message through the SMTP envelope
-                                              only: no Bcc header is written,
-                                              so neither the delivered message
-                                              nor the Sent copy names them.
-                                              The JSON result lists them as bcc.
-        [--html MARKUP|F|- | --html-file F]   --html/--html-file adds an HTML
-        [--in-reply-to MESSAGE-ID]            alternative beside that body, so
-                                              the message carries both and each
-                                              client shows the one it can. The
-                                              plain body is never derived from
-                                              the markup: a caller sending HTML
-                                              supplies the text it replaces.
-                                              Saves the exact MIME message in
-                                              the server's Sent folder. If SMTP
-                                              succeeds but that copy fails, the
-                                              result keeps sent=true and reports
-                                              sent_copy.saved=false; do not retry
-                                              the send or the recipient may get
-                                              a duplicate.
-  mailbox draft --to A [--to B ...] --subject S
-        [--body TEXT|- | --body-file F|-]     Save a prepared letter into the
-        [--cc A ...] [--attach FILE ...]      account's Drafts folder without
-        [--in-reply-to MESSAGE-ID]            sending it: the message is built
-                                              as send builds it (--in-reply-to
-                                              sets In-Reply-To and References,
-                                              so the draft threads under that
-                                              message) and APPENDed with the
-                                              \\Draft flag to the folder the
-                                              server marks \\Drafts, else one
-                                              named Drafts. Nothing is sent.
-                                              JSON: folder, uid (null when the
-                                              server does not report it),
-                                              message_id. Not idempotent: each
-                                              call saves another draft. A draft
-                                              is a write: on a read-only
-                                              connection it exits 4 and writes
-                                              nothing; ask the user for write
-                                              access rather than working
-                                              around it.
+Write commands (need "allow_write": true on the connection, else exit 4):
+  mailbox seen <uid>            flag or unflag \\Seen
+  mailbox move <uid>            move a message to another folder
+  mailbox send                  send a message, and keep its copy in Sent
+  mailbox draft                 save a letter into Drafts without sending it
 
 IMAP concurrency:
   Folder reads (list/search/show/fetch) each open one IMAP connection. Many
@@ -167,27 +60,13 @@ Idempotency:
   Use message_id (globally stable) as the dedup key for processing, NOT uid.
   IMAP uids reset if the folder's UIDVALIDITY changes (server migration), and
   a uid is only valid inside the folder it was read from — moving a message
-  (e.g. INBOX -> Archive) reassigns it. To re-open a message after a move, use
-  `show`/`fetch --message-id <id>`, which finds it in whatever folder it now
-  lives in. A uid + --folder is the fast path when both are known and current.
+  (e.g. INBOX -> Archive) reassigns it. To re-open a message after a move,
+  locate it by its Message-ID (`mailbox help show`), which finds it in
+  whatever folder it now lives in.
 
 I/O contract:
   - Success: JSON on stdout, exit 0.
   - Error:   {"error": {"code", "message", "hint"}} on stderr, non-zero exit.
-
-Contract commands (the same on every capability):
-  mailbox stub                                One-line awareness text.
-  mailbox manifest --json                     Machine-readable declaration.
-  mailbox guide [<topic>]                     Guide topics / one guide body,
-                                              fetched live from the docs base.
-  mailbox ids list|get <l>|set <l> <v>|rm <l> The project identifiers envelope
-          [--note <text>]                     (capabilities/mailbox/identifiers.json,
-                                               or store rows once the agent moved).
-  mailbox refs                                Menu of the project's reference
-                                              files for this capability.
-  mailbox inventory [--network]               What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
 
 Exit codes:
   0  success
@@ -304,6 +183,388 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 
 PORT_DEFAULTS = {"imap_port": 993, "smtp_port": 587}
 
+
+# The verb pages `mailbox help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections and ids follow. A
+# text several verbs own is one constant, added to each of their pages.
+_HELP_CONN = """
+  --connection <id|address>
+                    the connection to use, accepted before or after the
+                    subcommand (--mailbox is an alias). Unflagged, the
+                    registry's "default" pointer applies, else the sole
+                    entry; several entries without a pointer is refused as
+                    ambiguous.
+"""
+_HELP_FOLDER = """
+  --folder F        the folder the uid is read in, INBOX by default
+"""
+_HELP_SELECTOR = """
+  <uid> | --message-id <id>
+                    exactly one: the message's uid in --folder, or its
+                    Message-ID, which locates it across ALL folders
+                    (folder-agnostic; survives an INBOX -> Archive move) and
+                    reports the folder it now lives in. IMAP HEADER search is
+                    a substring match, so the value matches with or without
+                    its angle brackets. Both, or neither, exits 6
+                    `ambiguous_selector` / `missing_selector`; a uid the
+                    folder does not hold or a Message-ID no folder holds exits
+                    3 `not_found`.
+"""
+_HELP_IDEMPOTENCY = """
+  Idempotency:
+  Use message_id (globally stable) as the dedup key for processing, NOT uid.
+  IMAP uids reset if the folder's UIDVALIDITY changes (server migration), and
+  a uid is only valid inside the folder it was read from — moving a message
+  (e.g. INBOX -> Archive) reassigns it. To re-open a message after a move, use
+  `show`/`fetch --message-id <id>`, which finds it in whatever folder it now
+  lives in. A uid + --folder is the fast path when both are known and current.
+"""
+_HELP_CONCURRENCY = """
+  IMAP concurrency:
+  Folder reads (list/search/show/fetch) each open one IMAP connection. Many
+  servers cap concurrent sessions, so run them sequentially rather than in
+  parallel; a stuck or refused connection fails fast (30s socket timeout,
+  non-zero exit) rather than hanging. A login the server rejects exits 2
+  `login_rejected`, a server that does not answer 5 `imap_unreachable`.
+"""
+_HELP_WRITE = """
+  WRITES ARE OFF BY DEFAULT: mailbox writes leave the system (mail reaches
+  real people), so this verb exits 4 `read_only` unless the connection
+  carries an explicit "allow_write": true. No flag lifts the gate; granting
+  it is a deliberate registry edit, made after asking the user.
+"""
+_HELP_MESSAGE = """
+  A message is built as From the connection's address, To and Cc as given,
+  the Subject, a Date and a new Message-ID on the address's domain, the plain
+  body, then each --attach file (its type guessed from its name; a path that
+  does not exist exits 6 `attachment_missing`).
+  --to A            a recipient; repeatable, at least one
+  --cc A            a copy recipient; repeatable
+  --subject S       the subject
+  --body TEXT|-     the body text; - reads stdin
+  --body-file F|-   the body from a file; - reads stdin
+                    '-' in either flag, or piping with neither flag, reads
+                    stdin; --body and --body-file together exit 6
+                    `ambiguous_body`; a missing --body-file path is refused
+                    rather than sent (exit 6 `body_file_not_found`)
+  --attach FILE     attach a file; repeatable
+  --in-reply-to MESSAGE-ID
+                    sets In-Reply-To and References, so the message threads
+                    under the one it answers
+"""
+_HELP_TAIL = """
+I/O contract:
+  - Success: JSON on stdout, exit 0.
+  - Error:   {"error": {"code", "message", "hint"}} on stderr, non-zero exit.
+
+Exit codes:
+  0  success
+  2  auth (missing credentials, login rejected); also an argument the parser
+     refuses, with its usage on stderr
+  3  not found (no message with that uid)
+  4  policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
+     verb, or a write verb on a read-only connection (allow_write: false).
+     Ask the user; never lift a gate yourself.
+  5  server / network (IMAP/SMTP unreachable, timeout)
+  6  input / validation
+"""
+HELP_VERBS = {
+    "doctor": """\
+For mailbox:
+  Validate IMAP + SMTP login — every connection, or one: IMAP logs in and
+  counts the INBOX, SMTP logs in over STARTTLS.
+
+  Output: {ok, connections: {<id>: {user, imap, inbox_total, inbox_unseen,
+  smtp_ok, ok, error?, hint?}}}; a connection that fails carries error.
+
+  Exit codes: 0 when every examined connection is healthy, else the first
+  failure's: 2 missing credentials or a login rejected, 5 a server that does
+  not answer, 6 an incomplete connection.
+
+  Example: mailbox doctor --connection work
+""",
+    "connections": """\
+For mailbox:
+  Where every connection's values resolve from (tier, source, secrets
+  masked). Local only. Each connection reports its allow_write and its keys.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  mailbox. A project with several mailboxes declares them as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "address":    "user@example.com",
+          "imap_host":  "mail.example.com", "imap_port": 993,
+          "smtp_host":  "mail.example.com", "smtp_port": 587,
+          "secret_env": "MAILBOX_<ID>_APP_PASSWORD",
+          "allow_write": true
+        }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  Only the password is secret: the entry names the env var holding it
+  ("secret_env"); the value resolves through the credential cascade
+  (`Where a secret resolves`, above).
+
+  WRITES ARE OFF BY DEFAULT: mailbox writes leave the system (mail reaches
+  real people), so send/draft/move/seen (and fetch --mark-seen) exit 4 unless the
+  connection carries an explicit "allow_write": true. No flag lifts the
+  gate; granting it is a deliberate registry edit, made after asking the
+  user.
+
+  Selection: --connection <id|address> accepted before or after the
+  subcommand (--mailbox is an alias). Unflagged, the registry's "default"
+  pointer applies, else the sole entry; several entries without a pointer
+  is refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  Credential keys a connection may resolve through the cascade:
+    MAILBOX_ADDRESS       mailbox address                  (required)
+    MAILBOX_IMAP_HOST     IMAP host                        (required)
+    MAILBOX_IMAP_PORT     IMAP port                        (default 993)
+    MAILBOX_SMTP_HOST     SMTP host                        (required)
+    MAILBOX_SMTP_PORT     SMTP port                        (default 587)
+    MAILBOX_APP_PASSWORD  app password (secret)            (required)
+
+  Example: mailbox connections
+""",
+    "ids": """\
+For mailbox:
+  The project identifiers envelope (capabilities/mailbox/identifiers.json,
+  or store rows once the agent moved); `set` takes [--note <text>].
+""",
+    "guide": """\
+For mailbox:
+  Guide topics / one guide body, fetched live from the docs base. None ship
+  yet.
+""",
+    "refs": """\
+For mailbox:
+  Menu of the project's reference files for this capability.
+""",
+    "inventory": """\
+For mailbox:
+  What this capability holds in this project (--network adds remote
+  detail). mailbox declares no inventory of its own.
+""",
+    "list": """\
+mailbox list [--unread] [--folder F] [--since YYYY-MM-DD] [--limit N]
+     [--connection <id|address>]
+
+  List messages (headers only), newest first.
+
+  --unread          only messages not yet \\Seen
+  --folder F        the folder to read, INBOX by default
+  --since YYYY-MM-DD  only messages dated on or after that day (another form
+                    exits 6 `bad_date`)
+  --limit N         at most N messages, 50 by default
+""" + _HELP_CONN + """
+  Output: a JSON list, one object per message: {uid, message_id, date,
+  from, to, subject, seen}.
+""" + _HELP_CONCURRENCY + _HELP_IDEMPOTENCY + """
+  Example: mailbox list --unread --since 2026-11-01
+""" + _HELP_TAIL,
+    "search": """\
+mailbox search [--from EMAIL] [--subject S] [--text T]
+     [--since YYYY-MM-DD] [--folder F] [--limit N] [--connection <id|address>]
+
+  Server-side IMAP SEARCH; same output shape as `list`, newest first. The
+  criteria combine: a message matches every one given.
+
+  --from EMAIL      FROM substring match
+  --subject S       SUBJECT substring match
+  --text T          TEXT match (body and headers)
+  --since YYYY-MM-DD  only messages dated on or after that day (another form
+                    exits 6 `bad_date`)
+  --folder F        the folder to search, INBOX by default
+  --limit N         at most N messages, 50 by default
+""" + _HELP_CONN + """
+  A non-ASCII criterion goes to the server as its longest ASCII word (or not
+  at all) and the whole value is then matched case-insensitively in the
+  messages fetched, so --limit counts the narrowed result.
+
+  Output: a JSON list, one object per message: {uid, message_id, date,
+  from, to, subject, seen}.
+""" + _HELP_CONCURRENCY + _HELP_IDEMPOTENCY + """
+  Example: mailbox search --from billing@example.com --since 2026-10-01
+""" + _HELP_TAIL,
+    "show": """\
+mailbox show <uid> | --message-id <id> [--folder F] [--connection <id|address>]
+
+  One message: headers, text body, attachment manifest (no payloads). It
+  does not mark the message seen.
+""" + _HELP_SELECTOR + _HELP_FOLDER + _HELP_CONN + """
+  Output: {uid, folder, message_id, date, from, to, cc, subject, seen,
+  text, has_html, attachments: [{filename, content_type, size}]}; text is
+  the HTML where the message has no plain text.
+""" + _HELP_CONCURRENCY + _HELP_IDEMPOTENCY + """
+  Example: mailbox show --message-id '<abc123@example.com>'
+""" + _HELP_TAIL,
+    "fetch": """\
+mailbox fetch <uid> | --message-id <id> --save-dir DIR [--folder F]
+     [--mark-seen] [--connection <id|address>]
+
+  Save attachments to DIR.
+""" + _HELP_SELECTOR + """
+  --save-dir DIR    required: the folder the attachments are saved in,
+                    made when missing; a file keeps its own name, made safe,
+                    else attachment_<uid>_<n> with an extension for its type
+  --mark-seen       flag the message \\Seen; mark-seen is OFF by default. It
+                    mutates the mailbox: on a connection without
+                    "allow_write": true it exits 4 `read_only`, and nothing
+                    is fetched
+""" + _HELP_FOLDER + _HELP_CONN + """
+  Output: JSON: saved paths + content types: {uid, folder, message_id,
+  saved: [{path, content_type, size}], marked_seen}.
+""" + _HELP_CONCURRENCY + _HELP_IDEMPOTENCY + """
+  Example: mailbox fetch 4211 --save-dir ./inbox-attachments
+""" + _HELP_TAIL,
+    "pdf": """\
+mailbox pdf <uid> | --message-id <id> --save-dir DIR [--folder F]
+     [--connection <id|address>]
+
+  Render the message as a self-contained PDF: headers, the FULL text body
+  (wraps long lines and paginates), attachment manifest. UTF-8 safe
+  (Cyrillic, Estonian, ...). A message with HTML and no plain text is
+  rendered from its HTML, stripped to text. It does not mark the message
+  seen.
+""" + _HELP_SELECTOR + """
+  --save-dir DIR    required: the folder the PDF is saved in, made when
+                    missing; it is named after the subject
+""" + _HELP_FOLDER + _HELP_CONN + """
+  The font is the first found of ~/.config/mailbox/pdf-font.ttf, Arial
+  Unicode (macOS), DejaVu Sans or Liberation Sans (Linux); none exits 5
+  `no_font` (place a TTF at ~/.config/mailbox/pdf-font.ttf, or install a
+  system font). fpdf2 missing exits 5 `missing_dependency`.
+
+  Output: JSON: saved path + attachment manifest: {uid, folder, message_id,
+  saved, attachments: [{filename, content_type, size}]}.
+""" + _HELP_CONCURRENCY + _HELP_IDEMPOTENCY + """
+  Example: mailbox pdf 4211 --save-dir ./archive
+""" + _HELP_TAIL,
+    "eml": """\
+mailbox eml <uid> | --message-id <id> --save-dir DIR [--folder F]
+     [--connection <id|address>]
+
+  Save the raw RFC822 source (.eml) exactly as it sits on the server
+  (BODY.PEEK[], all headers and MIME parts preserved) — the archival
+  original for authenticity proofs. No flag flips.
+""" + _HELP_SELECTOR + """
+  --save-dir DIR    required: the folder message-<uid>.eml is saved in, made
+                    when missing
+""" + _HELP_FOLDER + _HELP_CONN + """
+  A raw fetch the server refuses or answers empty exits 5 `fetch_failed`.
+
+  Output: JSON: saved path: {uid, folder, message_id, saved}.
+""" + _HELP_CONCURRENCY + _HELP_IDEMPOTENCY + """
+  Example: mailbox eml --message-id '<abc123@example.com>' --save-dir ./archive
+""" + _HELP_TAIL,
+    "folders": """\
+mailbox folders [--connection <id|address>]
+
+  List IMAP folders (find Archive).
+""" + _HELP_CONN + """
+  Output: a JSON list of {name, delimiter}.
+
+  Example: mailbox folders
+""" + _HELP_TAIL,
+    "seen": """\
+mailbox seen <uid> [--unsee] [--folder F] [--connection <id|address>]
+
+  Flag / unflag \\Seen on the message with that uid.
+
+  --unsee           take the \\Seen flag off instead
+""" + _HELP_FOLDER + _HELP_CONN + _HELP_WRITE + """
+  Output: {uid, seen}. A uid the folder does not hold exits 3 `not_found`.
+
+  Example: mailbox seen 4211
+""" + _HELP_TAIL,
+    "move": """\
+mailbox move <uid> --to-folder F [--folder F] [--connection <id|address>]
+
+  Move a message to another folder (e.g. INBOX -> Archive). The message
+  gets a new uid there; its message_id stays.
+
+  --to-folder F     required: the folder it moves to
+  --folder F        the folder it is in, INBOX by default
+""" + _HELP_CONN + _HELP_WRITE + """
+  Output: {uid, from_folder, moved_to}. A uid the folder does not hold exits
+  3 `not_found`.
+
+  Example: mailbox move 4211 --to-folder Archive
+""" + _HELP_TAIL,
+    "send": """\
+mailbox send --to A [--to B ...] --subject S
+     [--body TEXT|- | --body-file F|-] [--cc A ...] [--bcc A ...]
+     [--attach FILE ...] [--html MARKUP|F|- | --html-file F]
+     [--in-reply-to MESSAGE-ID] [--connection <id|address>]
+
+  Send a message. Body from --body text, a file, or stdin.
+""" + _HELP_MESSAGE + """
+  --bcc A           --bcc recipients receive the message through the SMTP
+                    envelope only: no Bcc header is written, so neither the
+                    delivered message nor the Sent copy names them. The JSON
+                    result lists them as bcc. Repeatable.
+  --html MARKUP|F|-  adds an HTML alternative beside that body: markup, a
+                    file path, or - for stdin
+  --html-file F     the HTML alternative from a file path, or - for stdin
+                    --html/--html-file adds an HTML alternative beside that
+                    body, so the message carries both and each client shows
+                    the one it can. The plain body is never derived from the
+                    markup: a caller sending HTML supplies the text it
+                    replaces. Both together exit 6 `ambiguous_html`.
+""" + _HELP_CONN + """
+  Saves the exact MIME message in the server's Sent folder (the one the
+  server marks \\Sent, else Sent, Sent Messages or [Gmail]/Sent Mail),
+  resolved before anything is sent: none exits 6 `sent_folder_missing` and
+  a folder list that fails exits 5 `sent_folder_lookup_failed`, the message
+  not sent. Where the provider already stored the copy it is not appended
+  twice (provider_saved). If SMTP succeeds but that copy fails, the result
+  keeps sent=true and reports sent_copy.saved=false; do not retry the send
+  or the recipient may get a duplicate. An address beyond ASCII needs the
+  server's SMTPUTF8. An SMTP login rejected exits 2 `smtp_auth`; any other
+  SMTP failure exits 5 `send_failed`.
+""" + _HELP_WRITE + """
+  Output: {sent, to, cc, bcc, subject, html, message_id, attachments,
+  sent_copy: {saved, folder, message_id, provider_saved | error}, warning?}.
+
+  Example: mailbox send --to client@example.com --subject "Invoice 1042" --body-file note.txt --attach invoice-1042.pdf
+""" + _HELP_TAIL,
+    "draft": """\
+mailbox draft --to A [--to B ...] --subject S
+     [--body TEXT|- | --body-file F|-] [--cc A ...] [--attach FILE ...]
+     [--in-reply-to MESSAGE-ID] [--connection <id|address>]
+
+  Save a prepared letter into the account's Drafts folder without sending
+  it: the message is built as send builds it (--in-reply-to sets
+  In-Reply-To and References, so the draft threads under that message) and
+  APPENDed with the \\Draft flag to the folder the server marks \\Drafts,
+  else one named Drafts. Nothing is sent. Not idempotent: each call saves
+  another draft.
+""" + _HELP_MESSAGE + _HELP_CONN + """
+  A draft is a write: on a read-only connection it exits 4 and writes
+  nothing; ask the user for write access rather than working around it. No
+  Drafts folder exits 6 `drafts_folder_missing`; a folder list that fails
+  exits 5 `drafts_folder_lookup_failed` and an append that fails 5
+  `draft_save_failed`, no draft saved.
+
+  Output: JSON: folder, uid (null when the server does not report it),
+  message_id: {drafted, sent: false, folder, uid, message_id, to, cc,
+  subject, in_reply_to, attachments}.
+
+  Example: mailbox draft --to client@example.com --subject "Re: Invoice 1042" --body - --in-reply-to '<abc123@example.com>' < reply.txt
+""" + _HELP_TAIL,
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """instagram — agent-first CLI over an authenticated Instagram web session.
@@ -131,15 +131,24 @@ HELP = """instagram — agent-first CLI over an authenticated Instagram web sess
 
 This capability drives the same private browser-session endpoints used by
 instagram.com. It is stateful and may stop working when Instagram changes its
-web client. Run `instagram doctor` before domain work. Checkpoints, challenges,
-CAPTCHA, and 2FA always require the user in the browser; this tool never bypasses
-them.
+web client. Checkpoints, challenges, CAPTCHA, and 2FA always require the user in
+the browser; this tool never bypasses them.
+
+Startup protocol
+  1. Run `instagram doctor` before domain work; exit 0 means each session is
+     live and authenticated as its connection's expected_username.
+  2. Exit 2 means the session is missing, expired, unreadable or another
+     account's: have the user sign in to Instagram in a browser, import a fresh
+     capture with `instagram refresh` (`instagram help refresh` says how), and
+     run doctor again.
+  3. Exit 6 means the registry or a connection entry is missing or malformed:
+     fix it (`instagram help connections`). Exit 4 is policy: ask the user.
 
 Connections
   An explicit connections registry is required, even for one account. Put it in
   the consuming project's own connections or in
-  ~/.config/instagram/connections.json; "Where connections live" below says which
-  this project reads:
+  ~/.config/instagram/connections.json; "Where connections live" on
+  `instagram help connections` says which this project reads:
 
     {
       "default": "main",
@@ -154,66 +163,406 @@ Connections
 
   `expected_username` is mandatory and doctor refuses a session authenticated as
   another account. Each connection owns a separate session under the user state
-  home. Session JSON contains live cookies and is written with mode 0600.
+  home. Session JSON contains live cookies and is written with mode 0600. Every
+  verb takes the connection to use anywhere on the line (each verb's page says
+  how); without one the registry's default applies.
 
 Authentication
-  Sign in to Instagram in a browser, send one authorized test text DM, select the
-  successful IGDirectTextSendMutation in Network, and choose Copy as cURL. Keep
-  the capture out of chat and import it locally:
+  A browser capture of one successful text DM, imported locally by
+  `instagram refresh`, is the sign-in. Refresh only mints local session state.
+  Run doctor immediately afterwards.
+
+Commands
+  instagram refresh <capture>                    import a browser capture locally
+  instagram whoami                               the authenticated username
+  instagram profile show <handle-or-url>         profile routing metadata
+  instagram relationship show <handle-or-url>    the current follow relationship
+  instagram relationship follow <handle-or-url>  follow unless already followed/requested
+  instagram media list <handle-or-url>           recent profile media
+  instagram media like <handle-or-url> <code-or-id>
+                                                 like one listed media item
+  instagram conversations find <handle-or-url>   find the thread in the inbox folders
+  instagram conversations resolve <handle-or-url>
+                                                 obtain/create the private thread
+  instagram messages inspect <handle-or-url>     detect prior outgoing messages, no text
+  instagram messages eligibility <handle-or-url> read-only DM routing verdict
+  instagram messages reconcile <handle-or-url>   confirm a possibly ambiguous send
+  instagram messages send <handle-or-url>        resolve the thread and send text
+
+Conversation and message reads scan the Direct folders main|requests|spam|all;
+each verb's page says how to choose.
+
+Write policy
+  `relationship follow`, `media like`, `conversations resolve`, and
+  `messages send` leave state on Instagram and are refused unless the selected
+  connection has `allow_write: true`. Exit 4 means policy refusal; ask the user
+  rather than changing the gate. Existing follows, pending requests, and media
+  already liked return without a write. Ambiguous write failures are never
+  retried automatically because that could duplicate an action.
+
+I/O
+  Success is one JSON object on stdout; failure is {"error": {"code",
+  "message", "hint"?, "status"?}} on stderr; the exit code carries the category.
+
+Exit codes
+  0 success · 2 authentication/session · 3 profile not found · 4 policy refusal
+  5 Instagram/network failure · 6 input/configuration · 7 contract/audit failure
+"""
+
+
+# The verb pages `instagram help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, HELP being the menu. The
+# contract library dispatches both and renders the contract verbs' own pages,
+# which the entries here for doctor and connections follow. A text several
+# verbs own is one constant, added to each of their pages.
+_HELP_CONN = """
+  --connection ID   the connection whose session and policy apply, accepted
+                    anywhere on argv (also as --connection=ID), by id or
+                    label; without it the registry's default, else its sole
+                    entry
+"""
+_HELP_PROFILE = """
+  <handle-or-url> is an Instagram username, with or without a leading @, or
+  an http(s) instagram.com / www.instagram.com profile URL with exactly one
+  path segment. An empty value, another host or scheme, a longer path, or a
+  username outside [A-Za-z0-9._]{1,30} exits 6 `input`. Every verb that
+  takes it first reads the profile page, refreshes the session's dynamic
+  form values (fb_dtsg, lsd and the site revision values) and writes them
+  back to session.json; a profile that does not exist exits 3 `not_found`.
+"""
+_HELP_FOLDERS = """
+  --max-pages N     inbox pages to scan per folder search, 1 to 100 (default
+                    25); for inspect, also the thread history pages to scan
+  --folders F       main|requests|spam|all (default all): main is the main
+                    inbox, requests and spam the message-request folders.
+                    With all, main is scanned first and the request folders
+                    only when the thread is not found there.
+
+  A value outside these bounds, or any other argument, exits 6 `input`.
+"""
+_HELP_SESSION = """
+  Session: every verb here runs on the connection's stored session. A
+  session never imported exits 2 `session_missing` (run `instagram refresh`,
+  then doctor); a session file not mode 0600 exits 2 `session_permissions`;
+  an unreadable one exits 2 `session_invalid`; Instagram refusing it exits 2
+  `auth_failed`. A transport failure exits 5 `network_error`; a response
+  Instagram did not shape as expected exits 5 (`invalid_response`,
+  `instagram_error` or a `*_unvalidated` code).
+"""
+_HELP_WRITE = """
+  A write: it leaves state on Instagram and is refused with exit 4 unless
+  the selected connection has `allow_write: true`; the gate is checked
+  before the session is read. Ask the user rather than changing the gate.
+  An ambiguous write failure is never retried automatically, because that
+  could duplicate an action.
+"""
+_HELP_TAIL = """
+  Exit codes: 0 success · 2 authentication/session · 3 profile not found ·
+  4 policy refusal · 5 Instagram/network failure · 6 input/configuration ·
+  7 contract/audit failure
+"""
+HELP_VERBS = {
+    "doctor": """\
+For instagram:
+  Validates identity and session: for each connection (or the one
+  --connection names, accepted anywhere on argv) it makes one live read with
+  the stored session and refuses a session authenticated as another account
+  than the connection's expected_username. Checkpoints, challenges, CAPTCHA
+  and 2FA need the user in the browser.
+
+  Output: {ok: true, connections: [{connection, ok, username,
+  session_path}]} when every connection is ready.
+
+  Exit codes: 0 ready; 2 `doctor_failed` when one or more connections are
+  not ready - its message names each by label with its code
+  (`session_missing`, `session_permissions`, `session_invalid`,
+  `auth_failed`, `auth_invalid_response`, `unexpected_account`,
+  `network_error`); run `instagram connections`, refresh the affected
+  session, and retry. 4 policy; 6 `bad_config` for a malformed connection
+  entry.
+""",
+    "connections": """\
+For instagram:
+  Local masked configuration report: {default, registry, connections: {<id>:
+  {allow_write, expected_username, timeout_seconds, keys: [], session: {set,
+  path, secure}}}}. instagram holds no credential key, so `keys` is empty;
+  the credential is the per-connection browser session, and `session`
+  reports whether it is stored, where, and whether its mode is 0600. An
+  entry that does not validate reports {allow_write, keys: [],
+  configuration_error} instead. Local only: no call to Instagram.
+
+  An explicit connections registry is required, even for one account:
+
+    {
+      "default": "main",
+      "connections": {
+        "main": {
+          "expected_username": "account.handle",
+          "allow_write": false,
+          "timeout_seconds": 30
+        }
+      }
+    }
+
+  `expected_username` is mandatory (a valid username, a leading @ dropped),
+  and doctor refuses a session authenticated as another account.
+  `timeout_seconds` is 5 to 120 (default 30). `allow_write` defaults to
+  false. A malformed entry exits 6 `bad_config` on the verbs that use it.
+  Each connection owns a separate session under the user state home
+  (`<state>/<connection id>/session.json`); session JSON contains live
+  cookies and is written with mode 0600. A session made under a
+  connection's former name is moved to its id on first use.
+""",
+    "refresh": """\
+instagram refresh <PATH|-|--clipboard> [--connection ID]
+
+  Import a browser capture locally. Sign in to Instagram in a browser, send
+  one authorized test text DM, select the successful
+  IGDirectTextSendMutation in Network, and choose Copy as cURL. Keep the
+  capture out of chat and import it locally:
 
     instagram refresh --clipboard [--connection ID]
     instagram refresh /protected/path/request.curl [--connection ID]
     instagram refresh - [--connection ID]        # read cURL from stdin
 
-  Refresh only mints local session state. Run doctor immediately afterwards.
+  Refresh only mints local session state: it parses the cURL, keeps a
+  redacted request template plus live cookies, and writes them to the
+  connection's session.json with mode 0600 (its folder 0700). It does not
+  call Instagram. Run doctor immediately afterwards.
 
-Commands
-  instagram help
-  instagram doctor [--connection ID]             Validate identity and session.
-  instagram connections                           Local masked configuration report.
-  instagram refresh <PATH|-|--clipboard>          Import a browser capture locally.
-  instagram whoami [--connection ID]              Return authenticated username.
-  instagram profile show <handle-or-url>           Read profile routing metadata.
-  instagram relationship show <handle-or-url>      Read current follow relationship.
-  instagram relationship follow <handle-or-url>    Follow unless already followed/requested.
-  instagram media list <handle-or-url> [--limit N]
-                                                  List recent profile media.
-  instagram media like <handle-or-url> <code-or-id>
-                                                  Like one listed media item.
-  instagram conversations find <handle-or-url> [--max-pages N] [--folders main|requests|spam|all]
-                                                  Find a thread in main inbox, message requests, and/or spam.
-  instagram messages inspect <handle-or-url> [--max-pages N] [--folders main|requests|spam|all]
-                                                  Detect prior outgoing messages without exposing text.
-  instagram messages eligibility <handle-or-url> [--max-pages N] [--folders main|requests|spam|all]
-                                                  Read-only DM routing verdict; null means Instagram exposes no decisive preflight.
-  instagram messages reconcile <handle-or-url>
-      (--offline-id ID | --server-message-id ID) [--max-pages N]
-                                                  Confirm a possibly ambiguous send from thread history; never authorizes retry.
-  instagram conversations resolve <handle-or-url> Obtain/create the private thread.
-  instagram messages send <handle-or-url>
-      (--text TEXT | --text-file PATH | --stdin)
-                                                  Resolve the thread and send text.
+  PATH              a file holding the copied cURL
+  -                 read the cURL from stdin
+  --clipboard       read it from the clipboard (pbpaste)
+""" + _HELP_CONN + """
+  Output: {refreshed: true, connection, session_path, captured_at, cookies,
+  next} - `cookies` counts the captured cookies and `next` is the doctor
+  command to run.
 
-Write policy
-  `relationship follow`, `media like`, `conversations resolve`, and
-  `messages send` leave state on Instagram and are refused unless the selected connection has
-  `allow_write: true`. Exit 4 means policy refusal; ask the user rather than
-  changing the gate. Existing follows, pending requests, and media already
-  liked return without a write. Ambiguous write failures are never retried
-  automatically because that could duplicate an action.
+  Exit codes: 0 imported; 6 `input` without exactly one source or for an
+  unreadable file, `clipboard_unavailable` when pbpaste cannot read the
+  clipboard, `capture_invalid` when the capture is not a curl POST of
+  IGDirectTextSendMutation to the GraphQL endpoint with a Cookie header and
+  one complete form body; 4 policy.
 
-Exit codes
-  0 success · 2 authentication/session · 3 profile not found · 4 policy refusal
-  5 Instagram/network failure · 6 input/configuration · 7 contract/audit failure
+  Example: instagram refresh --clipboard --connection main
+""" + _HELP_TAIL,
+    "whoami": """\
+instagram whoami [--connection ID]
 
-Contract commands
-  instagram stub
-  instagram manifest --json
-  instagram guide [topic]
-  instagram ids list|get|set|rm
-  instagram refs
-  instagram inventory [--network]
-"""
+  Return the authenticated username: the same live session check doctor
+  makes, for one connection.
+""" + _HELP_CONN + """
+  Output: {connection, username, status: "healthy"}.
+
+  Exit codes: 2 `unexpected_account` when the session is another account's,
+  `auth_failed` or `auth_invalid_response` when Instagram does not accept it.
+""" + _HELP_SESSION + """
+  Example: instagram whoami --connection main
+""" + _HELP_TAIL,
+    "profile show": """\
+instagram profile show <handle-or-url> [--connection ID]
+
+  Read profile routing metadata.
+""" + _HELP_PROFILE + _HELP_CONN + """
+  Output: {connection, username, profile_url, recipient_pk, full_name,
+  is_private, is_verified, follower_count, following_count, media_count,
+  followed_by_viewer, requested_by_viewer, follows_viewer,
+  blocked_by_viewer, restricted_by_viewer}; a field Instagram does not
+  return is left out. Exit 5 `profile_unvalidated` when Instagram returns no
+  validated routing data.
+""" + _HELP_SESSION + """
+  Example: instagram profile show @account.handle
+""" + _HELP_TAIL,
+    "relationship show": """\
+instagram relationship show <handle-or-url> [--connection ID]
+
+  Read the current follow relationship from the profile.
+""" + _HELP_PROFILE + _HELP_CONN + """
+  Output: {connection, username, recipient_pk, is_private, status,
+  following, outgoing_request, followed_by, blocked, restricted}, status
+  being blocked, following, requested or not_following.
+""" + _HELP_SESSION + """
+  Example: instagram relationship show account.handle
+""" + _HELP_TAIL,
+    "relationship follow": """\
+instagram relationship follow <handle-or-url> [--connection ID]
+
+  Follow unless already followed or requested: an existing follow, a pending
+  request, or a blocked profile returns without a write.
+""" + _HELP_PROFILE + _HELP_CONN + _HELP_WRITE + """
+  Output: the relationship show object, its status being followed or
+  requested (a private profile) after the write, or already_following,
+  already_requested or blocked without one.
+
+  Exit codes: 2 `session_tokens_missing` without a current CSRF token (refresh
+  the browser session and retry relationship show); 5 `rate_limited`,
+  `follow_rejected` when Instagram does not confirm it, `follow_unknown`
+  when the result is unknown - do not retry automatically.
+""" + _HELP_SESSION + """
+  Example: instagram relationship follow account.handle
+""" + _HELP_TAIL,
+    "media list": """\
+instagram media list <handle-or-url> [--limit N] [--max-id ID] [--connection ID]
+
+  List recent profile media.
+
+  --limit N         items to list, 1 to 50 (default 12)
+  --max-id ID       the page cursor: the next_max_id of the previous page
+""" + _HELP_PROFILE + _HELP_CONN + """
+  Output: {connection, username, recipient_pk, items: [{media_pk, media_id,
+  code, permalink, owner_username, media_type, product_type, has_liked,
+  like_count, taken_at, is_pinned}], more_available, next_max_id}. Exit 6
+  `input` for a bad --limit or any other argument; exit 5
+  `media_unvalidated` when Instagram returns no validated list.
+""" + _HELP_SESSION + """
+  Example: instagram media list account.handle --limit 5
+""" + _HELP_TAIL,
+    "media like": """\
+instagram media like <handle-or-url> <code-or-id> [--connection ID]
+
+  Like one listed media item: it is looked up among the profile's 50 most
+  recent media by its code, media_pk or media_id. Media already liked
+  returns without a write.
+
+  <code-or-id>      the media's code, media_pk or media_id, as media list
+                    prints them
+""" + _HELP_PROFILE + _HELP_CONN + _HELP_WRITE + """
+  Output: {connection, status, media_pk, media_id, code, permalink, owner_username,
+  media_type, product_type, has_liked, like_count, taken_at, is_pinned},
+  status being liked (with server_media_id) or already_liked.
+
+  Exit codes: 3 `media_not_found` when it is not in the recent feed; 2
+  `session_tokens_missing` without fresh media and session tokens (refresh
+  the browser session and retry the media list); 5 `rate_limited`,
+  `like_rejected` when Instagram does not confirm it, `like_unknown` when
+  the result is unknown - do not retry automatically.
+""" + _HELP_SESSION + """
+  Example: instagram media like account.handle <code>
+""" + _HELP_TAIL,
+    "conversations find": """\
+instagram conversations find <handle-or-url> [--max-pages N]
+     [--folders main|requests|spam|all] [--connection ID]
+
+  Find a thread in main inbox, message requests, and/or spam. Read-only. A
+  thread is matched on the recipient's immutable user id, never on a handle
+  alone; a handle-only candidate makes an otherwise negative scan
+  incomplete.
+""" + _HELP_FOLDERS + _HELP_PROFILE + _HELP_CONN + """
+  Output: {connection, status, found, scan_complete, username,
+  recipient_pk, pages_scanned, threads_scanned, folders_scanned}; status is
+  found (with thread_id, thread_igid, pending and folder), not_found after a
+  complete scan, or unknown with a `reason` (max_pages_reached,
+  thread_identity_unverified, a cursor or request-folder failure).
+""" + _HELP_SESSION + """
+  Example: instagram conversations find account.handle --folders all
+""" + _HELP_TAIL,
+    "conversations resolve": """\
+instagram conversations resolve <handle-or-url> [--connection ID]
+
+  Obtain/create the private thread with the profile, validated to be a
+  private thread whose user is the recipient.
+""" + _HELP_PROFILE + _HELP_CONN + _HELP_WRITE + """
+  Output: {connection, username, recipient_pk, thread_igid}.
+
+  Exit codes: 2 `session_tokens_missing` when the session tokens are
+  missing; 5 `thread_unvalidated` when Instagram returns no validated
+  private thread.
+""" + _HELP_SESSION + """
+  Example: instagram conversations resolve account.handle
+""" + _HELP_TAIL,
+    "messages inspect": """\
+instagram messages inspect <handle-or-url> [--max-pages N]
+     [--folders main|requests|spam|all] [--connection ID]
+
+  Detect prior outgoing messages without exposing text. Read-only: finds the
+  thread as conversations find does, then reads its history for a message
+  the viewer sent.
+""" + _HELP_FOLDERS + _HELP_PROFILE + _HELP_CONN + """
+  Output: {connection, username, recipient_pk, conversation_found,
+  inbox_pages_scanned, folders_scanned, status, viewer_sent_message,
+  scan_complete, history_pages_scanned, items_scanned}; status is
+  already_contacted (with last_outgoing_item), no_outgoing_messages,
+  no_conversation, or unknown with a `reason` and viewer_sent_message null.
+  With a thread it adds thread_id, thread_igid, pending, folder and
+  last_item. An item is metadata only: {item_id, message_id,
+  client_context, offline_threading_id, item_type, timestamp, sender,
+  has_text}.
+""" + _HELP_SESSION + """
+  Example: instagram messages inspect account.handle
+""" + _HELP_TAIL,
+    "messages eligibility": """\
+instagram messages eligibility <handle-or-url> [--max-pages N]
+     [--folders main|requests|spam|all] [--connection ID]
+
+  Read-only DM routing verdict; null means Instagram exposes no decisive
+  preflight. Instagram has no reliable preflight for a first Direct message,
+  so a missing conversation stays unverified rather than allowed.
+""" + _HELP_FOLDERS + _HELP_PROFILE + _HELP_CONN + """
+  Output: {connection, username, recipient_pk, eligible, following,
+  followed_by, blocked, restricted, status, reason, conversation_found,
+  requires_new_invitation, ...}; status is existing_conversation (eligible
+  true), awaiting_acceptance (eligible false: a pending invitation the
+  viewer already wrote to), blocked_by_viewer (eligible false),
+  new_invitation_unverified (eligible null, requires_new_invitation true),
+  or unknown (eligible null, the scan incomplete). With a thread it adds
+  thread_id, thread_igid, pending and viewer_sent_message.
+""" + _HELP_SESSION + """
+  Example: instagram messages eligibility account.handle
+""" + _HELP_TAIL,
+    "messages reconcile": """\
+instagram messages reconcile <handle-or-url>
+     (--offline-id ID | --server-message-id ID) [--max-pages N] [--connection ID]
+
+  Confirm a possibly ambiguous send from thread history; never authorizes
+  retry. Read-only: it scans every folder for the thread, then its history
+  for the viewer's message with that id.
+
+  --offline-id ID          the offline_threading_id the send used (a
+                           delivery_unknown failure's hint names it)
+  --server-message-id ID   the server message id a send answered
+  --max-pages N            pages to scan, 1 to 100 (default 25)
+
+  Exactly one of --offline-id and --server-message-id; otherwise, or for any
+  other argument, exit 6 `input`.
+""" + _HELP_PROFILE + _HELP_CONN + """
+  Output: {connection, username, recipient_pk, conversation_found,
+  folders_scanned, lookup, retry_safe: false, status, delivery_confirmed,
+  scan_complete, history_pages_scanned, items_scanned}; status is delivered
+  (delivery_confirmed true, with matched_item), not_found (false, reason
+  message_not_observed) or unknown (null, with a reason). retry_safe is
+  always false.
+""" + _HELP_SESSION + """
+  Example: instagram messages reconcile account.handle --offline-id <id>
+""" + _HELP_TAIL,
+    "messages send": """\
+instagram messages send <handle-or-url>
+     (--text TEXT | --text-file PATH | --stdin) [--connection ID]
+
+  Resolve the thread and send text: obtains the private thread as
+  conversations resolve does, then sends the message through the captured
+  send request.
+
+  --text TEXT       the message
+  --text-file PATH  read the message from a file
+  --stdin           read the message from stdin
+
+  Exactly one of the three. The text is stripped; empty, over 1000
+  characters, an unreadable file or any other argument exits 6 `input`.
+""" + _HELP_PROFILE + _HELP_CONN + _HELP_WRITE + """
+  Output: {status: "sent", connection, username, recipient_pk, thread_igid,
+  offline_threading_id, server_message_id, timestamp_ms}.
+
+  Exit codes: 2 `auth_failed` when Instagram rejects the session (refresh
+  the browser session and run doctor); 5 `awaiting_acceptance` when the
+  recipient must accept the chat invitation before more messages,
+  `rate_limited`, `delivery_unknown` when delivery could not be confirmed -
+  do not retry automatically; its hint names the `messages reconcile`
+  command to run before any manual retry - and `template_failure` or
+  `explicit_failure` for another refusal Instagram states.
+""" + _HELP_SESSION + """
+  Example: instagram messages send account.handle --text-file /path/to/message.txt
+""" + _HELP_TAIL,
+}
 
 
 @dataclass

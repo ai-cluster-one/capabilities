@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -18,193 +18,49 @@ its own: the person reads the items and answers them, and the answer reaches
 the asking agent through the command the asker left with the question.
 Agent-invoked: every answer is JSON on stdout.
 
-Items live in the PostgreSQL the project resolves (STORE). Without a store
-there are none: every verb that reads or writes them exits 6
-`store_not_configured`.
+Items live in the PostgreSQL the project resolves (STORE, on `inbox help
+migrate`). Without a store there are none: every verb that reads or writes
+them exits 6 `store_not_configured`.
 
 ASKING  (the agent of the folder the command runs in)
-  inbox ask "<title>" --text T --yes WORDS --no WORDS --recommend yes|no
-            [--session ID] [--key K] [--on-answer CMD] [--source-label L --source-ref R]
-      A question for a yes or a no. --yes and --no are the words the person
-      reads for each answer, and --recommend the answer the agent would take.
-      The person may also answer it in words alone, neither yes nor no: its
-      answer is then `other` and the reply is the whole of it.
-  inbox talk "<title>" --text T [--session ID] [--key K] [--on-answer CMD]
-             [--source-label L --source-ref R]
-      A message the person answers in words.
-  inbox notify "<title>" --text T [--key K] [--source-label L --source-ref R]
-      Something the person should know; it takes no answer.
-      --source-label and --source-ref, both or neither, link the item to the
-      thing it came from: the label the person reads and the asker's own
-      reference to it, each one line of at most 200 characters. inbox does
-      not read either; show, status and list return them as
-      "source": {"label", "ref"}, null where the item names none.
-      Each of the three answers {"created", "item"}. The title is one line of
-      at most 200 characters. Write the title and the text as `inbox stub`
-      says, for the person deciding. --key K makes the same question one item:
-      a repeat with the same key by the same agent, while the item it names is
-      not withdrawn, creates nothing and answers that item with
-      "created": false, whatever else the repeat says. Without --key every
-      call puts a new item in.
-  inbox withdraw <id> | --key K
-      The question no longer stands: the item leaves every list, and its key
-      is free again. An answered item is not withdrawn (exit 6
-      `already_answered`). Repeating it by id answers "changed": false; by
-      key the withdrawn item is no longer found (exit 3).
-  inbox status <id> | --key K
-      This agent's item, with its answer and its delivery.
-  inbox wait <id> | --key K [--timeout S]
-      Wait until the item is answered and answer it as `status` does. S is
-      seconds, default 300; 0 looks once. Not answered in time exits 7
-      `not_answered`; a withdrawn item exits 6 `withdrawn`; a notify takes
-      no answer and exits 6 `not_answerable`.
-  inbox deliver
-      Run this agent's due on-answer commands (ON ANSWER) and record each
-      outcome. Answers {"agent", "delivered", "failed", "next_due_at"}; exits
-      7 `delivery_failed` after the answer when any command failed.
+  inbox ask "<title>"          a question for a yes or a no
+  inbox talk "<title>"         a message the person answers in words
+  inbox notify "<title>"       something the person should know; no answer
+  inbox withdraw <id>          the question no longer stands
+  inbox status <id>            this agent's item, with its answer and delivery
+  inbox wait <id>              wait until the item is answered
+  inbox deliver                run this agent's due on-answer commands
 
   An asker reaches only its own agent's items: an id or key of another
-  agent's item is not found (exit 3).
-
-THE SESSION AND THE NODE
-  Every item records the node it was put from, by the id `capabilities node
-  id` answers, and the harness session that put it in, so its answer can
-  return there; show, status and list return both for every kind. The
-  session is the one the harness names in the environment of the commands it
-  runs - CLAUDE_CODE_SESSION_ID for Claude Code, CODEX_THREAD_ID for Codex -
-  and an ask's or a talk's --session ID names another session of the same
-  agent instead. A session is this agent's where the harness's own session
-  store holds it as started in this project's folder, or in a folder inside
-  it that is no project of its own, by the first cwd its file records:
-    Claude Code   ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/<id>.jsonl
-    Codex         ${CODEX_HOME:-~/.codex}/sessions/*/*/*/rollout-*-<id>.jsonl
-  Any other session, the one the environment names included, is refused
-  (exit 6 `foreign_session`): the agent whose session it is puts the item in
-  itself. An ask or a talk with no session is refused (exit 6 `no_session`)
-  unless it gives --on-answer, whose command then takes the answer: a caller
-  that runs in no harness session - a service, an automation, tasks run by
-  none - leaves one. A notify records the session where there is one and
-  needs none.
+  agent's item is not found (exit 3). Every item records the node and the
+  harness session it was put from, so its answer can return there (THE
+  SESSION AND THE NODE, on `inbox help ask`). The answer reaches the asker
+  through the command it left, run in its own folder (ON ANSWER, on `inbox
+  help deliver`). Write the title and the text as `inbox stub` says, for
+  the person deciding.
 
 THE PERSON
-  inbox list [--view inbox|archive] [--agent A | --all-agents] [--kind K]
-             [--since WHEN] [--before CURSOR] [--limit N]
-      Items newest first, in pages. The inbox view holds the items neither
-      archived nor withdrawn; the archive view the archived ones not
-      withdrawn; a withdrawn item is in neither. Bare, the folder's agent's
-      items; --agent A another agent's by its id, --all-agents every agent's.
-      --kind ask|talk|notify. --limit 1-500, default 50. Answers {"view",
-      "agent", "count", "items", "next"}: `next` is null on the last page,
-      else the CURSOR that --before takes for the page after it.
-  inbox show <id>
-      One item whole.
-  inbox count [--agent A | --all-agents]
-      For the same agents as list: `inbox` (items in the inbox view),
-      `unread` and `unanswered` (asks and talks without an answer) among
-      them, `archive`, and `undelivered` (answers whose on-answer command has
-      not run to success).
-  inbox answer <id> yes|no [--reply TEXT]      for an ask
-  inbox answer <id> --reply TEXT               for an ask in words alone,
-                                               or for a talk
-      Record the answer and mark the item read. An ask answered with --reply
-      and neither yes nor no records the answer `other`: the words are the
-      whole answer. The word after --reply is the reply whatever it holds, a
-      leading dash and shell characters included. The first answer is final: a
-      second is refused (exit 7 `already_answered`), and the store refuses
-      any change to an answer once it is given. A notify takes none (exit 6
-      `not_answerable`), nor does a withdrawn item (exit 6 `withdrawn`).
-      Answering runs no command: it records the answer, and the asking
-      agent's own process runs its command (ON ANSWER).
-  inbox read <id>... | inbox unread <id>...
-  inbox archive <id>... | inbox unarchive <id>...
-      Mark items read or unread, archived or back in the inbox. Each item's
-      outcome is reported, "changed": false where it already was so; safe to
-      repeat.
+  inbox list                   the items newest first, in pages
+  inbox show <id>              one item whole
+  inbox count                  how many items are unread, unanswered, archived
+  inbox answer <id>            record the answer to an ask or a talk; final
+  inbox read <id>...           mark items read
+  inbox unread <id>...         mark items unread
+  inbox archive <id>...        move items to the archive
+  inbox unarchive <id>...      put items back in the inbox
 
-  The person reaches every agent's items by id. WHEN is a date
-  (2026-10-01), a moment (2026-10-01T12:00:00Z) or an age (30m, 12h, 7d,
-  2w). An id is the whole id or its first six or more characters.
+  The person reaches every agent's items by id. An id is the whole id or its
+  first six or more characters.
 
-ON ANSWER
-  --on-answer CMD is a command line the asker writes. Once the item is
-  answered it runs as the agent that asked: in that agent's folder, as a
-  child of `inbox deliver` run there, with that agent's own environment and
-  rights - never in the answering person's process. It runs as written,
-  through `sh -c`, its text unchanged; the answer reaches it only in the
-  environment, never in the command's text, so no reply becomes part of a
-  shell line:
-    INBOX_ITEM_ID       the item's id
-    INBOX_KEY           its key, empty where none
-    INBOX_KIND          ask or talk
-    INBOX_ANSWER        yes, no or other for an ask, empty for a talk
-    INBOX_REPLY         the reply, empty where none
-    INBOX_ANSWERED_BY   who answered, user@node
-    INBOX_ANSWERED_AT   when, as 2026-10-01T12:00:00.000000Z
-  Its stdin is empty; it is ended after 600 seconds. Exit 0 is delivered.
-  Any other outcome leaves the answer recorded and the item undelivered,
-  with the attempts, the error and the next attempt, which waits 30 seconds
-  after the first failure and doubles after each, up to an hour. Where the
-  agent's folder is on several machines, each delivery is claimed under a
-  lease, so it runs once. With nothing serving the agent the answer stays
-  recorded and visibly undelivered until `inbox deliver` runs in its folder.
+SERVICE  (bundled; it delivers answers with no one running `inbox deliver`)
+  inbox service run            the service in the foreground, for a supervisor
+  inbox service status         whether it runs, and each agent it serves
+  inbox service doctor         the process, the stores, each agent
 
-SERVICE  (inbox service run|status|doctor [--machine])
-  Its only work is to start `inbox deliver` as a child in a served agent's
-  folder, with that agent's .env and .env.local over the machine's
-  environment, when the store announces an answer for that agent and when a
-  failed delivery falls due; one child per agent at a time. It follows the
-  channel inbox_changed in the store's change versions about once a second,
-  and where the store names its transaction address apart it also listens,
-  so an answer wakes it at once.
-
-  inbox service run [--machine]      the service in the foreground, for a
-                                     supervisor
-  inbox service status [--machine]   whether it runs, and each agent it serves
-  inbox service doctor [--machine]   the process, the stores, each agent
-
-  `run` needs inbox enabled for the project itself (`capabilities enable
-  inbox --project`), not only globally, and the read-only switch refuses it.
-  Project mode serves the project it runs in from
-  $XDG_STATE_HOME/capabilities/projects/<slug>/inbox (daemon.pid,
-  daemon.json, daemon.log, daemon.lock, deliver.log). Machine mode serves
-  every project on $XDG_CONFIG_HOME/inbox/service/projects.json, keyed by
-  project id, from $XDG_STATE_HOME/capabilities/machine/inbox; it loads no
-  project's environment itself, checks before every action that the project
-  is still listed and enables inbox for itself, and holds each project's
-  daemon.lock, so one process serves a project at a time: a joined project's
-  own `run` exits 4 `joined_to_machine_service`. A project it cannot serve
-  is reported `refused` or `error` with the reason, and the others are
-  served. The node manager writes the list (`capabilities node supervise
-  inbox --machine`) from the agents placed on this node in mode shared;
-  inbox only reads it. A project is placed so with `capabilities service
-  start inbox`, and taken off with `capabilities service stop inbox`.
-  Every log line reads `<moment> inbox service [<slug>]: <what happened>`.
-  Nothing the service holds is reloaded: it reads no declaration.
-
-STORE
-  The table is inbox_items in the schema the project's store setting names,
-  migrated under the `inbox` ledger: the AGENTKIT_DB_* keys in the project's
-  .env.local and .env, then the same keys in the environment, then the
-  machine's store setting that `capabilities store set` writes. A key is
-  unique per agent among items not withdrawn; the store refuses any change
-  to what an item asks, any change to an answer once given, and taking a
-  withdrawal back. Every change raises the agent's version of the channel
-  `inbox_changed` in the store's change versions (schema_channel, scope the
-  agent id) in the writer's own transaction, and notifies `inbox_changed`
-  with {"schema", "agent_id", "id"} - ids only, never text.
-
-CONTRACT VERBS
-  inbox help                  this text
-  inbox doctor                the store, the table, and this project's identity
-  inbox connections           none: inbox reaches no system of its own
-  inbox stub                  the one-line awareness text
-  inbox manifest --json       the declaration, with the service
-  inbox guide [<topic>]       how-to guides (none ship)
-  inbox ids list|get|set|rm   this project's identifiers
-  inbox refs                  this project's references
-  inbox inventory [--network] the service's state on this machine; the
-                              items are the store's (`inbox list`)
-  inbox migrate [status]      bring the table up to this version / report
+  Its only work is to start `inbox deliver` in a served agent's folder when
+  the store announces an answer for that agent and when a failed delivery
+  falls due. It serves one project, or in machine mode every project the
+  node manager joins to it; both are on `inbox help service run`.
 
 I/O
   Success is JSON on stdout; failure is {"error": {"code", "message",
@@ -312,6 +168,517 @@ SERVICE = {
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+# The verb pages `inbox help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, manifest, guide,
+# inventory and migrate follow. A text several verbs own is one constant,
+# added to each of their pages.
+_HELP_TAIL = """
+I/O
+  Success is JSON on stdout; failure is {"error": {"code", "message",
+  "hint"?}} on stderr.
+
+EXIT CODES
+  0 success
+  3 not found - no item of that id or key
+  4 policy - inbox not enabled, the read-only switch, a service verb this
+    project may not run here
+  5 store - unreachable or busy
+  6 input - a malformed argument, no store configured, no project or project
+    identity, an item not in the state the verb needs, a question with no
+    session, a session that is not this agent's
+  7 already answered, not answered in time, or a delivery that failed
+  8 another service process already holds this state root
+"""
+_HELP_STORE_NEEDED = """
+  Items live in the PostgreSQL the project resolves (STORE, on `inbox help
+  migrate`). Without a store there are none: the verb exits 6
+  `store_not_configured`; a store that stops answering exits 5
+  `store_unreachable`, and a change the store refuses exits 6
+  `refused_by_store`. Outside a project it exits 6 `no_project`, and in a
+  project with no durable id 6 `no_project_identity`.
+"""
+_HELP_WRITE = """
+  It changes the store's items, so the read-only switch refuses it (exit 4).
+"""
+_HELP_OWN = """
+  <id>     the item's whole id or its first six or more characters; an id
+           that is neither exits 6 `input`, a prefix more than one item
+           shares exits 6 `ambiguous_id`
+  --key K  the item by the key it was put in with, among this agent's items
+           not withdrawn
+  Give the id or --key K, one of them (exit 6 `input` otherwise). An asker
+  reaches only its own agent's items: an id or key of another agent's item
+  is not found (exit 3 `not_found`).
+"""
+_HELP_ID = """
+  <id>     the item's whole id or its first six or more characters; an id
+           that is neither exits 6 `input`, a prefix more than one item
+           shares exits 6 `ambiguous_id`, and no item of that id exits 3
+           `not_found`. The person reaches every agent's items by id.
+"""
+_HELP_ITEM = """
+  An item is {"id", "agent", "kind", "key", "title", "text", "session",
+  "node", "source", "created_at", "created_by", "read", "read_at",
+  "archived_at", "withdrawn_at"}; an ask adds "yes", "no" and "recommend";
+  an ask and a talk add "on_answer", "answered", "answered_at",
+  "answered_by", "answer", "reply" and "delivery". "source" is {"label",
+  "ref"}, null where the item names none. "delivery" is null where the item
+  left no on-answer command, else {"state": "waiting_for_answer"},
+  {"state": "delivered", "delivered_at", "attempts"} or {"state":
+  "undelivered", "attempts", "error", "next_attempt_at", "claimed_until"}.
+  Moments read as 2026-10-01T12:00:00.000000Z.
+"""
+_HELP_PUT = """
+  --text T                  the item's text, for the person; required
+  --key K                   makes the same question one item (below)
+  --source-label L          the label the person reads for the thing the
+                            item came from
+  --source-ref R            the asker's own reference to that thing
+
+  --source-label and --source-ref, both or neither, link the item to the
+  thing it came from: the label the person reads and the asker's own
+  reference to it, each one line of at most 200 characters. inbox does not
+  read either; show, status and list return them as "source": {"label",
+  "ref"}, null where the item names none. Giving one without the other
+  exits 6 `input`.
+
+  Each of the three answers {"created", "item"}. The title is one line of
+  at most 200 characters. Write the title and the text as `inbox stub`
+  says, for the person deciding. --key K makes the same question one item:
+  a repeat with the same key by the same agent, while the item it names is
+  not withdrawn, creates nothing and answers that item with
+  "created": false, whatever else the repeat says. Without --key every call
+  puts a new item in. An empty title, key or label, or one that is not one
+  line, exits 6 `input`.
+"""
+_HELP_SESSION = """
+THE SESSION AND THE NODE
+  Every item records the node it was put from, by the id `capabilities node
+  id` answers, and the harness session that put it in, so its answer can
+  return there; show, status and list return both for every kind. The
+  session is the one the harness names in the environment of the commands it
+  runs - CLAUDE_CODE_SESSION_ID for Claude Code, CODEX_THREAD_ID for Codex -
+  and an ask's or a talk's --session ID names another session of the same
+  agent instead. A session is this agent's where the harness's own session
+  store holds it as started in this project's folder, or in a folder inside
+  it that is no project of its own, by the first cwd its file records:
+    Claude Code   ${CLAUDE_CONFIG_DIR:-~/.claude}/projects/*/<id>.jsonl
+    Codex         ${CODEX_HOME:-~/.codex}/sessions/*/*/*/rollout-*-<id>.jsonl
+  Any other session, the one the environment names included, is refused
+  (exit 6 `foreign_session`): the agent whose session it is puts the item in
+  itself. An ask or a talk with no session is refused (exit 6 `no_session`)
+  unless it gives --on-answer, whose command then takes the answer: a caller
+  that runs in no harness session - a service, an automation, tasks run by
+  none - leaves one. A notify records the session where there is one and
+  needs none.
+"""
+_HELP_ON_ANSWER = """
+ON ANSWER
+  --on-answer CMD is a command line the asker writes. Once the item is
+  answered it runs as the agent that asked: in that agent's folder, as a
+  child of `inbox deliver` run there, with that agent's own environment and
+  rights - never in the answering person's process. It runs as written,
+  through `sh -c`, its text unchanged; the answer reaches it only in the
+  environment, never in the command's text, so no reply becomes part of a
+  shell line:
+    INBOX_ITEM_ID       the item's id
+    INBOX_KEY           its key, empty where none
+    INBOX_KIND          ask or talk
+    INBOX_ANSWER        yes, no or other for an ask, empty for a talk
+    INBOX_REPLY         the reply, empty where none
+    INBOX_ANSWERED_BY   who answered, user@node
+    INBOX_ANSWERED_AT   when, as 2026-10-01T12:00:00.000000Z
+  Its stdin is empty; it is ended after 600 seconds. Exit 0 is delivered.
+  Any other outcome leaves the answer recorded and the item undelivered,
+  with the attempts, the error and the next attempt, which waits 30 seconds
+  after the first failure and doubles after each, up to an hour. Where the
+  agent's folder is on several machines, each delivery is claimed under a
+  lease, so it runs once. With nothing serving the agent the answer stays
+  recorded and visibly undelivered until `inbox deliver` runs in its folder.
+  An empty CMD exits 6 `input`.
+"""
+_HELP_AGENTS = """
+  --agent A        another agent's items, by its id
+  --all-agents     every agent's items
+  Bare, the folder's agent's items. --agent and --all-agents together exit
+  6 `input`.
+"""
+_HELP_MARK = """
+  <id>...  one or more items, each its whole id or its first six or more
+           characters; the person reaches every agent's items by id. An id
+           that names no item exits 3 `not_found`, one that is neither
+           exits 6 `input`, a prefix more than one item shares exits 6
+           `ambiguous_id`; then nothing is changed.
+
+  Mark items read or unread, archived or back in the inbox. Each item's
+  outcome is reported, "changed": false where it already was so; safe to
+  repeat. An item named twice is reported once.
+
+  Output: {"items": [{"id", "changed"}]}.
+"""
+_HELP_SERVICE = """
+  --machine   machine mode: every project on the machine list, instead of
+              the project the command runs in
+
+  Its only work is to start `inbox deliver` as a child in a served agent's
+  folder, with that agent's .env and .env.local over the machine's
+  environment, when the store announces an answer for that agent and when a
+  failed delivery falls due; one child per agent at a time. It follows the
+  channel inbox_changed in the store's change versions about once a second,
+  and where the store names its transaction address apart it also listens,
+  so an answer wakes it at once.
+
+  Project mode serves the project it runs in from
+  $XDG_STATE_HOME/capabilities/projects/<slug>/inbox (daemon.pid,
+  daemon.json, daemon.log, daemon.lock, deliver.log). Machine mode serves
+  every project on $XDG_CONFIG_HOME/inbox/service/projects.json, keyed by
+  project id, from $XDG_STATE_HOME/capabilities/machine/inbox; it loads no
+  project's environment itself, checks before every action that the project
+  is still listed and enables inbox for itself, and holds each project's
+  daemon.lock, so one process serves a project at a time: a joined
+  project's own `run` exits 4 `joined_to_machine_service`. A project it
+  cannot serve is reported `refused` or `error` with the reason, and the
+  others are served. The node manager writes the list (`capabilities node
+  supervise inbox --machine`) from the agents placed on this node in mode
+  shared; inbox only reads it. A list that does not read as {"version":
+  1, "projects": {...}} is logged by the service and reported by `service
+  status` (`projects_invalid`), and serves no one. A project is
+  placed so with `capabilities service start inbox`, and taken off with
+  `capabilities service stop inbox`. Every log line reads `<moment> inbox
+  service [<slug>]: <what happened>`. Nothing the service holds is
+  reloaded: it reads no declaration.
+"""
+HELP_VERBS = {
+    "doctor": """\
+For inbox:
+  The store, the table, and this project's identity. inbox takes no
+  connection: the store is the project's.
+
+  Output: {"ok", "project": {"root", "id"}, "store": {"level", "schema"},
+  "tables": {"state", "pending", "changed", "warnings"}, "items": {"inbox",
+  "undelivered"}}; "items" where the table is current and the project has
+  an id, "hint" where the table is pending or does not match this version,
+  and "service" - this project's service on this machine, with a hint where
+  nothing delivers - where answers wait undelivered. A store that does not
+  resolve or answer is reported under "store" as {"error": {"code",
+  "message"}}.
+
+  Exit codes: 0 ready (the table current or pending); 5 the store does not
+  answer; 6 the store setting is missing or refused; 7 the store's inbox
+  table does not match this version (`inbox migrate status` says how).
+""",
+    "connections": """\
+For inbox:
+  None: inbox reaches no system of its own. The store is the project's,
+  resolved through the shared library, so there is nothing to resolve
+  here; the report's "connections" map is empty and "default" null.
+""",
+    "manifest": """\
+For inbox:
+  The declaration, with the service it bundles under "service".
+""",
+    "guide": """\
+For inbox:
+  How-to guides; none ship.
+""",
+    "inventory": """\
+For inbox:
+  The service's state on this machine; the items are the store's, and
+  reading them is `inbox list`. Local only; it reaches nothing remote.
+  It reports under "service": {"state": "running"|"stopped"}, with
+  "detail" (its pid, and whether the machine service runs it) while it
+  runs, and "ok": true where it serves this project, or "ok": false with
+  "problem" where it does not.
+""",
+    "migrate": """\
+For inbox:
+  Bring the table up to this version / report. Every other verb that opens
+  the store migrates the table first, so `migrate` is rarely needed.
+
+STORE
+  The table is inbox_items in the schema the project's store setting names,
+  migrated under the `inbox` ledger: the AGENTKIT_DB_* keys in the project's
+  .env.local and .env, then the same keys in the environment, then the
+  machine's store setting that `capabilities store set` writes. A key is
+  unique per agent among items not withdrawn; the store refuses any change
+  to what an item asks, any change to an answer once given, and taking a
+  withdrawal back. Every change raises the agent's version of the channel
+  `inbox_changed` in the store's change versions (schema_channel, scope the
+  agent id) in the writer's own transaction, and notifies `inbox_changed`
+  with {"schema", "agent_id", "id"} - ids only, never text.
+""",
+    "ask": """\
+inbox ask "<title>" --text T --yes WORDS --no WORDS --recommend yes|no
+          [--session ID] [--key K] [--on-answer CMD] [--source-label L --source-ref R]
+
+  A question for a yes or a no. --yes and --no are the words the person
+  reads for each answer, and --recommend the answer the agent would take.
+  The person may also answer it in words alone, neither yes nor no: its
+  answer is then `other` and the reply is the whole of it. It is put in by
+  the agent of the folder the command runs in.
+
+  "<title>"                 the question, one line of at most 200 characters
+  --yes WORDS               what a yes means, for the person; required
+  --no WORDS                what a no means, for the person; required
+  --recommend yes|no        the answer the agent would take; required
+  --session ID              another session of this agent to return the
+                            answer to (THE SESSION AND THE NODE)
+  --on-answer CMD           the command that takes the answer (ON ANSWER)
+""" + _HELP_PUT + _HELP_SESSION + _HELP_ON_ANSWER + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Output: {"created": true|false, "item": <the item>}.
+""" + _HELP_ITEM + """
+  Example: inbox ask "Ship the release today?" --text "The checks pass; the release notes are written." --yes "Ship it" --no "Hold it" --recommend yes --key release-today
+""" + _HELP_TAIL,
+    "talk": """\
+inbox talk "<title>" --text T [--session ID] [--key K] [--on-answer CMD]
+           [--source-label L --source-ref R]
+
+  A message the person answers in words. It is put in by the agent of the
+  folder the command runs in.
+
+  "<title>"                 the message's title, one line of at most 200
+                            characters
+  --session ID              another session of this agent to return the
+                            answer to (THE SESSION AND THE NODE)
+  --on-answer CMD           the command that takes the answer (ON ANSWER)
+""" + _HELP_PUT + _HELP_SESSION + _HELP_ON_ANSWER + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Output: {"created": true|false, "item": <the item>}.
+""" + _HELP_ITEM + """
+  Example: inbox talk "Which customer goes first?" --text "Two onboardings are ready; I can start one this week."
+""" + _HELP_TAIL,
+    "notify": """\
+inbox notify "<title>" --text T [--key K] [--source-label L --source-ref R]
+
+  Something the person should know; it takes no answer, and leaves no
+  command. It is put in by the agent of the folder the command runs in.
+
+  "<title>"                 what happened, one line of at most 200 characters
+""" + _HELP_PUT + _HELP_SESSION + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Output: {"created": true|false, "item": <the item>}.
+""" + _HELP_ITEM + """
+  Example: inbox notify "The nightly backup finished" --text "All three databases were copied." --key backup-nightly
+""" + _HELP_TAIL,
+    "withdraw": """\
+inbox withdraw <id> | --key K
+
+  The question no longer stands: the item leaves every list, and its key
+  is free again. An answered item is not withdrawn (exit 6
+  `already_answered`). Repeating it by id answers "changed": false; by key
+  the withdrawn item is no longer found (exit 3).
+""" + _HELP_OWN + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Output: {"changed": true|false, "item": <the item>}.
+""" + _HELP_ITEM + """
+  Example: inbox withdraw --key release-today
+""" + _HELP_TAIL,
+    "status": """\
+inbox status <id> | --key K
+
+  This agent's item, with its answer and its delivery. It changes nothing.
+""" + _HELP_OWN + _HELP_STORE_NEEDED + """
+  Output: <the item>.
+""" + _HELP_ITEM + """
+  Example: inbox status --key release-today
+""" + _HELP_TAIL,
+    "wait": """\
+inbox wait <id> | --key K [--timeout S]
+
+  Wait until the item is answered and answer it as `status` does. S is
+  seconds, default 300; 0 looks once. Not answered in time exits 7
+  `not_answered`; a withdrawn item exits 6 `withdrawn`; a notify takes no
+  answer and exits 6 `not_answerable`. It follows the store's change
+  channel while it waits, so an answer ends the wait within a second.
+
+  --timeout S   seconds to wait, default 300; 0 looks once; a negative S
+                exits 6 `input`
+""" + _HELP_OWN + _HELP_STORE_NEEDED + """
+  Output: <the answered item>.
+""" + _HELP_ITEM + """
+  Example: inbox wait --key release-today --timeout 600
+""" + _HELP_TAIL,
+    "deliver": """\
+inbox deliver
+
+  Run this agent's due on-answer commands (ON ANSWER) and record each
+  outcome. Answers {"agent", "delivered", "failed", "next_due_at"}; exits 7
+  `delivery_failed` after the answer when any command failed. It takes no
+  argument: the agent is the folder's. The bundled service runs it in a
+  served agent's folder; run by hand it delivers what is due now.
+
+  Output: {"agent", "delivered": [{"id", "attempts"}], "failed": [{"id",
+  "attempts", "error", "next_attempt_at"}], "next_due_at"}; "next_due_at"
+  is the moment the next undelivered answer falls due, null where none
+  waits.
+""" + _HELP_ON_ANSWER + """
+  `deliver` writes each delivery's outcome, so the read-only switch refuses
+  it (exit 4).
+""" + _HELP_STORE_NEEDED + """
+  Example: inbox deliver
+""" + _HELP_TAIL,
+    "list": """\
+inbox list [--view inbox|archive] [--agent A | --all-agents] [--kind K]
+           [--since WHEN] [--before CURSOR] [--limit N]
+
+  Items newest first, in pages. The inbox view holds the items neither
+  archived nor withdrawn; the archive view the archived ones not withdrawn;
+  a withdrawn item is in neither. Bare, the folder's agent's items; --agent
+  A another agent's by its id, --all-agents every agent's. --kind
+  ask|talk|notify. --limit 1-500, default 50. Answers {"view", "agent",
+  "count", "items", "next"}: `next` is null on the last page, else the
+  CURSOR that --before takes for the page after it.
+
+  --view inbox|archive   which view, default inbox
+  --kind K               only items of kind ask, talk or notify
+  --since WHEN           only items put in at or after WHEN
+  --before CURSOR        the page after the one whose `next` this is; a
+                         value that is no cursor exits 6 `input`
+  --limit N              items per page, 1-500, default 50; any other N
+                         exits 6 `input`
+""" + _HELP_AGENTS + """
+  WHEN is a date (2026-10-01), a moment (2026-10-01T12:00:00Z) or an age
+  (30m, 12h, 7d, 2w); a date or moment without a zone is UTC, and anything
+  else exits 6 `input`.
+""" + _HELP_STORE_NEEDED + """
+  Output: {"view", "agent" (the agent's id, or "all"), "count", "items":
+  [<the item>, ...], "next"}.
+""" + _HELP_ITEM + """
+  Example: inbox list --all-agents --kind ask --since 7d --limit 20
+""" + _HELP_TAIL,
+    "show": """\
+inbox show <id>
+
+  One item whole, any agent's. It changes nothing; reading it does not mark
+  it read (`inbox read` does).
+""" + _HELP_ID + _HELP_STORE_NEEDED + """
+  Output: <the item>.
+""" + _HELP_ITEM + """
+  Example: inbox show 3f2a9c
+""" + _HELP_TAIL,
+    "count": """\
+inbox count [--agent A | --all-agents]
+
+  For the same agents as list: `inbox` (items in the inbox view), `unread`
+  and `unanswered` (asks and talks without an answer) among them,
+  `archive`, and `undelivered` (answers whose on-answer command has not run
+  to success). Withdrawn items count in none.
+""" + _HELP_AGENTS + _HELP_STORE_NEEDED + """
+  Output: {"agent" (the agent's id, or "all"), "inbox", "unread",
+  "unanswered", "archive", "undelivered"}.
+
+  Example: inbox count --all-agents
+""" + _HELP_TAIL,
+    "answer": """\
+inbox answer <id> yes|no [--reply TEXT]      for an ask
+inbox answer <id> --reply TEXT               for an ask in words alone,
+                                             or for a talk
+
+  Record the answer and mark the item read. An ask answered with --reply
+  and neither yes nor no records the answer `other`: the words are the
+  whole answer. The word after --reply is the reply whatever it holds, a
+  leading dash and shell characters included. The first answer is final: a
+  second is refused (exit 7 `already_answered`), and the store refuses any
+  change to an answer once it is given. A notify takes none (exit 6
+  `not_answerable`), nor does a withdrawn item (exit 6 `withdrawn`).
+  Answering runs no command: it records the answer, and the asking agent's
+  own process runs its command (ON ANSWER, on `inbox help deliver`).
+
+  yes|no         the answer to an ask
+  --reply TEXT   the words of the answer; with yes or no beside them for an
+                 ask, alone for an ask in words or for a talk
+""" + _HELP_ID + """
+  An ask with neither yes, no nor --reply, a talk answered yes or no, a
+  talk without --reply, and an empty --reply each exit 6 `input`. The person
+  reaches every agent's items by id; the answer is recorded as user@node.
+""" + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Output: <the answered item>.
+""" + _HELP_ITEM + """
+  Example: inbox answer 3f2a9c yes --reply "Ship it after lunch"
+""" + _HELP_TAIL,
+    "read": """\
+inbox read <id>...
+""" + _HELP_MARK + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Example: inbox read 3f2a9c 7be104
+""" + _HELP_TAIL,
+    "unread": """\
+inbox unread <id>...
+""" + _HELP_MARK + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Example: inbox unread 3f2a9c
+""" + _HELP_TAIL,
+    "archive": """\
+inbox archive <id>...
+""" + _HELP_MARK + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Example: inbox archive 3f2a9c 7be104
+""" + _HELP_TAIL,
+    "unarchive": """\
+inbox unarchive <id>...
+""" + _HELP_MARK + _HELP_WRITE + _HELP_STORE_NEEDED + """
+  Example: inbox unarchive 3f2a9c
+""" + _HELP_TAIL,
+    "service run": """\
+inbox service run [--machine]
+
+  The service in the foreground, for a supervisor. `run` needs inbox
+  enabled for the project itself (`capabilities enable inbox --project`),
+  not only globally, and the read-only switch refuses it. Keeping it running
+  is the manager's: `capabilities node supervise inbox` runs it as this
+  node's gate places it.
+""" + _HELP_SERVICE + """
+  Output: nothing on stdout; it runs until it is stopped, each log line
+  written to daemon.log in its state directory and to stderr.
+
+  Exit codes: 4 `joined_to_machine_service` where this project is joined to
+  the machine service (`capabilities service stop inbox` takes it back to
+  project mode first), or policy; 5 the store does not answer; 6
+  `store_not_configured`, no project (`no_project`) or project identity
+  (`no_project_identity`); 8 `service_running` where another service
+  process holds this state root (`inbox service status` names it).
+
+  Example: inbox service run --machine
+""" + _HELP_TAIL,
+    "service status": """\
+inbox service status [--machine]
+
+  Whether it runs, and each agent it serves. Local only: it reads this
+  machine's state files and changes nothing.
+
+  --machine   the machine service and every project on its list, instead of
+              this project's service (the machine's where this project is
+              joined to it)
+
+  Output, for this project: {"mode": "project"|"machine", "joined",
+  "running", "pid", "state_dir", "stores", "log", "project": {"state",
+  "reason", ...}}. With --machine: {"mode": "machine", "running", "pid",
+  "state_dir", "started_at", "published_at", "stores", "list": {"path",
+  "joined", "error"?}, "projects": [{"project", "project_id", "root",
+  "joined_at", "joined_by", "present", "state", "reason", ...}], "log"}.
+
+  Example: inbox service status --machine
+""" + _HELP_TAIL,
+    "service doctor": """\
+inbox service doctor [--machine]
+
+  The process, the stores, each agent: for this project, its store and its
+  table, and whether a process serves it; with --machine, whether the
+  machine service runs and reaches its stores, and every project on its
+  list.
+
+  --machine   the machine service, instead of this project's
+
+  Output: {"ok", "store"?: {"ok", "schema", "tables"} or {"ok", "code",
+  "error"}, "process": {"ok", ...}, "projects"? (with --machine)}; a
+  process that does not run carries its "error" and a "hint".
+
+  Exit codes: 0 every check holds; 5 the store, or every store the machine
+  service holds, does not answer; 6 the store setting is missing or
+  refused; 7 no process serves it, it does not serve this project, or the
+  table does not match this version.
+
+  Example: inbox service doctor
+""" + _HELP_TAIL,
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").
@@ -1871,7 +2238,9 @@ def main() -> None:
     args = _parser().parse_args(_words_whole(argv))
     cmd = args.cmd
     if cmd == "help":
-        _cmd_help()
+        # The contract dispatches `help` and `help <verb>` before the parser;
+        # this is the same layered help, should the parser reach it.
+        _cmd_help_verb(args.topic) if args.topic else _cmd_help()
         return
     if cmd in WRITE_VERBS:
         _read_only_gate(f"`{NAME} {cmd}`")

@@ -755,7 +755,7 @@
       "level": 0,
       "lucide_icon": "inbox",
       "path": "capabilities/inbox",
-      "payload_sha256": "af92c1293fe56448b14d8a296ec71f4be8980b1c6e5e94862ea3c2d9672ce646",
+      "payload_sha256": "e1069d77356de80b759172642a0a55d8c1f051f42360b720af6544b1d64a1c5e",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "A go-between to the person - an agent puts in a question to answer yes or no, a message to answer in words, or something to know, and leaves the command that takes the answer; the person lists, reads, answers and archives them, and the answer runs the asker's command in the asker's own folder. Whatever an agent puts before a person in the Inbox, itself or through another tool, is written for someone deciding, not someone reading code: say what this is, why it comes up now, what is needed from the person, and which answer you recommend and why, in plain language with no code, file paths, line numbers, commit or task ids, or internal names, under a title that says the matter itself.",
@@ -771,7 +771,7 @@
           "title": "Входящие"
         }
       },
-      "version": "2026-11-16 — `inbox` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `inbox help` is the menu, and `inbox help <verb>` one verb's whole contract"
     },
     "instagram": {
       "executable": [
@@ -787,7 +787,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/instagram",
-      "payload_sha256": "66704fdc740d2c4cf51d9cace78865b48f2ac8bfd7fcd3ebc091814db7782918",
+      "payload_sha256": "8d89c91cff49af3dbe5d2b10fe24d63c51524f7254cdf0ca1d2415037038f503",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Instagram CLI over a captured browser session — validate identity, read profiles, resolve Direct threads, and send text messages. Stateful — run `instagram doctor` first.",
@@ -803,7 +803,7 @@
           "title": "Instagram"
         }
       },
-      "version": "2026-11-16 — `instagram` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `instagram help` is the menu, and `instagram help <verb>` one verb's whole contract"
     },
     "journal": {
       "executable": [
@@ -820,7 +820,7 @@
       "level": 0,
       "lucide_icon": "notebook",
       "path": "capabilities/journal",
-      "payload_sha256": "23fbc9dcaef9637a6492017ae5eb9ebefc01174d1addc1efc440db9786df4945",
+      "payload_sha256": "b824acc290efab411edd91070432db9ca386d16b94c7c32c6019840952f4f0a9",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Journal CLI over a PostgreSQL store — list and read voice-journal entries, write enrichment back, chunk transcripts for embedding, and search the store at three levels.",
@@ -836,7 +836,7 @@
           "title": "Журнал"
         }
       },
-      "version": "2026-11-16 — `journal` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `journal help` is the menu, and `journal help <verb>` one verb's whole contract"
     },
     "macmail": {
       "executable": [
@@ -853,7 +853,7 @@
       "level": 0,
       "lucide_icon": "mail",
       "path": "capabilities/macmail",
-      "payload_sha256": "a3f2a93ea73edc90da9abbd7359c7e2bac7336c7e7a32ef438b02520e817c4f6",
+      "payload_sha256": "11b781ee0830847eb6b5d9961434f6cd1ab87f642c54584b0d10d2bea1808849",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Mail.app CLI over macOS Automation — read/search mail across configured accounts, show a message, save attachments, draft (never send), and export a mailbox to JSON.",
@@ -869,7 +869,7 @@
           "title": "Почта Apple"
         }
       },
-      "version": "2026-11-16 — `macmail` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `macmail help` is the menu, and `macmail help <verb>` one verb's whole contract"
     },
     "mailbox": {
       "executable": [
@@ -887,7 +887,7 @@
       "level": 0,
       "lucide_icon": "mail",
       "path": "capabilities/mailbox",
-      "payload_sha256": "4222f909bc99554fa226c666e0518c7e089f44e6c81bb035fb23521ceb1b48c8",
+      "payload_sha256": "e7da487d2e814cfc971c6be56a131a1b54a4b4a46eb89e7698cb6f329ddfa91b",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Thin IMAP/SMTP CLI for mailboxes — list/show messages, save attachments, render PDF, save raw .eml, flag `\\Seen`, move between folders, send, and save a draft into Drafts without sending it; send, draft, move and seen need a write grant.",
@@ -903,7 +903,7 @@
           "title": "Почтовый ящик"
         }
       },
-      "version": "2026-11-16 — `mailbox` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `mailbox help` is the menu, and `mailbox help <verb>` one verb's whole contract"
     },
     "memory": {
       "executable": [
@@ -932,7 +932,7 @@
       "level": 0,
       "lucide_icon": "brain",
       "path": "capabilities/memory",
-      "payload_sha256": "cf10ddf338903da84e3738abb6f76e2b736012c030016b31cdc0e29be21213b9",
+      "payload_sha256": "25e34ca3766a65121fd0c7ce0891f41a7e6172aea9814375c5a11fc02224e8b4",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a constant block in every session's context that says how to record and search them, and a grooming pass, run on a schedule, that consolidates the entries.",
@@ -948,7 +948,7 @@
           "title": "Память"
         }
       },
-      "version": "2026-11-17 — Turns run on callva-harness-runner 0.12.3"
+      "version": "2026-11-22 — `memory help` is the menu, and `memory help <verb>` one verb's whole contract"
     },
     "notion": {
       "executable": [
