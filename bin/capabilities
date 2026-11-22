@@ -31655,15 +31655,6 @@ MANAGER_VERB_PROBES = {
 # that holds nothing for the capability.
 HELP_MENU_CEILING = 8192
 
-# The catalogue bundles whose help predates the layered law, each awaiting its
-# own conversion. Their menu findings are reported under `pending` rather than
-# failing the audit, and a bundle named here whose help already conforms fails
-# until its name is taken out, so the set only shrinks. A name is never added:
-# every bundle outside it, a new capability included, is held to the whole law.
-HELP_MENU_PENDING = frozenset({
-    "telegram", "telegrambot", "vapic", "whatsapp", "windmill", "youtrack",
-})
-
 _HELP_FLAG = re.compile(r"(?<![\w-])--?[A-Za-z]")
 _HELP_WORD = re.compile(r"[a-z][a-z0-9-]*")
 
@@ -31781,7 +31772,6 @@ def _manager_verbs_problems(name: str, script: Path, help_text: str,
 
 def _audit_script(
     name: str, script: Path, manifest_result: list[dict] | None = None,
-    pending_result: list[str] | None = None,
 ) -> list[str]:
     failures: list[str] = []
     env = _snapshot_env()
@@ -32023,15 +32013,8 @@ def _audit_script(
         # judged on the menu as it renders in this project, which holds nothing.
         rc, menu, _errs = _run_script(script, ["help"], cwd=sandbox, env=genv)
         if rc == 0:
-            menu_problems = _help_menu_problems(name, script, menu, sandbox, genv)
-            if name not in HELP_MENU_PENDING:
-                failures += [f"help: {p}" for p in menu_problems]
-            elif not menu_problems:
-                failures.append(
-                    f"help: {name} answers the layered help; take it out of "
-                    "HELP_MENU_PENDING")
-            elif pending_result is not None:
-                pending_result += [f"help: {p}" for p in menu_problems]
+            failures += [f"help: {p}" for p in _help_menu_problems(
+                name, script, menu, sandbox, genv)]
 
         # inventory — the project self-report every reader renders the same way
         # (DOCTRINE rule 20). Bare, it costs nothing: the sandbox tree is
@@ -32173,12 +32156,8 @@ def cmd_audit(name: str, from_ref: str | None) -> None:
         if not script.is_file():
             _die(3, "not_found", f"{name} is not installed",
                  f"`capabilities install {name}` or audit --from <path>")
-    pending: list[str] = []
-    failures = _audit_script(name, script, pending_result=pending)
-    report = {"name": name, "ok": not failures, "failures": failures}
-    if pending:
-        report["pending"] = pending
-    _emit(report)
+    failures = _audit_script(name, script)
+    _emit({"name": name, "ok": not failures, "failures": failures})
     if failures:
         sys.exit(7)
 

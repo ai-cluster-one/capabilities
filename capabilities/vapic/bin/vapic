@@ -2,163 +2,62 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
-"""vapic - a capability harness around the official `vapi` CLI.
-
-It resolves a Vapi API key through the capability connection cascade, injects
-that key into the child environment, and normally forwards commands verbatim to
-`vapi`. vapic owns project policy, connection selection, and readiness. Vapi
-owns the actual voice-AI command surface.
+"""vapic - a capability harness around the official `vapi` CLI. It resolves a
+Vapi API key through the capability connection cascade, injects that key into
+the child environment, and normally forwards commands verbatim to `vapi`. It
+owns project policy, connection selection, and readiness; Vapi owns the
+actual voice-AI command surface. Agent-invoked - run `vapic help` to reload
+this menu and `vapic help <verb>` for one verb's whole contract, on demand.
 
 USAGE
-  vapic <command> [args...]    Forward to `vapi <command> [args...]`, normally
-                               with the selected connection injected as
-                               VAPI_API_KEY.
-  vapic bootstrap [--yes]      Check/install the official Vapi CLI. Without
-                               --yes, print the install plan and make no change.
-  vapic connections            Where every connection's values resolve from
-                               (tier, source, secrets masked). Local only.
-  vapic doctor [--connection <id>]
-                               Prove the selected Vapi key resolves, the
-                               official CLI exists, and the key is accepted.
-  vapic help                   Print this contract.
+  vapic <command> [args...]     forward to `vapi <command> [args...]`, normally with the selected connection injected as VAPI_API_KEY
+  vapic bootstrap               check for the official Vapi CLI and print its install plan, or install it
+  vapic connections             where every connection's values resolve from (tier, source, secrets masked); local only
+  vapic doctor                  prove the selected Vapi key resolves, the official CLI exists, and the key is accepted
 
-Contract commands (the same on every capability; vapic's own, never forwarded):
-  vapic stub                                  One-line awareness text.
-  vapic manifest --json                       Machine-readable declaration.
-  vapic guide [connections|official-cli]      Guide topics / one guide body.
-  vapic ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope
-        [--note <text>]                       (capabilities/vapic/identifiers.json,
-                                               or store rows once the agent moved).
-  vapic refs                                  Menu of the project's reference files.
-  vapic inventory [--network]                 What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
-
-Agent-invoked. Run `vapic help` to reload this contract; run `vapi --help` (the
-real CLI) for the full command surface. vapic deliberately does not re-document
-or re-map the official Vapi commands.
+The real CLI's own help is the full command surface; vapic deliberately does
+not re-document or re-map the official Vapi commands. How a command is
+forwarded - connection selection, the injected environment, the write gate,
+the narrow read-list fallback, reaching the official CLI's own help, and the
+exit code it returns - is `vapic help forward`.
 
 MODEL
-  vapic is not a general REST client for Vapi and not a replacement command
-  surface. It is a thin auth shim: it chooses one declared connection, sets
-  VAPI_API_KEY plus optional VAPI_ENV, VAPI_API_BASE_URL, and
-  VAPI_DASHBOARD_URL, then normally runs the official `vapi` CLI with inherited
-  stdio. `vapic --connection staging assistant list` runs `vapi assistant list`
-  under the staging key; stdout, stderr, prompts, --json, colors, and exit code
-  are Vapi CLI's own unless the documented narrow read-list fallback is
-  triggered.
-
-  It REQUIRES a capability connection and never falls back to the official
-  `~/.vapi-cli.yaml` login state. That refusal is the scoping guarantee: a
-  command can never silently run against whichever Vapi account the human last
-  selected with `vapi login` or `vapi auth switch`. Use native `vapi` directly
-  for manual login/account management; use vapic for agent work.
-
-  Narrow resilience exception: official Vapi CLI v0.2.1 can fail to decode
-  list responses for `assistant list` and `call list` when the API returns
-  schema variants its pinned Go SDK cannot unmarshal. Only for those exact read
-  commands, and only after that recognized failure, vapic retries the official
-  read-only REST endpoint with the already-resolved API key in an in-process
-  Authorization header. Native success, unrelated failures, all other reads,
-  and every write command stay native.
+The harness is not a general REST client for Vapi and not a replacement
+command surface. It is a thin auth shim: it chooses one declared
+connection, injects its key, then normally runs the official `vapi` CLI with
+inherited stdio. It REQUIRES a capability connection and never falls back to the official
+`~/.vapi-cli.yaml` login state, so a command can never silently run against
+whichever Vapi account the human last selected with `vapi login` or `vapi
+auth switch`. Use native `vapi` directly for manual login/account management;
+use vapic for agent work. Its own verbs above and the contract verbs below are
+never forwarded; every other word is.
 
 CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. Its VAPI_API_KEY is a Vapi API key. Because a key chooses
-  the Vapi organization/environment the agent can reach, its natural home is the
-  consuming project's .env when the project owns that integration.
-  It resolves through the credential cascade (`Where a secret resolves`, at the end
-  of this help); a deployed box or a one-shot `VAPI_API_KEY=... vapic ...` sets it in
-  the process env. There is deliberately no token flag - a secret must not touch
-  argv. One Vapi account/environment per connection; projects with prod + staging
-  declare one connection per key:
-    {
-      "default": "production",
-      "connections": {
-        "production": { "secret_env": "VAPI_PRODUCTION_API_KEY",
-                        "environment": "production",
-                        "allow_write": false },
-        "staging": { "secret_env": "VAPI_STAGING_API_KEY",
-                     "environment": "staging",
-                     "allow_write": true }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
-
-  Entry fields:
-    secret_env        required; env var holding the Vapi API key
-    environment       optional; production, staging, development
-    api_base_url      optional; explicit VAPI_API_BASE_URL override
-    dashboard_url     optional; explicit VAPI_DASHBOARD_URL override
-    allow_write       optional; default false
-
-  Selection: --connection <id> (accepted anywhere on the command line; consumed
-  by vapic, never forwarded). Unflagged, the registry's "default" pointer
-  applies, else the sole entry; several entries without a pointer is refused
-  as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
+One connection is one Vapi API key, so one Vapi account/environment, with its
+optional environment and URL overrides and its write grant. A registry is
+required even for one connection, and there is deliberately no token flag: a
+secret must not touch argv. Its shape, where it is kept and where a secret
+resolves are `vapic help connections`.
 
 WRITE GATE
-  Vapi can place outbound calls, change assistants, phone numbers, tools,
-  webhooks, campaigns, squads, and billing-relevant resources. Writes therefore
-  default to refused. A read-only connection allows only known read/status/help
-  commands; unknown official commands require allow_write: true instead of
-  being guessed safe.
-
-COMMANDS vapic owns
-  connections
-      The resolution report - every connection, every value, its winning tier
-      and source, secrets masked. Local only: no network, no token use.
-
-  bootstrap [--yes]
-      Check whether the official `vapi` CLI is on PATH. Without --yes, emit the
-      official install command and exit 0 without changing the machine. With
-      --yes, download https://vapi.ai/install.sh to a temporary file and run it.
-
-  doctor [--connection <id>]
-      Per connection (every configured one bare; one with --connection): resolve
-      its key, confirm `vapi` exists, run the resilient assistant-list probe
-      with injected env, and report the selected environment. Exit 0 all healthy /
-      2 key missing or rejected / 5 official CLI missing or unreachable.
-
-  help
-      Print this document. (`vapi --help` is the real CLI's surface, a separate
-      thing; vapic reserves bare `help` for itself but forwards `help <cmd>`.)
-
-EVERYTHING ELSE - forwarded verbatim to `vapi`, key injected, I/O transparent.
-  Run `vapi --help` and `vapi <cmd> --help` for the official surface. Common reaches:
-    assistant list|get|create|update|delete
-    call list|get|create
-    phone list|get|create|update|delete
-    tool list|get|create|update|delete
-    logs
-    listen --forward-to <url>
+Vapi can place outbound calls, change assistants, phone numbers, tools,
+webhooks, campaigns, squads, and billing-relevant resources. Writes therefore
+default to refused: a read-only connection allows only known read, status and
+help commands, and an unknown official command requires the connection's
+write grant instead of being guessed safe (`vapic help forward`).
 
 EXIT CODES (vapic's own layer)
+A forwarded command returns Vapi CLI's own exit code, not these - except the
+documented read-list fallback, which uses vapic's auth/environment categories
+if the REST retry fails.
   0 success - 2 auth (token missing or rejected) - 4 policy refusal: the
-  project gate (capabilities/settings.json) on any verb, or a write verb on a
-  read-only connection (allow_write: false); ask the user, never lift a gate
-  yourself - 5 environment (vapi not on PATH, installer failed, or unreachable)
-  - 6 input (bad use of a vapic-owned command, or an unknown/ambiguous connection).
-  Forwarded commands return Vapi CLI's own exit code, not these - except the
-  documented read-list fallback, which uses vapic's auth/environment categories
-  if the REST retry fails. vapic is transparent for everything it forwards
-  (after the gate).
-
-EXAMPLES
-  vapic bootstrap
-  vapic doctor
-  vapic --connection staging assistant list
-  vapic --connection staging assistant create --help
-  vapic --connection production logs
-  VAPI_API_KEY=... vapic assistant list
+  project gate on any verb, or a write on a read-only connection; ask the
+  user, never lift a gate yourself - 5 environment (vapi not on PATH,
+  installer failed, or unreachable) - 6 input (bad use of a vapic-owned
+  command, or an unknown/ambiguous connection)
 """
 
 from __future__ import annotations
@@ -252,6 +151,220 @@ VAPI_API_BASE_DEFAULT = "https://api.vapi.ai"
 VAPI_REST_USER_AGENT = "vapic-capability"
 DOCTOR_TIMEOUT = 30.0
 
+
+# The verb pages `vapic help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, help and ids
+# follow. The forwarded surface is the official CLI's own and has no page per
+# command; `forward` holds the contract of forwarding itself.
+HELP_VERBS = {
+    "forward": """\
+vapic <command> [args...] [--connection <id>]
+
+  Forwards `vapi <command> [args...]`, normally with the selected connection
+  injected as VAPI_API_KEY. Every word is forwarded but vapic's own verbs
+  (bootstrap, connections, doctor) and the contract verbs the menu lists,
+  which are vapic's own and never forwarded. `help` is one of them: bare
+  `vapic help` is the menu and `vapic help <verb>` a vapic verb page. Run
+  `vapi --help` (the real CLI) for the full command surface; vapic
+  deliberately does not re-document or re-map the official Vapi commands.
+
+  --connection <id> (or --connection=<id>) selects the connection. It is
+  accepted anywhere on the command line, consumed by vapic and never
+  forwarded. Unflagged, the registry's "default" pointer applies, else the
+  sole entry; several entries without a pointer is refused as ambiguous
+  (`vapic help connections`). The connection is selected and its write gate
+  decided BEFORE its key resolves or `vapi` is looked for.
+
+  MODEL
+  vapic is not a general REST client for Vapi and not a replacement command
+  surface. It is a thin auth shim: it chooses one declared connection, sets
+  VAPI_API_KEY plus optional VAPI_ENV, VAPI_API_BASE_URL, and
+  VAPI_DASHBOARD_URL, then normally runs the official `vapi` CLI with
+  inherited stdio. `vapic --connection staging assistant list` runs `vapi
+  assistant list` under the staging key; stdout, stderr, prompts, --json,
+  colors, and exit code are Vapi CLI's own unless the documented narrow
+  read-list fallback is triggered.
+
+  It REQUIRES a capability connection and never falls back to the official
+  `~/.vapi-cli.yaml` login state. That refusal is the scoping guarantee: a
+  command can never silently run against whichever Vapi account the human
+  last selected with `vapi login` or `vapi auth switch`. Use native `vapi`
+  directly for manual login/account management; use vapic for agent work.
+
+  Narrow resilience exception: official Vapi CLI v0.2.1 can fail to decode
+  list responses for `assistant list` and `call list` when the API returns
+  schema variants its pinned Go SDK cannot unmarshal. Only for those exact
+  read commands, and only after that recognized failure, vapic retries the
+  official read-only REST endpoint with the already-resolved API key in an
+  in-process Authorization header. Native success, unrelated failures, all
+  other reads, and every write command stay native.
+
+  The official CLI's own help: `vapic <cmd> --help` (or -h anywhere on the
+  line), and `vapic version`, `vapic --version`, `vapic completion` and
+  `vapic manual`, are forwarded to `vapi` as they stand, with no connection
+  selected, no key injected and no write gate; they still need the `vapi` on
+  PATH (exit 5 vapi_not_found otherwise).
+
+  WRITE GATE
+  Vapi can place outbound calls, change assistants, phone numbers, tools,
+  webhooks, campaigns, squads, and billing-relevant resources. Writes
+  therefore default to refused. A read-only connection (allow_write: false,
+  the default) allows only known read/status/help commands: `assistant`,
+  `call`, `phone`, `tool`, `workflow`, `squad`, `webhook` and `campaign`
+  with list, get, show, status or describe (bare, list); `auth status` and
+  `auth whoami` (bare, status); `logs`; and the official CLI's own help.
+  Unknown official commands require allow_write: true instead of being
+  guessed safe. Nothing in the cascade lifts the gate.
+
+  Outside any project a forwarded command, which needs a connection, is
+  refused; connections and doctor are machine reads there (`vapic help
+  connections`).
+
+  EVERYTHING ELSE - forwarded verbatim to `vapi`, key injected, I/O
+  transparent. Run `vapi --help` and `vapi <cmd> --help` for the official
+  surface. Common reaches:
+    assistant list|get|create|update|delete
+    call list|get|create
+    phone list|get|create|update|delete
+    tool list|get|create|update|delete
+    logs
+    listen --forward-to <url>
+
+  Output: Vapi CLI's own stdout and stderr, untouched; after the read-list
+  fallback, the REST endpoint's JSON body on stdout. A refusal by vapic
+  itself is a JSON error envelope on stderr, with nothing on stdout.
+
+  Exit codes: forwarded commands return Vapi CLI's own exit code, not
+  vapic's - except the documented read-list fallback, which uses vapic's
+  auth/environment categories if the REST retry fails. vapic is transparent
+  for everything it forwards (after the gate). vapic's own: 2 auth (token
+  missing or rejected: missing_credentials, missing_secret, auth_failed); 4
+  policy refusal: the project gate (capabilities/settings.json) on any verb,
+  or a write verb on a read-only connection (read_only), or a connection the
+  project is not granted - ask the user, never lift a gate yourself; 5
+  environment (vapi_not_found, vapi_exec_failed, or the fallback's
+  rest_http_error, rest_network_error, vapi_read_failed); 6 input
+  (connections_required, no_secret_env, unknown_connection,
+  ambiguous_connection, bad_default).
+
+  Examples:
+    vapic --connection staging assistant list
+    vapic --connection staging assistant create --help
+    vapic --connection production logs
+    VAPI_API_KEY=... vapic assistant list
+""",
+    "bootstrap": """\
+vapic bootstrap [--yes]
+
+  Check whether the official `vapi` CLI is on PATH. Without --yes, emit the
+  official install command and exit 0 without changing the machine. With
+  --yes, download https://vapi.ai/install.sh to a temporary file and run it.
+
+  Output: one JSON object on stdout. Already installed:
+    {"ok": true, "installed": true, "path": <path>}
+  Not installed, without --yes:
+    {"ok": true, "installed": false,
+     "install": {"command": "curl -sSL https://vapi.ai/install.sh | bash",
+                 "url": "https://vapi.ai/install.sh"},
+     "next": "run `vapic bootstrap --yes` to execute the official installer"}
+  With --yes, once the installer ran and `vapi` is on PATH, the installed
+  shape above.
+
+  Exit codes: 0; 5 installer_fetch_failed (the installer could not be
+  fetched), installer_failed (it exited non-zero), vapi_not_on_path (it
+  completed but `vapi` is not on PATH - open a new shell or add the install
+  directory to PATH, then rerun `vapic doctor`); 6 input for any other
+  argument, or connections_required without a connections registry.
+
+  Examples:
+    vapic bootstrap
+    vapic bootstrap --yes
+""",
+    "doctor": """\
+  For vapic: per connection (every configured one bare; one with
+  --connection): resolve its key, confirm `vapi` exists, run the resilient
+  assistant-list probe (`vapi assistant list` with injected env, with the
+  read-list fallback of `vapic help forward`), and report the selected
+  environment.
+
+  Output: one JSON object on stdout, failing or not:
+    {"ok": <bool>, "connections": {<id>: {"ok": true, "environment",
+     "api_base_url", "dashboard_url", "probe"}}}
+  A failing connection carries {"ok": false, "error"} and a "hint" where one
+  applies.
+
+  Exit 0 all healthy / 2 key missing or rejected / 5 official CLI missing or
+  unreachable / 6 a connection without secret_env, an unknown connection, or
+  connections_required without a registry. With several failing, the first
+  failing connection's code.
+
+  Outside any project doctor is a machine read: it uses the machine's own
+  connections read-only, unless a grant switched one off.
+
+  Examples:
+    vapic doctor
+    vapic doctor --connection staging
+""",
+    "connections": """\
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. Its VAPI_API_KEY is a Vapi API key. Because a key chooses
+  the Vapi organization/environment the agent can reach, its natural home is
+  the consuming project's .env when the project owns that integration.
+  It resolves through the credential cascade (`Where a secret resolves`,
+  above); a deployed box or a one-shot `VAPI_API_KEY=... vapic ...` sets it
+  in the process env. There is deliberately no token flag - a secret must not
+  touch argv. One Vapi account/environment per connection; projects with
+  prod + staging declare one connection per key:
+    {
+      "default": "production",
+      "connections": {
+        "production": { "secret_env": "VAPI_PRODUCTION_API_KEY",
+                        "environment": "production",
+                        "allow_write": false },
+        "staging": { "secret_env": "VAPI_STAGING_API_KEY",
+                     "environment": "staging",
+                     "allow_write": true }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  Entry fields:
+    secret_env        required; env var holding the Vapi API key
+    environment       optional; production, staging, development
+    api_base_url      optional; explicit VAPI_API_BASE_URL override
+    dashboard_url     optional; explicit VAPI_DASHBOARD_URL override
+    allow_write       optional; default false
+
+  Selection: --connection <id> (accepted anywhere on the command line;
+  consumed by vapic, never forwarded). Unflagged, the registry's "default"
+  pointer applies, else the sole entry; several entries without a pointer is
+  refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  Local only: no network, no token use.
+
+  Example: vapic connections
+""",
+    "help": """\
+  For vapic: `vapi --help` is the real CLI's surface, a separate thing. vapic
+  answers `help` and `help <verb>` itself and never forwards them; the
+  official CLI's help for one command is `vapic <cmd> --help`, forwarded
+  (`vapic help forward`).
+""",
+    "ids": """\
+  For vapic: the project identifiers envelope is
+  capabilities/vapic/identifiers.json, or store rows once the agent moved.
+
+  Example: vapic ids list
+""",
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

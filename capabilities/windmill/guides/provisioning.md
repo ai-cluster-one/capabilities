@@ -5,9 +5,9 @@ Standing up (or re-validating) a consuming project's Windmill workspace. The ide
 `windmill provision` builds the workspace *skeleton* idempotently and non-destructively — it never deletes and never overwrites a present secret. Inputs resolve two ways:
 
 - **Config-discovery (the default, file-less):** **folder** ← the namespace (`WINDMILL_FOLDER`, or `--folder`); **operator user + owners** ← `WINDMILL_OPERATOR` (+ `WINDMILL_OPERATOR_NAME`), owners deriving from the operator; **scripts** ← every deployable under `--scripts-dir` (path `f/<namespace>/<stem>`; `example_*` skipped).
-- **Explicit manifest:** pass a `<manifest.json>` to override config-discovery with a committed declarative target (schema in `windmill help`). A project that wants its workspace skeleton in git chooses this mode.
+- **Explicit manifest:** pass a `<manifest.json>` to override config-discovery with a committed declarative target (schema in `windmill help provision`). A project that wants its workspace skeleton in git chooses this mode.
 
-`windmill verify` is the read-only check of the same skeleton — same two input modes; run it before a work block; it reports per-item `ok` and overall `ready`. The method, flags, and idempotency rules are in `windmill help`.
+`windmill verify` is the read-only check of the same skeleton — same two input modes; run it before a work block; it reports per-item `ok` and overall `ready`. The method, flags, and idempotency rules are in `windmill help verify` and `windmill help provision`.
 
 ## The one out-of-band step — the box↔Windmill SSH key
 

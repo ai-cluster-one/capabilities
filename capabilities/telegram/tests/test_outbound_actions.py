@@ -2121,7 +2121,7 @@ class ServiceDoctorWorkerPreflightTests(unittest.TestCase):
         """An operator is told the cost before paying it: nothing by default,
         and under `--live` one live turn per distinct profile, each held to
         the turn's own window."""
-        help_text = " ".join(import_cli().__doc__.split())
+        help_text = " ".join(import_cli().HELP_VERBS["service doctor"].split())
         self.assertIn("and starts no session", help_text)
         self.assertIn("`doctor --live` also spends one live turn per profile", help_text)
         self.assertIn("held to `defaults.worker_timeout`", help_text)

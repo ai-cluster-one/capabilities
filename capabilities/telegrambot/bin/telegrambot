@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "psycopg[binary]>=3.2",
 #     "httpx>=0.27",
 #     "telethon==1.45.0",
@@ -10,6 +10,8 @@
 # ]
 # ///
 """telegrambot — an agent's own Telegram channel, through a bot.
+
+This is the menu; `telegrambot help <verb>` is one verb's whole contract.
 
 Agent-invoked. One connection is one bot, made with BotFather. New messages
 arrive and every write leaves through the HTTP Bot API; history is read back
@@ -22,284 +24,78 @@ date, listing chats (Telegram gives a bot none of these; `seen` lists what the
 bot itself has seen), reading history in a group where the bot does not see
 every message (privacy mode on and not an admin), calls, and a second account.
 
-CONNECTIONS
-  One connection is one bot and holds everything that bot needs, so it is whole
-  by itself on any machine. Where this project keeps it, `telegrambot
-  connections` says:
+Connections
+One connection is one bot and holds everything that bot needs: its token, the
+App api_id and api_hash that let it read history, and the Deepgram key voice
+messages are transcribed with, so it is whole by itself on any machine. How one
+is written, selected and resolved is on `telegrambot help connections`. One
+token is polled by one process: a bot another product also polls cannot be
+served here.
 
-    {"default": "<id>",
-     "connections": {"<id>": {
-        "secret_env":   "TELEGRAMBOT_<ID>_BOT_TOKEN",
-        "api_id_env":   "TELEGRAMBOT_<ID>_API_ID",
-        "api_hash_env": "TELEGRAMBOT_<ID>_API_HASH",
-        "deepgram_env": "TELEGRAMBOT_<ID>_DEEPGRAM_KEY"}}}
+Chats and topics
+A chat is its Bot API id: a person's id for a private chat, -<id> for a basic
+group, -100<id> for a supergroup. A forum topic is its number (the message that
+opened it); General is 1. `seen` lists both.
 
-  secret_env    the bot token from BotFather. Required.
-  api_id_env    the App api_id from my.telegram.org/apps. With api_hash_env it
-                lets the bot read history; without the two the bot runs with
-                no history and says so in doctor and in every turn.
-  api_hash_env  the App api_hash paired with that api_id.
-  deepgram_env  the Deepgram key voice messages are transcribed with. Without
-                it voice messages reach a turn as a voice attachment only.
+Readiness and who the bot has seen
+  telegrambot doctor                 the bot, privacy, webhook, history and voice
+  telegrambot seen                   the chats, topics and people the bot has seen
 
-  Each field names an env key; its value resolves through the credential
-  cascade (`Where a secret resolves`, at the end of this help), the agent's
-  vault first. Give a value and it is sealed into the vault under the
-  connection's own key; name a key the vault (or any tier) already holds and
-  the connection refers to it instead:
+History (needs api_id and api_hash on the connection)
+  telegrambot history <chat>         one chat's messages below a number, oldest first
+  telegrambot download <chat> <message>  fetch the file a message carries
 
-    telegrambot connection add <id> --stdin \
-        <<< '{"secret_env": "<token>", "api_id_env": "<api_id>",
-              "api_hash_env": "<api_hash>"}'
-    telegrambot connection add <id> --env secret_env=<KEY> \
-        --env api_id_env=<KEY> --env api_hash_env=<KEY> \
-        --env deepgram_env=DEEPGRAM_API_KEY
+Writes (each needs allow_write granted on the connection; exit 4 otherwise)
+  telegrambot send <chat> <text|->   send text, or a file with the text as caption
+  telegrambot react <chat> <message> [<emoji>]  set or clear the bot's one reaction
 
-  A new connection that names no Deepgram key is given a reference to the
-  machine's shared one (DEEPGRAM_API_KEY, `telegrambot setup`) where the
-  machine holds one, sealed into the vault and named in the answer's
-  `prefilled`. That is the only default: a connection that names no key has
-  none, and no machine value stands in for it at run time.
+Prompts (the agent's own text over the standard the bundle ships)
+  telegrambot prompts list           every prompt key with an active version
+  telegrambot prompts show <key>     one prompt and where its text comes from
+  telegrambot prompts put <key>      save a new version, the body on stdin
+  telegrambot prompts history <key>  every version of one key
+  telegrambot prompts retire <key>   leave the key with no active version
 
-  Writes are refused by default: send and react need `allow_write: true`
-  granted on the connection. Selection: --connection <id> anywhere on the
-  line, else the "default" pointer, else the sole entry.
+Profiles (how a turn runs: harness, model, effort, rights)
+  telegrambot profiles list          every telegrambot profile this project reaches
+  telegrambot profiles show <name>   one profile's knobs and where it comes from
+  telegrambot profiles save <name> <file|->  a new version at this project's scope
 
-  One token is polled by one process. A bot another product also polls (an
-  app's notification channel, a webhook) cannot be served here: doctor names
-  the webhook, and a poll that collides fails `poll_conflict`.
+Jobs (work a turn hands off; needs `delegation: allowed`)
+  telegrambot jobs help              the jobs verbs, in one list
+  telegrambot jobs list              the register, newest first
+  telegrambot jobs active            waiting and running work, oldest first
+  telegrambot jobs show <id>         one job, with its pending amendments
+  telegrambot jobs register "<one line>"  a draft: no runner takes it yet
+  telegrambot jobs amend <id> "<what changed>"  continues the job's session with it
+  telegrambot jobs submit <id>       hands the draft over; check `active` first
+  telegrambot jobs stop <id>         asks the runner to stop it; safe to repeat
+  telegrambot jobs resume <id>       asks the runner to resume it; safe to repeat
+  telegrambot jobs discard <id>      drops a draft that never started
 
-COMMANDS
-  Readiness
-    doctor [--connection <id>]
-        Per connection, from Telegram: the bot (getMe: id, username, name);
-        privacy mode (on means a group delivers only commands, replies and
-        mentions, unless the bot is an admin there); whether a webhook is set
-        (then nothing may poll the bot); history readiness (api_id and
-        api_hash resolve and the MTProto session signs in with the token);
-        voice readiness (the Deepgram key resolves and Deepgram accepts it).
-        Bot-to-Bot mode is not readable: it is reported unknown. ok is the
-        token's verdict; what the bot lacks is listed under `missing` and in
-        each part's `reason`. Exit 2 token missing or rejected, 5 unreachable.
-    connections
-        Where every value of every connection resolves from, secrets masked.
-        Local only.
+Inside a turn or a job (the worker wrapper, service/worker-bin, first on PATH)
+  telegrambot progress <text>        a line about the work; the service relays it
+The wrapper's send, history, download, react and jobs act on the turn's chat
+only; `telegrambot help progress` is the whole wrapper.
 
-  Who the bot has seen
-    seen [--kind chat|topic|person]
-        The chats, forum topics and people the bot has seen, from the store:
-        Telegram id, title or name, username, chat type, whether a person is
-        a bot, the bot's own membership in a chat, first and last seen. No
-        text. A bot cannot list its chats or find a person by @username, so
-        this is how a chat or a person is found to be allowed. Decide by id:
-        a name can be anyone's. Local to the store: no Telegram call.
-
-  History (needs api_id and api_hash on the connection)
-    history <chat> [--topic N] [--before ID] [--limit N]
-        Messages of one chat (and one forum topic) numbered below ID, oldest
-        first: steps back from ID through the bot's message numbers, keeping
-        only this chat's, at most 5 requests of 100 numbers (about 0.1 s
-        each). --limit 1-100 (default 40). Without --before, from the newest
-        message the service recorded in that chat. In a private chat the
-        numbers are shared with every other private chat of the bot, so a
-        busy bot reaches back less far for the same --limit. The answer says
-        how many it read of how many it wanted and why it stopped short
-        (`complete`, `reason`); an empty answer is a read that found nothing,
-        never a refusal. Refused (exit 4 group_not_visible) in a group where
-        the bot does not see every message. Exit 7 history_unavailable when
-        the connection names no api_id and api_hash.
-    download <chat> <message> [--out PATH]
-        Fetch the file a message carries (any size) to PATH, default
-        <state>/<connection>/files/<chat>-<message>-<name>. {path, bytes}.
-
-  Writes (allow_write on the connection)
-    send <chat> <text|-> [--topic N] [--reply-to ID] [--file PATH]
-        Send text (- reads it from stdin) as written, with no formatting, cut
-        into messages of at most 4096 characters; with --file, the file as a
-        document (at most 50 MB) with the text as its caption. {message_ids}.
-        Not idempotent: Telegram has no dedup key. A send whose outcome is
-        unknown (a timeout after it left) exits 5 delivery_unknown: read the
-        chat before sending again.
-    react <chat> <message> [<emoji>]
-        Set the bot's one reaction on a message; without an emoji, clear it.
-        Repeating it is safe. The emoji must be one the chat allows.
-
-  Prompts (the agent's own text over the standard the bundle ships)
-    prompts list
-    prompts show <key>
-    prompts put <key> [--base ID] [--note TEXT]     (body on stdin)
-    prompts history <key>
-    prompts retire <key>
-        Keys: bot (the agent's one prompt, read every turn after the
-        standard; empty is the standard alone), delegation (replaces the
-        standard text about handing work to a background job), and
-        context.<name> (a chat's or a topic's own context, which the service
-        settings name). Every save is a new version; the one it replaces
-        stays in history. --base names the version you read (its id or six
-        or more of its first characters) and refuses the save (exit 6
-        base_mismatch) when another was saved since. retire leaves no active
-        version and deletes nothing. show answers {key, body, version,
-        source}: store, bundle (delegation's standard text) or none.
-
-  Profiles (how a turn runs: harness, model, effort, rights)
-    profiles list | profiles show <name>
-    profiles save <name> <file|-> [--base VERSION]
-        Every telegrambot profile this project reaches: the project's version
-        in the store, the global one, then the bundled telegrambot-claude,
-        -codex, -job-claude, -job-codex and the reply gate's -gate-claude and
-        -gate-codex. A name always starts telegrambot-. save writes a new
-        version at this project's scope (exit 6 conflict when --base is not
-        the active one); inside a turn only for a requester whose role may
-        /set. list and show never print an env_set value or a settings object.
-
-  Jobs (work a turn hands off; needs `delegation: allowed`)
-    jobs help | list | active | show | register | amend | submit | stop |
-    resume | discard
-        `telegrambot jobs help` prints the whole surface. Inside a turn the
-        worker wrapper fixes the chat, topic, requester, origin message and
-        profile, and this CLI takes them from the turn again.
-
-  Service
-    service run [--machine]        foreground; the supervisor's command
-    service stop|reload [--machine] [--timeout S]
-    service status|logs|doctor [--machine]   (logs: --tail N)
-    service harness [--json]       the harnesses this project's turns run on
-
-SERVICE
-  One process per machine serves every bot of every project that joined it
-  (`service run --machine`); `service run` in a project not joined serves
-  that project alone with the same code. A project joins by being placed on
-  the node in mode shared (`capabilities service start telegrambot`, or
-  `capabilities place telegrambot --node <node> --mode shared`); the node
-  manager writes the list, ~/.config/telegrambot/service/projects.json, and
-  this CLI never does. One lock per project decides which process serves it.
-  The service needs the project's store (store_not_configured without one),
-  serves every connection the project grants with allow_write (checked again
-  every 30 s), and one getUpdates poll per bot: a bot with a webhook, or one
-  another process polls, is not served (webhook_set, poll_conflict).
-
-  A message is answered in this order; the first stop wins: the chat is
-  allowed (a private chat by direct_messages.mode and allowed_users, a group
-  by allowed_groups) -> /start is never a turn -> a last line #noreply ->
-  the sender may address it (may_address) -> other bots: at most
-  agent_dialogue.max_turns turns in a row (default 4; a person's message
-  starts the count again; Telegram's own is_bot says who is a bot) -> a
-  service command -> in a group, addressed: @username, an alias, a reply to
-  the bot (`triggers` switches each off; require_reference false admits
-  every message), else the reply gate, else an ambient voice message in an
-  `auto` chat. A stranger is ignored silently and recorded in `seen`.
-
-  An admitted message is reserved in the store before anything is done, the
-  chat shows the bot typing at once, and one person's messages within the
-  channel's debounce become one turn. A channel is a chat or one forum topic
-  (General is topic 1); one turn runs per channel at a time. A turn reads the
-  conversation back by message number (tail_size, at most history_requests
-  reads), climbs the reply chain of the first message, and runs in a fresh
-  harness session on the channel's profile; its answer, cut at
-  `=== REPLY ===`, is sent in parts of 4096, as a reply to the request in a
-  group. The answer, its progress lines, what it sends and a job's result
-  are rendered from Markdown into Telegram's own formatting (bold, italic,
-  strikethrough, code, code blocks, links, quotes, lists; a heading becomes
-  a bold line and a table a code block), sent as message entities with no
-  parse mode; a part whose formatting Telegram refuses is sent again as
-  plain text. An empty answer is silence. A request ending in #external has
-  everything sent for it end in #noreply. In a group where the bot does not
-  see every message (privacy on, not an admin) no history is read and the
-  bot answers only when addressed; with no api_id and api_hash on the
-  connection no history is read anywhere. Each turn's channel state says
-  which, and how far its read reached.
-
-  The prompt, top down: the bundle's mechanics (read every turn, never cut),
-  the bundle's behaviour (`prompt_mode: replace` drops it), the agent's own
-  prompt (`prompts put bot`), the delegation text where the chat may hand
-  off work, the group's or direct sender's context, the topic's context,
-  then the channel state, the request and the conversation. context_mode
-  exclusive on a group cuts the behaviour and the agent's prompt; on a topic
-  it cuts the group's context too. A job reads the job mechanics, the job
-  behaviour, the agent's prompt, its state, its brief and the conversation.
-
-  Voice: an addressed voice message (every one in a voice_transcription
-  `auto` chat) is fetched, transcribed with the connection's Deepgram key,
-  kept on disk under the connection's state, and echoed into the chat as a
-  quote when voice_echo is on; an ambient one is answered only when its
-  words name the bot. The turn reads it as `[voice] <text>`.
-
-  Commands in a chat, each gated by control.roles: /status (settings,
-  profile, history, the replies in flight numbered, open jobs), /stop
-  (everything in flight here) and /stop N (one of the last /status list),
-  /profiles, /reload, /set tail|debounce|worker-timeout|profile|
-  voice-transcription|voice-echo <value|default>, /help. A command with
-  another bot's @suffix is not read at all. The bot's command menu is set at
-  start. Roles come from allowed_users.<id>.role, a group member's role,
-  member_role, direct_messages.default_role; authority.roles hands each turn
-  its CAPABILITIES_AUTH_CONTEXT, and roles.<role>.profile names the profile
-  the sender's turn runs on, over the chat's, the topic's and /set profile.
-  roles.<role>.read_chats {<chat id>: {topics [<topic id>]}} is the role's
-  read reach: the other groups, and topics within them, its turns may read
-  with history and download; writing stays in the turn's own chat.
-
-  The reply gate (allowed_groups.<id>.gate {enabled, mode shadow|live,
-  brief, context_messages, context_chars, max_batch, model, effort}): in a
-  group the bot sees whole, unaddressed messages of people collect per
-  channel and, after the debounce, one light run on telegrambot-gate-<the
-  channel's harness> decides ignore, react with one emoji, or reply. shadow
-  logs only; live acts. A failing run is named by service doctor
-  (gate_failing).
-
-  Inside a turn or a job the worker wrapper (service/worker-bin) is first on
-  PATH: `telegrambot progress <text>`, `send current <text> [--file PATH]`,
-  `history`, `download <message>`, `react <message> [<emoji>]` and `jobs`
-  act on this chat only; with a read reach, `history <chat> [--topic ID]`
-  and `download <chat> <message>` also read the groups and topics it names.
-  The channel state names each command.
-
-SETTINGS
-  `telegrambot settings` reads and writes them (service/settings.json at the
-  project's scope over the global one; an agent in the store keeps them as
-  rows). The surface is closed: an unknown key is refused with its path.
-    assistant_name, prompt_mode (extend|replace)
-    direct_messages {mode: allowed_users|anyone|off, default_role}
-    allowed_users {<user id>: {name, role, may_address, profile,
-      worker_timeout, context, context_prompt, context_mode, project,
-      voice_transcription, voice_echo, delegation}}
-    allowed_groups {<chat id>: {name, member_role, members {<user id>:
-      {name, role, may_address}}, may_address (anyone|members), aliases,
-      require_reference, triggers, gate, profile, worker_timeout,
-      voice_transcription, voice_echo, context, context_prompt,
-      context_mode, project, delegation, agent_dialogue {max_turns},
-      topics {<topic id>: {name, profile, context, context_prompt,
-      context_mode, project}}}}
-    agent_dialogue {max_turns}, roles {<role>: {profile, read_chats {<chat id>:
-      {topics}}}},
-    control {roles {<role>: {commands}}},
-    authority {default, roles {<role>: {allowed_capabilities}}}
-    defaults {tail_size 40, history_requests 5, debounce 2, worker_timeout
-      120, progress_after 15, progress_from_stream false, max_parallel_jobs
-      1, job_recovery requeue|inspect, profile, job_profile,
-      voice_transcription addressed, voice_echo true, delegation disabled}
-  context is inline text; context_prompt names the prompt key
-  context.<name>. project runs that chat's (or topic's, or person's) turns
-  in another project folder. A profile left unset is telegrambot-claude
-  where claude is on PATH, else telegrambot-codex. Settings, connections and
-  profiles take `service reload`; prompts are read every turn.
-
-CHATS AND TOPICS
-  A chat is its Bot API id: a person's id for a private chat, -<id> for a
-  basic group, -100<id> for a supergroup. A forum topic is its number (the
-  message that opened it); General is 1. `seen` lists both.
-
-CONTRACT VERBS
-  telegrambot help | stub | manifest --json | guide [<topic>]
-  telegrambot connection add|remove|seal ... | setup [set|unset]
-  telegrambot settings [get|set|unset|put|export|edit] ...
-  telegrambot ids list|get <l>|set <l> <v> [--note <t>]|rm <l>
-  telegrambot refs | inventory | migrate [status]
+Service (one process per machine for the projects that join it, or in one
+project; `telegrambot guide assistant-service`)
+  telegrambot service run            serve in the foreground; the supervisor's command
+  telegrambot service stop           stop the process that serves here
+  telegrambot service reload         make the running process take this declaration
+  telegrambot service status         whether it runs, and what it serves
+  telegrambot service logs           the tail of the service's log
+  telegrambot service doctor         can it serve here, and does it, current
+  telegrambot service harness        the harnesses this project's turns run on
+How a message is admitted and answered is on `telegrambot help service run`.
+The service's settings are the contract's `telegrambot settings`; the whole
+surface is on `telegrambot help settings`.
 
 I/O
-  Success is JSON on stdout; failure is {"error": {"code", "message", "hint"?,
-  "status"?}} on stderr.
+Success is JSON on stdout; failure is {"error": {"code", "message", "hint"?,
+"status"?}} on stderr.
 
-EXIT CODES
+Exit codes
   0 success · 2 auth (token missing or rejected, api_id/api_hash rejected) ·
   3 not found (unknown chat or message) · 4 policy (the project gate, a write
   on a connection without a write grant, the read-only switch, history in a
@@ -1976,6 +1772,738 @@ def _inventory(_network: bool) -> dict:
             "service": service}
 
 
+# ── help: the verb pages ─────────────────────────────────────────────────────
+
+# The verb pages `telegrambot help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs' own
+# pages, which the entries here for doctor, connections, connection, setup and
+# settings follow. A text several verbs own is one constant, added to each page.
+_HELP_SELECT = """
+  Connection: --connection <id> anywhere on the line selects the bot; else the
+  "default" pointer, else the sole entry (`telegrambot help connections`).
+"""
+_HELP_EXIT = """
+  Exit codes: 0 success · 2 auth (token missing or rejected, api_id/api_hash
+  rejected) · 3 not found (unknown chat or message) · 4 policy (the project
+  gate, a write on a connection without a write grant, the read-only switch,
+  history in a group the bot does not fully see - ask the user, never lift a
+  gate yourself) · 5 server/network (timeout, 5xx, 429 after retries, a flood
+  wait, delivery_unknown, poll_conflict) · 6 input (bad arguments, a request
+  Telegram refused) · 7 history_unavailable (the connection names no api_id
+  and api_hash).
+"""
+_HELP_CHATS = """
+  A chat is its Bot API id: a person's id for a private chat, -<id> for a
+  basic group, -100<id> for a supergroup. A forum topic is its number (the
+  message that opened it); General is 1. `telegrambot seen` lists both.
+"""
+_HELP_TURN = """
+  Inside a turn or a job the service started, the call reaches the turn's own
+  chat and topic only (exit 4 chat_scope_denied, topic_scope_denied); a read
+  (history, download) also reaches the groups and topics the sender's role
+  names in roles.<role>.read_chats (`telegrambot help progress`).
+"""
+_HELP_WRITE = """
+  A write: refused by default; it needs `allow_write: true` granted on the
+  connection (exit 4 otherwise - ask the user, never lift a gate yourself).
+"""
+_HELP_STORE = """
+  Needs the project's store and its durable id (exit 6 no_project_identity
+  without one; 5 or 6 store_* when the store does not answer or is not
+  configured).
+"""
+_HELP_CONNECTIONS = """
+  For telegrambot:
+
+  One connection is one bot and holds everything that bot needs, so it is whole
+  by itself on any machine. Where this project keeps it, `telegrambot
+  connections` says:
+
+    {"default": "<id>",
+     "connections": {"<id>": {
+        "secret_env":   "TELEGRAMBOT_<ID>_BOT_TOKEN",
+        "api_id_env":   "TELEGRAMBOT_<ID>_API_ID",
+        "api_hash_env": "TELEGRAMBOT_<ID>_API_HASH",
+        "deepgram_env": "TELEGRAMBOT_<ID>_DEEPGRAM_KEY"}}}
+
+  secret_env    the bot token from BotFather. Required.
+  api_id_env    the App api_id from my.telegram.org/apps. With api_hash_env it
+                lets the bot read history; without the two the bot runs with
+                no history and says so in doctor and in every turn.
+  api_hash_env  the App api_hash paired with that api_id.
+  deepgram_env  the Deepgram key voice messages are transcribed with. Without
+                it voice messages reach a turn as a voice attachment only.
+
+  Each field names an env key; its value resolves through the credential
+  cascade (`Where a secret resolves`, on `telegrambot help connections` and
+  `telegrambot help connection`), the agent's vault first. Give a value and it
+  is sealed into the vault under the connection's own key; name a key the
+  vault (or any tier) already holds and the connection refers to it instead:
+
+    telegrambot connection add <id> --stdin \\
+        <<< '{"secret_env": "<token>", "api_id_env": "<api_id>",
+              "api_hash_env": "<api_hash>"}'
+    telegrambot connection add <id> --env secret_env=<KEY> \\
+        --env api_id_env=<KEY> --env api_hash_env=<KEY> \\
+        --env deepgram_env=DEEPGRAM_API_KEY
+
+  A new connection that names no Deepgram key is given a reference to the
+  machine's shared one (DEEPGRAM_API_KEY, `telegrambot setup`) where the
+  machine holds one, sealed into the vault and named in the answer's
+  `prefilled`. That is the only default: a connection that names no key has
+  none, and no machine value stands in for it at run time.
+
+  Writes are refused by default: send and react need `allow_write: true`
+  granted on the connection. Selection: --connection <id> anywhere on the
+  line, else the "default" pointer, else the sole entry.
+
+  One token is polled by one process. A bot another product also polls (an
+  app's notification channel, a webhook) cannot be served here: doctor names
+  the webhook, and a poll that collides fails `poll_conflict`.
+"""
+_HELP_JOBS = """
+  The jobs are the register of work that outlives a conversation: work a turn
+  hands off where the chat allows it (`delegation: allowed`). An id is the
+  whole id or six or more of its first characters. --actor U limits every read
+  and write to jobs requested by U; --chat C and --topic T narrow to one chat
+  and topic. Inside a turn the worker wrapper puts the chat, topic, requester,
+  origin message and profile in for you, and this CLI takes them from the turn
+  again: a job reports into the chat it came from. --connection picks the bot;
+  else the default. Answers are JSON rows; a draft, a stop and a resume are
+  asks the bot's runner acts on within seconds.
+
+  Exit codes: 0; 3 job_not_found for an id this scope does not reach; 4
+  agent_archived for a write while the agent is archived; 5 the store
+  unreachable; 6 input, no_project_identity, or the register's refusal named
+  by its code.
+"""
+_HELP_PROMPTS = """
+  Keys: bot (the agent's one prompt, read every turn after the standard; empty
+  is the standard alone), delegation (replaces the standard text about handing
+  work to a background job), and context.<name> (a chat's or a topic's own
+  context, which the service settings name). Every save is a new version; the
+  one it replaces stays in history. Prompts are read every turn: no reload.
+
+  Exit codes: 0; 4 put and retire under the read-only switch; 5 the store
+  unreachable; 6 a key that is not a prompt key (bad_prompt_key), an empty
+  body (empty_prompt), a --base that is not the active version
+  (base_mismatch), no_project_identity.
+"""
+_HELP_PROFILES = """
+  Every telegrambot profile this project reaches: the project's version in the
+  store, the global one, then the bundled telegrambot-claude,
+  telegrambot-codex, telegrambot-job-claude, telegrambot-job-codex and the
+  reply gate's telegrambot-gate-claude and telegrambot-gate-codex. A name
+  always starts telegrambot-. list and show never print an env_set value or a
+  settings object. A profile left unset is telegrambot-claude where claude is
+  on PATH, else telegrambot-codex. Profiles take `service reload`.
+"""
+_HELP_SERVICE_FLAGS = """
+  --machine    act on the machine process that serves every joined project,
+               not this project's own
+"""
+_HELP_SERVICE = """
+  One process per machine serves every bot of every project that joined it
+  (`service run --machine`); `service run` in a project not joined serves
+  that project alone with the same code. A project joins by being placed on
+  the node in mode shared (`capabilities service start telegrambot`, or
+  `capabilities place telegrambot --node <node> --mode shared`); the node
+  manager writes the list, ~/.config/telegrambot/service/projects.json, and
+  this CLI never does. One lock per project decides which process serves it.
+  Settings, connections and profiles take `service reload`; prompts are read
+  every turn. How a message is answered is on `telegrambot help service run`.
+"""
+HELP_VERBS = {
+    "doctor": """\
+  For telegrambot: per connection, from Telegram: the bot (getMe: id,
+  username, name); privacy mode (on means a group delivers only commands,
+  replies and mentions, unless the bot is an admin there); whether a webhook
+  is set (then nothing may poll the bot); history readiness (api_id and
+  api_hash resolve and the MTProto session signs in with the token); voice
+  readiness (the Deepgram key resolves and Deepgram accepts it). Bot-to-Bot
+  mode is not readable: it is reported unknown. ok is the token's verdict;
+  what the bot lacks is listed under `missing` and in each part's `reason`.
+  A connection lacking its token is refused before any round-trip (exit 2
+  credentials_missing), naming everything each connection lacks.
+
+  Output: {"ok", "connections": {<id>: {"ok", "bot": {"id", "username",
+  "name", "can_join_groups"}, "privacy": {"mode", "meaning"}, "webhook":
+  {"set", ...}, "bot_to_bot", "history": {"ready", "reason"?}, "voice":
+  {"ready", "reason"?}, "allow_write", "missing"}}}.
+
+  Exit 2 token missing or rejected, 5 unreachable.
+
+  Examples:
+    telegrambot doctor
+    telegrambot doctor --connection <id>
+""",
+    "connections": _HELP_CONNECTIONS + """
+  Example: telegrambot connections
+""",
+    "connection": _HELP_CONNECTIONS + """
+  Example: telegrambot connection add <id> --stdin <<< '{"secret_env": "<token>"}'
+""",
+    "setup": """\
+  For telegrambot: the machine's shared Deepgram key (DEEPGRAM_API_KEY), which
+  a connection uses only where it names it (deepgram_env); a new connection
+  that names no Deepgram key is given a reference to it where the machine
+  holds one (`telegrambot help connections`).
+
+  Example: telegrambot setup set --stdin <<< '{"DEEPGRAM_API_KEY": "<key>"}'
+""",
+    "settings": """\
+  For telegrambot: `telegrambot settings` reads and writes them
+  (service/settings.json at the project's scope over the global one; an agent
+  in the store keeps them as rows), also as `telegrambot settings
+  [get|set|unset|put|export|edit] ...`. The surface is closed: an unknown key
+  is refused with its path.
+    assistant_name, prompt_mode (extend|replace)
+    direct_messages {mode: allowed_users|anyone|off, default_role}
+    allowed_users {<user id>: {name, role, may_address, profile,
+      worker_timeout, context, context_prompt, context_mode, project,
+      voice_transcription, voice_echo, delegation}}
+    allowed_groups {<chat id>: {name, member_role, members {<user id>:
+      {name, role, may_address}}, may_address (anyone|members), aliases,
+      require_reference, triggers, gate, profile, worker_timeout,
+      voice_transcription, voice_echo, context, context_prompt,
+      context_mode, project, delegation, agent_dialogue {max_turns},
+      topics {<topic id>: {name, profile, context, context_prompt,
+      context_mode, project}}}}
+    agent_dialogue {max_turns}, roles {<role>: {profile, read_chats {<chat id>:
+      {topics}}}},
+    control {roles {<role>: {commands}}},
+    authority {default, roles {<role>: {allowed_capabilities}}}
+    defaults {tail_size 40, history_requests 5, debounce 2, worker_timeout
+      120, progress_after 15, progress_from_stream false, max_parallel_jobs
+      1, job_recovery requeue|inspect, profile, job_profile,
+      voice_transcription addressed, voice_echo true, delegation disabled}
+  context is inline text; context_prompt names the prompt key
+  context.<name>. project runs that chat's (or topic's, or person's) turns
+  in another project folder. A profile left unset is telegrambot-claude
+  where claude is on PATH, else telegrambot-codex. Settings, connections and
+  profiles take `service reload`; prompts are read every turn. What each key
+  does to a message is on `telegrambot help service run`.
+
+  Example: telegrambot settings set defaults.debounce 3
+""",
+    "seen": """\
+telegrambot seen [--kind chat|topic|person] [--connection <id>]
+
+  The chats, forum topics and people the bot has seen, from the store:
+  Telegram id, title or name, username, chat type, whether a person is a bot,
+  the bot's own membership in a chat, first and last seen. No text. A bot
+  cannot list its chats or find a person by @username, so this is how a chat
+  or a person is found to be allowed. Decide by id: a name can be anyone's.
+  Local to the store: no Telegram call.
+
+  --kind chat|topic|person   only that kind (default: all three)
+
+  Output: {"connection", "count", "seen": [<row>]}.
+""" + _HELP_SELECT + _HELP_STORE + _HELP_EXIT + """
+  Examples:
+    telegrambot seen
+    telegrambot seen --kind person
+""",
+    "history": """\
+telegrambot history <chat> [--topic N] [--before ID] [--limit N]
+                    [--connection <id>]
+
+  Messages of one chat (and one forum topic) numbered below ID, oldest first:
+  steps back from ID through the bot's message numbers, keeping only this
+  chat's, at most 5 requests of 100 numbers (about 0.1 s each). Without
+  --before, from the newest message the service recorded in that chat (exit 6
+  anchor_unknown when none is recorded). In a private chat the numbers are
+  shared with every other private chat of the bot, so a busy bot reaches back
+  less far for the same --limit. The answer says how many it read of how many
+  it wanted and why it stopped short (`complete`, `reason`); an empty answer
+  is a read that found nothing, never a refusal. In a forum without --topic it
+  reads General.
+
+  --topic N    one forum topic (General is 1)
+  --before ID  the newest message number to read below
+  --limit N    1-100 (default 40)
+
+  Needs api_id and api_hash on the connection: exit 7 history_unavailable when
+  the connection names none. Refused (exit 4 group_not_visible) in a group
+  where the bot does not see every message (privacy on, not an admin).
+
+  Output: {"connection", "chat", "topic", "before", "messages", "wanted",
+  "read", "requests", "complete", "reason"}.
+""" + _HELP_CHATS + _HELP_TURN + _HELP_SELECT + _HELP_EXIT + """
+  Examples:
+    telegrambot history <chat> --limit 20
+    telegrambot history -100<id> --topic 7 --before 5120
+""",
+    "download": """\
+telegrambot download <chat> <message> [--out PATH] [--connection <id>]
+
+  Fetch the file a message carries (any size) to PATH, default
+  <state>/<connection>/files/<chat>-<message>-<name>. Read through the
+  MTProto session, so it needs api_id and api_hash on the connection (exit 7
+  history_unavailable otherwise).
+
+  --out PATH   where to write the file
+
+  Output: {"path", "bytes"}.
+""" + _HELP_CHATS + _HELP_TURN + _HELP_SELECT + _HELP_EXIT + """
+  Example: telegrambot download <chat> 4211 --out ./invoice.pdf
+""",
+    "send": """\
+telegrambot send <chat> <text|-> [--topic N] [--reply-to ID] [--file PATH]
+                 [--connection <id>]
+
+  Send text (- reads it from stdin) as written, with no formatting, cut into
+  messages of at most 4096 characters; with --file, the file as a document (at
+  most 50 MB) with the text as its caption. Not idempotent: Telegram has no
+  dedup key. A send whose outcome is unknown (a timeout after it left) exits 5
+  delivery_unknown: read the chat before sending again. An empty text without
+  --file exits 6 empty_text; a --file that is not a file exits 6
+  file_missing.
+
+  --topic N       into one forum topic
+  --reply-to ID   as a reply to that message
+  --file PATH     the file to send, the text as its caption
+
+  Output: {"connection", "chat", "topic", "message_ids"}.
+""" + _HELP_WRITE + _HELP_CHATS + _HELP_TURN + _HELP_SELECT + _HELP_EXIT + """
+  Examples:
+    telegrambot send <chat> "On it."
+    telegrambot send <chat> - --reply-to 4211 < answer.txt
+""",
+    "react": """\
+telegrambot react <chat> <message> [<emoji>] [--connection <id>]
+
+  Set the bot's one reaction on a message; without an emoji, clear it.
+  Repeating it is safe. The emoji must be one the chat allows.
+
+  Output: {"chat", "message_id", "reaction"}.
+""" + _HELP_WRITE + _HELP_CHATS + _HELP_TURN + _HELP_SELECT + _HELP_EXIT + """
+  Examples:
+    telegrambot react <chat> 4211 👍
+    telegrambot react <chat> 4211
+""",
+    "prompts list": """\
+telegrambot prompts list
+
+  Every prompt key the agent has an active version of, from the store, by
+  key.
+
+  Output: {"prompts": [{"id", "key", "chars", "created_at", "created_by"}]}.
+""" + _HELP_PROMPTS + """
+  Example: telegrambot prompts list
+""",
+    "prompts show": """\
+telegrambot prompts show <key>
+
+  One prompt as the next turn reads it. Answers {key, body, version, source}:
+  store (the active version, with created_at and created_by), bundle
+  (delegation's standard text) or none.
+""" + _HELP_PROMPTS + """
+  Example: telegrambot prompts show bot
+""",
+    "prompts put": """\
+telegrambot prompts put <key> [--base ID] [--note TEXT]     (body on stdin)
+
+  Save a new version of the key from stdin. --base names the version you read
+  (its id or six or more of its first characters) and refuses the save (exit 6
+  base_mismatch) when another was saved since.
+
+  --base ID     the version you read
+  --note TEXT   a note kept with the version
+
+  Output: the saved version, with its id and created_at.
+""" + _HELP_PROMPTS + """
+  Example: telegrambot prompts put context.support --base 3f9a1c < support.md
+""",
+    "prompts history": """\
+telegrambot prompts history <key>
+
+  Every stored version of one key, newest first.
+
+  Output: {"key", "versions": [{"id", "active", "chars", "created_at",
+  "created_by", "note"}]}.
+""" + _HELP_PROMPTS + """
+  Example: telegrambot prompts history bot
+""",
+    "prompts retire": """\
+telegrambot prompts retire <key>
+
+  Leave the key with no active version; it deletes nothing, and history keeps
+  every version.
+
+  Output: {"key", "retired"}.
+""" + _HELP_PROMPTS + """
+  Example: telegrambot prompts retire context.support
+""",
+    "profiles list": """\
+telegrambot profiles list
+
+  Every telegrambot profile this project reaches, with the settings positions
+  that name each one, and the default profile and job profile.
+
+  Output: {"default", "default_job", "profiles": [{..., "positions"}]}.
+""" + _HELP_PROFILES + """
+  Exit codes: 0; 5 the store unreachable; 6 no_project_identity.
+
+  Example: telegrambot profiles list
+""",
+    "profiles show": """\
+telegrambot profiles show <name>
+
+  One profile's knobs and where it comes from, and what in it does not fit
+  (fit).
+
+  Output: {...its origin, "knobs", "fit"}.
+""" + _HELP_PROFILES + """
+  Exit codes: 0; 3 profile_not_found; 5 the store unreachable; 6
+  no_project_identity.
+
+  Example: telegrambot profiles show telegrambot-claude
+""",
+    "profiles save": """\
+telegrambot profiles save <name> <file|-> [--base VERSION]
+
+  Write a new version of a profile at this project's scope, from the file (or
+  stdin with -). The name starts telegrambot- and is none of the bundled
+  ones (exit 6 bad_profile_name). Inside a turn only for a requester whose
+  role may /set (exit 4 policy otherwise).
+
+  --base VERSION   the active version you read; another is a conflict (exit 6)
+
+  Output: {"name", "version", "created", "fit"}.
+""" + _HELP_PROFILES + """
+  Exit codes: 0; 4 under the read-only switch, or a turn's requester who may
+  not /set; 5 the store unreachable; 6 conflict, profile_invalid,
+  bad_profile_name.
+
+  Example: telegrambot profiles save telegrambot-support profile.toml --base <version>
+""",
+    "jobs help": """\
+telegrambot jobs help
+
+  The whole jobs surface in one text: every jobs verb with its flags. Inside a
+  turn the worker wrapper passes it through unchanged.
+
+  Output: that text, as JSON. Exit code 0.
+
+  Example: telegrambot jobs help
+""",
+    "jobs list": """\
+telegrambot jobs list [--state S] [--outcome O] [--chat C] [--topic T]
+                      [--limit N] [--actor U] [--connection <id>]
+
+  The register, newest first.
+
+  --state S     draft, waiting, running or stopped
+  --outcome O   only jobs with that outcome
+  --limit N     1-500 (default 20)
+
+  Output: {"connection", "count", "jobs": [<job>]}.
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs list --state running
+""",
+    "jobs active": """\
+telegrambot jobs active [--chat C] [--topic T] [--actor U] [--connection <id>]
+
+  Waiting and running work, oldest first. Read it before `jobs submit`: a new
+  outcome joins the work already in flight.
+
+  Output: {"connection", "count", "jobs": [<job>]}.
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs active --chat <chat>
+""",
+    "jobs show": """\
+telegrambot jobs show <id> [--chat C] [--topic T] [--actor U]
+
+  One job, with its pending amendments.
+
+  Output: <job> with "pending_amendments".
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs show 3f9a1c
+""",
+    "jobs register": """\
+telegrambot jobs register "<one line>" --chat C [--topic T] --requested-by U
+                          [--origin-message-id M] [--profile P] [--external]
+                          [--actor U] [--connection <id>]
+
+  A draft: no runner takes it yet. `jobs submit` hands it over.
+
+  --chat C                 the chat the job reports into (required)
+  --topic T                its forum topic
+  --requested-by U         the person it is done for (required)
+  --origin-message-id M    the message it answers
+  --profile P              the job's profile (default: defaults.job_profile,
+                           else the bundled job profile; exit 6
+                           profile_refused for one that does not resolve)
+  --external               everything sent for it ends in #noreply
+
+  Output: <job> with "next", the submit command.
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs register "Summarise this week's tickets" --chat <chat> --requested-by <user id>
+""",
+    "jobs amend": """\
+telegrambot jobs amend <id> "<what changed>" [--chat C] [--topic T] [--actor U]
+
+  Continues the job's session with what changed (exit 6 empty_amendment for an
+  empty one).
+
+  Output: <job> with "amendment".
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs amend 3f9a1c "Include last week too"
+""",
+    "jobs submit": """\
+telegrambot jobs submit <id> --confirm-active-jobs-checked [--chat C] [--topic T]
+                        [--actor U]
+
+  Hands the draft over to the runner. Check `jobs active` first: without
+  --confirm-active-jobs-checked it exits 6 confirm_required.
+
+  Output: <job>.
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs submit 3f9a1c --confirm-active-jobs-checked
+""",
+    "jobs stop": """\
+telegrambot jobs stop <id> [--chat C] [--topic T] [--actor U]
+
+  Asks the runner to stop the job; safe to repeat.
+
+  Output: <job>, with "stopping" while it ends.
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs stop 3f9a1c
+""",
+    "jobs resume": """\
+telegrambot jobs resume <id> [--chat C] [--topic T] [--actor U]
+
+  Asks the runner to resume a stopped job; safe to repeat.
+
+  Output: <job>.
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs resume 3f9a1c
+""",
+    "jobs discard": """\
+telegrambot jobs discard <id> [--chat C] [--topic T] [--actor U]
+
+  Drops a draft that never started; one that has started exits 6
+  job_not_draft (stop it instead).
+
+  Output: {"discarded": <id>}.
+""" + _HELP_JOBS + """
+  Example: telegrambot jobs discard 3f9a1c
+""",
+    "progress": """\
+telegrambot progress <text>          (inside a turn or a job only)
+
+  Inside a turn or a job the worker wrapper (service/worker-bin) is first on
+  PATH, and the chat, topic, connection, origin message, requester and job
+  profile come from the turn, never from the call (a call naming --connection,
+  --chat, --topic, --requested-by, --origin-message-id, --actor, --profile or
+  --external itself is refused). The channel state names each command.
+
+  progress <text>                 a line about the work; the service relays it
+                                  (the first at once, later ones at most one
+                                  per progress_after seconds)
+  send current <text|-> [--file PATH]
+                                  a message for the person, sent by the
+                                  service at once into this chat
+  history [--before ID] [--limit N]
+  download <message> [--out PATH]
+  react <message> [<emoji>]       this chat only
+  jobs <verb> ...                 the register, scoped to this chat and
+                                  requester
+  history <chat> [--topic ID] [--before ID] [--limit N]
+  download <chat> <message> [--out PATH]
+                                  with a read reach, also the groups and
+                                  topics the sender's role names in
+                                  roles.<role>.read_chats; writing stays here
+
+  Everything else passes to the real CLI unchanged, which applies its own
+  gates. Outside a turn the real CLI has no progress verb (exit 6
+  invalid_arguments).
+
+  Output: {"ok": true, "queued": "progress"}. Exit codes: 0; 4
+  worker_authority_missing or worker_progress_unavailable where the service
+  handed the run no chat or no outbox; 6 worker_progress_invalid,
+  worker_send_invalid.
+
+  Example: telegrambot progress "Reading the last week of the chat"
+""",
+    "service run": """\
+telegrambot service run [--machine]
+
+  Serve in the foreground; the supervisor's command. The service needs the
+  project's store (store_not_configured without one), serves every connection
+  the project grants with allow_write (checked again every 30 s), and one
+  getUpdates poll per bot: a bot with a webhook, or one another process polls,
+  is not served (webhook_set, poll_conflict). In a project the machine service
+  serves, it is refused (exit 4 joined_to_machine_service); while another
+  process holds the state, exit 8 service_running.
+""" + _HELP_SERVICE_FLAGS + _HELP_SERVICE + """
+  A message is answered in this order; the first stop wins: the chat is
+  allowed (a private chat by direct_messages.mode and allowed_users, a group
+  by allowed_groups) -> /start is never a turn -> a last line #noreply ->
+  the sender may address it (may_address) -> other bots: at most
+  agent_dialogue.max_turns turns in a row (default 4; a person's message
+  starts the count again; Telegram's own is_bot says who is a bot) -> a
+  service command -> in a group, addressed: @username, an alias, a reply to
+  the bot (`triggers` switches each off; require_reference false admits
+  every message), else the reply gate, else an ambient voice message in an
+  `auto` chat. A stranger is ignored silently and recorded in `seen`.
+
+  An admitted message is reserved in the store before anything is done, the
+  chat shows the bot typing at once, and one person's messages within the
+  channel's debounce become one turn. A channel is a chat or one forum topic
+  (General is topic 1); one turn runs per channel at a time. A turn reads the
+  conversation back by message number (tail_size, at most history_requests
+  reads), climbs the reply chain of the first message, and runs in a fresh
+  harness session on the channel's profile; its answer, cut at
+  `=== REPLY ===`, is sent in parts of 4096, as a reply to the request in a
+  group. The answer, its progress lines, what it sends and a job's result
+  are rendered from Markdown into Telegram's own formatting (bold, italic,
+  strikethrough, code, code blocks, links, quotes, lists; a heading becomes
+  a bold line and a table a code block), sent as message entities with no
+  parse mode; a part whose formatting Telegram refuses is sent again as
+  plain text. An empty answer is silence. A request ending in #external has
+  everything sent for it end in #noreply. In a group where the bot does not
+  see every message (privacy on, not an admin) no history is read and the
+  bot answers only when addressed; with no api_id and api_hash on the
+  connection no history is read anywhere. Each turn's channel state says
+  which, and how far its read reached.
+
+  The prompt, top down: the bundle's mechanics (read every turn, never cut),
+  the bundle's behaviour (`prompt_mode: replace` drops it), the agent's own
+  prompt (`prompts put bot`), the delegation text where the chat may hand
+  off work, the group's or direct sender's context, the topic's context,
+  then the channel state, the request and the conversation. context_mode
+  exclusive on a group cuts the behaviour and the agent's prompt; on a topic
+  it cuts the group's context too. A job reads the job mechanics, the job
+  behaviour, the agent's prompt, its state, its brief and the conversation.
+
+  Voice: an addressed voice message (every one in a voice_transcription
+  `auto` chat) is fetched, transcribed with the connection's Deepgram key,
+  kept on disk under the connection's state, and echoed into the chat as a
+  quote when voice_echo is on; an ambient one is answered only when its
+  words name the bot. The turn reads it as `[voice] <text>`.
+
+  Commands in a chat, each gated by control.roles: /status (settings,
+  profile, history, the replies in flight numbered, open jobs), /stop
+  (everything in flight here) and /stop N (one of the last /status list),
+  /profiles, /reload, /set tail|debounce|worker-timeout|profile|
+  voice-transcription|voice-echo <value|default>, /help. A command with
+  another bot's @suffix is not read at all. The bot's command menu is set at
+  start. Roles come from allowed_users.<id>.role, a group member's role,
+  member_role, direct_messages.default_role; authority.roles hands each turn
+  its CAPABILITIES_AUTH_CONTEXT, and roles.<role>.profile names the profile
+  the sender's turn runs on, over the chat's, the topic's and /set profile.
+  roles.<role>.read_chats {<chat id>: {topics [<topic id>]}} is the role's
+  read reach: the other groups, and topics within them, its turns may read
+  with history and download; writing stays in the turn's own chat.
+
+  The reply gate (allowed_groups.<id>.gate {enabled, mode shadow|live,
+  brief, context_messages, context_chars, max_batch, model, effort}): in a
+  group the bot sees whole, unaddressed messages of people collect per
+  channel and, after the debounce, one light run on telegrambot-gate-<the
+  channel's harness> decides ignore, react with one emoji, or reply. shadow
+  logs only; live acts. A failing run is named by service doctor
+  (gate_failing).
+
+  Inside a turn or a job the worker wrapper (service/worker-bin) is first on
+  PATH (`telegrambot help progress`).
+
+  Exit codes: 4 joined_to_machine_service; 5 or 6 the store (store_*); 8
+  another process already runs the service here.
+
+  Examples:
+    telegrambot service run
+    telegrambot service run --machine
+""",
+    "service stop": """\
+telegrambot service stop [--machine] [--timeout S]
+
+  Stop the process that serves here (SIGTERM) and wait for it to end. Not
+  running answers {"stopped": false, "reason": "not running"}. In a project
+  the machine service serves, `capabilities service stop telegrambot` stops
+  serving it and this exits 4 joined_to_machine_service.
+""" + _HELP_SERVICE_FLAGS + """\
+  --timeout S  seconds to wait (default 30)
+
+  Output: {"stopped", "pid"}. Exit codes: 0; 4 joined_to_machine_service; 5
+  stop_timeout.
+""" + _HELP_SERVICE + """
+  Example: telegrambot service stop --timeout 60
+""",
+    "service reload": """\
+telegrambot service reload [--machine] [--timeout S]
+
+  Make the running process take this declaration: check it, signal the
+  process (SIGHUP to it alone) and wait until it publishes the new
+  fingerprint. Settings, connections and profiles take it; prompts are read
+  every turn.
+""" + _HELP_SERVICE_FLAGS + """\
+  --timeout S  seconds to wait (default 30)
+
+  Output: {"reloaded", "fingerprint", "pid"[, "reason"]}. Exit codes: 0; 3
+  not_running; 5 reload_timeout; 6 reload_rejected (the running process kept
+  its declaration); a declaration here that does not check is refused with
+  its own code.
+""" + _HELP_SERVICE + """
+  Example: telegrambot service reload
+""",
+    "service status": """\
+telegrambot service status [--machine]
+
+  Whether a process serves here, its pid and state folder, whether it holds
+  this project's current declaration, and the project's row; with --machine,
+  every joined project from the node manager's list.
+""" + _HELP_SERVICE_FLAGS + """
+  Output: {"mode", "joined", "running", "pid", "state_dir", "current",
+  "project"}; with --machine {"mode", "running", "pid", "state_dir",
+  "fingerprint", "list", "projects"}. Exit code 0.
+""" + _HELP_SERVICE + """
+  Example: telegrambot service status
+""",
+    "service logs": """\
+telegrambot service logs [--machine] [--tail N]
+
+  The tail of the service's log; a project the machine service serves reads
+  its own lines of the machine log.
+""" + _HELP_SERVICE_FLAGS + """\
+  --tail N     the last N lines, 0-10000 (default 100; 0 is every line)
+
+  Output: {"log", "lines"}. Exit code 0.
+""" + _HELP_SERVICE + """
+  Example: telegrambot service logs --tail 200
+""",
+    "service doctor": """\
+telegrambot service doctor [--machine]
+
+  Whether the service can serve here, and whether it does: the store, the
+  settings, every profile they reach, each bot's token and webhook, whether
+  the running process is current, and a failing reply gate (gate_failing).
+  With --machine, whether the machine process runs and serves every joined
+  project.
+""" + _HELP_SERVICE_FLAGS + """
+  Output: {"ok", "problems", "store", "skipped", "profiles", "bots",
+  "service"}. Exit codes: 0 it serves; 7 the service unable to serve, not
+  running or not current.
+""" + _HELP_SERVICE + """
+  Example: telegrambot service doctor
+""",
+    "service harness": """\
+telegrambot service harness [--json]
+
+  The harnesses this project's turns and jobs run on, from every profile the
+  settings reach and the defaults, for the sign-ins a node needs. Starts
+  nothing, changes nothing. --json is accepted; the output is always JSON.
+
+  Output: {"harness", "profiles", "unresolved"}. Exit codes: 0; 5 the store
+  unreachable; 6 no_project_identity.
+""" + _HELP_SERVICE + """
+  Example: telegrambot service harness --json
+""",
+}
+
+
 # ── the command line ─────────────────────────────────────────────────────────
 
 
@@ -2009,7 +2537,7 @@ _positive = _bounded(1, 2 ** 53)
 def _parser() -> _Parser:
     root = _Parser(prog=NAME)
     sub = root.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
-    sub.add_parser("help")
+    sub.add_parser("help").add_argument("verb", nargs="*")
     sub.add_parser("doctor")
     p = sub.add_parser("seen")
     p.add_argument("--kind", choices=["chat", "topic", "person"])
@@ -2124,7 +2652,11 @@ def main() -> None:
     args = _parser().parse_args(cleaned)
     cmd = args.cmd
     if cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        # `--connection <id> help [<verb>]`: the same menu and pages as bare help.
+        if args.verb:
+            _cmd_help_verb(args.verb)
+        else:
+            _cmd_help()
         return
     if cmd == "doctor":
         cmd_doctor(wanted)

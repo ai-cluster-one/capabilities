@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-22 — `capabilities audit` holds every catalogue bundle to the layered help law; `HELP_MENU_PENDING` is gone
+
+The last six bundles awaiting the layered help - telegram, telegrambot, vapic, whatsapp, windmill and youtrack - are converted in the same release, so the pending set is empty and is removed: `HELP_MENU_PENDING`, the audit's branch that reported a pending bundle's help findings under `pending` instead of failing, and the `pending` key `capabilities audit <name>` added to its report only for such a bundle. Every bundle, a new capability included, is held to the whole help check, and SHEBANG.md no longer describes a pending set. No verb, flag, exit code or other key of the audit report changes.
+
 ## 2026-11-21 — `capabilities help` is the menu, and every verb answers `capabilities help <verb>` with its whole contract
 
 `capabilities help` was the whole contract, about 192 KB, and printed the same whatever followed it. It is now the menu, under 8 KB: every verb on one line under the section headings it had, the guides and the I/O contract. `capabilities help <verb>` (`help node add`, `help store upgrade`) prints that verb's whole contract, the text the old help held for it, unchanged but for its pointers to other sections, which now name the `help` that answers them. A group (`help node`, `help store`) lists its verbs' menu lines after the group's own text where it has one, and the topics `manager`, `environment`, `envelope`, `store` and `vault` print the text that was no single verb's: the store and vault topics also open the page of each of their verbs. A path the help does not know exits 6 `unknown_verb`, its hint `capabilities help`, with nothing on stdout. `capabilities --help` and `-h` print the menu, and `capabilities secrets help` prints the vault and every vault verb whole, as before. Only the help output changes: no verb, flag or JSON key is removed or renamed.

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "httpx>=0.27",
 #     "puremagic>=1.28",
 #     "qrcode>=7.4",
@@ -12,6 +12,8 @@
 """
 whatsapp — WhatsApp CLI carrying its own engine: one linked device, one store.
 
+This is the menu; `whatsapp help <verb>` is one verb's whole contract.
+
 Agent-invoked. Links a WhatsApp account as a companion device, keeps the account's
 chats and messages in the project's Postgres database, reads from it, deepens it
 on demand, downloads and transcribes voice notes, and renders an export a project
@@ -20,7 +22,7 @@ can commit to. Run `whatsapp doctor` first to confirm the chain.
 Every verb connects, works, and exits: the engine is whatsmeow, compiled into
 the installed wheel and driven in-process for the life of one invocation. The
 bundled assistant service is the one exception: it holds the connection and
-captures live for as long as it runs (see Assistant service).
+captures live for as long as it runs (`whatsapp help service run`).
 
 Startup protocol
   1. `whatsapp doctor` — proves the engine loads, the session exists and
@@ -33,523 +35,88 @@ Startup protocol
   4. Exit 2/4/6 are credentials, policy, and input as everywhere else.
 
 Connections
-  Configuration requires explicit named connections. A connection is one WhatsApp
-  identity. A project with several declares them as its own connections, or one
-  machine-level registry serves every project at
-  ~/.config/whatsapp/connections.json; where this project reads them from,
-  "Where connections live" below says:
-        {
-          "default": "<id>",
-          "connections": {
-            "<id>": {
-              "engine":              "whatsmeow",
-              "number":              "15551234567",
-              "expected_account_id": "15551234567",
-              "device_name":         "Capability (<host>)",
-              "initial_sync_days":   30,
-              "messages_dir":        "messages",
-              "allow_write":         false
-            }
-          }
-        }
-
-  engine               "whatsmeow" (the default — this CLI's own engine, no
-                       server) or "waha" (a self-hosted WAHA bridge).
-  number               the account's phone number, digits with country code. The
-                       default for `pair`, and what names the account's state
-                       home, so an in-house entry declares it (or pins
-                       expected_account_id) before it can pair.
-  expected_account_id  the account this session must be, and the identity that
-                       names its state home when it is set. `pair` reports the
-                       value to bind; a session belonging to a different account
-                       is then refused rather than silently used.
-  device_name          what the entry is called under Linked Devices on the
-                       phone. Default: "Capability (<this machine>)".
-  initial_sync_days    how far back the one-time pairing burst reaches
-                       (default 30). Depth is separable from reach: a shallow
-                       pairing does not cap what `messages` can later fetch.
-  messages_dir         where `export` writes. Absolute, or relative to the
-                       project's capabilities/whatsapp/ folder.
-
-  A "waha" connection instead carries base_url, session, secret_env,
-  dashboard_user_env / dashboard_pass_env, waha_engine ("GOWS") and tier. An
-  entry carrying base_url is a bridge entry whether or not it names its engine,
-  since only a bridge has an address to reach; `whatsapp connections` reports
-  the resolved engine and where that answer came from. A flag one engine does
-  not take is refused rather than ignored.
-
-  WRITES ARE OFF BY DEFAULT: a WhatsApp message reaches a real person, so `send`
-  exits 4 unless the connection carries an explicit "allow_write": true. No flag
-  lifts the gate; granting it is a deliberate registry edit, made after asking
-  the user.
-
-  Selection: --connection <id> (-c) on every command. Unflagged, the registry's
-  "default" pointer applies, else the sole entry; several entries without a
-  pointer is refused as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off. pair
-  uses them there too, so a connection declared globally is linked on the
-  machine; every other verb that needs a connection is refused there.
-
-Credentials
-  Flags win; otherwise a value resolves through the credential cascade
-  (`Where a secret resolves`, at the end of this help).
-        DEEPGRAM_API_KEY   only `whatsapp transcribe` reads it. Shared: set once
-                           with `whatsapp setup set`, which stores it, and read
-                           back, as `Where a secret resolves` says.
-  The linked-device session is not a configured secret: it is minted by pairing
-  and lives in the user state home, per account.
+A connection is one WhatsApp identity, named explicitly: a device linked by
+`whatsapp pair`, through this CLI's own engine or a WAHA bridge. How one is
+declared, selected and resolved is on `whatsapp help connections`. Writes are
+off by default: a message reaches a real person, so `send` exits 4 unless the
+connection grants writes, granted only after asking the user.
 
 Store
-  Chats, messages, identities, enrichment and capture provenance live in the
-  project's Postgres database, in whatsapp_* tables keyed by the account,
-  created and migrated on first use. The database is the first that answers
-  for the project: AGENTKIT_DB_* in its .env.local / .env, then the process
-  environment, then the machine's store setting (`capabilities store set`);
-  `capabilities store show` shows which answers. With none, every verb that
-  reads or writes the capture exits 6 store_not_configured; help, contract,
-  connections and the other contract commands still answer. History an
-  earlier version kept in a messages.db file in the state home is not read by
-  any verb until `whatsapp import-legacy` carries it into the store, once.
-
-State
-  $XDG_STATE_HOME/whatsapp/<account>/     named for the account, not for the
-                                          connection: a connection can be
-                                          renamed without losing the session
-                                          or the capture
-        session.db     the engine's own — device, keys, contacts, LID map
-        linked-by.json the connection that linked the device, and the project
-                       whose own connection it is (null: the machine's shared
-                       one); `connection add` and `pair` refuse another
-                       connection the same number (exit 6 number_linked,
-                       naming it under `holder`), and another project is given
-                       that connection by a grant
-        raw/           history chunks exactly as received, written before parsing
-        media/         downloaded attachments, keyed by message id
-        lock           held for the duration of any connected verb, and by
-                       the assistant service for its whole life
-        service/       the assistant service's control files on this
-                       machine: owner.json, health.json, daemon.pid,
-                       daemon.log, and capture-spool.jsonl while the store
-                       is unreachable (capture-spool.rejected.jsonl keeps
-                       a spooled capture the store refused for its content)
-
-Assistant service
-  `whatsapp service ...` runs a bundled long-running listener, `assistant`, on
-  one account. It holds the account's connection for as long as it runs,
-  through the same engine, capture path, account check and store every verb
-  uses, so each message is written to whatsapp_messages as it arrives (sync
-  type LIVE). A dropped connection is re-established with backoff (2s
-  doubling to 60s), and the offline queue drains on each reconnect. A device
-  removed from the phone is final: the service stops reconnecting and says
-  so in `service status` and `service doctor`. It sends the messages `send`
-  queues for its account, oldest first and at most `defaults.send_rate` a
-  minute; a queued row wakes the sender (in-process at once, or within about
-  a second from any other process, through the account's whatsapp_outbox
-  version in the store's change versions, which the listener polls on its
-  own store connection), with a half-second poll behind it. A capture the store cannot take because the store is unreachable is
-  appended to a spool file in the service's state directory and written into
-  the store, in order and once, when it answers again (and at start);
-  `service status` reports the spool depth and the store error. A send a
-  previous run left in flight is failed as interrupted_delivery_unknown at
-  start and never resent.
-  Liveness: a heartbeat thread publishes health every 15s whatever the
-  engine and the dialogue are doing, and a watchdog thread checks that the
-  listener's loop keeps going round and that no engine handler runs on; when
-  either has made no progress for `defaults.stall_seconds` (default 120) the
-  listener writes every thread's stack to its log and leaves with exit 9 for
-  its supervisor to restart. SIGTERM is honoured within 30s even when the
-  loop is blocked (exit 9 when it had to be forced). A `service run` or
-  `service start` that finds the account held by a listener whose health is
-  older than `stall_seconds` ends it (SIGTERM, then SIGKILL after 15s) and
-  takes over; a holder with fresh health is respected (exit 8). Health older
-  than 60s from a live holder is `stale`: `service status` reports it with
-  its age, and `service doctor` - the deploy doctor - fails on it.
-  Dialogue: it answers admitted messages with a dialogue turn. Each live
-  capture passes a gate in this order: its own message (never answered,
-  except what the owner types from the phone in the account's own self-chat),
-  history-sync origin (never), older than `max_age` (dropped), already in the
-  register (dropped), chat allowed, sender allowed (people are named by phone
-  number and matched through the store's phone/LID identities), addressed (a
-  group needs our JID or LID mentioned, a quote of our message, or an alias in
-  the text unless `require_reference` is false; a trailing `#noreply` line
-  opts out everywhere), role, then a control command (/status, /set, /reload,
-  /stop, /help, gated by control roles) or a turn. An admitted message is
-  reserved in whatsapp_register before anything else, so a redelivery or a
-  restart never answers it twice, and nothing before the service's first
-  sight of a chat is answered. A broadcast (status@broadcast, a broadcast
-  list, a channel post) is captured and never judged. The moment a message is
-  admitted for a turn it is marked read and the chat shows the account
-  composing, refreshed until the turn ends and paused when it ends without
-  an answer. Turns run per chat in arrival order after
-  `debounce`, at most `max_parallel_dialogue` at once, through
-  callva-harness-runner on a profile kept in the store, as agentrooms and
-  tasks keep theirs (the project's version, then the global one, then the
-  runner's shipped profiles, then the bundled whatsapp-claude, the default,
-  and whatsapp-codex; see `whatsapp profiles`), fit-checked at start, reload
-  and in `service doctor`, ended at `worker_timeout`. The
-  prompt is the context document, the chat's `context`, the channel state,
-  the request and the last `tail_size` stored messages; the role's
-  `authority` goes to the run as CAPABILITIES_AUTH_CONTEXT. The answer, cut
-  at `=== REPLY ===`, is queued as pending rows (quoting the request in a
-  group, split between paragraphs) and sent by the listener with no pause of
-  its own, as is a job's result; an empty answer is silent. The listener resolves the runner itself (`uv run --with`); the
-  CLI does not carry it.
-  Profiles are saved in the store with `tasks profiles save` (the table is
-  callva-harness-runner's, shared by the family) and taken at start and
-  `service reload`. A project's profile files in
-  capabilities/whatsapp/service/profiles/ are no longer read: while any is
-  there, start and doctor refuse, exit 6 `profiles_not_imported`, until
-  `whatsapp profiles import --apply` moves them into the store.
-  Voice notes: `voice_transcription` (`/set voice-transcription`, else the
-  group's or person's, else `defaults`, else `addressed`) decides which are
-  transcribed before the turn: `off` none; `addressed` every admitted one in
-  a direct chat and, in a group, one that quotes our message; `auto` every
-  one in a group, answered only when its transcript matches an alias. The
-  note is reserved first, fetched through the listener's own connection and
-  sent to Deepgram (DEEPGRAM_API_KEY through the credential cascade); the
-  transcript is stored in whatsapp_enrichment as `transcribe` stores it, and
-  each transcribed note is echoed into the chat before any turn (a direct
-  chat: `Твоё сообщение:` and the quoted transcript; a group: the quoted
-  transcript replying to the note; a failure: `[голосовое — не удалось
-  расшифровать]`). A turn, when one runs, reads `[voice] <transcript>`, or
-  `[voice note - transcription failed: <reason>]`, never retried. The tail
-  shows every stored transcript under its sender and leaves the echoes out.
-  Jobs: a turn whose role's authority reaches `whatsapp jobs` is told how to
-  hand longer work to a job (the `delegation` document) and runs with the
-  bundle's worker shim first on PATH, which fixes the chat, the requester, the
-  origin message and the job profile from the turn's environment and refuses
-  a call that names any of them. Submitting a draft ends the turn: its own
-  short line, or after a grace period the job's description, is the
-  acknowledgement. The listener's job runner claims waiting jobs in arrival
-  order within `defaults.max_parallel_jobs`, each with a slot row, a lease
-  and a fencing token in whatsapp_jobs / whatsapp_job_slots, and runs each
-  through callva-harness-runner on its profile (`defaults.job_profile`,
-  bundled whatsapp-job-claude) with the `job-worker` document as its prompt,
-  recording pid and session at start. An amendment stops the attempt and
-  continues the same session. The result is queued once, as pending rows
-  quoting the message that asked for it. A spent quota stops the job as
-  `quota` and pauses the queue until it lifts; a refused model or any other
-  failure is recorded and reported to the chat. A job whose listener went
-  away is interrupted and, per `defaults.job_recovery`, continued on its
-  session (`requeue`) or stopped and reported (`inspect`); a result not yet
-  delivered is delivered after a restart, once. /status lists the chat's
-  open jobs and /stop stops them with the running turn.
-  Its settings are the project's whatsapp service settings records
-  (capabilities/whatsapp/service/settings.json in files mode): `connection`,
-  `environment`, `assistant_name`, `direct_messages {mode allowlist|anyone|
-  off, default_role}`, `allowed_users {<phone>: {name, role, profile,
-  worker_timeout, context, voice_transcription}}`, `allowed_groups
-  {<jid>@g.us: {name, require_reference, aliases, may_address
-  anyone|allowed_users|[phones], member_role, profile, worker_timeout,
-  context, voice_transcription}}`, `control {roles}`, `authority {default,
-  roles}` and `defaults {tail_size, debounce, max_age, worker_timeout,
-  max_parallel_dialogue, profile, send_rate, max_parallel_jobs, job_profile,
-  job_recovery requeue|inspect, voice_transcription off|addressed|auto,
-  stall_seconds 30..3600}`. A top-level
-  `send_rate` is read as `defaults.send_rate`. Any other key is refused.
-  Settings that admit nobody leave the listener capturing and sending and
-  answering nothing.
-  Activation needs an explicit project enable (`capabilities enable whatsapp
-  --project`) and a configured store. While the service runs, `send` on that
-  account hands its message to the service and returns the service's answer,
-  every other verb that connects on that account exits 8 naming the service,
-  and reads that answer from the store (`status`, `health`, `chats` without
-  --fresh, `messages` the store covers or with --rounds 0) keep working.
-      whatsapp service init [--connection ID] [--force]
-                                       Seed the settings records.
-      whatsapp service start [--connection ID]
-                                       Start the listener detached; returns once
-                                       it holds the account (taking it over
-                                       from a stale holder).
-      whatsapp service run [--connection ID]
-                                       Run the listener in the foreground (the
-                                       deploy command). Exit 9 when it stalled.
-      whatsapp service stop [--connection ID] [--timeout S] [--force]
-      whatsapp service reload [--connection ID] [--timeout S]
-                                       Re-read and validate the settings in the
-                                       running listener, without reconnecting.
-      whatsapp service status [--connection ID]
-                                       state, pid, connected, uptime, last event.
-      whatsapp service logs [--connection ID] [--tail N]
-      whatsapp service doctor [--connection ID]
-                                       Settings, store, link and ownership.
-      whatsapp service harness [--json]
-                                       The harness tools (claude, codex) of
-                                       every profile a turn is configured to
-                                       run on now - each the settings reach,
-                                       every chat's `/set profile` and each
-                                       open job's - resolved and fitted as a
-                                       turn resolves it, for the sign-ins a
-                                       node needs. With no dialogue admitted
-                                       none. Runs no turn and writes nothing;
-                                       `unresolved` names a profile that does
-                                       not resolve or fit.
-      whatsapp jobs help               The job register's verbs: list, active,
-                                       show, register, submit, amend, discard,
-                                       stop, resume.
+The capture lives in the project's Postgres database, in whatsapp_* tables keyed
+by the account; with none, a verb that reads or writes it exits 6
+(`whatsapp help migrate`). The session and the account's files are in the user
+state home (`whatsapp help inventory`).
 
 Commands
-  whatsapp help                        Print this usage block
-  whatsapp doctor [--connection ID]    Readiness — the engine loads, a session
-                                       exists, it authorises, and the account
-                                       matches the binding. Connects, so it also
-                                       drains the server's queue for the device.
-  whatsapp status                      Human-readable account / session / store view
-  whatsapp health                      Store readiness — what the capture holds
-                                       per chat, its span, and what is missing.
-                                       Reads the store only; answers "is there
-                                       anything to consume?" without connecting
-                                       to WhatsApp.
-  whatsapp pair [--number DIGITS] [--qr] [--days N] [--full] [--hold SECONDS]
-                [--wait] [--recreate --yes] [--events]
-                                       Link this machine as a companion device.
-                                       Prints an XXXX-XXXX code to enter on the
-                                       phone (Settings → Linked Devices → Link a
-                                       Device → "Link with phone number"); --qr
-                                       paints a scannable QR code on the progress
-                                       stream instead, repainting it whenever the
-                                       reference expires. The symbol is wide — it
-                                       says so when the terminal is too narrow to
-                                       hold it.
-                                       Either way the invocation holds the socket
-                                       the code was minted on until the phone
-                                       completes the link — a link cannot complete
-                                       against a client that has exited — and then
-                                       holds it further to capture the one-time
-                                       history burst, which arrives once and is
-                                       not repeated on reconnect.
-                                       --events drives it with no terminal: JSON
-                                       lines on stdout instead of the painted
-                                       symbol (qr, each new reference as it
-                                       arrives; pairing_code; phone_needed, when
-                                       no number is known, answered by one line
-                                       on stdin; linked; progress; done; error).
-                                       A connection that names no account yet is
-                                       linked all the same, and the account the
-                                       link answers for is written to it as
-                                       expected_account_id (`identity_bound` in
-                                       the result). A first link under --events
-                                       that fails or is cancelled (SIGTERM,
-                                       SIGINT, SIGHUP) removes the connection
-                                       and the state it made.
-                                       --days sets the burst window (default: the
-                                       connection's initial_sync_days, else 30);
-                                       --full asks for everything the phone still
-                                       holds; --hold caps how long the burst is
-                                       waited for (default 180s) — it arrives once,
-                                       so a large account wants a larger value.
-                                       --recreate --yes re-links a session that
-                                       already exists. --wait is the WAHA form.
-  whatsapp chats [--search TERM] [--limit N] [--fresh] [--json]
-                                       List chats from the store, most recent
-                                       first. --fresh connects first, so the
-                                       server's queue is drained before answering.
-  whatsapp messages <chat_id> [--limit N] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
-                              [--rounds N] [--fresh] [--format conversation|table]
-                              [--json]
-                                       Read a chat. Answers from the store, and
-                                       reaches back to the phone when the store
-                                       cannot cover the request — depth is a
-                                       parameter of reading, not a separate verb.
-                                       Each round asks the phone for 50 older
-                                       messages and takes about 4 seconds;
-                                       --rounds caps them (default 10, 0 disables
-                                       reaching). The phone must be online to
-                                       answer; its absence is reported as itself.
-  whatsapp contact <contact_id> [--fresh] [--json]
-                                       Show a contact's name, number, and both
-                                       identity forms (phone JID and LID).
-  whatsapp export <chat_id> [--out PATH] [--media-dir PATH] [--limit N]
-                            [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--rounds N]
-                            [--page-size N] [--max-pages N] [--no-photos]
-                            [--no-stickers] [--videos] [--documents]
-                                       Render a chat from the store into
-                                       messages.json + media/. Idempotent —
-                                       re-runs preserve transcriptions and skip
-                                       already-downloaded media. Without --out,
-                                       writes to the connection's messages_dir
-                                       (<messages_dir>/<slug>/messages.json).
-                                       Media leaves WhatsApp's CDN while the keys
-                                       stay valid, so what can no longer be fetched
-                                       is recorded as lost rather than omitted or
-                                       retried forever. --page-size / --max-pages
-                                       page a WAHA connection instead.
-  whatsapp transcribe <json_path> [--force] [--model nova-3]
-                                       Fill transcription placeholders for
-                                       voice/audio messages in an exported JSON
-                                       using Deepgram (requires DEEPGRAM_API_KEY).
-                                       Results are also kept in the store, so a
-                                       later export carries them without redoing
-                                       the work.
-  whatsapp render <json_path> [--out PATH]
-                                       Pretty-print an exported messages.json as
-                                       a markdown conversation log (date headers,
-                                       sender names, voice transcriptions inlined).
-                                       stdout by default; --out writes a file.
-  whatsapp import-legacy [--file PATH]  Import, once, the history an earlier
-                                       version kept in messages.db in the
-                                       account's state home: chats, messages,
-                                       identities, enrichment, chunk records and
-                                       meta. Reads the file read-only and leaves
-                                       it as it is. Rows the store already holds
-                                       win; identities and enrichment fill what
-                                       the store lacks. A second run imports
-                                       nothing. Exit 3 when there is no file, 6
-                                       when it is not a legacy store.
-  whatsapp profiles list [NAME ...]    Each profile the service settings reach
-                                       (or each NAME) as it resolves from this
-                                       project: its layer (project, global,
-                                       shipped, capability), stored version,
-                                       harness, model, and whether it fits.
-  whatsapp profiles import [--apply]   Move this project's profile files from
-                                       capabilities/whatsapp/service/profiles/
-                                       into the store at its scope, all or
-                                       none; --apply saves them and removes the
-                                       files. Exit 6 naming a file that cannot
-                                       be read or differs from the version the
-                                       project already holds.
-  whatsapp prompts list                The service's prompts - context (the
-                                       dialogue's), delegation (what a turn is
-                                       told about handing work to a job) and
-                                       job-worker (the whole of a job's prompt) -
-                                       each with the source the next turn reads
-                                       it from: store (the agent's active
-                                       version), file (a project not yet moved),
-                                       or bundle (the standard text it ships).
-  whatsapp prompts show <key>          The text the next turn reads, and its
-                                       source and version.
-  whatsapp prompts put <key> [--base ID] [--note TEXT]
-                                       Save a new version from stdin; the one it
-                                       replaces stays in history. --base names
-                                       the version you read and refuses the save
-                                       (exit 6 base_mismatch) when another was
-                                       saved since. Read every turn: no restart.
-  whatsapp prompts history <key>       Every saved version, newest first.
-  whatsapp prompts retire <key>        Leave the key with no active version;
-                                       deletes nothing.
-  whatsapp prompts import [--apply]    Move this project's prompt files from
-                                       capabilities/whatsapp/service/ into the
-                                       store, their text byte for byte, all or
-                                       none; --apply saves them and removes the
-                                       files. Exit 6 naming a file that differs
-                                       from the version the store already holds.
-  whatsapp send <chat_id> <text> [--reply-to MESSAGE_ID]
-                [--mention PHONE]... [--typing]
-                                       Send one text message. Write-enabled
-                                       connections only: `send` exits 4 unless
-                                       the connection carries allow_write,
-                                       before anything is written.
-                                       The message is first a pending row in
-                                       the store. With the assistant service
-                                       running on the account the service sends
-                                       it and `send` waits up to 60s for its
-                                       answer; otherwise `send` connects and
-                                       sends it. Reports the id the account
-                                       minted, which is what a later read
-                                       carries, with local_id (the row's
-                                       internal id), delivery and sent_by
-                                       (service or direct). A failed send exits
-                                       5 send_failed; no answer in time exits 5
-                                       send_pending naming the local id, and
-                                       the row is still sent when the service
-                                       can, so sending again sends twice.
-                                       --reply-to quotes a message of the same
-                                       chat the store holds (exit 3 otherwise);
-                                       --mention mentions a number, repeatable,
-                                       and its @number leads the text unless
-                                       the text carries it; --typing shows
-                                       composing for 1.5-3.5s, then paused,
-                                       before sending.
-                                       What goes out is an ordinary message,
-                                       carrying no machine marking of any kind,
-                                       so saying who is writing is the sender's
-                                       job and belongs in the text.
+  whatsapp status                      the account, session and store, for a person
+  whatsapp health                      what the capture holds and lacks; store only
+  whatsapp pair                        link this machine as a companion device
+  whatsapp chats                       the chats in the store, most recent first
+  whatsapp messages <chat_id>          a chat, reaching back to the phone when needed
+  whatsapp contact <contact_id>        a contact's name, number and identity forms
+  whatsapp export <chat_id>            render a chat into messages.json and media/
+  whatsapp transcribe <json_path>      fill an export's voice transcriptions
+  whatsapp render <json_path>          an export as a markdown conversation log
+  whatsapp import-legacy               carry an earlier version's messages.db in, once
+  whatsapp contract                    the message envelope every read emits
 
-Chat and contact IDs
-  DMs    — <number>@s.whatsapp.net  e.g. 15551234567@s.whatsapp.net
-  Groups — <group-id>@g.us
-  LIDs   — <opaque>@lid, the privacy-preserving form group senders arrive as.
-  A bare number, and the <number>@c.us form, are accepted and normalised.
+Writes (each needs a connection that grants writes; exit 4 otherwise)
+  whatsapp send <chat_id> <text>       send one text message
+
+The assistant's profiles, prompts and jobs
+  whatsapp profiles list [<name> ...]  each profile the settings reach, resolved
+  whatsapp profiles import             move the project's profile files into the store
+  whatsapp prompts list                each prompt and the source a turn reads
+  whatsapp prompts show <key>          the text the next turn reads
+  whatsapp prompts put <key>           save a new version, from stdin
+  whatsapp prompts history <key>       every saved version, newest first
+  whatsapp prompts retire <key>        leave the key with no active version
+  whatsapp prompts import              move the project's prompt files into the store
+  whatsapp jobs help                   the job register's verbs, in one list
+  whatsapp jobs list                   jobs in this project, newest first
+  whatsapp jobs active                 only what is waiting or running
+  whatsapp jobs show <id>              one job, staged amendments included
+  whatsapp jobs register <outcome>     write a draft; nothing runs it yet
+  whatsapp jobs submit <id>            hand a draft to the runner
+  whatsapp jobs amend <id> <text>      continue a job with added context
+  whatsapp jobs discard <id>           drop a draft nobody will submit
+  whatsapp jobs stop <id>              stop the work; it keeps its session
+  whatsapp jobs resume <id>            continue a stopped job
+
+Service (the bundled listener `assistant` on one account: live capture, the
+queued sends, and the assistant that answers what its settings admit; `whatsapp
+guide assistant-service`)
+  whatsapp service init                seed the settings records
+  whatsapp service start               start the listener detached
+  whatsapp service run                 run the listener in the foreground
+  whatsapp service stop                stop the listener
+  whatsapp service reload              re-read and validate the settings in it
+  whatsapp service status              state, pid, connected, uptime, last event
+  whatsapp service logs                the tail of the listener's log
+  whatsapp service doctor              settings, store, link and ownership
+  whatsapp service harness             the harness tools the configured turns run on
+The assistant's settings are the contract's `whatsapp settings`, below.
 
 I/O contract
-  Success → stdout: JSON for structured results (doctor, health, --json, the
-  export / transcribe summaries) or a human-readable view for the read and render
-  commands. One message envelope is emitted everywhere a message appears — by
-  `messages --json` and in an export's "messages" array — and
-  `whatsapp contract` prints it, built by the same code that produces it.
-  Failure → a one-line JSON envelope on stderr:
-        {"error": {"code", "message", "hint"?, "status"?}}
-  Progress chatter from pair / export / transcribe goes to stderr; stdout stays
-  clean. Engine and protocol logs are stderr too.
-
-Contract commands (the same on every capability):
-  whatsapp contract                            The message envelope every read
-                                               emits, as a worked example.
-  whatsapp connections                         Where every connection's values
-                                               resolve from (tier, source, secrets
-                                               masked). Local only — no network.
-                                               Each connection carries `session`
-                                               {live, account}: `live` is true when
-                                               the engine's session on this machine
-                                               holds a linked device and the
-                                               service here has not recorded it
-                                               logged out; `account` is the account
-                                               the device is linked as, else the
-                                               connection's recorded identity, else
-                                               its expected_account_id, or null. A
-                                               waha connection's session is held by
-                                               the WAHA server, so `live` is null
-                                               and `reason` is `waha_server`.
-  whatsapp stub                                One-line awareness text.
-  whatsapp manifest --json                     Machine-readable declaration;
-                                               `connections.device_bound` is true:
-                                               a connection is a linked device.
-  whatsapp guide [<topic>]                     Guide topics / one guide body,
-                                               fetched live from the docs base.
-  whatsapp ids list|get <l>|set <l> <v>|rm <l> The project identifiers envelope
-           [--note <text>]                     (capabilities/whatsapp/identifiers.json,
-                                                or store rows once the agent moved).
-  whatsapp refs                                Menu of the project's reference
-                                               files for this capability.
-  whatsapp inventory [--network]               What this capability holds in
-                                               this project (--network adds
-                                               remote detail).
-  whatsapp migrate [status]                    Apply the store's pending steps
-                                               to the whatsapp_* tables;
-                                               `status` reports where they
-                                               stand, without a lock, changing
-                                               nothing.
+Success is JSON on stdout, or a human-readable view for the read and render
+verbs; a failure is one JSON line on stderr, {"error": {"code", "message",
+"hint"?, "status"?}}; progress and engine logs go to stderr. Every read emits
+one message envelope, which `whatsapp help contract` describes. Chat ids are
+<number>@s.whatsapp.net, <group-id>@g.us or <opaque>@lid; a bare number is
+accepted.
 
 Exit codes
   0  success
-  2  auth — missing / rejected credentials, or the session authorises as an
-     account other than the connection's expected_account_id
-  3  not found — the addressed chat, contact, file, or quoted message does
-     not exist
-  4  policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any verb,
-     or a write verb on a read-only connection (allow_write: false). Ask the user;
-     never lift a gate yourself.
-  5  server / network — the engine could not load, the connection failed, a
-     round-trip timed out, an engine event handler failed, the phone did not
-     answer a history request the read needed, a send failed or was not
-     answered in time, or the store could not be reached or answered with an
-     error
-  6  input / validation — a malformed argument or date, an incoherent connection
-     entry, an unsupported operation, or a store that is not configured or whose
-     setting is invalid
-  7  unlinked — no session for this connection, or the device was removed from
-     the account. Re-link with `whatsapp pair`. Also what an empty read reports
-     rather than answering with an absence it never established.
-  8  busy — another invocation holds this session's lock, or the assistant
-     service runs on the account (the message names it). Retry, or stop the
-     service; never work around it, because two clients on one linked device
-     desync the account.
-  9  stalled — `service run` only: the listener made no progress for
-     `defaults.stall_seconds`, or did not stop within 30s of SIGTERM, and
-     left with every thread's stack in its log, for its supervisor to
-     restart it.
+  2  auth — credentials missing or rejected, or a session of another account
+  3  not found — the chat, contact, file, or quoted message does not exist
+  4  policy — the project gate, or a write on a connection that does not grant
+     writes; ask the user, never lift a gate yourself
+  5  server / network — the engine, the connection, the phone, a send, the store
+  6  input / validation — an argument, a connection entry, the store setting
+  7  unlinked — no session, or the device was removed: `whatsapp pair`
+  8  busy — another invocation or the running service holds the session
+  9  stalled — `service run` only, for its supervisor to restart it
+Each verb's page gives its own exit codes in full.
 """
 
 import argparse
@@ -6603,8 +6170,16 @@ def cmd_render(args):
 # a bridge rather than from the engine this CLI carries.
 
 
-def cmd_help(_args):
-    return (__doc__ or "").strip()
+def cmd_help(args):
+    """The menu, or one verb's whole contract. Bare `help` and `help <verb>`
+    are the contract library's; this is reached only after `--connection
+    <id>` / `--session <name>`, and answers the same."""
+    path = list(getattr(args, "path", None) or [])
+    if path:
+        _cmd_help_verb(path)
+    else:
+        _cmd_help()
+    return None
 
 
 def cmd_contract(_args=None) -> dict:
@@ -9476,6 +9051,1142 @@ def cmd_service(args):
     return None
 
 
+# The verb pages `whatsapp help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, connection,
+# setup, settings, manifest, ids, inventory and migrate follow. A text several
+# verbs own is one constant, added to each of their pages.
+_HELP_CONNECTIONS = """
+  Connections
+  Configuration requires explicit named connections. A connection is one WhatsApp
+  identity. A project with several declares them as its own connections, or one
+  machine-level registry serves every project at
+  ~/.config/whatsapp/connections.json; where this project reads them from,
+  "Where connections live", on `whatsapp help connections`, says:
+        {
+          "default": "<id>",
+          "connections": {
+            "<id>": {
+              "engine":              "whatsmeow",
+              "number":              "15551234567",
+              "expected_account_id": "15551234567",
+              "device_name":         "Capability (<host>)",
+              "initial_sync_days":   30,
+              "messages_dir":        "messages",
+              "allow_write":         false
+            }
+          }
+        }
+
+  engine               "whatsmeow" (the default — this CLI's own engine, no
+                       server) or "waha" (a self-hosted WAHA bridge).
+  number               the account's phone number, digits with country code. The
+                       default for `pair`, and what names the account's state
+                       home, so an in-house entry declares it (or pins
+                       expected_account_id) before it can pair.
+  expected_account_id  the account this session must be, and the identity that
+                       names its state home when it is set. `pair` reports the
+                       value to bind; a session belonging to a different account
+                       is then refused rather than silently used.
+  device_name          what the entry is called under Linked Devices on the
+                       phone. Default: "Capability (<this machine>)".
+  initial_sync_days    how far back the one-time pairing burst reaches
+                       (default 30). Depth is separable from reach: a shallow
+                       pairing does not cap what `messages` can later fetch.
+  messages_dir         where `export` writes. Absolute, or relative to the
+                       project's capabilities/whatsapp/ folder.
+
+  A "waha" connection instead carries base_url, session, secret_env,
+  dashboard_user_env / dashboard_pass_env, waha_engine ("GOWS") and tier. An
+  entry carrying base_url is a bridge entry whether or not it names its engine,
+  since only a bridge has an address to reach; `whatsapp connections` reports
+  the resolved engine and where that answer came from. A flag one engine does
+  not take is refused rather than ignored.
+
+  WRITES ARE OFF BY DEFAULT: a WhatsApp message reaches a real person, so `send`
+  exits 4 unless the connection carries an explicit "allow_write": true. No flag
+  lifts the gate; granting it is a deliberate registry edit, made after asking
+  the user.
+
+  Selection: --connection <id> (-c) on every command. Unflagged, the registry's
+  "default" pointer applies, else the sole entry; several entries without a
+  pointer is refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off. pair
+  uses them there too, so a connection declared globally is linked on the
+  machine; every other verb that needs a connection is refused there.
+"""
+
+_HELP_CREDENTIALS = """
+  Credentials
+  Flags win; otherwise a value resolves through the credential cascade
+  (`Where a secret resolves`, on `whatsapp help connections`).
+        DEEPGRAM_API_KEY   only `whatsapp transcribe` reads it. Shared: set once
+                           with `whatsapp setup set`, which stores it, and read
+                           back, as `Where a secret resolves` says.
+  The linked-device session is not a configured secret: it is minted by pairing
+  and lives in the user state home, per account.
+"""
+
+_HELP_STORE = """
+  Store
+  Chats, messages, identities, enrichment and capture provenance live in the
+  project's Postgres database, in whatsapp_* tables keyed by the account,
+  created and migrated on first use. The database is the first that answers
+  for the project: AGENTKIT_DB_* in its .env.local / .env, then the process
+  environment, then the machine's store setting (`capabilities store set`);
+  `capabilities store show` shows which answers. With none, every verb that
+  reads or writes the capture exits 6 store_not_configured; help, contract,
+  connections and the other contract commands still answer. History an
+  earlier version kept in a messages.db file in the state home is not read by
+  any verb until `whatsapp import-legacy` carries it into the store, once.
+"""
+
+_HELP_STATE = """
+  State
+  $XDG_STATE_HOME/whatsapp/<account>/     named for the account, not for the
+                                          connection: a connection can be
+                                          renamed without losing the session
+                                          or the capture
+        session.db     the engine's own — device, keys, contacts, LID map
+        linked-by.json the connection that linked the device, and the project
+                       whose own connection it is (null: the machine's shared
+                       one); `connection add` and `pair` refuse another
+                       connection the same number (exit 6 number_linked,
+                       naming it under `holder`), and another project is given
+                       that connection by a grant
+        raw/           history chunks exactly as received, written before parsing
+        media/         downloaded attachments, keyed by message id
+        lock           held for the duration of any connected verb, and by
+                       the assistant service for its whole life
+        service/       the assistant service's control files on this
+                       machine: owner.json, health.json, daemon.pid,
+                       daemon.log, and capture-spool.jsonl while the store
+                       is unreachable (capture-spool.rejected.jsonl keeps
+                       a spooled capture the store refused for its content)
+"""
+
+_HELP_SERVICE_WHOLE = """
+  Assistant service
+  `whatsapp service ...` runs a bundled long-running listener, `assistant`, on
+  one account. It holds the account's connection for as long as it runs,
+  through the same engine, capture path, account check and store every verb
+  uses, so each message is written to whatsapp_messages as it arrives (sync
+  type LIVE). A dropped connection is re-established with backoff (2s
+  doubling to 60s), and the offline queue drains on each reconnect. A device
+  removed from the phone is final: the service stops reconnecting and says
+  so in `service status` and `service doctor`. It sends the messages `send`
+  queues for its account, oldest first and at most `defaults.send_rate` a
+  minute; a queued row wakes the sender (in-process at once, or within about
+  a second from any other process, through the account's whatsapp_outbox
+  version in the store's change versions, which the listener polls on its
+  own store connection), with a half-second poll behind it. A capture the store cannot take because the store is unreachable is
+  appended to a spool file in the service's state directory and written into
+  the store, in order and once, when it answers again (and at start);
+  `service status` reports the spool depth and the store error. A send a
+  previous run left in flight is failed as interrupted_delivery_unknown at
+  start and never resent.
+  Liveness: a heartbeat thread publishes health every 15s whatever the
+  engine and the dialogue are doing, and a watchdog thread checks that the
+  listener's loop keeps going round and that no engine handler runs on; when
+  either has made no progress for `defaults.stall_seconds` (default 120) the
+  listener writes every thread's stack to its log and leaves with exit 9 for
+  its supervisor to restart. SIGTERM is honoured within 30s even when the
+  loop is blocked (exit 9 when it had to be forced). A `service run` or
+  `service start` that finds the account held by a listener whose health is
+  older than `stall_seconds` ends it (SIGTERM, then SIGKILL after 15s) and
+  takes over; a holder with fresh health is respected (exit 8). Health older
+  than 60s from a live holder is `stale`: `service status` reports it with
+  its age, and `service doctor` - the deploy doctor - fails on it.
+  Dialogue: it answers admitted messages with a dialogue turn. Each live
+  capture passes a gate in this order: its own message (never answered,
+  except what the owner types from the phone in the account's own self-chat),
+  history-sync origin (never), older than `max_age` (dropped), already in the
+  register (dropped), chat allowed, sender allowed (people are named by phone
+  number and matched through the store's phone/LID identities), addressed (a
+  group needs our JID or LID mentioned, a quote of our message, or an alias in
+  the text unless `require_reference` is false; a trailing `#noreply` line
+  opts out everywhere), role, then a control command (/status, /set, /reload,
+  /stop, /help, gated by control roles) or a turn. An admitted message is
+  reserved in whatsapp_register before anything else, so a redelivery or a
+  restart never answers it twice, and nothing before the service's first
+  sight of a chat is answered. A broadcast (status@broadcast, a broadcast
+  list, a channel post) is captured and never judged. The moment a message is
+  admitted for a turn it is marked read and the chat shows the account
+  composing, refreshed until the turn ends and paused when it ends without
+  an answer. Turns run per chat in arrival order after
+  `debounce`, at most `max_parallel_dialogue` at once, through
+  callva-harness-runner on a profile kept in the store, as agentrooms and
+  tasks keep theirs (the project's version, then the global one, then the
+  runner's shipped profiles, then the bundled whatsapp-claude, the default,
+  and whatsapp-codex; see `whatsapp profiles`), fit-checked at start, reload
+  and in `service doctor`, ended at `worker_timeout`. The
+  prompt is the context document, the chat's `context`, the channel state,
+  the request and the last `tail_size` stored messages; the role's
+  `authority` goes to the run as CAPABILITIES_AUTH_CONTEXT. The answer, cut
+  at `=== REPLY ===`, is queued as pending rows (quoting the request in a
+  group, split between paragraphs) and sent by the listener with no pause of
+  its own, as is a job's result; an empty answer is silent. The listener resolves the runner itself (`uv run --with`); the
+  CLI does not carry it.
+  Profiles are saved in the store with `tasks profiles save` (the table is
+  callva-harness-runner's, shared by the family) and taken at start and
+  `service reload`. A project's profile files in
+  capabilities/whatsapp/service/profiles/ are no longer read: while any is
+  there, start and doctor refuse, exit 6 `profiles_not_imported`, until
+  `whatsapp profiles import --apply` moves them into the store.
+  Voice notes: `voice_transcription` (`/set voice-transcription`, else the
+  group's or person's, else `defaults`, else `addressed`) decides which are
+  transcribed before the turn: `off` none; `addressed` every admitted one in
+  a direct chat and, in a group, one that quotes our message; `auto` every
+  one in a group, answered only when its transcript matches an alias. The
+  note is reserved first, fetched through the listener's own connection and
+  sent to Deepgram (DEEPGRAM_API_KEY through the credential cascade); the
+  transcript is stored in whatsapp_enrichment as `transcribe` stores it, and
+  each transcribed note is echoed into the chat before any turn (a direct
+  chat: `Твоё сообщение:` and the quoted transcript; a group: the quoted
+  transcript replying to the note; a failure: `[голосовое — не удалось
+  расшифровать]`). A turn, when one runs, reads `[voice] <transcript>`, or
+  `[voice note - transcription failed: <reason>]`, never retried. The tail
+  shows every stored transcript under its sender and leaves the echoes out.
+  Jobs: a turn whose role's authority reaches `whatsapp jobs` is told how to
+  hand longer work to a job (the `delegation` document) and runs with the
+  bundle's worker shim first on PATH, which fixes the chat, the requester, the
+  origin message and the job profile from the turn's environment and refuses
+  a call that names any of them. Submitting a draft ends the turn: its own
+  short line, or after a grace period the job's description, is the
+  acknowledgement. The listener's job runner claims waiting jobs in arrival
+  order within `defaults.max_parallel_jobs`, each with a slot row, a lease
+  and a fencing token in whatsapp_jobs / whatsapp_job_slots, and runs each
+  through callva-harness-runner on its profile (`defaults.job_profile`,
+  bundled whatsapp-job-claude) with the `job-worker` document as its prompt,
+  recording pid and session at start. An amendment stops the attempt and
+  continues the same session. The result is queued once, as pending rows
+  quoting the message that asked for it. A spent quota stops the job as
+  `quota` and pauses the queue until it lifts; a refused model or any other
+  failure is recorded and reported to the chat. A job whose listener went
+  away is interrupted and, per `defaults.job_recovery`, continued on its
+  session (`requeue`) or stopped and reported (`inspect`); a result not yet
+  delivered is delivered after a restart, once. /status lists the chat's
+  open jobs and /stop stops them with the running turn.
+  Its settings are the project's whatsapp service settings records
+  (capabilities/whatsapp/service/settings.json in files mode): `connection`,
+  `environment`, `assistant_name`, `direct_messages {mode allowlist|anyone|
+  off, default_role}`, `allowed_users {<phone>: {name, role, profile,
+  worker_timeout, context, voice_transcription}}`, `allowed_groups
+  {<jid>@g.us: {name, require_reference, aliases, may_address
+  anyone|allowed_users|[phones], member_role, profile, worker_timeout,
+  context, voice_transcription}}`, `control {roles}`, `authority {default,
+  roles}` and `defaults {tail_size, debounce, max_age, worker_timeout,
+  max_parallel_dialogue, profile, send_rate, max_parallel_jobs, job_profile,
+  job_recovery requeue|inspect, voice_transcription off|addressed|auto,
+  stall_seconds 30..3600}`. A top-level
+  `send_rate` is read as `defaults.send_rate`. Any other key is refused.
+  Settings that admit nobody leave the listener capturing and sending and
+  answering nothing.
+  Activation needs an explicit project enable (`capabilities enable whatsapp
+  --project`) and a configured store. While the service runs, `send` on that
+  account hands its message to the service and returns the service's answer,
+  every other verb that connects on that account exits 8 naming the service,
+  and reads that answer from the store (`status`, `health`, `chats` without
+  --fresh, `messages` the store covers or with --rounds 0) keep working.
+"""
+
+_HELP_CHAT_IDS = """
+  Chat and contact IDs
+  DMs    — <number>@s.whatsapp.net  e.g. 15551234567@s.whatsapp.net
+  Groups — <group-id>@g.us
+  LIDs   — <opaque>@lid, the privacy-preserving form group senders arrive as.
+  A bare number, and the <number>@c.us form, are accepted and normalised.
+"""
+
+_HELP_IO = """
+  I/O contract
+  Success → stdout: JSON for structured results (doctor, health, --json, the
+  export / transcribe summaries) or a human-readable view for the read and render
+  commands. One message envelope is emitted everywhere a message appears — by
+  `messages --json` and in an export's "messages" array — and
+  `whatsapp contract` prints it, built by the same code that produces it.
+  Failure → a one-line JSON envelope on stderr:
+        {"error": {"code", "message", "hint"?, "status"?}}
+  Progress chatter from pair / export / transcribe goes to stderr; stdout stays
+  clean. Engine and protocol logs are stderr too.
+"""
+
+_HELP_EXITS = """
+  Exit codes
+  0  success
+  2  auth — missing / rejected credentials, or the session authorises as an
+     account other than the connection's expected_account_id
+  3  not found — the addressed chat, contact, file, or quoted message does
+     not exist
+  4  policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any verb,
+     or a write verb on a read-only connection (allow_write: false). Ask the user;
+     never lift a gate yourself.
+  5  server / network — the engine could not load, the connection failed, a
+     round-trip timed out, an engine event handler failed, the phone did not
+     answer a history request the read needed, a send failed or was not
+     answered in time, or the store could not be reached or answered with an
+     error
+  6  input / validation — a malformed argument or date, an incoherent connection
+     entry, an unsupported operation, or a store that is not configured or whose
+     setting is invalid
+  7  unlinked — no session for this connection, or the device was removed from
+     the account. Re-link with `whatsapp pair`. Also what an empty read reports
+     rather than answering with an absence it never established.
+  8  busy — another invocation holds this session's lock, or the assistant
+     service runs on the account (the message names it). Retry, or stop the
+     service; never work around it, because two clients on one linked device
+     desync the account.
+  9  stalled — `service run` only: the listener made no progress for
+     `defaults.stall_seconds`, or did not stop within 30s of SIGTERM, and
+     left with every thread's stack in its log, for its supervisor to
+     restart it.
+"""
+_HELP_SELECT = """
+  Connection: --connection <id> (-c), before or after the verb, selects it;
+  else the registry's "default" pointer, else the sole entry; several entries
+  without a pointer is refused as ambiguous (`whatsapp help connections`).
+  --session <name> overrides a WAHA connection's session name (no effect on
+  the in-house engine, whose session is the linked device). A flag the
+  selected connection's engine does not take is refused (exit 6), never
+  ignored.
+"""
+_HELP_SERVICE = """
+  The bundled listener, `assistant`, on one account: the connection
+  --connection <id> (-c) names, else the settings' `connection`, else the
+  registry's default; only an in-house (whatsmeow) connection can be held
+  (exit 6 service_engine_unsupported). --session <name> is accepted and has
+  no effect on it. Its settings are `whatsapp settings` (`whatsapp help
+  settings`). What it does while it runs is on `whatsapp help service run`;
+  `whatsapp guide assistant-service` is the guide.
+"""
+_HELP_PROMPTS = """
+  The prompts are the service's: context (the dialogue's), delegation (what a
+  turn is told about handing work to a job) and job-worker (the whole of a
+  job's prompt). Each is read from the store (the agent's active version),
+  else a file (a project not yet moved), else the bundle (the standard text it
+  ships). <key> is one of context, delegation, job-worker. They are the
+  agent's, not an account's: the selection flags are accepted on the
+  `prompts` word and not used, and they need a project and its store.
+
+  Exit codes: 0; 4 put, retire and import --apply under the read-only switch,
+  or the project gate; 5 the store unreachable; 6 no project, a key that is
+  not a prompt, an empty body on stdin (empty_prompt), a --base that is not
+  the active version (base_mismatch), a file that differs from the version
+  the store already holds (prompts_import_refused), or the store not
+  configured.
+"""
+_HELP_PROFILES = """
+  A profile is the harness (claude or codex), model and settings a turn or a
+  job runs on, kept in the store with `tasks profiles save` (the table is
+  callva-harness-runner's, shared by the family): the project's version, then
+  the global one, then the runner's shipped profiles, then the bundled
+  whatsapp-claude (the default), whatsapp-codex and whatsapp-job-claude. Both
+  verbs run on the harness runner, resolved with `uv run --with` when it is
+  not in process. The selection flags are accepted on the `profiles` word and
+  not used.
+
+  Exit codes: 0; 4 import --apply under the read-only switch, or the project
+  gate; 5 the store unreachable; 6 no project, the store not configured, or a
+  file that cannot be read or differs from the version the project already
+  holds (profiles_import_refused, conflict).
+"""
+_HELP_JOBS = """
+  The jobs are the register of work that outlives a conversation. A job runs
+  in arrival order within defaults.max_parallel_jobs, on the profile named by
+  defaults.job_profile, and answers into the chat it was registered from,
+  quoting the message that asked for it. States: draft, waiting, running,
+  stopped; a stopped job's outcome is succeeded, failed, cancelled,
+  interrupted, quota or model_refused. Outside a worker, --chat <chat_id>
+  narrows to one chat and register takes --chat and --requested-by. A worker
+  the service started is held to the chat, requester and origin message it
+  was started for (exit 4 job_scope_denied otherwise). Every jobs verb but
+  help takes --chat <chat_id>, --connection <id> (-c) and --session <name>.
+
+  Exit codes: 0; 2 job_not_found for an id not in this project's register; 4
+  job_scope_denied or job_scope_missing, or the project gate; 5 the store
+  unreachable; 6 no project, the store not configured, or the register's
+  refusal named by its code.
+"""
+HELP_VERBS = {
+    "doctor": """\
+  For whatsapp: readiness, per connection - the engine loads, a session
+  exists, it authorises, and the account matches the binding
+  (expected_account_id). It connects, so it also drains whatever the server
+  held for the device while nothing was connected. Every connection bare; one
+  with --connection <id> (-c); --session <name> overrides a WAHA connection's
+  session name. Outside any project it is a machine read: it uses the
+  machine's own connections read-only, unless a grant switched one off.
+
+  Output: {"ok", "connections": {<id>: {"ok": true, "engine", "mode",
+  "linked", "account", "drained", "captured", "store"[, "warnings",
+  "identity_binding"]} or {"ok": false, "category", "error"[, "hint"]}}}. The
+  exit code is the first failing connection's category.
+""" + _HELP_EXITS + """
+  Examples:
+    whatsapp doctor
+    whatsapp doctor --connection <id>
+""",
+    "connections": """\
+  For whatsapp: each connection also carries `session` {live, account}:
+  `live` is true when the engine's session on this machine holds a linked
+  device and the service here has not recorded it logged out; `account` is
+  the account the device is linked as, else the connection's recorded
+  identity, else its expected_account_id, or null. A waha connection's
+  session is held by the WAHA server, so `live` is null and `reason` is
+  `waha_server`. Outside any project it is a machine read of the machine's
+  own connections.
+""" + _HELP_CONNECTIONS + _HELP_CREDENTIALS + """
+  Example: whatsapp connections
+""",
+    "connection": """\
+  For whatsapp: `connection add` refuses an add that names an account (its
+  number or expected_account_id) another connection already links on this
+  machine, exit 6 number_linked, naming that connection under `holder`; one
+  account is reached through one connection, and another project is given
+  that connection by a grant. `whatsapp pair` links a connection once it is
+  added, or under its events form adds the account it links.
+""" + _HELP_CONNECTIONS + _HELP_STATE + """
+  Example: whatsapp connection add <id> --field number=15551234567
+""",
+    "setup": """\
+  For whatsapp:
+""" + _HELP_CREDENTIALS + """
+  Example: whatsapp setup set --stdin < deepgram.json
+""",
+    "settings": """\
+  For whatsapp these are the assistant service's settings: the project's
+  whatsapp service settings records (capabilities/whatsapp/service/
+  settings.json in files mode): `connection`, `environment`,
+  `assistant_name`, `direct_messages {mode allowlist|anyone|off,
+  default_role}`, `allowed_users {<phone>: {name, role, profile,
+  worker_timeout, context, voice_transcription}}`, `allowed_groups
+  {<jid>@g.us: {name, require_reference, aliases, may_address
+  anyone|allowed_users|[phones], member_role, profile, worker_timeout,
+  context, voice_transcription}}`, `control {roles}`, `authority {default,
+  roles}` and `defaults {tail_size, debounce, max_age, worker_timeout,
+  max_parallel_dialogue, profile, send_rate, max_parallel_jobs, job_profile,
+  job_recovery requeue|inspect, voice_transcription off|addressed|auto,
+  stall_seconds 30..3600}`. A top-level `send_rate` is read as
+  `defaults.send_rate`. Any other key is refused. Settings that admit nobody
+  leave the listener capturing and sending and answering nothing. `whatsapp
+  service init` seeds them, and `whatsapp service reload` makes a running
+  listener take them (`whatsapp guide assistant-service`).
+
+  Example: whatsapp settings get defaults.send_rate
+""",
+    "manifest": """\
+  For whatsapp the declaration also carries `service`, the bundled assistant
+  service, and `connections.device_bound` is true: a connection is a linked
+  device, not a portable value.
+
+  Example: whatsapp manifest --json
+""",
+    "ids": """\
+  For whatsapp the identifiers are kept in capabilities/whatsapp/
+  identifiers.json, or as store rows once the agent moved.
+
+  Example: whatsapp ids set <label> <value> --note "<what it is>"
+""",
+    "inventory": """\
+  For whatsapp: the assistant service's state on this machine, as `service
+  status` reads it, and `service doctor`'s verdict from this machine alone,
+  its first failing check named; outside a project, or where no connection
+  can be selected, the service is "not configured" and says why. What the
+  account keeps on this machine:
+""" + _HELP_STATE + """
+  Example: whatsapp inventory
+""",
+    "migrate": """\
+  For whatsapp: apply the store's pending steps to the whatsapp_* tables;
+  `status` reports where they stand, without a lock, changing nothing.
+  `migrate files` moves the project's profile files into the store, as
+  `whatsapp profiles import` does, for `capabilities migrate`.
+""" + _HELP_STORE + """
+  Example: whatsapp migrate status
+""",
+    "contract": """\
+whatsapp contract [--connection <id>] [--session <name>]
+
+  A valid example of the message envelope every read emits - the shape, not
+  live data - built by the same function the reads and the export go
+  through, so the published shape cannot drift from what they actually
+  produce. No account, no store, and no network; the selection flags are
+  accepted and not used.
+""" + _HELP_IO + """
+  Output: one JSON object on stdout. Exit codes: 0; 4 policy, the project
+  gate.
+
+  Example: whatsapp contract
+""",
+    "status": """\
+whatsapp status [--connection <id>] [--session <name>]
+
+  A human-readable account / session / store view of one connection: the
+  connection and its mode and engine, whether a device is linked, the
+  account, what it is bound to, the store's chats and messages, its span,
+  the capture's chunks and last capture, and where the store is. Reads the
+  session file and the store; a WAHA connection asks its server.
+
+  Output: plain text on stdout.
+""" + _HELP_SELECT + _HELP_STORE + _HELP_EXITS + """
+  Example: whatsapp status
+""",
+    "health": """\
+whatsapp health [--connection <id>] [--session <name>]
+
+  Store readiness - what the capture holds per chat, its span, and what is
+  missing. Reads the store only; answers "is there anything to consume?"
+  without connecting to WhatsApp. An empty store is a fact about the
+  capture, reported with a hint, not a fault.
+
+  Output: {"ready", "profile", "mode", "engine", "account": {"id", "jid",
+  "name"}, "store": {...}, "checks": [{"item", "ok", "detail"}][, "hint"]},
+  the checks being session, binding, store, capture, media, readability and
+  rebuild. The report is printed before a refusal: exit 7 not_linked with no
+  linked device, exit 2 account_identity_mismatch when the session belongs
+  to another account than expected_account_id.
+""" + _HELP_SELECT + _HELP_STORE + _HELP_EXITS + """
+  Example: whatsapp health
+""",
+    "pair": """\
+whatsapp pair [--number DIGITS] [--qr] [--days N] [--full] [--hold SECONDS]
+              [--wait] [--recreate --yes] [--events]
+              [--connection <id>] [--session <name>]
+
+  Link this machine as a companion device. Prints an XXXX-XXXX code to enter
+  on the phone (Settings → Linked Devices → Link a Device → "Link with phone
+  number"); --qr paints a scannable QR code on the progress stream instead,
+  repainting it whenever the reference expires. The symbol is wide - it says
+  so when the terminal is too narrow to hold it.
+
+  Either way the invocation holds the socket the code was minted on until the
+  phone completes the link - a link cannot complete against a client that has
+  exited - and then holds it further to capture the one-time history burst,
+  which arrives once and is not repeated on reconnect.
+
+  --events drives it with no terminal: JSON lines on stdout instead of the
+  painted symbol (qr, each new reference as it arrives; pairing_code;
+  phone_needed, when no number is known, answered by one line on stdin;
+  linked; progress; done; error). A connection that names no account yet is
+  linked all the same, and the account the link answers for is written to it
+  as expected_account_id (`identity_bound` in the result). A first link under
+  --events that fails or is cancelled (SIGTERM, SIGINT, SIGHUP) removes the
+  connection and the state it made. `whatsapp help connection` names the
+  two linking methods, under "Linking a connection".
+
+  --number DIGITS  account phone number incl. country code (default: the
+                   connection's `number`); digits, `+`/spaces stripped
+  --qr             paint a scannable QR code instead of requesting a pairing
+                   code
+  --days N         the burst window (default: the connection's
+                   initial_sync_days, else 30)
+  --full           ask for everything the phone still holds, not a window
+  --hold SECONDS   cap how long the burst is waited for (default """ + str(PAIR_HOLD_DEFAULT) + """s) -
+                   it arrives once, so a large account wants a larger value
+  --recreate --yes discard the session that already exists and link again;
+                   --recreate alone is refused (exit 6 confirm_recreate)
+  --wait           the WAHA form: poll until the session is WORKING
+  --events         speak JSON lines on stdout (qr, pairing_code, phone_needed,
+                   linked, progress, done, error) and read the phone number
+                   from stdin when asked
+  --days, --full and --hold are the in-house engine's, --wait the WAHA
+  bridge's; the other engine refuses them.
+
+  Pairing changes the account but is not a write verb: a connection that may
+  not send is paired all the same to be read, so only the read-only switch
+  refuses it (exit 4). Outside any project it uses the machine's
+  connections, so a connection declared globally is linked on the machine.
+  It refuses a number another connection links on this machine (exit 6
+  number_linked, naming it under `holder`), a connection that already has a
+  linked device (exit 6 already_paired) and pairing by code with no number
+  (exit 6 no_number).
+
+  Output: {"ok", "connection", "method": "qr"|"pairing_code", "account",
+  "sync_window", "captured": {"chunks", "chats", "messages"}, "store"[,
+  "identity_bound" | "identity_binding", "handler_errors"]}; progress, the
+  code and the painted symbol go to stderr. Exit 7 never_linked when the
+  phone did not complete the link before the request expired; exit 5
+  engine_handler_failed after the result when a handler failed during the
+  burst.
+""" + _HELP_SELECT + _HELP_STATE + _HELP_EXITS + """
+  Examples:
+    whatsapp pair --number 15551234567
+    whatsapp pair --qr --hold 600
+""",
+    "chats": """\
+whatsapp chats [--search TERM] [--limit N] [--fresh] [--json]
+               [--connection <id>] [--session <name>]
+
+  List chats from the store, most recent first.
+
+  --search TERM, -s TERM  filter chats by name or id (case-insensitive)
+  --limit N, -n N         max chats to show
+  --fresh                 connect first, so the server's queue is drained
+                          before answering (in-house engine)
+  --json                  emit JSON instead of a table
+
+  Output: a markdown table, or with --json a list of {"id", "name", "group",
+  "unread", "last_activity", "messages", "oldest"}. An empty answer from an
+  unlinked connection exits 7 rather than reporting an absence.
+""" + _HELP_SELECT + _HELP_CHAT_IDS + _HELP_STORE + _HELP_EXITS + """
+  Example: whatsapp chats --search family --json
+""",
+    "messages": """\
+whatsapp messages <chat_id> [--limit N] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
+                            [--rounds N] [--fresh]
+                            [--format conversation|table] [--json]
+                            [--connection <id>] [--session <name>]
+
+  Read a chat. Answers from the store, and reaches back to the phone when the
+  store cannot cover the request - depth is a parameter of reading, not a
+  separate verb. Each round asks the phone for """ + str(HISTORY_PAGE) + """ older messages and
+  takes about 4 seconds; --rounds caps them. The phone must be online to
+  answer; its absence is reported as itself. While the assistant service
+  runs on the account, a read the store covers, or with --rounds 0, keeps
+  working.
+
+  <chat_id>                 the chat (see Chat and contact IDs below)
+  --limit N, -n N           how many messages to return (default 50)
+  --from YYYY-MM-DD         start date
+  --to YYYY-MM-DD           end date, inclusive
+  --rounds N                cap on history requests when the store cannot
+                            cover the window (default """ + str(DEFAULT_ROUNDS) + """; 0 answers
+                            from the store alone)
+  --fresh                   connect even when the store already covers the
+                            request
+  --format, -f              conversation (default) or table
+  --json                    emit the message envelopes as JSON
+
+  Output: a conversation log or a markdown table, or with --json the list
+  of message envelopes (`whatsapp help contract`). Exit 3 unknown_chat for a
+  chat the store does not hold; 7 for an unlinked connection with nothing
+  stored.
+""" + _HELP_SELECT + _HELP_CHAT_IDS + _HELP_STORE + _HELP_EXITS + """
+  Example: whatsapp messages 15551234567 --from 2026-01-01 --json
+""",
+    "contact": """\
+whatsapp contact <contact_id> [--fresh] [--json]
+                 [--connection <id>] [--session <name>]
+
+  Show a contact's name, number, and both identity forms (phone JID and LID).
+
+  <contact_id>  the contact (see Chat and contact IDs below)
+  --fresh       ask the engine to resolve an unknown identity
+  --json        emit JSON instead of a table
+
+  Output: a short text view, or with --json {"id", "lid", "name", "number",
+  "group", "messages", "last_activity"}. Exit 3 unknown_contact when the
+  store holds nothing for it.
+""" + _HELP_SELECT + _HELP_CHAT_IDS + _HELP_STORE + _HELP_EXITS + """
+  Example: whatsapp contact 15551234567 --json
+""",
+    "export": """\
+whatsapp export <chat_id> [--out PATH] [--media-dir PATH] [--limit N]
+                          [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--rounds N]
+                          [--page-size N] [--max-pages N] [--no-photos]
+                          [--no-stickers] [--videos] [--documents]
+                          [--connection <id>] [--session <name>]
+
+  Render a chat from the store into messages.json + media/. Idempotent -
+  re-runs preserve transcriptions and skip already-downloaded media. Without
+  --out, writes to the connection's messages_dir
+  (<messages_dir>/<slug>/messages.json). Media leaves WhatsApp's CDN while
+  the keys stay valid, so what can no longer be fetched is recorded as lost
+  rather than omitted or retried forever.
+
+  <chat_id>          the chat (see Chat and contact IDs below)
+  --out PATH         output JSON path (default: the connection's
+                     messages_dir → <messages_dir>/<slug>/messages.json)
+  --media-dir PATH   media output dir (default: <out>/../media)
+  --limit N, -n N    cap on messages exported (default: everything held for
+                     the chat)
+  --from YYYY-MM-DD  start date
+  --to YYYY-MM-DD    end date
+  --rounds N         cap on history requests when the store cannot cover the
+                     window (default """ + str(DEFAULT_ROUNDS) + """; 0 exports the store alone)
+  --page-size N      WAHA connections: messages per page (default """ + str(PAGE_SIZE_DEFAULT) + """)
+  --max-pages N      WAHA connections: cap on pages fetched
+  --no-photos        skip photo downloads (default: download photos)
+  --no-stickers      skip sticker downloads (default: download stickers)
+  --videos           also download videos
+  --documents        also download documents
+  --page-size / --max-pages page a WAHA connection instead; a WAHA
+  connection refuses --limit, --from, --to and --rounds.
+
+  Output: {"ok", "chat", "out", "media_dir", "message_count",
+  "carried_over", "media"[, "reach"]}; progress goes to stderr. Exit 3
+  unknown_chat; 6 no_output_path with no --out and no messages_dir.
+""" + _HELP_SELECT + _HELP_CHAT_IDS + _HELP_IO + _HELP_STORE + _HELP_EXITS + """
+  Example: whatsapp export <group-id>@g.us --out exports/team/messages.json
+""",
+    "transcribe": """\
+whatsapp transcribe <json_path> [--force] [--model """ + DEEPGRAM_MODEL + """]
+                    [--connection <id>]
+
+  Fill transcription placeholders for voice/audio messages in an exported
+  JSON using Deepgram (requires DEEPGRAM_API_KEY). Results are also kept in
+  the store, so a later export carries them without redoing the work.
+
+  <json_path>  path to a messages.json produced by `whatsapp export`
+  --force      re-transcribe even if already filled
+  --model M    Deepgram model (default: """ + DEEPGRAM_MODEL + """)
+  --connection <id>, -c  the connection whose store keeps the transcripts
+               (default: the registry's default, else the sole entry); an
+               export from another connection, or a WAHA one, is not stored
+""" + _HELP_CREDENTIALS + """
+  Output: {"ok", "transcribed", "failed", "file"}; "ok" is false when any
+  file failed; progress goes to stderr.
+
+  Exit codes: 0, also when a file failed (counted under "failed"); 2
+  missing_deepgram_key; 3 file_not_found; 4 policy; 5 the store unreachable;
+  6 bad_export_json.
+
+  Example: whatsapp transcribe messages/team/messages.json
+""",
+    "render": """\
+whatsapp render <json_path> [--out PATH]
+
+  Pretty-print an exported messages.json as a markdown conversation log (date
+  headers, sender names, voice transcriptions inlined). stdout by default;
+  --out writes a file.
+
+  <json_path>  path to a messages.json produced by `whatsapp export`
+  --out PATH   write to a file instead of stdout
+  The selection flags (--connection, --session) are accepted and not used.
+
+  Output: the markdown on stdout, or nothing on stdout with --out (the path
+  goes to stderr). Exit codes: 0; 3 file_not_found; 4 policy; 6
+  bad_export_json.
+
+  Example: whatsapp render messages/team/messages.json --out team.md
+""",
+    "import-legacy": """\
+whatsapp import-legacy [--file PATH] [--connection <id>] [--session <name>]
+
+  Import, once, the history an earlier version kept in messages.db in the
+  account's state home: chats, messages, identities, enrichment, chunk
+  records and meta. Reads the file read-only and leaves it as it is. Rows the
+  store already holds win; identities and enrichment fill what the store
+  lacks. A second run imports nothing. In-house connections only (exit 6
+  flag_not_supported for a WAHA one).
+
+  --file PATH  the legacy store to read (default: messages.db in the
+               account's state home)
+
+  Output: {"ok", "connection", "account", "file", "legacy": {<table>: n},
+  "imported": {<table>: n}, "store"[, "warnings"]}. Exit 3 when there is no
+  file (legacy_store_not_found), 6 when it is not a legacy store
+  (legacy_store_unreadable), 2 when it belongs to another account
+  (store_account_mismatch).
+""" + _HELP_SELECT + _HELP_STORE + _HELP_EXITS + """
+  Example: whatsapp import-legacy
+""",
+    "send": """\
+whatsapp send <chat_id> <text> [--reply-to MESSAGE_ID] [--mention PHONE]...
+              [--typing] [--connection <id>] [--session <name>]
+
+  Send one text message. Write-enabled connections only: `send` exits 4
+  unless the connection carries allow_write, before anything is written. No
+  flag lifts the gate; granting it is a deliberate registry edit, made after
+  asking the user.
+
+  The message is first a pending row in the store. With the assistant service
+  running on the account the service sends it and `send` waits up to 60s for
+  its answer; otherwise `send` connects and sends it. Reports the id the
+  account minted, which is what a later read carries, with local_id (the
+  row's internal id), delivery and sent_by (service or direct). A failed send
+  exits 5 send_failed; no answer in time exits 5 send_pending naming the
+  local id, and the row is still sent when the service can, so sending again
+  sends twice.
+
+  <chat_id>               the recipient chat (see Chat and contact IDs below)
+  <text>                  the message text
+  --reply-to MESSAGE_ID   quote a message of the same chat the store holds
+                          (exit 3 otherwise)
+  --mention PHONE         mention a number, repeatable; its @number leads the
+                          text unless the text carries it
+  --typing                show composing for 1.5-3.5s, then paused, before
+                          sending
+  --reply-to, --mention and --typing are the in-house engine's.
+
+  What goes out is an ordinary message, carrying no machine marking of any
+  kind, so saying who is writing is the sender's job and belongs in the text.
+
+  Output: {"ok": true, "connection", "chat", "message_id", "timestamp",
+  "date", "length", "local_id", "delivery", "sent_by"}.
+""" + _HELP_SELECT + _HELP_CHAT_IDS + _HELP_STORE + _HELP_EXITS + """
+  Example: whatsapp send 15551234567@s.whatsapp.net "On my way"
+""",
+    "profiles list": """\
+whatsapp profiles list [NAME ...]
+
+  Each profile the service settings reach (or each NAME) as it resolves from
+  this project: its layer (project, global, shipped, capability), stored
+  version, harness, model, and whether it fits, with the positions of the
+  settings that name it.
+
+  Output: {"ok": <every profile fits>, "project", "profiles": [{"name", ...,
+  "ok", "positions"}]}.
+""" + _HELP_PROFILES + """
+  Example: whatsapp profiles list whatsapp-claude
+""",
+    "profiles import": """\
+whatsapp profiles import [--apply]
+
+  Move this project's profile files from capabilities/whatsapp/service/
+  profiles/ into the store at its scope, all or none. A project's profile
+  files there are no longer read: while any is there, `service start` and
+  `service doctor` refuse, exit 6 profiles_not_imported, until this moves
+  them.
+
+  --apply  save them and remove the files (default: say what it would do)
+
+  Output: {"project", "apply", "files"[, "next"]}, or with --apply
+  {"project", "project_id", "apply": true, "imported", "removed"}. Exit 6
+  naming a file that cannot be read or differs from the version the project
+  already holds.
+""" + _HELP_PROFILES + """
+  Example: whatsapp profiles import --apply
+""",
+    "prompts list": """\
+whatsapp prompts list
+
+  Each prompt with the source the next turn reads it from: store, file or
+  bundle.
+
+  Output: {"project", "agent_id", "prompts": [{"key", "source", "version"?,
+  "chars", ...}]}.
+""" + _HELP_PROMPTS + """
+  Example: whatsapp prompts list
+""",
+    "prompts show": """\
+whatsapp prompts show <key>
+
+  The text the next turn reads, and its source and version.
+
+  Output: {"key", "body", "source"[, "version"]}.
+""" + _HELP_PROMPTS + """
+  Example: whatsapp prompts show context
+""",
+    "prompts put": """\
+whatsapp prompts put <key> [--base ID] [--note TEXT] < prompt.md
+
+  Save a new version from stdin; the one it replaces stays in history. Read
+  every turn: no restart.
+
+  --base ID    the version you read (its id or six or more of its first
+               characters); refuses the save (exit 6 base_mismatch) when
+               another was saved since
+  --note TEXT  why this version was saved
+
+  Output: {"key", "version", "replaced", "created_at"}.
+""" + _HELP_PROMPTS + """
+  Example: whatsapp prompts put context --base <id> < context.md
+""",
+    "prompts history": """\
+whatsapp prompts history <key>
+
+  Every saved version, newest first.
+
+  Output: {"key", "versions": [{"id", "active", "chars", "created_at",
+  "created_by", "note"}]}.
+""" + _HELP_PROMPTS + """
+  Example: whatsapp prompts history delegation
+""",
+    "prompts retire": """\
+whatsapp prompts retire <key>
+
+  Leave the key with no active version; deletes nothing. The next turn reads
+  the file or the bundle's standard text.
+
+  Output: {"key", "retired": <the version retired, or null>, "now"}.
+""" + _HELP_PROMPTS + """
+  Example: whatsapp prompts retire job-worker
+""",
+    "prompts import": """\
+whatsapp prompts import [--apply]
+
+  Move this project's prompt files from capabilities/whatsapp/service/ into
+  the store, their text byte for byte, all or none.
+
+  --apply  save them and remove the files (default: say what it would do)
+
+  Output: {"project", "agent_id", "apply": false, "prompts", "next"}, or with
+  --apply {"project", "agent_id", "apply": true, "imported", "held",
+  "removed"}. Exit 6 naming a file that differs from the version the store
+  already holds.
+""" + _HELP_PROMPTS + """
+  Example: whatsapp prompts import --apply
+""",
+    "jobs help": """\
+whatsapp jobs help
+
+  The job register's verbs, as one plain-text list: list, active, show,
+  register, submit, amend, discard, stop, resume. Exit code 0.
+
+  Example: whatsapp jobs help
+""",
+    "jobs list": """\
+whatsapp jobs list [--state S] [--outcome O] [--limit N] [--chat ID]
+
+  Jobs in this project, newest first.
+
+  --state S    draft, waiting, running or stopped
+  --outcome O  succeeded, failed, cancelled, interrupted, quota or
+               model_refused
+  --limit N    at most N (default 50)
+
+  Output: {"environment", "account", "chat_id", "counts", "slots_in_use",
+  "jobs": [...]}.
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs list --state running
+""",
+    "jobs active": """\
+whatsapp jobs active [--limit N] [--chat ID]
+
+  Only what is waiting or running.
+
+  --limit N  at most N (default 50)
+
+  Output: as `jobs list`.
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs active
+""",
+    "jobs show": """\
+whatsapp jobs show <id> [--chat ID]
+
+  One job, staged amendments included.
+
+  Output: the job, with "pending_amendment".
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs show <id>
+""",
+    "jobs register": """\
+whatsapp jobs register "<one-line outcome>" [--chat ID] [--requested-by PHONE]
+                       [--origin-message-id ID] [--profile NAME]
+
+  Write a draft; nothing runs it yet.
+
+  <outcome>               one line: the outcome, in the requester's terms
+  --chat ID               the chat it reports into (exit 6 no_chat without)
+  --requested-by PHONE    the phone number whose authority the job carries
+                          (exit 6 no_requester without)
+  --origin-message-id ID  the message the job answers, quoted with its result
+  --profile NAME          the job profile (default: defaults.job_profile)
+  A worker the service started has the chat, requester, origin message and
+  profile fixed from its environment.
+
+  Output: the job, with "next" saying how to submit it.
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs register "the March invoices, totalled" --chat <chat_id> --requested-by 15551234567
+""",
+    "jobs submit": """\
+whatsapp jobs submit <id> --confirm-active-jobs-checked [--chat ID]
+
+  Hand a draft to the runner.
+
+  --confirm-active-jobs-checked  you read `jobs active` and this outcome is
+                                 not there (exit 6 active_jobs_unconfirmed
+                                 without it)
+
+  Output: the job.
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs submit <id> --confirm-active-jobs-checked
+""",
+    "jobs amend": """\
+whatsapp jobs amend <id> "<what changed>" [--chat ID]
+
+  Continue a job with added context, keeping its session: the amendment is
+  staged and the attempt stops and continues the same session.
+
+  Output: {"id", "amendment": "staged", "pending_amendment", "instruction"}.
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs amend <id> "only the paid ones"
+""",
+    "jobs discard": """\
+whatsapp jobs discard <id> [--chat ID]
+
+  Drop a draft nobody will submit; work that has started is stopped instead
+  (exit 6 job_not_a_draft).
+
+  Output: {"id", "discarded": true, "description"}.
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs discard <id>
+""",
+    "jobs stop": """\
+whatsapp jobs stop <id> [--chat ID]
+
+  Stop the work; it keeps its session and its place. Exit 6 job_not_running
+  when there is nothing to stop.
+
+  Output: {"id", "stopping": true, "instruction"}.
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs stop <id>
+""",
+    "jobs resume": """\
+whatsapp jobs resume <id> [--chat ID]
+
+  Continue a stopped job.
+
+  Output: the job.
+""" + _HELP_JOBS + """
+  Example: whatsapp jobs resume <id>
+""",
+    "service init": """\
+whatsapp service init [--force] [--connection <id>]
+
+  Seed the settings records, and in files mode the prompts where the project
+  has none. Settings already written are kept unless --force.
+
+  --force  reseed settings that already exist
+
+  Output: {"initialized", "project", "written", "skipped", "settings"[,
+  "next"]}.
+
+  Exit codes: 0; 3 service_bundle_missing; 4 the project gate; 6
+  service_settings_invalid, or a connection it cannot select.
+""" + _HELP_SERVICE + """
+  Example: whatsapp service init
+""",
+    "service start": """\
+whatsapp service start [--connection <id>]
+
+  Start the listener detached; returns once it holds the account (taking it
+  over from a stale holder: one whose health is older than
+  `defaults.stall_seconds`).
+
+  Output: what `service status` reports, with "started": true[,
+  "took_over_from"].
+
+  Exit codes: 0; 4 the project gate; 5 service_start_failed when it exited or
+  did not prove ownership in time; 6 service_settings_invalid,
+  profiles_not_imported, service_profile_invalid, or a connection it cannot
+  select; 8 service_running (a listener with fresh health holds the account)
+  or session_busy.
+""" + _HELP_SERVICE + _HELP_SERVICE_WHOLE + """
+  Example: whatsapp service start
+""",
+    "service run": """\
+whatsapp service run [--connection <id>]
+
+  Run the listener in the foreground (the deploy command). Exit 9 when it
+  stalled.
+
+  Exit codes: 0 stopped; 2 the session belongs to another account; 4 the
+  project gate; 5 the store or the connection failed; 6 the settings or a
+  profile refused, or a connection it cannot select; 7 the device is not
+  linked or was removed; 8 a listener with fresh health, or another
+  invocation, holds the account; 9 stalled.
+""" + _HELP_SERVICE + _HELP_SERVICE_WHOLE + _HELP_STATE + """
+  Example: whatsapp service run
+""",
+    "service stop": """\
+whatsapp service stop [--connection <id>] [--timeout S] [--force]
+
+  Stop the listener: SIGTERM, then wait for it to leave.
+
+  --timeout S  seconds to wait (default """ + f"{SERVICE_STOP_TIMEOUT:g}" + """)
+  --force      kill it when it does not stop within the timeout
+
+  Output: {"stopped", "running", "connection", "pid"[, "lock_free",
+  "killed"]}; "stopped": false when none was running.
+
+  Exit codes: 0; 5 service_stop_timeout; 6 service_stop_failed, or a
+  connection it cannot select.
+""" + _HELP_SERVICE + """
+  Example: whatsapp service stop
+""",
+    "service reload": """\
+whatsapp service reload [--connection <id>] [--timeout S]
+
+  Re-read and validate the settings in the running listener, without
+  reconnecting; a refused reload leaves the previous ones in force.
+
+  --timeout S  seconds to wait for the listener's acknowledgement (default 10)
+
+  Output: {"reloaded": true, "pid", "connection", "settings_generation",
+  "settings_reloaded_at", "environment"}.
+
+  Exit codes: 0; 5 service_not_running, or service_reload_timeout; 6
+  service_reload_refused, service_settings_invalid, or a connection it cannot
+  select.
+""" + _HELP_SERVICE + """
+  Example: whatsapp service reload
+""",
+    "service status": """\
+whatsapp service status [--connection <id>]
+
+  State, pid, connected, uptime, last event. Health older than 60s from a
+  live holder is `stale`, reported with its age; a device removed from the
+  phone is `logged_out`.
+
+  Output: {"initialized", "running", "state", "healthy", "pid",
+  "connected", "uptime_seconds", "started_at", "last_event_at",
+  "last_message_at", "messages_captured", "messages_sent", "send_failures",
+  "send_rate", "dialogue", "spool_depth", "store_error", "reconnects",
+  "last_error", "environment", "connection", "account", "project",
+  "owner_project", "health_age_seconds", "stale_after_seconds", ...}.
+
+  Exit codes: 0; 6 a connection it cannot select.
+""" + _HELP_SERVICE + """
+  Example: whatsapp service status
+""",
+    "service logs": """\
+whatsapp service logs [--connection <id>] [--tail N]
+
+  The tail of the listener's log.
+
+  --tail N  the last N lines (default 50)
+
+  Output: {"connection", "log_file", "lines"}.
+
+  Exit codes: 0; 3 logs_not_found when there is no log yet; 6 a connection
+  it cannot select.
+""" + _HELP_SERVICE + """
+  Example: whatsapp service logs --tail 200
+""",
+    "service doctor": """\
+whatsapp service doctor [--connection <id>]
+
+  Settings, store, link and ownership: the deploy doctor. It fails on a
+  stale holder, on a device removed from the phone, and on profile files not
+  yet imported (profiles_not_imported); the profiles are fit-checked and
+  each prompt's source named.
+
+  Output: {"ok", "project", "checks": [{"item", "ok", "detail"[, "code"]}],
+  ...}; the exit code is the first failing check's.
+
+  Exit codes: 0; 2 the session belongs to another account; 5 the store
+  unreachable; 6 the settings, a profile or a connection refused; 7 not
+  linked or logged out.
+""" + _HELP_SERVICE + """
+  Example: whatsapp service doctor
+""",
+    "service harness": """\
+whatsapp service harness [--json]
+
+  The harness tools (claude, codex) of every profile a turn is configured to
+  run on now - each the settings reach, every chat's `/set profile` and each
+  open job's - resolved and fitted as a turn resolves it, for the sign-ins a
+  node needs. With no dialogue admitted none. Runs no turn and writes
+  nothing; `unresolved` names a profile that does not resolve or fit.
+
+  --json  accepted for explicitness; the output is always JSON
+
+  Output: {"harness": [...], "profiles": [{"profile", "harness", "settings",
+  "chats", "jobs"}], "unresolved": [...]}, with "store": "not_configured"
+  or "dialogue": false when there is nothing to resolve.
+
+  Exit codes: 0; 5 profiles_unreadable; 6 profiles_not_imported.
+""" + _HELP_SERVICE + """
+  Example: whatsapp service harness --json
+""",
+}
+
+
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 
@@ -9518,7 +10229,8 @@ def main():
         _selection_flags(created, suppress=True)
         return created
 
-    _sub("help", help="Print full usage block")
+    _sub("help", help="The menu, or one verb's whole contract").add_argument(
+        "path", nargs="*", help="a verb path, e.g. `jobs list`")
     _sub("contract", help="The message envelope every read emits, as an example")
     _sub("doctor", help="Readiness probe (engine, session, identity)")
     _sub("status", help="Human-readable account / session / store view")

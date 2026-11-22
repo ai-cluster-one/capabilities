@@ -35,7 +35,7 @@ An export is one folder per conversation, keyed by a stable kebab-case slug of t
 
 `messages.json` holds the conversation and its metadata; `media/` holds the attachments, one file per message id, referenced from the JSON by path and never inlined. The export folder is self-contained: an attachment cached by the store is copied beside the JSON, so the folder can be moved or read on its own.
 
-The message envelope inside it is the capability's published output contract, identical to what the read verbs emit; run `whatsapp help` for its shape.
+The message envelope inside it is the capability's published output contract, identical to what the read verbs emit; run `whatsapp help contract` for its shape.
 
 Where an export root sits is a per-connection choice: absolute, or relative to the consuming project's own capability folder. Only the root moves; the structure beneath it is the same wherever it points.
 

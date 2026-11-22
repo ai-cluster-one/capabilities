@@ -1,8 +1,8 @@
 """`capabilities audit` holds a capability's help to the layered law
 (SHEBANG.md, "Agent-first help is the surface"): a short menu, no per-flag
 detail in it, every verb it names answering `help <verb>`, and an unknown
-`help <x>` answered with the pointer to the menu. A bundle the manager names
-as pending reports its findings instead of failing, until it conforms.
+`help <x>` answered with the pointer to the menu. Every catalogue bundle is
+held to the whole law; none is pending.
 
 The capability these tests drive is the manager's own scaffold given one
 domain verb, `greet`.
@@ -23,19 +23,6 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 MANAGER = REPO / "bin" / "capabilities"
 NAME = "helpfix"
-
-# The pending set as this law was introduced. It only shrinks as each bundle
-# is converted; a name beyond these is never added to it.
-PENDING_AT_INTRODUCTION = frozenset({
-    "agentrooms", "agenttemplates", "asana", "askproject", "assets", "automations",
-    "calcomc", "calendar", "callva", "callvatest", "clickup", "context", "coolify",
-    "deployment", "directo", "emta", "fathom", "geminitalk", "ical", "inbox",
-    "instagram", "journal", "macmail", "mailbox", "memory", "notion", "railwayc",
-    "rclonec", "resend", "routine", "signoz", "simplbooks", "skyscanner", "slack",
-    "slacker", "stripe", "tasks", "teams", "telegram", "telegrambot", "vapic",
-    "whatsapp", "windmill", "youtrack",
-})
-
 
 def _manager_module():
     loader = importlib.machinery.SourceFileLoader(
@@ -118,22 +105,8 @@ def test_each_departure_from_the_layered_law_fails(isolated, break_, says):
     assert failures and any(says in f for f in failures), failures
 
 
-def test_a_pending_bundle_reports_and_one_that_conforms_must_leave(isolated, monkeypatch):
-    monkeypatch.setattr(M, "HELP_MENU_PENDING", frozenset({NAME}))
-    pending: list[str] = []
-    failures = M._audit_script(NAME, _fixture(isolated, "no page"), pending_result=pending)
-    assert _help(failures) == [] and any(f"`{NAME} help greet`" in p for p in pending)
-    conforming = isolated / "conforming"
-    conforming.mkdir()
-    failures = _help(M._audit_script(NAME, _fixture(conforming)))
-    assert failures and "HELP_MENU_PENDING" in failures[0], failures
-
-
-def test_the_pending_set_only_shrinks_and_names_bundles_that_exist():
-    assert M.HELP_MENU_PENDING <= PENDING_AT_INTRODUCTION, \
-        sorted(M.HELP_MENU_PENDING - PENDING_AT_INTRODUCTION)
-    bundles = {p.name for p in (REPO / "capabilities").iterdir() if p.is_dir()}
-    assert M.HELP_MENU_PENDING <= bundles, sorted(M.HELP_MENU_PENDING - bundles)
+def test_the_manager_keeps_no_pending_set():
+    assert not hasattr(M, "HELP_MENU_PENDING")
 
 
 def _manager(*args: str) -> subprocess.CompletedProcess:

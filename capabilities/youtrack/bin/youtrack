@@ -3,230 +3,63 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
 youtrack — agent-first CLI for YouTrack issues and knowledge-base articles.
 
-Run `youtrack help` before use; this is the complete contract.
+This tool is designed to be invoked by agents. Run `youtrack help` to load this
+menu and `youtrack help <verb>` for one verb's whole contract, on demand — do
+not rely on memorised knowledge of its surface.
 
 Configuration resolves as named connections. Without a registry, `default`
 uses YOUTRACK_URL and YOUTRACK_TOKEN from the credential cascade (`Where a
-secret resolves`, at the end of this help).
+secret resolves`, on `youtrack help connections`).
 YOUTRACK_URL is the YouTrack origin, for example https://acme.youtrack.cloud.
 YOUTRACK_TOKEN is a permanent token and never belongs on the command line.
-
-A project may declare connections (where this project keeps them,
-"Where connections live" below says):
-  {
-    "default": "work",
-    "connections": {
-      "work": {
-        "secret_env": "YOUTRACK_WORK_TOKEN",
-        "base_url": "https://acme.youtrack.cloud",
-        "allow_write": true
-      }
-    }
-  }
-
-Outside any project, connections and doctor are machine reads: they use the
-machine's own connections read-only, unless a grant switched one off; every
-other verb that needs a connection is refused there.
-
-Commands:
-  youtrack help                              Print this contract.
-  youtrack connections                       Show local config resolution.
-  youtrack doctor [--connection ID]          Check config, identity, reachability.
-
-Contract commands:
-  youtrack stub
-  youtrack manifest --json
-  youtrack guide [topic]
-  youtrack ids list|get|set|rm
-  youtrack refs
-  youtrack inventory [--network]
+How a project declares connections is on `youtrack help connections`. Two
+global options, accepted anywhere on the command line, select the named
+connection and the env key holding its token; each verb's page names them.
 
 Read:
-  youtrack users me                          Current YouTrack user.
-  youtrack users find SUBSTRING [--limit N] [--offset N]
-                                             Find users by substring across
-                                             login, name and email. The visible
-                                             set is token-scoped, so absence
-                                             here does not prove a login is
-                                             invalid.
-  youtrack projects find [SUBSTRING] [--limit N] [--offset N]
-                                             Projects visible to the token;
-                                             optional substring match on name.
-  youtrack projects get ID                   One project: name, shortName,
-                                             description, archived, leader.
-  youtrack projects fields list ID [--limit N] [--offset N]
-                                             Custom-field schema for a project:
-                                             name, type, multiValue, canBeEmpty,
-                                             and allowed values where bundled.
-                                             canBeEmpty is YouTrack's own flag and
-                                             governs whether an existing value may
-                                             be emptied — it does NOT mean a create
-                                             must supply the field. A create that
-                                             omits a canBeEmpty=false field
-                                             succeeds; YouTrack supplies its own
-                                             default (measured).
-  youtrack projects fields get ID NAME       One field's schema; NAME matches
-                                             case-insensitively.
-  youtrack groups find [SUBSTRING] [--limit N] [--offset N]
-                                             Find user groups by substring on
-                                             name. Returns the group id, which
-                                             is what comment visibility needs —
-                                             permittedGroups rejects a name.
-  youtrack groups members GROUPID [--limit N] [--offset N]
-                                             List the users in a group. Takes
-                                             the group id from `groups find`.
-  youtrack searches list [--limit N] [--offset N]
-                                             Saved issue searches visible to
-                                             the token, with their queries.
-  youtrack issues get ISSUE                  Read one issue (ID or URL),
-                                             including its tags.
-  youtrack issues search QUERY [--limit N] [--offset N] [--select KEY,KEY]
-                                             Search issues server-side using
-                                             YouTrack query language.
-                                             --select trims the output to the
-                                             named keys: core attributes
-                                             (idReadable, summary, …) or
-                                             fields.<name> for one custom
-                                             field. A named custom field the
-                                             issue does not carry is omitted,
-                                             not an error.
-  youtrack issues comments list ISSUE [--limit N] [--offset N]
-                                             Read recent comments on an issue.
-  youtrack issues work list ISSUE [--limit N] [--offset N]
-                                             Work items logged on an issue:
-                                             date, duration, type, author, text.
-  youtrack articles list [--project ID] [--limit N] [--offset N]
-                                             List knowledge-base articles (paged;
-                                             --project scopes to one project). This
-                                             is a listing, not a full-text search.
-  youtrack articles get ID                   Read one article (ID or URL): summary,
-                                             content, project, parent/child refs.
-  youtrack articles comments list ID [--limit N] [--offset N]
-                                             Read recent comments on an article.
+  youtrack users me                          the current YouTrack user
+  youtrack users find <substring>            users by substring across login, name and email
+  youtrack projects find [<substring>]       projects visible to the token, by name substring
+  youtrack projects get <id>                 one project: name, shortName, description, archived, leader
+  youtrack projects fields list <id>         a project's custom-field schema, with allowed values
+  youtrack projects fields get <id> <name>   one custom field's schema
+  youtrack groups find [<substring>]         user groups by name, with the id comment visibility needs
+  youtrack groups members <group-id>         the users in a group
+  youtrack searches list                     saved issue searches visible to the token, with their queries
+  youtrack issues get <issue>                one issue (ID or URL), with its fields, links and tags
+  youtrack issues search <query>             issues by YouTrack query language, optionally trimmed to keys
+  youtrack issues comments list <issue>      recent comments on an issue
+  youtrack issues work list <issue>          work items logged on an issue
+  youtrack articles list                     knowledge-base articles; a listing, not a full-text search
+  youtrack articles search <query>           full-text / query-language search over articles
+  youtrack articles get <id>                 one article (ID or URL): summary, content, parent/child refs
+  youtrack articles comments list <id>       recent comments on an article
 
-Write:
-  youtrack issues create --project ID        Create an issue, with its custom
-        --summary S [--description TEXT|-]    fields set in the same call. Project
-        [--field NAME=VALUE]…                 is the database entity id (for
-        [--fields JSON|FILE|-] [--draft]      example 0-0), not its short name;
-                                             store stable ids with `youtrack ids
-                                             set project …`. --field and --fields
-                                             take the same values as on `issues
-                                             update` below. Omitted fields are left
-                                             to YouTrack, which fills in its own
-                                             defaults. --draft creates an
-                                             unnumbered draft instead: its
-                                             idReadable is the literal
-                                             `Issue.Draft`, it is invisible to
-                                             search, and only the returned `id`
-                                             addresses it — keep it. There is no
-                                             promote verb; to turn a draft into a
-                                             numbered issue call
-                                             `POST /api/issues?draftId={id}`
-                                             directly. Measured: the draft's
-                                             fields carry over intact, the draft
-                                             is consumed (it 404s afterwards), the
-                                             new issue gets a *different* internal
-                                             id that must be read from the
-                                             promotion response, and the Assignee
-                                             auto-default does NOT fire — so
-                                             promoting a draft and creating
-                                             directly are not equivalent.
-  youtrack issues update ISSUE               Update an issue's summary, description,
-        [--summary S] [--description TEXT|-]  and custom fields. Field names match
-        [--field NAME=VALUE]…                 case-insensitively. --field splits on
-        [--fields JSON|FILE|-]                the first `=` only; repeat it to give a
-                                             multi-value field several values, and
-                                             `--field NAME=` clears one. --fields
-                                             takes a JSON object of NAME: VALUE and
-                                             is applied first, so an explicit --field
-                                             patches one value of a piped template.
-                                             Enum/state/version/build/owned values are
-                                             names, user fields are logins, `date`
-                                             fields are YYYY-MM-DD, and `date and
-                                             time` fields are epoch milliseconds.
-                                             Respects allow_write connection policy.
-  youtrack issues comments add ISSUE [--text TEXT|-]
-        [--permitted-users LOGIN]…           Restrict who can see the comment.
-        [--permitted-groups NAME]…           Users are named by login, groups by
-                                             name — the name is resolved to an
-                                             id here because YouTrack's
-                                             permittedGroups rejects names. An
-                                             unknown group exits 6 before any
-                                             write. Omit both flags and the
-                                             comment is unrestricted.
-  youtrack issues links add ISSUE --to ISSUE --type PHRASE
-                                             Link two issues. --type takes the
-                                             direction phrase, not a type name:
-                                             "subtask of", "parent for",
-                                             "relates to", "depends on", "is
-                                             required for", "duplicates", "is
-                                             duplicated by". One write fills in
-                                             both sides. Linking an issue to
-                                             itself is refused.
-  youtrack issues links remove ISSUE --to ISSUE --type PHRASE
-                                             Remove a link. Not idempotent:
-                                             removing a link that is not there
-                                             exits 3.
-  youtrack issues tags add ISSUE TAG         Tag an issue. TAG is the tag name;
-  youtrack issues tags remove ISSUE TAG      it is resolved to an id here
-                                             because YouTrack's tag endpoint
-                                             rejects a name. Tags are
-                                             instance-wide, not per project, and
-                                             a tag owned by someone else can be
-                                             applied. A name that is not visible
-                                             to this token exits 6 before any
-                                             write. add is idempotent; removing
-                                             a tag the issue does not carry
-                                             exits 3.
-  youtrack issues work log ISSUE             Log time against an issue. Adds an
-        --duration D [--date YYYY-MM-DD]      entry; it never rewrites a field.
-        [--type NAME] [--text TEXT|-]         --duration needs a unit — 45m,
-                                             1h 30m, 2d — because YouTrack reads
-                                             a bare number as HOURS, so a
-                                             unit-less value is refused here. 1d
-                                             is the project's workday, not 24h,
-                                             and the server re-renders the
-                                             duration it stores, so the reply
-                                             carries both minutes and its own
-                                             presentation. --type is optional
-                                             and is validated against this
-                                             project's work item types, which
-                                             can differ from the instance's.
-                                             --date is a calendar day and
-                                             defaults to today. The Spent time
-                                             field is calculated from these
-                                             entries and cannot be set directly.
-  youtrack articles create --project ID      Create an article in a project
-        --summary S [--content TEXT|-]        (database entity id); optionally give
-        [--parent ID|URL]                    a parent article to create a sub-article.
-  youtrack articles search QUERY [--limit N] [--offset N]
-                                             Full-text / query-language search
-                                             over articles. Same endpoint as
-                                             `articles list`, with a query.
-  youtrack articles update ID                Update an article's summary and/or
-        [--summary S] [--content TEXT|-]     content and/or parent (ID|URL).
-        [--parent ID|URL]                    Respects allow_write policy. An
-                                             article cannot be given itself as
-                                             --parent (refused before the write).
-  youtrack articles comments add ID [--text TEXT|-]
-                                             Add a comment to an article.
-
-Global options accepted anywhere:
-  --connection ID                            Select a named connection.
-  --token-env KEY                            Select the env key holding the token.
+Write (each respects the connection's allow_write policy):
+  youtrack issues create                     create an issue or a draft, its custom fields in the same call
+  youtrack issues update <issue>             update an issue's summary, description and custom fields
+  youtrack issues comments add <issue>       comment on an issue, optionally visible to named users or groups
+  youtrack issues links add <issue>          link two issues by direction phrase
+  youtrack issues links remove <issue>       remove a link; not idempotent
+  youtrack issues tags add <issue> <tag>     tag an issue by tag name; idempotent
+  youtrack issues tags remove <issue> <tag>  untag an issue; not idempotent
+  youtrack issues work log <issue>           log time against an issue
+  youtrack articles create                   create an article in a project, optionally as a sub-article
+  youtrack articles update <id>              update an article's summary, content or parent
+  youtrack articles comments add <id>        add a comment to an article
 
 Text arguments accept inline text, a readable file path, or `-` for stdin.
-Every verb that takes --limit returns {"items": [...], "has_more": bool}
-rather than a bare array. has_more is true when the server had more rows
-than --limit; page on with --offset. This is how a sprint rollup detects
-that it was cut short instead of quietly reporting a partial total.
+Every paged list verb returns {"items": [...], "has_more": bool} rather than a
+bare array. has_more is true when the server had more rows than the page
+asked for; page on by offset. This is how a sprint rollup detects that it was
+cut short instead of quietly reporting a partial total.
+
 Success is JSON on stdout. Errors are JSON on stderr. Exit codes: 0 success,
 2 auth/config, 3 not found, 4 policy refusal (this connection is read-only),
 5 network/server, 6 input, 7 a YouTrack workflow rule rejected the change.
@@ -317,6 +150,517 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CONFIG_DIR = _CONFIG_HOME / NAME
 CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# The verb pages `youtrack help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for connections and doctor follow. A text
+# several verbs own is one constant, added to each of their pages.
+_HELP_GLOBAL = """
+  Global options accepted anywhere:
+    --connection ID    Select a named connection (`youtrack help connections`).
+    --token-env KEY    Select the env key holding the token; without it, the
+                       connection's secret_env, else YOUTRACK_TOKEN.
+"""
+_HELP_TEXT = """
+  Text arguments accept inline text, a readable file path, or `-` for stdin.
+"""
+
+
+def _help_paged(default: int) -> str:
+    return f"""
+  Paging: --limit N (default {default}) and --offset N (default 0). Returns
+  {{"items": [...], "has_more": bool}} rather than a bare array. has_more is
+  true when the server had more rows than --limit; page on with --offset.
+  This is how a sprint rollup detects that it was cut short instead of
+  quietly reporting a partial total. A --limit below 1 or a negative
+  --offset exits 6 input.
+"""
+
+
+_HELP_READ_EXITS = """
+  Exit codes: 0; 2 auth/config - the token resolves nowhere (missing_token),
+  YOUTRACK_URL/base_url is not configured (missing_url), or YouTrack rejected
+  the credentials or permission (auth, on 401/403); 3 not_found; 4 policy -
+  the project gate; 5 network/server - network_error after retries,
+  server_error on a 5xx or a 429 that persists, bad_response for non-JSON;
+  6 input - invalid_request for any other status YouTrack refuses, or a
+  connection it cannot select. A missing required argument or an unknown
+  option is refused by the parser itself: exit 2, its usage on stderr.
+"""
+_HELP_WRITE_EXITS = _HELP_READ_EXITS + """
+  A write verb on a connection whose allow_write is false is refused before
+  any call: exit 4 read_only. Ask the user; never lift a gate yourself.
+"""
+_HELP_FIELD_VALUES = """
+  Field names match case-insensitively. --field splits on the first `=`
+  only; repeat it to give a multi-value field several values, and `--field
+  NAME=` clears one. --fields takes a JSON object of NAME: VALUE (inline, a
+  file, or `-`) and is applied first, so an explicit --field patches one
+  value of a piped template. Enum/state/version/build/owned values are names,
+  user fields are logins, `date` fields are YYYY-MM-DD, and `date and time`
+  fields are epoch milliseconds. A numeric-looking --field value is sent as a
+  number; give a numeric string for a `string` field through --fields, where
+  JSON carries the type.
+
+  Refusals before or after the write, each exit 6: unknown_field for a name
+  the target does not carry (with near matches), invalid_value for a value
+  outside the field's bundle (naming the allowed values),
+  unsupported_field_type for a field type it cannot write, and input for a
+  malformed --field or --fields. A YouTrack workflow rule that rejects the
+  change exits 7 workflow_rejected: deterministic — the input was valid, so
+  retrying it unchanged will fail again; the rule name is in the error body.
+"""
+_HELP_ISSUE_OUT = """
+  Output: the issue as YouTrack returns it with its custom fields flattened
+  into "fields": {<name>: <value>} - a user by login, a bundle value by name,
+  text, a period's presentation, a `date` field as YYYY-MM-DD.
+"""
+HELP_VERBS = {
+    "connections": """\
+  connections
+      Show local config resolution.
+
+  Configuration resolves as named connections. Without a registry, `default`
+  uses YOUTRACK_URL and YOUTRACK_TOKEN from the credential cascade (`Where a
+  secret resolves`, above).
+  YOUTRACK_URL is the YouTrack origin, for example https://acme.youtrack.cloud.
+  YOUTRACK_TOKEN is a permanent token and never belongs on the command line.
+
+  A project may declare connections (where this project keeps them,
+  "Where connections live" above says):
+    {
+      "default": "work",
+      "connections": {
+        "work": {
+          "secret_env": "YOUTRACK_WORK_TOKEN",
+          "base_url": "https://acme.youtrack.cloud",
+          "allow_write": true
+        }
+      }
+    }
+
+  Selection: --connection ID (accepted anywhere on the command line) selects
+  a named connection; --token-env KEY selects the env key holding the token.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  A connection is written with `youtrack connection add` (`youtrack help
+  connection`).
+
+  Example: youtrack connections
+""",
+    "doctor": """\
+  doctor [--connection ID] [--token-env KEY]
+      Check config, identity, reachability.
+
+  For every connection, or the one --connection names, reads the token
+  (--token-env KEY, else the connection's secret_env, else YOUTRACK_TOKEN)
+  and the YouTrack origin, and asks YouTrack who the token is (`users me`).
+
+  Output: {"ok": true, "connections": {<id>: {"ok": true, "base_url",
+  "identity": {"id", "login", "name", "fullName", "email"}}}}. The first
+  connection that fails ends the run with its error: exit 2 no token
+  (missing_token) or credentials rejected (auth), 5 unreachable, 6 a
+  connection it cannot select. Outside any project it is a machine read: it
+  uses the machine's own connections read-only, unless a grant switched one
+  off.
+
+  Examples:
+    youtrack doctor
+    youtrack doctor --connection work
+""",
+    "users me": """\
+youtrack users me [--connection ID] [--token-env KEY]
+
+  Current YouTrack user: the identity the token resolves to.
+
+  Output: {"id", "login", "name", "fullName", "email"}.
+""" + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack users me
+""",
+    "users find": """\
+youtrack users find SUBSTRING [--limit N] [--offset N]
+                    [--connection ID] [--token-env KEY]
+
+  Find users by substring across login, name and email. The visible set is
+  token-scoped, so absence here does not prove a login is invalid.
+
+  Output: the paged envelope, each item {"id", "login", "name", "fullName",
+  "email"}.
+""" + _help_paged(50) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack users find ann --limit 10
+""",
+    "projects find": """\
+youtrack projects find [SUBSTRING] [--limit N] [--offset N]
+                       [--connection ID] [--token-env KEY]
+
+  Projects visible to the token; optional substring match on name.
+
+  Output: the paged envelope, each item {"id", "name", "shortName"}. The id
+  (for example 0-0) is the database entity id that `issues create --project`
+  and `articles create --project` take, not the short name.
+""" + _help_paged(100) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack projects find Support
+""",
+    "projects get": """\
+youtrack projects get ID [--connection ID] [--token-env KEY]
+
+  One project: name, shortName, description, archived, leader.
+
+  Output: {"id", "name", "shortName", "description", "archived", "leader":
+  {"login", "fullName"}}. An unknown project exits 3 not_found.
+""" + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack projects get 0-0
+""",
+    "projects fields list": """\
+youtrack projects fields list ID [--limit N] [--offset N]
+                              [--connection ID] [--token-env KEY]
+
+  Custom-field schema for a project: name, type, multiValue, canBeEmpty, and
+  allowed values where bundled. canBeEmpty is YouTrack's own flag and governs
+  whether an existing value may be emptied — it does NOT mean a create must
+  supply the field. A create that omits a canBeEmpty=false field succeeds;
+  YouTrack supplies its own default (measured).
+
+  Output: the paged envelope, each item {"name", "type", "multiValue",
+  "canBeEmpty", "values"}: type is YouTrack's fieldType id (enum[1],
+  user[*], date, ...), and values the bundle's names - logins for a user
+  field - or null where the field has no bundle.
+""" + _help_paged(100) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack projects fields list 0-0
+""",
+    "projects fields get": """\
+youtrack projects fields get ID NAME [--connection ID] [--token-env KEY]
+
+  One field's schema; NAME matches case-insensitively.
+
+  Output: one {"name", "type", "multiValue", "canBeEmpty", "values"}, as
+  `projects fields list` shapes it (`youtrack help projects fields list`). A
+  NAME the project does not define exits 3 not_found, its hint naming every
+  field the project has.
+""" + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack projects fields get 0-0 Priority
+""",
+    "groups find": """\
+youtrack groups find [SUBSTRING] [--limit N] [--offset N]
+                     [--connection ID] [--token-env KEY]
+
+  Find user groups by substring on name. Returns the group id, which is what
+  comment visibility needs — permittedGroups rejects a name.
+
+  Output: the paged envelope, each item {"id", "name", "description",
+  "usersCount"}.
+""" + _help_paged(100) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack groups find Incidents
+""",
+    "groups members": """\
+youtrack groups members GROUPID [--limit N] [--offset N]
+                        [--connection ID] [--token-env KEY]
+
+  List the users in a group. Takes the group id from `groups find`.
+
+  Output: the paged envelope, each item {"id", "login", "name", "fullName",
+  "email"}. An unknown group id exits 3 not_found.
+""" + _help_paged(100) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack groups members 3-1
+""",
+    "searches list": """\
+youtrack searches list [--limit N] [--offset N] [--connection ID] [--token-env KEY]
+
+  Saved issue searches visible to the token, with their queries.
+
+  Output: the paged envelope, each item {"id", "name", "query", "owner":
+  {"login"}, "visibleFor": {"name"}}.
+""" + _help_paged(100) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack searches list
+""",
+    "issues get": """\
+youtrack issues get ISSUE [--connection ID] [--token-env KEY]
+
+  Read one issue (ID or URL), including its tags.
+
+  ISSUE is a readable key (PROJ-123) or an issue URL.
+
+  Output: {"id", "idReadable", "summary", "description", "created",
+  "updated", "resolved", "project", "reporter", "fields", "links", "tags"}.
+  fields is {<name>: <value>}: a user by login, a bundle value by name, text,
+  a period's presentation, a `date` field as YYYY-MM-DD, a `date and time`
+  field as epoch milliseconds. links is [{"type": <direction phrase from this
+  issue's side>, "issues": [<key>, ...]}], and tags the tag names; each is
+  absent when the issue has none.
+""" + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack issues get PROJ-123
+""",
+    "issues search": """\
+youtrack issues search QUERY [--limit N] [--offset N] [--select KEY,KEY]
+                       [--connection ID] [--token-env KEY]
+
+  Search issues server-side using YouTrack query language. --select trims
+  the output to the named keys: core attributes (idReadable, summary, …) or
+  fields.<name> for one custom field. A named custom field the issue does not
+  carry is omitted, not an error.
+
+  Selectable keys: id, idReadable, summary, description, fields, and
+  fields.<custom field name>. Any other bare key exits 6 unknown_select_key
+  (with near matches); an empty --select exits 6 input.
+
+  Output: the paged envelope, each item {"id", "idReadable", "summary",
+  "description", "fields"} - fields flattened as `issues get` does - or only
+  the selected keys.
+""" + _help_paged(100) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Examples:
+    youtrack issues search "project: PROJ #Unresolved" --limit 20
+    youtrack issues search "assignee: me" --select idReadable,summary,fields.State
+""",
+    "issues comments list": """\
+youtrack issues comments list ISSUE [--limit N] [--offset N]
+                              [--connection ID] [--token-env KEY]
+
+  Read recent comments on an issue (ID or URL).
+
+  Output: the paged envelope, each item {"id", "text", "created", "updated",
+  "author": {"id", "login", "fullName"}, "visibility"}, visibility naming
+  permittedUsers and permittedGroups where the comment is restricted.
+""" + _help_paged(50) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack issues comments list PROJ-123
+""",
+    "issues work list": """\
+youtrack issues work list ISSUE [--limit N] [--offset N]
+                          [--connection ID] [--token-env KEY]
+
+  Work items logged on an issue: date, duration, type, author, text.
+
+  Output: the paged envelope, each item {"id", "duration": {"minutes",
+  "presentation"}, "text", "date": "YYYY-MM-DD", "type": <name>, "author":
+  <login>, "created"}. duration keeps both: the server re-renders
+  presentation (and never uses day units), while minutes reflects the
+  project's workday length.
+""" + _help_paged(50) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack issues work list PROJ-123
+""",
+    "articles list": """\
+youtrack articles list [--project ID] [--limit N] [--offset N]
+                       [--connection ID] [--token-env KEY]
+
+  List knowledge-base articles (paged; --project scopes to one project). This
+  is a listing, not a full-text search (`youtrack help articles search`).
+
+  Output: the paged envelope, each item {"id", "idReadable", "summary",
+  "updated", "project": {"id", "name", "shortName"}, "parentArticle":
+  {"idReadable"}}.
+""" + _help_paged(100) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack articles list --project 0-6
+""",
+    "articles search": """\
+youtrack articles search QUERY [--limit N] [--offset N]
+                         [--connection ID] [--token-env KEY]
+
+  Full-text / query-language search over articles. Same endpoint as
+  `articles list`, with a query.
+
+  Output: the paged envelope, each item shaped as `articles list` shapes it.
+""" + _help_paged(100) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack articles search "onboarding"
+""",
+    "articles get": """\
+youtrack articles get ID [--connection ID] [--token-env KEY]
+
+  Read one article (ID or URL): summary, content, project, parent/child refs.
+
+  Output: {"id", "idReadable", "summary", "content", "created", "updated",
+  "project", "reporter", "parentArticle": {"id", "idReadable", "summary"},
+  "childArticles": [{"id", "idReadable", "summary"}, ...]}.
+""" + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack articles get KB-A-12
+""",
+    "articles comments list": """\
+youtrack articles comments list ID [--limit N] [--offset N]
+                                [--connection ID] [--token-env KEY]
+
+  Read recent comments on an article (ID or URL).
+
+  Output: the paged envelope, each item {"id", "text", "created", "updated",
+  "author": {"id", "login", "fullName"}}.
+""" + _help_paged(50) + _HELP_GLOBAL + _HELP_READ_EXITS + """
+  Example: youtrack articles comments list KB-A-12
+""",
+    "issues create": """\
+youtrack issues create --project ID --summary S [--description TEXT|-]
+                       [--field NAME=VALUE]... [--fields JSON|FILE|-] [--draft]
+                       [--connection ID] [--token-env KEY]
+
+  Create an issue, with its custom fields set in the same call. Project is
+  the database entity id (for example 0-0), not its short name; store stable
+  ids with `youtrack ids set project …`. --field and --fields take the same
+  values as on `issues update` (below). Omitted fields are left to YouTrack,
+  which fills in its own defaults. Create is atomic: a batch with one bad
+  value produces no issue at all.
+
+  --draft creates an unnumbered draft instead: its idReadable is the literal
+  `Issue.Draft`, it is invisible to search, and only the returned `id`
+  addresses it — keep it. There is no promote verb; to turn a draft into a
+  numbered issue call `POST /api/issues?draftId={id}` directly. Measured: the
+  draft's fields carry over intact, the draft is consumed (it 404s
+  afterwards), the new issue gets a *different* internal id that must be read
+  from the promotion response, and the Assignee auto-default does NOT fire —
+  so promoting a draft and creating directly are not equivalent.
+""" + _HELP_FIELD_VALUES + _HELP_ISSUE_OUT + _HELP_TEXT + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Examples:
+    youtrack issues create --project 0-0 --summary "Login fails" --field Priority=Major
+    echo '{"Type": "Bug", "Subsystem": ["UI", "API"]}' | \\
+      youtrack issues create --project 0-0 --summary "Crash" --fields - --draft
+""",
+    "issues update": """\
+youtrack issues update ISSUE [--summary S] [--description TEXT|-]
+                       [--field NAME=VALUE]... [--fields JSON|FILE|-]
+                       [--connection ID] [--token-env KEY]
+
+  Update an issue's summary, description, and custom fields. Respects
+  allow_write connection policy. With nothing to change it exits 6 input. A
+  field the project defines but this issue's Type does not carry exits 6
+  field_not_on_issue.
+""" + _HELP_FIELD_VALUES + _HELP_ISSUE_OUT + _HELP_TEXT + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Examples:
+    youtrack issues update PROJ-123 --field State=Fixed --field Assignee=ann
+    youtrack issues update PROJ-123 --field Subsystem=UI --field Subsystem=API --field "Due Date=2026-12-01"
+""",
+    "issues comments add": """\
+youtrack issues comments add ISSUE [--text TEXT|-]
+                             [--permitted-users LOGIN]... [--permitted-groups NAME]...
+                             [--connection ID] [--token-env KEY]
+
+  Add a comment to an issue. Without --text the comment is read from stdin;
+  an empty comment exits 6 input.
+
+  --permitted-users and --permitted-groups restrict who can see the comment.
+  Users are named by login, groups by name — the name is resolved to an id
+  here because YouTrack's permittedGroups rejects names. An unknown group
+  exits 6 before any write (unknown_group, with near matches), and so does a
+  name several groups share (ambiguous_group_name). Omit both flags and the
+  comment is unrestricted.
+
+  Output: the comment {"id", "text", "created", "updated", "author",
+  "visibility"}.
+""" + _HELP_TEXT + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack issues comments add PROJ-123 --text "Fixed in 2.1" --permitted-groups "Support"
+""",
+    "issues links add": """\
+youtrack issues links add ISSUE --to ISSUE --type PHRASE
+                          [--connection ID] [--token-env KEY]
+
+  Link two issues. --type takes the direction phrase, not a type name:
+  "subtask of", "parent for", "relates to", "depends on", "is required for",
+  "duplicates", "is duplicated by". One write fills in both sides. Linking an
+  issue to itself is refused (exit 6 input).
+
+  A phrase the instance does not know exits 6 unknown_link_type (with near
+  matches), one naming several directions 6 ambiguous_link_type, and a --to
+  issue that does not exist 3 not_found.
+
+  Output: ISSUE read back as `issues get` reads it.
+""" + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack issues links add PROJ-124 --to PROJ-100 --type "subtask of"
+""",
+    "issues links remove": """\
+youtrack issues links remove ISSUE --to ISSUE --type PHRASE
+                             [--connection ID] [--token-env KEY]
+
+  Remove a link. Not idempotent: removing a link that is not there exits 3.
+  --type takes the direction phrase, as on `issues links add`. Unlinking an
+  issue from itself is refused (exit 6 input); a phrase it does not know
+  exits 6 unknown_link_type, and a --to issue that does not exist 3
+  not_found.
+
+  Output: ISSUE read back as `issues get` reads it.
+""" + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack issues links remove PROJ-124 --to PROJ-100 --type "subtask of"
+""",
+    "issues tags add": """\
+youtrack issues tags add ISSUE TAG [--connection ID] [--token-env KEY]
+
+  Tag an issue. TAG is the tag name; it is resolved to an id here because
+  YouTrack's tag endpoint rejects a name. Tags are instance-wide, not per
+  project, and a tag owned by someone else can be applied. A name that is not
+  visible to this token exits 6 before any write (unknown_tag), and so does a
+  name several tags share (ambiguous_tag_name). add is idempotent.
+
+  Output: ISSUE read back as `issues get` reads it.
+""" + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack issues tags add PROJ-123 regression
+""",
+    "issues tags remove": """\
+youtrack issues tags remove ISSUE TAG [--connection ID] [--token-env KEY]
+
+  Untag an issue. TAG is the tag name, resolved to an id as on `issues tags
+  add`; a name that is not visible to this token exits 6 before any write.
+  Removing a tag the issue does not carry exits 3.
+
+  Output: ISSUE read back as `issues get` reads it.
+""" + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack issues tags remove PROJ-123 regression
+""",
+    "issues work log": """\
+youtrack issues work log ISSUE --duration D [--date YYYY-MM-DD] [--type NAME]
+                         [--text TEXT|-] [--connection ID] [--token-env KEY]
+
+  Log time against an issue. Adds an entry; it never rewrites a field.
+  --duration needs a unit — 45m, 1h 30m, 2d — because YouTrack reads a bare
+  number as HOURS, so a unit-less value is refused here (exit 6 input). 1d is
+  the project's workday, not 24h, and the server re-renders the duration it
+  stores, so the reply carries both minutes and its own presentation. A
+  duration the server cannot parse, or a negative or empty one, exits 6
+  invalid_duration.
+
+  --type is optional and is validated against this project's work item
+  types, which can differ from the instance's (unknown_work_item_type or
+  ambiguous_work_item_type, exit 6). --date is a calendar day and defaults to
+  today. The Spent time field is calculated from these entries and cannot be
+  set directly.
+
+  Output: the work item as `issues work list` shapes it.
+""" + _HELP_TEXT + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack issues work log PROJ-123 --duration "1h 30m" --type Development --text "review"
+""",
+    "articles create": """\
+youtrack articles create --project ID --summary S [--content TEXT|-]
+                         [--parent ID|URL] [--connection ID] [--token-env KEY]
+
+  Create an article in a project (database entity id); optionally give a
+  parent article to create a sub-article. A parent in another project exits
+  6 input.
+
+  Output: the article as `articles get` reads it.
+""" + _HELP_TEXT + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack articles create --project 0-6 --summary "Runbook" --content runbook.md --parent KB-A-1
+""",
+    "articles update": """\
+youtrack articles update ID [--summary S] [--content TEXT|-] [--parent ID|URL]
+                         [--connection ID] [--token-env KEY]
+
+  Update an article's summary and/or content and/or parent (ID|URL).
+  Respects allow_write policy. An article cannot be given itself as --parent
+  (refused before the write, exit 6 input), and a parent in another project
+  exits 6 input. With no non-empty --summary, --content or --parent it exits
+  6 input.
+
+  Output: the article as `articles get` reads it.
+""" + _HELP_TEXT + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack articles update KB-A-12 --content - < runbook.md
+""",
+    "articles comments add": """\
+youtrack articles comments add ID [--text TEXT|-] [--connection ID] [--token-env KEY]
+
+  Add a comment to an article. Without --text the comment is read from
+  stdin; an empty comment exits 6 input.
+
+  Output: the comment {"id", "text", "created", "updated", "author"}.
+""" + _HELP_TEXT + _HELP_GLOBAL + _HELP_WRITE_EXITS + """
+  Example: youtrack articles comments add KB-A-12 --text "Updated for 2.1"
+""",
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

@@ -1,6 +1,6 @@
 # Windmill — script authoring (`f/<namespace>/*`)
 
-The model for a deployable script in a consuming project — the starting point for understanding how its Windmill scripts are built. The wider operating context is the `operational` guide. Platform mechanics common to any project (deploy, timeout, lock) are in `windmill help`; a project's fixed values and variable paths live in its own identifiers envelope (`windmill ids list`).
+The model for a deployable script in a consuming project — the starting point for understanding how its Windmill scripts are built. The wider operating context is the `operational` guide. Platform mechanics common to any project (deploy, timeout, lock) are in `windmill help deploy`; a project's fixed values and variable paths live in its own identifiers envelope (`windmill ids list`).
 
 ## Prefer the box's CLIs over reimplementation
 

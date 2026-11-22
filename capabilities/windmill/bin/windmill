@@ -3,192 +3,95 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
 windmill — agent-first CLI for a Windmill instance (scripts, schedules, jobs, vars).
 
-This tool is designed to be invoked by agents. Run `windmill help` to load the
-full usage contract on demand — do not rely on memorised knowledge of its surface.
+This tool is designed to be invoked by agents. Run `windmill help` to load this
+menu and `windmill help <verb>` for one verb's whole contract, on demand — do
+not rely on memorised knowledge of its surface.
 It is identity-free: it knows nothing about any consuming project. Connection +
 workspace come from config/env/flags; project-specific paths (folders, script
 paths, variable paths) are supplied by the caller.
 
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. A flag wins (--url / --token / --workspace); otherwise WINDMILL_URL /
-  WINDMILL_API_TOKEN / WINDMILL_WORKSPACE resolve through the credential cascade
-  (`Where a secret resolves`, at the end of this help). Same WINDMILL_* keys at
-  every tier; the project you're in wins, so a deployed host's injected env
-  governs when no config file is present. Never pass the token on the command line.
+Configuration requires an explicit connections registry, even for one
+connection: each entry names the instance URL, the workspace and the env var
+holding the token, and only the token is secret. A connection marked
+"allow_write": false is read-only: every mutating verb exits 4, and nothing
+lifts the gate. Writes default to allowed (a Windmill instance is the
+consumer's own). How a connection is declared, selected and resolved is
+CONNECTIONS, on `windmill help connections`.
 
-  A project that talks to several Windmill instances declares them as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": {
-          "url": "https://wm.example.com", "workspace": "main",
-          "secret_env": "WINDMILL_<ID>_API_TOKEN",
-          "allow_write": true
-        }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
+Options before the verb select the connection, override its URL, token or
+workspace, and act as another workspace user (isolation). The stored token
+is the workspace admin's; acting as a user mints a short-lived impersonation
+token from it (nothing per-user is stored), so folder RBAC confines secret
+reads.
+Each verb's page names the options and says whether the verb writes.
 
-  Only the token is secret: the entry names the env var holding it
-  ("secret_env"); the value resolves through the credential cascade above.
-  "allow_write": false makes the
-  connection read-only: every mutating verb (deploy, run, *-set, *-delete,
-  *-ensure, *-create, provision) exits 4, and no flag lifts the gate.
-  Writes default to allowed (a Windmill instance is the consumer's own).
+A <path> is a Windmill path like f/myproj/runner (folder-scoped). The
+workspace is NOT part of the path; it comes from the selected connection.
 
-  Selection: --connection <id> on every command. Unflagged, the registry's
-  "default" pointer applies, else the sole entry; several entries without a
-  pointer is refused as ambiguous. --workspace still switches workspaces
-  within the selected connection's instance.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
-
-Acting as another user (isolation): the stored token is the workspace admin's.
-  windmill --as <email> <cmd ...>             Run the call AS that workspace user, by
-                                              minting a short-lived impersonation token
-                                              from the admin token (nothing per-user is
-                                              stored). Use it to execute under an operator
-                                              identity so folder RBAC confines secret reads.
-
-Commands:
-  windmill help                               Print this document.
-  windmill connections                        Where every connection's values resolve
-                                              from (tier, source, secrets masked).
-                                              Local only — no network.
-  windmill doctor [--connection <id>]         Version + whoami + workspace reachability —
-                                              every connection, or one.
+COMMANDS
 
   Scripts (Windmill versions by content hash; no PUT — update = archive+create):
-  windmill scripts [--prefix f/x] [--limit N] List scripts (optionally by path prefix).
-  windmill script-get <path>                  Show one script (incl. content, hash).
-  windmill script-delete <path>               Hard-delete every version of a script at a
-                                              path (irreversible; `deploy` recreates).
-  windmill deploy <path> <file|->             Create/update a script from a file or
-        [--lang bun] [--summary S]            stdin. Re-deploy archives the old hash
-        [--description D] [--timeout 600]     then creates the new version at the same
-        [--tag TAG]                           path. --tag pins a worker group/tag.
+  windmill scripts                       list scripts, optionally by path prefix
+  windmill script-get <path>             show one script (incl. content, hash)
+  windmill script-delete <path>          hard-delete every version at a path; irreversible
+  windmill deploy <path> <file|->        create/update a script from a file or stdin
 
   Schedules (native Windmill cron — the schedule registry):
-  windmill schedules [--limit N]              List schedules.
-  windmill schedule-get <path>                Show one schedule.
-  windmill schedule-set <path> --script SP    Create or update a cron schedule on a
-        --cron "0 */5 * * * *"                script. Cron is Windmill format (6-7
-        [--timezone Etc/UTC] [--arg k=v ...]  fields: sec min hour dom mon dow [year]).
-        [--off]                               --arg sets static job args. --off creates
-                                              it disabled.
-  windmill schedule-enable <path> (--on|--off) Toggle a schedule.
-  windmill schedule-delete <path>             Delete a schedule.
+  windmill schedules                     list schedules
+  windmill schedule-get <path>           show one schedule
+  windmill schedule-set <path>           create or update a cron schedule on a script
+  windmill schedule-enable <path>        toggle a schedule on or off
+  windmill schedule-delete <path>        delete a schedule
 
   Jobs / runs:
-  windmill run <path> [--sync] [--arg k=v ...] Run a script. Async (default) returns the
-        [--timeout N]                         job id; --sync blocks and returns result.
-  windmill runs [--script PATH] [--limit N]   List recent runs (no logs/result body).
-        [--running] [--success|--failed]
-  windmill job <id>                           Show one job WITH result + logs.
+  windmill run <path>                    run a script: async returns the job id, sync the result
+  windmill runs                          list recent runs (no logs/result body)
+  windmill job <id>                      show one job WITH result + logs
 
   Variables (secrets + config):
-  windmill vars [--prefix f/x]                List variables (names only; values hidden).
-  windmill var-set <path> [--value V|--stdin] Create or update a variable. Defaults to
-        [--plain] [--description D]           secret; --plain stores non-secret. Value
-                                              from --value, --stdin, or a file path.
-  windmill var-delete <path>                  Delete a variable.
+  windmill vars                          list variables (names only; values hidden)
+  windmill var-set <path>                create or update a variable; secret by default
+  windmill var-delete <path>             delete a variable
 
   Folders:
-  windmill folder-create <name> [--owner U]   Create a folder (e.g. myproj → f/myproj).
-        [--owner U ...]                       --owner repeats; pass like u/alice or g/team.
-  windmill folder-ensure <name> [--owner U]   Idempotent create-or-update of a folder's
-                                              owners/ACL (owners also granted in extra_perms).
+  windmill folder-create <name>          create a folder (e.g. myproj → f/myproj)
+  windmill folder-ensure <name>          idempotent create-or-update of a folder's owners/ACL
 
   HTTP triggers (custom routes that run a script/flow when called):
-  windmill triggers [--limit N]               List HTTP triggers.
-  windmill trigger-get <path>                 Show one trigger.
-  windmill trigger-set <path> --script SP     Create or update an HTTP route on a script.
-        --route inbound/webhook               --route is the URL path (no leading /). Returns
-        [--method post] [--auth none]         the public URL. Idempotent (create-or-update).
-        [--request-type sync] [--raw]         sync (default) returns the script's result, so a
-        [--wrap-body] [--no-workspaced]       sync route can echo a handshake header; async
-        [--flow] [--summary S]                returns a job id. auth=none is a public endpoint.
-        [--description D] [--off]             --raw passes the body unparsed; --no-workspaced
-                                              drops the workspace id from the URL; --off disables.
-  windmill trigger-delete <path>              Delete a trigger.
+  windmill triggers                      list HTTP triggers
+  windmill trigger-get <path>            show one trigger
+  windmill trigger-set <path>            create or update an HTTP route on a script; idempotent
+  windmill trigger-delete <path>         delete a trigger
 
   Users (workspace membership — the isolation identity):
-  windmill users                              List workspace users (email, operator, admin).
-  windmill user-ensure --email E [--operator] Idempotent: ensure a global user exists and is
-        [--admin] [--name N]                  a member of this workspace. No token is minted
-                                              or stored — act as the user via `--as E`.
+  windmill users                         list workspace users (email, operator, admin)
+  windmill user-ensure                   ensure a global user exists and is a workspace member
 
   Data Tables (Postgres databases hosted inside the Windmill instance):
-  windmill datatables                          List datatable stores in this workspace.
-  windmill datatable run "<sql>" [--store S]   Execute SQL (DDL or DML) against a store.
-        [--arg k=v ...] [--timeout N]         Runs as an ephemeral postgresql preview job
-                                              with args.database = datatable://<store>.
-                                              MUTATING — gated by allow_write.
-  windmill datatable tables [--store S]        List tables in a store (default --store main).
-  windmill datatable schema <table>            Column names + compact types for one table.
-        [--store S] [--schema pub]            <table> may be "schema.table"; --schema
-                                              (default public) applies when omitted.
+  windmill datatables                    list datatable stores in this workspace
+  windmill datatable run "<sql>"         execute SQL (DDL or DML) against a store; MUTATING
+  windmill datatable tables              list tables in a store
+  windmill datatable schema <table>      column names + compact types for one table
 
   Instance databases (superadmin-only lifecycle of the underlying PG databases):
-  windmill datatable-db list                   Statuses of every custom instance database.
-  windmill datatable-db create <name>          Run CREATE DATABASE on the Windmill PG and
-                                              grant custom_instance_user. MUTATING.
-  windmill datatable-db drop <name>            Drop a custom instance database (irreversible).
-                                              MUTATING. Superadmin token required — a
-                                              non-superadmin surfaces as exit 2 with a hint.
+  windmill datatable-db list             statuses of every custom instance database
+  windmill datatable-db create <name>    CREATE DATABASE on the Windmill PG; MUTATING
+  windmill datatable-db drop <name>      drop a custom instance database (irreversible)
 
   Provisioning (workspace skeleton — folder, operator user, scripts):
-  windmill verify [--folder NS]               Read-only: check the workspace skeleton against
-        [--operator E] [--scripts-dir D]      live state (folder+owners, operator user, each
-        [<manifest.json>]                     discovered script) and report per-item ok + `ready`.
-  windmill provision [--folder NS]            Idempotent, non-destructive apply of that skeleton.
-        [--operator E] [--operator-name N]    Never deletes; never overwrites a present secret.
-        [--owner U ...] [--scripts-dir D]     Inputs resolve from config unless flagged:
-        [<manifest.json>]                       folder    --folder | WINDMILL_FOLDER (the namespace)
-                                                operator  --operator | WINDMILL_OPERATOR (email) +
-                                                          --operator-name | WINDMILL_OPERATOR_NAME
-                                                owners    the operator user, plus any --owner
-                                                scripts   *.ts under --scripts-dir (path
-                                                          f/<folder>/<stem>; example_* skipped)
-                                              Variables are NOT provisioned here: the box↔Windmill
-                                              SSH vars are wired by the consumer's box routine. Pass
-                                              an explicit <manifest.json> to override config-discovery
-                                              (schema: {folder, owners[], users[], variables[],
-                                              scripts[], schedules[]}; file paths relative to it).
-
-References:
-  <path> values are Windmill paths like f/myproj/runner (folder-scoped). The
-  workspace is NOT part of the path — it comes from --workspace / WINDMILL_WORKSPACE.
+  windmill verify [<manifest.json>]      read-only check of the skeleton against live state
+  windmill provision [<manifest.json>]   idempotent, non-destructive apply of that skeleton
 
 I/O contract:
   - Success: JSON (or a bare string for scalar responses like a hash/job-id) on
     stdout, exit 0.
   - Error:   {"error": {"code","message","hint","status"}} on stderr, non-zero exit.
-
-Contract commands (the same on every capability):
-  windmill stub                                 One-line awareness text.
-  windmill manifest --json                      Machine-readable declaration.
-  windmill guide [<topic>]                      Guide topics / one guide body,
-                                                 fetched live from the docs base.
-  windmill ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-                [--note <text>]                  (capabilities/windmill/identifiers.json,
-                                                  or store rows once the agent moved).
-  windmill refs                                 Menu of the project's reference
-                                                 files for this capability.
-  windmill inventory [--network]                What this capability holds in
-                                                this project (--network adds
-                                                remote detail).
 
 Exit codes:
   0 success | 2 auth | 3 not found | 4 policy refusal (the project gate, or a
@@ -196,16 +99,10 @@ Exit codes:
   yourself) | 5 server/network | 6 input/validation
 
 Notes:
-  - Worker model: a worker runs ONE job at a time for its whole duration; long jobs
-    block a slot. Keep jobs bounded; use --tag to route heavy jobs to a dedicated
-    worker group so they don't starve other scripts on a shared instance.
-  - Timeout is YOURS to set: --timeout on deploy (default 600s) hard-kills any run that
-    overruns. It is not a fixed platform limit — choose it per script to fit the job's
-    real worst-case duration, and keep each job a bounded step rather than a long wait.
-  - Lock resolves async after deploy: a freshly-deployed bun/deno script is not runnable
-    until Windmill computes its dependency lock (seconds). Until then `run` returns
-    404 "script not found at name" even though `scripts` lists it. `deploy` does not wait
-    — poll `script-get <path>` until its `lock` field is non-null, then run.
+  - Worker model: a worker runs ONE job at a time for its whole duration; long
+    jobs block a slot. Timeout is YOURS to set at deploy. A freshly-deployed
+    script is not runnable until Windmill computes its dependency lock. All
+    three are on `windmill help deploy`.
   - Scalar endpoints (deploy hash, run job-id, version) return a bare string, not an
     object — that's expected.
 """
@@ -316,6 +213,581 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CONFIG_DIR = _CONFIG_HOME / "windmill"
 CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
 CONN_KEYS = ("WINDMILL_URL", "WINDMILL_API_TOKEN", "WINDMILL_WORKSPACE")
+
+# The verb pages `windmill help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections and ids follow.
+# A text several verbs own is one constant, added to each of their pages.
+_HELP_OPTIONS = """
+  Options: windmill's own, so they stand before the verb
+  (`windmill [--connection <id>] [--url URL] [--token TOKEN] [--workspace WS]
+  [--as <email>] <verb> ...`); after the verb the parser refuses them.
+    --connection <id>  connection id (optional with a default pointer or a sole
+                       connection); unflagged, the registry's "default" pointer
+                       applies, else the sole entry (`windmill help connections`)
+    --url URL          Windmill base URL (overrides env/config)
+    --token TOKEN      API token (prefer config/env; avoid CLI) — never pass the
+                       token on the command line
+    --workspace WS     workspace id (overrides env/config); switches workspaces
+                       within the selected connection's instance
+    --as <email>       Run the call AS that workspace user, by minting a
+                       short-lived (15-minute) impersonation token from the admin
+                       token (nothing per-user is stored). Use it to execute
+                       under an operator identity so folder RBAC confines secret
+                       reads.
+  Outside any project this verb is refused: only connections and doctor read
+  the machine's own connections there.
+"""
+_HELP_PATH = """
+  <path> values are Windmill paths like f/myproj/runner (folder-scoped). The
+  workspace is NOT part of the path — it comes from --workspace / WINDMILL_WORKSPACE.
+"""
+_HELP_WRITE = """
+  Writes: a mutating verb. On a connection with "allow_write": false it exits 4
+  and no flag lifts the gate.
+"""
+_HELP_ARG = """
+  --arg k=v repeats; each value is JSON-typed if it parses (42, true, "x",
+  {"a":1}), else kept as a string. An --arg without '=' exits 6 bad_arg.
+"""
+_HELP_WORKER = """
+  Worker model: a worker runs ONE job at a time for its whole duration; long jobs
+  block a slot. Keep jobs bounded; use --tag to route heavy jobs to a dedicated
+  worker group so they don't starve other scripts on a shared instance.
+"""
+_HELP_LOCK = """
+  Lock resolves async after deploy: a freshly-deployed bun/deno script is not runnable
+  until Windmill computes its dependency lock (seconds). Until then `run` returns
+  404 "script not found at name" even though `scripts` lists it. `deploy` does not wait
+  — poll `script-get <path>` until its `lock` field is non-null, then run.
+"""
+_HELP_EXIT = """
+  Exit codes: 0 success; 2 auth — unauthorized (Windmill answered 401/403: token
+  invalid or lacks workspace access), or the token resolves nowhere
+  (missing_credentials, missing_secret); 3 not_found (404: verify the path and
+  workspace); 4 policy refusal — the project gate on any verb, or a write verb
+  on a read-only connection (ask the user, never lift a gate yourself); 5
+  server/network — timeout, network_error, rate_limited, server_error or
+  api_error, after retries on timeouts, 429 and 5xx; 6 input/validation —
+  invalid_request (Windmill answered 400/409/422), no connections registry
+  (connections_required), a connection it cannot select, or one missing
+  secret_env, url or workspace. A missing required argument or flag, or a
+  value outside a flag's choices, is refused by the parser itself: exit 2, its
+  usage on stderr.
+"""
+_HELP_SUPERADMIN = """
+  Superadmin token required: a token Windmill refuses here (401/403) exits 2
+  not_superadmin with the hint to use a superadmin's API token for this
+  connection; any other failure of the settings endpoint exits 5 api_error.
+"""
+HELP_VERBS = {
+    "connections": """\
+  windmill connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked). Local only — no network.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. A flag wins (--url / --token / --workspace); otherwise WINDMILL_URL /
+  WINDMILL_API_TOKEN / WINDMILL_WORKSPACE resolve through the credential cascade
+  (`Where a secret resolves`, above). Same WINDMILL_* keys at
+  every tier; the project you're in wins, so a deployed host's injected env
+  governs when no config file is present. Never pass the token on the command line.
+
+  A project that talks to several Windmill instances declares them as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "url": "https://wm.example.com", "workspace": "main",
+          "secret_env": "WINDMILL_<ID>_API_TOKEN",
+          "allow_write": true
+        }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  Only the token is secret: the entry names the env var holding it
+  ("secret_env"); the value resolves through the credential cascade above.
+  "allow_write": false makes the
+  connection read-only: every mutating verb (deploy, run, *-set, *-delete,
+  *-ensure, *-create, provision) exits 4, and no flag lifts the gate.
+  Writes default to allowed (a Windmill instance is the consumer's own).
+  schedule-enable, datatable run, datatable-db create and datatable-db drop
+  are mutating verbs too.
+
+  Selection: --connection <id> on every command. Unflagged, the registry's
+  "default" pointer applies, else the sole entry; several entries without a
+  pointer is refused as ambiguous. --workspace still switches workspaces
+  within the selected connection's instance. --connection is windmill's own
+  option, so it stands before the verb (`windmill --connection <id> scripts`).
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  A connection is written with `windmill connection add` (`windmill help
+  connection`); its fields include script_timeout_default and
+  script_timeout_min, which `windmill help deploy` explains.
+
+  Example: windmill connections
+""",
+    "doctor": """\
+  windmill [--connection <id>] doctor
+      Version + whoami + workspace reachability — every connection, or one.
+
+  --connection is windmill's own option, so it stands before the verb
+  (`windmill --connection <id> doctor`). Each examined connection is asked
+  GET /api/version, then its workspace's whoami, then one script of the
+  workspace's script list.
+
+  Output: {"ok": <every examined connection healthy>, "connections": {<id>:
+  {"url", "workspace", "version", "whoami", "scripts_reachable", "ok": true}
+  or {..., "ok": false, "error", "hint"?}}}. The exit code is the first
+  failing connection's: 2 credentials missing or refused (401/403), 5
+  unreachable, another error status or an unreadable answer, 6 a connection
+  missing secret_env, url or workspace, no connections registry
+  (connections_required), or a connection it cannot select.
+
+  Examples:
+    windmill doctor
+    windmill --connection <id> doctor
+""",
+    "ids": """\
+  For windmill: the project identifiers envelope is
+  capabilities/windmill/identifiers.json, or store rows once the agent moved.
+
+  Example: windmill ids list
+""",
+    "scripts": """\
+windmill scripts [--prefix f/x] [--limit N]
+
+  List scripts (optionally by path prefix). --prefix keeps the scripts whose
+  path starts with it; --limit N caps the page (default 100).
+
+  Output: Windmill's script list as it answers it, a JSON array of script
+  objects.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill scripts --prefix f/myproj/
+""",
+    "script-get": """\
+windmill script-get <path>
+
+  Show one script (incl. content, hash), as Windmill answers it: one JSON
+  object, with its `lock` field null until the dependency lock resolves.
+""" + _HELP_PATH + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill script-get f/myproj/runner
+""",
+    "script-delete": """\
+windmill script-delete <path>
+
+  Hard-delete every version of a script at a path (irreversible; `deploy`
+  recreates). There is no archive-then-restore here.
+
+  Output: {"path", "deleted": true}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill script-delete f/myproj/old_runner
+""",
+    "deploy": """\
+windmill deploy <path> <file|-> [--lang bun] [--summary S] [--description D]
+                [--timeout 600] [--tag TAG]
+
+  Create/update a script from a file or stdin. Re-deploy archives the old hash
+  then creates the new version at the same path (Windmill versions by content
+  hash; no PUT — update = archive+create). --tag pins a worker group/tag.
+
+  <file> is the source file, or '-' for stdin; an argument that names no
+  existing file is taken as the source text itself.
+  --lang        bun (default) | deno | python3 | bash | go | nativets; on a
+                re-deploy the prior version's language when not given.
+  --summary S, --description D
+                the script's summary and description; on a re-deploy the prior
+                version's when not given.
+  --timeout N   seconds any run may take before it is hard-killed.
+  --tag TAG     the worker group/tag the script's jobs run on.
+
+  Timeout is YOURS to set: --timeout on deploy (default 600s) hard-kills any run that
+  overruns. It is not a fixed platform limit — choose it per script to fit the job's
+  real worst-case duration, and keep each job a bounded step rather than a long wait.
+  Unflagged, the connection's script_timeout_default applies, else 600; the
+  connection's script_timeout_min is a hard floor: an unflagged default below it
+  is raised to it, and a --timeout below it refuses the deploy (exit 6
+  timeout_below_floor).
+""" + _HELP_WORKER + _HELP_LOCK + """
+  Output: {"path", "hash": <the new version's hash>, "language", "archived":
+  <the archived prior hash, or null>, "tag"}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Examples:
+    windmill deploy f/myproj/runner ./runner.ts --timeout 900 --tag heavy
+    cat runner.ts | windmill deploy f/myproj/runner -
+""",
+    "schedules": """\
+windmill schedules [--limit N]
+
+  List schedules (native Windmill cron — the schedule registry). --limit N
+  caps the page (default 100).
+
+  Output: Windmill's schedule list as it answers it, a JSON array.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill schedules
+""",
+    "schedule-get": """\
+windmill schedule-get <path>
+
+  Show one schedule, as Windmill answers it: one JSON object.
+""" + _HELP_PATH + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill schedule-get f/myproj/every_5m
+""",
+    "schedule-set": """\
+windmill schedule-set <path> --script SP --cron "0 */5 * * * *"
+                      [--timezone Etc/UTC] [--arg k=v ...] [--off]
+
+  Create or update a cron schedule on a script. Cron is Windmill format (6-7
+  fields: sec min hour dom mon dow [year]). --arg sets static job args. --off
+  creates it disabled.
+
+  --script SP and --cron are required; --timezone defaults to Etc/UTC. On an
+  update the enabled state is set as well: enabled, or disabled with --off.
+""" + _HELP_ARG + """
+  Output: created, {"path", "created": true, "enabled", "cron", "script_path"};
+  updated, {"path", "updated": true, "enabled", "cron"}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill schedule-set f/myproj/every_5m --script f/myproj/runner --cron "0 */5 * * * *" --arg mode=full
+""",
+    "schedule-enable": """\
+windmill schedule-enable <path> (--on|--off)
+
+  Toggle a schedule. Exactly one of --on and --off is required; neither, or
+  both, is refused by the parser (exit 2).
+
+  Output: {"path", "enabled"}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill schedule-enable f/myproj/every_5m --off
+""",
+    "schedule-delete": """\
+windmill schedule-delete <path>
+
+  Delete a schedule.
+
+  Output: {"path", "deleted": true}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill schedule-delete f/myproj/every_5m
+""",
+    "run": """\
+windmill run <path> [--sync] [--arg k=v ...] [--timeout N]
+
+  Run a script. Async (default) returns the job id; --sync blocks and returns
+  result. --arg sets the job's args; --timeout N is passed to Windmill as the
+  run's timeout in seconds.
+""" + _HELP_ARG + """
+  Output: async, {"path", "job_id"}; --sync, {"path", "result": <the script's
+  return value>}. `windmill job <id>` reads an async run's result and logs.
+""" + _HELP_WORKER + _HELP_LOCK + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Examples:
+    windmill run f/myproj/runner --arg day=2026-11-22
+    windmill run f/myproj/runner --sync
+""",
+    "runs": """\
+windmill runs [--script PATH] [--limit N] [--running] [--success|--failed]
+
+  List recent runs (no logs/result body). --script PATH keeps the runs of that
+  exact script path; --limit N caps the page (default 20); --running keeps
+  the runs still going; --success the succeeded ones and --failed the failed
+  ones (given both, --failed wins).
+
+  Output: Windmill's job list as it answers it, a JSON array, without logs.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill runs --script f/myproj/runner --failed --limit 5
+""",
+    "job": """\
+windmill job <id>
+
+  Show one job WITH result + logs: Windmill's job object as it answers it.
+  Logs may carry raw ANSI control bytes; they are read leniently.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill job <job_id>
+""",
+    "vars": """\
+windmill vars [--prefix f/x]
+
+  List variables (names only; values hidden). --prefix keeps the variables
+  whose path starts with it.
+
+  Output: Windmill's variable list as it answers it, a JSON array.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill vars --prefix f/myproj/
+""",
+    "var-set": """\
+windmill var-set <path> (--value V | --stdin) [--plain] [--description D]
+
+  Create or update a variable. Defaults to secret; --plain stores non-secret.
+  The value is --value V as given, or --stdin, read whole from standard
+  input; neither exits 6 no_value. --description D describes a new variable.
+
+  An existing variable is updated in its value only: the secrecy and
+  description it already has are kept, and is_secret echoes what was asked.
+
+  Output: created, {"path", "created": true, "is_secret"}; updated, {"path",
+  "updated": true, "is_secret"}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: printf %s "$TOKEN" | windmill var-set f/myproj/api_token --stdin
+""",
+    "var-delete": """\
+windmill var-delete <path>
+
+  Delete a variable.
+
+  Output: {"path", "deleted": true}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill var-delete f/myproj/old_token
+""",
+    "folder-create": """\
+windmill folder-create <name> [--owner U ...]
+
+  Create a folder (e.g. myproj → f/myproj). --owner repeats; pass like u/alice
+  or g/team. A folder that already exists is Windmill's refusal (exit 6
+  invalid_request); `folder-ensure` is the idempotent form.
+
+  Output: {"folder": "f/<name>", "owners": [...]}.
+""" + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill folder-create myproj --owner u/alice --owner g/team
+""",
+    "folder-ensure": """\
+windmill folder-ensure <name> [--owner U ...]
+
+  Idempotent create-or-update of a folder's owners/ACL (owners also granted in
+  extra_perms). --owner repeats; pass like u/alice or g/team. An existing
+  folder's owners become exactly the ones given.
+
+  Output: {"folder": "f/<name>", "owners": [...], "created": true} or
+  {..., "updated": true}.
+""" + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill folder-ensure myproj --owner u/operator
+""",
+    "triggers": """\
+windmill triggers [--limit N]
+
+  List HTTP triggers (custom routes that run a script/flow when called).
+  --limit N caps the page (default 100).
+
+  Output: Windmill's HTTP trigger list as it answers it, a JSON array.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill triggers
+""",
+    "trigger-get": """\
+windmill trigger-get <path>
+
+  Show one trigger, as Windmill answers it: one JSON object.
+""" + _HELP_PATH + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill trigger-get f/myproj/inbound
+""",
+    "trigger-set": """\
+windmill trigger-set <path> --script SP --route inbound/webhook
+                     [--method post] [--auth none] [--request-type sync] [--raw]
+                     [--wrap-body] [--no-workspaced] [--flow] [--summary S]
+                     [--description D] [--off]
+
+  Create or update an HTTP route on a script. --route is the URL path (no
+  leading /). Returns the public URL. Idempotent (create-or-update). sync
+  (default) returns the script's result, so a sync route can echo a handshake
+  header; async returns a job id. auth=none is a public endpoint. --raw passes
+  the body unparsed; --no-workspaced drops the workspace id from the URL; --off
+  disables.
+
+    --script SP       script/flow path to run (f/..); required
+    --route R         URL route path, no leading / (e.g. inbound/webhook); required
+    --method M        get | post (default) | put | delete | patch
+    --auth A          none (default: public endpoint) | windmill | api_key |
+                      basic_http | custom_script | signature
+    --request-type T  sync (default) returns the script result; async returns a
+                      job id; sync_sse
+    --raw             pass the body as a raw string (no JSON parse)
+    --wrap-body       wrap the request body in a 'body' parameter
+    --no-workspaced   omit the workspace id from the route URL
+    --flow            script path points to a flow
+    --summary S       human label for the trigger
+    --description D   longer description of the trigger
+    --off             create disabled
+
+  Output: {"path", "created": true or "updated": true, "route": <the public
+  URL, <url>/api/r/<workspace>/<route>, or <url>/api/r/<route> with
+  --no-workspaced>, "method", "request_type", "auth"}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill trigger-set f/myproj/inbound --script f/myproj/on_webhook --route inbound/webhook
+""",
+    "trigger-delete": """\
+windmill trigger-delete <path>
+
+  Delete a trigger.
+
+  Output: {"path", "deleted": true}.
+""" + _HELP_PATH + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill trigger-delete f/myproj/inbound
+""",
+    "users": """\
+windmill users
+
+  List workspace users (email, operator, admin): Windmill's user list as it
+  answers it, a JSON array.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill users
+""",
+    "user-ensure": """\
+windmill user-ensure --email E [--operator] [--admin] [--name N]
+
+  Idempotent: ensure a global user exists and is a member of this workspace.
+  No token is minted or stored — act as the user via `--as E`. --email is
+  required; --operator makes the member an operator, --admin a workspace
+  admin, and --name N is the new user's display name. An existing user, or an
+  existing membership, is a no-op.
+
+  Output: {"email", "username": <the email's local part, alphanumerics only>,
+  "operator", "is_admin", "created": <the global user was created now>,
+  "added_to_workspace": <the membership was added now>}.
+""" + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill user-ensure --email operator@example.com --operator --name Operator
+""",
+    "datatables": """\
+windmill datatables
+
+  List datatable stores in this workspace (Postgres databases hosted inside
+  the Windmill instance), as Windmill answers it.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill datatables
+""",
+    "datatable run": """\
+windmill datatable run "<sql>" [--store S] [--arg k=v ...] [--timeout N]
+
+  Execute SQL (DDL or DML) against a store. Runs as an ephemeral postgresql
+  preview job with args.database = datatable://<store>. MUTATING — gated by
+  allow_write. --store defaults to main; --arg values become extra preview args
+  (named parameters for the SQL, for example); --timeout N is the preview
+  job's timeout in seconds.
+""" + _HELP_ARG + """
+  Output: the preview job's result, as Windmill answers it.
+""" + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill datatable run "CREATE TABLE IF NOT EXISTS seen (id text primary key)"
+""",
+    "datatable tables": """\
+windmill datatable tables [--store S]
+
+  List tables in a store (default --store main).
+
+  Output: {"store", "schemas": {<schema>: <its tables>}}. A store this
+  workspace does not have exits 3 not_found, naming the known stores in its
+  hint; a store that reports an error exits 5 datatable_error.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill datatable tables --store main
+""",
+    "datatable schema": """\
+windmill datatable schema <table> [--store S] [--schema pub]
+
+  Column names + compact types for one table. <table> may be "schema.table";
+  --schema (default public) applies when omitted. An explicit --schema wins
+  over the segment before the dot. --store defaults to main.
+
+  Output: the table's schema, as Windmill answers it.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill datatable schema public.seen
+""",
+    "datatable-db list": """\
+windmill datatable-db list
+
+  Statuses of every custom instance database (superadmin-only lifecycle of the
+  underlying PG databases), as Windmill answers it.
+""" + _HELP_SUPERADMIN + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill datatable-db list
+""",
+    "datatable-db create": """\
+windmill datatable-db create <name>
+
+  Run CREATE DATABASE on the Windmill PG and grant custom_instance_user.
+  MUTATING.
+
+  Output: {"name", "created": true, "status": <Windmill's answer>}.
+""" + _HELP_SUPERADMIN + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill datatable-db create analytics
+""",
+    "datatable-db drop": """\
+windmill datatable-db drop <name>
+
+  Drop a custom instance database (irreversible). MUTATING. Superadmin token
+  required — a non-superadmin surfaces as exit 2 with a hint.
+
+  Output: {"name", "dropped": true}.
+""" + _HELP_SUPERADMIN + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill datatable-db drop analytics
+""",
+}
+_HELP_SKELETON = """
+  Inputs resolve from config unless flagged:
+    folder    --folder | WINDMILL_FOLDER (the namespace)
+    operator  --operator | WINDMILL_OPERATOR (email) +
+              --operator-name | WINDMILL_OPERATOR_NAME
+    owners    the operator user (u/<local part of the email>), plus any --owner
+    scripts   each .ts (bun), .py (python3), .sh (bash) or .go file under
+              --scripts-dir (path f/<folder>/<stem>; example_* skipped; the
+              summary from its first comment line); omit to skip scripts
+  Each value resolves from its flag, else the project's .env(.local), else
+  the user config, else the process environment. No folder resolved exits 6
+  missing_folder; no operator exits 6 missing_config.
+
+    --folder NS        workspace folder/namespace (else WINDMILL_FOLDER)
+    --operator E       operator user email (else WINDMILL_OPERATOR)
+    --operator-name N  operator display name (else WINDMILL_OPERATOR_NAME)
+    --owner U          extra folder owner (u/.. or g/..); the operator is always
+                       an owner; repeats
+    --scripts-dir D    dir of deployable scripts (path f/<folder>/<stem>); omit to
+                       skip scripts
+
+  Variables are NOT provisioned here: the box↔Windmill
+  SSH vars are wired by the consumer's box routine. Pass
+  an explicit <manifest.json> to override config-discovery
+  (schema: {folder, owners[], users[], variables[],
+  scripts[], schedules[]}; file paths relative to it); given one, the
+  options above are not read. Its entries:
+    users[]      {email, operator, admin, name}
+    variables[]  {path, secret, value | value_env, description, external, note}
+    scripts[]    {path, file, lang, summary, description, timeout, tag}
+    schedules[]  {path, script, cron, timezone, enabled, run_as}
+  An unreadable manifest exits 6 manifest_unreadable, one that is not JSON 6
+  manifest_invalid.
+"""
+HELP_VERBS["verify"] = """\
+windmill verify [--folder NS] [--operator E] [--operator-name N]
+                [--owner U ...] [--scripts-dir D] [<manifest.json>]
+
+  Read-only: check the workspace skeleton against live state (folder+owners,
+  operator user, each discovered script) and report per-item ok + `ready`.
+  A script is ok once its lock is set and it has no deploy errors; a
+  manifest's variables and schedules are checked too.
+""" + _HELP_SKELETON + """
+  Output: {"ready": <every check ok>, "checks": [{"item", "ok", "detail"}]}.
+""" + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill verify --scripts-dir ./windmill
+"""
+HELP_VERBS["provision"] = """\
+windmill provision [--folder NS] [--operator E] [--operator-name N]
+                   [--owner U ...] [--scripts-dir D] [<manifest.json>]
+
+  Idempotent, non-destructive apply of that skeleton (the one `windmill help
+  verify` checks). Never deletes; never overwrites a present secret. A script
+  whose live content is unchanged is skipped; a manifest's `external`
+  variables are reported, not minted. A schedule with run_as is authored as
+  that user (impersonation), so its jobs execute under that identity.
+""" + _HELP_SKELETON + """
+  Output: {"folder", "actions": [...]}, one action per item: the answer of
+  the verb that applied it (folder-ensure, user-ensure, var-set, deploy,
+  schedule-set), or a note for an item it left - {"var"|"script", "skipped":
+  <why>}, an external variable's {"var", "external": true, "present", "note"},
+  or a schedule it could not author as its run_as user {"schedule", "run_as",
+  "note"}.
+""" + _HELP_WRITE + _HELP_OPTIONS + _HELP_EXIT + """
+  Example: windmill provision --folder myproj --operator operator@example.com --scripts-dir ./windmill
+"""
 
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -1455,7 +1927,7 @@ def main() -> None:
 
     args = p.parse_args()
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n")); return
+        _cmd_help(); return      # `--connection <id> help`: the same menu
     if args.cmd == "doctor":
         cmd_doctor(args); return
 

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -11,492 +11,114 @@
 """
 telegram — agent-first CLI for a personal Telegram account (MTProto, full account).
 
-This tool is designed to be invoked by agents. Run `telegram help` to load the full
-usage contract on demand — do not rely on memorised knowledge of its surface.
+This is the menu; `telegram help <verb>` is one verb's whole contract, loaded on
+demand rather than from memorised knowledge of its surface.
 
 Agent startup protocol (this is a STATEFUL CLI — it holds a login session):
-  1. Run `telegram doctor` first. It proves the chain: credentials resolve, Telegram
-     is reachable, and the session is authorized.
+  1. Run `telegram doctor` first. It proves the chain: credentials resolve,
+     Telegram is reachable, and the session is authorized.
   2. Exit 2 from doctor means the session is missing or expired — run
      `telegram login` (shows a QR to scan from an already authorized Telegram
-     app, then prompts for the 2FA password if set), or `telegram login --phone`
-     (prompts for phone, the code Telegram sends, and a 2FA password if set).
-     Login persists the session file; later commands reuse it with no prompt.
+     app, then prompts for the 2FA password if set), or sign in with the phone
+     number and the code Telegram sends (`telegram help login`). Login persists
+     the session file; later commands reuse it with no prompt.
   3. A healthy `telegram doctor` (exit 0) means ready to work.
 
 The app every account signs in through is registered once at my.telegram.org/apps
-and given to the machine once: `telegram setup set --field TELEGRAM_API_ID=<id>
---stdin` with {"TELEGRAM_API_HASH": "<hash>"} on stdin, and `telegram app-check`
-asks Telegram whether it accepts it before any account is linked. `connection add`
-of a connection naming no `api_id` or `secret_env` of its own copies that app into
-it - the id as its `api_id`, the hash sealed into the agent's vault under the
-connection's own TELEGRAM_<ID>_API_HASH - so it is the connection's own from then
-on and signs in the same on a node with no machine file; where no vault takes the
-hash nothing is copied and the connection inherits the machine's app as before.
-`connection seal` (and `capabilities connections seal`) does the same for a
-connection that still inherits it.
+and given to the machine once with `telegram setup set`, and `telegram app-check`
+asks Telegram whether it accepts it before any account is linked. `connection
+add` copies that app into a connection that names none of its own
+(`telegram help connection`).
 
-Configuration requires explicit connections with a positive
-`expected_account_id`, including the one-account case. The selected connection's app credentials and session resolve
-through the credential cascade (`Where a secret resolves`, at the end of this
-help), after the `--session` flag (session path only). Secrets (TELEGRAM_API_HASH,
-DEEPGRAM_API_KEY) have no flag — only their env-var NAME resolves them, never the
-command line.
-
-More than one account is declared in a connections registry — the project's
-own, else the machine-level ~/.config/telegram/connections.json (the natural
-home for a personal account); where this project keeps its own, and in what
-order they are read, "Where connections live" below says. An entry may name an app of its own - its id literally and
-its hash by env-key indirection - and otherwise signs in through the machine's;
-each owns a per-connection session, kept on each machine at
-<state-dir>/<id>/session. A `session` path the entry records is one machine's
-path, since every machine reading the record sees it: it is used where a session
-already lives there or where it lies under this machine's home, and elsewhere the
-connection's session is this machine's own <state-dir>/<id>/session:
-
-  {
-    "default": "marvin",
-    "connections": {
-      "marvin": { "name": "Marvin AI", "username": "marvin_kz",
-                       "expected_account_id": 8200881535,
-                       "api_id": 1234567, "secret_env": "TELEGRAM_API_HASH",
-                       "allow_write": true }
-    }
-  }
-
-Every live connection declares the positive Telegram user/account ID in
-`expected_account_id`; it is distinct from the API application `api_id` and
-need not equal the registry label. Discovery login may run before this binding;
-doctor, service and live takeover refuse an absent or mismatched identity.
-
-One account is reached through one connection. The account's own folder,
-$XDG_STATE_HOME/telegram/<account>/linked-by.json, records the connection that
-holds it on this machine and the project whose own connection that is (null
-for one the machine shares); `login` writes it, and a successful `doctor`
-writes it where nothing holds the account yet. `connection add` naming that
-account's expected_account_id, and `login` of any other connection to it, are
-refused with exit 6 `number_linked`, the error carrying `account` and
-`holder` {connection, owner}: nothing is written, and a session the refused
-login had just signed in is signed out again. Another project is given the
-holding connection by a grant instead. The holder logging in again is not
-refused, nor is anyone once the holder was removed.
+Every live connection declares the positive Telegram account it signs in as,
+`expected_account_id`; one account is reached through one connection. Where
+connections live, how one is selected and where its app and session resolve:
+`telegram help connections`. Secrets never come on the command line.
 
 The write gate: outbound sends and reactions leave the system, so they are off
-unless a connection grants them. Grant them with
-`"allow_write": true` on a connection's grant. A refused write exits
-4 — ask the user, never lift the gate yourself.
+unless a connection grants them, with `"allow_write": true` on a connection's
+grant. A refused write exits 4 — ask the user, never lift the gate yourself.
 
-Outside any project, connections, doctor and app-check are machine reads:
-they use the machine's own connections read-only, unless a grant switched one
-off. login uses them there too, so a connection declared globally is linked on
-the machine; every other verb that needs a connection is refused there.
+Outside any project, connections, doctor and app-check are machine reads, and
+login links a connection declared globally; every other verb that needs a
+connection is refused there.
 
-  --connection <id>        Select a connection; accepted by every verb. Optional
-                           with a default pointer or a sole connection.
-  TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps: the machine's
-                           app, which a connection naming no `api_id` is given as its
-                           own when it is added, and inherits until it is.
-  TELEGRAM_API_HASH        App hash paired with the id (secret); copied with the id
-                           under the connection's own key, else inherited.
-  TELEGRAM_SESSION         Session path, no extension — Telethon writes
-                           <path>.session on disk. Optional one-shot override; the
-                           default connection's session defaults to
-                           $XDG_STATE_HOME/telegram/session, a named connection's
-                           to <state-dir>/<id>/session.
-  DEEPGRAM_API_KEY         Required only by `transcribe` (secret). Shared: set once
-                           with `telegram setup set`, which stores it, and read
-                           back, as `Where a secret resolves` says.
+Signing in
+  telegram login                       link the account: a QR, or phone and code
+  telegram app-check                   does Telegram accept the app; no account touched
+  telegram whoami                      identity of the signed-in account
 
-  --session <PATH>         One-shot override of the session-file path, accepted
-                           anywhere on the line. Names a path, not a secret.
+Reading
+  telegram chats                       recent dialogs, each with what the chat is
+  telegram topics <chat>               a forum group's topics
+  telegram read <chat>                 messages from a chat, or from one forum topic
+  telegram search <chat> <query>       messages matching a query inside a chat
+  telegram download <chat> <msgid>     one message's media, at its cached path
+  telegram export <chat>               full history to JSON, with its media
+  telegram transcribe <json_path>      fill an export's audio transcriptions
 
-Commands:
-  telegram help                                Print this document.
-  telegram doctor                              Health check: creds + reachability + session.
-  telegram login [--phone [NUMBER]] [--events] Interactive first-time auth: by default scan
-                                               a QR from an authorized app (`--qr` names it
-                                               explicitly); `--phone` signs in with the
-                                               phone number and the code Telegram sends.
-                                               `--events` drives it with no terminal: JSON
-                                               lines on stdout (qr, with a new one each
-                                               time one expires, for up to five minutes;
-                                               phone_needed; code_needed; password_needed
-                                               with the account's hint; done; error) and
-                                               each answer as one line on stdin. A first
-                                               login under `--events` that fails or is
-                                               cancelled (SIGTERM, SIGINT, SIGHUP) removes
-                                               the connection and the session file it
-                                               made. The session file is owner-only (0600).
-  telegram app-check                           Ask Telegram whether it accepts the app
-                                               this machine signs in through (`--connection`
-                                               names a connection's app instead), by asking
-                                               for a login token: no account is touched and
-                                               no code is sent. `status` is `accepted`
-                                               (exit 0), `invalid` (Telegram does not know
-                                               the id and hash; exit 2), or `refused`, with
-                                               `reason` `blocked` (exit 2), `flood_limited`
-                                               and `retry_after` seconds (exit 5), or
-                                               `other` (exit 5); `message` says why in
-                                               a sentence a person can be shown, and
-                                               `error` carries what Telegram answered.
-  telegram whoami                              Identity of the signed-in account.
-  telegram chats [--limit N]                   List recent dialogs. Beside `id`, `name`,
-                                               `unread` and `kind` (the raw Telegram
-                                               class), each entry settles what the chat
-                                               is: `category` is `user`, `bot`, `group`
-                                               (a legacy group, a supergroup or a
-                                               gigagroup), `channel` (a broadcast only
-                                               its admins post in), or `unknown` when the
-                                               class settles nothing; and `forum` is true
-                                               when the chat's messages live in topics,
-                                               which `telegram topics` lists.
-  telegram topics <chat> [--limit N] [--query TEXT]
-                                               List a forum group's topics; each
-                                               `id` is the root message id the
-                                               send verbs take as --topic.
-  telegram read <chat> [--limit N] [--since ISO] [--topic TOPIC_ID] [--json]
-                                               Read messages from a chat. A read
-                                               of a forum spans every one of its
-                                               topics unless --topic names one
-                                               by its root message id, the id
-                                               `telegram topics` prints and the
-                                               send verbs take; a named topic
-                                               carries both the messages posted
-                                               straight into it and the replies
-                                               threaded inside it, and --limit
-                                               counts what comes back. Each JSON
-                                               record carries the `topic_id` it
-                                               came from: a root message id, 1
-                                               for a forum's General topic, and
-                                               null in a chat whose messages
-                                               live in no topic at all.
-  telegram search <chat> <query> [--limit N] [--topic TOPIC_ID] [--json]
-                                               Search messages inside a chat;
-                                               the same forum-topic scoping and
-                                               `topic_id` as `read`.
-  telegram send <chat> <text> [--reply-to MSG_ID | --topic TOPIC_ID] [--external]
-            [--no-link-preview]
-                                               Send a message. In a forum, a
-                                               message lands in the topic named
-                                               by --topic (its root message id)
-                                               or in the topic owning the
-                                               --reply-to message; with neither
-                                               it lands in General.
-                                               --no-link-preview sends it
-                                               without the preview card Telegram
-                                               attaches to a link; the service's
-                                               own messages take the same switch
-                                               as `defaults.link_preview`.
-  telegram send-media <chat> <path> [--caption TEXT]
-            [--reply-to MSG_ID | --topic TOPIC_ID]
-                                                 Send a local media file; the
-                                                 same forum-topic addressing.
-  telegram react <chat> <msgid> <emoji> [...]  Add one or more emoji reactions.
-  telegram download <chat> <msgid> [--json]    Materialize one message's media to a
-                                               deterministic per-connection cache
-                                               path (download only if absent);
-                                               prints the absolute path.
-  telegram export <chat> --out PATH [--media-dir PATH] [--limit N] [--since ISO]
-            [--topic TOPIC_ID] [--no-photos] [--no-stickers] [--videos] [--documents]
-                                               Dump full history to JSON; download
-                                               voice/audio (+photos/stickers by
-                                               default) to media-dir; leave
-                                               transcription placeholders. The
-                                               same forum-topic scoping and
-                                               `topic_id` as `read`.
-  telegram transcribe <json_path> [--force] [--model nova-3]
-                                               Fill transcription placeholders in an
-                                               exported JSON via Deepgram (audio
-                                               referenced by media.file_path).
-  telegram service init [--connection ID] [--force]
-                                               Create project-local service settings
-                                               and context templates.
-  telegram service migrate-ownership --connection ID
-            --confirm-all-legacy-daemons-stopped
-                                               One-time fail-closed cutover to
-                                               account-global daemon ownership.
-  telegram service migrate-profiles [--apply]
-                                               Move the old worker settings to
-                                               profile names: each distinct
-                                               worker and its model, effort,
-                                               speed and context becomes one
-                                               project profile named from the
-                                               values, and settings, the
-                                               channel register and open job
-                                               rows name it. A dry run unless
-                                               --apply; --apply needs the
-                                               service stopped. Prints the
-                                               TELEGRAM_SERVICE_PROFILE value
-                                               that replaces a set TG_WORKER or
-                                               TELEGRAM_SERVICE_WORKER.
-  telegram service schema                      Print the settings the service
-                                               holds itself to as JSON Schema
-                                               (draft 2020-12), with what a
-                                               panel needs under x- keys:
-                                               x-apply (reload or restart),
-                                               x-keyed-by and x-entry-label of
-                                               each map, x-inherits (where an
-                                               absent value comes from),
-                                               x-layers, x-document (a prompt
-                                               file and its document key) and
-                                               x-documents (the service's own
-                                               prompts).
-  telegram service validate [--scope project|global] [--key KEY]
-                                               Judge proposed settings exactly
-                                               as `service reload` would and
-                                               write nothing: stdin carries the
-                                               scope's whole document, or with
-                                               --key the JSON value of that key
-                                               (dotted for a nested one) put
-                                               over the document held now.
-                                               Refused with exit 6
-                                               service_settings_invalid naming
-                                               the full path the reload names.
-                                               Accepted, it prints the top-level
-                                               keys that change, `apply`
-                                               (reload, or restart when
-                                               connection changes) and each
-                                               prompt file the settings name
-                                               with its document key: `telegram
-                                               context show|edit|put <key>`
-                                               reads and writes it.
-  telegram service harness [--json]            The harness tools (claude, codex)
-                                               of every profile a turn is
-                                               configured to run on now - each
-                                               name the settings reach, every
-                                               chat's `/set profile` and the
-                                               profile of every open job - each
-                                               resolved and fitted as a turn
-                                               resolves it, for the sign-ins a
-                                               node needs. Runs no turn and
-                                               writes nothing; `unresolved`
-                                               names a profile that does not
-                                               resolve or fit.
-  telegram call hangup [--chat ID] [--timeout S]
-                                               End the voice call the running
-                                               service holds, after what is
-                                               already being said: the service
-                                               answers `scheduled` at once and
-                                               closes the line once it has been
-                                               quiet for a moment (at most
-                                               about 30 s), through the
-                                               ordinary ending, so the
-                                               recording and summary still
-                                               arrive. Exit 5 no_active_call
-                                               when no call runs (in that chat,
-                                               with --chat); exit 6
-                                               call_hangup_unsupported when the
-                                               running service predates it,
-                                               which is then never signalled.
-                                               Inside a service turn it ends
-                                               only that turn's own chat's call.
-  telegram service doctor|run|start|reload|stop|status|logs
-                                               Manage the bundled Telegram assistant
-                                               service for this project. The engine
-                                               runs from the installed capability
-                                               bundle; the project stores only
-                                               capabilities/telegram/service config.
-                                               Status follows the account-global
-                                               owner record and reports actual code,
-                                               project and state provenance.
-                                               Every worker turn - dialogue,
-                                               job, voice task, call summary -
-                                               runs through callva-harness-
-                                               runner on the profile its room
-                                               names: the channel's /set
-                                               profile, a forum topic's,
-                                               group's or direct user's
-                                               `profile`, then
-                                               `defaults.profile` (over it,
-                                               TELEGRAM_SERVICE_PROFILE), else
-                                               `stub`; a call's task and the
-                                               call summary run on
-                                               `defaults.voice_agent.profile`,
-                                               then the default. `start` and
-                                               `run` refuse with exit 6
-                                               profile_refused when a name the
-                                               settings reach does not resolve
-                                               or fit, and with exit 6
-                                               profiles_migration_required while
-                                               settings, the channel register
-                                               or the environment still name a
-                                               worker (`worker`, `workers`,
-                                               TELEGRAM_SERVICE_WORKER,
-                                               TG_WORKER). `doctor` reports
-                                               each distinct profile the
-                                               settings name as `resolved` with
-                                               its harness, model, layer and
-                                               version, or `failed` when it does
-                                               not resolve or fit, and starts
-                                               no session. `doctor --live` also
-                                               spends one live turn per
-                                               profile, held to
-                                               `defaults.worker_timeout`, and
-                                               reports the harness's own
-                                               verdict in place of `resolved`:
-                                               a model the harness refuses, a
-                                               harness missing from PATH or
-                                               older than the runner supports,
-                                               one that cannot authenticate, or
-                                               one that gives no verdict in
-                                               time is not ok.
-                                               `doctor` exits 5 when its own
-                                               verdict is `ok: false`, so a
-                                               script can gate on it. A
-                                               settings `environment` key or a
-                                               TELEGRAM_ENVIRONMENT variable is
-                                               retired and has no effect: the
-                                               service keeps one register per
-                                               project, and `doctor` names
-                                               either under `retired` and
-                                               `warnings` for its removal.
-                                               The job register lives in the
-                                               project's Postgres database, in
-                                               telegram_* tables migrated on
-                                               first use; `doctor` reports
-                                               whether it opens and which level
-                                               named it. The database is the
-                                               first that answers: the
-                                               project's .env.local / .env,
-                                               then the environment, then the
-                                               machine's store setting
-                                               (`capabilities store show` shows
-                                               which). With none, `start`, `run`
-                                               and `jobs` exit 6
-                                               store_not_configured.
-  telegram prompts list | show <key> [--version ID] | versions <key>
-            | put <key> <file|-> [--base ID] [--note TEXT]
-            | import [DIR] [--note TEXT] | export [DIR]
-                                               The service's prompts - context,
-                                               delegation, job-worker, the voice
-                                               prompts and each context/<x> - as
-                                               versions in telegram_prompt_versions
-                                               in the project's store. The service
-                                               reads a key's active version, and its
-                                               file under capabilities/telegram/
-                                               service only while the store holds
-                                               no version of that key. `import`
-                                               saves each file there (or in DIR)
-                                               whose text is not the active
-                                               version; `export` writes each
-                                               active version back as its file,
-                                               leaving an equal one alone. `put`
-                                               saves a new version and keeps the
-                                               earlier ones readable through
-                                               `versions` and `show --version`;
-                                               `--base` names the version
-                                               replaced, and a save that lost the
-                                               race exits 6 conflict. A worker
-                                               saves only for a requester whose
-                                               role may /set.
-  telegram profiles list | show <name> | save <name> <file|-> [--base ID]
-                                               The harness profiles a worker runs
-                                               on, kept in the project's store.
-                                               Every name starts with telegram-;
-                                               one resolves to this project's
-                                               version, then the global one, then
-                                               the bundled telegram-claude and
-                                               telegram-codex. `list` shows each
-                                               with its layer, version, harness,
-                                               model, effort, rights, timeout and
-                                               fit; `show` adds its text. `save`
-                                               writes a new version at this
-                                               project's scope only, refusing a
-                                               bundled or global name, a profile
-                                               the runner or fit refuses, and a
-                                               `${`; `--base` names the version
-                                               replaced, and a save that lost the
-                                               race exits 6 conflict. A worker
-                                               saves only for a requester whose
-                                               role may /set. The runner is
-                                               pinned in the bundle's
-                                               service/profiles.py, which these
-                                               verbs run.
+Writing (each needs a connection that grants writes; exit 4 otherwise)
+  telegram send <chat> <text>          send a message
+  telegram send-media <chat> <path>    send a local media file
+  telegram react <chat> <msgid> <emoji>  add one or more emoji reactions
 
-Chat references:
-  <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
-  (case-insensitive substring matched against your dialog list).
+The assistant service (`telegram guide assistant-service`)
+  telegram service init                create the project's service settings and prompts
+  telegram service doctor              local readiness: settings, profiles, store
+  telegram service run                 run the assistant in the foreground
+  telegram service start               start it in the background
+  telegram service reload              validate and apply settings without disconnecting
+  telegram service stop                stop it, once it acknowledges
+  telegram service status              owner record, health and provenance
+  telegram service logs                the tail of the service log
+  telegram service schema              its settings as JSON Schema
+  telegram service validate            judge proposed settings as a reload would
+  telegram service harness             the harness tools the configured profiles run on
+  telegram service migrate-ownership   one-time cutover to account-global ownership
+  telegram service migrate-profiles    move old worker settings to profile names
+  telegram call hangup                 end the voice call the service holds
+Its settings are the contract's `telegram settings`, below.
 
-I/O contract:
-  - Success: JSON on stdout, exit 0. (`read`/`search` without --json emit a
-    human-readable transcript as a single text block.)
-  - Progress for long runs (export, transcribe) goes to STDERR; stdout stays
-    clean for the final result.
-  - Error:   {"error": {"code", "message", "hint"?, "status"?}} on stderr,
-             non-zero exit.
+The service's profiles, prompts and jobs
+  telegram profiles list               the harness profiles a worker runs on
+  telegram profiles show <name>        one profile as it resolves, and its text
+  telegram profiles save <name>        a new version at this project's scope
+  telegram prompts list                every prompt key the store holds
+  telegram prompts show <key>          one prompt's active version, or one named
+  telegram prompts versions <key>      every version of one prompt, newest first
+  telegram prompts put <key>           save a new version of one prompt
+  telegram prompts import              save the service directory's prompt files
+  telegram prompts export              write each active version as its file
+  telegram jobs help                   the jobs surface: every verb and its flags
+  telegram jobs list                   jobs in this project's register
+  telegram jobs active                 only what is waiting or running
+  telegram jobs show <id>              one job in full, staged text included
+  telegram jobs register <description> enter one task into the queue, as a draft
+  telegram jobs submit <id>            hand a draft to the runner
+  telegram jobs amend <id> <text>      continue a job with added context
+  telegram jobs discard <id>           drop a draft nobody is going to submit
+  telegram jobs stop <id>              stop the work; it keeps its session and place
+  telegram jobs resume <id>            continue stopped work, whatever stopped it
 
-Contract commands (the same on every capability):
-  telegram stub                                 One-line awareness text.
-  telegram manifest --json                      Machine-readable declaration;
-                                                 `connections.device_bound` is
-                                                 true: a connection is a session
-                                                 minted on one device.
-  telegram connections                          Where every connection's values
-                                                 resolve from — tier, source,
-                                                 secrets masked (local, no network).
-                                                 Each connection carries `session`
-                                                 {live, account}: `live` is true
-                                                 when its session file on this
-                                                 machine holds an auth key and the
-                                                 signed-in account Telethon keeps
-                                                 beside it, and no service here
-                                                 recorded it unauthorized since it
-                                                 last started; `account` is the
-                                                 account the connection records
-                                                 (the one login/doctor verified,
-                                                 else expected_account_id), or null.
-  telegram guide [<topic>]                      Guide topics / one guide body,
-                                                 fetched live from the docs base.
-  telegram ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-                [--note <text>]                  (capabilities/telegram/identifiers.json,
-                                                  or store rows once the agent moved).
-  telegram refs                                 Menu of the project's reference
-                                                 files for this capability.
-  telegram inventory [--network]                What this capability holds in
-                                                this project (--network adds
-                                                remote detail).
-  telegram migrate [status]                     Apply the job register's pending
-                                                steps to the machine's store,
-                                                after the harness runner's
-                                                profile table under its ledger
-                                                `harness`; `status` reports
-                                                where both stand (the runner's
-                                                under `harness`), without a
-                                                lock, changing nothing.
+Chat references: <chat> can be @username, a phone (+1555…), a numeric id, or a
+chat title (case-insensitive substring matched against your dialog list).
 
-Exit codes:
-  0  success
-  2  auth — missing/invalid credentials, session expired, not logged in
-  3  not found — the chat or entity could not be resolved
-  4  policy refusal — disabled by effective project/global policy records,
-     or `send` on a read-only connection — ask the user, never lift the gate
-     yourself
-  5  server / network — Telegram unreachable, flood-wait, Deepgram 5xx, and
-     `service doctor` reporting `ok: false` — a running daemon whose update
-     sync is not fresh, a profile the settings name that does not resolve
-     or fit or, under `--live`, that its harness did not accept, a job
-     register the store did not open, or a running daemon whose last
-     reply-gate run in a channel failed; after its report it prints the
-     error envelope naming the first of these (`service_unhealthy` with the
-     daemon's last error, `worker_unavailable`, the store's own code, or
-     `gate_failing`),
-     which a supervisor records as why the service cannot work. A route
-     skipped on this node is named under `skipped_settings` beside
-     `warnings`, and the doctor stays ok
-  6  input / validation — a malformed argument, a bad date, a machine with
-     no store configured for the service or its jobs, a profile the
-     service settings name that does not resolve or fit, a worker still
-     named where a profile is (run `telegram service migrate-profiles`), or
-     an account another connection already holds (`number_linked`), or a
-     file this machine cannot open or make, such as the session's folder
-     (`local_file_error`, naming the path)
+I/O contract: success is JSON on stdout, exit 0 (`read` and `search` print a
+transcript unless asked for JSON); progress for long runs goes to STDERR; an
+error is {"error": {"code", "message", "hint"?, "status"?}} on stderr, non-zero
+exit.
 
-Quirks worth knowing:
-  - This is a full-account MTProto session — a personal user account, so it
-    sees everything that account sees. The session file is auth material — it
-    grants account access; keep it out of the repo.
-  - A flood-wait (too many requests) surfaces as exit 5 with the wait seconds
-    in the message; back off and retry later.
+Exit codes: 0 success; 2 auth — missing or invalid credentials, session expired,
+not logged in; 3 not found — the chat or entity could not be resolved; 4 policy
+refusal — disabled by policy, or a write on a read-only connection; 5 server or
+network — Telegram unreachable, a flood-wait, Deepgram, or `service doctor`
+reporting not ok; 6 input or validation. Each verb's page names its own.
+
+Quirks worth knowing: this is a full-account MTProto session — a personal user
+account, so it sees everything that account sees. The session file is auth
+material — it grants account access; keep it out of the repo. A flood-wait (too
+many requests) surfaces as exit 5 with the wait seconds in the message; back
+off and retry later.
 """
 
 import argparse
@@ -5654,6 +5276,1006 @@ def cmd_service_run(connection_flag: str | None, session_flag: str | None) -> No
 
 # --- CLI ---------------------------------------------------------------------
 
+# The verb pages `telegram help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, connection, setup,
+# manifest, ids and migrate follow. A text several verbs own is one constant,
+# added to each of their pages.
+_HELP_SELECT = """
+  Connection: --connection <id>   Select a connection; accepted by every verb,
+                                  anywhere on the line. Optional with a
+                                  default pointer or a sole connection.
+  --session <PATH>                One-shot override of the session-file path,
+                                  accepted anywhere on the line. Names a path,
+                                  not a secret.
+  The selected connection's app credentials and session resolve through the
+  credential cascade (`Where a secret resolves`, on `telegram help
+  connections`), after the --session flag (session path only). Secrets
+  (TELEGRAM_API_HASH, DEEPGRAM_API_KEY) have no flag — only their env-var NAME
+  resolves them, never the command line.
+
+  TELEGRAM_API_ID          Numeric app id from my.telegram.org/apps: the machine's
+                           app, which a connection naming no `api_id` is given as its
+                           own when it is added, and inherits until it is.
+  TELEGRAM_API_HASH        App hash paired with the id (secret); copied with the id
+                           under the connection's own key, else inherited.
+  TELEGRAM_SESSION         Session path, no extension — Telethon writes
+                           <path>.session on disk. Optional one-shot override; the
+                           default connection's session defaults to
+                           $XDG_STATE_HOME/telegram/session, a named connection's
+                           to <state-dir>/<id>/session.
+  DEEPGRAM_API_KEY         Required only by `transcribe` (secret). Shared: set once
+                           with `telegram setup set`, which stores it, and read
+                           back, as `Where a secret resolves` says.
+"""
+_HELP_CHAT = """
+  <chat> can be @username, a phone (+1555…), a numeric id, or a chat title
+  (case-insensitive substring matched against your dialog list).
+"""
+_HELP_APP = """
+  The app every account signs in through is registered once at my.telegram.org/apps
+  and given to the machine once: `telegram setup set --field TELEGRAM_API_ID=<id>
+  --stdin` with {"TELEGRAM_API_HASH": "<hash>"} on stdin, and `telegram app-check`
+  asks Telegram whether it accepts it before any account is linked. `connection add`
+  of a connection naming no `api_id` or `secret_env` of its own copies that app into
+  it - the id as its `api_id`, the hash sealed into the agent's vault under the
+  connection's own TELEGRAM_<ID>_API_HASH - so it is the connection's own from then
+  on and signs in the same on a node with no machine file; where no vault takes the
+  hash nothing is copied and the connection inherits the machine's app as before.
+  `connection seal` (and `capabilities connections seal`) does the same for a
+  connection that still inherits it.
+"""
+_HELP_REGISTRY = """
+  Configuration requires explicit connections with a positive
+  `expected_account_id`, including the one-account case.
+
+  More than one account is declared in a connections registry — the project's
+  own, else the machine-level ~/.config/telegram/connections.json (the natural
+  home for a personal account); where this project keeps its own, and in what
+  order they are read, "Where connections live" on `telegram help connections`
+  says. An entry may name an app of its own - its id literally and its hash by
+  env-key indirection - and otherwise signs in through the machine's; each owns
+  a per-connection session, kept on each machine at <state-dir>/<id>/session. A
+  `session` path the entry records is one machine's path, since every machine
+  reading the record sees it: it is used where a session already lives there or
+  where it lies under this machine's home, and elsewhere the connection's
+  session is this machine's own <state-dir>/<id>/session:
+
+    {
+      "default": "main",
+      "connections": {
+        "main": { "name": "Example Account", "username": "example_user",
+                         "expected_account_id": 1000000001,
+                         "api_id": 1234567, "secret_env": "TELEGRAM_API_HASH",
+                         "allow_write": true }
+      }
+    }
+
+  Every live connection declares the positive Telegram user/account ID in
+  `expected_account_id`; it is distinct from the API application `api_id` and
+  need not equal the registry label. Discovery login may run before this binding;
+  doctor, service and live takeover refuse an absent or mismatched identity.
+"""
+_HELP_ONE_ACCOUNT = """
+  One account is reached through one connection. The account's own folder,
+  $XDG_STATE_HOME/telegram/<account>/linked-by.json, records the connection that
+  holds it on this machine and the project whose own connection that is (null
+  for one the machine shares); `login` writes it, and a successful `doctor`
+  writes it where nothing holds the account yet. `connection add` naming that
+  account's expected_account_id, and `login` of any other connection to it, are
+  refused with exit 6 `number_linked`, the error carrying `account` and
+  `holder` {connection, owner}: nothing is written, and a session the refused
+  login had just signed in is signed out again. Another project is given the
+  holding connection by a grant instead. The holder logging in again is not
+  refused, nor is anyone once the holder was removed.
+"""
+_HELP_MACHINE_READS = """
+  Outside any project, connections, doctor and app-check are machine reads:
+  they use the machine's own connections read-only, unless a grant switched one
+  off. login uses them there too, so a connection declared globally is linked on
+  the machine; every other verb that needs a connection is refused there.
+"""
+_HELP_WRITE = """
+  The write gate: outbound sends and reactions leave the system, so they are off
+  unless a connection grants them. Grant them with `"allow_write": true` on a
+  connection's grant. A refused write exits 4 — ask the user, never lift the
+  gate yourself.
+"""
+_HELP_TOPIC_SCOPE = """
+  A read of a forum spans every one of its topics unless --topic names one by
+  its root message id, the id `telegram topics` prints and the send verbs take;
+  a named topic carries both the messages posted straight into it and the
+  replies threaded inside it, and --limit counts what comes back. Each JSON
+  record carries the `topic_id` it came from: a root message id, 1 for a
+  forum's General topic, and null in a chat whose messages live in no topic at
+  all. --topic on a chat that is no forum exits 3 not_a_forum; a --topic that
+  is not a positive message id exits 6 invalid_message_id.
+"""
+_HELP_SEND_TOPIC = """
+  In a forum, a message lands in the topic named by --topic (its root message
+  id) or in the topic owning the --reply-to message; with neither it lands in
+  General. --reply-to and --topic together exit 6 reply_target_conflict (a
+  reply already lands in its own topic), and either one that is not a positive
+  message id exits 6 invalid_message_id.
+
+  --external asks the answering assistant to tag its reply so no peer daemon
+  answers it: the text (the caption, for send-media) ends with a last line
+  #external.
+"""
+_HELP_EXIT_CONN = """
+  Exit codes:
+    0  success
+    2  auth — missing/invalid credentials, session expired, not logged in
+       (not_authorized, auth_failed, account_identity_mismatch): run
+       `telegram login`, or `telegram login --phone`
+    3  not found — the chat or entity could not be resolved (chat_not_found)
+    4  policy refusal — disabled by effective project/global policy records,
+       or a write on a read-only connection — ask the user, never lift the
+       gate yourself
+    5  server / network — Telegram unreachable (network_error, rpc_error), or
+       a flood-wait (flood_wait, with the wait seconds in the message; back
+       off and retry later)
+    6  input / validation — a malformed argument, a bad date (bad_date),
+       invalid_input, or a file this machine cannot open or make, such as the
+       session's folder (local_file_error, naming the path)
+"""
+_HELP_STORE = """
+  The job register lives in the project's Postgres database, in telegram_*
+  tables migrated on first use. The database is the first that answers: the
+  project's .env.local / .env, then the environment, then the machine's store
+  setting (`capabilities store show` shows which). With none, `service start`,
+  `service run` and `jobs` exit 6 store_not_configured.
+"""
+_HELP_SERVICE = """
+  The bundled Telegram assistant service for this project
+  (`telegram guide assistant-service`). The engine runs from the installed
+  capability bundle; the project stores only capabilities/telegram/service
+  config. Status follows the account-global owner record and reports actual
+  code, project and state provenance. --connection <id> names the connection
+  it runs on, else the settings' `connection`; --session <PATH> overrides the
+  session path. Its settings are the contract's `telegram settings`
+  (`telegram help settings`).
+"""
+_HELP_SERVICE_PROFILES = """
+  Every worker turn - dialogue, job, voice task, call summary - runs through
+  callva-harness-runner on the profile its room names: the channel's /set
+  profile, a forum topic's, group's or direct user's `profile`, then
+  `defaults.profile` (over it, TELEGRAM_SERVICE_PROFILE), else `stub`; a call's
+  task and the call summary run on `defaults.voice_agent.profile`, then the
+  default.
+"""
+_HELP_SERVICE_REFUSALS = """
+  `start` and `run` refuse with exit 6 profile_refused when a name the settings
+  reach does not resolve or fit, and with exit 6 profiles_migration_required
+  while settings, the channel register or the environment still name a worker
+  (`worker`, `workers`, TELEGRAM_SERVICE_WORKER, TG_WORKER: run `telegram
+  service migrate-profiles`). A machine with no store configured for the
+  service or its jobs exits 6 store_not_configured. Other refusals: exit 3
+  service_bundle_missing (the bundled daemon is absent: reinstall/update
+  telegram), exit 6 service_not_initialized (run `telegram service init`),
+  service_state_version_mismatch, legacy_daemon_running, a connection with no
+  expected_account_id, and exit 4 under the write gate, since the service
+  answers through the connection's write grant.
+"""
+_HELP_JOBS = """
+  The register of work that outlives a conversation, in the project's store.
+  States: draft, waiting, running, stopped; a stopped job's outcome is
+  succeeded, failed, cancelled, interrupted, quota or model_refused. A row
+  reports `stopping` for a stop that was requested and not yet taken.
+
+  Every jobs verb but help takes --chat <chat id> (restrict to one chat) and
+  --topic-id <id> (restrict to one forum topic). A worker the service started
+  is held to the chat, topic, requester, origin and profile it was started for:
+  naming another exits 4 job_scope_denied or job_actor_denied, and a worker
+  launched without its requester exits 4 job_scope_missing. A maintainer at a
+  terminal reads the whole register unscoped. The register is a table, not a
+  session: no jobs verb opens Telegram. Every verb but list, active and show
+  changes the register and is refused under the read-only switch (exit 4).
+""" + _HELP_STORE + """
+  Exit codes: 0; 2 job_not_found for an id not in this project's register; 4
+  job_scope_denied, job_actor_denied, job_scope_missing, the read-only switch,
+  or agent_archived; 5 the store unreachable; 6 store_not_configured, or the
+  register's refusal named by its code.
+"""
+_HELP_PROFILE_SAVE = """
+  A worker saves only for a requester whose role may /set; --base names the
+  version replaced, and a save that lost the race exits 6 conflict.
+"""
+_HELP_PROMPTS = """
+  The service's prompts - context, delegation, job-worker, the voice prompts
+  and each context/<x> - as versions in telegram_prompt_versions in the
+  project's store. The service reads a key's active version, and its file
+  under capabilities/telegram/service only while the store holds no version of
+  that key. Needs a project and its store; put and import are refused under the
+  read-only switch (exit 4).
+
+  Exit codes: 0; 3 not_found for a key or version the store does not hold; 4
+  the read-only switch; 5 the store unreachable; 6 store_not_configured, input
+  (a file that cannot be read or written, a directory that is not one), or the
+  store's refusal by its code (conflict, for a save that lost the race).
+"""
+_HELP_PROFILES = """
+  The harness profiles a worker runs on, kept in the project's store. Every
+  name starts with telegram-; one resolves to this project's version, then the
+  global one, then the bundled telegram-claude and telegram-codex. The runner
+  is pinned in the bundle's service/profiles.py, which these verbs run. Needs a
+  project that declares an id (exit 6 no_project_identity otherwise: run
+  `capabilities init`) and its store.
+
+  Exit codes: 0; 4 save under the read-only switch; 6 no_project_identity or
+  input; otherwise a refusal of service/profiles.py - a name that does not
+  resolve, a profile the runner or fit refuses, the store unreachable - with
+  its own exit code and code.
+"""
+HELP_VERBS = {
+    "doctor": """\
+  For telegram: every connection's cheapest authenticated round-trip - the bare
+  cascade, or just the one --connection <id> names: credentials resolve,
+  Telegram is reachable, the session is authorized, and the account it signs in
+  as is the connection's `expected_account_id`. A healthy connection records
+  its identity, and the account's linked-by.json where nothing holds the
+  account yet.
+
+  Output: {"ok", "connections": {<id>: {"ok": true, "reachable": true,
+  "account", "id", "expected_account_id", "actual_account_id"} or {"ok": false,
+  "error", "hint"?}}}. Exit 0 only when every examined connection is healthy,
+  else the first failure's category: 2 not logged in or an identity mismatch
+  (run `telegram login --connection <id>`, or `telegram login --phone
+  --connection <id>`), 5 Telegram unreachable or a flood-wait, 6 a connection
+  with no positive expected_account_id (log in to discover it, then bind it).
+""" + _HELP_REGISTRY + _HELP_MACHINE_READS + _HELP_SELECT + """
+  Examples:
+    telegram doctor
+    telegram doctor --connection main
+""",
+    "connections": """\
+  For telegram: each connection carries `session` {live, account}: `live` is
+  true when its session file on this machine holds an auth key and the
+  signed-in account Telethon keeps beside it, and no service here recorded it
+  unauthorized since it last started; `account` is the account the connection
+  records (the one login/doctor verified, else expected_account_id), or null.
+""" + _HELP_REGISTRY + _HELP_MACHINE_READS + _HELP_SELECT + """
+  Example: telegram connections
+""",
+    "connection": """\
+  For telegram:
+""" + _HELP_APP + _HELP_REGISTRY + _HELP_ONE_ACCOUNT + """
+  Example: telegram connection add main --field expected_account_id=1000000001
+""",
+    "setup": """\
+  For telegram:
+""" + _HELP_APP + """
+  Example: echo '{"TELEGRAM_API_HASH": "<hash>"}' |
+           telegram setup set --field TELEGRAM_API_ID=<id> --stdin
+""",
+    "manifest": """\
+  For telegram: `connections.device_bound` is true: a connection is a session
+  minted on one device. The manifest also carries `service_state_version`,
+  `programs` and the bundled `service`.
+""",
+    "ids": """\
+  For telegram: the project identifiers envelope is
+  capabilities/telegram/identifiers.json, or store rows once the agent moved.
+""",
+    "migrate": """\
+  For telegram: `migrate` applies the job register's pending steps to the
+  machine's store, after the harness runner's profile table under its ledger
+  `harness`; `status` reports where both stand (the runner's under `harness`),
+  without a lock, changing nothing.
+""",
+    "login": """\
+telegram login [--qr | --phone [NUMBER]] [--events] [--connection <id>]
+
+  Interactive first-time auth. By default it shows a QR to scan from an
+  already authorized Telegram app (`--qr` names it explicitly), then prompts
+  for the 2FA password if set; `--phone` signs in with the phone number
+  (prompted for unless given) and the code Telegram sends, and a 2FA password
+  if set. Login persists the session file; later commands reuse it with no
+  prompt. The session file is owner-only (0600).
+
+  --qr               scan a QR from an already-authorized Telegram app (the default)
+  --phone [NUMBER]   sign in with the phone number and the code Telegram sends
+  --events           drive it with no terminal: JSON lines on stdout (qr, with a
+                     new one each time one expires, for up to five minutes;
+                     phone_needed; code_needed; password_needed with the
+                     account's hint; done; error) and each answer as one line on
+                     stdin (`telegram help connection`, "Linking a
+                     connection"). A first login under `--events` that fails or
+                     is cancelled (SIGTERM, SIGINT, SIGHUP) removes the
+                     connection and the session file it made.
+
+  Output: {"ok": true, "connection", "logged_in_as", "id",
+  "already_authorized"?, "identity_binding"?}: `identity_binding` names the
+  `expected_account_id` to set on a connection that does not declare one yet.
+
+  Exit codes: 0 signed in; 2 qr_expired, code_expired, code_invalid, an
+  account_identity_mismatch, or credentials Telegram refused; 4 policy; 5
+  Telegram unreachable or a flood-wait; 6 no_phone, number_linked, input.
+""" + _HELP_ONE_ACCOUNT + _HELP_REGISTRY + _HELP_MACHINE_READS + _HELP_SELECT + """
+  Examples:
+    telegram login
+    telegram login --phone --connection main
+    telegram login --events --connection main
+""",
+    "app-check": """\
+telegram app-check [--connection <id>]
+
+  Ask Telegram whether it accepts the app this machine signs in through
+  (`--connection` names a connection's app instead), by asking for a login
+  token: no account is touched and no code is sent.
+
+  Output: {"ok", "app": {"api_id", "from": "connection"|"machine",
+  "hash_env", "connection"?}, "status", "reason"?, "retry_after"?, "message"?,
+  "error"?}. `status` is `accepted` (exit 0), `invalid` (Telegram does not know
+  the id and hash; exit 2), or `refused`, with `reason` `blocked` (exit 2),
+  `flood_limited` and `retry_after` seconds (exit 5), or `other` (exit 5);
+  `message` says why in a sentence a person can be shown, and `error` carries
+  what Telegram answered.
+
+  Exit codes: 0 accepted; 2 invalid or blocked, or no app configured
+  (missing_credentials, missing_secret); 4 policy; 5 flood_limited, other, or
+  network_error; 6 incomplete_connection, bad_api_id, input.
+""" + _HELP_APP + _HELP_MACHINE_READS + """
+  Example: telegram app-check
+""",
+    "whoami": """\
+telegram whoami [--connection <id>]
+
+  Identity of the signed-in account.
+
+  Output: {"account", "id", "phone", "username"}.
+""" + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram whoami
+""",
+    "chats": """\
+telegram chats [--limit N] [--connection <id>]
+
+  List recent dialogs. Beside `id`, `name`, `unread` and `kind` (the raw
+  Telegram class), each entry settles what the chat is: `category` is `user`,
+  `bot`, `group` (a legacy group, a supergroup or a gigagroup), `channel` (a
+  broadcast only its admins post in), or `unknown` when the class settles
+  nothing; and `forum` is true when the chat's messages live in topics, which
+  `telegram topics` lists.
+
+  --limit N          how many dialogs (default 50)
+
+  Output: a JSON list of {"id", "kind", "name", "unread", "category", "forum"}.
+""" + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram chats --limit 20
+""",
+    "topics": """\
+telegram topics <chat> [--limit N] [--query TEXT] [--connection <id>]
+
+  List a forum group's topics; each `id` is the root message id the send verbs
+  take as --topic. A chat that is no forum exits 3 not_a_forum.
+
+  --limit N          how many topics (default 100)
+  --query TEXT       match topic titles
+
+  Output: a JSON list of {"id", "title", "top_message", "unread", "closed",
+  "pinned", "hidden"}.
+""" + _HELP_CHAT + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram topics "Team forum" --query release
+""",
+    "read": """\
+telegram read <chat> [--limit N] [--since ISO] [--topic TOPIC_ID] [--json]
+              [--connection <id>]
+
+  Read messages from a chat, oldest first.
+""" + _HELP_TOPIC_SCOPE + """
+  --limit N          how many messages (default 50)
+  --since ISO        ISO datetime; stop at this date (exit 6 bad_date otherwise)
+  --topic TOPIC_ID   forum topic root message id to read inside
+  --json             JSON records instead of the transcript
+
+  Output: without --json, a human-readable transcript as a single text block
+  ("# <chat>  (<n> messages)", then "[<UTC time>] <sender>: <text>" per
+  message); with --json, a list of {"id", "date", "sender_id", "sender",
+  "text", "reply_to", "topic_id"}.
+""" + _HELP_CHAT + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram read @example_user --limit 20 --json
+""",
+    "search": """\
+telegram search <chat> <query> [--limit N] [--topic TOPIC_ID] [--json]
+                [--connection <id>]
+
+  Search messages inside a chat; the same forum-topic scoping and `topic_id` as
+  `read`.
+""" + _HELP_TOPIC_SCOPE + """
+  --limit N          how many hits (default 50)
+  --topic TOPIC_ID   forum topic root message id to search inside
+  --json             JSON records instead of the transcript
+
+  Output: without --json, a transcript as one text block ("# <chat>  search:
+  '<query>'  (<n> hits)", then one line per message); with --json, the records
+  `read` prints.
+""" + _HELP_CHAT + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram search "Team forum" invoice --json
+""",
+    "send": """\
+telegram send <chat> <text> [--reply-to MSG_ID | --topic TOPIC_ID] [--external]
+              [--no-link-preview] [--connection <id>]
+
+  Send a message.
+""" + _HELP_SEND_TOPIC + """
+  --reply-to MSG_ID  message id to reply to
+  --topic TOPIC_ID   forum topic root message id to post into
+  --external         ask the answering assistant to tag its reply so no peer
+                     daemon answers it
+  --no-link-preview  send it without the preview card Telegram attaches to a
+                     link; the service's own messages take the same switch as
+                     `defaults.link_preview`
+
+  Output: {"sent_id", "to", "reply_to"}.
+""" + _HELP_WRITE + _HELP_CHAT + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram send @example_user "on my way" --connection main
+""",
+    "send-media": """\
+telegram send-media <chat> <path> [--caption TEXT]
+                    [--reply-to MSG_ID | --topic TOPIC_ID] [--force-document]
+                    [--external] [--connection <id>]
+
+  Send a local media file; the same forum-topic addressing as `send`.
+""" + _HELP_SEND_TOPIC + """
+  --caption TEXT     optional caption
+  --reply-to MSG_ID  message id to reply to
+  --topic TOPIC_ID   forum topic root message id to post into
+  --force-document   upload images as documents instead of photos
+  --external         ask the answering assistant to tag its reply so no peer
+                     daemon answers it
+
+  Output: {"sent_id", "to", "path", "reply_to"}. A path that is no file exits 6
+  invalid_input.
+""" + _HELP_WRITE + _HELP_CHAT + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram send-media @example_user ./report.pdf --caption "the report"
+""",
+    "react": """\
+telegram react <chat> <msgid> <emoji> [<emoji> ...] [--connection <id>]
+
+  Add one or more emoji reactions to a message.
+
+  Output: {"reacted_to", "to", "reactions"}.
+""" + _HELP_WRITE + _HELP_CHAT + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram react @example_user 4211 👍
+""",
+    "download": """\
+telegram download <chat> <msgid> [--json] [--connection <id>]
+
+  Materialize one message's media to a deterministic per-connection cache path
+  (download only if absent). It reads a copy of the session file, so it never
+  contends with a daemon holding the session open.
+
+  --json             the record instead of the bare path
+
+  Output: the absolute path, as plain text; with --json, {"path", "cached",
+  "msgid", "chat", "filename", "mime", "size"}. Exit 3 message_not_found or
+  no_media for a message that is absent or carries no media.
+""" + _HELP_CHAT + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram download @example_user 4211 --json
+""",
+    "export": """\
+telegram export <chat> --out PATH [--media-dir PATH] [--limit N] [--since ISO]
+                [--topic TOPIC_ID] [--no-photos] [--no-stickers] [--videos]
+                [--documents] [--connection <id>]
+
+  Dump full history to JSON; download voice/audio (+photos/stickers by
+  default) to media-dir; leave transcription placeholders, which `telegram
+  transcribe` fills. The same forum-topic scoping and `topic_id` as `read`.
+  Transcriptions already in an existing --out file are kept. Progress goes to
+  stderr.
+""" + _HELP_TOPIC_SCOPE + """
+  --out PATH         output JSON path (required)
+  --media-dir PATH   directory for downloaded media (default: alongside --out)
+  --limit N          max messages (default: all)
+  --since ISO        ISO datetime; stop at this date
+  --topic TOPIC_ID   forum topic root message id to export
+  --no-photos        skip photos (downloaded by default)
+  --no-stickers      skip stickers (downloaded by default)
+  --videos           also download videos + video-notes (default: off)
+  --documents        also download documents (default: off)
+
+  Output: {"out", "media_dir", "message_count", "new_downloads"}; the file is
+  {"chat", "exported_at", "exported_by", "message_count", "media_dir",
+  "media_policy", "schema_version": 2, "notes", "messages"}, newest-last.
+""" + _HELP_CHAT + _HELP_EXIT_CONN + _HELP_SELECT + """
+  Example: telegram export @example_user --out ./export/chat.json --videos
+""",
+    "transcribe": """\
+telegram transcribe <json_path> [--force] [--model nova-3]
+
+  Fill transcription placeholders in an exported JSON via Deepgram (audio
+  referenced by media.file_path), saving after each file. Needs no connection;
+  needs DEEPGRAM_API_KEY (secret), set once with `telegram setup set` and read
+  back as `Where a secret resolves` says. Progress goes to stderr.
+
+  --force            re-transcribe even if already filled
+  --model M          Deepgram model (default: nova-3)
+
+  Output: {"file", "transcribed", "failed"} (and "pending": 0 when there was
+  nothing to do). A file Deepgram fails on is recorded as that message's
+  transcription {"error"} and counted in `failed`.
+
+  Exit codes: 0; 2 missing_deepgram_key; 6 file_not_found for a path that does
+  not exist.
+
+  Example: telegram transcribe ./export/chat.json
+""",
+    "profiles": """\
+telegram profiles list | show <name> | save <name> <file|-> [--base ID]
+""" + _HELP_PROFILES,
+    "profiles list": """\
+telegram profiles list
+
+  Every telegram profile this project reaches, each with its layer, version,
+  harness, model, effort, rights, timeout and fit.
+""" + _HELP_PROFILES + """
+  Example: telegram profiles list
+""",
+    "profiles show": """\
+telegram profiles show <name>
+
+  One profile as it resolves - its layer, version, harness, model, effort,
+  rights, timeout and fit - and its text.
+""" + _HELP_PROFILES + """
+  Example: telegram profiles show telegram-claude
+""",
+    "profiles save": """\
+telegram profiles save <name> <file|-> [--base ID]
+
+  Write a new version at this project's scope only, refusing a bundled or
+  global name, a profile the runner or fit refuses, and a `${`.
+
+  <file|->           the profile file, or - for stdin
+  --base ID          the version being replaced, from `profiles show`
+""" + _HELP_PROFILE_SAVE + _HELP_PROFILES + """
+  Example: telegram profiles save telegram-fast ./fast.toml --base 12
+""",
+    "prompts": """\
+telegram prompts list | show <key> [--version ID] | versions <key>
+               | put <key> <file|-> [--base ID] [--note TEXT]
+               | import [DIR] [--note TEXT] | export [DIR]
+""" + _HELP_PROMPTS,
+    "prompts list": """\
+telegram prompts list
+
+  Every prompt key the store holds, and its active version.
+
+  Output: {"project_id", "prompts": [...]}.
+""" + _HELP_PROMPTS + """
+  Example: telegram prompts list
+""",
+    "prompts show": """\
+telegram prompts show <key> [--version ID]
+
+  One prompt's active version, or the one --version names (a version id, from
+  `prompts versions`), as its stored row with its text.
+""" + _HELP_PROMPTS + """
+  Example: telegram prompts show context
+""",
+    "prompts versions": """\
+telegram prompts versions <key>
+
+  Every version of one prompt, newest first: {"key", "versions": [...]}. The
+  earlier ones stay readable through `versions` and `show --version`.
+""" + _HELP_PROMPTS + """
+  Example: telegram prompts versions delegation
+""",
+    "prompts put": """\
+telegram prompts put <key> <file|-> [--base ID] [--note TEXT]
+
+  Save a new version and keep the earlier ones readable through `versions` and
+  `show --version`; `--base` names the version replaced, and a save that lost
+  the race exits 6 conflict. A worker saves only for a requester whose role may
+  /set.
+
+  <file|->           the prompt's text, or - for stdin
+  --base ID          the version being replaced, from `prompts show`
+  --note TEXT        why the version is saved
+
+  Output: {"key", "version", "outcome": "saved"|"unchanged"}.
+""" + _HELP_PROMPTS + """
+  Example: telegram prompts put context - --base 41 < context.md
+""",
+    "prompts import": """\
+telegram prompts import [DIR] [--note TEXT]
+
+  Save each file there (or in DIR; default capabilities/telegram/service) whose
+  text is not the active version.
+
+  --note TEXT        why the versions are saved
+
+  Output: {"directory", "prompts": [...]}.
+""" + _HELP_PROMPTS + """
+  Example: telegram prompts import
+""",
+    "prompts export": """\
+telegram prompts export [DIR]
+
+  Write each active version back as its file (in DIR; default
+  capabilities/telegram/service), leaving an equal one alone.
+
+  Output: {"directory", "prompts": [...]}.
+""" + _HELP_PROMPTS + """
+  Example: telegram prompts export
+""",
+    "jobs help": """\
+telegram jobs help
+
+  The whole jobs surface in one answer: the verbs, then each verb's own flags.
+  A prompt names this command instead of listing the verbs, and it answers
+  inside a worker as well as outside one. Plain text on stdout; exit 0.
+
+  Example: telegram jobs help
+""",
+    "jobs list": """\
+telegram jobs list [--state STATE] [--outcome OUTCOME] [--limit N]
+                   [--chat ID] [--topic-id ID]
+
+  Jobs in this project's register, newest first.
+
+  --state STATE      what the job is doing: draft, waiting, running, stopped
+  --outcome OUTCOME  why a stopped job stopped: succeeded, failed, cancelled,
+                     interrupted, quota, model_refused
+  --limit N          how many (default 50)
+
+  Output: {"channel_key", "counts", "slots_in_use", "jobs": [...]}.
+""" + _HELP_JOBS + """
+  Example: telegram jobs list --state waiting
+""",
+    "jobs active": """\
+telegram jobs active [--limit N] [--chat ID] [--topic-id ID]
+
+  Only what is waiting or running, oldest first; read it before submitting.
+
+  --limit N          how many (default 50)
+
+  Output: {"channel_key", "counts", "slots_in_use", "jobs": [...]}.
+""" + _HELP_JOBS + """
+  Example: telegram jobs active
+""",
+    "jobs show": """\
+telegram jobs show <id> [--chat ID] [--topic-id ID]
+
+  One job in full, staged text included: its row and `pending_amendment`.
+""" + _HELP_JOBS + """
+  Example: telegram jobs show 12
+""",
+    "jobs register": """\
+telegram jobs register <description> [--profile NAME] [--requested-by ID]
+                       [--origin-message-id ID] [--chat ID] [--topic-id ID]
+
+  Enter one task into the queue, as a draft nothing runs yet; `jobs submit`
+  hands it to the runner. A job runs on a profile, which carries the harness
+  and the model together; --engine and --model are gone (exit 6 input).
+
+  <description>             one line, in the operator's terms
+  --profile NAME            the profile it runs on (default: defaults.profile,
+                            else stub), resolved and fitted as a turn would
+  --requested-by ID         the operator whose authority it carries (required
+                            outside a worker: exit 6 no_requester)
+  --origin-message-id ID    the message the request came from
+  --chat ID                 the chat it reports into (required outside a
+                            worker: exit 6 no_channel)
+
+  Output: the new job's row.
+""" + _HELP_JOBS + """
+  Example: telegram jobs register "draft the weekly summary" --chat -1001
+           --requested-by 777
+""",
+    "jobs submit": """\
+telegram jobs submit <id> --confirm-active-jobs-checked [--chat ID] [--topic-id ID]
+
+  Hand a draft to the runner.
+
+  --confirm-active-jobs-checked   you read `jobs active` and this outcome is
+                                  not there (exit 6 active_jobs_unconfirmed
+                                  without it)
+
+  Output: the job's row.
+""" + _HELP_JOBS + """
+  Example: telegram jobs submit 12 --confirm-active-jobs-checked
+""",
+    "jobs amend": """\
+telegram jobs amend <id> <text> [--chat ID] [--topic-id ID]
+
+  Continue a job with added context, keeping its session: the text is staged
+  and consumed when the job is next dispatched, and a stopped job goes back to
+  waiting.
+
+  <text>             what changed, in the operator's terms
+
+  Output: {"id", "amendment": "staged", "pending_amendment", "instruction"}.
+""" + _HELP_JOBS + """
+  Example: telegram jobs amend 12 "use the March figures"
+""",
+    "jobs discard": """\
+telegram jobs discard <id> [--chat ID] [--topic-id ID]
+
+  Drop a draft nobody is going to submit. Work that has started is stopped
+  with `jobs stop` instead (exit 6 job_not_a_draft).
+
+  Output: {"id", "discarded": true, "description"}.
+""" + _HELP_JOBS + """
+  Example: telegram jobs discard 12
+""",
+    "jobs stop": """\
+telegram jobs stop <id> [--chat ID] [--topic-id ID]
+
+  Stop the work; it keeps its session and its place. Stopping is asynchronous:
+  the runner ends the process on its next tick. A job already stopped exits 6
+  job_stopped.
+
+  Output: {"id", "stopping": true, "instruction"}.
+""" + _HELP_JOBS + """
+  Example: telegram jobs stop 12
+""",
+    "jobs resume": """\
+telegram jobs resume <id> [--chat ID] [--topic-id ID]
+
+  Continue stopped work, whatever stopped it.
+
+  Output: the job's row.
+""" + _HELP_JOBS + """
+  Example: telegram jobs resume 12
+""",
+    "call hangup": """\
+telegram call hangup [--chat ID] [--timeout S] [--connection <id>]
+
+  End the voice call the running service holds, after what is already being
+  said: the service answers `scheduled` at once and closes the line once it has
+  been quiet for a moment (at most about 30 s), through the ordinary ending, so
+  the recording and summary still arrive. Inside a service turn it ends only
+  that turn's own chat's call.
+
+  --chat ID          the caller's chat id; refused unless it is the call's
+                     (`current` names the turn's own chat inside a turn)
+  --timeout S        seconds to wait for the service to answer (default 5)
+
+  Output: {"hangup": "scheduled", "chat_id", "pid", "connection", "note"}.
+
+  Exit codes: 0 scheduled; 4 chat_scope_denied for another chat inside a turn;
+  5 no_active_call when no call runs (in that chat, with --chat),
+  service_not_running, call_hangup_timeout; 6 call_hangup_unsupported when the
+  running service predates it, which is then never signalled, chat_required,
+  service_provenance_mismatch.
+
+  Example: telegram call hangup
+""",
+    "service init": """\
+telegram service init [--connection ID] [--force]
+
+  Create project-local service settings and context templates: the settings
+  records from the bundle's template (`connection` set from --connection), and
+  the context, delegation, job-worker and voice prompts, each only where none is
+  held yet.
+
+  --force            overwrite existing service settings/context
+
+  Output: {"initialized", "project", "service_dir", "written", "skipped",
+  "next"}.
+
+  Exit codes: 0; 3 service_bundle_missing; 6 no_envelope (run `capabilities
+  init` first), or settings the schema refuses (service_settings_invalid).
+""" + _HELP_SERVICE + """
+  Example: telegram service init --connection main
+""",
+    "service doctor": """\
+telegram service doctor [--live] [--connection ID]
+
+  Local service readiness check. `doctor` reports each distinct profile the
+  settings name as `resolved` with its harness, model, layer and version, or
+  `failed` when it does not resolve or fit, and starts no session. `doctor
+  --live` also spends one live turn per profile, held to
+  `defaults.worker_timeout`, and reports the harness's own verdict in place of
+  `resolved`: a model the harness refuses, a harness missing from PATH or older
+  than the runner supports, one that cannot authenticate, or one that gives no
+  verdict in time is not ok. `doctor` exits 5 when its own verdict is `ok:
+  false`, so a script can gate on it. A settings `environment` key or a
+  TELEGRAM_ENVIRONMENT variable is retired and has no effect: the service keeps
+  one register per project, and `doctor` names either under `retired` and
+  `warnings` for its removal. It reports whether the job register opens and
+  which level named it. `telegram doctor` performs the authenticated Telegram
+  round-trip.
+
+  --live             also run one live turn per profile on its harness
+
+  Output: {"ok", "service", "workers", "store", "connection", "note",
+  "skipped_settings"?, "retired"?, "warnings"?}.
+
+  Exit codes: 0 ok; 5 `ok: false` — a running daemon whose update sync is not
+  fresh, a profile the settings name that does not resolve or fit or, under
+  `--live`, that its harness did not accept, a job register the store did not
+  open, or a running daemon whose last reply-gate run in a channel failed;
+  after its report it prints the error envelope naming the first of these
+  (`service_unhealthy` with the daemon's last error, `worker_unavailable`, the
+  store's own code, or `gate_failing`), which a supervisor records as why the
+  service cannot work. A route skipped on this node is named under
+  `skipped_settings` beside `warnings`, and the doctor stays ok. 6 settings
+  the schema refuses (service_settings_invalid).
+""" + _HELP_SERVICE + _HELP_SERVICE_PROFILES + _HELP_STORE + """
+  Examples:
+    telegram service doctor
+    telegram service doctor --live
+""",
+    "service run": """\
+telegram service run [--connection ID]
+
+  Run the assistant service in the foreground: the bundled daemon replaces this
+  process. This is the command a deployment runs.
+""" + _HELP_SERVICE_REFUSALS + _HELP_SERVICE + _HELP_SERVICE_PROFILES + _HELP_STORE + """
+  Example: telegram service run
+""",
+    "service start": """\
+telegram service start [--connection ID]
+
+  Start the assistant service in the background and wait until it publishes
+  its ownership provenance. Already running, it answers its status.
+
+  Output: the `service status` record with "started": true, or with
+  "already_running": true when it was running. Exit 5
+  service_start_failed when the daemon exits or publishes nothing, with the
+  log's tail as the hint; exit 6 service_owned_elsewhere or takeover_active
+  when another owner holds the account.
+""" + _HELP_SERVICE_REFUSALS + _HELP_SERVICE + _HELP_SERVICE_PROFILES + _HELP_STORE + """
+  Example: telegram service start
+""",
+    "service reload": """\
+telegram service reload [--timeout S] [--connection ID]
+
+  Validate and apply settings without disconnecting: signals the daemon the
+  account-global owner record names, which re-reads its settings and keeps the
+  previous ones on a refusal. Inside a service turn it is reserved for a
+  supervisor request.
+
+  --timeout S        seconds to wait for the daemon's answer (default 5)
+
+  Output: {"reloaded": true, "running": true, "pid", "connection", "project",
+  "settings_generation", "settings_reloaded_at", "health_file"}.
+
+  Exit codes: 0 reloaded; 4 service_reload_not_authorized; 5
+  service_not_running, service_reload_failed, service_reload_timeout; 6
+  service_reload_refused (the settings the daemon refused), legacy_daemon_running,
+  service_provenance_mismatch.
+""" + _HELP_SERVICE + _HELP_SERVICE_PROFILES + """
+  Example: telegram service reload
+""",
+    "service stop": """\
+telegram service stop [--timeout S] [--force] [--connection ID]
+
+  Stop the assistant service: signal only a proven owner and require its
+  graceful stop acknowledgement.
+
+  --timeout S        seconds to wait for it to stop (default 10)
+  --force            kill it when it does not stop in time
+
+  Output: {"stopped", "running": false, "connection", "pid", "pid_file",
+  "killed"?}; nothing running answers "stopped": false.
+
+  Exit codes: 0; 5 service_stop_unacknowledged, service_stop_timeout; 6
+  expected_account_required, service_owned_elsewhere,
+  service_provenance_mismatch, legacy_daemon_running, service_stop_failed.
+""" + _HELP_SERVICE + """
+  Example: telegram service stop
+""",
+    "service status": """\
+telegram service status [--connection ID]
+
+  Show local service status. Status follows the account-global owner record
+  and reports actual code, project and state provenance.
+
+  Output: {"initialized", "running", "healthy", "pid", "stale_pid", "health",
+  "expected_account_id", "owner", "expectation_mismatches", "control_dir",
+  "connection", "project", "project_envelope", "project_layout", "daemon",
+  "settings", "context", "delegation", "job_worker", "prompts",
+  "voice_context", "session", "state_dir", "pid_file", "log_file",
+  "health_file", "register", "progress_dir", "worker_sessions", ...}.
+""" + _HELP_SERVICE + """
+  Example: telegram service status
+""",
+    "service logs": """\
+telegram service logs [--tail N] [--connection ID]
+
+  Tail the service log.
+
+  --tail N           how many lines (default 80)
+
+  Output: {"connection", "log_file", "lines"}. Exit 3 logs_not_found when the
+  log does not exist.
+""" + _HELP_SERVICE + """
+  Example: telegram service logs --tail 200
+""",
+    "service migrate-ownership": """\
+telegram service migrate-ownership --connection ID
+          --confirm-all-legacy-daemons-stopped
+
+  One-time fail-closed cutover to account-global daemon ownership: writes the
+  account's ownership marker once every legacy daemon is stopped.
+
+  --confirm-all-legacy-daemons-stopped   required (exit 6 confirmation_required)
+
+  Output: {"migrated": true, "account_id", "marker"}. Exit 6
+  legacy_daemon_running while a daemon still runs.
+""" + _HELP_SERVICE + """
+  Example: telegram service migrate-ownership --connection main
+           --confirm-all-legacy-daemons-stopped
+""",
+    "service migrate-profiles": """\
+telegram service migrate-profiles [--apply] [--connection ID]
+
+  Move the old worker settings to profile names: each distinct worker and its
+  model, effort, speed and context becomes one project profile named from the
+  values, and settings, the channel register and open job rows name it. A dry
+  run unless --apply; --apply needs the service stopped (exit 6
+  service_running). Prints the TELEGRAM_SERVICE_PROFILE value that replaces a
+  set TG_WORKER or TELEGRAM_SERVICE_WORKER.
+
+  --apply            write the move; without it, report it
+
+  Output: {"applied", "changed", "profiles", "settings", "register",
+  "carried", "jobs", "refused", "environment"?}.
+
+  Exit codes: 0; 5 the store unreachable; 6 service_running,
+  register_unreadable, no_project_identity, store_not_configured.
+""" + _HELP_SERVICE + _HELP_SERVICE_PROFILES + """
+  Example: telegram service migrate-profiles
+""",
+    "service schema": """\
+telegram service schema
+
+  Print the settings the service holds itself to as JSON Schema (draft
+  2020-12), with what a panel needs under x- keys: x-apply (reload or
+  restart), x-keyed-by and x-entry-label of each map, x-inherits (where an
+  absent value comes from), x-layers, x-document (a prompt file and its
+  document key) and x-documents (the service's own prompts). Exit 0.
+
+  Example: telegram service schema
+""",
+    "service validate": """\
+telegram service validate [--scope project|global] [--key KEY]
+
+  Judge proposed settings exactly as `service reload` would and write nothing:
+  stdin carries the scope's whole document, or with --key the JSON value of
+  that key (dotted for a nested one) put over the document held now. Refused
+  with exit 6 service_settings_invalid naming the full path the reload names.
+  Accepted, it prints the top-level keys that change, `apply` (reload, or
+  restart when connection changes) and each prompt file the settings name with
+  its document key: `telegram context show|edit|put <key>` reads and writes it.
+
+  --scope S          project (default) or global
+  --key KEY          stdin is this key's value, not the whole document
+
+  Output: {"ok": true, "scope", "key", "changed", "apply", "restart",
+  "documents", "skipped_routes"}.
+
+  Exit codes: 0 accepted; 6 service_settings_invalid, input (stdin that is not
+  a JSON object), settings_unreadable.
+
+  Example: echo '120' | telegram service validate --key defaults.worker_timeout
+""",
+    "service harness": """\
+telegram service harness [--json]
+
+  The harness tools (claude, codex) of every profile a turn is configured to
+  run on now - each name the settings reach, every chat's `/set profile` and
+  the profile of every open job - each resolved and fitted as a turn resolves
+  it, for the sign-ins a node needs. Runs no turn and writes nothing;
+  `unresolved` names a profile that does not resolve or fit.
+
+  --json             accepted; the output is always JSON
+
+  Output: {"harness", "profiles", "unresolved"}, or with no store
+  {"harness": [], "profiles": [], "unresolved": [], "store":
+  "not_configured"}.
+
+  Exit codes: 0; 5 store_unreachable; 6 no_project_identity, or the store's
+  refusal by its code.
+""" + _HELP_SERVICE_PROFILES + """
+  Example: telegram service harness --json
+""",
+}
+
+
 def main() -> None:
     _gate()                      # every verb passes the effective policy gate first
     if (sys.argv[1:2] or [""])[0] == "manifest":
@@ -5669,7 +6291,8 @@ def main() -> None:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("help", help="print the full usage contract")
+    sub.add_parser("help", help="the menu, or one verb's whole contract").add_argument(
+        "topic", nargs="*")
     sub.add_parser("doctor", help="health check: creds + reachability + session")
     pl = sub.add_parser("login", help="interactive first-time auth (QR, or phone + code)")
     login_method = pl.add_mutually_exclusive_group()
@@ -5929,7 +6552,8 @@ def main() -> None:
         _events_begin()
 
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        # `help` after `--connection <id>`: the contract's layered help, as bare.
+        _cmd_help_verb(args.topic) if args.topic else _cmd_help()
         return
     if args.cmd == "doctor":
         cmd_doctor(connection_flag)   # per-connection; emits and sets the exit code itself

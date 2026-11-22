@@ -2,7 +2,7 @@
 
 The `youtrack` CLI is the adapter for reading and publishing knowledge-base
 articles. Article quality comes from the authored content and its placement
-in the article tree, not from the CLI. Run `youtrack help` for the current
+in the article tree, not from the CLI. Run `youtrack help articles <verb>` for the current
 command contract; this guide focuses on the reusable authoring method.
 
 ## Give the article a project and, optionally, a parent
