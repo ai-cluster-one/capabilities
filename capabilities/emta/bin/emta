@@ -3,15 +3,15 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """emta — agent-first CLI for the Estonian Tax Board (maasikas.emta.ee).
 
-This tool is designed to be invoked by agents. Run `emta help` to load the
-full usage contract on demand — do not rely on memorised knowledge of its
-surface. It is identity-free: it knows nothing about any consuming project's
-person, company, or accounts.
+This tool is designed to be invoked by agents. `emta help` is this menu and
+`emta help <verb>` one verb's whole contract — load them on demand; do not
+rely on memorised knowledge of its surface. It is identity-free: it knows
+nothing about any consuming project's person, company, or accounts.
 
 AUTH MODEL — maasikas.emta.ee has TWO authenticated surfaces:
 
@@ -77,80 +77,32 @@ IDENTIFIERS
     data call. AUTO-DISCOVERED by `emta session ingest` and `emta doctor`
     via a `/client/session-user` round-trip (the only authed call that
     needs no `x-principal-person-id`); written to the ids store. Override
-    with `emta ids set principal_person_id <value>` if needed. The stored
-    value is coerced to a string when sent — a numeric ids value works.
+    it with `emta ids set` if needed (`emta help ids`). The stored value is
+    coerced to a string when sent — a numeric ids value works.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
   connection. Each connection keeps state under its id in project or user
-  state. A
-  project that drives several EMTA identities (e.g. several entities)
-  declares them as connections, kept where "Where connections live" below says:
-
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": { "allow_write": false }
-      }
-    }
-
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below. Sessions
-  are kept per connection in the state home, so two connections never share
-  a session. EMTA exposes no env-resolvable secret — the cascade has nothing
-  to resolve (see deviations.md) — so a connection entry carries no
-  `secret_env`. `allow_write` is accepted, but the surface is read-only, so
-  no verb is gated by it.
-
-  Selection: `--connection <id>` accepted anywhere on the line.
+  state, so two connections never share a session; a project that drives
+  several EMTA identities (e.g. several entities) declares them as
+  connections. EMTA exposes no env-resolvable secret — the cascade has
+  nothing to resolve (see deviations.md) — so a connection entry carries no
+  secret, and its write grant is accepted but gates no verb: the surface is
+  read-only. Every verb takes the connection to use anywhere on the line
+  (each verb's page says how); the registry's shape and where this project
+  keeps it are on `emta help connections`.
 
 COMMANDS
+  emta session ingest           read a `Copy as cURL` on stdin; store the session
+  emta session show             masked summary of the stored session; never values
+  emta session clear            drop the stored session of a connection
+  emta balances                 current prepay account balances
+  emta period-balances          per-tax-period balances on a date
+  emta interest                 per-tax-period interest on a date
+  emta ledger                   prepay ledger movements within one calendar year
 
-  emta help                                  this contract
-  emta doctor [--connection <id>]            probe with stored creds via
-                                             /client/session-user; refresh
-                                             principal_person_id on 200
-  emta session ingest                        read a `Copy as cURL` on
-                                             stdin; persist bearer + xsrf
-                                             + cookies to per-connection
-                                             state; bootstrap via
-                                             session-user; auto-set
-                                             principal_person_id
-  emta session show [--connection <id>]      masked summary: bearer/xsrf
-                                             present, cookie names,
-                                             ingested-at; never values
-  emta session clear [--connection <id>]     drop per-connection state
-  emta balances [--connection <id>]          current prepay account balances
-  emta period-balances --date YYYY-MM-DD     per-tax-period balances on a
-                  [--connection <id>]        date; rows de-duplicated on
-                                             (taxPeriodCode, claimTypeCode,
-                                             documentNr)
-  emta interest --date YYYY-MM-DD            per-tax-period interest on a
-                  [--connection <id>]        date (sibling of
-                                             period-balances; chases
-                                             interest / cent gaps); rows
-                                             de-duplicated on the same key
-  emta ledger --from YYYY-MM-DD              prepay ledger movements;
-              --to YYYY-MM-DD                EMTA refuses multi-year spans
-              [--connection <id>]            — --from and --to must be in
-                                             the same calendar year
-
-CONTRACT COMMANDS (the same on every capability):
-  emta connections                           where every connection's
-                                             values resolve from; secrets
-                                             masked; local only
-  emta stub                                  one-line awareness text
-  emta manifest --json                       machine-readable declaration
-  emta guide [<topic>]                       guide topics / one guide body
-                                             (none ship initially)
-  emta ids list|get <l>|set <l> <v>|rm <l>   project identifiers envelope
-        [--note <text>]                      (capabilities/emta/identifiers.json,
-                                              or store rows once the agent moved)
-  emta refs                                  menu of the project's reference
-                                             files for this capability
-  emta inventory [--network]                 What this capability holds in this
-                                             project (--network adds remote
-                                             detail).
+  `emta doctor` (below) probes the stored session via /client/session-user
+  and refreshes principal_person_id on 200. The surface is read-only.
 
 EXIT CODES
   0  success
@@ -259,6 +211,262 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CREDENTIALS_ENV = _CONFIG_HOME / "emta" / "credentials.env"  # for _docs_base only; never written
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
+
+# The verb pages `emta help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, guide, ids, refs
+# and inventory follow. A text several verbs own is one constant, added to
+# each of their pages.
+_HELP_CONN = """
+  --connection <id>   the connection to use, accepted anywhere on the line,
+                      including after the verb; without it the registry's
+                      default (`emta help connections`). Its session is kept
+                      under its id, so two connections never share one.
+"""
+_HELP_STALE = """
+  SELF-HEAL: any 401 or 406 on an authed call is exit 2 `session_stale`, and
+  a 403 exit 2 `unauthorized`: the bearer is dead and there is nothing to
+  refresh from - paste a fresh `Copy as cURL` from any logged-in
+  /payments-and-settlements-api/ XHR via `emta session ingest` (WHICH
+  REQUEST TO COPY, on `emta help`). Timeouts, 5xx and 429 are retried up to
+  3 times, then exit 5.
+"""
+_HELP_DATA = """
+  The call is sent with the stored bearer, the PAS-XSRF-TOKEN and the cookie
+  jar, and `principal_person_id` from the ids store (or the session's
+  fallback copy) as the `x-principal-person-id` header; without one it exits
+  6 `missing_identifier` - run `emta session ingest`, which auto-discovers
+  it, or `emta ids set principal_person_id <value>`.
+"""
+_HELP_TAIL = """
+  I/O
+  Success is JSON on stdout; failure is {"error": {"code", "message",
+  "hint"?}} on stderr.
+
+  EXIT CODES
+  0  success
+  2  auth / session_stale - paste a fresh cURL via `emta session ingest`
+  3  not found - unknown identifier, missing guide topic, a 404 from EMTA
+  4  policy refusal - the project gate, or a write verb on a read-only
+     connection (this CLI is read-only, no verb is gated)
+  5  network / server - timeout, 5xx, transport error
+  6  input / validation - bad date, multi-year ledger span, malformed cURL
+"""
+HELP_VERBS = {
+    "doctor": """\
+For emta:
+  Probes each connection's stored session with one GET of
+  /payments-and-settlements-api/client/session-user (the one authed call
+  that needs no `x-principal-person-id`), sending the stored bearer + xsrf +
+  cookie jar, and refreshes `principal_person_id` in the ids store on 200.
+  Bare, every connection the registry declares; with --connection, that one.
+  EMTA has no env-resolvable credential, so the credential preflight is
+  empty and readiness is the round-trip alone.
+
+  Output: {ok, connections: {<id>: {ok, session: "live", ingested_at,
+  principal_person_id}}}, where principal_person_id is the ids action
+  (`set`, `updated`, `unchanged`, `no_principal_in_response`,
+  `session_fallback`); an unhealthy connection reports {ok: false, error,
+  hint?} instead. Exit 0 only when every examined connection is healthy.
+
+  Exit codes: 0 every connection live; 2 no session stored, a stored session
+  without bearer or PAS-XSRF-TOKEN, or session-user answering 401/406 -
+  paste a fresh cURL via `emta session ingest`; 5 any other session-user
+  status, timeout or transport error; 6 connections_required, an unknown
+  connection.
+
+  Example: emta doctor --connection <id>
+""",
+    "connections": """\
+For emta:
+  Where every connection's values resolve from; secrets masked; local only,
+  no network. EMTA has no env-resolvable credential (the session is
+  paste-fed into state; see deviations.md), so each entry's `keys` list is
+  empty and readiness is judged at use time by `emta doctor`'s round-trip,
+  not by the cascade.
+
+  Configuration requires an explicit connections registry, even for one
+  connection. Each connection keeps state under its id in project or user
+  state. A project that drives several EMTA identities (e.g. several
+  entities) declares them as connections, kept where "Where connections
+  live" below says:
+
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "allow_write": false }
+      }
+    }
+
+  Sessions are kept per connection in the state home, so two connections
+  never share a session. A connection entry carries no `secret_env`.
+  `allow_write` is accepted, but the surface is read-only, so no verb is
+  gated by it.
+
+  Selection: `--connection <id>` accepted anywhere on the line.
+
+  Each connection in the report carries `allow_write` and an empty `keys`
+  list.
+""",
+    "guide": """\
+For emta:
+  Guide topics / one guide body. None ship initially: the bare menu is
+  empty and any topic exits 3.
+""",
+    "ids": """\
+For emta:
+  The project identifiers envelope (capabilities/emta/identifiers.json, or
+  store rows once the agent moved). The one emta uses is
+  `principal_person_id`, sent as `x-principal-person-id` on every data
+  call: auto-discovered by `emta session ingest` and `emta doctor` via a
+  /client/session-user round-trip and written here. Override it with
+  `emta ids set principal_person_id <value> [--note <text>]`; the stored
+  value is coerced to a string when sent, so a numeric value works.
+""",
+    "refs": """\
+For emta:
+  Menu of the project's reference files for this capability.
+""",
+    "inventory": """\
+For emta:
+  What this capability holds in this project (--network adds remote
+  detail). emta declares no inventory of its own.
+""",
+    "session ingest": """\
+emta session ingest [--connection <id>]
+
+  Read a `Copy as cURL` of any logged-in /payments-and-settlements-api/ XHR
+  on stdin (WHICH REQUEST TO COPY, on `emta help`), e.g.
+  `pbpaste | emta session ingest`. argv is refused: a TTY-attached stdin
+  exits 6 `stdin_required`, as the raw cURL carries the live bearer, the
+  XSRF token and the PAS cookie jar.
+
+  It extracts the PAS bearer (the `Authorization: Bearer …` header, else the
+  `PAS-AUTHORIZATION` cookie), the PAS-XSRF-TOKEN (the `x-xsrf-token`
+  header, else the cookie) and the PAS-path cookies
+  (`customer-kmd2_JSESSIONID`, `cf_clearance`, `_cfuvid`, `PAS-XSRF-TOKEN`),
+  persists them to per-connection state (mode 0600, never committed), then
+  bootstraps via /client/session-user: on 200 it writes the discovered
+  `principal_person_id` to the ids store (or, where the ids store cannot be
+  written, to the session as a fallback). A paste missing the bearer, the
+  xsrf or `customer-kmd2_JSESSIONID` is refused as `bad_curl`, naming what
+  is missing and which surface the URL came from (the customer-portal page,
+  the access-token bootstrap, customer-kmd2).
+""" + _HELP_CONN + """
+  Output: {connection, state_file, bearer_stored, xsrf_stored,
+  cookies_stored, ingested_at, bootstrap: {ok, status, ids_action?,
+  error?}}; ids_action is `set`, `updated`, `unchanged`,
+  `no_principal_in_response` or `session_fallback`. The answer is printed
+  even when the bootstrap fails, and the exit is then 2.
+
+  Exit codes: 0 stored and bootstrapped; 2 the bootstrap did not answer 200;
+  5 timeout, 5xx or transport error; 6 stdin_required, bad_curl,
+  connections_required, an unknown connection.
+
+  Example: pbpaste | emta session ingest --connection <id>
+""" + _HELP_TAIL,
+    "session show": """\
+emta session show [--connection <id>]
+
+  Masked summary of the connection's stored session: whether bearer and
+  xsrf are present, cookie NAMES, ingested-at, and whether
+  `principal_person_id` is in the ids store or the session's fallback.
+  Never the bearer, the xsrf or any cookie value. Local only, no network.
+""" + _HELP_CONN + """
+  Output: {connection, stored: false} when nothing is stored, else
+  {connection, stored: true, state_file, bearer_stored, xsrf_stored,
+  cookies_stored, ingested_at, principal_person_id_in_ids,
+  principal_person_id_in_session_fallback}.
+
+  Exit codes: 0; 6 connections_required, an unknown connection.
+
+  Example: emta session show
+""" + _HELP_TAIL,
+    "session clear": """\
+emta session clear [--connection <id>]
+
+  Drop the connection's per-connection state: the stored session file.
+  Local only, no network. Safe to repeat.
+""" + _HELP_CONN + """
+  Output: {connection, cleared, state_file}; cleared is false when nothing
+  was stored.
+
+  Exit codes: 0; 6 connections_required, an unknown connection.
+
+  Example: emta session clear --connection <id>
+""" + _HELP_TAIL,
+    "balances": """\
+emta balances [--connection <id>]
+
+  Current prepay account balances: GET
+  client/prepay/account/active?isBankruptcyPeriod=false.
+""" + _HELP_CONN + _HELP_DATA + """
+  Output: EMTA's JSON body, as returned.
+
+  Exit codes: 0; 2 no session stored, session_stale, unauthorized; 3 a 404
+  from EMTA; 5 timeout, 5xx, 429, non-JSON; 6 missing_identifier,
+  bad_request, connections_required.
+
+  Example: emta balances
+""" + _HELP_STALE + _HELP_TAIL,
+    "period-balances": """\
+emta period-balances --date YYYY-MM-DD [--connection <id>]
+
+  Per-tax-period balances on a date: GET
+  client/claim/accrual/tax-period-balances?queryDate=<date>. Rows are
+  de-duplicated on (taxPeriodCode, claimTypeCode, documentNr), first
+  occurrence wins, since EMTA sometimes returns the same row twice.
+
+  --date YYYY-MM-DD   the query date; required (also `--date=YYYY-MM-DD`)
+""" + _HELP_CONN + _HELP_DATA + """
+  Output: EMTA's JSON body, its `data` array de-duplicated.
+
+  Exit codes: 0; 2 no session stored, session_stale, unauthorized; 3 a 404
+  from EMTA; 5 timeout, 5xx, 429, non-JSON; 6 input (no --date), bad_date,
+  missing_identifier, bad_request.
+
+  Example: emta period-balances --date 2026-06-30
+""" + _HELP_STALE + _HELP_TAIL,
+    "interest": """\
+emta interest --date YYYY-MM-DD [--connection <id>]
+
+  Per-tax-period interest on a date: GET
+  client/claim/accrual/tax-period-interest?queryDate=<date>. The sibling of
+  period-balances, for chasing interest and cent gaps; rows are
+  de-duplicated on the same key (taxPeriodCode, claimTypeCode, documentNr).
+
+  --date YYYY-MM-DD   the query date; required (also `--date=YYYY-MM-DD`)
+""" + _HELP_CONN + _HELP_DATA + """
+  Output: EMTA's JSON body, its `data` array de-duplicated.
+
+  Exit codes: 0; 2 no session stored, session_stale, unauthorized; 3 a 404
+  from EMTA; 5 timeout, 5xx, 429, non-JSON; 6 input (no --date), bad_date,
+  missing_identifier, bad_request.
+
+  Example: emta interest --date 2026-06-30
+""" + _HELP_STALE + _HELP_TAIL,
+    "ledger": """\
+emta ledger --from YYYY-MM-DD --to YYYY-MM-DD [--connection <id>]
+
+  Prepay ledger movements: GET
+  client/prepay/account/transaction/search?dateFrom=<from>&dateTo=<to>.
+  EMTA refuses multi-year spans — --from and --to must be in the same
+  calendar year; split a longer window into per-year calls.
+
+  --from YYYY-MM-DD   the first day; required (also `--from=YYYY-MM-DD`)
+  --to YYYY-MM-DD     the last day, not before --from; required
+""" + _HELP_CONN + _HELP_DATA + """
+  Output: EMTA's JSON body, as returned.
+
+  Exit codes: 0; 2 no session stored, session_stale, unauthorized; 3 a 404
+  from EMTA; 5 timeout, 5xx, 429, non-JSON; 6 input (a missing date),
+  bad_date, multi_year_span, bad_range (--from after --to),
+  missing_identifier, bad_request.
+
+  Example: emta ledger --from 2026-01-01 --to 2026-06-30
+""" + _HELP_STALE + _HELP_TAIL,
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").
@@ -962,9 +1170,8 @@ def main() -> None:
     _ACTIVE_VERB = cleaned[0] if cleaned else ""
 
     if not cleaned or cleaned[0] in ("help", "--help", "-h"):
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
-        sys.stdout.write(_connections_home_section())
-        return
+        # The contract's layered help: the menu bare, one verb's page with a path.
+        _contract(["help", *cleaned[1:]])
 
     _contract(cleaned)               # contract verbs; falls through otherwise
 

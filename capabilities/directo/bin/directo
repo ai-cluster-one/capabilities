@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "click>=8.1",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """directo — agent-first CLI for a Directo ERP instance (login.directo.ee).
@@ -142,6 +142,11 @@ Directo exposes no public API. This tool reproduces the browser-session calls th
 web UI makes against https://login.directo.ee/<db>/. Load this contract on demand;
 do not rely on memorised surface knowledge.
 
+START HERE: run `directo doctor` on the first call of a session. It checks the
+session of every connection and logs in again where one has expired; exit 0 is
+ready, 2 a login refused or its credentials missing, 5 Directo did not answer, 6
+a connection that resolves no database. Fix what its hint names and run it again.
+
 AUTH — the three-step ceremony (login mints the session):
   1. GET  /<db>/keeks.asp                      seeds cookie=x + ASPSESSIONID*
   2. POST /<db>/keeks.asp   nimi+sala+login=1   credential entry → place-selection page
@@ -151,60 +156,26 @@ The session is (chuser + ASPSESSIONID); it is bound to the chosen location (koht
 home, keyed per connection — capabilities/directo/state/<connection>/ in an
 initialized project, else $XDG_STATE_HOME/directo/<connection>/.
 
-LOCATION (koht) is a per-session selection, not a fixed preset. Pass --koht to choose;
-if omitted, the last-selected DIRECTO_KOHT is reused, else the default ({default}).
-Run `directo kohts` to list the locations this login offers. Ask the user which
-location they want before acting when it matters.
+LOCATION (koht) is a per-session selection, not a fixed preset. `login` chooses it
+(`directo help login`); unchosen, the last-selected DIRECTO_KOHT is reused, else
+the default ({default}). Run `directo kohts` to list the locations this login
+offers. Ask the user which location they want before acting when it matters.
 
 CREDENTIALS — 4-tier cascade (flags > project .env(.local) > user config > process env):
   DIRECTO_USERNAME  DIRECTO_PASSWORD  DIRECTO_DB  DIRECTO_KOHT  DIRECTO_COOKIE
 User config: {cfg}
 Once minted, the live DIRECTO_COOKIE/DIRECTO_KOHT resolve from the session file in
-the state home first; the cascade remains the one-shot override path.
+the state home first; the cascade remains the one-shot override path. Each verb's
+page names the flags it takes.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
-  connection. A project with several Directo instances (or several logins on
-  one) declares them as
-  connections, kept where "Where connections live" below says:
-    {{
-      "default": "<id>",
-      "connections": {{
-        "<id>": {{
-          "db":   "<db>",
-          "koht": "{default}",
-          "username_env": "DIRECTO_<ID>_USERNAME",
-          "password_env": "DIRECTO_<ID>_PASSWORD",
-          "allow_write": true
-        }}
-      }}
-    }}
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
-  Only username/password are secret: the entry names the env keys holding them
-  ("username_env"/"password_env"), and the values resolve through the credential
-  cascade (`Where a secret resolves`, at the end of this help). "allow_write": false is
-  accepted, but this CLI's surface is read-only, so no verb is gated by it.
+  connection; a project with several Directo instances (or several logins on
+  one) declares each as a connection. Only username/password are secret.
   Sessions are kept per connection in the state home, so two connections never
-  share a session.
-
-  Selection: --connection <id>, accepted anywhere on the line, on every
-  command. Unflagged, the registry's "default" pointer applies, else the sole
-  entry; several entries without a pointer is refused as ambiguous.
-
-CONTRACT COMMANDS (the same on every capability):
-  directo connections                          where every connection's values
-                                               resolve from (tier, source,
-                                               secrets masked); local only
-  directo stub                                 one-line awareness text
-  directo manifest --json                      machine-readable declaration
-  directo guide [<topic>]                      guide topics / one guide body
-  directo ids list|get <l>|set <l> <v>|rm <l>  the project identifiers envelope
-          [--note <text>]                      (capabilities/directo/identifiers.json)
-  directo refs                                 menu of the project's reference files
-  directo inventory [--network]                What this capability holds in
-                                               this project (--network adds
-                                               remote detail).
+  share a session. Every command takes a connection selection; unselected, the
+  registry's "default" pointer applies, else the sole entry. The registry's
+  shape, where it is kept and how each value resolves: `directo help connections`.
 
 EXIT CODES: 0 success · 2 auth/session · 4 policy refusal — the project gate
 (capabilities/settings.json) on any verb, or a write verb on a read-only
@@ -212,38 +183,25 @@ connection. Ask the user; never lift a gate yourself. · contract verbs add
 3 not-found / 5 network / 6 input; domain commands otherwise exit 1 via
 click (recorded deviation).
 
-COMMANDS:
-  directo help                       this contract
-  directo doctor [--connection <id>] per-connection health — every connection, or one.
-                                     JSON: ok + per-connection findings (db, koht, user,
-                                     session); auto-login on expiry. Start here on the
-                                     first call of a session
-  directo login [--koht CODE]        run the full ceremony; persist session + location
-  directo kohts                      list the locations this login offers (code + label)
-  directo api <action> [-p k=v ...]  authed GET of components_api.asp?action=<action>&...; prints JSON
-  directo get <path> [-p k=v ...]    authed GET of an arbitrary /<db>-relative path; prints body
-  directo schema <asp>               dump a report form's parameter schema (fields, options,
-                                     lisa:* filter enums) — read before reaching for -p
-  directo report <asp> [--from D --to D] [-p k=v ...]
-                                     run a report → compact manifest (stdout) + full typed rows
-                                     sidecar (on disk). --from/--to → aeg1/aeg2 (dd.mm.yyyy);
-                                     showall=jee added for you. --refresh bypasses cache,
-                                     --tsv writes TSV, --raw emits the underlying HTML.
-  directo fetch <asp> [...]          fetch raw HTML into the cache, print its path (network only)
-  directo render <asp> [...] [--file F]   render cached/given HTML → manifest (no network)
-  directo cache list|prune|clear     inspect / sweep the on-disk cache (~/.cache/directo/<db>/);
-                                     e.g. cache prune --older-than 7d
+COMMANDS (`directo help <verb>` gives each one's whole contract):
+  directo login                 run the full ceremony; persist session + location
+  directo kohts                 list the locations this login offers (code + label)
+  directo api <action>          authed GET of components_api.asp?action=<action>; prints JSON
+  directo get <path>            authed GET of an arbitrary path under /<db>/; prints body
+  directo schema <asp>          a report form's parameter schema; read it before setting any
+  directo report <asp>          run a report: compact manifest + full typed rows on disk
+  directo fetch <asp>           fetch a report's raw HTML into the cache, print its path
+  directo render <asp>          render cached or given HTML into the manifest; no network
+  directo cache list            cached files per database: count, total size, oldest
+  directo cache prune           delete cache files past an age
+  directo cache clear           delete every cached file
 
 REPORTS — form is the schema, the manifest is the answer. A report page (e.g.
-mr_aru_art_stat.asp) is server-rendered HTML; its form declares the settable fields
-(date range, filters like artikkel/klass/klient/ladu/objekt/projekt/myyja, and mode
-selects like mida/naita/sortby/grupp — many gated by `tükelda`). Read them with
-`directo schema`. `report` GETs them, caches the raw HTML, and renders the result —
-either a flat `list` or a pivot `matrix` — into an envelope: typed columns, the
-report's own grand totals, a `truncated` flag, a preview, and the path to the full
-NDJSON rows. Fetch is split from render: re-parse cached HTML with `render`, no refetch.
-To break a report down by an attribute, set a time bucket: `-p tykk=<BUCKET> -p
-mida=<DIM> -p naita=<MEASURE>` renders the matrix; without `tykk`, mida/naita are ignored.
+mr_aru_art_stat.asp) is server-rendered HTML whose form declares the settable
+fields; `schema` reads them, `report` runs the report into a compact envelope with
+the path to its full NDJSON rows, and `fetch` and `render` split the network step
+from the parse. The parameters, the pivot breakdown and the envelope are on
+`directo help report`.
 
 Every authed call self-heals: a session that has expired (302 → login) triggers a
 re-login from DIRECTO_USERNAME/PASSWORD, then the call is retried once.
@@ -251,7 +209,288 @@ re-login from DIRECTO_USERNAME/PASSWORD, then the call is retried once.
 ONE SESSION PER LOGIN: re-authenticating a login anywhere (another host, a browser
 sign-in) rotates the server session and invalidates the prior cookie — two actors on
 one login keep evicting each other. Use one login per concurrent actor.
+
+CONTRACT COMMANDS (the same on every capability) are the Contract verbs below.
 """.format(default=DEFAULT_KOHT, cfg=CREDENTIALS_ENV)
+
+# The verb pages `directo help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, HELP being the menu. The
+# contract library dispatches both and renders the contract verbs' own pages,
+# which the entries here for doctor, connections and ids follow. A text several
+# verbs own is one constant, added to each of their pages.
+_HELP_OVERRIDES = """
+  --username, --password and --db override DIRECTO_USERNAME, DIRECTO_PASSWORD
+  and DIRECTO_DB for this one call: the flags tier, first in the cascade (flags >
+  project .env(.local) > user config > process env). Never pass the password on
+  the command line outside a throwaway shell.
+"""
+_HELP_KOHT = """
+  --koht CODE overrides DIRECTO_KOHT for this call: the location a re-login
+  binds the session to.
+"""
+_HELP_SELECT = """
+  Selection: --connection <id>, accepted anywhere on the line, on every
+  command. Unflagged, the registry's "default" pointer applies, else the sole
+  entry; several entries without a pointer is refused as ambiguous.
+"""
+_HELP_HEAL = """
+  Every authed call self-heals: a session that has expired (302 → login)
+  triggers a re-login from DIRECTO_USERNAME/PASSWORD, saying so on stderr, then
+  the call is retried once.
+"""
+_HELP_EXIT = """
+  Exit codes: 0 success; 1 failure via click (recorded deviation) - a login
+  refused, a session still unauthenticated after the re-login, a missing
+  DIRECTO_DB; 2 click's usage error, an unknown flag or a missing argument; 4
+  policy refusal - the project gate (capabilities/settings.json); 6 the
+  connection selection - no registry, an unknown id, several entries without a
+  default.
+"""
+_HELP_REPORT_OPTS = """
+  REPORT_ASP is the report page, e.g. mr_aru_art_stat; `.asp` is added where it
+  is missing. Settable parameters are those on its form (`directo schema
+  <report>`).
+
+  --from D, --to D   period start and end → aeg1 / aeg2 (dd.mm.yyyy)
+  -p, --param k=v    a report parameter (repeatable); caller parameters win,
+                     including over showall, aeg1 and aeg2
+  The run trigger showall=jee is added for you. The cache key is (report,
+  params): the same report and parameters reach the same files, under
+  ~/.cache/directo/<db>/ ($XDG_CACHE_HOME/directo/<db>/).
+"""
+_HELP_REPORTS = """
+  REPORTS — form is the schema, the manifest is the answer. A report page (e.g.
+  mr_aru_art_stat.asp) is server-rendered HTML; its form declares the settable
+  fields (date range, filters like artikkel/klass/klient/ladu/objekt/projekt/myyja,
+  and mode selects like mida/naita/sortby/grupp — many gated by `tükelda`). Read
+  them with `directo schema`. `report` GETs them, caches the raw HTML, and renders
+  the result — either a flat `list` or a pivot `matrix` — into an envelope: typed
+  columns, the report's own grand totals, a `truncated` flag, a preview, and the
+  path to the full NDJSON rows. Fetch is split from render: re-parse cached HTML
+  with `render`, no refetch. To break a report down by an attribute, set a time
+  bucket: `-p tykk=<BUCKET> -p mida=<DIM> -p naita=<MEASURE>` renders the matrix;
+  without `tykk`, mida/naita are ignored.
+"""
+_HELP_ENVELOPE = """
+  Output: the manifest as JSON on stdout - {report, params, period: {from, to},
+  shape: list|matrix, columns: [{key, type}], totals, row_count, truncated,
+  row_dim, periods, measure (a matrix only), rows_path, raw_path, preview} - the
+  preview being the first 10 rows. The full typed rows are written beside it as
+  NDJSON (rows_path), or TSV with a header line under --tsv, and the manifest as
+  <key>.json. A list is truncated when its rows do not sum to the report's own
+  totals; a matrix never is, the server aggregates it.
+"""
+_HELP_TAIL = _HELP_OVERRIDES + _HELP_SELECT + _HELP_HEAL + _HELP_EXIT
+HELP_VERBS = {
+    "doctor": f"""\
+For directo:
+  directo doctor [--connection <id>] [--username U] [--password P] [--db DB]
+
+  Per-connection health — every connection bare, one with --connection: it
+  validates each one's session and, where it has expired, runs the login
+  ceremony again (at the connection's location, else {DEFAULT_KOHT}) and persists the
+  new session. Start here on the first call of a session. A broken connection
+  is a finding, not a stop: every examined connection is reported.
+""" + _HELP_OVERRIDES + """
+  Output: {"ok", "connections": {<id>: {db, koht, user, ok, session?, error?,
+  hint?}}}; session is "live" or "re-authenticated".
+
+  Exit codes: 0 only when every examined connection is healthy, else the first
+  failure's category - 2 a login refused or credentials missing, 5 Directo did
+  not answer, 6 a connection that resolves no DIRECTO_DB (missing_db) or a
+  selection that names none; 4 policy.
+
+  Example: directo doctor --connection main
+""",
+    "connections": """\
+For directo:
+  Configuration requires an explicit connections registry, even for one
+  connection. A project with several Directo instances (or several logins on
+  one) declares them as connections, kept where "Where connections live" above
+  says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "db":   "<db>",
+          "koht": "%s",
+          "username_env": "DIRECTO_<ID>_USERNAME",
+          "password_env": "DIRECTO_<ID>_PASSWORD",
+          "allow_write": true
+        }
+      }
+    }
+  Only username/password are secret: the entry names the env keys holding them
+  ("username_env"/"password_env"), and the values resolve through the credential
+  cascade (`Where a secret resolves`, above). "allow_write": false is accepted,
+  but this CLI's surface is read-only, so no verb is gated by it. Sessions are
+  kept per connection in the state home, so two connections never share a
+  session. The report covers configuration tiers, not the minted session:
+  readiness stays doctor's question.
+""" % DEFAULT_KOHT + _HELP_SELECT,
+    "ids": """\
+For directo:
+  The project identifiers envelope (capabilities/directo/identifiers.json).
+""",
+    "login": f"""\
+directo login [--koht CODE] [--username U] [--password P] [--db DB]
+
+  Run the full three-step ceremony (`directo help`, AUTH) and persist the
+  session (cookie + location) in the state home, keyed per connection.
+
+  --koht CODE   the location to select; omitted, the last-selected
+                DIRECTO_KOHT is reused, else the default ({DEFAULT_KOHT}). Run
+                `directo kohts` for the codes this login offers.
+""" + _HELP_TAIL + """
+  Output: plain text - "✓ logged in to <db> at location <koht>" and the path
+  the session was written to.
+
+  Example: directo login --koht L01
+""",
+    "kohts": """\
+directo kohts [--username U] [--password P] [--db DB]
+
+  List the locations this login offers: it logs in with the credentials
+  (steps 1 and 2 of the ceremony) and reads the place-selection page, without
+  selecting a location or writing a session. Needs DIRECTO_USERNAME and
+  DIRECTO_PASSWORD.
+""" + _HELP_TAIL + """
+  Output: plain text, one code per line, the active one (DIRECTO_KOHT, else
+  the default) marked "← active"; a login that presents no selection answers
+  that it may have a single implicit location.
+
+  Example: directo kohts
+""",
+    "api": """\
+directo api <action> [-p k=v ...] [--koht CODE] [--username U] [--password P] [--db DB]
+
+  Authed GET of components_api.asp?action=<action>&... on the database.
+
+  -p, --param k=v   an extra query parameter (repeatable)
+""" + _HELP_KOHT + _HELP_TAIL + """
+  Output: the response pretty-printed as JSON when it is JSON, else its body
+  as returned.
+
+  Example: directo api calendar_info
+""",
+    "get": """\
+directo get <path> [-p k=v ...] [--koht CODE] [--username U] [--password P] [--db DB]
+
+  Authed GET of an arbitrary /<db>-relative path, e.g. a report page or an
+  endpoint the web UI calls.
+
+  -p, --param k=v   an extra query parameter (repeatable)
+""" + _HELP_KOHT + _HELP_TAIL + """
+  Output: the body, pretty-printed as JSON when the response is JSON.
+
+  Example: directo get mr_aru_art_stat.asp -p showall=jee
+""",
+    "schema": """\
+directo schema <asp> [--refresh] [--koht CODE] [--username U] [--password P] [--db DB]
+
+  Dump a report form's parameter schema (fields, options, lisa:* filter enums):
+  its select fields with their options, plus the `lisa:*` filter enums. Read
+  it before reaching for -p on report, fetch or render, instead of scraping
+  the form by hand. The form (the page without showall, not the heavy result)
+  is cached as <asp>.form.html under ~/.cache/directo/<db>/.
+
+  --refresh   refetch the form instead of reading the cached one
+""" + _HELP_KOHT + _HELP_TAIL + """
+  Output: JSON {report, fields, selects: {<field>: {options: [{value,
+  label}]}}, lisa_enums: {<name>: [values]}}.
+
+  Example: directo schema mr_aru_art_stat
+""",
+    "report": """\
+directo report <asp> [--from D --to D] [-p k=v ...] [--refresh] [--tsv] [--raw]
+               [--koht CODE] [--username U] [--password P] [--db DB]
+
+  Run a report → compact manifest (stdout) + full typed rows sidecar (on
+  disk). This is fetch + render in one call: the raw HTML is cached and
+  reused unless --refresh.
+""" + _HELP_REPORT_OPTS + """
+  --refresh   bypass the cache and refetch
+  --tsv       write the rows sidecar as TSV instead of NDJSON
+  --raw       emit the raw HTML instead of the envelope
+""" + _HELP_KOHT + _HELP_ENVELOPE + _HELP_REPORTS + _HELP_TAIL + """
+  Examples:
+    directo report mr_aru_art_stat --from 01.01.2026 --to 31.03.2026
+    directo report mr_aru_art_stat --from 01.01.2026 --to 31.03.2026 -p tykk=<BUCKET> -p mida=<DIM> -p naita=<MEASURE>
+""",
+    "fetch": """\
+directo fetch <asp> [--from D --to D] [-p k=v ...] [--refresh]
+              [--koht CODE] [--username U] [--password P] [--db DB]
+
+  Fetch a report's raw HTML into the cache and print its path: the network
+  step, isolated (network only) - render or analyse it as a separate pass
+  without refetching. A cached fetch for the same report and parameters is
+  reused unless --refresh.
+""" + _HELP_REPORT_OPTS + """
+  --refresh   bypass the cache and refetch
+""" + _HELP_KOHT + _HELP_TAIL + """
+  Output: JSON {report, params, raw_path, cached, bytes}.
+
+  Example: directo fetch mr_aru_art_stat --from 01.01.2026 --to 31.03.2026
+""",
+    "render": """\
+directo render <asp> [--from D --to D] [-p k=v ...] [--file F] [--tsv]
+               [--koht CODE] [--username U] [--password P] [--db DB]
+
+  Render cached or given HTML into the envelope — no network. Re-run it to
+  re-parse after a parser change: pass the same query as the fetch (it
+  re-derives the cache key), or point at a file with --file. Without a cached
+  fetch for these parameters it exits 1, naming `directo fetch` and the path.
+""" + _HELP_REPORT_OPTS + """
+  --file F    render this HTML file instead of the cached fetch
+  --tsv       write the rows sidecar as TSV instead of NDJSON
+""" + _HELP_KOHT + _HELP_ENVELOPE + _HELP_REPORTS + _HELP_TAIL + """
+  Example: directo render mr_aru_art_stat --from 01.01.2026 --to 31.03.2026
+""",
+    "cache list": """\
+directo cache list
+
+  Inspect the on-disk cache (~/.cache/directo/<db>/, under $XDG_CACHE_HOME):
+  raw HTML, rendered sidecars and manifests. Local only.
+
+  Output: plain text, one line per database - "<db>: N files, X KiB, oldest
+  Yd" - or "cache empty".
+
+  Exit codes: 0; 4 policy.
+
+  Example: directo cache list
+""",
+    "cache prune": """\
+directo cache prune [--older-than AGE]
+
+  Delete cache files past an age — the residual sweep for system health.
+  Local only.
+
+  --older-than AGE   delete cache files older than this (e.g. 7d, 24h, 30m);
+                     default 7d
+
+  Output: plain text - "pruned N files, freed X KiB (older than AGE)".
+
+  Exit codes: 0; 1 an age not shaped like 7d / 24h / 30m; 2 an unknown flag; 4
+  policy.
+
+  Example: directo cache prune --older-than 7d
+""",
+    "cache clear": """\
+directo cache clear [--yes]
+
+  Delete every cached file, across every database. It asks first ("Delete the
+  entire directo report cache?"); --yes confirms without prompting. Local only.
+
+  --yes   confirm the action without prompting
+
+  Output: plain text - "cleared N files".
+
+  Exit codes: 0; 1 aborted - the prompt declined or no answer on stdin; 4
+  policy.
+
+  Example: directo cache clear --yes
+""",
+}
 
 
 # ─── Errors ──────────────────────────────────────────────────────────────────

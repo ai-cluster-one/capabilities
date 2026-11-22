@@ -4,7 +4,7 @@
 # dependencies = [
 #     "httpx>=0.27",
 #     "pyobjc-framework-EventKit>=12.1; sys_platform == 'darwin'",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
@@ -20,18 +20,19 @@ Writes currently use Calendar.app automation and require:
 Writes are gated through the standard connections model — the same exit-4
 write-gate every capability uses. A connection here carries policy, not a
 credential: which Calendar.app calendars are in scope, and whether that
-scope may be written. Selection: `--connection <id>` (anywhere on argv);
-without the flag the registry's default applies (marked with * in the
-`connections` output). Read verbs also respect the connection's scope —
-when `calendars` is non-empty they read only those calendars.
+scope may be written. Every verb takes the connection to use anywhere on
+the line (each verb's page says how); without one the registry's default
+applies (marked with * in the `connections` output). Read verbs also
+respect the connection's scope — when `calendars` is non-empty they read
+only those calendars.
 
 Outside any project, connections and doctor are machine reads: they use the
 machine's own connections read-only, unless a grant switched one off; every
 other verb that needs a connection is refused there.
 
 Registry: where this project keeps it, and in what order the project's and the
-machine's ~/.config/ical/connections.json are read, "Where connections live" below
-says.
+machine's ~/.config/ical/connections.json are read, "Where connections live"
+on `ical help connections` says.
 
 Registry shape:
   {
@@ -43,61 +44,21 @@ Registry shape:
   `calendars: []` (or omitted) means every calendar is in scope.
   `allow_write: false` (the safe default) blocks the write verbs.
 
-Read commands:
-  ical help
-      Print this document.
-
-  ical doctor
-      Readiness — proves the macOS Automation grant by listing calendars.
-
-  ical calendars [--json] [--connection ID]
-      List calendars Calendar.app knows about (name, writable flag),
-      restricted to the connection's scope when non-empty.
-
-  ical events [--calendar NAME] [--from ISO] [--to ISO] [--limit N]
-       [--json] [--connection ID]
-      List events in a date window, sorted chronologically. Default window
-      is today .. +7 days. Each event carries a stable id (uid), title,
-      startDate, endDate, allDay flag, calendar name, and location.
-      Datetimes are emitted as ISO 8601 with the local offset.
-
-  ical show <event-id> [--json] [--connection ID]
-      Show one event by uid: title, times, allDay, calendar, location,
-      notes, url, and attendees (name + email). Only events on calendars
-      in the connection's scope are visible.
-
-  ical search <query> [--calendar NAME] [--from ISO] [--to ISO]
-       [--field title|notes|any] [--limit N] [--json] [--connection ID]
-      Search events. Default field 'any' matches title OR notes. Default
-      window today .. +30 days.
-
-  ical freebusy --from ISO --to ISO [--calendars NAME,NAME]
-       [--include-noise] [--json] [--connection ID]
-      Merged busy blocks across the given window. Restricted to the
-      connection's scope (intersected with --calendars when given). By
-      default excludes obvious noise (Birthdays / Holidays / Reminders /
-      Siri Suggestions); --include-noise turns that off.
+Read commands (human-readable by default, JSON on request):
+  ical calendars                the Calendar.app calendars in scope, writable or not
+  ical events                   events in a date window, sorted chronologically
+  ical show <event-id>          one event by uid, with notes, url and attendees
+  ical search <query>           events whose title or notes match, in a window
+  ical freebusy                 merged busy blocks across a window
 
 Write commands (gated: allow_write:true AND target calendar in scope,
 else exit 4):
-  ical create --calendar NAME --title T --from ISO --to ISO
-       [--all-day] [--location L] [--notes N] [--url U]
-       [--invitee EMAIL ...] [--alarm SPEC ...] [--connection ID]
-      Create an event. --url is where a video-call link belongs.
-      --invitee is repeatable (one email per flag). --alarm is repeatable;
-      SPEC is either relative — `-15m`, `-1h`, `-30s`, `-1d` meaning that
-      much before start — or an absolute ISO datetime. Prints the created
-      event's uid.
+  ical create                   create an event; prints its uid
+  ical update <event-id>        edit an event by uid; only given fields change
+  ical delete <event-id>        delete an event by uid
 
-  ical update <event-id>
-       [--title T] [--from ISO] [--to ISO] [--all-day] [--no-all-day]
-       [--location L] [--notes N] [--url U]
-       [--add-invitee EMAIL ...] [--alarm SPEC ...] [--connection ID]
-      Edit an existing event by uid; only provided fields change. Alarms
-      passed replace the existing alarm set on the event.
-
-  ical delete <event-id> [--connection ID]
-      Delete an event by uid.
+  `ical doctor` (below) is the readiness check: it proves Full Calendar
+  Access by listing the indexed local calendars.
 
 Calendar integration caveats — recorded honestly:
   • Reads use EventKit date predicates rather than Calendar.app `whose`
@@ -116,29 +77,9 @@ Calendar integration caveats — recorded honestly:
 name (trailing/leading whitespace ignored). Calendars are global to the
 app — there is no <account> concept.
 
-Contract commands (the same on every capability):
-  ical stub                                 One-line awareness text.
-  ical manifest --json                      Machine-readable declaration.
-  ical connections                          Connection resolution report —
-                                            each entry carries its calendars
-                                            scope and allow_write flag. ical
-                                            holds no credential, so every
-                                            connection reports an empty key
-                                            set.
-  ical guide [<topic>]                      Guide topics / one guide body,
-                                            fetched live from the docs base.
-  ical ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-       [--note <text>]                      (capabilities/ical/identifiers.json,
-                                             or store rows once the agent moved).
-  ical refs                                 Menu of the project's reference
-                                            files for this capability.
-  ical inventory [--network]                What this capability holds in this
-                                            project (--network adds remote
-                                            detail).
-
 Exit codes:
   0  success
-  2  auth — the macOS Automation grant is missing (doctor)
+  2  auth — Full Calendar Access or the macOS Automation grant is missing
   3  not found (contract verbs)
   4  disabled by project policy, OR the active connection does not permit
      the write (allow_write:false, or target calendar outside scope).
@@ -296,6 +237,284 @@ _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config
 CREDENTIALS_ENV = _CONFIG_HOME / "ical" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
 
+
+# The verb pages `ical help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, guide, ids, refs
+# and inventory follow. A text several verbs own is one constant, added to
+# each of their pages.
+_HELP_CONN = """
+  --connection ID   the connection whose policy applies, accepted anywhere
+                    on argv; without it the registry's default (marked with
+                    * in the `connections` output). Its `calendars` scope
+                    bounds what the verb reads or writes.
+"""
+_HELP_JSON = """
+  --json            the structured answer instead of the human-readable one
+"""
+_HELP_READ_SCOPE = """
+  Scope: with --calendar, a calendar outside the connection's `calendars`
+  scope exits 4 `out_of_scope`; without it, the read intersects with the
+  scope silently (every calendar when the scope is empty). <calendar>
+  matches case-insensitively against a Calendar.app calendar's name
+  (trailing/leading whitespace ignored); a name no calendar has exits 3
+  `not_found`.
+"""
+_HELP_ISO = """
+  ISO is an ISO 8601 datetime; a date alone is local midnight. A value that
+  does not parse exits 1 (`bad ISO datetime`), and a window whose end is not
+  after its start exits 1 (`--to must be after --from`). Datetimes are
+  emitted as ISO 8601 with the local offset.
+"""
+_HELP_WRITE = """
+  A write: gated by allow_write:true AND the target calendar in the
+  connection's scope, else exit 4 (`read_only` from the standard write
+  gate, or `out_of_scope`). Ask the user; never lift the gate yourself. It runs through Calendar.app automation and needs the macOS
+  Automation grant (System Settings → Privacy & Security → Automation → your
+  terminal → Calendar): without it exit 2 `automation_denied`; osascript
+  missing is exit 2, an osascript timeout exit 1 `jxa_timeout`, any other
+  osascript failure exit 1 `jxa_failed`.
+"""
+_HELP_EVENTKIT = """
+  Reads use the indexed local EventKit store and need Full Calendar Access
+  (System Settings → Privacy & Security → Calendars) for the terminal or IDE
+  that launched ical: without it exit 2 `calendar_access_denied`, and exit 2
+  `eventkit_unavailable` when the EventKit bridge does not load.
+"""
+_HELP_TAIL = """
+  Exit codes:
+  0  success
+  1  a domain failure - human-readable message on stderr (deviations.md)
+  2  auth - Full Calendar Access or the macOS Automation grant is missing;
+     also an argument the parser refuses, with its usage on stderr
+  3  not found
+  4  disabled by project policy, OR the active connection does not permit
+     it (allow_write:false, or a calendar outside scope)
+  6  input / validation
+"""
+_HELP_ALARM = """
+  SPEC is either relative — `-15m`, `-1h`, `-30s`, `-1d` meaning that much
+  before start (units s, m, h, d) — or an absolute ISO datetime. An empty or
+  malformed SPEC exits 6 `input`. Alarms are created as `display alarm`
+  entries: absolute-ISO SPECs use `trigger date`; relative SPECs use
+  `trigger interval` in seconds (negative = before start).
+"""
+HELP_VERBS = {
+    "doctor": """\
+For ical:
+  Readiness: proves Full Calendar Access to the indexed local EventKit
+  store by listing its calendars. It takes no connection: ical's
+  connections carry policy, not a credential.
+
+  Output: {ok: true, backend: "EventKit", count, calendars: [<name>, ...]}.
+
+  Exit codes: 0 ready; 2 calendar_access_denied (grant Full Calendar Access
+  in System Settings → Privacy & Security → Calendars to the terminal or IDE
+  that launched it), eventkit_unavailable; 4 policy.
+""",
+    "connections": """\
+For ical:
+  Connection resolution report — each entry carries its calendars scope and
+  allow_write flag. ical holds no credential, so every connection reports
+  an empty key set (`keys: []`); the report exists to publish the policy
+  (`calendars`, `allow_write`) and mark the default with * in the `default`
+  field. Local only: no network, no Calendar.app call.
+
+  Registry shape:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "calendars": ["<Calendar.app name>", ...], "allow_write": <bool> }
+      }
+    }
+  `calendars: []` (or omitted) means every calendar is in scope.
+  `allow_write: false` (the safe default) blocks the write verbs.
+""",
+    "guide": """\
+For ical:
+  Guide topics / one guide body, fetched live from the docs base. None ship
+  yet.
+""",
+    "ids": """\
+For ical:
+  The project identifiers envelope (capabilities/ical/identifiers.json, or
+  store rows once the agent moved); `set` takes [--note <text>].
+""",
+    "refs": """\
+For ical:
+  Menu of the project's reference files for this capability.
+""",
+    "inventory": """\
+For ical:
+  What this capability holds in this project (--network adds remote
+  detail). ical declares no inventory of its own.
+""",
+    "calendars": """\
+ical calendars [--json] [--connection ID]
+
+  List calendars Calendar.app knows about (name, writable flag), restricted
+  to the connection's scope when non-empty.
+""" + _HELP_JSON + _HELP_CONN + """
+  Output: a `# N calendar(s)` banner (naming the connection when scoped),
+  then one calendar per line, `[read-only]` marking one that cannot be
+  written. With --json: [{name, writable}].
+""" + _HELP_EVENTKIT + """
+  Example: ical calendars --json
+""" + _HELP_TAIL,
+    "events": """\
+ical events [--calendar NAME] [--from ISO] [--to ISO] [--limit N]
+     [--json] [--connection ID]
+
+  List events in a date window, sorted chronologically. Default window is
+  today .. +7 days. Each event carries a stable id (uid), title, startDate,
+  endDate, allDay flag, calendar name, and location.
+
+  --calendar NAME   restrict to one calendar (case-insensitive)
+  --from ISO        window start (default: today, local midnight)
+  --to ISO          window end (default: today+7d)
+  --limit N         cap results (0, the default, = no cap)
+""" + _HELP_JSON + _HELP_CONN + """
+  Output: a `# <calendars>  <from> .. <to>  (N events)` banner, then per
+  event `[start] (calendar) title` (◉ marks all-day), its `@ location` and
+  `id: <uid>`. With --json: [{id, title, startDate, endDate, allDay,
+  calendar, location}].
+""" + _HELP_ISO + _HELP_READ_SCOPE + _HELP_EVENTKIT + """
+  Example: ical events --calendar Work --from 2026-11-23 --to 2026-11-30
+""" + _HELP_TAIL,
+    "show": """\
+ical show <event-id> [--json] [--connection ID]
+
+  Show one event by uid: title, times, allDay, calendar, location, notes,
+  url, and attendees (name + email). Only events on calendars in the
+  connection's scope are visible: an event outside it, or no event of that
+  uid, exits 3 `not_found`.
+
+  <event-id>        the event's uid, as events and search print it
+""" + _HELP_JSON + _HELP_CONN + """
+  Output: Title, Calendar, Start, End, All-day, Location, URL, Id and
+  Attendees lines, then a blank line and the notes. With --json: {id,
+  title, startDate, endDate, allDay, calendar, location, notes, url,
+  attendees: [{name, email}]}.
+""" + _HELP_EVENTKIT + """
+  Example: ical show <event-id> --json
+""" + _HELP_TAIL,
+    "search": """\
+ical search <query> [--calendar NAME] [--from ISO] [--to ISO]
+     [--field title|notes|any] [--limit N] [--json] [--connection ID]
+
+  Search events. Default field 'any' matches title OR notes (and
+  location). Default window today .. +30 days. Matching is a
+  case-insensitive substring.
+
+  <query>                   the text to find
+  --calendar NAME           restrict to one calendar (case-insensitive)
+  --from ISO                window start (default: today, local midnight)
+  --to ISO                  window end (default: today+30d)
+  --field title|notes|any   where to match (default any)
+  --limit N                 stop after N hits (0, the default, = no cap)
+""" + _HELP_JSON + _HELP_CONN + """
+  Output: a `# search '<query>' in <calendars>  <from> .. <to>  (N hits)`
+  banner, then per hit `[start] (calendar) title` and `id: <uid>`. With
+  --json: [{id, title, startDate, endDate, allDay, calendar, location}].
+""" + _HELP_ISO + _HELP_READ_SCOPE + _HELP_EVENTKIT + """
+  Example: ical search standup --field title --limit 5
+""" + _HELP_TAIL,
+    "freebusy": """\
+ical freebusy --from ISO --to ISO [--calendars NAME,NAME]
+     [--include-noise] [--json] [--connection ID]
+
+  Merged busy blocks across the given window. Restricted to the
+  connection's scope (intersected with --calendars when given). By default
+  excludes obvious noise (Birthdays / Holidays / Reminders / Siri
+  Suggestions); --include-noise turns that off.
+
+  --from ISO              window start; required
+  --to ISO                window end; required
+  --calendars NAME,NAME   comma-separated calendar names; default: every
+                          calendar in scope minus obvious noise; a name
+                          outside the scope exits 4 `out_of_scope`
+  --include-noise         include Birthdays/Holidays/Reminders/Siri
+                          Suggestions in the default-all set
+""" + _HELP_JSON + _HELP_CONN + """
+  Output: `# freebusy <from> .. <to>`, `# calendars: <names>`, `# N busy
+  block(s)`, then one `busy  <start> .. <end>` line per merged block. With
+  --json: {from, to, calendars, busy: [{start, end}]}.
+""" + _HELP_ISO + _HELP_EVENTKIT + """
+  Example: ical freebusy --from 2026-11-23T09:00 --to 2026-11-23T18:00 --json
+""" + _HELP_TAIL,
+    "create": """\
+ical create --calendar NAME --title T --from ISO --to ISO
+     [--all-day] [--location L] [--notes N] [--url U]
+     [--invitee EMAIL ...] [--alarm SPEC ...] [--json] [--connection ID]
+
+  Create an event. --url is where a video-call link belongs. Prints the
+  created event's uid.
+
+  --calendar NAME    target calendar; required, and in the connection scope
+  --title T          the event's title; required
+  --from ISO         event start; required
+  --to ISO           event end; required, after --from unless --all-day
+  --all-day          an all-day event
+  --location L       its location
+  --notes N          description / notes
+  --url U            URL (use for a video-call link)
+  --invitee EMAIL    attendee email; repeatable, one email per flag
+  --alarm SPEC       an alarm; repeatable
+""" + _HELP_JSON + _HELP_CONN + _HELP_ALARM + """
+  Whether attendee invitations are actually *sent* depends on the
+  underlying account (iCloud/Exchange/CalDAV send; local calendars just
+  record the attendee). ical adds the attendee via JXA and reports success
+  at the JXA level, not the account level.
+
+  Output: `created  (<calendar>) <title>` and `id: <uid>`. With --json:
+  {uid, calendar}.
+""" + _HELP_WRITE + """
+  Example: ical create --calendar Work --title "Review" --from 2026-11-24T10:00 --to 2026-11-24T10:30 --alarm -15m
+""" + _HELP_TAIL,
+    "update": """\
+ical update <event-id>
+     [--title T] [--from ISO] [--to ISO] [--all-day] [--no-all-day]
+     [--location L] [--notes N] [--url U]
+     [--add-invitee EMAIL ...] [--alarm SPEC ...] [--json] [--connection ID]
+
+  Edit an existing event by uid; only provided fields change. Alarms passed
+  replace the existing alarm set on the event. At least one field flag is
+  required (exit 1 otherwise). The event is looked up within the
+  connection's scope first - no event of that uid in scope exits 1 - and
+  the write gate is checked against its calendar.
+
+  <event-id>           the event's uid
+  --title T            new title
+  --from ISO           new start
+  --to ISO             new end
+  --all-day            make it all-day
+  --no-all-day         make it timed
+  --location L         new location
+  --notes N            new notes
+  --url U              new URL
+  --add-invitee EMAIL  add an attendee email; repeatable
+  --alarm SPEC         replace the alarm set; repeatable
+""" + _HELP_JSON + _HELP_CONN + _HELP_ALARM + """
+  Output: `updated  (<calendar>) id: <uid>`. With --json: {uid, calendar}.
+""" + _HELP_WRITE + """
+  Example: ical update <event-id> --title "Review (moved)" --from 2026-11-24T11:00 --to 2026-11-24T11:30
+""" + _HELP_TAIL,
+    "delete": """\
+ical delete <event-id> [--json] [--connection ID]
+
+  Delete an event by uid. The event is looked up within the connection's
+  scope first - no event of that uid in scope exits 1 - and the write gate
+  is checked against its calendar.
+
+  <event-id>   the event's uid
+""" + _HELP_JSON + _HELP_CONN + """
+  Output: `deleted  (<calendar>) id: <uid>`. With --json: {deleted,
+  calendar}.
+""" + _HELP_WRITE + """
+  Example: ical delete <event-id>
+""" + _HELP_TAIL,
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").
@@ -1213,7 +1432,7 @@ def main():
     )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("help", help="Print the full usage contract.")
+    sub.add_parser("help", help="Print the menu; `ical help <verb>` gives one verb's contract.")
     sub.add_parser("doctor", help="Prove the macOS Automation grant.")
 
     pc = sub.add_parser("calendars", help="List Calendar.app calendars.")
@@ -1295,7 +1514,8 @@ def main():
     args = p.parse_args(cleaned)
 
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        # `help` after `--connection <id>`: the contract's menu, as bare.
+        _cmd_help()
         return
     if args.cmd == "doctor":
         cmd_doctor()

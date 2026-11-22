@@ -560,7 +560,7 @@
       "level": 0,
       "lucide_icon": "rocket",
       "path": "capabilities/deployment",
-      "payload_sha256": "58284e5b6d19c23b242a64440c1a725f285b4fc0ae10f2889a0fd863edf85049",
+      "payload_sha256": "b02b080a05adfe2c432ee09a257fdd04070ded9e1baf7c7c568975a84a3d7e3f",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to.",
@@ -576,7 +576,7 @@
           "title": "Развёртывание"
         }
       },
-      "version": "2026-11-16 — `deployment` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `deployment help` is the menu, and `deployment help <verb>` one verb's whole contract"
     },
     "directo": {
       "executable": [
@@ -591,7 +591,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/directo",
-      "payload_sha256": "4fc22b1d749e4dbf8bc78f42b2a8220a524e0190e112de2c9155297df9dcd1fc",
+      "payload_sha256": "acb632fbcae56991b3d84132b298992d5e9e326a7bc625c8183a6d2dd8be935e",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Directo ERP CLI over the browser-session endpoints its web UI uses — log in, select a location, and read the authed `*.asp` surface (sales, purchases, stock, ledger). Stateful — run `directo doctor` first.",
@@ -607,7 +607,7 @@
           "title": "Directo"
         }
       },
-      "version": "2026-11-16 — `directo` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `directo help` is the menu, and `directo help <verb>` one verb's whole contract"
     },
     "emta": {
       "executable": [
@@ -623,7 +623,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/emta",
-      "payload_sha256": "5572050994b9a30da1e136672d13442cfd80a60bbfe77d4ccf42d1fcc6328661",
+      "payload_sha256": "f76bd00cd39cdfbdffec26e5149ab65a91450f2ab57ac3ceab8cde2a7a23f8f0",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Estonian Tax Board (maasikas.emta.ee) read-only CLI — prepay balances, per-period balances, prepay ledger. Session is paste-fed from a logged-in browser. Stateful — run `emta doctor` first.",
@@ -639,7 +639,7 @@
           "title": "EMTA"
         }
       },
-      "version": "2026-11-16 — `emta` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `emta help` is the menu, and `emta help <verb>` one verb's whole contract"
     },
     "fathom": {
       "executable": [
@@ -655,7 +655,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/fathom",
-      "payload_sha256": "17772f8e676ff354ced2a8cb8260b526bbcf4ad9fc6da857467794b8369ad175",
+      "payload_sha256": "f5c0cba329471681a06d97efccbeaef39dc2c5e3749df0fa77e5de9606d7dc58",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Fathom CLI over the External API + a PostgreSQL store — sync meetings and transcripts in one pass, read/update stored meetings, manage a vocabulary, and search the store at three levels.",
@@ -671,7 +671,7 @@
           "title": "Fathom"
         }
       },
-      "version": "2026-11-16 — `fathom` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `fathom help` is the menu, and every verb answers `fathom help <verb>` with its whole contract"
     },
     "geminitalk": {
       "executable": [
@@ -690,7 +690,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/geminitalk",
-      "payload_sha256": "8ab58c337ad0b991d47fbe90e40dc5d93af42073c365ad93b818f760e7cf3cd9",
+      "payload_sha256": "6317eff4de8dd5f1b3a34c8bfd2bba404efa96540c9ace2b3a6c4537f4182d2e",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Gemini Live native-audio project companion with continuous duplex audio, bounded project tools, optional headless Codex delegation, and an active Codex-thread relay.",
@@ -706,7 +706,7 @@
           "title": "Разговор с Gemini"
         }
       },
-      "version": "2026-11-16 — `geminitalk` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `geminitalk help` is the menu, and `geminitalk help <verb>` one verb's whole contract"
     },
     "ical": {
       "executable": [
@@ -723,7 +723,7 @@
       "level": 0,
       "lucide_icon": "calendar",
       "path": "capabilities/ical",
-      "payload_sha256": "48170283c21a500dd7e3b2b4a7fb02a698197bcb68747dd512f766191abcf317",
+      "payload_sha256": "b0a1c9eee5b3c6c0760b08fbb46665ef15dba81def6046ae30014b142c2d8aae",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "macOS Calendar CLI with indexed EventKit reads and Calendar.app automation writes across configured calendars (calendars, events, show, search, freebusy, create, update, delete). Writes are gated by the connection's policy (scope + allow_write); no credential is stored on disk.",
@@ -739,7 +739,7 @@
           "title": "Календарь Apple"
         }
       },
-      "version": "2026-11-16 — `ical` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `ical help` is the menu, and `ical help <verb>` one verb's whole contract"
     },
     "inbox": {
       "executable": [

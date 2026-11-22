@@ -4,139 +4,48 @@
 # dependencies = [
 #     "google-genai>=1.36.0",
 #     "sounddevice>=0.5.1",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """geminitalk - Gemini Live voice companion for the current project.
 
 Agent startup protocol:
-  1. Run `geminitalk help` to load this contract.
+  1. Run `geminitalk help` to load this menu, and `geminitalk help <verb>` for
+     one verb's whole contract.
   2. Run `geminitalk connections` to see where the API key and voice config resolve.
   3. Run `geminitalk doctor` to prove the key can reach the configured Live model.
   4. Run `geminitalk talk` for a live microphone/speaker session, or
      `geminitalk text "question"` for a headless smoke test.
 
-geminitalk is a voice-in / voice-out project companion built on Gemini Live API
-native audio. It can clarify project structure, read and search project files,
+Gemini Talk is a voice-in / voice-out project companion built on Gemini Live
+API native audio. It can clarify project structure, read and search project files,
 inspect safe capability surfaces, and optionally delegate an explicit bounded
 task to headless Codex. When launched from an active Codex thread it can relay
 explicit messages between the voice session and that active text turn without
 copying the complete conversation history.
 
 COMMANDS
-  geminitalk help
-      Print this contract.
+  geminitalk init                 scaffold the project-editable base prompt
+  geminitalk voices               the known Gemini prebuilt voices
+  geminitalk prompt               the system prompt that will be sent to Gemini; no API call
+  geminitalk tools                the function declarations exposed to the Live session
+  geminitalk project              the bounded project-overview tool, run locally
+  geminitalk text "<message>"     one text message through a Live session, no audio devices
+  geminitalk talk                 the interactive voice session
 
-  geminitalk init
-      Scaffold the project-editable base prompt at
-      capabilities/geminitalk/base.md. Existing files are never overwritten.
-
-  geminitalk doctor [--connection <id>] [--audio]
-      Resolve the selected connection(s), check the Google GenAI SDK import, and
-      prove the configured model is visible to the API key. With --audio, also
-      require usable input/output audio devices.
-
-  geminitalk connections
-      Local resolution report for API key, model, voice, prompt files, and tool
-      policy. Secrets are masked. No network.
-
-  geminitalk voices [--json]
-      List known Gemini prebuilt voices that can be put in a connection's
-      `voice` field or GEMINITALK_VOICE.
-
-  geminitalk prompt [--connection <id>]
-      Render the system prompt that will be sent to Gemini, including the
-      current project snapshot. No API call and no secrets.
-
-  geminitalk tools
-      Print the function declarations exposed to the Live session.
-
-  geminitalk project
-      Run the same bounded project-overview tool locally and print JSON.
-
-  geminitalk text [--connection <id>] [--timeout <seconds>] "<message>"
-      Start a Live session without local audio devices, send one text message,
-      and print the model's output transcription/text. Useful for smoke tests
-      and for headless machines.
-
-  geminitalk talk [--connection <id>] [--timeout <seconds>] [--no-tools]
-      Start the interactive voice session. Microphone audio is sent as raw PCM
-      16-bit 16 kHz while model audio is streamed concurrently as PCM 24 kHz.
-      On macOS, system Voice Processing supplies acoustic echo cancellation.
-      Lines received on terminal stdin are relayed to Gemini as realtime text.
-      Ctrl-C ends the session. Transcripts and tool calls are echoed to stderr.
+  `geminitalk doctor` proves the key reaches the configured Live model and
+  `geminitalk connections` reports where the key, model, voice, prompt files
+  and tool policy resolve (Contract verbs, below). Every verb that uses a
+  connection can be pointed at one by name; each verb's page says how.
 
 CONNECTIONS
   An explicit connections registry is required, even for one connection. The
-  selected entry's key resolves through the credential cascade (`Where a
-  secret resolves`, at the end of this help); the preferred env
-  var is GEMINITALK_API_KEY, with
-  GOOGLE_API_KEY and GEMINI_API_KEY accepted as compatibility aliases.
-
-  Optional env keys a connection may inherit:
-    GEMINITALK_MODEL              default gemini-3.1-flash-live-preview
-    GEMINITALK_VOICE              default Aoede
-    GEMINITALK_LANGUAGE           conversational language hint; default auto
-    GEMINITALK_AGENT_NAME         spoken agent name; default Tessa
-    GEMINITALK_MAX_AGENT_SESSIONS concurrent background agent limit; default 3
-    GEMINITALK_PROJECT_ROOT       project root override
-    GEMINITALK_PROMPT_FILES       explicit JSON array of ordered prompt files
-    GEMINITALK_SYSTEM_PROMPT_FILE legacy single project prompt file
-    GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS
-                               true/false; default false
-    GEMINITALK_ALLOW_CODEX_TASKS true/false; default true
-
-  A named registry lives with the project's connections, else the machine's
-  ~/.config/geminitalk/connections.json; "Where connections live" below says which
-  this project reads:
-    {
-      "default": "studio",
-      "connections": {
-        "studio": {
-          "secret_env": "GOOGLE_API_KEY",
-          "model": "gemini-3.1-flash-live-preview",
-          "voice": "Aoede",
-          "agent_name": "Tessa",
-          "max_agent_sessions": 3,
-          "language": "auto",
-          "allow_capability_domain_commands": false,
-          "allow_codex_tasks": true,
-          "allow_write": true
-        }
-      }
-    }
-
-  Entry fields:
-    secret_env      required; env var containing the Google AI Studio API key
-    model           optional; Live model id
-    voice           optional; prebuilt voice name
-    agent_name      optional; spoken agent name
-    max_agent_sessions
-                    optional; concurrent background agent limit, clamped 1..16
-    language        optional; prompt hint such as auto, ru-RU, en-US
-    project_root    optional; project to inspect; defaults to current project
-    prompt_files    optional; ordered string array. Project-relative paths are
-                    read from project_root; capability: paths come from bundle.
-                    When omitted, GeminiTalk loads capabilities/geminitalk/base.md
-                    and then .codex/generated/context.md only if it exists.
-    prompt_file     legacy single project prompt; appended after the default
-                    project base/context stack.
-    allow_capability_domain_commands
-                    optional; default false. When false, the Live model can only
-                    call contract/readiness commands on other capabilities.
-    allow_codex_tasks
-                    optional; default true. Exposes bounded read/act delegation
-                    to headless Codex in the selected project.
-    allow_write     optional; default true. Set false for a read-only
-                    connection.
-
-CONTRACT COMMANDS
-  geminitalk stub
-  geminitalk manifest --json
-  geminitalk guide [connections|voice-session]
-  geminitalk ids list|get <l>|set <l> <v>|rm <l> [--note <text>]
-  geminitalk refs
-  geminitalk inventory [--network]
+  selected entry's key resolves through the credential cascade; the preferred
+  env var is GEMINITALK_API_KEY, with GOOGLE_API_KEY and GEMINI_API_KEY
+  accepted as compatibility aliases. The optional env keys a connection may
+  inherit, the registry's form, each entry field and where a secret resolves
+  are on `geminitalk help connections`, and writing one is on `geminitalk
+  help connection`.
 
 I/O CONTRACT
   Success: JSON on stdout for local commands; `text` prints the answer text.
@@ -371,6 +280,247 @@ KNOWN_VOICES = [
     {"name": "Sadaltager", "style": "knowledgeable"},
     {"name": "Sulafat", "style": "warm"},
 ]
+
+
+# The verb pages `geminitalk help <verb>` answers (SHEBANG.md, "Agent-first
+# help is the surface"): each verb's whole contract, the module docstring being
+# the menu. The contract library dispatches both and renders the contract
+# verbs' own pages, which the entries here for doctor and connections follow.
+# A text several verbs own is one constant, added to each of their pages.
+_HELP_CONNECTION = """
+  --connection <id>   the connection to use, by id or label; without it the
+                      registry's default, or its only entry. It is read
+                      wherever it stands on the command line.
+"""
+_HELP_TAIL = """
+  I/O CONTRACT
+  Success: JSON on stdout for local commands; `text` prints the answer text.
+  Progress/transcripts during Live sessions go to stderr.
+  Error: {"error":{"code","message","hint"?,"status"?}} on stderr.
+
+  EXIT CODES
+  0 success
+  2 auth/config missing or rejected by Google API
+  3 not found
+  4 policy refusal from the project gate, auth context, or read-only tool fence
+  5 environment/network/audio/API runtime failure
+  6 input/validation
+"""
+HELP_VERBS = {
+    "doctor": """\
+For geminitalk:
+  geminitalk doctor [--connection <id>] [--audio]
+
+  Resolve the selected connection(s), check the Google GenAI SDK import, and
+  prove the configured model is visible to the API key. With --audio, also
+  require usable input/output audio devices. Without --connection every
+  connection in the registry is checked.
+
+  --connection <id>   check only this connection
+  --audio             fail unless input/output audio devices are usable
+
+  Output: {ok, connections: {<id>: {ok, model: {ok, name, display_name} or
+  {ok, category, error}, voice, language, agent_name, max_agent_sessions,
+  project_root, prompt_files, audio: {ok, required, default_device,
+  device_count} or {ok, required, error}, sdk: {ok, error?}}}}; a connection
+  that does not resolve answers {ok: false, error}.
+
+  Exit codes: 0 ready; 2 the key is missing or Google rejected it; 5 the SDK
+  does not import, the model is not found for the key, Google is not
+  reachable, or --audio found no usable devices; 6 an unknown argument, no
+  connections registry, an unknown connection, an entry without secret_env.
+
+  Examples:
+    geminitalk doctor
+    geminitalk doctor --connection studio --audio
+""" + _HELP_TAIL,
+    "connections": """\
+For geminitalk:
+  Local resolution report for API key, model, voice, prompt files, and tool
+  policy. Secrets are masked. No network. Output: {default, connections:
+  {<id>: {allow_write, keys: [...]}}}.
+
+  An explicit connections registry is required, even for one connection. The
+  selected entry's key resolves through the credential cascade (`Where a
+  secret resolves`, above); the preferred env var is GEMINITALK_API_KEY, with
+  GOOGLE_API_KEY and GEMINI_API_KEY accepted as compatibility aliases.
+
+  Optional env keys a connection may inherit:
+    GEMINITALK_MODEL              default gemini-3.1-flash-live-preview
+    GEMINITALK_VOICE              default Aoede
+    GEMINITALK_LANGUAGE           conversational language hint; default auto
+    GEMINITALK_AGENT_NAME         spoken agent name; default Tessa
+    GEMINITALK_MAX_AGENT_SESSIONS concurrent background agent limit; default 3
+    GEMINITALK_PROJECT_ROOT       project root override
+    GEMINITALK_PROMPT_FILES       explicit JSON array of ordered prompt files
+    GEMINITALK_SYSTEM_PROMPT_FILE legacy single project prompt file
+    GEMINITALK_ALLOW_CAPABILITY_DOMAIN_COMMANDS
+                               true/false; default false
+    GEMINITALK_ALLOW_CODEX_TASKS true/false; default true
+
+  A named registry lives with the project's connections, else the machine's
+  ~/.config/geminitalk/connections.json; "Where connections live" above says
+  which this project reads:
+    {
+      "default": "studio",
+      "connections": {
+        "studio": {
+          "secret_env": "GOOGLE_API_KEY",
+          "model": "gemini-3.1-flash-live-preview",
+          "voice": "Aoede",
+          "agent_name": "Tessa",
+          "max_agent_sessions": 3,
+          "language": "auto",
+          "allow_capability_domain_commands": false,
+          "allow_codex_tasks": true,
+          "allow_write": true
+        }
+      }
+    }
+
+  Entry fields:
+    secret_env      required; env var containing the Google AI Studio API key
+    model           optional; Live model id
+    voice           optional; prebuilt voice name
+    agent_name      optional; spoken agent name
+    max_agent_sessions
+                    optional; concurrent background agent limit, clamped 1..16
+    language        optional; prompt hint such as auto, ru-RU, en-US
+    project_root    optional; project to inspect; defaults to current project
+    prompt_files    optional; ordered string array. Project-relative paths are
+                    read from project_root; capability: paths come from bundle.
+                    When omitted, GeminiTalk loads capabilities/geminitalk/base.md
+                    and then .codex/generated/context.md only if it exists.
+    prompt_file     legacy single project prompt; appended after the default
+                    project base/context stack.
+    allow_capability_domain_commands
+                    optional; default false. When false, the Live model can only
+                    call contract/readiness commands on other capabilities.
+    allow_codex_tasks
+                    optional; default true. Exposes bounded read/act delegation
+                    to headless Codex in the selected project.
+    allow_write     optional; default true. Set false for a read-only
+                    connection.
+
+  Example: geminitalk connections
+""",
+    "init": """\
+geminitalk init
+
+  Scaffold the project-editable base prompt at
+  capabilities/geminitalk/base.md from the bundled template. Existing files
+  are never overwritten. Takes no argument. A write: refused under the
+  read-only switch.
+
+  Output: {initialized, project, prompt, written, skipped, prompt_files,
+  next}: the file written, or listed as skipped when it already exists.
+
+  Exit codes: 0; 3 prompt_template_missing, the bundled template is not
+  found; 4 the read-only switch; 6 no_project, no_envelope (run
+  `capabilities init` first), or any argument.
+
+  Example: geminitalk init
+""" + _HELP_TAIL,
+    "voices": """\
+geminitalk voices [--json]
+
+  List known Gemini prebuilt voices that can be put in a connection's
+  `voice` field or GEMINITALK_VOICE. No network.
+
+  --json   the structured answer
+
+  Output: plain text, `default: <voice>` then one `<name>: <style>` line per
+  voice. With --json: {default, voices: [{name, style}]}.
+
+  Exit codes: 0; 6 an unknown argument.
+
+  Examples:
+    geminitalk voices
+    geminitalk voices --json
+""" + _HELP_TAIL,
+    "prompt": """\
+geminitalk prompt [--connection <id>]
+
+  Render the system prompt that will be sent to Gemini, including the
+  current project snapshot: the prompt files in order (`prompt_files` on
+  `geminitalk help connections`). No API call and no secrets; the API key
+  need not resolve.
+""" + _HELP_CONNECTION + """
+  Output: the rendered system prompt as plain text.
+
+  Exit codes: 0; 6 an unknown argument, no connections registry, an unknown
+  connection, an entry without secret_env.
+
+  Example: geminitalk prompt --connection studio
+""" + _HELP_TAIL,
+    "tools": """\
+geminitalk tools
+
+  Print the function declarations exposed to the Live session:
+  project_overview, list_project_files, search_project, read_project_file,
+  capability_read, codex_task, codex_portal and end_session. Takes no
+  argument. No network.
+
+  Output: a JSON array of {name, description, parameters?}.
+
+  Exit codes: 0; 6 any argument.
+
+  Example: geminitalk tools
+""" + _HELP_TAIL,
+    "project": """\
+geminitalk project
+
+  Run the same bounded project-overview tool locally and print JSON. Takes
+  no argument. No network.
+
+  Output: {root, git_branch, git_dirty_lines, file_count_seen, top_files,
+  common_files, enabled_capabilities, readme?}: enabled_capabilities is the
+  project gate's list, null without a gate, or "unreadable".
+
+  Exit codes: 0; 6 any argument.
+
+  Example: geminitalk project
+""" + _HELP_TAIL,
+    "text": """\
+geminitalk text [--connection <id>] [--timeout <seconds>] "<message>"
+
+  Start a Live session without local audio devices, send one text message,
+  and print the model's output transcription/text. Useful for smoke tests
+  and for headless machines.
+""" + _HELP_CONNECTION + """
+  --timeout <seconds>  how long the session may run; default 60
+
+  Output: the answer text as plain text on stdout.
+
+  Exit codes: 0; 2 the key is missing or rejected; 5 live_timeout, the
+  session ran past --timeout, or live_error; 6 no message, no connections
+  registry, an unknown connection, an entry without secret_env.
+
+  Example: geminitalk text --timeout 30 "What is this repo for?"
+""" + _HELP_TAIL,
+    "talk": """\
+geminitalk talk [--connection <id>] [--timeout <seconds>] [--no-tools]
+
+  Start the interactive voice session. Microphone audio is sent as raw PCM
+  16-bit 16 kHz while model audio is streamed concurrently as PCM 24 kHz.
+  On macOS, system Voice Processing supplies acoustic echo cancellation.
+  Lines received on terminal stdin are relayed to Gemini as realtime text.
+  Ctrl-C ends the session. Transcripts and tool calls are echoed to stderr.
+""" + _HELP_CONNECTION + """
+  --timeout <seconds>  end the session after this long; default no limit
+  --no-tools           expose no function declarations to the session
+
+  Output: the voice session itself; transcripts and tool calls on stderr,
+  nothing on stdout.
+
+  Exit codes: 0 the session ended; 2 the key is missing or rejected; 5
+  live_error, audio devices or the Live API failed; 6 an unknown argument,
+  no connections registry, an unknown connection, an entry without
+  secret_env.
+
+  Example: geminitalk talk --connection studio
+""" + _HELP_TAIL,
+}
 
 
 # The shared capability code is the capabilities-contract library's, bound here

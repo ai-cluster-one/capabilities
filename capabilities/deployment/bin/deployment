@@ -2,425 +2,86 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
 
-Agent-invoked. Run `deployment help` to reload this contract before using the
-tool. This capability is provider-neutral: it owns the local deployment shape
-inside a consuming project, while provider capabilities such as `coolify` own
-the external substrate. A project can use deployment without enabling Coolify.
+Agent-invoked. Run `deployment help` to reload this menu and `deployment help
+<verb>` for one verb's whole contract, on demand. This capability is
+provider-neutral: it owns the local deployment shape inside a consuming
+project, while provider capabilities such as `coolify` own the external
+substrate. A project can use deployment without enabling Coolify.
 
 Generated Docker builds install every capability in the catalogue, then set
-the project up with the manager: `capabilities init --codex --claude`
-(target-local bindings), `capabilities doctor`, `capabilities hooks install
---claude --codex` (session hooks that run `capabilities session-start`),
-`capabilities build`. Generated host bindings, compiled context, and
-machine-local bindings (.env.local) are target-local build artifacts, not
-deployment inputs shipped from the repo.
+the project up with the manager (init, doctor, hooks install, build; the
+`sync` page names each). Generated host bindings, compiled context, and
+machine-local bindings (.env.local) are target-local build artifacts,
+not deployment inputs shipped from the repo.
 
-USAGE
-  deployment setup [--profile agent-box|agent-box-checkout|agent-box-shell]
-                   [--target production]
-                   [--provider coolify|dockerhost|manual]
-                   [--with-telegram auto|yes|no] [--project-name NAME]
-                   [--with-automations auto|yes|no]
-                   [--force] [--dry-run]
-      Full bootstrap for a non-technical deployment path. Creates the deployment
-      declarations and the target's bundle in deployment/targets/<target>/:
-      docker-compose.yaml, Dockerfile, Dockerfile.dockerignore, .env.example,
-      entrypoint.sh, and (when needed) supervisord.conf. Agent-box setup
-      embeds services in one supervised container, each under the node's
-      service supervisor (`capabilities node supervise`): in files mode the descriptor-default services of
-      capabilities the project enabled itself, with `enabled` available for
-      separate Compose services, and the Telegram/automations flags are
-      compatibility shorthands for per-capability service policy; in store
-      mode (an agent whose records are in the store) every installed capability
-      service, and those flags with any value but `auto` exit 6
-      retired_option, since whether a service runs is the gate's answer on
-      each node. If --dry-run is passed, print the files that would be written.
+A profile picks the substrate `deployment sync` compiles for: agent-box, one
+supervised container carrying the project; agent-box-checkout, the same
+container with the project arriving from Git and kept level with its branch;
+agent-box-shell, the same container with no body, for an agent that lives
+wholly in the store; host-agents, the services on a Mac under its node
+manager; generic, declarations only. The `init` page says each in full, and
+`deployment guide profiles` gives the trade-offs. Which services sync
+compiles depends on where the project's gate is kept, in files or in the
+store; the `sync` page says both.
 
-  deployment scaffold
-      Alias for `deployment setup`.
+SETTING UP  (writes: exit 4 under the read-only switch, a preview excepted)
+  deployment setup              full bootstrap: the declarations and the target's bundle
+  deployment scaffold           alias for `deployment setup`
+  deployment init               the standard declarations alone: runtime and target
+  deployment sync               compile the service graph and each target's bundle, or check drift
 
-  deployment init [--profile generic|agent-box|agent-box-checkout|agent-box-shell
-                             |host-agents]
-                  [--target production]
-                  [--provider coolify|dockerhost|manual] [--force]
-      Create the standard local deployment files:
-        deployment/runtime.json
-        deployment/targets/<target>/target.json
-      Existing files are left untouched unless --force is passed. This command
-      requires an existing project `capabilities/` envelope; it never writes
-      `capabilities/settings.json`.
+READING  (they change nothing)
+  deployment doctor             are the declarations valid, and the provider ready here
+  deployment runtime            deployment/runtime.json as it stands
+  deployment targets            the target declarations
+  deployment plan               an execution-neutral plan of what each target would run
+  deployment next               the human next steps after setup
+  deployment services           this node and its view of each compiled service
 
-      The profile picks the substrate `deployment sync` compiles for.
-      `agent-box` builds one supervised container carrying the project.
-      `agent-box-checkout` builds the same container without the project: the
-      image holds tools and the boot path, and the checkout arrives from Git on
-      a volume the entrypoint clones into. The profile then keeps that body
-      level with the branch it tracks, in both directions, so what was pushed
-      reaches the box and what the agent commits there both survives a redeploy
-      and reaches the remote. `agent-box-shell` builds the same container
-      with no body at all, for an agent that lives wholly in the store: no
-      project copy, no clone, no body sync. Each boot binds an
-      empty project root to the agent with `capabilities init --id
-      $CAPABILITIES_PROJECT_ID`, wires the agent CLIs with `capabilities hooks
-      install`, composes its context from the store with `capabilities build`,
-      and starts the compiled services under the node's service manager, where
-      the gate for this node places them. `host-agents` declares the same
-      services for a Mac, where they run as processes on the machine itself
-      under its node manager (`capabilities node install --apply`, which
-      places each service the gate puts on that node); `sync` compiles no
-      agent for a service, only one per Coolify target that carries the body
-      to its node, under `compiler.host.agents_dir`, and `deployment next`
-      hands over the launchctl steps for those. `generic` stays
-      declaration-only. A Linux host uses a container profile, or `generic`
-      with a supervisor the project owns. Run `deployment guide profiles` for
-      the trade-offs.
+DEPLOYING  (a Coolify target, through the coolify capability and SSH)
+  deployment deploy             check drift, carry the body, deploy, wait for healthy
+  deployment rollback           roll a target back to the previous release or a commit
+  deployment logs               a target's runtime logs or its recorded build log
 
-  deployment sync [--check|--adopt]
-      Compile the project's deployable-service descriptors into the runtime
-      service graph and, for a container profile, one bundle per declared
-      target (Compose, Dockerfile, ignore file, env example, entrypoint,
-      supervisor configuration) in its folder. Every compiled service runs
-      under the node's service supervisor, `capabilities node supervise`. Which
-      services are compiled
-      depends on where the project's gate is kept:
-      Files mode (no node in the gate): as before, only capabilities
-      explicitly enabled in project settings are candidates, one enabled only
-      at global scope contributes no service, and service_policy decides
-      which run and how: auto_include, default_mode (enabled|embedded),
-      capabilities.<name> auto|enabled|disabled|embedded and the descriptor's
-      default_policy; service_policy.placement and services.<name>.placement
-      (node|local|both) choose the substrate.
-      Store mode (an agent whose records are in the store): every deployable
-      descriptor of the installed catalogue, less capabilities.exclude, so
-      the gate row naming each node, not the compile, decides whether a
-      service runs there, and turning it on or off needs no recompile or
-      redeploy. service_policy keeps only the shape: `shape`
-      (embedded|container) for every service and `capabilities.<name>` for
-      one; embedded runs under the agent container's Supervisor, whose one
-      program for them is the node's service manager (`capabilities node
-      run`), which keeps a program per service placed on the node and none
-      for any other; container is a Compose service of its own. A service
-      that declares only a machine form (service.machine, no service.deploy)
-      has no container of its own, so a box carries it embedded whatever the
-      shape, on that program's --services list. A store-mode
-      runtime still carrying the retired switches (auto_include, default_mode,
-      capabilities.<name> auto|enabled|disabled) or placement is reported as a
-      warning naming each one, and sync rewrites it, keeping the shape it
-      implied; `retired` in the result lists what it rewrote.
-      A target's `node` is the id of the node its server runs as in the
-      gate. The node resolves an id itself, from the
-      ~/.config/capabilities/node-id that enrol writes (`capabilities node
-      id --set`), so its bundle hands it none and `deploy` empties
-      AGENT_NODE_ID on the application. For a node registered before ids,
-      `node` is the name it is still keyed by: its bundle's Compose file
-      sets AGENT_NODE_ID to it in every container, so every container of
-      the box and every redeploy is that one node, and `deploy` sends it to
-      the application. A target without one takes AGENT_NODE_ID from the
-      server's environment, else its AGENT_NODE_NAME, which named the node
-      before ids. The node's
-      label is its row's (`capabilities node set <id> --label`). A malformed
-      node (node_invalid) or a service environment_defaults also setting
-      AGENT_NODE_ID beside it (node_declared_twice) stops the sync.
-      The project's id (CAPABILITIES_PROJECT_ID, as the project resolves it
-      at sync) is set with CAPABILITIES_PROJECT_ID_ROOT, the box's project
-      root, in every container and, for an image that runs `capabilities
-      init` in its build, in the image before that step.
-      --check is read-only and exits 7 with structured drift details.
-      --adopt explicitly replaces unmarked files at the runtime-declared
-      managed artifact paths; external artifacts and overlays are never written.
+NODES
+  deployment node create <node>  a store agent's node, its image built by Coolify from a repository
+  deployment node login claude|codex  subscription login in the agent container, over SSH
+  deployment node sync          carry the body through node-<target>: fetch, rebase, push
+  deployment node status        host, release, Git sync, harness, store and per-service state
 
-  deployment services
-      This node - its id (node) and the label it gives itself (label) - and
-      its view of each compiled service: what the gate answers for
-      it here (placed, the row that answered: scope, node, enabled, service,
-      and why),
-      whether its supervisor (`capabilities node supervise`, which records
-      it under capabilities/deployment/state/runners/) is running it, a
-      refusal it is held idle for, and who holds its lease (state, holder,
-      expiry, and last_error: the exit code and time the service last
-      failed with on the holder, else null). Writes nothing; a store that
-      holds no lease table yet answers free.
+THIS MACHINE
+  deployment machine handover   hand this Mac's machine-service agents to the node manager
+  deployment runner <name>      what an older deployment's launcher runs, kept until handed over
 
-  deployment machine handover [<name> ...] [--dry-run]
-      Hand this Mac's machine-service agents - the
-      `capabilities.machine.<name>` launchd agents an older deployment
-      compiled for the services that run once per machine, and the
-      `capabilities.machine.watchdog` over them, in
-      `$XDG_STATE_HOME/deployment/machine/launchd/` - over to the node's
-      service manager (`capabilities node install --apply` does the same for
-      the machine services the node manager will run there): it boots out
-      each loaded `capabilities.machine.<name>` of the named services (every
-      one found when none is named) and takes its entry out of
-      ~/Library/LaunchAgents, as `capabilities node install --apply` does a
-      project's, and the machine watchdog with them once no other machine
-      service agent stays loaded. The compiled files stay. Run again it
-      changes nothing; --dry-run changes nothing and answers the same. It
-      stays for the machine agents of a service no agent on this Mac places
-      in mode shared, which `capabilities node install` does not reach.
-      Answers {dry_run, ok,
-      agents_dir, agents [{label, kind (service|watchdog), service?, loaded,
-      installed, action, kept_at?}]}; exit 6 when an agent could not be
-      handed over.
-
-  deployment runner <name> [--every SECONDS] [--restart POLICY] -- <command...>
-      What a launchd agent or supervisor entry an older deployment compiled
-      runs, kept so that agent goes on working until the node manager takes
-      it over. It checks its arguments, this capability's gate and the
-      read-only switch, then hands the service, in the same process, to the
-      manager's supervisor, `capabilities node supervise <name> --every
-      SECONDS --restart POLICY -- <command...>`, with SECONDS
-      service_policy.reconcile_seconds when omitted (default 60, 5-3600) and
-      POLICY unless-stopped. With a manager that does not answer `node
-      supervise --probe`, or none found here, it says so on stderr, naming
-      `capabilities self-update`, and supervises the service itself as the
-      manager's supervisor would (`capabilities help`, node supervise),
-      keeping its record under capabilities/deployment/state/runners/.
-      Nothing deployment compiles runs it.
-
-  deployment deploy [--target <name>]
-      Check compiler drift, sync the body through node-<target> over SSH,
-      provision a Coolify application in the project's existing environment
-      (target.environment, default production; none is created), named
-      <project>-<target> after the project (its agent's name as `capabilities
-      agent show` answers it in a folder that carries a legacy context
-      binding, else the [identity] name that binding's config file sets,
-      else its recorded slug), and set that name, its base
-      directory and its Compose location
-      (the target's bundle) on every deploy, set environment through bulk stdin
-      (with the runtime's compiler.build_args, which Coolify builds with), deploy,
-      follow the deployment until Coolify ends it (at most 3600 s), then wait for healthy.
-      The database is never sent: the node takes AGENTKIT_DB_* from the
-      server's environment, and a deploy leaves those values standing.
-      On failure request the previous release; the message says
-      rollback=healthy, rollback=failed (<code>) or rollback=no previous
-      release. A check of a started deployment that cannot reach the store
-      (store_unreachable, store_busy) is tried again, up to 4 times; one that
-      still cannot is not a failed deploy: nothing is rolled back, the answer
-      on stdout says "deployment running, verification failed" with the
-      deployment and the `coolify wait` that checks it, and deploy exits 5
-      deployment_unverified. Requires agent-box-checkout, a
-      committed branch and a granted connection. A target whose body_source
-      is GitHub ({"kind": "github", "repository": "<owner>/<repo>"}, with
-      deploy_key) prepares no server repository and pushes nothing: it
-      refuses (commit_not_on_remote) unless the commit is on the GitHub
-      branch, points the application at that repository and branch, sets
-      AGENT_REPO_URL to its HTTPS URL, and builds exactly that commit.
-  deployment rollback [--target <name>] [--to <commit>]
-      Set the build args that release's runtime declares, roll back through
-      Coolify and wait. Without --to use the previous release; a deploy that
-      fails rolls back the same way.
-  deployment logs [--target <name>] [--build] [--follow]
-      Read runtime logs or the recorded deployment build log; --follow polls.
-  deployment node create <node> --project <uuid> --server <uuid>
-                         --environment <name> --repository <url>
-                         --branch <branch> --dockerfile <path> [--context <dir>]
-                         [--deploy-key <uuid> | --github-app <uuid>]
-                         [--docker-socket] [--host-dir <path>]...
-                         [--memory 2g] [--connection <id> | --coolify-stdin]
-      For an agent that lives in the store: a node whose image Coolify
-      builds on that server from the Dockerfile at --dockerfile in the
-      repository's --branch, with --context as the build context (the
-      repository root by default; the Dockerfile lies inside it) - a
-      Dockerfile FROM the standard image ghcr.io/agenium-dev/agent-node,
-      with no CI and no registry - through the coolify connection (the only
-      one granted, or --connection), in that project's existing environment
-      on that server. The repository is cloned with a Coolify deploy key or
-      GitHub App (`coolify sources` lists their uuids), else as public. The
-      node is a Coolify application with no domain, no automatic deploy on
-      push, the memory limit, a volume of its own for each state path of the
-      image (~/.config, ~/.local/state, ~/.claude, ~/.codex) and for ~/work,
-      where the agent keeps its checkouts and git worktrees, and only
-      CAPABILITIES_PROJECT_ID and CAPABILITIES_PROJECT_ID_ROOT (/app) in its
-      environment. It takes host paths, each bound at the same path in the
-      container: --docker-socket the host's /var/run/docker.sock, and each
-      --host-dir an existing directory on the server (not /home/agent, /app
-      or above them). Coolify never creates, writes or deletes a host path.
-      Then mint the node's id, twelve lowercase hex characters, and register
-      the node row under it with <node> as its label, the name it is shown
-      by, and the connection, server and resource (`capabilities node
-      add`); a row that cannot be written takes the application away again,
-      as does a step that fails once it exists. The node starts idle,
-      knowing no store; the answer's node.node is its id, and next the
-      `capabilities node enrol` that puts it on its config volume. The
-      answer names the application and the build's deployment; `coolify
-      wait <uuid> --deployment <uuid>` waits for the build before enrol.
-      Exit 6 node_exists (a node of this agent already labelled so),
-      not_store_mode, environment_missing (3).
-      --coolify-stdin: reach Coolify through a connection the caller lends
-      this one run instead of one granted to the agent - a JSON object
-      {"url", "token"} on standard input, the instance root without /api/v1
-      and its API token - which each coolify the verb runs is given in its
-      environment alone (COOLIFY_LENT_BASE_URL, COOLIFY_LENT_TOKEN; coolify
-      help) and which is never on a command line, printed or written.
-      --connection beside it is refused (exit 6 lent_connection). A node
-      created so records that Coolify's address as its connection.
-      Every other verb on a node, once it exists, is the capabilities
-      manager's (`capabilities node`), whose rows it reaches as any other.
-      The logins are not handed over: a person makes them on the node, over
-      SSH to its server and `docker exec -it` into the container labelled
-      with the project alone - `claude auth login`, `codex login
-      --device-auth`, and `gh auth login` for the GitHub CLI - or with
-      `capabilities node login <node> <tool> --events`.
-  deployment node login claude|codex [--target <name>] [--print-command]
-      SSH with a terminal into the application's agent container for subscription
-      login. --print-command prepares the command without attempting login.
-  deployment node sync [--target <name>]
-      Fetch node-<target>, rebase and push; abort conflicts and report diverged.
-      Optional target.mirror receives the synced branch. Host-agents compiles
-      an interval job (target.sync_interval, default 60 seconds). A target
-      whose body_source is GitHub answers state nothing_to_carry, touches no
-      remote and gets no interval job: its node syncs with GitHub itself.
-  deployment node status [--target <name>] [--json]
-      JSON host, release, Git sync, harness, store and per-service state.
-      Git sync is against the node remote, or the GitHub branch for a target
-      whose body_source is GitHub.
-      store is the node's database in force, resolved in its container through
-      the shared library: level, sources and setting redacted, reachable,
-      tls_enforced.
-      Each service carries `node` (its Supervisor or container state there),
-      `local` (its launchd agent here), `placement` in files mode, and, from
-      `deployment services` run in the node's container, `gate`, `running`,
-      `lease` and any `refusal`; node_id is the id the node answers to in
-      the gate and node_name the label it gives itself (its
-      AGENT_NODE_NAME). A target that declares `node` adds
-      declared_node_name, and an error node_name_mismatch while the node
-      answers to another id.
-      leftovers is what no service accounts for, read in the container:
-      processes that are neither a Supervisor program nor descended from one
-      (pid, ppid, age_seconds, command), development sessions open longer than
-      a day or damaged (id, capability, age_hours, damaged), and the size of
-      /tmp and of the uv cache in bytes.
-
-  deployment doctor [--target <name>]
-      Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
-      references. Reports provider readiness as local facts only: whether the
-      provider capability is installed/enabled here. It does not call Coolify,
-      SSH, Docker, or any remote provider. For host-agents it reports the
-      launchd agent an older deployment compiled for each service as launchd
-      holds it, and one still loaded as a warning: the services run under
-      this Mac's node manager (`capabilities node install --apply`, which
-      hands such an agent over); `deployment next` there lists only the
-      agents that carry the body to a node, and starts, stops and restarts
-      the services through `capabilities service`.
-
-  deployment runtime
-      Print deployment/runtime.json.
-
-  deployment targets [--target <name>]
-      Print target declarations from deployment/targets/.
-
-  deployment plan [--target <name>]
-      Print an execution-neutral deployment plan. The plan names the provider
-      adapter that would execute the target, plus command hints, but performs no
-      remote operation.
-
-  deployment next [--target <name>] [--text|--json]
-      Human next steps after setup: what to review, what secrets to enter, how
-      to create the provider resource, first-login commands, and validation.
-
-  Moved to the capabilities manager
-      The standard agent node, the list of an agent's nodes and the handover
-      of an older deployment's launchd agents are the manager's. These forms
-      run nothing here: each exits 6 moved, naming the manager command that
-      does its work, with its usage as the hint, and under --events (node
-      add, node login) the refusal is the stream's error event.
-        deployment node image            capabilities node image
-        deployment node create           capabilities node create
-          (with no --repository, --branch, --dockerfile, --context,
-          --deploy-key, --github-app, --docker-socket or --host-dir)
-        deployment node enrol            capabilities node enrol
-        deployment node add              capabilities node add
-        deployment node update           capabilities node update <node>
-                                           --version <tag>
-        deployment node remove           capabilities node remove <node> --yes
-        deployment node exec             capabilities node exec
-        deployment node login <node> <tool> | --events | --connection
-          | --method                     capabilities node login <node>
-                                           <tool> --events
-        deployment node list             capabilities node list, and
-                                           capabilities agent state for
-                                           which nodes are live
-        deployment handover              capabilities node install --apply
-
-Contract commands:
-  deployment help
-  deployment stub
-  deployment manifest --json
-  deployment guide [agent-node|bootstrap|profiles|standard|targets]
-  deployment connections
-  deployment ids list|get <label>|set <label> <value>|rm <label> [--note <text>]
-  deployment refs
-  deployment inventory [--network]
+MOVED TO THE CAPABILITIES MANAGER
+The standard agent node, the list of an agent's nodes and the handover of an
+older deployment's launchd agents are the manager's. These forms run nothing
+here: each exits 6 moved, naming the manager command that does its work, with
+its usage as the hint; each one's page says which form it is.
+  deployment node image         capabilities node image
+  deployment node create        capabilities node create, for the standard image
+  deployment node enrol         capabilities node enrol
+  deployment node add           capabilities node add
+  deployment node update        capabilities node update
+  deployment node remove        capabilities node remove
+  deployment node exec          capabilities node exec
+  deployment node login <node> <tool>  capabilities node login
+  deployment node list          capabilities node list, and capabilities agent state
+  deployment handover           capabilities node install
 
 FILES
-  deployment/runtime.json
-      The project's runtime declaration: profile, services, service-level
-      required env, state volumes, runtime capability exclusions, and
-      service_policy (see `deployment sync`; reconcile_seconds in either mode) and compiler layout. A container runtime
-      that names no artifact path compiles one bundle per target (below).
-      compiler.artifacts declares the
-      Dockerfile, entrypoint, env example, dockerignore, and optional supervisor paths;
-      compose_file declares the generated base Compose file; either one keeps
-      the runtime on those declared paths instead of per-target bundles;
-      compiler.compose_overlays declares untouched project-owned overlays;
-      compiler.container supplies agent_home and project_root for portable mounts;
-      compiler.container.persistent_manager true (container profiles) keeps the
-      capabilities manager's whole home on named volumes, its launcher
-      directory first on PATH: the node keeps the tools it installs, and each
-      boot updates the manager to the newest release of the official
-      source's tracked branch, never an older one than it has, and brings
-      the catalogue capabilities to the image's catalogue;
-      compiler.container.checkouts (agent-box-checkout) lists other
-      repositories the box works on, each {path, url, branch, register}: each
-      boot clones one whose path is absent or empty, never touches one already
-      checked out, and with register "official" registers it as the manager's
-      integration checkout unless the manager already names it;
-      compiler.build_args is the only source of generated Compose build args.
-      A service environment_defaults mapping overrides descriptor env defaults.
+  deployment/runtime.json       the runtime declaration; its page is `deployment help runtime`
+  deployment/targets/<target>/  one folder per target: target.json and the bundle sync compiles
+  capabilities/deployment/reference/*.md  optional project-specific operational models
 
-  Runtime-declared compiler artifact paths
-      A string path is compiler-managed for compatibility. Object declarations
-      use {path, ownership}, where ownership is managed or external. External
-      files must exist but are excluded from drift, sync, and adoption. Setup
-      declares none, so its runtime compiles per-target bundles; declared local
-      Compose overlays are external.
-
-  deployment/targets/<target>/
-      One folder per deployment target. target.json chooses a provider
-      (`coolify`, `dockerhost`, or `manual`) and carries only the adapter-facing
-      resource handle needed to execute that target; a declaration still at
-      deployment/targets/<target>.json is read until it is moved. Beside it,
-      sync compiles the target's bundle: docker-compose.yaml (build context
-      ../../.., the project root), Dockerfile, Dockerfile.dockerignore (Docker
-      reads it for that Dockerfile), .env.example, entrypoint.sh,
-      supervisord.conf when Supervisor runs, and body-sync.sh on the checkout
-      profile. The project root gains only .gitattributes on that profile.
-
-  Capabilities in a container image
-      The image installs every capability in the official catalogue at
-      CAPABILITIES_REF (default main) with `capabilities install <name>
-      --allow`, a core one arriving enabled by the manager's first-install
-      rule, and each boot brings the registry to that catalogue: it installs
-      any catalogue capability the registry lacks, reinstalls from it one
-      installed from another catalogue, updates one whose payload differs from
-      it, and leaves one installed from elsewhere as it is, so a node whose
-      manager home persists runs the catalogue its image names. Whether a
-      capability is usable is its gate's and its connections' answer, not
-      whether it is installed. The runtime's capabilities.exclude list keeps
-      operator-only tools out of the image without changing their project
-      policy on the host.
-
-  capabilities/deployment/reference/*.md
-      Optional project-specific operational models. Reference files are neither
-      created nor required by deployment init or setup. When present, they hold
-      genuine project-specific deployment context rather than pointers
-      duplicating runtime.json or target JSON schemas. Loaded on demand by
-      `deployment refs` and the manager's generated capability context.
+I/O
+  An answer is JSON on stdout (`deployment next` gives Markdown unless asked for
+  JSON); a failure is {"error": {"code", "message", "hint"?}} on stderr.
 
 EXIT CODES
   0 success
@@ -428,7 +89,7 @@ EXIT CODES
   4 project policy refused this capability
   5 the store cannot be reached
   6 malformed input, validation failure, or init conflict
-  7 deployment sync --check drift
+  7 drift that sync's check found
 """
 
 from __future__ import annotations
@@ -467,6 +128,817 @@ TRANSLATIONS = {
            "description": ('Projekti juurutamise standard – kirjelda teenused, mida projekt '
                             'käitab, kompileeri need konteineri kujutiseks ja kirjelda sihtkohad, '
                             'kuhu need juurutatakse.')},
+}
+
+# The verb pages `deployment help <verb>` answers (SHEBANG.md, "Agent-first
+# help is the surface"): each verb's whole contract, the module docstring being
+# the menu. The contract library dispatches both and renders the contract
+# verbs' own pages, which the entries here for doctor and inventory follow. A
+# text several verbs own is one constant, added to each of their pages.
+_HELP_BUILD = """
+  THE IMAGE'S SETUP
+  Generated Docker builds install every capability in the catalogue, then set
+  the project up with the manager: `capabilities init --codex --claude`
+  (target-local bindings), `capabilities doctor`, `capabilities hooks install
+  --claude --codex` (session hooks that run `capabilities session-start`),
+  `capabilities build`. Generated host bindings, compiled context, and
+  machine-local bindings (.env.local) are target-local build artifacts, not
+  deployment inputs shipped from the repo.
+"""
+_HELP_RUNTIME_FILE = """
+  deployment/runtime.json
+      The project's runtime declaration: profile, services, service-level
+      required env, state volumes, runtime capability exclusions, and
+      service_policy (see `deployment sync`; reconcile_seconds in either mode) and compiler layout. A container runtime
+      that names no artifact path compiles one bundle per target (below).
+      compiler.artifacts declares the
+      Dockerfile, entrypoint, env example, dockerignore, and optional supervisor paths;
+      compose_file declares the generated base Compose file; either one keeps
+      the runtime on those declared paths instead of per-target bundles;
+      compiler.compose_overlays declares untouched project-owned overlays;
+      compiler.container supplies agent_home and project_root for portable mounts;
+      compiler.container.persistent_manager true (container profiles) keeps the
+      capabilities manager's whole home on named volumes, its launcher
+      directory first on PATH: the node keeps the tools it installs, and each
+      boot updates the manager to the newest release of the official
+      source's tracked branch, never an older one than it has, and brings
+      the catalogue capabilities to the image's catalogue;
+      compiler.container.checkouts (agent-box-checkout) lists other
+      repositories the box works on, each {path, url, branch, register}: each
+      boot clones one whose path is absent or empty, never touches one already
+      checked out, and with register "official" registers it as the manager's
+      integration checkout unless the manager already names it;
+      compiler.build_args is the only source of generated Compose build args.
+      A service environment_defaults mapping overrides descriptor env defaults.
+"""
+_HELP_ARTIFACTS = """
+  Runtime-declared compiler artifact paths
+      A string path is compiler-managed for compatibility. Object declarations
+      use {path, ownership}, where ownership is managed or external. External
+      files must exist but are excluded from drift, sync, and adoption. Setup
+      declares none, so its runtime compiles per-target bundles; declared local
+      Compose overlays are external.
+"""
+_HELP_TARGET_DIR = """
+  deployment/targets/<target>/
+      One folder per deployment target. target.json chooses a provider
+      (`coolify`, `dockerhost`, or `manual`) and carries only the adapter-facing
+      resource handle needed to execute that target; a declaration still at
+      deployment/targets/<target>.json is read until it is moved. Beside it,
+      sync compiles the target's bundle: docker-compose.yaml (build context
+      ../../.., the project root), Dockerfile, Dockerfile.dockerignore (Docker
+      reads it for that Dockerfile), .env.example, entrypoint.sh,
+      supervisord.conf when Supervisor runs, and body-sync.sh on the checkout
+      profile. The project root gains only .gitattributes on that profile.
+"""
+_HELP_IMAGE_CAPS = """
+  Capabilities in a container image
+      The image installs every capability in the official catalogue at
+      CAPABILITIES_REF (default main) with `capabilities install <name>
+      --allow`, a core one arriving enabled by the manager's first-install
+      rule, and each boot brings the registry to that catalogue: it installs
+      any catalogue capability the registry lacks, reinstalls from it one
+      installed from another catalogue, updates one whose payload differs from
+      it, and leaves one installed from elsewhere as it is, so a node whose
+      manager home persists runs the catalogue its image names. Whether a
+      capability is usable is its gate's and its connections' answer, not
+      whether it is installed. The runtime's capabilities.exclude list keeps
+      operator-only tools out of the image without changing their project
+      policy on the host.
+"""
+_HELP_REFERENCE = """
+  capabilities/deployment/reference/*.md
+      Optional project-specific operational models. Reference files are neither
+      created nor required by deployment init or setup. When present, they hold
+      genuine project-specific deployment context rather than pointers
+      duplicating runtime.json or target JSON schemas. Loaded on demand by
+      `deployment refs` and the manager's generated capability context.
+"""
+_HELP_TAIL = """
+  I/O
+  An answer is JSON on stdout; a failure is {"error": {"code", "message",
+  "hint"?}} on stderr. An unknown flag or a missing argument exits 6 `input`.
+
+  EXIT CODES
+  0 success
+  3 not found (no project, no runtime, unknown target)
+  4 project policy refused this capability
+  5 the store cannot be reached
+  6 malformed input, validation failure, or init conflict
+  7 deployment sync --check drift
+"""
+_HELP_NODE_TAIL = """
+  A target here is a declaration in deployment/targets/ whose provider is
+  coolify, naming its server and project by Coolify identifier labels; without
+  --target the first declared target is used. Every Coolify call goes through
+  the coolify capability and the connection the target names, which must be
+  granted to this agent (exit 4 `connection_not_granted`), and a write needs
+  one that grants writes (exit 4 `read_only_connection`). A failure of the
+  coolify call keeps its exit code.
+"""
+_HELP_MOVED = """
+  MOVED TO THE CAPABILITIES MANAGER
+  The standard agent node, the list of an agent's nodes and the handover
+  of an older deployment's launchd agents are the manager's. These forms
+  run nothing here: each exits 6 moved, naming the manager command that
+  does its work, with its usage as the hint, and under --events (node
+  add, node login) the refusal is the stream's error event.
+    deployment node image            capabilities node image
+    deployment node create           capabilities node create
+      (with no --repository, --branch, --dockerfile, --context,
+      --deploy-key, --github-app, --docker-socket or --host-dir)
+    deployment node enrol            capabilities node enrol
+    deployment node add              capabilities node add
+    deployment node update           capabilities node update <node>
+                                       --version <tag>
+    deployment node remove           capabilities node remove <node> --yes
+    deployment node exec             capabilities node exec
+    deployment node login <node> <tool> | --events | --connection
+      | --method                     capabilities node login <node>
+                                       <tool> --events
+    deployment node list             capabilities node list, and
+                                       capabilities agent state for
+                                       which nodes are live
+    deployment handover              capabilities node install --apply
+"""
+_HELP_SETUP = """\
+deployment setup [--profile agent-box|agent-box-checkout|agent-box-shell]
+                 [--target production]
+                 [--provider coolify|dockerhost|manual]
+                 [--with-telegram auto|yes|no] [--project-name NAME]
+                 [--with-automations auto|yes|no]
+                 [--force] [--dry-run]
+
+  Full bootstrap for a non-technical deployment path. Creates the deployment
+  declarations and the target's bundle in deployment/targets/<target>/:
+  docker-compose.yaml, Dockerfile, Dockerfile.dockerignore, .env.example,
+  entrypoint.sh, and (when needed) supervisord.conf. Agent-box setup
+  embeds services in one supervised container, each under the node's
+  service supervisor (`capabilities node supervise`): in files mode the descriptor-default services of
+  capabilities the project enabled itself, with `enabled` available for
+  separate Compose services, and the Telegram/automations flags are
+  compatibility shorthands for per-capability service policy; in store
+  mode (an agent whose records are in the store) every installed capability
+  service, and those flags with any value but `auto` exit 6
+  retired_option, since whether a service runs is the gate's answer on
+  each node. If --dry-run is passed, print the files that would be written.
+  It needs the project's `capabilities/` envelope, and takes the container
+  profiles only (`deployment init --profile generic` writes descriptors
+  alone).
+
+  --profile P            the container profile (default agent-box); the
+                         profiles are on `deployment help init`
+  --target NAME          the target to declare and compile (default production)
+  --provider P           the target's provider: coolify (default), dockerhost
+                         or manual
+  --with-telegram V      auto (default), yes or no: in files mode yes sets
+                         service_policy.capabilities.telegram to enabled and no
+                         to disabled; in store mode any value but auto exits 6
+                         retired_option
+  --with-automations V   the same for automations
+  --project-name NAME    the name the declarations carry (default the project
+                         folder's name)
+  --force                write over existing files, the target declaration
+                         among them, and take over unmarked files at the
+                         managed artifact paths
+  --dry-run              write nothing: answer what would be written, with the
+                         questions a person answers before setup
+
+  Output: {ok, project, profile, provider, target, services,
+  embedded_services, with_telegram, with_automations, written, drift,
+  findings, next}. With --dry-run: {ok, dry_run, project, profile, provider,
+  target, services, embedded_services, with_telegram, with_automations,
+  would_write, findings, questions}.
+
+  Exit codes: 0; 3 no project; 4 policy, the read-only switch (not under
+  --dry-run); 6 no_envelope, unsupported_profile, retired_option, a file
+  left untouched or a compile that failed (ok false).
+
+  Examples:
+    deployment setup --dry-run
+    deployment setup --profile agent-box-checkout --target production
+""" + _HELP_BUILD + _HELP_RUNTIME_FILE + _HELP_TARGET_DIR + _HELP_IMAGE_CAPS + _HELP_TAIL
+_HELP_NODE_LOGIN = """\
+deployment node login claude|codex [--target <name>] [--print-command]
+
+  SSH with a terminal into the application's agent container for subscription
+  login. --print-command prepares the command without attempting login.
+
+  claude runs `claude auth login` in the container and codex runs `codex login
+  --device-auth`, through `docker exec -it` over SSH to the target's server.
+
+  --target NAME     the Coolify target (default the first declared)
+  --print-command   answer the command instead of running it
+
+  Output: with --print-command {target, harness, command}; otherwise the
+  login runs on this terminal and its exit code is this one's.
+
+  Exit codes: the login's own; 3 no target, no agent container; 4 policy, the
+  read-only switch, terminal_required without a terminal, the connection's
+  grant; 6 input for a harness other than claude or codex, target_incomplete.
+
+  Moved form: `deployment node login <node> <tool>`, or any login given
+  --events, --connection or --method, is the manager's and exits 6 moved:
+  `capabilities node login <node> claude|codex|gh|<capability>
+  [--connection <id>] [--method <id>] --events` does its work.
+
+  Examples:
+    deployment node login claude
+    deployment node login codex --target production --print-command
+""" + _HELP_NODE_TAIL + _HELP_MOVED + _HELP_TAIL
+HELP_VERBS = {
+    "doctor": """\
+For deployment:
+deployment doctor [--target <name>]
+
+  Validate deployment/runtime.json, deployment/targets/*.json, and the deployment
+  references. Reports provider readiness as local facts only: whether the
+  provider capability is installed/enabled here. It does not call Coolify,
+  SSH, Docker, or any remote provider. For host-agents it reports the
+  launchd agent an older deployment compiled for each service as launchd
+  holds it, and one still loaded as a warning: the services run under
+  this Mac's node manager (`capabilities node install --apply`, which
+  hands such an agent over); `deployment next` there lists only the
+  agents that carry the body to a node, and starts, stops and restarts
+  the services through `capabilities service`. Deployment has no
+  connections of its own, so it takes no --connection (exit 6 `input`).
+
+  --target NAME   validate that target alone (an error finding when it is
+                  missing); without it every declared target
+
+  Output: {ok, project, runtime, targets, references, services,
+  embedded_services, host_agents, drift, findings}; ok is false when a
+  finding is an error.
+
+  Exit codes: 0; 3 no project; 4 policy; 6 an error finding.
+
+  Example: deployment doctor --target production
+""" + _HELP_REFERENCE + _HELP_TAIL,
+    "inventory": """\
+For deployment:
+  The services this project declares and the targets they deploy to, read
+  from deployment/runtime.json and deployment/targets/; whether a target is
+  up is the provider capability's question. Never reaches the network.
+""",
+    "setup": _HELP_SETUP,
+    "scaffold": ("deployment scaffold - alias for `deployment setup`: the same "
+                 "flags, output and exit codes.\n\n" + _HELP_SETUP),
+    "init": """\
+deployment init [--profile generic|agent-box|agent-box-checkout|agent-box-shell
+                           |host-agents]
+                [--target production]
+                [--provider coolify|dockerhost|manual] [--force]
+
+  Create the standard local deployment files:
+    deployment/runtime.json
+    deployment/targets/<target>/target.json
+  Existing files are left untouched unless --force is passed. This command
+  requires an existing project `capabilities/` envelope; it never writes
+  `capabilities/settings.json`.
+
+  The profile picks the substrate `deployment sync` compiles for.
+  `agent-box` builds one supervised container carrying the project.
+  `agent-box-checkout` builds the same container without the project: the
+  image holds tools and the boot path, and the checkout arrives from Git on
+  a volume the entrypoint clones into. The profile then keeps that body
+  level with the branch it tracks, in both directions, so what was pushed
+  reaches the box and what the agent commits there both survives a redeploy
+  and reaches the remote. `agent-box-shell` builds the same container
+  with no body at all, for an agent that lives wholly in the store: no
+  project copy, no clone, no body sync. Each boot binds an
+  empty project root to the agent with `capabilities init --id
+  $CAPABILITIES_PROJECT_ID`, wires the agent CLIs with `capabilities hooks
+  install`, composes its context from the store with `capabilities build`,
+  and starts the compiled services under the node's service manager, where
+  the gate for this node places them. `host-agents` declares the same
+  services for a Mac, where they run as processes on the machine itself
+  under its node manager (`capabilities node install --apply`, which
+  places each service the gate puts on that node); `sync` compiles no
+  agent for a service, only one per Coolify target that carries the body
+  to its node, under `compiler.host.agents_dir`, and `deployment next`
+  hands over the launchctl steps for those. `generic` stays
+  declaration-only. A Linux host uses a container profile, or `generic`
+  with a supervisor the project owns. Run `deployment guide profiles` for
+  the trade-offs.
+
+  --profile P     the profile (default agent-box)
+  --target NAME   the target to declare (default production)
+  --provider P    the target's provider: coolify (default), dockerhost or
+                  manual
+  --force         write over the files that exist
+
+  Output: {ok, project, written: [{path, action, ...}]}, one entry per file.
+
+  Exit codes: 0; 3 no project; 4 policy, the read-only switch; 6
+  no_envelope, a file left untouched (ok false).
+
+  Example: deployment init --profile agent-box-checkout --target production
+""" + _HELP_RUNTIME_FILE + _HELP_TARGET_DIR + _HELP_TAIL,
+    "sync": """\
+deployment sync [--check|--adopt]
+
+  Compile the project's deployable-service descriptors into the runtime
+  service graph and, for a container profile, one bundle per declared
+  target (Compose, Dockerfile, ignore file, env example, entrypoint,
+  supervisor configuration) in its folder. Every compiled service runs
+  under the node's service supervisor, `capabilities node supervise`. Which
+  services are compiled
+  depends on where the project's gate is kept:
+  Files mode (no node in the gate): as before, only capabilities
+  explicitly enabled in project settings are candidates, one enabled only
+  at global scope contributes no service, and service_policy decides
+  which run and how: auto_include, default_mode (enabled|embedded),
+  capabilities.<name> auto|enabled|disabled|embedded and the descriptor's
+  default_policy; service_policy.placement and services.<name>.placement
+  (node|local|both) choose the substrate.
+  Store mode (an agent whose records are in the store): every deployable
+  descriptor of the installed catalogue, less capabilities.exclude, so
+  the gate row naming each node, not the compile, decides whether a
+  service runs there, and turning it on or off needs no recompile or
+  redeploy. service_policy keeps only the shape: `shape`
+  (embedded|container) for every service and `capabilities.<name>` for
+  one; embedded runs under the agent container's Supervisor, whose one
+  program for them is the node's service manager (`capabilities node
+  run`), which keeps a program per service placed on the node and none
+  for any other; container is a Compose service of its own. A service
+  that declares only a machine form (service.machine, no service.deploy)
+  has no container of its own, so a box carries it embedded whatever the
+  shape, on that program's --services list. A store-mode
+  runtime still carrying the retired switches (auto_include, default_mode,
+  capabilities.<name> auto|enabled|disabled) or placement is reported as a
+  warning naming each one, and sync rewrites it, keeping the shape it
+  implied; `retired` in the result lists what it rewrote.
+  A target's `node` is the id of the node its server runs as in the
+  gate. The node resolves an id itself, from the
+  ~/.config/capabilities/node-id that enrol writes (`capabilities node
+  id --set`), so its bundle hands it none and `deploy` empties
+  AGENT_NODE_ID on the application. For a node registered before ids,
+  `node` is the name it is still keyed by: its bundle's Compose file
+  sets AGENT_NODE_ID to it in every container, so every container of
+  the box and every redeploy is that one node, and `deploy` sends it to
+  the application. A target without one takes AGENT_NODE_ID from the
+  server's environment, else its AGENT_NODE_NAME, which named the node
+  before ids. The node's
+  label is its row's (`capabilities node set <id> --label`). A malformed
+  node (node_invalid) or a service environment_defaults also setting
+  AGENT_NODE_ID beside it (node_declared_twice) stops the sync.
+  The project's id (CAPABILITIES_PROJECT_ID, as the project resolves it
+  at sync) is set with CAPABILITIES_PROJECT_ID_ROOT, the box's project
+  root, in every container and, for an image that runs `capabilities
+  init` in its build, in the image before that step.
+  --check is read-only and exits 7 with structured drift details.
+  --adopt explicitly replaces unmarked files at the runtime-declared
+  managed artifact paths; external artifacts and overlays are never written.
+
+  --check   write nothing: report drift, exit 7 when there is any
+  --adopt   replace unmarked files at the managed artifact paths
+  (one of them at most)
+
+  Output: {ok, check, project, services, embedded_services, service_policy,
+  migrated_legacy_runtime, retired, drift, findings, written}.
+
+  Exit codes: 0; 3 no project, no runtime; 4 policy, the read-only switch
+  (not under --check); 6 no_envelope, bad_runtime, both flags, a compile
+  that failed; 7 drift under --check.
+
+  Examples:
+    deployment sync --check
+    deployment sync
+""" + _HELP_BUILD + _HELP_RUNTIME_FILE + _HELP_ARTIFACTS + _HELP_TARGET_DIR + _HELP_IMAGE_CAPS + _HELP_TAIL,
+    "services": """\
+deployment services
+
+  This node - its id (node) and the label it gives itself (label) - and
+  its view of each compiled service: what the gate answers for
+  it here (placed, the row that answered: scope, node, enabled, service,
+  and why),
+  whether its supervisor (`capabilities node supervise`, which records
+  it under capabilities/deployment/state/runners/) is running it, a
+  refusal it is held idle for, and who holds its lease (state, holder,
+  expiry, and last_error: the exit code and time the service last
+  failed with on the holder, else null). Writes nothing; a store that
+  holds no lease table yet answers free.
+
+  Takes no argument.
+
+  Output: {project, node, label, records, services: [{name, gate, running,
+  refusal, runner, lease}]}.
+
+  Exit codes: 0; 3 no project; 4 policy.
+
+  Example: deployment services
+""" + _HELP_TAIL,
+    "machine handover": """\
+deployment machine handover [<name> ...] [--dry-run]
+
+  Hand this Mac's machine-service agents - the
+  `capabilities.machine.<name>` launchd agents an older deployment
+  compiled for the services that run once per machine, and the
+  `capabilities.machine.watchdog` over them, in
+  `$XDG_STATE_HOME/deployment/machine/launchd/` - over to the node's
+  service manager (`capabilities node install --apply` does the same for
+  the machine services the node manager will run there): it boots out
+  each loaded `capabilities.machine.<name>` of the named services (every
+  one found when none is named) and takes its entry out of
+  ~/Library/LaunchAgents, as `capabilities node install --apply` does a
+  project's, and the machine watchdog with them once no other machine
+  service agent stays loaded. The compiled files stay. Run again it
+  changes nothing; --dry-run changes nothing and answers the same. It
+  stays for the machine agents of a service no agent on this Mac places
+  in mode shared, which `capabilities node install` does not reach.
+
+  <name> ...   the machine services' capability names (default every one
+               found)
+  --dry-run    change nothing; answer what would be done
+
+  Output: {dry_run, ok, agents_dir, agents [{label, kind
+  (service|watchdog), service?, loaded, installed, action, kept_at?}]}.
+
+  Exit codes: 0; 4 policy, the read-only switch (not under --dry-run); 6
+  input for a name that is no capability name, an agent that could not be
+  handed over.
+
+  Example: deployment machine handover --dry-run
+""" + _HELP_TAIL,
+    "runner": """\
+deployment runner <name> [--every SECONDS] [--restart POLICY] -- <command...>
+
+  What a launchd agent or supervisor entry an older deployment compiled
+  runs, kept so that agent goes on working until the node manager takes
+  it over. It checks its arguments, this capability's gate and the
+  read-only switch, then hands the service, in the same process, to the
+  manager's supervisor, `capabilities node supervise <name> --every
+  SECONDS --restart POLICY -- <command...>`, with SECONDS
+  service_policy.reconcile_seconds when omitted (default 60, 5-3600) and
+  POLICY unless-stopped. With a manager that does not answer `node
+  supervise --probe`, or none found here, it says so on stderr, naming
+  `capabilities self-update`, and supervises the service itself as the
+  manager's supervisor would (`capabilities help`, node supervise),
+  keeping its record under capabilities/deployment/state/runners/.
+  Nothing deployment compiles runs it.
+
+  <name>              the capability whose service it runs
+  --every SECONDS     how often it reconciles, 5-3600
+  --restart POLICY    no, on-failure, always or unless-stopped (default)
+  -- <command...>     the service's command, passed on untouched; required
+
+  Output: none of its own on stdout; it runs until stopped.
+
+  Exit codes: the supervisor's; 4 policy, the read-only switch; 6 input for
+  a name that is no capability name, no command, a cadence out of range.
+
+  Example: deployment runner <name> -- <name> service run
+""" + _HELP_TAIL,
+    "deploy": """\
+deployment deploy [--target <name>]
+
+  Check compiler drift, sync the body through node-<target> over SSH,
+  provision a Coolify application in the project's existing environment
+  (target.environment, default production; none is created), named
+  <project>-<target> after the project (its agent's name as `capabilities
+  agent show` answers it in a folder that carries a legacy context
+  binding, else the [identity] name that binding's config file sets,
+  else its recorded slug), and set that name, its base
+  directory and its Compose location
+  (the target's bundle) on every deploy, set environment through bulk stdin
+  (with the runtime's compiler.build_args, which Coolify builds with), deploy,
+  follow the deployment until Coolify ends it (at most 3600 s), then wait for healthy.
+  The database is never sent: the node takes AGENTKIT_DB_* from the
+  server's environment, and a deploy leaves those values standing.
+  On failure request the previous release; the message says
+  rollback=healthy, rollback=failed (<code>) or rollback=no previous
+  release. A check of a started deployment that cannot reach the store
+  (store_unreachable, store_busy) is tried again, up to 4 times; one that
+  still cannot is not a failed deploy: nothing is rolled back, the answer
+  on stdout says "deployment running, verification failed" with the
+  deployment and the `coolify wait` that checks it, and deploy exits 5
+  deployment_unverified. Requires agent-box-checkout, a
+  committed branch and a granted connection. A target whose body_source
+  is GitHub ({"kind": "github", "repository": "<owner>/<repo>"}, with
+  deploy_key) prepares no server repository and pushes nothing: it
+  refuses (commit_not_on_remote) unless the commit is on the GitHub
+  branch, points the application at that repository and branch, sets
+  AGENT_REPO_URL to its HTTPS URL, and builds exactly that commit.
+
+  --target NAME   the Coolify target (default the first declared)
+
+  Output: {target, application, release: {commit, deployment, deployed_at,
+  rollback_to}}. Unverified: {ok: false, target, application, deployment,
+  state, rolled_back, error, next} on stdout, then the error.
+
+  Exit codes: 0; 3 no target, environment_missing; 4 policy, the read-only
+  switch, the connection's grant; 5 deployment_unverified, a deployment that
+  failed or timed out; 6 node_profile, body_not_committed,
+  commit_not_on_remote, target_incomplete; 7 deployment_drift.
+
+  Example: deployment deploy --target production
+""" + _HELP_NODE_TAIL + _HELP_TAIL,
+    "rollback": """\
+deployment rollback [--target <name>] [--to <commit>]
+
+  Set the build args that release's runtime declares, roll back through
+  Coolify and wait. Without --to use the previous release; a deploy that
+  fails rolls back the same way.
+
+  --target NAME   the Coolify target (default the first declared)
+  --to COMMIT     the commit to roll back to (default the previous release)
+
+  Output: {target, release: {commit, deployment, deployed_at, rollback_to}}.
+
+  Exit codes: 0; 3 rollback_missing (no previous release and no --to), no
+  target; 4 policy, the read-only switch, the connection's grant; 5 a
+  rollback that failed or timed out; 6 target_incomplete.
+
+  Example: deployment rollback --target production --to 3f2a9c1
+""" + _HELP_NODE_TAIL + _HELP_TAIL,
+    "logs": """\
+deployment logs [--target <name>] [--build] [--follow]
+
+  Read runtime logs or the recorded deployment build log; --follow polls.
+
+  --target NAME   the Coolify target (default the first declared)
+  --build         the build log of the deployment the last release recorded
+  --follow        answer again every 2 seconds until stopped
+
+  Output: coolify's answer: the application's runtime logs, or with --build
+  the recorded deployment.
+
+  Exit codes: 0; 3 release_missing (no build log recorded), no target; 4
+  policy, the connection's grant; 6 target_incomplete.
+
+  Example: deployment logs --target production --build
+""" + _HELP_NODE_TAIL + _HELP_TAIL,
+    "node create": """\
+deployment node create <node> --project <uuid> --server <uuid>
+                       --environment <name> --repository <url>
+                       --branch <branch> --dockerfile <path> [--context <dir>]
+                       [--deploy-key <uuid> | --github-app <uuid>]
+                       [--docker-socket] [--host-dir <path>]...
+                       [--memory 2g] [--connection <id> | --coolify-stdin]
+
+  For an agent that lives in the store: a node whose image Coolify
+  builds on that server from the Dockerfile at --dockerfile in the
+  repository's --branch, with --context as the build context (the
+  repository root by default; the Dockerfile lies inside it) - a
+  Dockerfile FROM the standard image ghcr.io/agenium-dev/agent-node,
+  with no CI and no registry - through the coolify connection (the only
+  one granted, or --connection), in that project's existing environment
+  on that server. The repository is cloned with a Coolify deploy key or
+  GitHub App (`coolify sources` lists their uuids), else as public. The
+  node is a Coolify application with no domain, no automatic deploy on
+  push, the memory limit, a volume of its own for each state path of the
+  image (~/.config, ~/.local/state, ~/.claude, ~/.codex) and for ~/work,
+  where the agent keeps its checkouts and git worktrees, and only
+  CAPABILITIES_PROJECT_ID and CAPABILITIES_PROJECT_ID_ROOT (/app) in its
+  environment. It takes host paths, each bound at the same path in the
+  container: --docker-socket the host's /var/run/docker.sock, and each
+  --host-dir an existing directory on the server (not /home/agent, /app
+  or above them). Coolify never creates, writes or deletes a host path.
+  Then mint the node's id, twelve lowercase hex characters, and register
+  the node row under it with <node> as its label, the name it is shown
+  by, and the connection, server and resource (`capabilities node
+  add`); a row that cannot be written takes the application away again,
+  as does a step that fails once it exists. The node starts idle,
+  knowing no store; the answer's node.node is its id, and next the
+  `capabilities node enrol` that puts it on its config volume. The
+  answer names the application and the build's deployment; `coolify
+  wait <uuid> --deployment <uuid>` waits for the build before enrol.
+  Exit 6 node_exists (a node of this agent already labelled so),
+  not_store_mode, environment_missing (3).
+  --coolify-stdin: reach Coolify through a connection the caller lends
+  this one run instead of one granted to the agent - a JSON object
+  {"url", "token"} on standard input, the instance root without /api/v1
+  and its API token - which each coolify the verb runs is given in its
+  environment alone (COOLIFY_LENT_BASE_URL, COOLIFY_LENT_TOKEN; coolify
+  help) and which is never on a command line, printed or written.
+  --connection beside it is refused (exit 6 lent_connection). A node
+  created so records that Coolify's address as its connection.
+  Every other verb on a node, once it exists, is the capabilities
+  manager's (`capabilities node`), whose rows it reaches as any other.
+  The logins are not handed over: a person makes them on the node, over
+  SSH to its server and `docker exec -it` into the container labelled
+  with the project alone - `claude auth login`, `codex login
+  --device-auth`, and `gh auth login` for the GitHub CLI - or with
+  `capabilities node login <node> <tool> --events`.
+
+  <node>                 the node's label; required
+  --project UUID         the Coolify project; required
+  --server UUID          the Coolify server; required
+  --environment NAME     the project's existing environment; required
+  --repository URL       the repository Coolify clones
+  --branch BRANCH        the branch it builds
+  --dockerfile PATH      the Dockerfile's path in the repository
+  --context DIR          the build context (default the repository root)
+  --deploy-key UUID      a Coolify deploy key to clone with
+  --github-app UUID      a Coolify GitHub App to clone with (not both)
+  --docker-socket        bind the host's /var/run/docker.sock
+  --host-dir PATH        bind an existing server directory; repeatable
+  --memory SIZE          the memory limit (default 2g)
+  --connection ID        the coolify connection (default the only one granted)
+  --coolify-stdin        a lent connection on standard input, as above
+
+  Output: {ok, node, image: {repository, branch, context, dockerfile},
+  memory, environment: {project, name}, volumes: [{name, path}], handed,
+  next, resource: {kind, uuid}, deployment, host_paths, wait}.
+
+  Exit codes: 0; 3 environment_missing; 4 policy, the read-only switch, the
+  connection's grant; 6 input, node_exists, not_store_mode,
+  no_project_identity, lent_connection. A coolify call that fails keeps its
+  exit code.
+
+  Moved form: given none of --repository, --branch, --dockerfile, --context,
+  --deploy-key, --github-app, --docker-socket or --host-dir, `deployment node
+  create` is the standard image's node, the manager's: it exits 6 moved and
+  `capabilities node create <label> --project <uuid> --server <uuid>
+  --environment <name> [--version <tag>] [--memory 2g] [--connection <id> |
+  --coolify-stdin]` does its work.
+
+  Example:
+    deployment node create box-1 --project <uuid> --server <uuid> --environment production --repository git@github.com:<owner>/<repo>.git --branch main --dockerfile node/Dockerfile --deploy-key <uuid>
+""" + _HELP_MOVED + _HELP_TAIL,
+    "node login": _HELP_NODE_LOGIN,
+    "node sync": """\
+deployment node sync [--target <name>]
+
+  Fetch node-<target>, rebase and push; abort conflicts and report diverged.
+  Optional target.mirror receives the synced branch. Host-agents compiles
+  an interval job (target.sync_interval, default 60 seconds). A target
+  whose body_source is GitHub answers state nothing_to_carry, touches no
+  remote and gets no interval job: its node syncs with GitHub itself.
+
+  --target NAME   the Coolify target (default the first declared)
+
+  Output: {target, sync: {remote, state, conflicts, last_sync_at}}, state
+  `level`; for a GitHub body_source {target, sync: {source, repository,
+  state: nothing_to_carry, ...}}.
+
+  Exit codes: 0; 3 node_remote, no target; 4 policy, the read-only switch;
+  6 node_busy, target_incomplete; 7 diverged, with the conflicts.
+
+  Example: deployment node sync --target production
+""" + _HELP_NODE_TAIL + _HELP_TAIL,
+    "node status": """\
+deployment node status [--target <name>] [--json]
+
+  JSON host, release, Git sync, harness, store and per-service state.
+  Git sync is against the node remote, or the GitHub branch for a target
+  whose body_source is GitHub.
+  store is the node's database in force, resolved in its container through
+  the shared library: level, sources and setting redacted, reachable,
+  tls_enforced.
+  Each service carries `node` (its Supervisor or container state there),
+  `local` (its launchd agent here), `placement` in files mode, and, from
+  `deployment services` run in the node's container, `gate`, `running`,
+  `lease` and any `refusal`; node_id is the id the node answers to in
+  the gate and node_name the label it gives itself (its
+  AGENT_NODE_NAME). A target that declares `node` adds
+  declared_node_name, and an error node_name_mismatch while the node
+  answers to another id.
+  leftovers is what no service accounts for, read in the container:
+  processes that are neither a Supervisor program nor descended from one
+  (pid, ppid, age_seconds, command), development sessions open longer than
+  a day or damaged (id, capability, age_hours, damaged), and the size of
+  /tmp and of the uv cache in bytes.
+
+  --target NAME   the Coolify target (default the first declared)
+  --json          accepted; the answer is always JSON
+
+  Output: {target, instance, server, application, release, sync, harness,
+  services, store, errors, ...}; what could not be read is an entry of
+  errors, not a failure.
+
+  Exit codes: 0; 3 no target; 4 policy; 6 target_incomplete.
+
+  Example: deployment node status --target production
+""" + _HELP_NODE_TAIL + _HELP_TAIL,
+    "runtime": """\
+deployment runtime
+
+  Print deployment/runtime.json.
+
+  Takes no argument.
+
+  Output: the runtime declaration, as JSON.
+
+  Exit codes: 0; 3 no project, no runtime; 4 policy; 6 bad_runtime (not
+  JSON, or not an object).
+
+  Example: deployment runtime
+""" + _HELP_RUNTIME_FILE + _HELP_ARTIFACTS + _HELP_TAIL,
+    "targets": """\
+deployment targets [--target <name>]
+
+  Print target declarations from deployment/targets/.
+
+  --target NAME   that target alone
+
+  Output: [{name, path, target}], one per declared target.
+
+  Exit codes: 0; 3 no project, an unknown target; 4 policy; 6 bad_target.
+
+  Example: deployment targets --target production
+""" + _HELP_TARGET_DIR + _HELP_TAIL,
+    "plan": """\
+deployment plan [--target <name>]
+
+  Print an execution-neutral deployment plan. The plan names the provider
+  adapter that would execute the target, plus command hints, but performs no
+  remote operation.
+
+  --target NAME   that target alone (default every declared target)
+
+  Output: {ok, project, runtime: {path, name, profile, compose_file},
+  targets: [{name, path, provider, connection, resource, execution,
+  findings}], findings}.
+
+  Exit codes: 0; 3 no project, no runtime, no targets; 4 policy; 6
+  bad_runtime, an error finding.
+
+  Example: deployment plan --target production
+""" + _HELP_TAIL,
+    "next": """\
+deployment next [--target <name>] [--text|--json]
+
+  Human next steps after setup: what to review, what secrets to enter, how
+  to create the provider resource, first-login commands, and validation.
+
+  --target NAME   that target (default the first declared)
+  --text          Markdown, the default
+  --json          the same steps as JSON
+
+  Output: Markdown on stdout, or with --json the structured steps.
+
+  Exit codes: 0; 3 no project, no runtime, no targets; 4 policy; 6
+  bad_runtime, bad_target.
+
+  Example: deployment next --target production
+""" + _HELP_TAIL,
+    "node image": """\
+deployment node image
+
+  Moved to the capabilities manager: runs nothing here and exits 6 `moved`;
+  `capabilities node image` does its work, and its usage is the hint:
+    capabilities node image [--json]
+""" + _HELP_MOVED,
+    "node enrol": """\
+deployment node enrol
+
+  Moved to the capabilities manager: runs nothing here and exits 6 `moved`;
+  `capabilities node enrol` does its work, and its usage is the hint:
+    capabilities node enrol <node> [--services <name,...>] [--wait 300]
+      [--coolify-stdin]
+""" + _HELP_MOVED,
+    "node add": """\
+deployment node add
+
+  Moved to the capabilities manager: runs nothing here and exits 6 `moved`,
+  under --events as the stream's error event; `capabilities node add` does
+  its work, and its usage is the hint:
+    capabilities node add <label> --server <uuid> [--version <tag>]
+      [--memory 2g] [--services <name,...>] [--project <uuid>]
+      [--environment production] [--connection <id>] [--wait 600] [--events]
+      [--coolify-stdin]
+""" + _HELP_MOVED,
+    "node update": """\
+deployment node update
+
+  Moved to the capabilities manager: runs nothing here and exits 6 `moved`;
+  `capabilities node update <node> --version <tag>` does its work, and its
+  usage is the hint:
+    capabilities node update <node> --version <tag> [--memory <size>]
+      [--wait 600] [--coolify-stdin]
+""" + _HELP_MOVED,
+    "node remove": """\
+deployment node remove
+
+  Moved to the capabilities manager: runs nothing here and exits 6 `moved`;
+  `capabilities node remove <node> --yes` does its work, and its usage is the
+  hint:
+    capabilities node remove <node> --yes [--coolify-stdin]
+""" + _HELP_MOVED,
+    "node exec": """\
+deployment node exec
+
+  Moved to the capabilities manager: runs nothing here and exits 6 `moved`;
+  `capabilities node exec` does its work, and its usage is the hint:
+    capabilities node exec <node> -- <command> [<arg>...]
+""" + _HELP_MOVED,
+    "node list": """\
+deployment node list
+
+  Moved to the capabilities manager: runs nothing here and exits 6 `moved`;
+  `capabilities node list` does its work, and the hint says so:
+  capabilities node list lists this agent's nodes, and capabilities agent
+  state <id|slug> says which of them are live.
+""" + _HELP_MOVED,
+    "handover": """\
+deployment handover
+
+  Moved to the capabilities manager: runs nothing here and exits 6 `moved`;
+  `capabilities node install --apply` does its work, and the hint says so:
+  capabilities node install answers what it would hand over; with --apply it
+  hands this Mac's old agents over and loads the node manager.
+""" + _HELP_MOVED,
 }
 SCOPE = "project"
 CRED_KEYS: list = []
