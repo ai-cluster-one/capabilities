@@ -1171,7 +1171,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/simplbooks",
-      "payload_sha256": "f170d9043e73e6e69d7047b3afd95ae93450b207a54a629ffabb248c266bdc2b",
+      "payload_sha256": "2ecd7d1a04087177d626b37a01c0827a4ad6832b8301a3e7e37d302f8d0bf28d",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "SimpleBooks accounting CLI over a browser session (no public API) — read clients/invoices/purchases/accounts/bank-transactions/financial_transactions, create invoices & purchase invoices, record payments/incomings, post balanced journal entries, stage bank payment orders, and process the PSD2 bank worklist. Stateful — run `simplbooks doctor` first.",
@@ -1187,7 +1187,7 @@
           "title": "SimplBooks"
         }
       },
-      "version": "2026-11-16 — `simplbooks` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `simplbooks help` is the menu, and `simplbooks help <verb>` one verb's whole contract"
     },
     "skyscanner": {
       "executable": [
@@ -1202,7 +1202,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/skyscanner",
-      "payload_sha256": "c2e60c70cdb3bb2e5e36c4516f246077f5ca6c1703418368c8e62594357f3c53",
+      "payload_sha256": "2bf03a9a3eef91727305668318c2fa262810f40764d97f7de6c5f1df36cea7d8",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Skyscanner flight search over plain HTTP — resolve places, search live itineraries with prices, comfort facts (stops, layovers, self-transfer, airport changes) and booking links, and read the cached cheapest price per day; read-only, optionally through an Oxylabs residential proxy that keeps Skyscanner's bot protection from blocking the address.",
@@ -1218,7 +1218,7 @@
           "title": "Skyscanner"
         }
       },
-      "version": "2026-11-16 — `skyscanner` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `skyscanner help` is the menu, and `skyscanner help <verb>` one verb's whole contract"
     },
     "slack": {
       "executable": [
@@ -1261,7 +1261,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/slack",
-      "payload_sha256": "4eb4ed8fbcca62231a4471d4e9ce9a3fdaec67ba71a097bb4ac586d4412e7a1f",
+      "payload_sha256": "fc2557ff0324998143e298acd9e6b753f8223cf2470a807057bb88b34c10f75c",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Slack CLI over a bot token — post to and read channels, groups, threads and DMs, and resolve names to ids; conversation targets are gated by a project allow-list policy.",
@@ -1277,7 +1277,7 @@
           "title": "Slack"
         }
       },
-      "version": "2026-11-16 — `slack` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `slack help` is the menu, and `slack help <verb>` one verb's whole contract"
     },
     "slacker": {
       "executable": [
@@ -1316,7 +1316,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/slacker",
-      "payload_sha256": "bef1208a877a9c9c756a8a9399ccbd024e51be7d500d64aebc9b649ad2d359ff",
+      "payload_sha256": "e63e6c9503355cd302052e6d7b612adc431933249d77abeb42b9a81d35ed10c7",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Slack CLI that reads the linked user's own workspace over their web session (xoxc token + d cookie) — list conversations (DMs, group DMs, public and private channels), read message history and thread replies, keep an incremental-synced Postgres store, and capture live — and write as that user: send, reply in a thread, edit, delete, react, upload a file, mark read and open a DM, each gated by a write grant on the connection.",
@@ -1332,7 +1332,7 @@
           "title": "Slack (чтение)"
         }
       },
-      "version": "2026-11-19 — The service answers in Slack as the linked user"
+      "version": "2026-11-22 — `slacker help` is the menu, and `slacker help <verb>` one verb's whole contract"
     },
     "stripe": {
       "executable": [
@@ -1346,7 +1346,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/stripe",
-      "payload_sha256": "0cb0fb16ef70322b4dcc7fd085fe59cd59eb23a4cfca90a839d54c676cbd02d6",
+      "payload_sha256": "cc9cdfd4aa1caf9753cd4dc0f9be402e16c191f29ac20e5dc594bae32c69c69d",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Read-only Stripe CLI over the REST API — emit a neutral JSON contract of account activity (sync-plan), check identity/reachability (doctor), list invoices and download their PDFs, and read balance-transactions and payouts.",
@@ -1362,7 +1362,7 @@
           "title": "Stripe"
         }
       },
-      "version": "2026-11-16 — `stripe` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `stripe help` is the menu, and `stripe help <verb>` one verb's whole contract"
     },
     "tasks": {
       "executable": [
@@ -1456,7 +1456,7 @@
       "level": 1,
       "lucide_icon": "users",
       "path": "capabilities/teams",
-      "payload_sha256": "75f2b978688295a7576f064e54b1738052ac6d3535d080743967a6e1f7e1c9f6",
+      "payload_sha256": "5e5883bd60c92c12e99646b5d897802f3eca7aaafaa8c03524a6bb0fc5ad7709",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
@@ -1472,7 +1472,7 @@
           "title": "Команды"
         }
       },
-      "version": "2026-11-16 — `teams` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `teams help` is the menu, and `teams help <verb>` one verb's whole contract"
     },
     "telegram": {
       "executable": [

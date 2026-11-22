@@ -2,11 +2,18 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
 """teams — teams of agents that carry shared instructions, in the store.
+
+USAGE
+  teams <command> [options]
+
+This tool is designed to be invoked by agents. Run `teams help` to load this
+menu and `teams help <verb>` for one verb's whole contract, on demand — do
+not rely on memorised knowledge of its surface.
 
 A team is a store record: an id, a name, one line saying what it is for and
 when to turn to it, its members (agents, by their declared id), and its
@@ -21,42 +28,28 @@ and the body, with who saved it, when, and why. One version is active; a save
 adds a new version and never changes an old one. Each document is switched on
 or off for its team, and only one that is on reaches a member.
 
-A team is in one of two modes:
-
-  ordinary  (the default) a member's context lists the team by its one line
-            and how to read it; the member reads its documents on request.
-  always    a member's context carries the team's enabled `always`
-            documents whole, each headed by the team's name, and lists its
-            enabled `on-request` documents by their line.
-
-`teams section` prints that part, the Teams section, for the agent it runs
-in, and the manifest's `contribution` names it as the command whose block
-stands ahead of the agent's own doctrine, so the capabilities manager runs it
-at every composition while teams is enabled for the member; nothing renders
-it ahead of time, and it carries nothing that changes from one session to
-the next. Disabling teams for an agent removes it and nothing else.
+A team is in one of two modes. In ordinary mode, the default, a member's
+context lists the team by its one line and how to read it; the member reads
+its documents on request. In always mode a member's context carries the
+team's enabled `always` documents whole, each headed by the team's name, and
+lists its enabled `on-request` documents by their line. `teams section`
+prints that part, the Teams section, for the agent it runs in, and the
+capabilities manager runs it at every composition while teams is enabled for
+the member (`teams help section`).
 
 Any agent reads every team and writes through the usual gates: teams enabled
 for it, and no read-only switch. Teams belong to the store, not to an agent.
-Agent-invoked: reads answer plain text by default and JSON with --json;
+Agent-invoked: reads answer plain text by default and JSON on request;
 writes answer JSON.
 
-Documents live in the PostgreSQL the project resolves (STORE). Without a
-store there are none: every verb that reads or writes them exits 6
+Documents live in the PostgreSQL the project resolves (`teams help migrate`).
+Without a store there are none: every verb that reads or writes them exits 6
 `store_not_configured`.
 
-IDS AND NAMES
-  A team and a document each have an id: twelve lowercase hex characters,
-  given when it is made and never changed. Everything that belongs to a team
-  or a document holds its id. A name is free text to show and to type: one
-  line, not empty, no space at either end, at most 128 characters, and not
-  twelve lowercase hex characters, the shape of an id. A team's name is
-  unique in the store, a document's within its team; `rename` and
-  `doc rename` change it and nothing else.
-
-  Wherever a verb takes <team> or <doc>, give its id or its current name.
-  Quote a name that holds a space (`teams show "Release crew"`). An agent is
-  named by its declared id, as `capabilities agent show` gives it.
+Wherever a verb takes <team> or <doc>, give its id - twelve lowercase hex
+characters, given when it is made and never changed - or its current name.
+Quote a name that holds a space. An agent is named by its declared id, as
+`capabilities agent show` gives it. Each verb's page says the whole rule.
 
 THE FILE FORM
   A document is read and written as this text:
@@ -72,115 +65,26 @@ THE FILE FORM
   does not read back byte for byte in this form is refused (exit 6
   `not_canonical`, naming the line).
 
-SIZE
-  A size in tokens is an estimate: a quarter of the characters, rounded up.
-  Each document carries the size of its active body; a team carries `tokens`,
-  the size of its enabled documents together, and `always_tokens`, the size
-  of its enabled `always` documents, which is what the team adds to every
-  member's context in always mode.
+READING  (plain text by default; JSON on request)
+  teams list                       the teams this agent is in, or every team
+  teams show <team>                a team: line, mode, members, size, documents
+  teams doc show <team> <doc>      a document's active version, or one named
+  teams doc history <team> <doc>   every version of a document, newest first
+  teams section                    the Teams section of this agent's context
 
-READING  (plain text by default; --json gives the structured answer)
-  teams list [--all] [--json]
-      The teams this agent is a member of, each with its mode, line and id.
-      With --all, every team in the store but a retired one, each marked
-      `member` or not. An agent in no team is told so (exit 0).
-  teams show <team> [--json]
-      The team: its id, line, mode, members, size, and every document but a
-      retired one with its load, whether it is on, its line, size and id. A
-      retired team answers to its id.
-  teams doc show <team> <doc> [--version ID] [--json]
-      The active version, or the version ID names, in the file form. --json
-      adds the team and document ids, the version id, who saved it, when,
-      its note and its size; the version id is what `doc save --base` names.
-      A retired document answers to its id.
-  teams doc history <team> <doc> [--json]
-      Every version, newest first: id, when, by whom, the note, its load and
-      size, and which one is active.
-  teams section
-      The Teams section of this agent's context, as Markdown: a level-1
-      `Teams` heading, the lines that say these teams bind the agent and that
-      its own doctrine wins on conflict, then each team it is a member of
-      under a level-2 heading with its line. A team in ordinary mode adds how
-      to read its instructions; one in always mode adds its enabled always
-      documents whole, each under a level-3 heading - its own title where the
-      document opens with one, else its name - with its headings shifted two
-      levels deeper (never inside code), and its enabled on-request
-      documents as one level-3 group by their line. It carries nothing that
-      changes from one session to the next. Nothing at all (exit 0) for an
-      agent in no team, with no project identity or no store, or where the
-      store has no teams tables. The capabilities manager runs it when it
-      composes the agent's context (`manifest --json`, `contribution`).
-
-  ID is a version's whole id or a prefix of six or more characters that names
-  one version of the document.
-
-WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
-  teams create <team> --description TEXT [--always]
-      Make a team with that line, in ordinary mode, or in always mode with
-      --always. Safe to repeat: the same line and mode answer `"changed":
-      false`; a team of that name with another line or mode is refused (exit
-      6 `team_exists`) - `teams mode` switches the mode.
-  teams mode <team> ordinary|always
-      Switch the team's mode. Safe to repeat.
-  teams rename <team> <name>
-      Give the team a new name; its id, members and documents stay. A name
-      another team holds is refused (exit 6 `name_taken`). Safe to repeat.
-  teams describe <team> --description TEXT
-      Give the team a new line. Safe to repeat.
-  teams retire <team>
-      Retire the team: its members are removed, it is listed no more, and
-      its name, which then carries its id, is free again; its documents and
-      every version stay, and `show <id>` still reads it.
-  teams members add <team> <agent>
-  teams members remove <team> <agent>
-      Make the agent a member of the team, or no longer one. Safe to repeat:
-      answers `"changed": false`.
-  teams doc save <team> <doc> --from FILE|- [--base ID] [--note TEXT]
-      Save the file form read from FILE, or stdin with `-`, as the document's
-      new active version; a name not in use starts a new document, switched
-      on. --base names the version the edit was made from: the save is
-      refused (exit 7 `stale_base`, naming the active version) when it is no
-      longer the active one, because another save came first. Without --base
-      the active version at the time of the save is the base. --note says
-      why. Safe to repeat: content equal to the active version's adds no
-      version and answers `"changed": false`.
-  teams doc on <team> <doc>
-  teams doc off <team> <doc>
-      Switch the document on or off for its team. Off, it reaches no member
-      and keeps every version. Safe to repeat: answers `"changed": false`.
-  teams doc rename <team> <doc> <name>
-      Give the document a new name; its id and versions stay. A name another
-      document of the team holds is refused (exit 6 `name_taken`). Safe to
-      repeat.
-  teams doc retire <team> <doc>
-      Retire the document: it is switched off, listed no more, and its name,
-      which then carries its id, is free again; every version stays, and
-      `doc show <team> <id>` still reads it.
-
-STORE
-  The tables are teams_teams (one row per team, keyed by its id),
-  teams_members (one row per member of a team, holding the team's id),
-  teams_documents (one row per document, keyed by its id, holding its team's
-  id, with its switch) and teams_versions (one row per version, holding its
-  document's id), in the schema the project's store setting names, migrated
-  under the `teams` ledger. The store refuses a change of an id. Members,
-  documents and versions also keep a copy of the current team and document
-  name, with no key, which the store keeps equal to the name, a rename
-  included, for readers that still join on names. One version per document is
-  active, which the store enforces; it refuses any change to a version other
-  than clearing `active` and those copies, and any delete.
-
-CONTRACT VERBS
-  teams help                  this text
-  teams doctor                the store, the tables, and this agent's teams
-  teams connections           none: teams reaches no system of its own
-  teams stub                  the one-line awareness text
-  teams manifest --json       the declaration, with `contribution`
-  teams guide [<topic>]       none
-  teams ids list|get|set|rm   this project's identifiers
-  teams refs                  this project's references
-  teams inventory [--network] empty: the teams are the store's (`teams list`)
-  teams migrate [status]      bring the tables up to this version / report
+WRITING  (answers JSON; refused under the read-only switch)
+  teams create <team>              make a team, in ordinary or always mode
+  teams mode <team> ordinary|always   switch a team's mode
+  teams rename <team> <name>       give a team a new name; its id stays
+  teams describe <team>            give a team a new line
+  teams retire <team>              retire a team; its documents stay
+  teams members add <team> <agent>     make the agent a member of the team
+  teams members remove <team> <agent>  make the agent no longer a member
+  teams doc save <team> <doc>      save the file form as the active version
+  teams doc on <team> <doc>        switch a document on for its team
+  teams doc off <team> <doc>       switch a document off; it keeps its versions
+  teams doc rename <team> <doc> <name>  give a document a new name; its id stays
+  teams doc retire <team> <doc>    retire a document; every version stays
 
 I/O
   Success is plain text or JSON on stdout; failure is
@@ -255,6 +159,414 @@ LEVEL = 1
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+# The verb pages `teams help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, manifest, guide,
+# inventory and migrate follow. A text several verbs own is one constant,
+# added to each of their pages.
+_HELP_REFS = """
+  IDS AND NAMES
+  A team and a document each have an id: twelve lowercase hex characters,
+  given when it is made and never changed. Everything that belongs to a team
+  or a document holds its id. A name is free text to show and to type: one
+  line, not empty, no space at either end, at most 128 characters, and not
+  twelve lowercase hex characters, the shape of an id. A team's name is
+  unique in the store, a document's within its team; `rename` and
+  `doc rename` change it and nothing else.
+
+  Wherever a verb takes <team> or <doc>, give its id or its current name.
+  Quote a name that holds a space (`teams show "Release crew"`). An agent is
+  named by its declared id, as `capabilities agent show` gives it.
+"""
+_HELP_FORM = """
+  THE FILE FORM
+  A document is read and written as this text:
+
+    ---
+    description: <one line>
+    load: always|on-request
+    ---
+    <body>
+
+  The two keys, each once, in this order, each `key: value` on one line; the
+  body is every byte after the closing `---` line, kept exactly. Input that
+  does not read back byte for byte in this form is refused (exit 6
+  `not_canonical`, naming the line).
+"""
+_HELP_SIZE = """
+  SIZE
+  A size in tokens is an estimate: a quarter of the characters, rounded up.
+  Each document carries the size of its active body; a team carries `tokens`,
+  the size of its enabled documents together, and `always_tokens`, the size
+  of its enabled `always` documents, which is what the team adds to every
+  member's context in always mode.
+"""
+_HELP_MODES = """
+  MODES
+  A team is in one of two modes:
+
+    ordinary  (the default) a member's context lists the team by its one line
+              and how to read it; the member reads its documents on request.
+    always    a member's context carries the team's enabled `always`
+              documents whole, each headed by the team's name, and lists its
+              enabled `on-request` documents by their line.
+"""
+_HELP_VERSION = """
+  ID is a version's whole id or a prefix of six or more characters that names
+  one version of the document; a shorter or non-hex ID exits 6 `input`, and
+  one that names several versions exits 6 `ambiguous_version`.
+"""
+_HELP_READ = """
+  A read: plain text by default; --json gives the structured answer. Any agent
+  reads every team.
+"""
+_HELP_WRITE = """
+  A write (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY): it answers
+  one JSON object on stdout. Any agent writes through the usual gates: teams
+  enabled for it, and no read-only switch. A write the store refuses exits 6
+  `refused_by_store`.
+"""
+_HELP_STORE_EXIT = """
+  Like every verb that reads or writes the store, it also exits 4 where teams
+  is not enabled, 5 where the store is unreachable or busy, and 6
+  `store_not_configured` where no store is configured (or another store
+  setting it cannot use). A malformed argument exits 6 `input`.
+"""
+_HELP_STORE = """
+  STORE
+  The tables are teams_teams (one row per team, keyed by its id),
+  teams_members (one row per member of a team, holding the team's id),
+  teams_documents (one row per document, keyed by its id, holding its team's
+  id, with its switch) and teams_versions (one row per version, holding its
+  document's id), in the schema the project's store setting names, migrated
+  under the `teams` ledger. The store refuses a change of an id. Members,
+  documents and versions also keep a copy of the current team and document
+  name, with no key, which the store keeps equal to the name, a rename
+  included, for readers that still join on names. One version per document is
+  active, which the store enforces; it refuses any change to a version other
+  than clearing `active` and those copies, and any delete.
+
+  Documents live in the PostgreSQL the project resolves. Without a store there
+  are none: every verb that reads or writes them exits 6 `store_not_configured`.
+"""
+HELP_VERBS = {
+    "list": """\
+teams list [--all] [--json]
+
+  The teams this agent is a member of, each with its mode, line and id.
+  With --all, every team in the store but a retired one, each marked
+  `member` or not. An agent in no team is told so (exit 0).
+""" + _HELP_READ + """
+  Output, plain: one line per team, `<name>  <mode>  <line>  [<id>]`, with
+  `member` after the mode under --all for a team this agent is in; with no
+  team, a line saying so. --json: {"scope": "mine"|"all", "agent", "teams":
+  [{"id", "name", "description", "mode", "member"}]}, `member` present where
+  this agent's id is known.
+
+  Exit codes: 0, an agent in no team included; 6 `no_project` outside a
+  project, or `no_project_identity` in a project with no durable id, without
+  --all (--all needs neither).
+""" + _HELP_STORE_EXIT + """
+  Examples:
+    teams list
+    teams list --all --json
+""",
+    "show": """\
+teams show <team> [--json]
+
+  The team: its id, line, mode, members, size, and every document but a
+  retired one with its load, whether it is on, its line, size and id. A
+  retired team answers to its id.
+""" + _HELP_READ + """
+  Output, plain: `team:`, `id:`, `retired:` (a retired team), `description:`,
+  `mode:`, `members:`, `tokens:` and `documents:` lines, then one line per
+  document, `<name>  <load>  on|off  ~<tokens> tokens  <line>  [<id>]`.
+  --json: {"id", "name", "description", "mode", "members", "tokens",
+  "always_tokens", "documents": [{"id", "name", "enabled", "load",
+  "description", "version", "tokens"}], "created_at", "created_by",
+  "retired_at", "member"}, `member` present where this agent's id is known.
+
+  Exit codes: 0; 3 `not_found` for no team of that id or name, or a retired
+  team named by its name.
+""" + _HELP_STORE_EXIT + _HELP_SIZE + _HELP_REFS + """
+  Examples:
+    teams show "Release crew"
+    teams show <team-id> --json
+""",
+    "doc show": """\
+teams doc show <team> <doc> [--version ID] [--json]
+
+  The active version, or the version ID names, in the file form. --json
+  adds the team and document ids, the version id, who saved it, when,
+  its note and its size; the version id is what `doc save --base` names.
+  A retired document answers to its id.
+""" + _HELP_VERSION + _HELP_READ + """
+  Output, plain: the version in the file form, exactly. --json: {"team",
+  "document", "team_id", "document_id", "enabled", "retired_at", "version",
+  "active", "description", "load", "tokens", "created_at", "created_by",
+  "note", "body", "rendered"}, `rendered` being the file form.
+
+  Exit codes: 0; 3 `not_found` for no team, document or version of that id
+  or name, or a retired one named by its name; 6 `input`, `ambiguous_version`.
+""" + _HELP_STORE_EXIT + _HELP_FORM + _HELP_SIZE + _HELP_REFS + """
+  Examples:
+    teams doc show "Release crew" checklist
+    teams doc show <team-id> <doc-id> --version 3f2a9c --json
+""",
+    "doc history": """\
+teams doc history <team> <doc> [--json]
+
+  Every version, newest first: id, when, by whom, the note, its load and
+  size, and which one is active.
+""" + _HELP_READ + """
+  Output, plain: one line per version, `<version>  <when>  <by>  <load>
+  ~<tokens> tokens`, then `active` on the active one and its note where it
+  has one. --json: {"team", "document", "team_id", "document_id", "versions":
+  [{"version", "active", "description", "load", "tokens", "created_at",
+  "created_by", "note"}]}.
+
+  Exit codes: 0; 3 `not_found` for no team or document of that id or name.
+""" + _HELP_STORE_EXIT + _HELP_SIZE + _HELP_REFS + """
+  Example: teams doc history "Release crew" checklist --json
+""",
+    "section": """\
+teams section
+
+  The Teams section of this agent's context, as Markdown: a level-1
+  `Teams` heading, the lines that say these teams bind the agent and that
+  its own doctrine wins on conflict, then each team it is a member of
+  under a level-2 heading with its line. A team in ordinary mode adds how
+  to read its instructions; one in always mode adds its enabled always
+  documents whole, each under a level-3 heading - its own title where the
+  document opens with one, else its name - with its headings shifted two
+  levels deeper (never inside code), and its enabled on-request
+  documents as one level-3 group by their line. It carries nothing that
+  changes from one session to the next. Nothing at all (exit 0) for an
+  agent in no team, with no project identity or no store, or where the
+  store has no teams tables. The capabilities manager runs it when it
+  composes the agent's context (`manifest --json`, `contribution`).
+
+  The manifest's `contribution` names it as the command whose block stands
+  ahead of the agent's own doctrine, so the capabilities manager runs it at
+  every composition while teams is enabled for the member; nothing renders
+  it ahead of time. Disabling teams for an agent removes it and nothing
+  else. It reads in a read-only transaction and migrates nothing.
+
+  Output: the Markdown on stdout, or nothing.
+
+  Exit codes: 0, nothing to print included; 4 where teams is not enabled;
+  5 where the store is unreachable or busy; 6 a store setting it cannot use.
+""" + _HELP_MODES + """
+  Example: teams section
+""",
+    "create": """\
+teams create <team> --description TEXT [--always]
+
+  Make a team with that line, in ordinary mode, or in always mode with
+  --always. Safe to repeat: the same line and mode answer `"changed":
+  false`; a team of that name with another line or mode is refused (exit
+  6 `team_exists`) - `teams mode` switches the mode. --description is
+  required: one line of text, not empty, with no space at either end.
+""" + _HELP_WRITE + """
+  Output: {"team", "id", "description", "mode", "changed"}.
+
+  Exit codes: 0; 4 `read_only_switch`; 6 `team_exists`, or `input` for a
+  name or line that is not one.
+""" + _HELP_STORE_EXIT + _HELP_MODES + _HELP_REFS + """
+  Example: teams create "Release crew" --description "How we ship; read before a release"
+""",
+    "mode": """\
+teams mode <team> ordinary|always
+
+  Switch the team's mode. Safe to repeat.
+""" + _HELP_WRITE + """
+  Output: {"team", "mode", "changed"}.
+
+  Exit codes: 0; 3 `not_found`; 4 `read_only_switch`; 6 `input` for a mode
+  other than ordinary or always.
+""" + _HELP_STORE_EXIT + _HELP_MODES + _HELP_REFS + """
+  Example: teams mode "Release crew" always
+""",
+    "rename": """\
+teams rename <team> <name>
+
+  Give the team a new name; its id, members and documents stay. A name
+  another team holds is refused (exit 6 `name_taken`). Safe to repeat.
+""" + _HELP_WRITE + """
+  Output: {"id", "team", "previous", "changed"}, `team` being the new name.
+
+  Exit codes: 0; 3 `not_found`; 4 `read_only_switch`; 6 `name_taken`, also
+  when another write took the name at the same moment, or `input` for a name
+  that is not one.
+""" + _HELP_STORE_EXIT + _HELP_REFS + """
+  Example: teams rename "Release crew" "Shipping crew"
+""",
+    "describe": """\
+teams describe <team> --description TEXT
+
+  Give the team a new line. Safe to repeat. --description is required: one
+  line of text, not empty, with no space at either end.
+""" + _HELP_WRITE + """
+  Output: {"id", "team", "description", "changed"}.
+
+  Exit codes: 0; 3 `not_found`; 4 `read_only_switch`; 6 `input`.
+""" + _HELP_STORE_EXIT + _HELP_REFS + """
+  Example: teams describe "Release crew" --description "How we ship; read before a release"
+""",
+    "retire": """\
+teams retire <team>
+
+  Retire the team: its members are removed, it is listed no more, and
+  its name, which then carries its id, is free again; its documents and
+  every version stay, and `show <id>` still reads it.
+""" + _HELP_WRITE + """
+  Output: {"id", "team", "retired": true, "members_removed", "changed": true},
+  `members_removed` being the agents that were its members.
+
+  Exit codes: 0; 3 `not_found` for no team, or one already retired;
+  4 `read_only_switch`.
+""" + _HELP_STORE_EXIT + _HELP_REFS + """
+  Example: teams retire "Release crew"
+""",
+}
+_HELP_MEMBERS = """
+  Make the agent a member of the team, or no longer one. Safe to repeat:
+  answers `"changed": false`.
+""" + _HELP_WRITE + """
+  Output: {"team", "agent", "member", "changed"}, `member` true after add and
+  false after remove.
+
+  Exit codes: 0; 3 `not_found` for the team; 4 `read_only_switch`; 6 `input`
+  for an agent id that is not one.
+""" + _HELP_STORE_EXIT + _HELP_REFS
+for _action in ("add", "remove"):
+    HELP_VERBS[f"members {_action}"] = (
+        f"teams members {_action} <team> <agent>\n" + _HELP_MEMBERS
+        + f"\n  Example: teams members {_action} \"Release crew\" <agent-id>\n")
+_HELP_SWITCH = """
+  Switch the document on or off for its team. Off, it reaches no member
+  and keeps every version. Safe to repeat: answers `"changed": false`.
+""" + _HELP_WRITE + """
+  Output: {"team", "document", "enabled", "changed"}.
+
+  Exit codes: 0; 3 `not_found` for no team or document of that id or name;
+  4 `read_only_switch`.
+""" + _HELP_STORE_EXIT + _HELP_REFS
+for _switch in ("on", "off"):
+    HELP_VERBS[f"doc {_switch}"] = (
+        f"teams doc {_switch} <team> <doc>\n" + _HELP_SWITCH
+        + f"\n  Example: teams doc {_switch} \"Release crew\" checklist\n")
+HELP_VERBS.update({
+    "doc save": """\
+teams doc save <team> <doc> --from FILE|- [--base ID] [--note TEXT]
+
+  Save the file form read from FILE, or stdin with `-`, as the document's
+  new active version; a name not in use starts a new document, switched
+  on. --base names the version the edit was made from: the save is
+  refused (exit 7 `stale_base`, naming the active version) when it is no
+  longer the active one, because another save came first. Without --base
+  the active version at the time of the save is the base. --note says
+  why. Safe to repeat: content equal to the active version's adds no
+  version and answers `"changed": false`. --from is required; --base on a
+  document that does not exist yet exits 3 `not_found`.
+""" + _HELP_VERSION + _HELP_WRITE + """
+  Output, a new version: {"team", "document", "version", "previous",
+  "created", "tokens", "changed": true}, `previous` null and `created` true
+  for a new document. Content equal to the active version's: {"team",
+  "document", "version", "changed": false}.
+
+  Exit codes: 0; 3 `not_found` for no team, a --base on a new document, or a
+  base version the document does not have; 4 `read_only_switch`; 6
+  `not_canonical` for input that is not the file form or not UTF-8, `input`
+  for a file it cannot read or a new document's name that is not one,
+  `ambiguous_version`, `name_taken` when another write took a new document's
+  name at the same moment; 7 `stale_base`, also when another save changed the
+  document at the same moment.
+""" + _HELP_STORE_EXIT + _HELP_FORM + _HELP_REFS + """
+  Examples:
+    teams doc save "Release crew" checklist --from checklist.md --note "add the rollback step"
+    teams doc show "Release crew" checklist --json   # its version is the --base
+    cat checklist.md | teams doc save "Release crew" checklist --from - --base 3f2a9c
+""",
+    "doc rename": """\
+teams doc rename <team> <doc> <name>
+
+  Give the document a new name; its id and versions stay. A name another
+  document of the team holds is refused (exit 6 `name_taken`). Safe to
+  repeat.
+""" + _HELP_WRITE + """
+  Output: {"team", "id", "document", "previous", "changed"}, `document` being
+  the new name.
+
+  Exit codes: 0; 3 `not_found`; 4 `read_only_switch`; 6 `name_taken`, also
+  when another write took the name at the same moment, or `input` for a name
+  that is not one.
+""" + _HELP_STORE_EXIT + _HELP_REFS + """
+  Example: teams doc rename "Release crew" checklist release-checklist
+""",
+    "doc retire": """\
+teams doc retire <team> <doc>
+
+  Retire the document: it is switched off, listed no more, and its name,
+  which then carries its id, is free again; every version stays, and
+  `doc show <team> <id>` still reads it.
+""" + _HELP_WRITE + """
+  Output: {"team", "id", "document", "retired": true, "changed": true}.
+
+  Exit codes: 0; 3 `not_found` for no document, or one already retired;
+  4 `read_only_switch`.
+""" + _HELP_STORE_EXIT + _HELP_REFS + """
+  Example: teams doc retire "Release crew" checklist
+""",
+    "doctor": """\
+  For teams: the store, the tables, and this agent's teams. teams reaches no
+  system of its own and takes no connection.
+
+  Output: {"ok", "agent": {"root", "id"}, "store": {"level", "schema"},
+  "tables": {"state", "pending", "changed", "warnings"}, "teams": {"store",
+  "member_of"}, "hint"}: `teams`, once the tables are current, counts the
+  store's teams but retired ones and this agent's (`member_of`, null without
+  its id); `hint` says what to run where the tables are not current. A store
+  it cannot reach or use adds `store.error` {"code", "message"}.
+
+  Exit codes: 0 the tables current or pending (any call migrates them); 5 the
+  store unreachable; 6 no store configured or a store setting it cannot use;
+  7 tables that do not match this version (`teams migrate status`).
+
+  Example: teams doctor
+""",
+    "connections": """\
+  For teams: none. teams reaches no system of its own: the store is the
+  project's, resolved through the shared library, so there is nothing to
+  resolve here and the report names no connection.
+
+  Example: teams connections
+""",
+    "manifest": """\
+  For teams the declaration carries `contribution`: the block that says which
+  commands read a team, and `section` as the command whose output stands
+  ahead of the agent's own doctrine (`teams help section`).
+
+  Example: teams manifest --json
+""",
+    "guide": """\
+  For teams: none. It ships no guides; every topic is in `teams help` and
+  `teams help <verb>`.
+""",
+    "inventory": """\
+  For teams: empty. The teams are the store's, not this project's (`teams
+  list`).
+
+  Example: teams inventory
+""",
+    "migrate": """\
+  For teams: bring the tables up to this version, or report where they stand.
+""" + _HELP_STORE + """
+  Example: teams migrate status
+""",
+})
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

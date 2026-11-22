@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """slack — managed capability scaffold.
@@ -141,13 +141,16 @@ POST_INSTALL: list[dict] = []
 HELP = """\
 slack — post and read Slack over a bot token, with a project allow-list.
 
-USAGE
-  slack doctor [--connection ID]        auth.test: verify token + show bot identity
-  slack resolve <#channel|@user|id>     resolve a name to a Slack id (discovery)
-  slack read <target> [--limit N] [--thread TS]
-                                        read recent messages (default N=20)
-  slack post <target> <text> [--thread TS]     post a message   (WRITE)
-  slack connections                     show credential / write resolution
+This tool is designed to be invoked by agents. Run `slack help` to load this
+menu and `slack help <verb>` for one verb's whole contract, on demand — do
+not rely on memorised knowledge of its surface.
+
+COMMANDS
+  slack doctor                  auth.test: verify token + show bot identity
+  slack resolve <target>        resolve a name to a Slack id (discovery)
+  slack read <target>           read recent messages, or one thread's replies
+  slack post <target> <text>    post a message, or a thread reply   (WRITE)
+  slack connections             show credential / write resolution
 
 TARGET
   #channel-name / @user-name            resolved by name (needs …:read scopes)
@@ -155,22 +158,59 @@ TARGET
   A user target posts/reads a direct message; a channel/group target the channel.
 
 CREDENTIAL  (scope: project)
-  SLACK_BOT_TOKEN  bot token (xoxb-…). Resolves through the credential cascade
-                   (`Where a secret resolves`, at the end of this help).
-                   `slack connections` shows where it resolves.
-  SLACK_APP_TOKEN  optional app-level token (xapp-…) used only by
-                   `slack service`; requires connections:write.
+  SLACK_BOT_TOKEN is the bot token (xoxb-…) every verb that calls Slack
+  needs; SLACK_APP_TOKEN, the optional app-level token (xapp-…), is used only
+  by the service and requires connections:write. Where each resolves is on
+  `slack help connections`.
 
 WRITES
-  post is a write verb and is refused unless the selected connection sets
-  "allow_write": true in its grant ("Where connections live" below). Writes are off
-  by default; do not lift the gate yourself — ask the user.
+  `post` and the service's start and run are writes, refused (exit 4) unless
+  the selected connection grants allow_write. Writes are off by default; do
+  not lift the gate yourself — ask the user.
 
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
+ALLOW-LIST POLICY
+  Even when writes are allowed, `read` and `post` may only touch the
+  conversations the project's allow-list permits, and it fails closed when
+  absent (no DMs, no channels). `resolve` and `doctor` are never
+  policy-gated, so ids can still be discovered. Its keys, where it is kept,
+  and how DMs, channels and threads are judged are on `slack help read` and
+  `slack help post`.
 
-ALLOW-LIST POLICY  (capabilities/slack/policy.json)
+SERVICE  (real-time daemon, Socket Mode — needs SLACK_APP_TOKEN xapp-…)
+  slack service init            write project service settings/context
+  slack service doctor          verify both tokens + Socket Mode endpoint issuance
+  slack service start           start the background daemon   (WRITE)
+  slack service stop            stop the background daemon
+  slack service status          whether the daemon runs, and where its state is
+  slack service run             run the daemon in the foreground   (WRITE)
+  slack service logs            show the daemon log
+
+  Shipped settings admit nobody and auto-answer nobody. What the service
+  needs to run and what its workers receive are on `slack help service
+  start`; run `slack guide service` for the trust and configuration model.
+
+OUTPUT  JSON on stdout; errors as JSON on stderr.
+EXITS   0 ok · 2 auth · 3 not found · 4 policy/write refusal · 5 network · 6 input
+"""
+
+# The verb pages `slack help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, `HELP` being the menu. The
+# contract library dispatches both and renders the contract verbs' own pages,
+# which the entries here for doctor and connections follow. A text several
+# verbs own is one constant, added to each of their pages.
+_HELP_TARGET = """
+  TARGET
+  #channel-name / @user-name            resolved by name (needs …:read scopes)
+  C…/G…/D… (channel)   U…/W… (user)      raw Slack ids
+  A user target posts/reads a direct message; a channel/group target the channel.
+  A channel name is looked up through conversations.list (public and private
+  channels the bot can see), a user name through users.list, matched
+  case-insensitively against the user's name, display name and real name.
+  Anything else is refused as input (exit 6): prefix a channel name with #, a
+  user name with @, or pass a Slack id.
+"""
+_HELP_POLICY = """
+  ALLOW-LIST POLICY  (capabilities/slack/policy.json)
   Even when writes are allowed, post/read may only touch permitted conversations.
   Default when the file is absent: fail closed (no DMs, no channels). resolve
   and doctor are never policy-gated, so ids can still be discovered.
@@ -191,13 +231,28 @@ ALLOW-LIST POLICY  (capabilities/slack/policy.json)
   well, edited with `slack settings set` (for example `slack settings set
   allowed_channels.C0123456789 '"#team"'`). Absent keys fail closed as above.
 
-SERVICE (real-time daemon, Socket Mode — needs SLACK_APP_TOKEN xapp-…)
-  slack service init [--connection ID]   write project service settings/context
-  slack service doctor                   verify both tokens + Socket Mode endpoint issuance
-  slack service start | stop | status    manage the background daemon; start is WRITE
-  slack service run                      run the daemon in the foreground   (WRITE)
-  slack service logs [--tail N]          show the daemon log
-
+  A conversation outside it exits 4 policy_refusal, naming the key to add it
+  to; a policy that is not valid JSON, not an object, or carries a mode
+  other than the ones above exits 6 bad_policy.
+"""
+_HELP_MACHINE = """
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+"""
+_HELP_TOKEN = """
+  The bot token is SLACK_BOT_TOKEN (`slack help connections`); unset, the verb
+  exits 2 credentials_missing. Slack refusing it, or the app lacking an OAuth
+  scope the call needs, exits 2 auth; a channel, user, thread or message Slack
+  does not find, or a channel the bot is not in, exits 3 not_found; Slack not
+  answering exits 5; any other error Slack returns exits 6 slack_error.
+"""
+_HELP_EXIT = """
+  OUTPUT  JSON on stdout; errors as JSON on stderr.
+  EXITS   0 ok · 2 auth · 3 not found · 4 policy/write refusal · 5 network · 6 input
+"""
+_HELP_SERVICE = """
+  SERVICE  (real-time daemon, Socket Mode — needs SLACK_APP_TOKEN xapp-…)
   start/run require the selected connection's allow_write=true. Shipped settings
   admit nobody, auto-answer nobody, authorize no capabilities, use the stub worker,
   and keep the workspace read-only. Selecting claude/codex requires an explicit
@@ -206,20 +261,233 @@ SERVICE (real-time daemon, Socket Mode — needs SLACK_APP_TOKEN xapp-…)
   variables; their only Slack operation is the daemon-mediated
   `slack post current <text>`.
   Run `slack guide service` for the trust and configuration model.
-
-CONTRACT COMMANDS  (present on every capability)
-  slack stub                            one-line awareness text
-  slack manifest --json                 machine-readable declaration
-  slack connections                     where each connection's values resolve
-  slack guide [<topic>]                 guide topics / one guide body (docs base)
-  slack ids list|get|set|rm <label>     the project identifiers envelope
-  slack refs                            menu of this capability's reference files
-  slack inventory [--network]           What this capability holds in this
-                                        project (--network adds remote detail).
-
-OUTPUT  JSON on stdout; errors as JSON on stderr.
-EXITS   0 ok · 2 auth · 3 not found · 4 policy/write refusal · 5 network · 6 input
 """
+_HELP_SERVICE_CONN = """
+  Connection: --connection ID (accepted anywhere on the command line) selects
+  it; unflagged, the service settings' `connection` applies, else the
+  registry's default pointer, else the sole entry. Every service verb runs
+  inside a project (exit 6 no_project outside one). The daemon's state - its
+  pid file, ready marker, log and inbox - is kept per connection in
+  $XDG_STATE_HOME/slack/<connection>/service. An unknown service subcommand
+  exits 6 input.
+"""
+HELP_VERBS = {
+    "doctor": """\
+  For slack: auth.test - verify token + show bot identity. It first checks,
+  with no network, that every connection (or the one --connection names)
+  resolves SLACK_BOT_TOKEN, then calls auth.test once. Never policy-gated, so
+  ids can still be discovered.
+
+  Output: {"ok": true, "identity": {"team", "team_id", "user", "user_id",
+  "bot_id", "url"}, "connections": <the map `slack connections` reports>}.
+""" + _HELP_TOKEN + _HELP_MACHINE + """
+  Examples:
+    slack doctor
+    slack doctor --connection <id>
+""" + _HELP_EXIT,
+    "connections": """\
+  For slack: show credential / write resolution.
+
+  CREDENTIAL  (scope: project)
+  SLACK_BOT_TOKEN  bot token (xoxb-…). Resolves through the credential cascade
+                   (`Where a secret resolves`, above).
+                   `slack connections` shows where it resolves.
+  SLACK_APP_TOKEN  optional app-level token (xapp-…) used only by
+                   `slack service`; requires connections:write.
+
+  Output: {"default": <id>, "connections": {<id>: {"allow_write": <bool>,
+  "keys": [<one row per key above: where it resolved, secrets masked>]}}}.
+  With no connections registry, one connection "default" that does not allow
+  writes.
+""" + _HELP_MACHINE + """
+  Example: slack connections
+""",
+    "resolve": """\
+slack resolve <#channel|@user|id>
+
+  Resolve a name to a Slack id (discovery). A raw id is classified locally,
+  with no token and no network; a name is looked up with the bot token.
+  Never policy-gated, so ids can still be discovered before they are
+  allowed.
+
+  Output: {"query": <the target as given>, "kind": "channel"|"user", "id":
+  <the Slack id>}.
+
+  Exit codes: 0; 2, 3, 5 and 6 as below; 6 input for an empty target, one
+  it cannot classify, or other than exactly one argument.
+""" + _HELP_TARGET + _HELP_TOKEN + _HELP_MACHINE + """
+  Examples:
+    slack resolve '#team'
+    slack resolve @operator
+""" + _HELP_EXIT,
+    "read": """\
+slack read <target> [--limit N] [--thread TS]
+
+  Read recent messages (default N=20) of the target's conversation,
+  through conversations.history; a user target reads the direct message
+  with that user, opened through conversations.open. --thread TS reads the
+  replies of the thread whose parent has timestamp TS instead
+  (conversations.replies). --limit N caps how many messages come back. The
+  target must pass the allow-list below before anything is read.
+
+  Output: {"channel": <the conversation id read>, "count": <n>, "messages":
+  [{"ts", "user" (the user id, or the bot id for a bot), "text",
+  "thread_ts"}]}.
+
+  Exit codes: 0; 2, 3, 5 and 6 as below; 4 policy_refusal for a
+  conversation outside the allow-list; 6 input for a --limit that is not an
+  integer, or other than exactly one target.
+""" + _HELP_TARGET + _HELP_POLICY + _HELP_TOKEN + _HELP_MACHINE + """
+  Examples:
+    slack read '#team'
+    slack read C0123456789 --limit 50
+    slack read '#team' --thread 1700000000.000100
+""" + _HELP_EXIT,
+    "post": """\
+slack post <target> <text> [--thread TS] [--connection ID]
+
+  Post a message (WRITE) through chat.postMessage; every word after the
+  target is joined with spaces into the text. --thread TS posts it as a
+  reply in the thread whose parent has timestamp TS. A user target posts a
+  direct message to that user.
+
+  WRITES
+  post is a write verb and is refused unless the selected connection sets
+  "allow_write": true in its grant ("Where connections live", on `slack help
+  connections`). Writes are off by default; do not lift the gate yourself —
+  ask the user. The gate is judged before the token resolves or anything is
+  sent; a refusal exits 4 read_only. --connection ID (accepted anywhere on
+  the command line) selects the connection whose grant is judged; unflagged,
+  the registry's default pointer applies, else the sole entry. The target
+  must then pass the allow-list below.
+
+  Output: {"ok": true, "target": <the target as given>, "channel": <the
+  conversation id posted to>, "ts": <the new message's timestamp>}.
+
+  Exit codes: 0; 2, 3, 5 and 6 as below; 4 read_only for a connection
+  without allow_write, policy_refusal for a conversation outside the
+  allow-list; 6 input for fewer than a target and a text.
+""" + _HELP_TARGET + _HELP_POLICY + _HELP_TOKEN + _HELP_MACHINE + """
+  Examples:
+    slack post '#team' "Deploy finished."
+    slack post C0123456789 "Looking into it." --thread 1700000000.000100
+""" + _HELP_EXIT,
+    "service init": """\
+slack service init [--connection ID]
+
+  Write project service settings/context: the shipped settings, which admit
+  nobody, into the slack settings, and the service context document, each
+  only where none is there yet, so a second run writes nothing. --connection
+  ID writes that connection's id as the settings' `connection`. An
+  allow-list kept in the settings before the service was set up is kept.
+
+  Output: {"initialized": "slack", "service_dir": <path>, "written":
+  [<what was written>], "next": [<the steps that follow>]}.
+
+  Exit codes: 0; 3 service_bundle_missing when the bundle's templates are
+  missing; 6 no_project outside a project, or a store error.
+""" + _HELP_SERVICE_CONN + _HELP_SERVICE + """
+  Example: slack service init
+""" + _HELP_EXIT,
+    "service doctor": """\
+slack service doctor [--connection ID]
+
+  Verify both tokens + Socket Mode endpoint issuance: the settings are
+  checked as safe to run, with the worker they name; SLACK_BOT_TOKEN and
+  SLACK_APP_TOKEN must both resolve; then auth.test with the bot token and
+  apps.connections.open with the app token, which proves the app-level token
+  and that Socket Mode is enabled.
+
+  Output: {"ok": true, "connection", "allow_write", "bot_identity": {"user",
+  "team"}, "socket_mode": "app token accepted", "settings": <where the
+  settings are kept>, "initialized"}.
+
+  Exit codes: 0; 2 credentials_missing naming each unset token, or Slack
+  refusing a token (auth); 3 service_bundle_missing; 5 Slack did not
+  answer; 6 service_not_initialized (run `slack service init` first),
+  bad_service_settings for settings that are not safe to run, no_project.
+""" + _HELP_SERVICE_CONN + _HELP_SERVICE + """
+  Example: slack service doctor
+""" + _HELP_EXIT,
+    "service start": """\
+slack service start [--connection ID]
+
+  Start the background daemon (WRITE): the settings are checked as `slack
+  service doctor` checks them, the write gate is judged, and the daemon is
+  started detached, writing its log, and waited on for up to 20 seconds
+  until it confirms a Socket Mode connection. A daemon already running for
+  the connection is left as it is.
+
+  Output: {"started": true, "pid", "connection", "log_file"}, or
+  {"already_running": true, "connection"}.
+
+  Exit codes: 0; 2 credentials_missing; 3 service_bundle_missing; 4
+  read_only for a connection without allow_write; 5 service_start_failed
+  when the daemon exits (the log's last lines are the hint),
+  service_start_timeout when it does not confirm in 20 seconds; 6
+  service_not_initialized, bad_service_settings, no_project.
+""" + _HELP_SERVICE_CONN + _HELP_SERVICE + """
+  Example: slack service start
+""" + _HELP_EXIT,
+    "service stop": """\
+slack service stop [--connection ID]
+
+  Stop the background daemon: SIGTERM to its process group, then SIGKILL
+  if it is still alive after 5 seconds. A pid file that names no running
+  process is removed.
+
+  Output: {"stopped": true, "pid", "connection"}, or {"stopped": false,
+  "running": false, "connection"} when none was running.
+
+  Exit codes: 0; 6 stale_pid when the pid file names a process that is not
+  this Slack service (the pid file is removed and nothing is signalled),
+  service_stop_failed when the daemon survives SIGTERM and SIGKILL,
+  no_project.
+""" + _HELP_SERVICE_CONN + """
+  Example: slack service stop
+""" + _HELP_EXIT,
+    "service status": """\
+slack service status [--connection ID]
+
+  Whether the daemon runs, and where its state is. Local only: no call to
+  Slack.
+
+  Output: {"initialized", "running", "pid" (null unless running), "ready"
+  (running and confirmed connected), "connection", "state_dir", "settings",
+  "log_file", "inbox"}.
+
+  Exit codes: 0; 6 no_project, or a connection it cannot select.
+""" + _HELP_SERVICE_CONN + """
+  Example: slack service status
+""" + _HELP_EXIT,
+    "service run": """\
+slack service run [--connection ID]
+
+  Run the daemon in the foreground (WRITE), for a supervisor: the same
+  checks and write gate as `slack service start`, then the daemon runs with
+  this process's stdio, so the supervisor sees the log stream, and the verb
+  exits with the daemon's exit code.
+
+  Exit codes: the daemon's own once it runs; before it, 2
+  credentials_missing; 3 service_bundle_missing; 4 read_only for a
+  connection without allow_write; 6 service_not_initialized,
+  bad_service_settings, no_project.
+""" + _HELP_SERVICE_CONN + _HELP_SERVICE + """
+  Example: slack service run
+""" + _HELP_EXIT,
+    "service logs": """\
+slack service logs [--tail N] [--connection ID]
+
+  Show the daemon log: its last N lines (default 40).
+
+  Output: {"log_file": <path>, "lines": [<line>]}, with no lines when there
+  is no log yet.
+
+  Exit codes: 0; 6 input for a --tail that is not an integer, no_project.
+""" + _HELP_SERVICE_CONN + """
+  Example: slack service logs --tail 100
+""" + _HELP_EXIT,
+}
 
 SERVICE = {
     # How many nodes run it at once (service.placement). One Socket Mode connection

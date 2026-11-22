@@ -13,12 +13,12 @@ The bot protection also judges each of Skyscanner's country sites apart, and gro
 A connection carries the proxy as separate fields, and skyscanner builds the proxy from them on every call:
 
 - `oxylabs_username` - the proxy user's own name as the Oxylabs dashboard shows it under the residential proxy users, with nothing added. Leaving it empty sends requests direct.
-- `oxylabs_password_env` - the env key holding that user's password. The password is a secret: `connection add` takes it only on stdin and keeps it where `skyscanner help` (`Where a secret resolves`) says - the agent's vault by default - and the entry keeps only the key's name.
+- `oxylabs_password_env` - the env key holding that user's password. The password is a secret: `connection add` takes it only on stdin and keeps it where `skyscanner help connections` (`Where a secret resolves`) says - the agent's vault by default - and the entry keeps only the key's name.
 - `oxylabs_country` - `auto` (the default) for an exit address in the country of the site each attempt uses, or a two-letter country code that pins every attempt to that country.
 - `oxylabs_host` and `oxylabs_port` - the residential entry point, default `pr.oxylabs.io` and `7777`.
 - `oxylabs_session_minutes` - how long one attempt may hold its address, 1 to 30, default 10.
 
-`skyscanner help` lists every connection field with its type and default.
+`skyscanner help connection` lists every connection field with its type and default.
 
 Write a connection with the proxy user's name on argv and the password on stdin, so the password never reaches the command line:
 

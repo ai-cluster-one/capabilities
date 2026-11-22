@@ -2,13 +2,15 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "slack_sdk>=3.33",
 #     "websocket-client>=1.8",
 # ]
 # ///
 """
 slacker — read and write a Slack workspace as the linked user, over their own session.
+
+This is the menu; `slacker help <verb>` is one verb's whole contract.
 
 Agent-invoked. Links the person's OWN Slack account by its web-client
 session (the workspace `xoxc-` token plus the shared `d` cookie), the way the
@@ -41,133 +43,70 @@ Startup protocol
      writes); exit 5 is the store or Slack being unreachable.
 
 Connections
-  A connection is one workspace session of one linked account. It carries the
-  env vars that hold the session secrets (token_env, cookie_env), never the
-  secret values, plus the non-secret workspace identity. A machine with several
-  workspaces declares one connection each. Secrets resolve through the
-  credential cascade (`Where a secret resolves`, at the end of this help);
-  selection is `--connection <id>` (-c), else the registry's default, else the
-  sole entry.
-
-  Two ways to link. `slacker link` signs you in through a Chrome window it
-  opens and reads the session out for you (needs an installed Chrome and a
-  display). Or paste: read the xoxc- token and the `d` cookie from a browser
-  you are already signed in to and run `connection add <id> --stdin` (see
-  `slacker guide linking`). `link` writes the two secrets into the credentials
-  file; `connection add` stores them as `Where a secret resolves` says. Either
-  way they never land in the registry, a log, or output.
+A connection is one workspace session of one linked account: the env vars that
+hold its two secrets, never their values, plus the non-secret workspace
+identity. A machine with several workspaces declares one connection each. Link
+one with `slacker link` (a Chrome window) or by paste with `slacker connection
+add` (`slacker guide linking`); how a connection is declared, selected and
+resolved is on `slacker help connections`.
 
 Store
-  Conversations, messages, thread replies, reactions, users and the sync cursor
-  live in the project's Postgres database, in slacker_* tables keyed by the
-  workspace account (the team id), created and migrated on first use. The
-  capture belongs to the account, not to one project: an account has one history
-  in a database, whichever project on the machine reads it, so the tables carry
-  no project id. The database is resolved as every store capability resolves it
-  (AGENTKIT_DB_* in the project .env.local/.env, then the environment, then the
-  machine's `capabilities store set`). With none, every verb that reads or writes
-  the capture exits 6; help, contract and connections still answer.
+The capture lives in the project's Postgres database, in slacker_* tables keyed
+by the workspace account (the team id), created and migrated on first use. With
+no database every verb that reads or writes the capture exits 6; each verb's
+page says whether it needs one, and `slacker help migrate` says where it comes
+from.
 
 Commands
-  slacker help                       Print this usage block
-  slacker link [<id>] [--workspace W] [--default] [--replace] [--timeout S]
-               [--global|--project] [--events]
-                                     Link a workspace by signing in through a
-                                     Chrome window it opens: it waits while you
-                                     sign in (typing and clicking nothing),
-                                     reads the xoxc- token and the `d` cookie
-                                     over Chrome's DevTools protocol, writes
-                                     them as a connection, closes the window
-                                     and deletes the temporary profile, then
-                                     proves the link. Several workspaces: pass
-                                     `--workspace` (team id, domain or name) or
-                                     an id that matches one. No Chrome or no
-                                     display: link by paste instead.
-  slacker doctor [--connection ID]   Prove the session, the user and the
-                                     workspace; match the binding.
-  slacker whoami [--connection ID]   The linked identity and workspace, named.
-  slacker conversations [--types ...] [--limit N] [--search TERM]
-                                     List the conversations the account can
-                                     see (im, mpim, public_channel,
-                                     private_channel), newest activity first.
-  slacker history <channel> [--limit N] [--oldest TS] [--latest TS] [--fresh]
-                                     Read a conversation. Answers from the
-                                     store, and fetches from Slack when it
-                                     cannot cover the request.
-  slacker thread <channel> <thread_ts> [--fresh]
-                                     Read a thread's replies. Answers from the
-                                     store once it holds every reply the
-                                     parent counts, else fetches from Slack.
-  slacker search <query> [--limit N] [--sort score|timestamp]
-                                     Search message text across every
-                                     conversation the account can see, as
-                                     Slack's own search answers it (its query
-                                     modifiers such as in: and from: apply),
-                                     the store not needed. Each match names
-                                     its channel, ts and thread_ts, which
-                                     `history` and `thread` read. No match is
-                                     count 0 at exit 0.
-  slacker sync [--channel ID] [--full] [--limit N]
-                                     Bring the store forward: fetch every
-                                     message of each member conversation newer
-                                     than the stored cursor, deduplicating on
-                                     the message timestamp. --limit bounds how
-                                     far back a first sync or --full reaches.
-  slacker service ...                The bundled listener: live capture, and
-                                     the assistant that answers the messages
-                                     its settings admit (see `slacker service
-                                     help` and `slacker guide
-                                     assistant-service`).
-  slacker settings [get|set|unset|put|edit] ...
-                                     The assistant's settings, validated on
-                                     write; `service reload` makes a running
-                                     listener take them.
-  slacker prompts list|show|put|history|retire [<key>]
-                                     The assistant's prompts (context,
-                                     delegation, job-worker): the agent's own
-                                     versions in the store over the bundle's
-                                     standard text.
-  slacker jobs help|list|active|show|register|submit|amend|discard|stop|resume
-                                     The work an assistant turn handed over.
+  slacker link [<id>]                link a workspace by signing in through Chrome
+  slacker whoami                     the linked identity and workspace, named
+  slacker conversations              the conversations the account can see
+  slacker history <channel>          a conversation's messages, from the store or Slack
+  slacker thread <channel> <ts>      a thread's replies, from the store or Slack
+  slacker search <query>             Slack's own message search, store not needed
+  slacker sync                       bring the store forward from Slack
 
 Writes (each needs a connection that grants writes; exit 4 otherwise)
-  slacker send <channel> <text> [--thread TS] [--broadcast]
-                                     Send a message to a DM, group DM or
-                                     channel; with --thread, reply in that
-                                     thread, and with --broadcast also post
-                                     the reply to the channel. Text `-` reads
-                                     it from stdin. Answers the new ts.
-  slacker edit <channel> <ts> <text> Edit one of the account's own messages.
-  slacker delete <channel> <ts>      Delete one of the account's own messages.
-  slacker react <channel> <ts> <emoji>
-  slacker unreact <channel> <ts> <emoji>
-                                     Add or remove the account's reaction
-                                     (the emoji's name, e.g. thumbsup); what
-                                     already holds answers changed:false.
-  slacker upload <channel> <path> [--comment TEXT] [--thread TS] [--title T]
-                                     Upload a file, posted with the comment,
-                                     to the conversation or into a thread.
-  slacker mark <channel> [<ts>]      Mark the conversation read up to ts, by
-                                     default up to its newest message.
-  slacker open <user> [<user> ...]   Open the DM with one user, or the group
-                                     DM with several, and answer its channel.
-  Each answers the channel and ts it wrote, and records the write in the store
-  as the live capture records the same act: a sent message or reply as its row
-  (a reply raises its parent's reply count), an edit as the new text, a
-  deletion as the soft flag, a reaction in the message's reactions, an opened
-  conversation as its row. A read mark is not captured.
+  slacker send <channel> <text>      send a message, or reply in a thread
+  slacker edit <channel> <ts> <text> edit one of the account's own messages
+  slacker delete <channel> <ts>      delete one of the account's own messages
+  slacker react <channel> <ts> <e>   add the account's reaction to a message
+  slacker unreact <channel> <ts> <e> remove the account's reaction
+  slacker upload <channel> <path>    upload a file, with a comment, to a conversation
+  slacker mark <channel> [<ts>]      mark the conversation read
+  slacker open <user> [<user> ...]   open a DM or group DM, and answer its channel
+Each answers the channel and ts it wrote, and records the write in the store as
+the live capture records the same act; a read mark is not captured.
 
-Contract commands (shared by every capability)
-  slacker connections                Resolve every connection, secrets masked
-  slacker stub                       One-line summary
-  slacker manifest [--json]          The capability's declaration, with the
-                                     bundled capture service
-  slacker guide [topic]              The guide menu, or one guide
-  slacker ids list|get|set|rm        Durable, non-secret project identifiers
-  slacker refs                       What this project reads for connections
-  slacker inventory [--network]      What this capability holds here, local
-                                     and secret-free
-  slacker migrate [status]           Apply or report the slacker_* tables
+The assistant's prompts and jobs
+  slacker prompts list               each prompt and where its text comes from
+  slacker prompts show <key>         one prompt as the next turn reads it
+  slacker prompts put <key>          a new active version, from stdin
+  slacker prompts history <key>      every stored version, newest first
+  slacker prompts retire <key>       back to the bundle's standard text
+  slacker jobs help                  the jobs verbs, in one list
+  slacker jobs list                  jobs in this project, newest first
+  slacker jobs active                only what is waiting or running
+  slacker jobs show <id>             one job, staged amendments included
+  slacker jobs register <outcome>    write a draft; nothing runs it yet
+  slacker jobs submit <id>           hand a draft to the runner
+  slacker jobs amend <id> <text>     continue a job with added context
+  slacker jobs discard <id>          drop a draft nobody will submit
+  slacker jobs stop <id>             stop the work; it keeps its session
+  slacker jobs resume <id>           continue a stopped job
+
+Service (the bundled listener: live capture, and the assistant that answers
+the messages its settings admit; `slacker guide assistant-service`)
+  slacker service init               seed the control files and the settings
+  slacker service run                run the listener in the foreground
+  slacker service reload             make the running listener take the settings
+  slacker service status             the last health the listener wrote
+  slacker service logs               the tail of the listener's log
+  slacker service doctor             store, session, what the settings reach
+  slacker service start              deferred to the deployment capability
+  slacker service stop               deferred to the deployment capability
+  slacker service help               the service verbs, in one list
+The assistant's settings are the contract's `slacker settings`, below.
 
 Success is JSON on stdout; structured errors are JSON on stderr. Exit 4 is a
 policy refusal.
@@ -3816,6 +3755,715 @@ _SERVICE_HELP = (
     "  service doctor [--connection ID]   Store, session, and what the\n"
     "                                     assistant's settings reach\n"
     "  service start|stop                 Deferred to the deployment capability\n")
+
+
+# The verb pages `slacker help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections, connection,
+# settings, manifest, inventory and migrate follow. A text several verbs own is
+# one constant, added to each of their pages.
+_HELP_SELECT = """
+  Connection: --connection <id> (-c), accepted anywhere on the command line,
+  selects it; else the registry's default, else the sole entry (`slacker help
+  connections`).
+"""
+_HELP_CONNECTIONS = """
+  Connections
+  A connection is one workspace session of one linked account. It carries the
+  env vars that hold the session secrets (token_env, cookie_env), never the
+  secret values, plus the non-secret workspace identity. A machine with several
+  workspaces declares one connection each. Secrets resolve through the
+  credential cascade (`Where a secret resolves`, on `slacker help connections`
+  and `slacker help connection`); selection is `--connection <id>` (-c), else
+  the registry's default, else the sole entry.
+
+  Two ways to link. `slacker link` signs you in through a Chrome window it
+  opens and reads the session out for you (needs an installed Chrome and a
+  display). Or paste: read the xoxc- token and the `d` cookie from a browser
+  you are already signed in to and run `connection add <id> --stdin` (see
+  `slacker guide linking`). `link` writes the two secrets into the credentials
+  file; `connection add` stores them as `Where a secret resolves` says. Either
+  way they never land in the registry, a log, or output.
+"""
+_HELP_STORE = """
+  Store
+  Conversations, messages, thread replies, reactions, users and the sync cursor
+  live in the project's Postgres database, in slacker_* tables keyed by the
+  workspace account (the team id), created and migrated on first use. The
+  capture belongs to the account, not to one project: an account has one history
+  in a database, whichever project on the machine reads it, so the tables carry
+  no project id. The database is resolved as every store capability resolves it
+  (AGENTKIT_DB_* in the project .env.local/.env, then the environment, then the
+  machine's `capabilities store set`). With none, every verb that reads or writes
+  the capture exits 6; help, contract and connections still answer.
+"""
+_HELP_EXIT_READ = """
+  Exit codes: 0 answered; 2 the session is invalid or expired (invalid_auth:
+  link the connection again); 4 policy, the capability not enabled here; 5 the
+  store or Slack unreachable, or Slack rate-limited the session (rate_limited);
+  6 a configuration fault (no connection, no store), an invalid argument, or a
+  conversation the session cannot see (channel_not_found, not_in_channel,
+  thread_not_found).
+"""
+_HELP_WRITE = """
+  A write: refused with exit 4 (read_only) unless the connection grants writes
+  (`allow_write`, given per connection - a person grants one with
+  `capabilities set slacker grant <connection> '{"allow_write": true}'`); ask
+  the user, never lift a gate yourself. Each write answers the channel and ts
+  it wrote, and records the write in the store as the live capture records the
+  same act: a sent message or reply as its row (a reply raises its parent's
+  reply count), an edit as the new text, a deletion as the soft flag, a
+  reaction in the message's reactions, an opened conversation as its row. A
+  read mark is not captured.
+
+  Exit codes: 0 written; 2 the session is invalid or expired (invalid_auth);
+  4 the write gate (read_only) or the project gate; 5 the store or Slack
+  unreachable, or rate-limited; 6 a configuration fault (no connection, no
+  store), an invalid argument, or a write Slack refused, named by Slack's
+  reason (not your message, an archived conversation, an unknown emoji, ...).
+"""
+_HELP_MESSAGES = """
+  Each message is {"ts", "ts_at", "thread_ts", "user", "type", "subtype",
+  "text", "edited", "deleted", "reply_count", "reactions"}, oldest first;
+  reactions is {<name>: [<user id>, ...]}. A deleted message is left out.
+"""
+_HELP_JOBS = """
+  The jobs are the work an assistant turn handed over: the register of work
+  that outlives a conversation. A job runs in arrival order within
+  defaults.max_parallel_jobs, on the profile named by defaults.job_profile,
+  and answers into the conversation it was registered from, in the thread its
+  request was answered in. States: draft,
+  waiting, running, stopped; a stopped job's outcome is succeeded, failed,
+  cancelled, interrupted, quota or model_refused. Outside a worker, --chat
+  narrows to one conversation and register takes --chat, --thread and
+  --requested-by. A worker the service started is held to the conversation,
+  requester and origin it was started for (exit 4 job_scope_denied otherwise).
+  Every jobs verb but help takes --connection <id> (-c) and --chat
+  <conversation id>.
+
+  Exit codes: 0; 2 job_not_found for an id not in this project's register; 4
+  job_scope_denied or job_scope_missing; 5 the store unreachable; 6 no_project
+  outside a project, or the register's refusal named by its code.
+"""
+_HELP_PROMPTS = """
+  The prompts are the assistant's: context, delegation and job-worker. Each is
+  the agent's own active version in the store, else the bundle's standard
+  text. Needs a project and its store; --connection <id> (-c) is accepted
+  and not used, since the prompts are the agent's, not an account's.
+
+  Exit codes: 0; 4 put and retire under the read-only switch; 5 the store
+  unreachable; 6 no_project, a key that is not a prompt (invalid_arguments),
+  an empty body on stdin (empty_prompt), a --base that is not the active
+  version (base_mismatch).
+"""
+_HELP_SERVICE = """
+  The bundled listener: live capture, and the assistant that answers the
+  messages its settings admit (`slacker guide assistant-service`). It runs one
+  account, the connection --connection <id> (-c) names, else the settings'
+  `connection`. The assistant's settings are `slacker settings` (`slacker help
+  settings`); init, doctor, run and reload check them first and exit 6
+  service_settings_invalid on a document the schema refuses.
+"""
+HELP_VERBS = {
+    "doctor": """\
+  For slacker: proves each connection's session authorises (`auth.test`),
+  resolves the linked user and the workspace, and matches the connection's
+  binding (team_id, expect_user). Every connection bare; one with
+  --connection <id> (-c), which is the only argument it takes (exit 6
+  invalid_arguments for any other).
+
+  Output: {"ok": <every examined connection authorised>, "connections": {<id>:
+  {"ok": true, "user", "user_id", "team", "team_id", "url"} or {"ok": false,
+  "error"[, "hint"]}}}. The exit code is the first failing connection's: 2 the
+  session invalid or expired (invalid_auth: link it again; its `d` cookie is
+  short-lived and there is no silent refresh), 5 Slack unreachable, 6 a
+  connection that does not resolve or a session that resolves to another
+  workspace or user (wrong_workspace, wrong_user).
+
+  Examples:
+    slacker doctor
+    slacker doctor --connection <id>
+""",
+    "connections": """\
+  For slacker:
+""" + _HELP_CONNECTIONS + """
+  Example: slacker connections
+""",
+    "connection": """\
+  For slacker:
+""" + _HELP_CONNECTIONS + """
+  Example: slacker connection add <id> --stdin < session.json
+""",
+    "link": """\
+slacker link [<id>] [--workspace W] [--default] [--replace] [--timeout S]
+             [--global|--project|--machine] [--events] [--connection <id>]
+
+  Link a workspace by signing in through a Chrome window it opens: it waits
+  while you sign in (typing and clicking nothing), reads the xoxc- token and
+  the `d` cookie over Chrome's DevTools protocol, writes them as a connection,
+  closes the window and deletes the temporary profile, then proves the link.
+  Several workspaces: pass `--workspace` (team id, domain or name) or an id
+  that matches one. No Chrome or no display: link by paste instead
+  (`slacker connection add <id> --stdin`, `slacker guide linking`).
+
+  <id>               the connection id to write (default: the workspace domain)
+  --workspace W, -w  which signed-in workspace to link, by team id, domain or name
+  --default          make this the default connection
+  --replace          re-link an existing connection id, writing over it
+  --timeout S        seconds to wait for sign-in (default """ + str(LINK_TIMEOUT) + """)
+  --project          write it in this project's capabilities/ envelope (the
+                     default where the project has one)
+  --global           write the connection at global (machine-wide) scope (the
+                     default outside a project with an envelope)
+  --machine          write the machine's connection (global scope)
+  --events           drive the ceremony as a JSON event stream on stdout/stdin
+                     (`slacker help connection`, "Linking a connection"); with
+                     several workspaces signed in it asks workspace_needed
+
+  Output: {"ok": true, "action": "link", "connection", "scope", "registry",
+  "credentials", "default", "verified": true, "workspace": {"team_id", "name",
+  "domain"}, "user", "user_id", "team", "url", "secrets": {"token_env",
+  "cookie_env"}, "next"}. No secret value reaches stdout, the log or the
+  registry.
+
+  Exit codes: 0 linked and proven; 2 the session read did not authorise
+  (link_unverified, or the exit of the check that failed); 4 under the read-only switch or the project gate; 5
+  Chrome exited or opened no debugging port (chrome_exited, chrome_no_port),
+  the window was closed before sign-in finished (window_closed), or the store
+  unreachable; 6 no_chrome, no_envelope for --project without a
+  capabilities/ envelope, link_timeout (no signed-in workspace appeared in
+  time), several_workspaces or unknown_workspace, bad_connection_id,
+  connection_exists without --replace.
+""" + _HELP_CONNECTIONS + """
+  Examples:
+    slacker link
+    slacker link work --workspace <team-id|domain|name> --default
+""",
+    "whoami": """\
+slacker whoami [--no-store] [--connection <id>]
+
+  The linked identity and workspace, named, proven by `auth.test`. It records
+  them in the store's meta, unless --no-store (do not open or write the store).
+  It checks the connection's bindings: exit 6 wrong_workspace when the session
+  resolves to another team than team_id, wrong_user when not to expect_user.
+
+  Output: {"ok": true, "connection", "user_id", "user", "team_id", "team",
+  "url"}.
+""" + _HELP_SELECT + _HELP_EXIT_READ + _HELP_STORE + """
+  Examples:
+    slacker whoami
+    slacker whoami --no-store
+""",
+    "conversations": """\
+slacker conversations [--types T] [--limit N] [--search TERM] [--connection <id>]
+
+  List the conversations the account can see (im, mpim, public_channel,
+  private_channel), newest activity first. Each one read is written to the
+  store's conversations.
+
+  --types T          comma list of im,mpim,public_channel,private_channel
+                     (default: all four)
+  --search TERM, -s  only conversations whose name or id contains TERM,
+                     case-insensitively
+  --limit N, -n      at most N rows (a positive whole number)
+
+  Output: {"connection", "count", "conversations": [{"id", "kind", "name",
+  "is_member", "is_archived", "user"}]}.
+""" + _HELP_SELECT + _HELP_EXIT_READ + _HELP_STORE + """
+  Examples:
+    slacker conversations
+    slacker conversations --types im,mpim --search <name>
+""",
+    "history": """\
+slacker history <channel> [--limit N] [--oldest TS] [--latest TS] [--fresh]
+                [--connection <id>]
+
+  Read a conversation. Answers from the store, and fetches from Slack when it
+  cannot cover the request: when the store holds no sync cursor for the
+  conversation, or with --fresh. <channel> is a conversation id (C..., G...,
+  D... or an mpdm id) from `slacker conversations`; empty exits 6 bad_channel.
+
+  --limit N, -n   the newest N messages in the range (default 100)
+  --oldest TS     only messages at or after this ts
+  --latest TS     only messages at or before this ts
+  --fresh         fetch from Slack even when the store covers the request
+
+  Output: {"connection", "channel", "fetched_from_slack", "count",
+  "messages"}.
+""" + _HELP_MESSAGES + _HELP_SELECT + _HELP_EXIT_READ + _HELP_STORE + """
+  Examples:
+    slacker history <channel> --limit 20
+    slacker history <channel> --oldest 1728999999.000100 --fresh
+""",
+    "thread": """\
+slacker thread <channel> <thread_ts> [--fresh] [--connection <id>]
+
+  Read a thread's replies. Answers from the store once it holds every reply
+  the parent counts, else fetches from Slack (up to 1000 replies). A thread
+  reply posted while the listener was disconnected is not in Slack's channel
+  history and is read with --fresh.
+
+  --fresh   fetch from Slack even when the store covers the thread
+
+  Output: {"connection", "channel", "thread_ts", "fetched_from_slack",
+  "count", "messages"}, the parent with its replies.
+""" + _HELP_MESSAGES + _HELP_SELECT + _HELP_EXIT_READ + _HELP_STORE + """
+  Example: slacker thread <channel> <thread_ts>
+""",
+    "search": """\
+slacker search <query> [--limit N] [--sort score|timestamp] [--connection <id>]
+
+  Search message text across every conversation the account can see, as
+  Slack's own search answers it (its query modifiers such as in: and from:
+  apply), the store not needed. The query's words are joined with spaces. Each
+  match names its channel, ts and thread_ts, which `history` and `thread`
+  read. No match is count 0 at exit 0; an empty query exits 6.
+
+  --limit N, -n            at most N matches (default 20)
+  --sort score|timestamp   Slack's ranking, or newest first (default score)
+
+  Output: {"connection", "query", "total", "count", "messages": [{"channel",
+  "channel_name", "kind", "ts", "ts_at", "thread_ts", "user", "username",
+  "text", "permalink"}]}; total is Slack's count of every match.
+""" + _HELP_SELECT + _HELP_EXIT_READ + """
+  Examples:
+    slacker search deploy failed
+    slacker search "in:#general from:@<user>" --sort timestamp --limit 5
+""",
+    "sync": """\
+slacker sync [--channel ID] [--full] [--limit N] [--connection <id>]
+
+  Bring the store forward: fetch every message of each member conversation
+  newer than the stored cursor, deduplicating on the message timestamp. Bare,
+  it first lists the conversations the account can see into the store, then
+  syncs each one it is a member of and that is not archived. With a stored
+  cursor every newer message is fetched, however many, and a sync cut short
+  resumes where it stopped.
+
+  --channel ID     one channel id (default: every member channel)
+  --full           re-fetch from the beginning, not only what is newer
+  --limit N, -n    how far back a first sync or --full reaches (default 1000)
+
+  Output: {"connection", "channels", "new", "detail": [{"channel",
+  "fetched", "new"}]}.
+""" + _HELP_SELECT + _HELP_EXIT_READ + _HELP_STORE + """
+  Examples:
+    slacker sync
+    slacker sync --channel <channel> --full --limit 5000
+""",
+    "send": """\
+slacker send <channel> <text> [--thread TS] [--broadcast] [--connection <id>]
+
+  Send a message to a DM, group DM or channel; with --thread, reply in that
+  thread, and with --broadcast also post the reply to the channel. Text `-`
+  reads it from stdin; empty text exits 6. Answers the new ts.
+
+  --thread TS   the parent ts: reply in its thread
+  --broadcast   with --thread, also post the reply to the channel (exit 6
+                without --thread)
+
+  Output: {"ok": true, "connection", "channel", "ts", "thread_ts",
+  "broadcast", "stored"}; stored is whether the store gained the row.
+""" + _HELP_WRITE + _HELP_SELECT + _HELP_STORE + """
+  Examples:
+    slacker send <channel> "On it."
+    printf 'Done.' | slacker send <channel> - --thread <ts> --broadcast
+""",
+    "edit": """\
+slacker edit <channel> <ts> <text> [--connection <id>]
+
+  Edit one of the account's own messages. <text> is the new text, or `-` to
+  read it from stdin; empty text exits 6. Slack refuses another account's
+  message (cant_update_message) and one the workspace no longer lets be edited
+  (edit_window_closed), exit 6.
+
+  Output: {"ok": true, "connection", "channel", "ts", "edited": true}.
+""" + _HELP_WRITE + _HELP_SELECT + _HELP_STORE + """
+  Example: slacker edit <channel> <ts> "Corrected text."
+""",
+    "delete": """\
+slacker delete <channel> <ts> [--connection <id>]
+
+  Delete one of the account's own messages. Slack refuses another account's
+  message (cant_delete_message), exit 6.
+
+  Output: {"ok": true, "connection", "channel", "ts", "deleted": true}.
+""" + _HELP_WRITE + _HELP_SELECT + _HELP_STORE + """
+  Example: slacker delete <channel> <ts>
+""",
+    "react": """\
+slacker react <channel> <ts> <emoji> [--connection <id>]
+
+  Add the account's reaction (the emoji's name, e.g. thumbsup; colons are
+  stripped); what already holds answers changed:false. An empty name exits 6,
+  an unknown one exits 6 invalid_name.
+
+  Output: {"ok": true, "connection", "channel", "ts", "reaction", "action":
+  "added", "changed"}.
+""" + _HELP_WRITE + _HELP_SELECT + _HELP_STORE + """
+  Example: slacker react <channel> <ts> thumbsup
+""",
+    "unreact": """\
+slacker unreact <channel> <ts> <emoji> [--connection <id>]
+
+  Remove the account's reaction (the emoji's name, e.g. thumbsup; colons are
+  stripped); what already holds answers changed:false. An empty name exits 6.
+
+  Output: {"ok": true, "connection", "channel", "ts", "reaction", "action":
+  "removed", "changed"}.
+""" + _HELP_WRITE + _HELP_SELECT + _HELP_STORE + """
+  Example: slacker unreact <channel> <ts> thumbsup
+""",
+    "upload": """\
+slacker upload <channel> <path> [--comment TEXT] [--thread TS] [--title T]
+               [--connection <id>]
+
+  Upload a file, posted with the comment, to the conversation or into a
+  thread. A path that is no file exits 6 file_not_found.
+
+  --comment TEXT   the message the file is posted with
+  --thread TS      the parent ts: post the file in its thread
+  --title T        the file's title (default: its name)
+
+  Output: {"ok": true, "connection", "channel", "file", "name", "ts",
+  "thread_ts", "stored"}; ts is the message the file was shared in, where
+  Slack names it.
+""" + _HELP_WRITE + _HELP_SELECT + _HELP_STORE + """
+  Example: slacker upload <channel> ./report.pdf --comment "This week's report"
+""",
+    "mark": """\
+slacker mark <channel> [<ts>] [--connection <id>]
+
+  Mark the conversation read up to ts, by default up to its newest message.
+  A read mark is not captured, and the store is not opened.
+
+  Output: {"ok": true, "connection", "channel", "ts", "marked": true}; an
+  empty conversation answers "ts": null, "marked": false and a note.
+""" + _HELP_WRITE + _HELP_SELECT + """
+  Example: slacker mark <channel>
+""",
+    "open": """\
+slacker open <user> [<user> ...] [--connection <id>]
+
+  Open the DM with one user, or the group DM with several, and answer its
+  channel. Users are ids (U...), as `history` and `search` name them; a
+  leading @ is dropped.
+
+  Output: {"ok": true, "connection", "channel", "kind", "users",
+  "already_open"}.
+""" + _HELP_WRITE + _HELP_SELECT + _HELP_STORE + """
+  Example: slacker open <user-id>
+""",
+    "settings": """\
+  For slacker: the assistant's settings, validated on write (an unknown key
+  is refused naming its path; `slacker guide assistant-service` holds the
+  model). The contract's `settings edit [--scope S] [--yes]` and `settings
+  export [--scope S]` reach them too. `slacker service reload` makes a running
+  listener take them.
+
+  Example: slacker settings get direct_messages.mode
+""",
+    "prompts list": """\
+slacker prompts list
+
+  The assistant's prompts (context, delegation, job-worker): the agent's own
+  versions in the store over the bundle's standard text.
+
+  Output: {"project", "agent_id", "prompts": [{"key", "source", "version",
+  "created_at", "created_by", "chars"}]}; source is store, bundle or none, and
+  the version fields are a stored prompt's.
+""" + _HELP_PROMPTS + """
+  Example: slacker prompts list
+""",
+    "prompts show": """\
+slacker prompts show <key>
+
+  One prompt as the next turn reads it.
+
+  Output: {"key", "body", "source", "version", "created_at", "created_by"}
+  for a stored version; {"key", "body", "source": "bundle"} for the bundle's
+  standard text.
+""" + _HELP_PROMPTS + """
+  Example: slacker prompts show context
+""",
+    "prompts put": """\
+slacker prompts put <key> [--base ID] [--note TEXT] < prompt.md
+
+  Make the text on stdin the prompt's new active version, clearing the one it
+  replaces, in one transaction.
+
+  --base ID     the active version it replaces (its id, or six or more of its
+                first characters); exit 6 base_mismatch when it is not
+  --note TEXT   why this version
+
+  Output: {"key", "version", "replaced", "created_at"}.
+""" + _HELP_PROMPTS + """
+  Example: slacker prompts put context --note "name the team" < context.md
+""",
+    "prompts history": """\
+slacker prompts history <key>
+
+  Every stored version of the prompt, newest first.
+
+  Output: {"key", "versions": [{"id", "active", "chars", "created_at",
+  "created_by", "note"}]}.
+""" + _HELP_PROMPTS + """
+  Example: slacker prompts history delegation
+""",
+    "prompts retire": """\
+slacker prompts retire <key>
+
+  Clear the prompt's active stored version, so the bundle's standard text
+  answers again.
+
+  Output: {"key", "retired": <the version cleared, or null>, "now": <the
+  source that answers now>}.
+""" + _HELP_PROMPTS + """
+  Example: slacker prompts retire job-worker
+""",
+    "jobs help": """\
+slacker jobs help
+
+  The register of work that outlives a conversation, as one plain-text list
+  of its verbs, with how a job runs. Exit code 0.
+
+  Example: slacker jobs help
+""",
+    "jobs list": """\
+slacker jobs list [--state S] [--outcome O] [--limit N] [--chat ID]
+
+  Jobs in this project, newest first.
+
+  --state S     draft, waiting, running or stopped
+  --outcome O   succeeded, failed, cancelled, interrupted, quota or model_refused
+  --limit N     at most N jobs (default 50)
+
+  Output: {"environment", "account", "chat_id", "counts", "slots_in_use",
+  "jobs": [<job>]}.
+""" + _HELP_JOBS + """
+  Example: slacker jobs list --state running
+""",
+    "jobs active": """\
+slacker jobs active [--limit N] [--chat ID]
+
+  Only what is waiting or running.
+
+  --limit N   at most N jobs (default 50)
+
+  Output: as `jobs list`.
+""" + _HELP_JOBS + """
+  Example: slacker jobs active
+""",
+    "jobs show": """\
+slacker jobs show <id> [--chat ID]
+
+  One job, staged amendments included.
+
+  Output: the job, with "pending_amendment".
+""" + _HELP_JOBS + """
+  Example: slacker jobs show <id>
+""",
+    "jobs register": """\
+slacker jobs register "<one-line outcome>" [--chat ID] [--requested-by USER]
+                      [--thread TS] [--origin-message-id TS] [--profile P]
+
+  Write a draft; nothing runs it yet. The description is one line: the
+  outcome, in the requester's terms.
+
+  --chat ID                the conversation it reports into (exit 6 no_chat
+                           without it)
+  --requested-by USER      the Slack user id whose authority the job carries
+                           (exit 6 no_requester without it)
+  --thread TS              the thread its result is posted in
+  --origin-message-id TS   the ts of the message the job answers
+  --profile P              the job profile (default: defaults.job_profile)
+
+  Output: the draft job, with "next": how to submit it.
+""" + _HELP_JOBS + """
+  Example: slacker jobs register "a summary of this week's incidents" --chat <channel> --requested-by <user-id>
+""",
+    "jobs submit": """\
+slacker jobs submit <id> --confirm-active-jobs-checked [--chat ID]
+
+  Hand a draft to the runner. --confirm-active-jobs-checked says you read
+  `jobs active` and this outcome is not there; without it, exit 6
+  active_jobs_unconfirmed.
+
+  Output: the job.
+""" + _HELP_JOBS + """
+  Example: slacker jobs submit <id> --confirm-active-jobs-checked
+""",
+    "jobs amend": """\
+slacker jobs amend <id> "<what changed>" [--chat ID]
+
+  Continue a job with added context, in the requester's terms.
+
+  Output: {"id", "amendment": "staged", "pending_amendment", "instruction"}.
+""" + _HELP_JOBS + """
+  Example: slacker jobs amend <id> "only the production incidents"
+""",
+    "jobs discard": """\
+slacker jobs discard <id> [--chat ID]
+
+  Drop a draft nobody will submit; a job that is not a draft exits 6
+  job_not_a_draft (work that has started is stopped instead).
+
+  Output: {"id", "discarded": true, "description"}.
+""" + _HELP_JOBS + """
+  Example: slacker jobs discard <id>
+""",
+    "jobs stop": """\
+slacker jobs stop <id> [--chat ID]
+
+  Stop the work; it keeps its session and its place. The listener ends the
+  work on its next look at the register. A job with nothing to stop exits 6
+  job_not_running.
+
+  Output: {"id", "stopping": true, "instruction"}.
+""" + _HELP_JOBS + """
+  Example: slacker jobs stop <id>
+""",
+    "jobs resume": """\
+slacker jobs resume <id> [--chat ID]
+
+  Continue a stopped job.
+
+  Output: the job.
+""" + _HELP_JOBS + """
+  Example: slacker jobs resume <id>
+""",
+    "service init": """\
+slacker service init [--force] [--connection <id>]
+
+  Seed the control files, and the assistant's settings from the bundle's
+  template, which admits nobody. Settings already written are kept unless
+  --force (reseed settings that already exist).
+
+  Output: {"ok": true, "initialized": <the service home>, "settings": "kept"
+  or "seeded", "next"}.
+
+  Exit codes: 0; 4 the project gate; 6 service_settings_invalid, a
+  connection it cannot select, or a settings write refused.
+""" + _HELP_SERVICE + """
+  Example: slacker service init
+""",
+    "service run": """\
+slacker service run [--connection <id>]
+
+  Run the listener in the foreground (the deploy command): it captures every
+  message live into the store, closing a reconnect's gap through the sync
+  cursor, and where its settings admit anyone answers through the assistant.
+
+  SIGTERM or SIGINT ends it cleanly; SIGHUP makes it re-read the settings, as
+  `service reload` asks.
+
+  Exit codes: 0 stopped; 2 the session invalid or expired when it starts; 4
+  under the read-only switch or the project gate; 5 the store or Slack
+  unreachable; 6 service_settings_invalid, service_dialogue_invalid, or a
+  connection it cannot select; 7 when the session is no longer linked.
+""" + _HELP_SERVICE + """
+  Example: slacker service run
+""",
+    "service reload": """\
+slacker service reload [--connection <id>]
+
+  Make the running listener take the settings; a refused reload leaves the
+  previous ones in force.
+
+  Output: {"reloaded": true, "pid", "connection", "settings_reloaded_at"}.
+
+  Exit codes: 0; 5 service_not_running, or service_reload_timeout when the
+  listener does not acknowledge within 10s; 6 service_reload_refused (the
+  previous settings remain active) or service_settings_invalid.
+""" + _HELP_SERVICE + """
+  Example: slacker service reload
+""",
+    "service status": """\
+slacker service status [--connection <id>]
+
+  The last health the listener wrote, the assistant's counters with it.
+
+  Output: {"connection", "health", "state", "dialogue"}; state is "unknown"
+  where no health was written. Exit codes: 0; 6 a connection it cannot select.
+""" + _HELP_SERVICE + """
+  Example: slacker service status
+""",
+    "service logs": """\
+slacker service logs [--connection <id>]
+
+  The tail of the listener's log.
+
+  Output: {"connection", "log": <its last 4000 characters>}. Exit codes: 0;
+  6 a connection it cannot select.
+""" + _HELP_SERVICE + """
+  Example: slacker service logs
+""",
+    "service doctor": """\
+slacker service doctor [--connection <id>]
+
+  Store, session, and what the assistant's settings reach: whether they admit
+  anyone, whether the connection grants the writes an answer needs, the
+  profiles they name, and where each prompt comes from.
+
+  Output: {"ok", "connection", "store_opened": true, "user", "team",
+  "health", "assistant": {"configured", "writes", "warning", "prompts",
+  "profiles", "voice_warning", ...}}.
+
+  Exit codes: 0; 2 the session invalid or expired; 5 the store or Slack
+  unreachable; 6 service_settings_invalid or a connection it cannot select.
+""" + _HELP_SERVICE + """
+  Example: slacker service doctor
+""",
+    "service start": """\
+slacker service start [--connection <id>]
+
+  Deferred to the deployment capability: `service run` is the foreground
+  deploy command, supervised by it.
+
+  Output: {"ok": false, "connection", "note"}, at exit 0; 6 a connection it
+  cannot select.
+""" + _HELP_SERVICE + """
+  Example: slacker service start
+""",
+    "service stop": """\
+slacker service stop [--connection <id>]
+
+  Deferred to the deployment capability: `service run` is the foreground
+  deploy command, supervised by it.
+
+  Output: {"ok": false, "connection", "note"}, at exit 0; 6 a connection it
+  cannot select.
+""" + _HELP_SERVICE + """
+  Example: slacker service stop
+""",
+    "service help": """\
+slacker service help
+
+  The service verbs, as one plain-text list. Exit code 0.
+
+  Example: slacker service help
+""",
+    "manifest": """\
+  For slacker the declaration also carries `service`, the bundled capture
+  service.
+
+  Example: slacker manifest
+""",
+    "inventory": """\
+  For slacker: the linked accounts (one state home each, named by its
+  connection's label) and the capture service's last health; the per-account
+  message counts are deferred, since they need a project's database and a
+  connection.
+
+  Example: slacker inventory
+""",
+    "migrate": """\
+  For slacker: apply or report the slacker_* tables.
+""" + _HELP_STORE + """
+  Example: slacker migrate status
+""",
+}
 
 
 # --- dispatch ----------------------------------------------------------------

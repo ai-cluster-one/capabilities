@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx[http2]>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """skyscanner — Skyscanner flight search over plain HTTP: resolve places, search
@@ -13,179 +13,55 @@ JSON on stdout.
 
 USAGE
   skyscanner <command> [options]     Run one verb against the selected connection.
-  skyscanner help                    Print this contract.
+  skyscanner help [<verb>]           This menu, or one verb's whole contract.
+
+This tool is designed to be invoked by agents. Run `skyscanner help` to load
+this menu and `skyscanner help <verb>` for one verb's whole contract, on
+demand — do not rely on memorised knowledge of its surface.
 
 MODEL
-  skyscanner calls the endpoints Skyscanner's own website calls (autosuggest,
-  the unified flight search and the price calendar), as a browser would: a
-  Chrome user agent and the x-skyscanner-market, -locale, -currency and
-  -channelid headers. There is no Skyscanner account, key or login; the
-  answers are Skyscanner's public prices.
-
-  Skyscanner's country sites (www.skyscanner.de, .fr, .it, .nl, .fi, .ie, .pl,
-  .se and .net) serve the same endpoints and the same data; the market,
-  currency and locale come from the headers, not the site. Each call runs on
-  one site: the ones without a recent refusal first, the one used longest ago
-  among them, www.skyscanner.net only after the others. The connection's
-  domains field replaces this pool. Booking links point at the site that
-  served the search.
+  It calls the endpoints Skyscanner's own website calls (autosuggest, the
+  unified flight search and the price calendar), as a browser would. There is
+  no Skyscanner account, key or login; the answers are Skyscanner's public
+  prices.
 
   Skyscanner's bot protection refuses an address, or a site, that is asked too
-  often: a 403, an answer that points at its captcha, or a search that never
-  completes. A refused call is started again as a whole - every request of it,
-  from the first autosuggest - on the next site and, through an Oxylabs
-  connection, from a new exit address, up to 12 attempts, each refusal named
-  on stderr; after the twelfth skyscanner reports exit 7 `blocked` with what
-  was tried. A site that refused is passed over for 30 minutes; the state
-  home keeps when, per connection. Each site is tried once per call before
-  any is tried again, and once all have been, the attempts go on to the site
-  refused longest ago, each on a fresh session: the cooldown orders the
-  sites and never ends a call before its 12 attempts are spent. Through an Oxylabs residential proxy every
-  attempt holds one sticky exit address for all its requests, by default in
-  the country of the site it uses (www.skyscanner.de from Germany,
-  www.skyscanner.net from Great Britain), so it reads as that site's own
-  visitor; direct, every attempt leaves from this machine's address, which
-  is refused after roughly 15 to 25 searches in half an hour. The remedy is a
-  fresh address and a fresh site, not a browser session.
-  `skyscanner guide oxylabs` teaches the proxy fields, how they compose, and
-  how to test the exit address.
+  often. Each call runs on one of Skyscanner's country sites, rotating across
+  them; a refused call is started again as a whole on the next site, up to 12
+  attempts, and then exits 7 `blocked`. Direct, every attempt leaves from this
+  machine's address, which is refused after roughly 15 to 25 searches in half
+  an hour; through an Oxylabs connection every attempt gets a fresh exit
+  address. The whole of it, SITES AND THE BLOCK, is on the page of each verb
+  that calls Skyscanner (`skyscanner help search`), and `skyscanner guide
+  oxylabs` teaches the proxy fields, how they compose, and how to test the
+  exit address.
 
   Market, currency and locale shape every answer. The market is the country
   site: it chooses which booking agents are offered, so prices differ slightly
   between markets for the same currency. The currency is the one every price
-  comes back in. The locale is the language of place names and labels.
+  comes back in. The locale is the language of place names and labels. Each
+  of places, search and calendar can override them for one call.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
   connection. A connection is how skyscanner reaches Skyscanner: optionally
   through one Oxylabs residential proxy user, and with the market, currency
-  and locale its answers use. The fields are listed at the end of this help.
-
-  With no oxylabs_username the connection goes direct from this machine's
-  address, and `doctor` warns about the block. With one, every request goes
-  through the Oxylabs residential proxy, and skyscanner composes the proxy
-  username itself from oxylabs_username, oxylabs_country and
-  oxylabs_session_minutes (default 10), with a fresh session id for every
-  attempt, so the requests of one attempt share one exit address.
-  oxylabs_country defaults to auto, the country of each attempt's site; a
-  two-letter code pins every attempt to that country. The market, currency
-  and locale stay as configured whichever country the address is in.
-  domains, when set, is the comma-separated list of Skyscanner site hosts to
-  rotate across, in order of preference. oxylabs_username is the
-  proxy user's own name, without the customer- prefix or any parameter;
-  `skyscanner guide oxylabs` shows the composition, country targeting,
-  sticky sessions and how to test the exit address.
-  The password is a secret: the entry names its env key in
-  oxylabs_password_env, and its value resolves through the cascade below.
-
-  Selection: --connection <id> (accepted anywhere on the command line).
-  Unflagged, the registry's "default" pointer applies, else the sole entry;
-  several entries without a pointer is refused as ambiguous.
-
-  Outside any project, every verb below is a machine read: it uses the
-  machine's own connections, unless a grant switched one off.
-
-  The key oxylabs_password_env names resolves through the credential cascade
-  (`Where a secret resolves`, at the end of this help).
-  There is no password flag: a secret never touches argv.
+  and locale its answers use. How a connection goes direct or through the
+  proxy, and how one is selected, is on `skyscanner help connections`; its
+  fields are on `skyscanner help connection`.
 
 COMMANDS
   Readiness
-    doctor [--connection <id>]
-        Per connection (every configured one bare; one with --connection):
-        resolve its fields, then, with an Oxylabs user, one request to
-        https://ip.oxylabs.io/location through the proxy proving the exit
-        address and its country against the one asked for the site a call
-        would use next (exit: {ip, country, providers, asked, site}), then
-        one autosuggest request to Skyscanner
-        proving it answers rather than blocks, on the site a call would use
-        next and on the following ones while a site refuses (each site at
-        most once). Emits
-        {ok, connections: {<id>: {ok, proxy, exit?, skyscanner: {reachable,
-        domain, refused, suggestions}, warning?}}}; domain is the site that
-        answered, refused the sites that refused before it. Exit 0 all healthy / 2 a
-        password missing or refused by the proxy / 5 unreachable / 7 blocked by
-        Skyscanner / 8 the proxy exits in another country than it asked for.
-    connections
-        The resolution report: every connection, every value, its winning tier
-        and source, the password masked, and the market, currency, locale and
-        proxy the connection uses. Local only: no network.
+    doctor                     prove each connection: fields, proxy exit, Skyscanner's answer
+    connections                every connection's values and where they resolve from; local
 
   Flights
-    places <query> [--market CC] [--currency CUR] [--locale LL-CC]
-        Skyscanner's place suggestions for a city, airport or country name or
-        an IATA code: {query, market, locale, places: [{name, code, place_id,
-        entity_id, country, nearby_airport}]}. nearby_airport is set when the
-        suggestion is an airport offered near the place asked for. No match
-        answers an empty list at exit 0. One request.
-
-    search <from> <to> <date> [--return DATE] [--adults N]
-           [--cabin economy|premium_economy|business|first]
-           [--sort price|duration|best] [--max-stops N] [--max-layover H]
-           [--max-duration H] [--top N]
-           [--market CC] [--currency CUR] [--locale LL-CC]
-        Live itineraries from <from> to <to>, departing <date>, returning
-        --return DATE when given (one-way without it). Dates are YYYY-MM-DD.
-        <from> and <to> are a place as `places` takes it; each resolves to its
-        exact code when one matches, else to the first suggestion, and the
-        answer names the place it resolved to. A place with no suggestion exits
-        3 not_found.
-        --adults is 1 to 9 (default 1); --cabin defaults to economy.
-        Filters apply before --top (default 10):
-          --max-stops N     no leg has more than N stops
-          --max-layover H   no single connection waits longer than H hours
-          --max-duration H  no leg takes longer than H hours
-        Sorting:
-          price (default)   cheapest first, then shortest
-          duration          shortest total travel time first, then cheapest
-          best              Skyscanner's own "Best" score, highest first
-        The answer: {origin, destination, outbound, return, adults, cabin,
-        market, currency, locale, status, complete, sort, filters, itineraries,
-        matched, returned, truncated, results}. itineraries counts what
-        Skyscanner returned with a price, matched what passed the filters,
-        returned what is in results; truncated is true when --top cut matched
-        results. complete is false when Skyscanner was still collecting prices
-        after 30 polls; the results are then what it had.
-        Each result: price_total (all adults), price_per_passenger,
-        price_formatted, carriers, total_duration_min (the legs added),
-        max_stops, longest_layover_min, self_transfer, protected_self_transfer,
-        separate_tickets (the cheapest option is booked as several tickets),
-        airport_change (a connection leaves from another airport than it
-        landed at), score, tags, skyscanner_rank, agent and agent_price (the
-        cheapest booking option), deeplink, and legs: [{from, to, departure,
-        arrival, duration_min, stops, carriers, connections: [{airport,
-        layover_min, airport_change, to_airport}]}]. A layover is measured
-        from one flight's arrival to the next flight's departure.
-        Cost: two autosuggest requests, one search request and one poll every
-        1.5 seconds until Skyscanner completes (usually 3 to 10), so a search
-        takes 5 to 20 seconds and counts as one search toward the block.
-
-    calendar <from> <to> [--months-only]
-             [--market CC] [--currency CUR] [--locale LL-CC]
-        Skyscanner's cached cheapest one-way price per adult for each day it
-        has one, from <from> to <to>, and the cheapest day of each month:
-        {origin, destination, currency, requested_currency, market, days:
-        [{day, price, group}], months: [{month, price, day}]}. These are
-        estimates from earlier searches, not live prices: run `search` on a
-        chosen day for live prices and booking links. currency is the one
-        Skyscanner answered in. --months-only leaves days out. No cached price
-        answers empty lists at exit 0. Three requests.
-
-  --market, --currency and --locale override the connection's values for one
-  call: market a two-letter country code (EE, GB, US), currency a three-letter
-  code (EUR, USD), locale a language tag (en-GB, de-DE).
-
-Contract commands (the same on every capability):
-  skyscanner stub                                  One-line awareness text.
-  skyscanner manifest --json                       Machine-readable declaration.
-  skyscanner guide [<topic>]                       Guide topics / one guide body.
-  skyscanner ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope.
-             [--note <text>]
-  skyscanner refs                                  Menu of the project's reference files.
-  skyscanner inventory [--network]                 What this capability holds here.
+    places <query>             Skyscanner's place suggestions for a name or an IATA code
+    search <from> <to> <date>  live itineraries with prices, comfort facts, booking links
+    calendar <from> <to>       the cached cheapest one-way price per day and per month
 
 THE WRITE GATE
-  skyscanner has no write verb: nothing it does changes anything at
+  There is no write verb: nothing skyscanner does changes anything at
   Skyscanner, and a connection's allow_write has nothing to open.
 
 QUIRKS WORTH KNOWING
@@ -206,15 +82,6 @@ EXIT CODES
   Skyscanner refused as invalid) · 7 blocked (Skyscanner's bot protection
   refused all 12 attempts) · 8 wrong exit country (doctor: the proxy exits in
   another country than it asked for).
-
-EXAMPLES
-  skyscanner doctor
-  skyscanner places <city name>
-  skyscanner search <FROM> <TO> <YYYY-MM-DD> --return <YYYY-MM-DD> --adults 2
-  skyscanner search <city name> <city name> <YYYY-MM-DD> --currency USD --top 5
-  skyscanner search <FROM> <TO> <YYYY-MM-DD> --max-stops 1 --max-layover 4 --sort best
-  skyscanner calendar <FROM> <TO> --months-only
-  skyscanner --connection <id> places <query>
 """
 
 from __future__ import annotations
@@ -347,6 +214,228 @@ MAX_RETRIES = 3
 POLL_INTERVAL = 1.5
 MAX_POLLS = 30
 FIELD_DEFAULTS = {f["key"]: f["default"] for f in CONN_FIELDS if "default" in f}
+
+# The verb pages `skyscanner help <verb>` answers (SHEBANG.md, "Agent-first
+# help is the surface"): each verb's whole contract, the module docstring being
+# the menu. The contract library dispatches both and renders the contract
+# verbs' own pages, which the entries here for doctor and connections follow.
+# A text several verbs own is one constant, added to each of their pages.
+_HELP_SITES = """
+  SITES AND THE BLOCK
+  skyscanner calls the endpoints Skyscanner's own website calls (autosuggest,
+  the unified flight search and the price calendar), as a browser would: a
+  Chrome user agent and the x-skyscanner-market, -locale, -currency and
+  -channelid headers. There is no Skyscanner account, key or login; the
+  answers are Skyscanner's public prices.
+
+  Skyscanner's country sites (www.skyscanner.de, .fr, .it, .nl, .fi, .ie, .pl,
+  .se and .net) serve the same endpoints and the same data; the market,
+  currency and locale come from the headers, not the site. Each call runs on
+  one site: the ones without a recent refusal first, the one used longest ago
+  among them, www.skyscanner.net only after the others. The connection's
+  domains field replaces this pool. Booking links point at the site that
+  served the search.
+
+  Skyscanner's bot protection refuses an address, or a site, that is asked too
+  often: a 403, an answer that points at its captcha, or a search that never
+  completes. A refused call is started again as a whole - every request of it,
+  from the first autosuggest - on the next site and, through an Oxylabs
+  connection, from a new exit address, up to 12 attempts, each refusal named
+  on stderr; after the twelfth skyscanner reports exit 7 `blocked` with what
+  was tried. A site that refused is passed over for 30 minutes; the state
+  home keeps when, per connection. Each site is tried once per call before
+  any is tried again, and once all have been, the attempts go on to the site
+  refused longest ago, each on a fresh session: the cooldown orders the
+  sites and never ends a call before its 12 attempts are spent. Through an Oxylabs residential proxy every
+  attempt holds one sticky exit address for all its requests, by default in
+  the country of the site it uses (www.skyscanner.de from Germany,
+  www.skyscanner.net from Great Britain), so it reads as that site's own
+  visitor; direct, every attempt leaves from this machine's address, which
+  is refused after roughly 15 to 25 searches in half an hour. The remedy is a
+  fresh address and a fresh site, not a browser session.
+  `skyscanner guide oxylabs` teaches the proxy fields, how they compose, and
+  how to test the exit address.
+"""
+_HELP_MARKET = """
+  --market, --currency and --locale override the connection's values for one
+  call: market a two-letter country code (EE, GB, US), currency a three-letter
+  code (EUR, USD), locale a language tag (en-GB, de-DE). Market, currency and
+  locale shape every answer. The market is the country site: it chooses which
+  booking agents are offered, so prices differ slightly between markets for
+  the same currency. The currency is the one every price comes back in. The
+  locale is the language of place names and labels.
+"""
+_HELP_SELECT = """
+  Connection: --connection <id> (accepted anywhere on the command line)
+  selects it; unflagged, the registry's "default" pointer applies, else the
+  sole entry; several entries without a pointer is refused as ambiguous
+  (exit 6). Outside any project this verb is a machine read: it uses the
+  machine's own connections, unless a grant switched one off (`skyscanner
+  help connections`).
+"""
+_HELP_EXIT = """
+  EXIT CODES
+  0 success · 2 auth (the Oxylabs password missing, or refused by the proxy) ·
+  3 not found (a place with no suggestion) · 4 policy refusal (the project
+  gate; ask the user, never lift a gate yourself) · 5 server/network (timeout,
+  5xx, 429 after retries, the proxy unreachable) · 6 input (bad arguments, an
+  unknown or ambiguous connection, a malformed connection field, a request
+  Skyscanner refused as invalid) · 7 blocked (Skyscanner's bot protection
+  refused all 12 attempts) · 8 wrong exit country (doctor: the proxy exits in
+  another country than it asked for).
+"""
+HELP_VERBS = {
+    "doctor": """\
+  doctor [--connection <id>]
+      Per connection (every configured one bare; one with --connection):
+      resolve its fields, then, with an Oxylabs user, one request to
+      https://ip.oxylabs.io/location through the proxy proving the exit
+      address and its country against the one asked for the site a call
+      would use next (exit: {ip, country, providers, asked, site}), then
+      one autosuggest request to Skyscanner
+      proving it answers rather than blocks, on the site a call would use
+      next and on the following ones while a site refuses (each site at
+      most once). Emits
+      {ok, connections: {<id>: {ok, proxy, exit?, skyscanner: {reachable,
+      domain, refused, suggestions}, warning?}}}; domain is the site that
+      answered, refused the sites that refused before it. Exit 0 all healthy / 2 a
+      password missing or refused by the proxy / 5 unreachable / 7 blocked by
+      Skyscanner / 8 the proxy exits in another country than it asked for.
+
+  With no oxylabs_username the connection goes direct from this machine's
+  address, and doctor warns about the block. doctor takes no argument but
+  --connection <id>; any other is refused with exit 6 invalid_arguments.
+
+  Examples:
+    skyscanner doctor
+    skyscanner doctor --connection <id>
+""" + _HELP_SITES + _HELP_EXIT,
+    "connections": """\
+  connections
+      The resolution report: every connection, every value, its winning tier
+      and source, the password masked, and the market, currency, locale and
+      proxy the connection uses. Local only: no network.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. A connection is how skyscanner reaches Skyscanner: optionally
+  through one Oxylabs residential proxy user, and with the market, currency
+  and locale its answers use. The fields are listed on `skyscanner help
+  connection`, which writes one.
+
+  With no oxylabs_username the connection goes direct from this machine's
+  address, and `doctor` warns about the block. With one, every request goes
+  through the Oxylabs residential proxy, and skyscanner composes the proxy
+  username itself from oxylabs_username, oxylabs_country and
+  oxylabs_session_minutes (default 10), with a fresh session id for every
+  attempt, so the requests of one attempt share one exit address.
+  oxylabs_country defaults to auto, the country of each attempt's site; a
+  two-letter code pins every attempt to that country. The market, currency
+  and locale stay as configured whichever country the address is in.
+  domains, when set, is the comma-separated list of Skyscanner site hosts to
+  rotate across, in order of preference. oxylabs_username is the
+  proxy user's own name, without the customer- prefix or any parameter;
+  `skyscanner guide oxylabs` shows the composition, country targeting,
+  sticky sessions and how to test the exit address.
+  The password is a secret: the entry names its env key in
+  oxylabs_password_env, and its value resolves through the cascade above.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+  Outside any project, every verb of skyscanner (connections, doctor, places,
+  search and calendar) is a machine read: it uses the machine's own
+  connections, unless a grant switched one off.
+
+  The key oxylabs_password_env names resolves through the credential cascade
+  (`Where a secret resolves`, above).
+  There is no password flag: a secret never touches argv.
+
+  Example: skyscanner connections
+""",
+    "places": """\
+skyscanner places <query> [--market CC] [--currency CUR] [--locale LL-CC]
+                  [--connection <id>]
+
+  Skyscanner's place suggestions for a city, airport or country name or
+  an IATA code: {query, market, locale, places: [{name, code, place_id,
+  entity_id, country, nearby_airport}]}. nearby_airport is set when the
+  suggestion is an airport offered near the place asked for. No match
+  answers an empty list at exit 0. One request.
+""" + _HELP_MARKET + _HELP_SELECT + """
+  Examples:
+    skyscanner places <city name>
+    skyscanner --connection <id> places <query>
+""" + _HELP_SITES + _HELP_EXIT,
+    "search": """\
+skyscanner search <from> <to> <date> [--return DATE] [--adults N]
+                  [--cabin economy|premium_economy|business|first]
+                  [--sort price|duration|best] [--max-stops N] [--max-layover H]
+                  [--max-duration H] [--top N]
+                  [--market CC] [--currency CUR] [--locale LL-CC]
+                  [--connection <id>]
+
+  Live itineraries from <from> to <to>, departing <date>, returning
+  --return DATE when given (one-way without it). Dates are YYYY-MM-DD.
+  <from> and <to> are a place as `places` takes it; each resolves to its
+  exact code when one matches, else to the first suggestion, and the
+  answer names the place it resolved to. A place with no suggestion exits
+  3 not_found. A --return date before <date> exits 6 invalid_arguments.
+  --adults is 1 to 9 (default 1); --cabin defaults to economy.
+  Filters apply before --top (default 10):
+    --max-stops N     no leg has more than N stops
+    --max-layover H   no single connection waits longer than H hours
+    --max-duration H  no leg takes longer than H hours
+  Sorting:
+    price (default)   cheapest first, then shortest
+    duration          shortest total travel time first, then cheapest
+    best              Skyscanner's own "Best" score, highest first
+  The answer: {origin, destination, outbound, return, adults, cabin,
+  market, currency, locale, status, complete, sort, filters, itineraries,
+  matched, returned, truncated, results}. itineraries counts what
+  Skyscanner returned with a price, matched what passed the filters,
+  returned what is in results; truncated is true when --top cut matched
+  results. complete is false when Skyscanner was still collecting prices
+  after 30 polls; the results are then what it had.
+  Each result: price_total (all adults), price_per_passenger,
+  price_formatted, carriers, total_duration_min (the legs added),
+  max_stops, longest_layover_min, self_transfer, protected_self_transfer,
+  separate_tickets (the cheapest option is booked as several tickets),
+  airport_change (a connection leaves from another airport than it
+  landed at), score, tags, skyscanner_rank, agent and agent_price (the
+  cheapest booking option), deeplink, and legs: [{from, to, departure,
+  arrival, duration_min, stops, carriers, connections: [{airport,
+  layover_min, airport_change, to_airport}]}]. A layover is measured
+  from one flight's arrival to the next flight's departure.
+  Cost: two autosuggest requests, one search request and one poll every
+  1.5 seconds until Skyscanner completes (usually 3 to 10), so a search
+  takes 5 to 20 seconds and counts as one search toward the block.
+""" + _HELP_MARKET + _HELP_SELECT + """
+  Examples:
+    skyscanner search <FROM> <TO> <YYYY-MM-DD> --return <YYYY-MM-DD> --adults 2
+    skyscanner search <city name> <city name> <YYYY-MM-DD> --currency USD --top 5
+    skyscanner search <FROM> <TO> <YYYY-MM-DD> --max-stops 1 --max-layover 4 --sort best
+""" + _HELP_SITES + _HELP_EXIT,
+    "calendar": """\
+skyscanner calendar <from> <to> [--months-only]
+                    [--market CC] [--currency CUR] [--locale LL-CC]
+                    [--connection <id>]
+
+  Skyscanner's cached cheapest one-way price per adult for each day it
+  has one, from <from> to <to>, and the cheapest day of each month:
+  {origin, destination, currency, requested_currency, market, days:
+  [{day, price, group}], months: [{month, price, day}]}. These are
+  estimates from earlier searches, not live prices: run `search` on a
+  chosen day for live prices and booking links. currency is the one
+  Skyscanner answered in. --months-only leaves days out. No cached price
+  answers empty lists at exit 0. Three requests. <from> and <to> are a
+  place as `places` takes it, resolved as `search` resolves them; a place
+  with no suggestion exits 3 not_found.
+""" + _HELP_MARKET + _HELP_SELECT + """
+  Example: skyscanner calendar <FROM> <TO> --months-only
+""" + _HELP_SITES + _HELP_EXIT,
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

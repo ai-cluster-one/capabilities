@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """stripe — read-only Stripe fetch CLI. Emits a neutral JSON contract of what
@@ -14,103 +14,29 @@ coupling.
 USAGE
   stripe <command> [options]
 
+This tool is designed to be invoked by agents. Run `stripe help` to load this
+menu and `stripe help <verb>` for one verb's whole contract, on demand — do
+not rely on memorised knowledge of its surface.
+
 Identity-free: it reports on whatever account STRIPE_SECRET_KEY authorizes.
 Read-only: every command is a GET against the Stripe REST API. All structured
-reads emit JSON to stdout. Date ranges are --from inclusive, --to exclusive
-(YYYY-MM-DD, interpreted at local-midnight).
+reads emit JSON to stdout. A date range is from inclusive, to exclusive
+(YYYY-MM-DD, interpreted at local-midnight); each verb's page names its flags.
 
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. Its STRIPE_SECRET_KEY comes from the --api-key flag when
-  given, else resolves through the credential cascade (`Where a secret
-  resolves`, at the end of this help).
-
-  A project that reads several Stripe accounts declares them as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": { "secret_env": "STRIPE_<ID>_SECRET_KEY" }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
-
-  The entry names the env var holding its key ("secret_env"); the value
-  resolves through the credential cascade above. Every command is a read, so
-  "allow_write": false changes nothing here — the write gate guards a
-  surface this CLI does not have.
-
-  Selection: --connection <id> (accepted anywhere on the command line).
-  Unflagged, the registry's "default" pointer applies, else the sole entry;
-  several entries without a pointer is refused as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
+Configuration requires an explicit connections registry, even for one
+connection: each entry names the env var holding its Stripe key. How a
+connection is declared and selected is CONNECTIONS, on `stripe help
+connections`.
 
 COMMANDS
-  connections
-      Where every connection's values resolve from (tier, source, secrets
-      masked). Local only — no network.
-
-  doctor [--connection <id>]
-      Validate key + API reachability (GET /v1/balance) — every connection,
-      or one. Exit 0 all healthy / 2 missing-or-rejected key / 5 unreachable.
-
-  sync-plan --from YYYY-MM-DD --to YYYY-MM-DD [--only-type T]
-      THE contract producer. Walks balance_transactions over [from, to),
-      classifies each into the neutral event taxonomy, and emits the JSON
-      contract on stdout. One call = everything a consumer needs to reconcile.
-        · charge  → gross/fee/net split + customer block + invoice block
-                    (stripe number, line items [description/qty/amount],
-                    hosted PDF url) + resolve:{client_id, invoice_id}=null
-                    (the seam a consumer fills with its own ids)
-        · fee     → amount + category (billing_usage / invoicing / tax / processing)
-        · payout  → amount (for tying to the bank side)
-        · refund  → kind:"refund", flagged residual — surfaced with the
-                    paired charge block {id, date, customer, gross} and a
-                    full_refund true|false signal (null when the charge is
-                    unresolvable), so a consumer can detect same-customer
-                    test-payment pairings without a second Stripe read
-      Stateless: emits everything in range. Idempotency is the consumer's (it
-      skips events already recorded in its own store, keyed by the txn_ id).
-      --only-type restricts to one of charge|fee|payout|refund.
-
-  contract
-      Print a valid example of the contract sync-plan emits — the event and
-      envelope shape, not live data, no API key required. The machine-readable
-      companion to the event taxonomy above; built from the same builders the
-      producer uses, so it never drifts. Pipe to jq to inspect the fields.
-
-  invoices list --from YYYY-MM-DD --to YYYY-MM-DD [--status paid]
-      Standalone read of Stripe invoices (number, customer, amount, currency,
-      hosted PDF url). Inspection read; sync-plan's charge events embed this.
-
-  invoices pdf <invoice_id> --out PATH
-      Download an invoice's hosted PDF, for attaching to the books on create.
-
-  balance-transactions list --from YYYY-MM-DD --to YYYY-MM-DD [--type T]
-      Lower-level normalized BT read — for resolving an edge case sync-plan
-      flagged, or a staged by-type migration. --type one of
-      charge|stripe_fee|payout|refund.
-
-  payouts list --from YYYY-MM-DD --to YYYY-MM-DD
-      Standalone payout read.
-
-Contract commands (the same on every capability):
-  stripe stub                                 One-line awareness text.
-  stripe manifest --json                      Machine-readable declaration.
-  stripe guide [<topic>]                      Guide topics / one guide body,
-                                               fetched live from the docs base.
-  stripe ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-              [--note <text>]                  (capabilities/stripe/identifiers.json,
-                                                or store rows once the agent moved).
-  stripe refs                                 Menu of the project's reference
-                                               files for this capability.
-  stripe inventory [--network]                What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
+  connections                  where every connection's values resolve from; local
+  doctor                       validate key + API reachability, per connection
+  sync-plan                    THE contract producer: a date range as the JSON contract
+  contract                     a valid example of the contract sync-plan emits; no key
+  invoices list                standalone read of Stripe invoices in a date range
+  invoices pdf <invoice_id>    download an invoice's hosted PDF
+  balance-transactions list    lower-level normalized balance-transaction read
+  payouts list                 standalone payout read in a date range
 
 EXIT CODES
   0 success · 2 auth/credentials · 3 not found · 4 policy refusal — the
@@ -185,6 +111,223 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / "stripe" / "credentials.env"
 KEY_NAME = "STRIPE_SECRET_KEY"
+
+# The verb pages `stripe help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections and ids follow.
+# A text several verbs own is one constant, added to each of their pages.
+_HELP_RANGE = """
+  Dates: --from inclusive, --to exclusive (YYYY-MM-DD, interpreted at
+  local-midnight); both are required. A date that is not YYYY-MM-DD exits 6
+  bad_date.
+"""
+_HELP_KEY = """
+  Key: the connection's STRIPE_SECRET_KEY comes from the --api-key flag when
+  given, else resolves through the credential cascade (`stripe help
+  connections`). --api-key belongs to stripe itself, so it stands before the
+  verb (`stripe --api-key <key> <verb> ...`); prefer config/env, avoid it on
+  the command line.
+"""
+_HELP_SELECT = """
+  Connection: --connection <id> (accepted anywhere on the command line) selects
+  it; unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous (`stripe help
+  connections`). Outside any project this verb is refused: only connections
+  and doctor read the machine's own connections there.
+"""
+_HELP_EXIT = """
+  EXIT CODES
+  0 success · 2 auth/credentials · 3 not found · 4 policy refusal — the
+  project gate (capabilities/settings.json) on any verb, or a write verb
+  on a read-only connection; ask the user, never lift a gate yourself ·
+  5 server/network · 6 input
+"""
+_HELP_READ_EXITS = """
+  Exit codes: 0; 2 key missing (missing_credentials) or rejected by Stripe
+  (unauthorized); 3 not_found; 4 the project gate; 5 server/network, after
+  retries on timeouts, 429 and 5xx; 6 a request Stripe refused as invalid
+  (invalid_request), a connection missing 'secret_env' (no_secret_env), no
+  connections registry (connections_required), or a connection it cannot
+  select. A missing required flag, or a value outside a
+  flag's choices, is refused by the parser itself: exit 2, its usage on stderr.
+"""
+HELP_VERBS = {
+    "connections": """\
+  connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked). Local only — no network.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. Its STRIPE_SECRET_KEY comes from the --api-key flag when
+  given, else resolves through the credential cascade (`Where a secret
+  resolves`, above).
+
+  A project that reads several Stripe accounts declares them as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "STRIPE_<ID>_SECRET_KEY" }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  The entry names the env var holding its key ("secret_env"); the value
+  resolves through the credential cascade above. Every command is a read, so
+  "allow_write": false changes nothing here — the write gate guards a
+  surface this CLI does not have.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  A connection is written with `stripe connection add` (`stripe help
+  connection`).
+
+  Example: stripe connections
+""",
+    "doctor": """\
+  doctor [--connection <id>]
+      Validate key + API reachability (GET /v1/balance) — every connection,
+      or one. Exit 0 all healthy / 2 missing-or-rejected key / 5 unreachable.
+
+  Before any round-trip, a connection whose key resolves nowhere, or that
+  names no secret_env, is refused (exit 2 credentials_missing). Given
+  --api-key (before the verb: `stripe --api-key <key> doctor`), that key is
+  the one each examined connection's round-trip uses.
+
+  Output: {"ok": <every examined connection healthy>, "connections": {<id>:
+  {"ok": true, "livemode": <bool>, "currencies": [<available balance
+  currencies>]} or {"ok": false, "error"}}}. The exit code is the first
+  failing connection's: 2 key missing or rejected (401/403), 5 unreachable,
+  another error status or an unreadable answer, 6 no connections registry
+  (connections_required) or a connection it cannot select. Outside any project it is a
+  machine read: it uses the machine's own connections read-only, unless a
+  grant switched one off.
+
+  Examples:
+    stripe doctor
+    stripe doctor --connection <id>
+""",
+    "sync-plan": """\
+stripe [--api-key <key>] sync-plan --from YYYY-MM-DD --to YYYY-MM-DD
+       [--only-type charge|fee|payout|refund] [--connection <id>]
+
+  THE contract producer. Walks balance_transactions over [from, to),
+  classifies each into the neutral event taxonomy, and emits the JSON
+  contract on stdout. One call = everything a consumer needs to reconcile.
+    · charge  → gross/fee/net split + customer block + invoice block
+                (stripe number, line items [description/qty/amount],
+                hosted PDF url) + resolve:{client_id, invoice_id}=null
+                (the seam a consumer fills with its own ids)
+    · fee     → amount + category (billing_usage / invoicing / tax / processing)
+    · payout  → amount (for tying to the bank side)
+    · refund  → kind:"refund", flagged residual — surfaced with the
+                paired charge block {id, date, customer, gross} and a
+                full_refund true|false signal (null when the charge is
+                unresolvable), so a consumer can detect same-customer
+                test-payment pairings without a second Stripe read
+  Stateless: emits everything in range. Idempotency is the consumer's (it
+  skips events already recorded in its own store, keyed by the txn_ id).
+  --only-type restricts to one of charge|fee|payout|refund.
+
+  A balance transaction of any other Stripe type is emitted as kind "other",
+  flagged residual, with its stripe_type; --only-type leaves it out.
+
+  Output: one JSON object, {"source": "stripe", "clears_through": "stripe",
+  "period": {"from", "to"}, "counts": {<kind>: <n>}, "events": [...]}, the
+  events in created order. `stripe contract` prints a valid example of every
+  field.
+""" + _HELP_RANGE + _HELP_KEY + _HELP_SELECT + _HELP_READ_EXITS + """
+  Examples:
+    stripe sync-plan --from 2026-01-01 --to 2026-02-01
+    stripe sync-plan --from 2026-01-01 --to 2026-02-01 --only-type charge
+""" + _HELP_EXIT,
+    "contract": """\
+stripe contract
+
+  Print a valid example of the contract sync-plan emits — the event and
+  envelope shape, not live data, no API key required. The machine-readable
+  companion to the event taxonomy (`stripe help sync-plan`); built from the
+  same builders the producer uses, so it never drifts. Pipe to jq to inspect
+  the fields.
+
+  Output: the envelope {"source", "clears_through", "period", "counts",
+  "events"} with one event of each kind: charge, fee, payout, refund and
+  other. It reads no connection and calls nothing.
+
+  Exit codes: 0; 4 the project gate.
+
+  Example: stripe contract | jq '.events[0]'
+""",
+    "invoices list": """\
+stripe [--api-key <key>] invoices list --from YYYY-MM-DD --to YYYY-MM-DD
+       [--status paid] [--connection <id>]
+
+  Standalone read of Stripe invoices (number, customer, amount, currency,
+  hosted PDF url). Inspection read; sync-plan's charge events embed this.
+
+  --status restricts to invoices in one Stripe status (paid, for example); the
+  value is passed to Stripe as given.
+
+  Output: a JSON array, one {"id", "number", "status", "customer",
+  "customer_name", "customer_email", "total", "currency", "date", "pdf_url",
+  "hosted_url"} per invoice created in range.
+""" + _HELP_RANGE + _HELP_KEY + _HELP_SELECT + _HELP_READ_EXITS + """
+  Example: stripe invoices list --from 2026-01-01 --to 2026-02-01 --status paid
+""" + _HELP_EXIT,
+    "invoices pdf": """\
+stripe [--api-key <key>] invoices pdf <invoice_id> --out PATH [--connection <id>]
+
+  Download an invoice's hosted PDF, for attaching to the books on create.
+
+  <invoice_id> is the Stripe invoice id. --out is required: the file the PDF
+  is written to, its parent directories created.
+
+  Output: {"ok": true, "invoice", "number", "out", "bytes"}.
+
+  Besides the codes below: exit 3 no_pdf for an invoice without a hosted PDF
+  url, and 5 pdf_fetch_failed when the PDF itself cannot be downloaded.
+""" + _HELP_KEY + _HELP_SELECT + _HELP_READ_EXITS + """
+  Example: stripe invoices pdf <invoice_id> --out ./invoice.pdf
+""" + _HELP_EXIT,
+    "balance-transactions list": """\
+stripe [--api-key <key>] balance-transactions list --from YYYY-MM-DD --to YYYY-MM-DD
+       [--type charge|stripe_fee|payout|refund] [--connection <id>]
+
+  Lower-level normalized BT read — for resolving an edge case sync-plan
+  flagged, or a staged by-type migration. --type one of
+  charge|stripe_fee|payout|refund.
+
+  Output: a JSON array, one {"id", "type", "date", "amount", "fee", "net",
+  "currency", "description"} per balance transaction created in range.
+""" + _HELP_RANGE + _HELP_KEY + _HELP_SELECT + _HELP_READ_EXITS + """
+  Example: stripe balance-transactions list --from 2026-01-01 --to 2026-02-01 --type refund
+""" + _HELP_EXIT,
+    "payouts list": """\
+stripe [--api-key <key>] payouts list --from YYYY-MM-DD --to YYYY-MM-DD [--connection <id>]
+
+  Standalone payout read.
+
+  Output: a JSON array, one {"id", "status", "amount", "currency",
+  "arrival_date", "created", "description"} per payout created in range.
+""" + _HELP_RANGE + _HELP_KEY + _HELP_SELECT + _HELP_READ_EXITS + """
+  Example: stripe payouts list --from 2026-01-01 --to 2026-02-01
+""" + _HELP_EXIT,
+    "ids": """\
+  For stripe: the project identifiers envelope is
+  capabilities/stripe/identifiers.json, or store rows once the agent moved.
+
+  Example: stripe ids list
+""",
+}
 
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -828,7 +971,7 @@ def main() -> None:
 
     args = p.parse_args(cleaned)
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        _cmd_help()              # `--connection <id> help`: the same menu
         return
     if args.cmd == "contract":
         _emit(cmd_contract())

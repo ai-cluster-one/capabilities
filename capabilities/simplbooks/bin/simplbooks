@@ -5,7 +5,7 @@
 #     "httpx>=0.27",
 #     "click>=8.1",
 #     "beautifulsoup4>=4.12",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """simplbooks — agent-first CLI for the SimpleBooks accounting app."""
@@ -211,492 +211,155 @@ SALES_META_CACHE = _state_dir() / "sales_meta.json"
 PIN_STATE_FILE = _state_dir() / ".pin_pending"
 
 
-# ─── Help (full agent contract) ─────────────────────────────────────────────
+# ─── Help (the menu, and every verb's whole contract) ───────────────────────
+#
+# SHEBANG.md, "Agent-first help is the surface": HELP is the menu `simplbooks
+# help` prints, and HELP_VERBS the pages `simplbooks help <verb>` answers, each
+# verb's whole contract. The contract library dispatches both and renders the
+# contract verbs' own menu lines and pages, which the entries here for doctor,
+# connections, setup and ids follow. A text several verbs own is one constant,
+# added to each of their pages.
 
 HELP = """simplbooks — agent-first CLI for the SimpleBooks accounting app.
 
-Configuration resolves as *connections* — a named login identity plus its
-minted session, with a per-connection write gate. `simplbooks connections`
-prints the resolution (every value, its tier and source, secrets masked;
-local only). Select a non-default connection with `--connection <id>` /
-`-c <id>` (accepted anywhere on the line; optional with a sole entry or a
-`default` pointer). A write on a read-only connection exits 4 — ask the
-user, never lift the gate.
+This tool is designed to be invoked by agents. Run `simplbooks help` to load
+this menu and `simplbooks help <verb>` for one verb's whole contract, on
+demand; do not rely on memorised knowledge of its surface.
 
-Optional pins (resolved via the connection's env cascade):
-  SIMPLBOOKS_WORKER=<name>            pin the invoice worker (else logged-in user)
-  SIMPLBOOKS_INVOICE_FOOTER='...'     replace the default invoice footer line
+SimpleBooks has no API: every verb drives a logged-in browser session.
+Configuration resolves as connections, a named login identity plus its minted
+session, with a per-connection write gate (`simplbooks help connections`).
 
-═══ Agent startup protocol ═════════════════════════════════════════════════
+STARTUP PROTOCOL
+Every task that touches SimpleBooks begins with `simplbooks doctor`. Exit 0:
+proceed. Exit 2: the session is missing or expired and could not recover by
+itself. With the login email and password stored, the CLI logs in again on its
+own; a PIN gate (new IP or device) stops `simplbooks login` until the user
+gives the 6-digit PIN SimpleBooks emailed them, and re-running login without
+it invalidates that PIN. Without credentials, `simplbooks refresh` rewrites the
+session from a browser's Copy-as-cURL paste. Then re-run doctor. The whole
+protocol, with what to ask the user, is on `simplbooks help doctor`.
 
-EVERY task that touches SimpleBooks MUST begin with:
+SESSION
+  login                             log in with the stored email and password, or finish a PIN
+  refresh [<path>|-]                fallback: rewrite the session from a Copy-as-cURL paste
 
-  simplbooks doctor
+CLIENTS
+  clients list                      clients and partners; caches them for invoices create
+  clients search <query>            the EE business registry, by partial company name
+  clients lookup <reg_code>         one company's registry details, by reg code
+  clients create                    WRITE. create a client, optionally from the registry
+  clients show <client_id>          one client's identity and writable settings
+  clients update <client_id>        WRITE. change only the fields given, e.g. VAT defaults
 
-If doctor exits 0 → proceed.
-If doctor exits 2 → session is missing/expired AND auto-recovery is not
-possible. The exact next step depends on the error message:
+SALES INVOICES
+  invoices list                     recent sales invoices
+  invoices show <invoice_id>        one invoice: lines, client, saved reference
+  invoices meta                     the live sales VAT types: rate, income account
+  invoices create                   WRITE. create an invoice, VAT read live
+  invoices update <invoice_id>      WRITE. edit an invoice in place
+  invoices unbind <invoice_id>      WRITE. remove every payment binding from it
+  invoices delete <invoice_id>      WRITE. delete an invoice; irreversible
 
-  PRIMARY (auto-login):
-    If credentials.env has SIMPLBOOKS_EMAIL + SIMPLBOOKS_PASSWORD, the CLI
-    re-authenticates by itself. No agent action needed on most expiries.
+PURCHASE INVOICES (OSTUARVED)
+  purchases list                    recent purchase invoices
+  purchases meta                    the live purchase VAT types
+  purchases show <id>               one purchase: header, rows, bound payments
+  purchases attachments <id>        its stored attachments, with their ids
+  purchases attachment-delete <id> <attachment_id>  WRITE. delete one attachment
+  purchases download <id>           save a stored attachment to disk
+  purchases create                  WRITE. create a purchase invoice
+  purchases update <id>             WRITE. edit a purchase invoice in place
+  purchases delete <id>             WRITE. delete a purchase invoice; irreversible
+  purchases send-payment <id>       WRITE. stage it as a payment order to the bank
 
-    SimpleBooks keeps ONE live session per account: a login on another host,
-    or in a browser, expires this host's cookie. Every read (GET) recovers
-    from that by itself when EMAIL + PASSWORD are present — which is why a
-    scheduled job and an interactive session share one account without
-    fighting over it. A write landing on an expired session fails instead of
-    retrying; re-run it.
+PAYMENTS (OUTGOING) AND INCOMINGS (INCOMING)
+  payments list                     outgoing payments
+  payments show <payment_id>        one payment and the purchases it covers
+  payments create                   WRITE. create an outgoing payment
+  payments bind <payment_id>        WRITE. bind a payment to purchase invoices
+  payments delete <payment_id>      WRITE. delete a payment
+  incomings list                    incoming payments
+  incomings show <incoming_id>      one incoming and the invoices it covers
+  incomings create                  WRITE. create an incoming payment
+  incomings bind <incoming_id>      WRITE. bind an incoming to sales invoices
+  incomings delete <incoming_id>    WRITE. delete an incoming
 
-    If SimpleBooks returns a PIN gate (new IP/device), `simplbooks login`
-    will save the pending state and stop. Ask the user:
+ACCOUNTS AND REPORTS
+  accounts list chart|cashbook      the chart of accounts, or the cashbooks
+  accounts ledgers                  which chart account each cashbook posts to
+  reports trial-balance             every account's opening and closing balance
+  reports account-ledger <CODE>     one account's entries with a running saldo
 
-      "SimpleBooks sent a 6-digit PIN to <email>. What's the code?"
+JOURNAL ENTRIES (KANDED)
+  simplbooks financial_transactions list         manual journal entries
+  simplbooks financial_transactions show <id>    one kanne, both legs, balance check
+  simplbooks financial_transactions create       WRITE. a balanced double entry
+  simplbooks financial_transactions update <id>  WRITE. edit a kanne in place
+  simplbooks financial_transactions delete <id>  WRITE. delete a kanne
 
-    Then run (do NOT re-run `simplbooks login` — that invalidates the PIN):
+BANK WORKLIST (PSD2)
+  bank-transactions list            the unprocessed bank rows
+  bank-transactions show <bt_id>    one row in full: party, IBAN, suggestions
+  bank-transactions delete <bt_id>  WRITE. drop a row without booking it
+  bank-transactions import          WRITE. re-pull bank rows; dry run by default
+  bank-transactions save <bt_id>    WRITE. book a row as incoming, payment or kanne
 
-      simplbooks login --pin <code>
+VAT RETURN (KMD)
+  kmd show                          the return the books compute for a month
+  kmd list                          the months of a year: output, input, net
+  kmd reconcile                     the books against a filed e-MTA export
+  kmd check                         SimpleBooks' own per-line change flags
+  kmd regenerate                    WRITE. create or regenerate a VAT closure
+  kmd submit                        WRITE. file a month's return to e-MTA
+  kmd amend                         WRITE. re-file a corrected return to e-MTA
 
-  FALLBACK (cURL paste):
-    If auto-login fails or credentials are entirely missing, ask the user:
+ACCOUNT ID-SPACES
+Chart accounts are addressed by CODE and cashbooks by ID; which flag you use
+decides the space, and a value from the wrong one is refused before anything
+posts. `simplbooks guide id-spaces` holds the rule.
 
-      "Please open app.simplbooks.com in your browser, open DevTools →
-       Network, right-click any request, choose Copy as cURL, and paste."
+THE WRITE GATE
+A WRITE verb creates legal invoices or stages real bank payments, so it is off
+unless the connection grants allow_write; refused, it exits 4. Ask the user;
+never lift the gate yourself.
 
-    Save the paste to a tmp file and run:
+EXIT CODES
+  0 success · 1 generic error (validation, network, CSRF) · 2 auth (missing
+  creds, login rejected, or PIN required) · 4 policy refusal: the project gate,
+  or a write on a read-only connection · 6 input: a payment or incoming amount
+  refused, and input to the contract verbs · contract verbs add 3 not-found and
+  5 network
+"""
 
-      simplbooks refresh /tmp/sb.curl
-
-    (Or `pbpaste | simplbooks refresh -` if you can read the clipboard.)
-
-Then re-run `simplbooks doctor` to confirm.
-
-═══ Commands ═══════════════════════════════════════════════════════════════
-
-  simplbooks help                              Print this document.
-  simplbooks doctor                            Validate session health.
-                                                Auto-recovers via login when
-                                                EMAIL+PASSWORD are present.
-  simplbooks login                             Authenticate using EMAIL +
-                                                PASSWORD. Prompts for PIN on
-                                                TTY; otherwise saves pending
-                                                PIN state and exits 2.
-  simplbooks login --pin <code>                Complete a pending PIN flow.
-                                                Does NOT re-post credentials.
-  simplbooks refresh [PATH|-]                  Fallback: rewrite cookie +
-                                                account from a Copy-as-cURL
-                                                paste. Preserves EMAIL +
-                                                PASSWORD lines.
-
-  simplbooks clients list [--search TERM] [--limit N]
-                                                List clients/partners. Caches
-                                                results to clients.json for
-                                                use by `invoices create`.
-  simplbooks clients search <query>             Search the EE business registry
-                                                by partial company name.
-  simplbooks clients lookup <reg_code>          Full company details from the EE
-                                                business registry by reg code.
-  simplbooks clients create
-        [--reg-code C] [--name N] [--reg-no R] [--vat-no V] [--country EE]
-        [--street/--city/--postal-code/--county T] [--email/--phone T]
-        [--language et_EE]
-                                                Create a client. --reg-code
-                                                auto-fills from the registry.
-                                                Set VAT defaults + IBAN/SWIFT with
-                                                `clients update`.
-  simplbooks clients update <client_id> [--<field> VALUE ...]
-                                                Edit a client; only the flags you
-                                                pass change. Common use: set
-                                                per-client VAT defaults
-                                                (--sales-vat-type, --purchase-vat-type,
-                                                --expense-coa) so future
-                                                invoices inherit them.
-  simplbooks clients show <client_id> [--json]  One client's identity + writable
-                                                settings, read-through from the
-                                                edit form (vat_type / account
-                                                ids kept raw).
-
-  simplbooks invoices list [--search TERM] [--limit N]
-                                                List recent invoices.
-  simplbooks invoices show <invoice_id> [--json]
-                                                Read one invoice: line items,
-                                                client metadata and its saved
-                                                reference (additional_info).
-  simplbooks invoices meta [--json] [--refresh]
-                                                Live SALES vat types (id → rate,
-                                                income account), read from the
-                                                form + cached to sales_meta.json.
-
-  simplbooks invoices create
-        --client-id ID --description TEXT --price NUM
-        [--tax-class ee-domestic|eu-reverse|non-eu]
-        [--vat-type-id ID] [--income-coa CODE] --bank-cashbook-id ID
-        [--number N] [--quantity N] [--unit U] [--date YYYY-MM-DD]
-        [--due-days D] [--worker W] [--reference TEXT] [--creator ID]
-        [--dry-run]
-                                                Create an invoice. Client must
-                                                exist in the local cache —
-                                                run `clients list` first. The
-                                                VAT rate + income account are read
-                                                LIVE from the account's vat_types
-                                                map (see `invoices meta`); creator
-                                                is the logged-in user. --dry-run
-                                                resolves + prints without creating.
-
-  simplbooks invoices update <invoice_id>
-        [--reference TEXT] [--append-reference TEXT] [--number N] [...]
-                                                Edit an invoice in place
-                                                (Lisainfo, number, lines …).
-                                                Scrapes the form, patches,
-                                                re-POSTs.
-  simplbooks invoices unbind <invoice_id>       Remove all incoming/payment
-                                                bindings from an invoice.
-  simplbooks invoices delete <invoice_id>       Delete a sales invoice by id.
-                                                Irreversible — frees its number
-                                                from the sequence. Unbind first
-                                                if it has incomings/payments.
-
-  simplbooks purchases list [--search TERM] [--limit N]
-                                                List purchase invoices.
-  simplbooks purchases meta [--json] [--refresh]
-                                                Live PURCHASE vat types, read from
-                                                /purchases/add + cached to
-                                                purchases_meta.json.
-  simplbooks purchases show <id> [--view] [--json]
-                                                Read a purchase invoice. --view
-                                                reads the rendered view page:
-                                                status and bound payments/
-                                                incomings, for any purchase.
-  simplbooks purchases attachments <purchase_id> [--json]
-                                                List the purchase's stored
-                                                attachments: attachment id,
-                                                filename, type, byte size and
-                                                which copy is primary. The same
-                                                file uploaded twice is two
-                                                attachments with two ids. Size
-                                                reads `?` on a payment-locked
-                                                purchase, which SimpleBooks
-                                                serves without it.
-  simplbooks purchases attachment-delete <purchase_id> <attachment_id>
-        [--dry-run] [--force-unbind]
-                                                Delete ONE stored attachment by
-                                                its id, as listed by `purchases
-                                                attachments`. Irreversible, and
-                                                one per call by design — prune a
-                                                duplicate set copy by copy. A
-                                                PAID purchase is locked for
-                                                editing: --force-unbind unbinds
-                                                the bound payment(s), deletes
-                                                the one id, re-binds the same
-                                                entries and verifies the
-                                                binding came back identical.
-  simplbooks purchases download <purchase_id> [--index N] [--out PATH]
-                                                Save a stored attachment to
-                                                disk. --index is 1-based over
-                                                `purchases attachments` order.
-  simplbooks purchases create
-        --supplier-id ID --number STR
-        --date YYYY-MM-DD
-        --line "coa=<chart code>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>"
-        [--line "..." ...]
-        [--internal-number STR] [--due YYYY-MM-DD]
-        [--vat-total AMT] [--rounding AMT]
-        [--row-sum-with-vat/--row-sum-net]
-        [--attachment PATH] [--reference TEXT]
-        [--currency EUR] [--comments TEXT] [--creator ID] [--dry-run]
-                                                Create a purchase invoice
-                                                (ostuarve). --line is
-                                                repeatable, one per row.
-                                                --vat-total defaults to the
-                                                row-derived VAT total (0 when
-                                                all rows are 0%-rate); pass it
-                                                only to correct supplier
-                                                rounding gaps.
-                                                --attachment uploads a PDF.
-                                                Creator defaults to the logged-in
-                                                user (read from the form).
-                                                --dry-run resolves + prints
-                                                without creating.
-
-  simplbooks purchases update <purchase_id>
-        [--number STR] [--internal-number STR]
-        [--date YYYY-MM-DD] [--due YYYY-MM-DD]
-        [--vat-total AMT] [--rounding AMT] [--reference TEXT]
-        [--add-line "coa=<chart code>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amt>"]
-        [--set-line "<idx>:coa=<chart code>"]
-        [--set "<field-name>=<value>"] [--attach PATH] [--force-unbind]
-                                                Edit an existing purchase
-                                                invoice. Scrapes the edit
-                                                form, applies the patch,
-                                                re-POSTs. Use --add-line for
-                                                Ümardamine cent-gap fixes
-                                                when the supplier's KOKKU
-                                                doesn't tie to net+VAT.
-                                                A PAID purchase is locked for
-                                                editing: --force-unbind is the
-                                                only way in. It unbinds the
-                                                bound payment(s), applies the
-                                                change, then re-binds the same
-                                                entries. This is also the only
-                                                unbind path — `payments bind`
-                                                has no unbind-in-place.
-                                                On a FOREIGN-CURRENCY purchase
-                                                the exchange rate is re-derived
-                                                from the EUR total the books
-                                                carry, because SimpleBooks
-                                                renders the stored rate rounded
-                                                to 4 decimals and re-posting it
-                                                as shown re-values the invoice.
-                                                The EUR total is read back after
-                                                the edit and any movement is an
-                                                error, not a warning.
-
-  simplbooks purchases delete <purchase_id>      Delete a purchase invoice by id.
-                                                Irreversible; unbind bound
-                                                payments first.
-
-  simplbooks purchases send-payment <purchase_id>
-        [--amount AMT] [--from-cashbook-id ID] [--date DD.MM.YYYY]
-        [--target <bank>]
-                                                Stage a purchase invoice as a
-                                                payment order to the bank.
-                                                Scrapes the invoice's pre-filled
-                                                amount + paying account, POSTs
-                                                send_payment. On success the
-                                                invoice flips to "Pangas ootel";
-                                                the order waits in the bank's
-                                                netbank to be confirmed/signed —
-                                                never signs, only stages. Needs
-                                                own-account SWIFT + supplier IBAN
-                                                or the bank rejects it.
-
-  simplbooks accounts list chart | cashbook [--limit N] [--json]
-                                                List accounts. TWO id-spaces:
-                                                `cashbook` is the bank-like clearing
-                                                accounts (Kassa / bank accounts),
-                                                addressed by its ID (1-8) on every
-                                                --*-cashbook-id flag; `chart` is the
-                                                full chart of accounts (income 4xxx,
-                                                expense 5xxx), addressed by its CODE
-                                                on every --*-coa flag and `coa=` line
-                                                key. A value from the wrong space is
-                                                refused before anything is posted.
-                                                See `simplbooks guide id-spaces`.
-
-  simplbooks accounts ledgers [--refresh] [--json]
-                                                The JOIN between the two spaces,
-                                                derived live from each cashbook's
-                                                own edit form (never name-matched,
-                                                never declared): one row per
-                                                cashbook with the chart account it
-                                                posts to and that account's CODE,
-                                                plus what each cashbook id resolves
-                                                to if handed to a chart-side field.
-                                                The discovery point for "which
-                                                number addresses this ledger".
-                                                Cached; --refresh re-derives.
-
-  simplbooks reports trial-balance --from YYYY-MM-DD --to YYYY-MM-DD
-        [--account TERM] [--all] [--json]
-                                                Käibeandmik — every account's
-                                                opening + closing balance over a
-                                                period. CLOSING is the balance AS
-                                                OF --to: the reconciliation
-                                                workhorse for a bank, a clearing
-                                                or any control account. The footer
-                                                sums closing debits vs credits and
-                                                reports the gap (0,00 = the books
-                                                balance; anything else is a
-                                                dangling leg).
-
-  simplbooks reports account-ledger <CODE> --from YYYY-MM-DD --to YYYY-MM-DD
-        [--json]
-                                                Pearaamat — one account's card:
-                                                opening balance, every entry that
-                                                touched it with a running saldo,
-                                                the period's debit/credit totals
-                                                and the closing balance. The
-                                                drill-down behind a trial-balance
-                                                figure. CODE is the chart code
-                                                (`accounts list chart`).
-
-  simplbooks bank-transactions list
-        [--direction in|out] [--status valid|invalid|warning|duplicate]
-        [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--limit N] [--json]
-                                                Worklist of un-processed PSD2
-                                                bank rows. One row per
-                                                pending bank movement.
-                                                Tabular by default; --json
-                                                emits a structured array.
-
-  simplbooks bank-transactions show <bt_id> [--json]
-                                                Full per-row detail: party,
-                                                IBAN, available object_types,
-                                                pre-selected client/invoice,
-                                                inline errors/warnings.
-
-  simplbooks bank-transactions delete <bt_id>
-                                                Drop a row from the worklist
-                                                without booking it. Use for
-                                                payment-processor payout
-                                                duplicates (already mirrored
-                                                as a kanne) or mis-imports.
-                                                One row at a time — there is no
-                                                bulk delete (see the source note
-                                                at delete_all: reviewing a
-                                                duplicate needs a bank archive id
-                                                SimpleBooks does not expose).
-
-  simplbooks bank-transactions import --from YYYY-MM-DD --to YYYY-MM-DD
-        --bank-cashbook-id N [--source NAME] [--apply] [--json]
-                                                Re-pull statement rows from the
-                                                linked bank into the worklist.
-                                                DRY RUN unless --apply: resolves
-                                                and validates everything, shows
-                                                the exact body, and reports the
-                                                rows already staged in the window.
-                                                What SimpleBooks keys duplicate-
-                                                marking on is UNVERIFIED, so
-                                                --apply measures it — before/after
-                                                snapshots, created and duplicate-
-                                                flagged counts. A re-import can
-                                                flood the worklist; rows that come
-                                                back `duplicate` are manual review,
-                                                never automated booking.
-
-  simplbooks bank-transactions save <bt_id> --as incoming
-        --client-id N [--invoice-id N ...]
-        [--bank-cashbook-id N] [--sum AMT] [--date YYYY-MM-DD] [--description T]
-                                                Save inflow as a customer
-                                                payment, optionally bound to
-                                                one or more sales invoices.
-
-  simplbooks bank-transactions save <bt_id> --as payment
-        --client-id N [--purchase-id N ...]
-        [--bank-cashbook-id N] [--sum AMT] [--date YYYY-MM-DD] [--description T]
-        [--payment-object-type Purchase|ExpenseReport]
-                                                Save outflow as a supplier
-                                                payment, optionally bound to
-                                                one or more purchase
-                                                invoices.
-
-  simplbooks bank-transactions save <bt_id> --as kanne
-        --counter-coa CHART-CODE
-        [--sum AMT] [--date YYYY-MM-DD] [--description T]
-                                                Save as a manual kanne
-                                                (financial_transaction). The
-                                                bank side (account + direction)
-                                                is auto-derived from the BT
-                                                row; only the counter
-                                                account needs to be supplied.
-
-  Operational doctrine + decision tree for the worklist are consumer-side:
-  see the consuming project's own simplbooks reference. Read it before
-  processing rows.
-
-  simplbooks financial_transactions list [--search T]
-        [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--limit N] [--json]
-                                                List manual journal entries
-                                                (Kanded / financial_transactions).
-                                                --from/--to bound on date; a range
-                                                older than the recent rows is paged
-                                                back to, not missed. NOTE: the list
-                                                row does NOT show which accounts a
-                                                kanne hit — use `financial_transactions
-                                                show` for that.
-
-  simplbooks financial_transactions show <id> [--json]
-                                                Full read of one kanne: both
-                                                legs with resolved account
-                                                names, per-leg debit/credit,
-                                                notes, attached doc, and a
-                                                balance check. Read before
-                                                editing.
-
-  simplbooks financial_transactions create --date YYYY-MM-DD [--note T]
-        --line 'side=debit|credit:coa=<chart code>:sum=<amt>[:note=...]' ...
-                                                Create a balanced double-entry.
-                                                Debit total must equal credit
-                                                total. --line repeatable. BOTH
-                                                legs are chart-of-accounts legs,
-                                                named by CODE — a journal entry
-                                                has no cashbook leg.
-
-  simplbooks financial_transactions update <id>
-        [--date YYYY-MM-DD] [--note T]
-        [--set-line '<idx>:coa=<chart code>[:debit=<amt>][:credit=<amt>][:note=T]']
-        [--add-line 'side=debit|credit:coa=<chart code>:sum=<amt>[:note=...]']
-        [--remove-line <idx>] [--attach PATH] [--set 'NAME=VALUE']
-                                                Edit a kanne in place. Scrapes
-                                                the edit form, patches, re-checks
-                                                debit==credit, re-POSTs. Leg ids
-                                                are preserved (no delete+recreate).
-                                                idx is the leg number from
-                                                `financial_transactions show`.
-                                                Headline use is reclassification:
-                                                  financial_transactions update 20046 --set-line '1:coa=<chart code>'
-                                                --attach uploads a source PDF.
-
-  simplbooks financial_transactions delete <id> Delete a kanne by id.
-
-  simplbooks payments  list|show|create|bind|delete
-                                                Outgoing bank movements
-  simplbooks incomings list|show|create|bind|delete
-                                                Incoming bank movements
-                                                (supplier/customer payments;
-                                                `--help` on each for flags).
-
-  simplbooks kmd show --period YYYY-MM [--json]
-                                                The KMD (käibedeklaratsioon) SB
-                                                computes from the books for the
-                                                period — every line 1–13 with the
-                                                value it would file. Line 12 =
-                                                VAT payable, line 13 = refundable.
-
-  simplbooks kmd list --year YYYY [--json]      Per-month KMD for a year: output
-                                                VAT (line 4), input (line 5), net.
-
-  simplbooks kmd reconcile --filed <emta.csv>
-        [--year YYYY] [--tolerance EUR] [--json]
-                                                Diff the books' KMD against a
-                                                filed e-MTA KMD export; flags the
-                                                months whose net differs — the
-                                                amend candidates.
-
-  simplbooks kmd check --year YYYY [--filed <csv>] [--json]
-                                                Per-month, per-line KMD change flags
-                                                from SimpleBooks itself — any
-                                                declaration line that changed since
-                                                the period was confirmed is reported.
-                                                --filed adds the books-vs-filed net
-                                                delta per month.
-
-  simplbooks kmd regenerate --period YYYY-MM
-        [--apply] [--yes] [--json]              Create a missing closure or
-                                                regenerate a stale one (Käibemaksu
-                                                kontode sulgemine): SB only computes
-                                                fresh legs from its inline create-form,
-                                                so this either submits that form (new
-                                                period) or deletes the stale closure
-                                                so SB re-renders the form, then
-                                                submits it (regenerate). Default is
-                                                dry-run; --apply mutates and confirms
-                                                first (declared period), --yes for
-                                                non-interactive runs.
-
-  simplbooks kmd submit --period YYYY-MM [--yes]
-  simplbooks kmd amend  --period YYYY-MM [--yes]
-                                                File / re-file a KMD to e-MTA
-                                                directly. Requires the e-MTA
-                                                integration active (exit 4 with the
-                                                activation path otherwise); external
-                                                and effectively irreversible, so it
-                                                confirms before filing.
-
-═══ Account id-spaces ══════════════════════════════════════════════════════
-
-  Two disjoint id-spaces, one rule: which flag you use decides which one you
-  are in, and a value from the wrong space is refused before anything posts.
+_HELP_CONN = """
+  Connection: --connection <id> / -c <id> (accepted anywhere on the line;
+  optional with a sole entry or a `default` pointer) selects the login identity
+  and minted session it runs as (`simplbooks help connections`).
+"""
+_HELP_WRITE = """
+  WRITE: on a read-only connection (no allow_write) it exits 4 before its body
+  runs. It creates legal invoices or stages real bank payments; ask the user,
+  never lift the gate.
+"""
+_HELP_EXIT = """
+  Exit codes:
+    0  success
+    1  generic error (validation, network, CSRF)
+    2  auth (missing creds, login rejected, or PIN required — see message);
+       also a usage error the parser refuses (a missing required option, a
+       bad choice or value), with its usage on stderr
+    4  policy refusal — disabled by project policy (capabilities/settings.json),
+       or a write verb on a read-only connection (ask the user, never lift the
+       gate or enable the capability yourself)
+"""
+_HELP_EXIT6 = """    6  input — a payment/incoming amount refused: <= 0, or a --sum sign that
+       contradicts the bank row
+"""
+_HELP_ID_SPACES = """
+  Account id-spaces. Two disjoint id-spaces, one rule: which flag you use
+  decides which one you are in, and a value from the wrong space is refused
+  before anything posts.
 
   chart of accounts   addressed by CODE (four-to-five digits, >= 1010) on
                       --income-coa / --expense-coa / --counter-coa /
@@ -710,50 +373,1364 @@ Then re-run `simplbooks doctor` to confirm.
   Both listings: `simplbooks accounts list chart | cashbook`; the join between
   them, derived: `simplbooks accounts ledgers`. Full rule and command
   inventory: `simplbooks guide id-spaces`.
+"""
+_HELP_STARTUP = """
+  ═══ Agent startup protocol ═══
 
-═══ Tax classes ════════════════════════════════════════════════════════════
+  EVERY task that touches SimpleBooks MUST begin with:
 
-  A regime is a presentation choice (invoice language, reverse-charge mode,
-  footer) anchored to a sales vat_type_id. The VAT rate is read live from the
-  account's vat_types map (`invoices meta`); the income account defaults to
-  the same map, overridable per invoice with --income-account-id (or the type
-  itself with --vat-type-id).
+    simplbooks doctor
 
-  ee-domestic   Estonia, standard VAT
-  eu-reverse    EU B2B, 0% reverse-charge (requires VAT no on client)
-  non-eu        Export, 0%
+  If doctor exits 0 → proceed.
+  If doctor exits 2 → session is missing/expired AND auto-recovery is not
+  possible. The exact next step depends on the error message:
 
-═══ Price format ═══════════════════════════════════════════════════════════
+    PRIMARY (auto-login):
+      If credentials.env has SIMPLBOOKS_EMAIL + SIMPLBOOKS_PASSWORD, the CLI
+      re-authenticates by itself. No agent action needed on most expiries.
 
-Accepts '100', '100.00', '1234.50', '1234,50', '1 234,50'. Internally
-normalised to Estonian format ('1 234,50') for the SimpleBooks form.
+      SimpleBooks keeps ONE live session per account: a login on another host,
+      or in a browser, expires this host's cookie. Every read (GET) recovers
+      from that by itself when EMAIL + PASSWORD are present — which is why a
+      scheduled job and an interactive session share one account without
+      fighting over it. A write landing on an expired session fails instead of
+      retrying; re-run it.
 
-═══ Contract commands (the same on every capability) ═══════════════════════
+      If SimpleBooks returns a PIN gate (new IP/device), `simplbooks login`
+      will save the pending state and stop. Ask the user:
 
-  simplbooks stub                                 one-line awareness text
-  simplbooks manifest --json                      machine-readable declaration
-  simplbooks connections                          where every connection's values
-                                                  resolve from — tier, source,
-                                                  secrets masked (local, no network)
-  simplbooks guide [<topic>]                      guide topics / one guide body
-  simplbooks ids list|get <l>|set <l> <v>|rm <l>  the project identifiers envelope
-             [--note <text>]                      (capabilities/simplbooks/identifiers.json)
-  simplbooks refs                                 menu of the project's reference files
-  simplbooks inventory [--network]                What this capability holds in
-                                                  this project (--network adds
-                                                  remote detail).
+        "SimpleBooks sent a 6-digit PIN to <email>. What's the code?"
 
-═══ Exit codes ═════════════════════════════════════════════════════════════
+      Then run (do NOT re-run `simplbooks login` — that invalidates the PIN):
 
-  0  success
-  1  generic error (validation, network, CSRF)
-  2  auth (missing creds, login rejected, or PIN required — see message)
-  4  policy refusal — disabled by project policy (capabilities/settings.json),
-     or a write verb on a read-only connection (ask the user, never lift the
-     gate or enable the capability yourself)
-  6  input — a payment/incoming amount refused: <= 0, or a --sum sign that
-     contradicts the bank row (contract verbs also use 6 for input)
-  (contract verbs add 3 not-found / 5 network)
+        simplbooks login --pin <code>
+
+    FALLBACK (cURL paste):
+      If auto-login fails or credentials are entirely missing, ask the user:
+
+        "Please open app.simplbooks.com in your browser, open DevTools →
+         Network, right-click any request, choose Copy as cURL, and paste."
+
+      Save the paste to a tmp file and run:
+
+        simplbooks refresh /tmp/sb.curl
+
+      (Or `pbpaste | simplbooks refresh -` if you can read the clipboard.)
+
+  Then re-run `simplbooks doctor` to confirm.
+"""
+_HELP_PINS = """
+  Optional pins (resolved via the connection's env cascade):
+    SIMPLBOOKS_WORKER=<name>            pin the invoice worker (else logged-in user)
+    SIMPLBOOKS_INVOICE_FOOTER='...'     replace the default invoice footer line
+"""
+_HELP_TAX = """
+  Tax classes. A regime is a presentation choice (invoice language,
+  reverse-charge mode, footer) anchored to a sales vat_type_id. The VAT rate is
+  read live from the account's vat_types map (`invoices meta`); the income
+  account defaults to the same map, overridable per invoice with
+  --income-account-id (or the type itself with --vat-type-id).
+
+    ee-domestic   Estonia, standard VAT
+    eu-reverse    EU B2B, 0% reverse-charge (requires VAT no on client)
+    non-eu        Export, 0%
+"""
+_HELP_PRICE = """
+  Price format: accepts '100', '100.00', '1234.50', '1234,50', '1 234,50'.
+  Internally normalised to Estonian format ('1 234,50') for the SimpleBooks
+  form.
+"""
+_HELP_WORKLIST = """
+  Operational doctrine + decision tree for the worklist are consumer-side:
+  see the consuming project's own simplbooks reference. Read it before
+  processing rows. The mechanism is `simplbooks guide worklist`.
+"""
+_HELP_MONEY = """
+  A payment or incoming carries a positive amount: SimpleBooks stores it
+  unsigned, the document type being the direction, so a --sum <= 0 is refused
+  (exit 6) rather than posted as a reversed document.
+"""
+_HELP_LEGACY = """
+  Legacy aliases, hidden from the synopsis and kept for callers pinned to
+  them: {}. They take the internal id, are existence-checked only, and cannot
+  be combined with the flag they alias. Compose from the flags above.
+"""
+
+HELP_VERBS = {
+    "doctor": """\
+  simplbooks doctor validates session health and auto-recovers via login when
+  EMAIL+PASSWORD are present: an expired cookie re-logs in inside the client
+  (announced on stderr); an unrecoverable one exits 2.
+
+  Output, plain text: the account hash, the session's cookie count and names,
+  `GET /invoices/add: HTTP <status>`, `CSRF scrape : OK (...)`, then
+  `✓ session healthy`. Exit 1 on an unexpected status or no _csrfToken on the
+  page (the layout changed); 2 when creds are missing/stale and unrecoverable.
+""" + _HELP_STARTUP + """
+  Examples:
+    simplbooks doctor
+    simplbooks doctor --connection <id>
+""",
+    "connections": """\
+  Configuration resolves as *connections* — a named login identity plus its
+  minted session, with a per-connection write gate. `simplbooks connections`
+  prints the resolution (every value, its tier and source, secrets masked;
+  local only). Select a non-default connection with `--connection <id>` /
+  `-c <id>` (accepted anywhere on the line; optional with a sole entry or a
+  `default` pointer). A write on a read-only connection exits 4 — ask the
+  user, never lift the gate.
+
+  Each registry connection carries its login email, the env var holding its
+  password (secret_env) and allow_write; a connection is written with
+  `simplbooks connection add` (`simplbooks help connection`).
+
+  Example: simplbooks connections
+""",
+    "setup": _HELP_PINS + """
+  Example: simplbooks setup show
+""",
+    "ids": """\
+  For simplbooks: the project identifiers envelope is
+  capabilities/simplbooks/identifiers.json, or store rows once the agent moved.
+
+  Example: simplbooks ids list
+""",
+    "login": """\
+simplbooks login [--pin <code>]
+
+  Authenticate using the stored SIMPLBOOKS_EMAIL + SIMPLBOOKS_PASSWORD.
+
+  Without --pin: posts credentials. On a clean login it persists the session
+  and exits. On a PIN gate (new IP/device) it saves the pending PIN state; on a
+  TTY it prompts for the PIN inline, otherwise it exits 2 with instructions to
+  re-run with --pin.
+
+  --pin <code>  the 6-digit PIN, completing a pending PIN flow. Does NOT
+                re-post credentials: re-posting would invalidate the active
+                PIN and trigger a new email.
+
+  Output: plain text; `✓ logged in (PIN verified) — account <hash>` after a
+  PIN. Exit codes: 0 logged in; 2 missing credentials, login rejected, or a PIN
+  required; 1 any other failure, --pin with no pending PIN flow included.
+""" + _HELP_STARTUP + _HELP_CONN + """
+  Examples:
+    simplbooks login
+    simplbooks login --pin <code>
+""",
+    "refresh": """\
+simplbooks refresh [PATH|-]
+
+  Fallback: parse a Copy-as-cURL paste and rewrite cookie + account in
+  credentials.env. Preserves the SIMPLBOOKS_EMAIL + PASSWORD lines if present.
+  Prefer `simplbooks login` when EMAIL+PASSWORD are configured.
+
+  PATH is a file holding the paste; `-`, the default, reads it from stdin.
+
+  Output: `✓ wrote <credentials.env>`, the account and the cookie count, then
+  the pointer to re-run `simplbooks doctor`. Exit 1 on an empty stdin, a
+  missing file, or a paste without the SB_APP cookie (not a SimpleBooks
+  request).
+""" + _HELP_STARTUP + _HELP_CONN + """
+  Examples:
+    simplbooks refresh /tmp/sb.curl
+    pbpaste | simplbooks refresh -
+""",
+
+    # ── clients ──────────────────────────────────────────────────────────
+    "clients list": """\
+simplbooks clients list [--search TERM] [--limit N]
+
+  List clients/partners. Caches results to clients.json for use by
+  `invoices create`, which takes only a client that is in the local cache.
+
+  --search TERM  filter by name / reg no / VAT no / etc.
+  --limit N      rows to return (default 200)
+
+  Output: `<total> total · <n> returned · cached → <path>`, then a table:
+  ID, NAME, REG NO, VAT NO, COUNTRY.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks clients list --search <name>
+""",
+    "clients search": """\
+simplbooks clients search <query>
+
+  Search the Estonian business registry by partial company name.
+
+  Output: a table of REG CODE, NAME and the registry's R-ID, or `No matches in
+  the EE business registry.`; exit 1 on a registry HTTP error.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks clients search <company name fragment>
+""",
+    "clients lookup": """\
+simplbooks clients lookup <reg_code>
+
+  Full company details from the EE business registry by reg code.
+
+  Output: the registry's record as indented JSON, or `No data returned for
+  that reg_code.`; exit 1 on a registry HTTP error.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks clients lookup <reg_code>
+""",
+    "clients create": """\
+simplbooks clients create
+      [--reg-code C] [--name N] [--reg-no R] [--vat-no V] [--country EE]
+      [--street T] [--city T] [--postal-code T] [--county T]
+      [--email T] [--phone T] [--language et_EE]
+
+  Create a client. Use --reg-code to auto-fill from the EE registry, or pass
+  fields manually; without --reg-code, --name is required. Set VAT defaults +
+  IBAN/SWIFT with `clients update`.
+
+  --reg-code C   EE reg code; auto-fills the rest from the registry
+  --country      default EE; --language default et_EE; every other field
+                 defaults to empty
+
+  Output: `✓ Created client <id>`, its name, reg no, VAT no, address and URL.
+  Exit 1 on a failed registry lookup or a refused create (the response is
+  saved and its path named).
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks clients create --reg-code <reg_code>
+    simplbooks clients create --name 'Example OÜ' --country EE --email <address>
+""",
+    "clients show": """\
+simplbooks clients show <client_id> [--json]
+
+  One client's identity + writable settings, read-through from the edit form:
+  the same scrape as `clients update`, no cache, no mutation. VAT-type and
+  account fields come back as raw ids — resolve labels via `invoices meta` or
+  the account's chart of accounts.
+
+  Output: `Client <id>: <name>` and one `<field> = <value>` line per setting;
+  --json emits the record as a JSON object.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks clients show <client_id> --json
+""",
+    "clients update": """\
+simplbooks clients update <client_id>
+      [--name T] [--reg-no T] [--vat-no T] [--street T] [--city T]
+      [--county T] [--country T] [--postal-code T] [--email T] [--phone T]
+      [--iban T] [--bank T] [--swift T] [--language T]
+      [--sales-vat-type ID] [--purchase-vat-type ID]
+      [--trade-receivables-coa CODE] [--trade-creditors-coa CODE]
+      [--expense-coa CODE]
+
+  Edit a client; only the flags you pass change, everything else is
+  preserved. Common use: set per-client VAT defaults (--sales-vat-type,
+  --purchase-vat-type, --expense-coa) so future invoices inherit them.
+  At least one flag is required.
+
+  --iban T                     payee bank account (account_no) used when
+                               pushing payments to the bank
+  --bank T                     bank name for the payee account
+  --swift T                    SWIFT/BIC for the payee account
+  --sales-vat-type ID          VAT type id applied by default to sales
+                               invoice lines
+  --purchase-vat-type ID       VAT type id applied by default to purchase
+                               invoice rows
+  --trade-receivables-coa CODE AR account override — chart-of-accounts CODE
+                               (`accounts list chart`)
+  --trade-creditors-coa CODE   AP account override — chart-of-accounts CODE
+  --expense-coa CODE           default expense account for purchase rows —
+                               chart-of-accounts CODE
+
+  Output: `✓ Updated client <id>` and one `<field> = <value>` line per field
+  changed. Exit 1 on no flag given or a refused update (the response is saved
+  and its path named).
+""" + _HELP_LEGACY.format(
+        "--trade-receivables, --trade-creditors and --expense-account (for the "
+        "three -coa flags)") + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks clients update 407 --purchase-vat-type 11 --expense-coa 5060
+    simplbooks clients update 389 --sales-vat-type 32 --vat-no EE123456789
+""",
+
+    # ── sales invoices ───────────────────────────────────────────────────
+    "invoices list": """\
+simplbooks invoices list [--search TERM] [--limit N]
+
+  List recent invoices.
+
+  --search TERM  filter by number / client / status
+  --limit N      rows to return (default 20)
+
+  Output: `<total> total · <n> returned`, then a table: ID, NUMBER, CREATED,
+  CLIENT, SUM, STATUS.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks invoices list --search <client>
+""",
+    "invoices show": """\
+simplbooks invoices show <invoice_id> [--json]
+
+  Read one invoice: line items, client metadata and its saved reference
+  (additional_info). It reads via the /invoices/add/<id> copy form
+  (deterministic input names), so prices and descriptions come from the
+  original invoice.
+
+  Output: the client, its VAT and reg no, the reference and where it was read
+  from, then a table of DESCRIPTION, PRICE, AMT, VAT%, VTYP, ACCT. --json emits
+  one object: client_id, client_name, client_country, client_vat_no,
+  client_reg_no, additional_info, additional_info_source and line_items[], each
+  {description, price_per_unit, amount, unit, vat_rate, vat_type_id,
+  income_account_id}.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks invoices show <invoice_id> --json
+""",
+    "invoices meta": """\
+simplbooks invoices meta [--json] [--refresh]
+
+  Live SALES vat types (id → rate, income account, name), read from the
+  /invoices/add form's `vat_types` map and cached to sales_meta.json. This is
+  the source `invoices create` resolves the income account + VAT rate from —
+  so the books-side mapping always comes from SimpleBooks, not a constant.
+
+  --json     emit the raw map as JSON
+  --refresh  re-scrape /invoices/add instead of reading the cache
+
+  Output: `Sales VAT types (<n>):` and a table of ID, RATE, INCOME, NAME.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks invoices meta --refresh
+""",
+    "invoices create": """\
+simplbooks invoices create
+      --client-id ID --description TEXT --price NUM
+      [--tax-class ee-domestic|eu-reverse|non-eu]
+      [--vat-type-id ID] [--income-coa CODE] --bank-cashbook-id ID
+      [--number N] [--quantity N] [--unit U] [--date YYYY-MM-DD]
+      [--due-days D] [--worker W] [--reference TEXT] [--creator ID]
+      [--dry-run]
+
+  Create an invoice. Client must exist in the local cache — run `clients
+  list` first. The VAT rate + income account are read LIVE from the account's
+  vat_types map (see `invoices meta`); creator is the logged-in user. --dry-run
+  resolves + prints without creating.
+
+  --client-id ID         the client, from the local cache (required)
+  --description TEXT     the line's description (required)
+  --price NUM            the unit price (required; see Price format)
+  --tax-class            the regime (default ee-domestic; see Tax classes)
+  --vat-type-id ID       override the regime's sales vat_type_id (see
+                         `invoices meta`)
+  --income-coa CODE      override the income account — chart-of-accounts
+                         CODE (else read live from the vat_types map)
+  --bank-cashbook-id ID  own bank account shown on the invoice — cashbook ID,
+                         required (`accounts list cashbook`)
+  --number N             invoice number; defaults to SimpleBooks' next
+                         sequential number
+  --quantity N           default 1; --unit U default tk
+  --date YYYY-MM-DD      invoice date; defaults to today
+  --due-days D           days to the due date (default 7)
+  --worker W             line worker (issuer) name; defaults to the
+                         logged-in user (read from the form)
+  --reference TEXT       text set in the invoice footer, after the regime's
+                         prefix and before the footer line
+  --creator ID           issuer user id (else the logged-in user, read from
+                         the form)
+  --dry-run              resolve everything and print the payload WITHOUT
+                         creating the invoice
+
+  Output: `✓ Created invoice <id> (number <n>)`, the client, date, amount and
+  URL; with --dry-run, `DRY RUN — invoice NOT created.` and the resolved
+  client, number, tax class, vat_type_id, rate, income account, bank account,
+  creator, worker and price. Exit 1 on a client missing from the cache or a
+  refused create (the response is saved and its path named).
+""" + _HELP_TAX + _HELP_PRICE + _HELP_PINS + _HELP_LEGACY.format(
+        "--income-account-id (for --income-coa) and --bank-account (for "
+        "--bank-cashbook-id)") + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks invoices create --client-id <id> --description 'Consulting' --price '1 234,50' --bank-cashbook-id <id> --dry-run
+    simplbooks invoices create --client-id <id> --description 'Services' --price 100 --tax-class eu-reverse --bank-cashbook-id <id>
+""",
+    "invoices update": """\
+simplbooks invoices update <invoice_id>
+      [--reference TEXT] [--append-reference TEXT] [--number N]
+      [--date YYYY-MM-DD] [--due YYYY-MM-DD] [--client-id ID]
+      [--add-line SPEC ...] [--set NAME=VALUE ...]
+      [--force-unbind | --no-force-unbind]
+
+  Edit an invoice in place (Lisainfo, number, lines …): scrapes the form,
+  patches, re-POSTs. Preserves line items. Common fields have dedicated flags,
+  and --set covers anything else. At least one flag is required.
+
+  --reference TEXT         set the invoice's 'Lisainfo' (additional_info)
+                           field; overwrites
+  --append-reference TEXT  append to the existing additional_info
+                           (separator ' · ')
+  --number N               change the invoice number
+  --date / --due           change the invoice date / due date (YYYY-MM-DD)
+  --client-id ID           change the customer; pulls full client data from
+                           the local cache
+  --add-line SPEC          append a Task line, repeatable:
+                           'name=X:price=Y:vat=R:vat_type=ID:coa=<code>[:amount=N:unit=tk]';
+                           `coa=` is the income account's chart CODE. For
+                           rounding: 'name=Ümardamine:price=-0,01:vat=0:vat_type=15:coa=<code>'
+  --set NAME=VALUE         generic field override, repeatable; the exact form
+                           field name (e.g. 'data[Invoice][client_vat_no]=EE123',
+                           'Task[0][price_per_unit]=2,42', 'overdue_charge_percent=0,30')
+  --force-unbind           paid invoices are locked for editing in SB: unbind
+                           the bound payments/incomings, perform the edit,
+                           then re-bind the previously-bound entries. Use with
+                           caution.
+
+  Output: `✓ Updated invoice <id>`, each field changed (`<name> → <value>`)
+  and each entry re-bound. Exit 1 on no flag, a malformed --set or --add-line,
+  or a refused update.
+""" + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks invoices update 173 --reference '...' --set 'overdue_charge_percent=0,30'
+""",
+    "invoices unbind": """\
+simplbooks invoices unbind <invoice_id>
+
+  Remove all incoming/payment bindings from an invoice.
+
+  Output: `✓ Removed all bindings from invoice <id>`.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks invoices unbind <invoice_id>
+""",
+    "invoices delete": """\
+simplbooks invoices delete <invoice_id>
+
+  Delete a sales invoice by id. Irreversible — removes the document and frees
+  its number from the sequence. Unbind first if it has incomings/payments.
+
+  Output: `✓ Deleted invoice <id>`.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks invoices delete <invoice_id>
+""",
+
+    # ── purchase invoices ────────────────────────────────────────────────
+    "purchases list": """\
+simplbooks purchases list [--search TERM] [--limit N]
+
+  List purchase invoices.
+
+  --search TERM  filter by supplier / number / status
+  --limit N      rows to return (default 20)
+
+  Output: `<total> total · <n> returned`, then a table: ID, NUMBER, CREATED,
+  SUPPLIER, SUM, STATUS.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks purchases list --search <supplier>
+""",
+    "purchases meta": """\
+simplbooks purchases meta [--json] [--refresh]
+
+  Live PURCHASE vat types, read from the /purchases/add `vat_types` map and
+  cached to purchases_meta.json; this is the live set, not a constant. Expense
+  account IDs are chart-of-accounts entries — use `simplbooks accounts list
+  chart` and filter for 5xxx codes.
+
+  --json     emit the raw map as JSON
+  --refresh  re-scrape /purchases/add instead of reading the cache
+
+  Output: `Purchase VAT types (<n>):`, a table of id, rate and name, then a
+  note of common usages and where expense account ids are listed.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks purchases meta --json
+""",
+    "purchases show": """\
+simplbooks purchases show <id> [--view] [--json]
+
+  Read a purchase invoice's header + line items. It reads the edit form, which
+  carries the exact stored values including each row's account and vat-type
+  ids, the saved reference number and payment description, and the
+  payments/incomings bound to it from the view page. A payment-bound invoice
+  is locked out of editing (SB redirects to its view page), so it is read from
+  the rendered view instead — same header data, but rows expose display values
+  only.
+
+  --view  read the rendered view page instead: status and bound
+          payments/incomings, for any purchase, with every label/value pair it
+          shows (`fields`)
+  --json  emit JSON
+
+  Output: the supplier, its VAT and reg no, number and internal number, dates,
+  VAT total and currency, reference and payment description, a table of rows
+  (#, NAME, VAT_T, VAT%, AMT, SUM, ACCT) and what it is bound to. --json emits
+  the header (supplier_id, supplier_name, number, internal_number, created,
+  transaction_date, due, vat_total, currency, reference, payment_description,
+  bindings, …) with rows[].
+""" + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks purchases show <id> --json
+    simplbooks purchases show <id> --view
+""",
+    "purchases attachments": """\
+simplbooks purchases attachments <purchase_id> [--json]
+
+  List the purchase's stored attachments: attachment id, filename, type, byte
+  size and which copy is primary. The id is what `purchases attachment-delete`
+  takes, and the same file uploaded twice is two attachments with two ids.
+  Size reads `?` on a payment-locked purchase, which SimpleBooks serves
+  without it.
+
+  Output: a table of ID, FILENAME, TYPE, SIZE, PRIMARY, or `Purchase <id> has
+  no attachments.`; --json emits {"purchase_id", "attachments": [...]}.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks purchases attachments <purchase_id>
+""",
+    "purchases attachment-delete": """\
+simplbooks purchases attachment-delete <purchase_id> <attachment_id>
+      [--dry-run] [--force-unbind | --no-force-unbind]
+
+  Delete ONE stored attachment by its id, as listed by `purchases
+  attachments`. Irreversible, and one per call by design — prune a duplicate
+  set copy by copy; the surviving copy is named before each step.
+
+  --dry-run       resolve and print what would be deleted; post nothing
+  --force-unbind  a PAID purchase is locked for editing: unbind the bound
+                  payment(s)/incoming(s), delete the one id, re-bind the same
+                  entries and verify the binding came back identical
+
+  Output: the POST it makes, the attachment deleted and the ones kept, each
+  entry re-bound, and `Bindings : <n> restored and verified identical`. Exit 1
+  on an unknown attachment id, a locked purchase without --force-unbind, or a
+  binding that did not come back identical.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks purchases attachment-delete <purchase_id> <attachment_id> --dry-run
+""",
+    "purchases download": """\
+simplbooks purchases download <purchase_id> [--index N] [--out PATH]
+
+  Save a stored attachment (the file uploaded via `purchases create`) to
+  disk. Attachments are behind the authed session, not on a public URL — this
+  pulls the anchor SB renders on /purchases/view/<id> and streams the bytes.
+
+  --index N   which attachment, 1-based over `purchases attachments` order
+              (default 1)
+  --out PATH  output path; default the server-supplied filename in the
+              current directory
+
+  Output: `✓ Saved <path>`; a purchase without a stored copy prints `Purchase
+  <id> has no attachment.` and exits 0. Exit 1 on an --index below 1 or past
+  the attachments; 2 when the purchase or the file fetch redirects (session
+  stale, or the purchase not accessible).
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks purchases download <purchase_id> --out invoice.pdf
+""",
+    "purchases create": """\
+simplbooks purchases create
+      --supplier-id ID --number STR
+      --date YYYY-MM-DD
+      --line "coa=<chart code>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amount>"
+      [--line "..." ...]
+      [--internal-number STR] [--due YYYY-MM-DD]
+      [--vat-total AMT] [--rounding AMT]
+      [--row-sum-with-vat | --row-sum-net]
+      [--attachment PATH] [--reference TEXT]
+      [--currency EUR] [--rate X] [--comments TEXT] [--creator ID] [--dry-run]
+
+  Create a purchase invoice (ostuarve), optionally attaching the source PDF.
+  --line is repeatable, one per row: a colon-separated set of key=value
+  pairs, where `coa` is the expense account's chart-of-accounts CODE
+  (`accounts list chart`). Creator defaults to the logged-in user (read from
+  the form). --dry-run resolves + prints without creating.
+
+  --supplier-id ID       the supplier's client id (required)
+  --number STR           supplier-issued invoice number (required)
+  --internal-number STR  your internal sequence; defaults to --number
+  --date YYYY-MM-DD      invoice date (required); --due defaults to it
+  --vat-total AMT        total VAT; defaults to the row-derived VAT total (0
+                         when all rows are 0%-rate, e.g. reverse-charge); pass
+                         it only to correct supplier rounding gaps. SB rejects
+                         a --vat-total that differs from the rows' computed
+                         VAT by more than rounding as an illegal
+                         'VAT-modification', failing the whole save
+  --rounding AMT         the supplier's own rounding adjustment (the
+                         'Ümardamine' row on the PDF, default 0): positive
+                         means SB's net+VAT total under-shoots the supplier's
+                         stated gross by this amount, negative that it
+                         over-shoots; closes cent gaps when net × (1 + VAT)
+                         doesn't match their KOKKU line
+  --row-sum-with-vat     read each --line `sum` as GROSS (VAT-inclusive), the
+                         default; --row-sum-net reads it as NET
+  --attachment PATH      uploads a PDF / image of the source invoice
+  --reference TEXT       free-form supplier reference / payment note — the
+                         form's "Makse kirjeldus" (payment description)
+  --comments TEXT        Lisainfo — the free-text note shown on the invoice
+  --currency             document currency (default EUR)
+  --rate X               document-currency → EUR multiplier (default 1.0).
+                         For a foreign-currency invoice settled by an EUR bank
+                         debit, --rate = actual EUR settled / foreign-currency
+                         invoice total; the rows stay in the document currency
+                         and SimplBooks is sent the reciprocal UI rate
+  --creator ID           issuer user id (else the logged-in user)
+  --dry-run              resolve everything and print the payload WITHOUT
+                         creating the invoice
+
+  Output: `✓ Created expense <id> (number <n>)`, the supplier, date, line
+  count and VAT total, the attachment (byte-verified), the rounding (readback
+  verified) and the URL; with --dry-run, `DRY RUN — purchase invoice NOT
+  created.` and the resolved payload. Exit 1 on a malformed --line, a
+  non-positive --rate, or a refused or unverified save.
+""" + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example:
+    simplbooks purchases create --supplier-id <id> --number <supplier no> --date 2026-05-03 --line 'coa=5060:vat_type=34:vat=24:name=Office supplies:sum=82,18' --attachment invoice.pdf
+""",
+    "purchases update": """\
+simplbooks purchases update <purchase_id>
+      [--number STR] [--internal-number STR]
+      [--date YYYY-MM-DD] [--due YYYY-MM-DD]
+      [--vat-total AMT] [--rounding AMT] [--reference TEXT]
+      [--add-line "coa=<chart code>:vat_type=<id>:vat=<rate>:name=<desc>:sum=<amt>"]
+      [--set-line "<idx>:coa=<chart code>"]
+      [--set "<field-name>=<value>"] [--attach PATH]
+      [--force-unbind | --no-force-unbind]
+
+  Edit an existing purchase invoice. Scrapes the edit form
+  (/purchases/edit/<id>), applies the patch, re-POSTs to /purchases/update.
+  Use --add-line for Ümardamine cent-gap fixes when the supplier's KOKKU
+  doesn't tie to net+VAT.
+
+  A PAID purchase is locked for editing: --force-unbind is the only way in. It
+  unbinds the bound payment(s), applies the change, then re-binds the same
+  entries. This is also the only unbind path — `payments bind` has no
+  unbind-in-place.
+
+  On a FOREIGN-CURRENCY purchase the exchange rate is re-derived from the EUR
+  total the books carry, because SimpleBooks renders the stored rate rounded
+  to 4 decimals and re-posting it as shown re-values the invoice. The EUR
+  total is read back after the edit and any movement is an error, not a
+  warning.
+
+  --number / --internal-number  change the supplier-issued / internal number
+  --date / --due                change the invoice / due date (YYYY-MM-DD)
+  --vat-total AMT               override the stored total VAT
+  --rounding AMT                set the supplier's rounding-adjustment cents
+                                (positive or negative)
+  --reference TEXT              replace the free-form payment note (the
+                                "Makse kirjeldus" field)
+  --add-line SPEC               append a line, repeatable; the format of
+                                `purchases create --line`, with optional
+                                [:amount=N][:unit=tk]
+  --set-line SPEC               edit an EXISTING line in place by its 1-based
+                                index (the order `purchases show` prints),
+                                repeatable: '<idx>:coa=<chart code>[:vat_type=<id>][:vat=<rate>][:name=<desc>][:sum=<amt>][:amount=N][:unit=tk]'
+  --set NAME=VALUE              raw form field override, repeatable, e.g.
+                                'data[Purchase][cash_accounting_method]=1'
+  --attach PATH                 attach (set/replace) the source-document
+                                PDF/image
+  --force-unbind                as above: unbind, edit, re-bind
+
+  Output: `✓ Updated purchase <id>`, the lines edited, the attachment
+  (byte-verified), the rounding (readback verified), each entry re-bound and
+  the URL. Exit 1 on a malformed spec, an unknown line index, a refused
+  update, or a moved EUR total.
+""" + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    # Bump the rounding adjustment by 1 cent.
+    simplbooks purchases update 1731 --rounding 0,01
+    # Add a second line (e.g. an Ümardamine row when --rounding isn't enough).
+    simplbooks purchases update 1731 --add-line 'coa=<chart code>:vat_type=15:vat=0:name=Ümardamine:sum=0,01'
+    # Re-point an existing line's expense account (idx as shown by `purchases show`).
+    simplbooks purchases update 1763 --set-line '1:coa=<chart code>'
+    # Re-point the account, close the 1-cent VAT gap, and attach the source PDF in one call.
+    simplbooks purchases update 1763 --set-line '1:coa=<chart code>' --vat-total 10,65 --attach invoice.pdf
+    # Fix a PAID invoice (locked): unbind its payment, fix number+period+PDF, re-bind.
+    simplbooks purchases update 1764 --force-unbind --number 3B6A7575-0016 --date 2026-05-03 --attach invoice.pdf
+    # Change the invoice date / due date.
+    simplbooks purchases update 1731 --date 2026-05-18 --due 2026-05-25
+""",
+    "purchases delete": """\
+simplbooks purchases delete <purchase_id>
+
+  Delete a purchase invoice by id. Irreversible — removes the document;
+  unbind bound payments first.
+
+  Output: `✓ Deleted expense <id>`.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks purchases delete <purchase_id>
+""",
+    "purchases send-payment": """\
+simplbooks purchases send-payment <purchase_id>
+      [--amount AMT] [--from-cashbook-id ID] [--date DD.MM.YYYY]
+      [--target <bank>]
+
+  Stage a purchase invoice as a payment order to the bank. Scrapes the
+  invoice's pre-filled amount + paying account, POSTs send_payment to the
+  configured bank integration. On success the invoice flips to "Pangas
+  ootel"; the order waits in the bank's netbank for an authorised person to
+  confirm and sign — never signs, only stages. The push is reversible (SB's
+  "Tühista makse panka saatmise märge") until the order is signed in the bank.
+
+  Prerequisites, or the bank rejects it: the own bank account must carry a
+  SWIFT/BIC in SimplBooks bank settings, and the supplier contact must carry
+  an IBAN (`simplbooks clients update <id> --iban`).
+
+  --amount AMT            payment amount; defaults to the invoice's
+                          pre-filled total
+  --from-cashbook-id ID   paying cashbook ID (`accounts list cashbook`);
+                          defaults to the invoice's pre-selected account
+  --date DD.MM.YYYY       payment date; defaults to today
+  --target <bank>         bank integration target to push the order to
+                          (required)
+
+  Output: `✓ Payment staged for purchase <id> → <target>`, the amount, paying
+  account and date, then the pointer to confirm and sign in the netbank. Exit
+  1 on no amount or paying account to use, or a refused push.
+""" + _HELP_LEGACY.format("--from-account (for --from-cashbook-id)") \
+        + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks purchases send-payment 1733 --target <bank>
+    simplbooks purchases send-payment 1733 --amount 166,82 --date 09.06.2026 --target <bank>
+""",
+
+    # ── payments ─────────────────────────────────────────────────────────
+    "payments list": """\
+simplbooks payments list [--search T] [--bank-cashbook-id ID] [--limit N] [--json]
+
+  List outgoing payments (outgoing bank movements: supplier payments, expense
+  reimbursements) — a server-side global search with a client-side account
+  filter.
+
+  --search T             substring search across description / client / etc.
+  --bank-cashbook-id ID  filter (client-side) by cashbook ID (`accounts list
+                         cashbook`)
+  --limit N              rows to fetch (default 200)
+
+  Output: `<n> returned`, then a table: ID, DATE, CLIENT, SUM, ACCOUNT,
+  DESCRIPTION. --json emits the rows as a JSON array; its keys are only ever
+  added to.
+""" + _HELP_LEGACY.format("--account-id (for --bank-cashbook-id)") \
+        + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks payments list --bank-cashbook-id <id> --json
+""",
+    "payments show": """\
+simplbooks payments show <payment_id> [--json]
+
+  Read one outgoing payment and the purchase invoices it is bound to, each
+  with the amount it covers (read-only).
+
+  Output: `Payment <id>   client [<client_id>]`, each field of its view page,
+  each purchase it covers and the URL. --json emits {"id", "client_id",
+  "fields", "bound": [{"document", "id", "amount", "columns"}]}; its keys are
+  only ever added to. Exit 1 when the payment is not accessible (likely
+  deleted).
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks payments show <payment_id> --json
+""",
+    "payments create": """\
+simplbooks payments create --client-id ID --bank-cashbook-id ID --sum AMT
+      --date YYYY-MM-DD [--description T] [--object-type Purchase|ExpenseReport]
+
+  Create an outgoing payment (makse) and print its new id. A payment does NOT
+  require a purchase invoice to exist — an unbound payment is a first-class SB
+  primitive that books as a supplier prepayment: SB credits the paying
+  bank/cashbook and debits the supplier-prepayment account (the `Ettemaksed
+  tarnijatele` family), so the money sits as a claim on the supplier rather
+  than netted against payables. Bind it later with `payments bind` when the
+  invoice arrives.
+
+  --client-id ID          SB client id of the counter-party (supplier),
+                          required
+  --bank-cashbook-id ID   paying cashbook ID (`accounts list cashbook`),
+                          required
+  --sum AMT               amount, plain or Estonian decimal (e.g. 10 or
+                          10,85), required
+  --date YYYY-MM-DD       payment date, required
+  --object-type           the settlement target: Purchase (default) or
+                          ExpenseReport
+
+  Output: `✓ Created payment <id>` and its URL.
+""" + _HELP_MONEY + _HELP_LEGACY.format("--account-id (for --bank-cashbook-id)") \
+        + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_EXIT6 + _HELP_CONN + """
+  Example: simplbooks payments create --client-id <id> --bank-cashbook-id <id> --sum 10,85 --date 2026-05-03
+""",
+    "payments bind": """\
+simplbooks payments bind <payment_id> --to-purchase ID [--to-purchase ID ...]
+
+  Link an outgoing payment to one or more purchase invoices. Bind allocates
+  only the payment's FREE (unallocated) remainder against each invoice's open
+  balance; a cent residual stays as free prepayment. Binding is a separate,
+  later step from creating — an unbound payment sits as a supplier prepayment
+  until a document arrives to bind it to.
+
+  A bound allocation is NOT editable in place: to move or re-split an
+  already-bound payment, delete it and re-create it, then re-bind. There is no
+  unbind-in-place.
+
+  --to-purchase ID  purchase invoice id to bind, repeatable, required
+
+  Output: `✓ Bound payment <id>`, then `purchase <id>: allocated <amount>` per
+  invoice.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks payments bind <payment_id> --to-purchase <id> --to-purchase <id>
+""",
+    "payments delete": """\
+simplbooks payments delete <payment_id>
+
+  Delete a payment by id.
+
+  Output: `✓ Deleted payment <id>`.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks payments delete <payment_id>
+""",
+
+    # ── incomings ────────────────────────────────────────────────────────
+    "incomings list": """\
+simplbooks incomings list [--search T] [--bank-cashbook-id ID] [--limit N] [--json]
+
+  List incoming payments (incoming bank movements: customers paying sales
+  invoices).
+
+  --search T             substring search across description / client / etc.
+  --bank-cashbook-id ID  filter (client-side) by cashbook ID (`accounts list
+                         cashbook`)
+  --limit N              rows to fetch (default 200)
+
+  Output: `<n> returned`, then a table: ID, DATE, CLIENT, SUM, ACCOUNT,
+  DESCRIPTION. --json emits the rows as a JSON array; its keys are only ever
+  added to.
+""" + _HELP_LEGACY.format("--account-id (for --bank-cashbook-id)") \
+        + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks incomings list --search <client> --json
+""",
+    "incomings show": """\
+simplbooks incomings show <incoming_id> [--json]
+
+  Read one incoming payment and the sales invoices it is bound to, each with
+  the amount it covers (read-only).
+
+  Output: `Incoming <id>   client [<client_id>]`, each field of its view page,
+  each invoice it covers and the URL. --json emits {"id", "client_id",
+  "fields", "bound": [{"document", "id", "amount", "columns"}]}; its keys are
+  only ever added to. Exit 1 when the incoming is not accessible (likely
+  deleted).
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks incomings show <incoming_id>
+""",
+    "incomings create": """\
+simplbooks incomings create --client-id ID --bank-cashbook-id ID --sum AMT
+      --date YYYY-MM-DD [--description T]
+
+  Create an incoming payment (laekumine) and print its new id.
+
+  --client-id ID         SB client id of the customer, required
+  --bank-cashbook-id ID  receiving cashbook ID (`accounts list cashbook`),
+                         required
+  --sum AMT              amount, required
+  --date YYYY-MM-DD      required
+
+  Output: `✓ Created incoming <id>` and its URL.
+""" + _HELP_MONEY + _HELP_LEGACY.format("--account-id (for --bank-cashbook-id)") \
+        + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_EXIT6 + _HELP_CONN + """
+  Example: simplbooks incomings create --client-id <id> --bank-cashbook-id <id> --sum 100 --date 2026-05-03
+""",
+    "incomings bind": """\
+simplbooks incomings bind <incoming_id> --to-invoice ID [--to-invoice ID ...]
+
+  Link an incoming payment to one or more sales invoices.
+
+  --to-invoice ID  sales invoice id to bind, repeatable, required
+
+  Output: `✓ Bound incoming <id>`, then `invoice <id>: allocated <amount>` per
+  invoice.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks incomings bind <incoming_id> --to-invoice <id>
+""",
+    "incomings delete": """\
+simplbooks incomings delete <incoming_id>
+
+  Delete an incoming by id.
+
+  Output: `✓ Deleted incoming <id>`.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks incomings delete <incoming_id>
+""",
+
+    # ── accounts and reports ─────────────────────────────────────────────
+    "accounts list": """\
+simplbooks accounts list [chart | cashbook] [--limit N] [--json]
+
+  List accounts. TWO id-spaces: `cashbook` is the bank-like clearing accounts
+  (Kassa / bank accounts), addressed by its ID (1-8) on every
+  --*-cashbook-id flag; `chart` (the default) is the full chart of accounts
+  (income 4xxx, expense 5xxx), addressed by its CODE on every --*-coa flag and
+  `coa=` line key. A value from the wrong space is refused before anything is
+  posted. See `simplbooks guide id-spaces`.
+
+  The CODE column is what the chart-side flags and `coa=` line keys take
+  (`--income-coa 4010`, `--counter-coa 1030`); the ID column is the internal
+  id SimpleBooks stores. The cashbook ID column is what the cashbook-side
+  flags take (`--bank-cashbook-id 3`).
+
+  --limit N  page size (default 1000). The default covers the whole chart; a
+             short page is reported on stderr, never dropped silently.
+
+  Output: `<kind> accounts: <n> returned`, then a table: ID, CODE, NAME,
+  ACTIVE. --json emits the rows as a JSON array; its keys are only ever added
+  to.
+""" + _HELP_ID_SPACES + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks accounts list chart
+    simplbooks accounts list cashbook --json
+""",
+    "accounts ledgers": """\
+simplbooks accounts ledgers [--refresh] [--json]
+
+  The JOIN between the two spaces, derived live from each cashbook's own edit
+  form (never name-matched, never declared): one row per cashbook with the
+  chart account it posts to and that account's CODE, plus what each cashbook
+  id resolves to if handed to a chart-side field. The discovery point for
+  "which number addresses this ledger". Read it to look an account up; do not
+  rely on having read it — the typed flags and the pre-POST validator hold
+  whether or not you did.
+
+  --refresh  re-derive from SimpleBooks instead of reading the cached map
+
+  Output: a table of CASHBOOK (ID, NAME) and CHART ACCOUNT (CODE, ID, NAME),
+  then where the two spaces overlap. --json emits {"account", "derived_at",
+  "source", "ledgers": [...], "coa_id_collisions": [...]}; its keys are only
+  ever added to.
+""" + _HELP_ID_SPACES + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks accounts ledgers --refresh
+""",
+    "reports trial-balance": """\
+simplbooks reports trial-balance --from YYYY-MM-DD --to YYYY-MM-DD
+      [--account TERM] [--all] [--json]
+
+  Käibeandmik — every account's opening + closing balance over a period.
+  CLOSING is the balance AS OF --to: the reconciliation workhorse for a bank,
+  a clearing or any control account. A positive value is a debit
+  (asset/expense) balance, negative a credit (liability/equity/income)
+  balance. The footer sums closing debits vs credits and reports the gap
+  (0,00 = the books balance; anything else is a dangling leg).
+
+  --from / --to   period start and end, YYYY-MM-DD or DD.MM.YYYY (required)
+  --account TERM  only accounts whose code or name contains this
+  --all           every account, including those flat at zero (hidden by
+                  default)
+
+  Output: a table of CODE, ACCOUNT, OPENING, CLOSING and the footer, `✓
+  balanced` or `⚠ off-balance`. --json emits {"period_from", "period_to",
+  "closing_debit_total", "closing_credit_total", "gap", "rows": [{account_id,
+  code, name, is_group, opening, closing}]}; a scheduled integrity check parses
+  these keys, which are only ever added to.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks reports trial-balance --from 2026-01-01 --to 2026-03-31 --account 1535
+""",
+    "reports account-ledger": """\
+simplbooks reports account-ledger <CODE> --from YYYY-MM-DD --to YYYY-MM-DD [--json]
+
+  Pearaamat — one account's card (kontokaart): opening balance, every entry
+  that touched it with a running saldo, the period's debit/credit totals and
+  the closing balance. The drill-down behind a trial-balance figure — see
+  WHICH entries moved an account when reconciling a control/clearing/bank
+  account or chasing where a balance came from.
+
+  CODE is the account's four-to-five digit chart code (the CODE column of
+  `accounts list chart`, e.g. 1535) — the internal id is still accepted, since
+  the two ranges are disjoint. The DOC NR column is SimplBooks'
+  journal/document number (Kande nr., as shown in the SB UI) — this is NOT the
+  id that `financial_transactions show` takes; to open an underlying entry
+  from the CLI find it with `financial_transactions list --search` by its date
+  + description. Saldo is debit-positive (a positive saldo is a debit/asset
+  balance, negative a credit/liability balance).
+
+  --from / --to  period start and end, YYYY-MM-DD or DD.MM.YYYY (required)
+
+  Output: the opening balance, one row per entry (DOC NR, description, DEBIT,
+  CREDIT, SALDO), the period's movements and the closing saldo as of --to;
+  --json emits the account card as one JSON object.
+""" + _HELP_ID_SPACES + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks reports account-ledger 1535 --from 2026-01-01 --to 2026-03-31
+""",
+
+    # ── journal entries ──────────────────────────────────────────────────
+    "financial_transactions list": """\
+simplbooks financial_transactions list [--search T]
+      [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--limit N] [--json]
+
+  List manual journal entries (Kanded / financial_transactions). --from/--to
+  bound on transaction_date; the listdata endpoint has no server-side date
+  range, so a bounded query pages backwards through the (desc-by-date) result
+  set until it has covered the window — a range older than the recent rows is
+  found, not missed. NOTE: the list row does NOT show which accounts a kanne
+  hit — use `financial_transactions show` for that.
+
+  --search T  substring search across transaction_note etc.
+  --from / --to  only kanne on/after, on/before this date (YYYY-MM-DD)
+  --limit N   rows to fetch (default 200)
+
+  Output: `<n> returned`, then a table: ID, DATE, +SUM, -SUM, NOTE. --json
+  emits the rows as a JSON array.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks financial_transactions list --from 2026-01-01 --to 2026-01-31 --search <note>
+""",
+    "financial_transactions show": """\
+simplbooks financial_transactions show <id> [--json]
+
+  Full read of one kanne: both legs with resolved account names, per-leg
+  debit/credit, notes, attached doc, and a balance check. The read-one
+  primitive — `financial_transactions list` cannot show which accounts an
+  entry touched; this can. Read it before `financial_transactions update` so
+  you patch the right leg.
+
+  Output: `Kanne <id>`, its group, date, note, source and document, then a
+  table of the legs (#, ACCOUNT, DEBIT, CREDIT, NOTE) and the balance line.
+  --json emits {"id", "group_id", "date", "note", "base_object_type",
+  "import_archive_hash", "document", "lines": [...], "balance": {"debit",
+  "credit", "ok"}}.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks financial_transactions show <id>
+""",
+    "financial_transactions create": """\
+simplbooks financial_transactions create --date YYYY-MM-DD [--note T]
+      --line 'side=debit|credit:coa=<chart code>:sum=<amt>[:note=...]' ...
+
+  Create a balanced double-entry. Debit total must equal credit total. --line
+  repeatable. BOTH legs are chart-of-accounts legs, named by CODE — a journal
+  entry has no cashbook leg. The `coa` key is the account's four-to-five digit
+  CODE from the CODE column of `simplbooks accounts list chart`; cashbook ids
+  are a different id-space and are never valid here.
+
+  --date YYYY-MM-DD  transaction date, required
+  --note T           top-level kanne description
+  --line SPEC        one leg, repeatable, required
+
+  Output: `✓ Created kanne <id>`, its date and note, the line count with the
+  debit and credit totals, and the URL. Exit 1 on a malformed --line, an
+  unbalanced entry, or a refused create.
+""" + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example — move 1 000,00 from the Kassa ledger to a bank ledger:
+    simplbooks financial_transactions create --date 2026-01-02 --note 'Inter-account transfer' --line 'side=debit:coa=1025:sum=1000,00:note=transfer' --line 'side=credit:coa=1010:sum=1000,00:note=transfer'
+""",
+    "financial_transactions update": """\
+simplbooks financial_transactions update <id>
+      [--date YYYY-MM-DD] [--note T]
+      [--set-line '<idx>:coa=<chart code>[:debit=<amt>][:credit=<amt>][:note=T]']
+      [--add-line 'side=debit|credit:coa=<chart code>:sum=<amt>[:note=...]']
+      [--remove-line <idx>] [--attach PATH] [--set 'NAME=VALUE']
+
+  Edit a kanne in place. Scrapes the edit form
+  (/financial_transactions/edit/<id>), patches, re-checks debit==credit,
+  re-POSTs. Leg ids are preserved (no delete+recreate), so the entry keeps its
+  identity. idx is the leg number from `financial_transactions show`.
+  Headline use is reclassification, naming the target by its
+  chart-of-accounts CODE.
+
+  --date YYYY-MM-DD  change the transaction date
+  --note T           replace the top-level transaction_note
+  --set-line SPEC    patch a leg in place, repeatable
+  --add-line SPEC    append a leg, repeatable
+  --remove-line IDX  remove a leg by idx, repeatable
+  --attach PATH      uploads a source PDF to the kanne
+  --set NAME=VALUE   raw form field override (escape hatch), repeatable
+
+  Output: `✓ Updated kanne <id>`, its debit and credit balance, and the URL.
+  Exit 1 on an unknown leg idx, a malformed spec, an unbalanced result, a
+  kanne left with no legs, or a refused update.
+""" + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks financial_transactions update 20046 --set-line '1:coa=<chart code>'
+    simplbooks financial_transactions update 20046 --note 'SaaS subscription - 24.80 USD'
+    simplbooks financial_transactions update 20046 --date 2026-05-29
+    simplbooks financial_transactions update 20046 --attach /path/to/receipt.pdf
+""",
+    "financial_transactions delete": """\
+simplbooks financial_transactions delete <id>
+
+  Delete a kanne (financial_transaction) by id.
+
+  Output: `✓ Deleted kanne <id>`.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks financial_transactions delete <id>
+""",
+
+    # ── bank worklist ────────────────────────────────────────────────────
+    "bank-transactions list": """\
+simplbooks bank-transactions list
+      [--direction in|out] [--status valid|invalid|warning|duplicate]
+      [--from YYYY-MM-DD] [--to YYYY-MM-DD] [--limit N] [--json]
+
+  Worklist of un-processed PSD2 bank rows (/bank_transactions/process). One
+  row per pending bank movement. SB has typically not auto-matched a SB
+  client_id for these — the agent does that work via `clients` / `purchases
+  list` / `invoices list` and then `save`. Tabular by default; --json emits a
+  structured array.
+
+  --direction in|out  inflows or outflows only
+  --status            SB's auto-validation status
+  --from / --to       start / end date YYYY-MM-DD (inclusive)
+  --limit N           server-side row cap (default 500); the worklist usually
+                      has <100 rows
+
+  Output: `<n> row(s) in worklist` and a table. --json emits one object per
+  row: id, date, sum, direction, currency, party_name, bank_iban,
+  transaction_note, default_object_type, available_object_types, status,
+  errors, warnings, income_financial_account_id, income_account_id and the
+  suggested_incoming_/suggested_payment_ client and document ids; the bank
+  reconciler parses these keys, which are only ever added to.
+""" + _HELP_WORKLIST + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks bank-transactions list --direction out --json
+""",
+    "bank-transactions show": """\
+simplbooks bank-transactions show <bt_id> [--json]
+
+  Full per-row detail: party, IBAN, available object_types, pre-selected
+  client/invoice, inline errors/warnings.
+
+  Output: the row's date, sum and direction, bank IBAN, party, bank note,
+  status, default save mode, bank-side account, what SB pre-selected, and its
+  errors and warnings; --json emits the row as the object `list --json` gives.
+""" + _HELP_WORKLIST + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks bank-transactions show <bt_id>
+""",
+    "bank-transactions delete": """\
+simplbooks bank-transactions delete <bt_id>
+
+  Drop a row from the worklist without booking it. Use for payment-processor
+  payout duplicates (already mirrored as a kanne) or mis-imports. It only
+  removes the worklist entry; it does NOT touch any already-booked incoming /
+  payment / kanne the row may correspond to. One row at a time — there is no
+  bulk delete (see the source note at delete_all: reviewing a duplicate needs
+  a bank archive id SimpleBooks does not expose).
+
+  Output: `✓ Deleted bank transaction <id>`.
+""" + _HELP_WORKLIST + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks bank-transactions delete <bt_id>
+""",
+    "bank-transactions import": """\
+simplbooks bank-transactions import --from YYYY-MM-DD --to YYYY-MM-DD
+      --bank-cashbook-id N [--source NAME] [--apply] [--json]
+
+  Re-pull statement rows from the linked bank into the worklist. DRY RUN
+  unless --apply: resolves and validates everything, shows the exact body,
+  and reports the rows already staged in the window. What SimpleBooks keys
+  duplicate-marking on is UNVERIFIED (it may compare against booked documents
+  or only against rows still in the worklist), so --apply measures it —
+  before/after snapshots, created and duplicate-flagged counts. A re-import
+  can flood the worklist; rows that come back `duplicate` are manual review,
+  never automated booking.
+
+  --from / --to          the statement window, YYYY-MM-DD (inclusive),
+                         required
+  --bank-cashbook-id N   cashbook ID the rows import into (`accounts list
+                         cashbook`), required; one the bank link offers
+  --source NAME          bank source to pull from (the form's data[source]);
+                         defaults to the only one the account offers, required
+                         when there are several
+  --apply                actually run the import
+
+  Output: dry run, `DRY RUN — nothing posted.`, the POST it would make, the
+  rows staged in the window and the dedupe note; with --apply, the rows
+  created by status, their ids, rows re-statused, the worklist before → after
+  and the dedupe observation. --json emits the plan or the result as one
+  object.
+""" + _HELP_WORKLIST + _HELP_ID_SPACES + """
+  WRITE: gated on the connection even as a dry run, since its leaf is
+  `import`.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks bank-transactions import --from 2026-05-01 --to 2026-05-31 --bank-cashbook-id <id>
+    simplbooks bank-transactions import --from 2026-05-01 --to 2026-05-31 --bank-cashbook-id <id> --apply --json
+""",
+    "bank-transactions save": """\
+simplbooks bank-transactions save <bt_id> --as incoming|payment|kanne [options]
+
+  Save a worklist row as an incoming, payment, or kanne.
+
+  simplbooks bank-transactions save <bt_id> --as incoming
+        --client-id N [--invoice-id N ...]
+        [--bank-cashbook-id N] [--sum AMT] [--date YYYY-MM-DD] [--description T]
+      Save inflow as a customer payment, optionally bound to one or more
+      sales invoices.
+
+  simplbooks bank-transactions save <bt_id> --as payment
+        --client-id N [--purchase-id N ...]
+        [--bank-cashbook-id N] [--sum AMT] [--date YYYY-MM-DD] [--description T]
+        [--payment-object-type Purchase|ExpenseReport]
+      Save outflow as a supplier payment, optionally bound to one or more
+      purchase invoices.
+
+  simplbooks bank-transactions save <bt_id> --as kanne
+        --counter-coa CHART-CODE
+        [--sum AMT] [--date YYYY-MM-DD] [--description T]
+      Save as a manual kanne (financial_transaction). The bank side (account +
+      direction) is auto-derived from the BT row; only the counter account
+      needs to be supplied.
+
+  --client-id N          SB client id (required for incoming/payment)
+  --invoice-id N         sales invoice id to bind (repeatable; --as incoming)
+  --purchase-id N        purchase invoice id to bind (repeatable; --as payment)
+  --counter-coa CODE     chart-of-accounts CODE of the offsetting account
+                         (--as kanne)
+  --bank-cashbook-id N   cashbook ID for incoming/payment (default: the one SB
+                         pre-selected, usually the main bank cashbook)
+  --sum AMT              override amount; defaults to the BT row's own sum. A
+                         payment is stored unsigned: a minus matching the
+                         outflow row is dropped, and a zero, or a minus on an
+                         inflow row, is refused (exit 6)
+  --date YYYY-MM-DD      override date; defaults to the BT row's own date
+  --description T        override description; defaults to the bank
+                         transaction_note for incoming/payment, '<party> ·
+                         <note>' for kanne
+  --payment-object-type  only for --as payment: what the bound id refers to
+                         (Purchase, the default, or ExpenseReport)
+
+  Output: `✓ Saved BT <id> as <variant> (<document> <id>)`, the client, sum
+  and date, and each binding with the amount allocated; for a kanne, its date,
+  note, bank side and counter side, and the accounts touched. Exit 1 on a
+  missing --client-id, a binding flag on the wrong variant, or a refused save.
+""" + _HELP_WORKLIST + _HELP_LEGACY.format(
+        "--counter-account (for --counter-coa) and --account-id (for "
+        "--bank-cashbook-id)") + _HELP_ID_SPACES + _HELP_WRITE + _HELP_EXIT \
+        + _HELP_EXIT6 + _HELP_CONN + """
+  Examples:
+    # 1. Customer paid sales invoice 9876
+    simplbooks bank-transactions save 7090 --as incoming --client-id 257 --invoice-id 9876
+    # 2. Supplier paid via bank transfer, multiple purchase invoices in one transfer
+    simplbooks bank-transactions save 6750 --as payment --client-id 368 --purchase-id 1685 --purchase-id 1686
+    # 3. Owner loan repayment (no invoice; offset to the owner-loan account by CODE)
+    simplbooks bank-transactions save 7062 --as kanne --counter-coa <chart code> --description 'Omanikule laenu tagastamine'
+""",
+
+    # ── VAT return (KMD) ─────────────────────────────────────────────────
+    "kmd show": """\
+simplbooks kmd show --period YYYY-MM [--json]
+
+  The KMD (käibedeklaratsioon) SB computes from the books for the period —
+  every line 1–13 (and sub-lines) with the value it would file: the books' own
+  version of the return, to reconcile against what was actually filed to
+  e-MTA. Line 12 = VAT payable, line 13 = refundable.
+
+  This vatstatement figure — NOT the VAT closing (VatClosure) legs — is the
+  books' authoritative version of the return, the figure to reconcile a filed
+  declaration against. Closing legs can be manually adjusted, can under-drain
+  input VAT, and can leave a residual debit on the VAT settlement account
+  that has nothing to do with what the return should say; never reconcile by
+  reading closure legs.
+
+  --period YYYY-MM  tax period, e.g. 2025-06 (required)
+
+  Output: a table of LINE, DESCRIPTION, AMOUNT, then the net VAT payable or
+  refundable (line 12−13). --json emits {"period", "period_from",
+  "period_to", "net", …the declaration's lines}.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks kmd show --period 2025-06
+""",
+    "kmd list": """\
+simplbooks kmd list --year YYYY [--json]
+
+  Per-month KMD for a year: the books' output VAT (line 4), input VAT (line
+  5) and net (line 12−13) for every month, the reconciliation backbone.
+
+  --year YYYY  calendar year, e.g. 2025 (required)
+
+  Output: a table of MONTH, OUT(4), INPUT(5), PAYABLE(12), REFUND(13), NET,
+  then the year's net. --json emits {"year", "months": [{month, out, input,
+  payable, refund, net}]}.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks kmd list --year 2025
+""",
+    "kmd reconcile": """\
+simplbooks kmd reconcile --filed <emta.csv> [--year YYYY] [--tolerance EUR] [--json]
+
+  Diff the books' KMD against a filed e-MTA KMD export: for every month it
+  compares the filed net VAT (filed line 12 − line 13) to what SB computes
+  from the books today, and flags the months whose net differs — the amend
+  candidates.
+
+  --filed <csv>    the e-MTA KMD export CSV of what was actually filed
+                   (required)
+  --year YYYY      override the year (else read from the CSV)
+  --tolerance EUR  per-month net gap treated as rounding noise (default 0.05)
+
+  Output: a table of MONTH, FILED NET, BOOKS NET, Δ(books−filed), then `✓
+  every filed month ties to the books.` or the amend candidates. --json emits
+  {"year", "rows", "mismatch_months"}. Exit 1 when the CSV carries no year and
+  --year is not given.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks kmd reconcile --filed emta.csv --year 2025
+""",
+    "kmd check": """\
+simplbooks kmd check --year YYYY [--filed <csv>] [--json]
+
+  Per-month, per-line KMD change flags from SimpleBooks itself — any
+  declaration line that changed since the period was confirmed is reported.
+  On the vatstatement report page SB flags every such line (the
+  `col-type-change` cell gets `text-danger`); this walks all 12 months of
+  --year and reports SB's verdict — RECONCILES, or the flagged
+  R<line>=<value> list.
+
+  --year YYYY    calendar year, e.g. 2025 (required)
+  --filed <csv>  an e-MTA KMD export CSV; adds the books-vs-filed net delta per
+                 month (same parsing as `kmd reconcile`)
+
+  Output: one line per month with SB's verdict (and the delta with --filed),
+  then `✓ every month reconciles per SimpleBooks.` or the count flagged.
+  --json emits {"year", "months": [{month, reconciles, flags, …}]}.
+""" + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks kmd check --year 2025 --filed emta.csv
+""",
+    "kmd regenerate": """\
+simplbooks kmd regenerate --period YYYY-MM [--apply] [--yes] [--json]
+
+  Create a missing closure or regenerate a stale one (Käibemaksu kontode
+  sulgemine, base_object_type=VatClosure), the closing kanne that zeroes the
+  input/output VAT accounts into the settlement account at period end. SB
+  only computes fresh legs from its inline create-form on the vatstatement
+  page — it does not recompute a saved closure in place — so this either
+  submits that form (new period) or deletes the stale closure so SB
+  re-renders the form, then submits it (regenerate).
+
+  Modes:
+    dry-run (default)  preview proposed legs (create) or existing+books figures
+                       (regenerate) and exit. No mutation.
+    --apply            create or delete+recreate, then re-fetch the period and
+                       confirm the new closure balances. On regenerate, a
+                       recreate failure AFTER the delete is fatal and loud
+                       (period left with no closure — recreate manually).
+
+  --apply on a declared period confirms first (type 'yes'); --yes skips the
+  prompt, and is required with --apply + --json or in non-interactive runs.
+
+  Reverse-charge input VAT is excluded from the VAT settlement account's
+  closing leg by design, so that leg sitting below KMD line 5 (R5) by exactly
+  the reverse-charge amount is correct, not stale — do not treat that gap as
+  a reason to regenerate.
+
+  Output: the proposed or old and new legs, the closure ids and the URL, `✓
+  Regenerated VAT closure` or `✓ Created VAT closure`; --json emits the report
+  as one object. Exit 1 when the operator aborts the prompt, a required --yes
+  is missing, or the recreate fails.
+
+  WRITE: gated on the connection even as a dry run, since its leaf is
+  `regenerate`.
+""" + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Examples:
+    simplbooks kmd regenerate --period 2025-06
+    simplbooks kmd regenerate --period 2025-06 --apply --yes --json
+""",
+}
+_HELP_EMTA = """
+  File / re-file a KMD to e-MTA directly. Requires the e-MTA integration
+  active (exit 4 emta_inactive with the activation path otherwise); external
+  and effectively irreversible, so it confirms before filing (unless --yes).
+  With the integration active it still refuses today (exit 1): the live send
+  action is not yet wired and verified, and it never posts a declaration
+  blind.
+"""
+HELP_VERBS["kmd submit"] = """\
+simplbooks kmd submit --period YYYY-MM [--yes]
+
+  File the period's KMD to e-MTA directly (requires the e-MTA integration).
+
+  --period YYYY-MM  tax period to file (required)
+  --yes             skip the confirmation prompt
+""" + _HELP_EMTA + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks kmd submit --period 2025-06
+"""
+HELP_VERBS["kmd amend"] = """\
+simplbooks kmd amend --period YYYY-MM [--yes]
+
+  Re-file a corrected KMD for a past period (parandusdeklaratsioon) to e-MTA.
+  Same gate and caution as `kmd submit`.
+
+  --period YYYY-MM  tax period to re-file (required)
+  --yes             skip the confirmation prompt
+""" + _HELP_EMTA + _HELP_WRITE + _HELP_EXIT + _HELP_CONN + """
+  Example: simplbooks kmd amend --period 2025-06
 """
 
 # ─── Tax classification map ─────────────────────────────────────────────────
@@ -1965,9 +2942,15 @@ def cli() -> None:
 
 
 @cli.command("help")
-def cmd_help() -> None:
-    """Print the full agent usage contract."""
-    click.echo(HELP)
+@click.argument("path", nargs=-1)
+def cmd_help(path: tuple[str, ...]) -> None:
+    """The menu, or one verb's whole contract. Bare `help` and `help <verb>`
+    are the contract library's; this is reached only after `--connection
+    <id>` / `-c <id>`, and answers the same."""
+    if path:
+        _cmd_help_verb(list(path))
+    else:
+        _cmd_help()
 
 
 @cli.command("doctor")
