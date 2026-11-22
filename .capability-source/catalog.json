@@ -962,7 +962,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/notion",
-      "payload_sha256": "6966ca2774eb51285c627734af6389390ae731a7eee6df8c72020e6d614091bf",
+      "payload_sha256": "7743b2f2dbe2d565d0c0971f680b5b80fa2e9851d1921d09a07f4addaddf9ff3",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Notion CLI over the REST API — publish markdown to pages: list child pages, fetch a page as markdown, replace a page's body and title, create under a parent, and upsert by exact title.",
@@ -978,7 +978,7 @@
           "title": "Notion"
         }
       },
-      "version": "2026-11-16 — `notion` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `notion help` is the menu, and `notion help <verb>` one verb's whole contract"
     },
     "railwayc": {
       "executable": [
@@ -994,7 +994,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/railwayc",
-      "payload_sha256": "124f54cd9e7c9a3c4d43320313e532c55f555591227d96a5a7356e65ef3f0546",
+      "payload_sha256": "5f5aca7b6789a8498223711268a630c4f798ebc9d1070e9ed12154fec4cb528e",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Credential harness around the official `railway` CLI — resolves a project-scoped Railway token, injects it, and forwards your command straight to `railway` (everything but railwayc's own verbs passes through untouched); the command surface is `railway help`.",
@@ -1010,7 +1010,7 @@
           "title": "Railway"
         }
       },
-      "version": "2026-11-16 — `railwayc` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `railwayc help` is the menu, and `railwayc help <verb>` one verb's whole contract"
     },
     "rclonec": {
       "executable": [
@@ -1029,7 +1029,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/rclonec",
-      "payload_sha256": "0956a955025b1e14fb9ec6d7455e68e552d6ad3b51e3480a222ab3985a77af94",
+      "payload_sha256": "1b7a749cb2d5f9128a07e6c9a2500a6570cf10e955b74217fc764243b20807c9",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Credential harness around the official `rclone` binary — resolves one named connection into a single rclone remote (Google Drive, Amazon S3, Cloudflare R2, Backblaze B2, Dropbox, OneDrive, Box, SFTP, WebDAV and rclone's other backends), injects it as configuration, and forwards your command straight to `rclone` (everything but rclonec's own verbs passes through untouched); the command surface is `rclone help`.",
@@ -1045,7 +1045,7 @@
           "title": "Rclone"
         }
       },
-      "version": "2026-11-16 — `rclonec` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `rclonec help` is the menu, and `rclonec help <verb>` one verb's whole contract"
     },
     "resend": {
       "executable": [
@@ -1059,7 +1059,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/resend",
-      "payload_sha256": "d561b8dcdb3e62d1fe61eeb6bf5c883f26b7207a8ca02cf0bb3249e754f9f1fc",
+      "payload_sha256": "0460ec580c9d30d60ad571d2fc7f97e03d88dbc6896886572ed85d6e11853429",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Send-only email CLI over the Resend HTTP API — deliver mail from a verified sending domain (send, write-gated with an optional recipient allow-list), list sending domains and their verification status (domains), and prove key + reachability (doctor). One-way by construction: no read or receive surface.",
@@ -1075,7 +1075,7 @@
           "title": "Resend"
         }
       },
-      "version": "2026-11-16 — `resend` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `resend help` is the menu, and `resend help <verb>` one verb's whole contract"
     },
     "routine": {
       "executable": [
@@ -1095,7 +1095,7 @@
       "level": 0,
       "lucide_icon": "list-ordered",
       "path": "capabilities/routine",
-      "payload_sha256": "86fd048d50f8b5af0624e55367204ef1af4e2f51d7b7ee8f0e441c63b7a48b10",
+      "payload_sha256": "9374a9411b9347445997b209283767cd4fe6086699b27b58ee0de592af946bba",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte.",
@@ -1111,7 +1111,7 @@
           "title": "Процедуры"
         }
       },
-      "version": "2026-11-16 — `routine` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `routine help` is the menu, and `routine help <verb>` one verb's whole contract"
     },
     "signoz": {
       "executable": [
@@ -1128,7 +1128,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/signoz",
-      "payload_sha256": "607fd2d322bb3c50ee033ae5ea7170788b57645dbf733f4aa2fd61c35a4b72e0",
+      "payload_sha256": "a3616da55e6bd3e1811990369f54ff19131f1784a1d1d2c9dc28680acd013db4",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "SigNoz CLI over the management and Query Builder APIs — discover services/metrics/fields, search logs and traces, inspect dashboards/alerts/views/channels, and execute raw API queries on Cloud or self-hosted instances.",
@@ -1144,7 +1144,7 @@
           "title": "SigNoz"
         }
       },
-      "version": "2026-11-16 — `signoz` declares its title and summary in Russian and Estonian"
+      "version": "2026-11-22 — `signoz help` is the menu, and `signoz help <verb>` one verb's whole contract"
     },
     "simplbooks": {
       "executable": [

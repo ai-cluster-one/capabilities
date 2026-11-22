@@ -457,7 +457,7 @@ def test_doctor_without_railway_on_path_still_proves_the_api(project, capsys):
 # --- help is truthful -------------------------------------------------------
 
 def test_help_discloses_backups_and_its_exit_codes():
-    text = module.__doc__ or ""
+    text = module.HELP_VERBS["backups"] + module.HELP_VERBS["doctor"]
     assert "railwayc backups [--connection <id>]" in text
     assert "Project-Access-Token" in text
     assert "allow_write: false" in text

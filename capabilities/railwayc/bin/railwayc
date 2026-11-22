@@ -3,189 +3,57 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """railwayc — a credential harness around the official `railway` CLI. It resolves a
 PROJECT-SCOPED Railway token, injects it, and forwards your command verbatim to
 `railway`. railwayc owns auth and readiness; the command surface stays railway's own.
+Agent-invoked: run `railwayc help` to reload this menu and `railwayc help <verb>` for
+one verb's whole contract, on demand. Start with `railwayc doctor`.
 
 USAGE
-  railwayc <command> [args...]   Forward to `railway <command> [args...]`, authenticated
-                                 with the resolved project token.
-  railwayc connections           Where every connection's values resolve from
-                                 (tier, source, secrets masked). Local only.
-  railwayc doctor [--connection <id>]
-                                 Prove the token resolves and report the project —
-                                 every connection, or one — over both paths: the
-                                 `railway` CLI and railwayc's own API call.
-  railwayc backups [--connection <id>]
-                                 Every volume instance in the token's project +
-                                 environment with its backup schedules and its
-                                 backups. railwayc's own API call, read-only.
-  railwayc help                  Print this contract.
-
-Contract commands (the same on every capability; railwayc's own, never forwarded):
-  railwayc stub                                 One-line awareness text.
-  railwayc manifest --json                      Machine-readable declaration.
-  railwayc guide [<topic>]                      Guide topics / one guide body.
-  railwayc ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-           [--note <text>]                      (capabilities/railwayc/identifiers.json,
-                                                 or store rows once the agent moved).
-  railwayc refs                                 Menu of the project's reference files.
-  railwayc inventory [--network]                What this capability holds in
-                                                this project (--network adds
-                                                remote detail).
-
-Agent-invoked. Run `railwayc help` to reload this contract; run `railway help` (the
-real CLI) for the full command surface — railwayc does NOT re-document or re-map it.
+  railwayc <command> [args...]   forward to `railway <command> [args...]`, token injected
 
 MODEL
-  railwayc is not a wrapper around railway's command surface — it never maps, renames,
-  or enumerates railway commands. It is a thin auth shim: it puts a project token in
-  front of `railway` and execs it. `railwayc logs -s web` runs `railway logs -s web`
-  with RAILWAY_TOKEN set; stdout, stderr, and the exit code are railway's, passed
-  through untouched, so streaming, --json, and colors behave exactly as in railway
-  itself. Only `help`, `doctor`, `backups`, and the contract commands are railwayc's
-  own; every other word forwards (`railwayc help <cmd>` forwards too, so railway's
-  own help stays reachable).
+It is not a wrapper around railway's command surface: it never maps, renames or
+enumerates railway commands. It is a thin auth shim that puts a project token in
+front of `railway` and execs it; stdout, stderr and the exit code are railway's,
+passed through untouched, so streaming, JSON output and colors behave exactly as
+in railway itself. Only `help`, `doctor`, `backups` and the contract verbs are
+railwayc's own; every other word forwards. `railway help` (the real CLI) is the full
+command surface, which railwayc does NOT re-document or re-map.
 
-  `backups` is the one domain verb railwayc answers itself: the railway CLI has no
-  command for volume backups, so railwayc queries Railway's GraphQL API directly
-  with the same project token, sent as the `Project-Access-Token` header. It is
-  queries only — nothing railwayc calls itself can mutate the project.
-
-  It REQUIRES a project token and never falls back to interactive login or this
-  machine's account session — that refusal is the point: access stays scoped to the
-  one Railway project + environment the token was minted for, never the whole account.
-
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. Its RAILWAY_TOKEN is a Railway PROJECT token (project →
-  Settings → Tokens), scoped to ONE project and ONE environment. Because it is
-  project-scoped, its home is the CONSUMING PROJECT's .env, not a global file.
-  It resolves through the credential cascade (`Where a secret resolves`, at the end
-  of this help); a deployed box or a one-shot `RAILWAY_TOKEN=… railwayc …` sets it
-  in the process env. There is deliberately no token flag — a secret must not
-  touch argv. A Railway PROJECT token is scoped to one project + one environment,
-  so its natural home is the consuming project's .env (where install scaffolds
-  it); doctor's expect_project check (exit 7) catches a token that points at the
-  wrong project. One token = one project + one environment; a project with prod +
-  staging uses one token per environment — and declares them as connections as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": { "secret_env": "RAILWAY_<ID>_TOKEN",
-                  "expect_project": "<project name or id>",
-                  "allow_write": true }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
-
-  The entry names the env var holding its token ("secret_env"); the value
-  resolves through the same cascade above. "expect_project" is the optional
-  per-connection counterpart of RAILWAYC_EXPECT_PROJECT. "allow_write": false
-  makes the connection read-only: every forwarded command that mutates the
-  Railway project (up, down, redeploy, restart, add, deploy, domain,
-  environment, init, service, scale, connect, ssh, shell, `variables --set`,
-  and every `volume` subcommand except `volume list`) exits 4, and no flag
-  lifts the gate. Reading what protects the project is not a write: `volume
-  list` answers whether a volume exists and how full it is, which a read-only
-  connection is exactly the right credential to ask. Writes default to allowed
-  (a project the consumer owns).
-
-  Selection: --connection <id> (accepted anywhere on the command line; consumed
-  by railwayc, never forwarded). Unflagged, the registry's "default" pointer
-  applies, else the sole entry; several entries without a pointer is refused
-  as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
-
-  Optional, non-secret — RAILWAYC_EXPECT_PROJECT (project .env): if set, `doctor`
-  asserts the token resolves to that project (by name or id) and exits 7 on mismatch.
-  The safety net against pasting the wrong project's token into a project's .env.
+It REQUIRES a project token and never falls back to interactive login or this
+machine's account session: access stays scoped to the one Railway project +
+environment the token was minted for. A read-only connection refuses every
+forwarded command that mutates the project with exit 4 (`railwayc help connections`).
 
 COMMANDS railwayc owns
-  connections
-      The resolution report — every connection, every value, its winning tier
-      and source, secrets masked. Local only: no network, no token use.
+  railwayc backups               every volume instance with its backup schedules and backups; read-only API call
 
-  doctor [--connection <id>]
-      Per connection (every configured one bare; one with --connection): resolve
-      its token and prove it over both paths railwayc uses. The CLI path runs
-      `railway status --json` with the token injected and fills the top-level
-      fields; the API path asks Railway's GraphQL API `{ projectToken {
-      projectId environmentId } }` under the same token and fills `api`, so a
-      reader can tell which of the two paths failed. Emits
-      {ok, connections: {<id>: {project:{id,name}, workspace, environments:[…],
-      services:[…], api:{ok, project_id, environment_id | error, hint}}}}; a
-      failed CLI path carries `error` at the top level, a failed API path
-      carries it under `api`. Exit 0 all healthy / 2 token missing or rejected on
-      either path / 5 railway not installed, or either path unreachable / 7
-      token resolved to a project other than the expected one. Use this for
-      health — `railway whoami` does NOT work under a project token, and the
-      API's `me` query is refused for every token class, so neither is asked.
+FORWARDED to `railway`, token injected, I/O transparent (common reaches; any other word forwards too)
+  railwayc status                project + services + deployment state
+  railwayc logs                  deploy / build logs
+  railwayc variables             read service variables, or set one (a write)
+  railwayc redeploy              WRITE. redeploy the latest deployment
+  railwayc restart               WRITE. restart the latest deployment
+  railwayc up                    WRITE. deploy from cwd
+  railwayc down                  WRITE. remove the latest deploy
+  railwayc domain                WRITE. add / generate / list domains
+  railwayc run                   run a local command with the environment's vars
 
-  backups [--connection <id>]
-      railwayc's own read of Railway's GraphQL API (not a forward): the token's
-      project and environment (`projectToken`), the project's volumes, and for
-      every volume instance in that environment its backup schedules
-      (`volumeInstanceBackupScheduleList`) and its backups
-      (`volumeInstanceBackupList`), as JSON:
-      {connection, project_id, environment_id, volumes:[{id, name,
-      instances:[{id, service_id, environment_id, schedules:[{id, name, kind,
-      cron, retention_seconds, created_at}], backups:[{id, external_id, name,
-      created_at, expires_at, schedule_id, creator_id, used_mb, referenced_mb,
-      volume_instance_size_mb}]}]}]}. Instances in other environments are
-      outside the token's scope and are not listed. A read: it runs on a
-      connection with allow_write: false. Exit 0 / 2 the token is rejected or
-      an id is outside its scope (Railway answers both as "Not Authorized" and
-      never as not-found) / 5 network, timeout, rate-limited or 5xx after
-      bounded retries / 6 a bad argument, or a query Railway's schema rejects.
-
-  help
-      Print this document. (`railway help` is the real CLI's surface, a separate
-      thing; railwayc reserves a bare `help` for itself but forwards `help <cmd>`.)
-
-EVERYTHING ELSE — forwarded verbatim to `railway`, token injected, I/O transparent.
-  Run `railway <cmd> --help` for each; railwayc adds nothing to them. Common reaches:
-    status [--json]                  project + services + deployment state
-    logs [-s SVC] [-e ENV] [--json]  deploy / build logs
-    variables [-s SVC] [--json]      read service variables
-    variables --set "K=V" [-s SVC]   set a variable (triggers a deploy)
-    redeploy [-s SVC]  /  restart    redeploy / restart the latest deployment
-    up [-c]  /  down                 deploy from cwd / remove the latest deploy
-    domain                           add / generate / list domains
-    run -- <cmd>                     run a local command with the environment's vars
+The contract verbs below are railwayc's own and never forwarded.
 
 EXIT CODES (railwayc's own layer)
-  0 success · 2 auth (token missing or rejected; for backups also an id outside
-  the token's scope, which Railway reports identically) · 4 policy refusal — the
-  project gate (capabilities/settings.json) on any verb, or a write verb on a
-  read-only connection (allow_write: false); ask the user, never lift a gate
-  yourself · 5 environment (railway not on PATH, or unreachable; for backups
-  and doctor's API path a network error, timeout, rate limit or 5xx after
-  bounded retries) · 6 input (bad use of a railwayc-owned command, an
-  unknown/ambiguous connection, or a query Railway's schema rejects) · 7 wrong
-  project (doctor: token ≠ the expected project). railwayc's own verbs never
-  exit 3: Railway answers an unknown id as "Not Authorized" (2), not not-found.
-  Forwarded commands return RAILWAY's own exit code, not these — railwayc is
-  transparent for everything it forwards (after the gate).
-
-EXAMPLES
-  railwayc doctor
-  railwayc backups
-  railwayc backups --connection <id>
-  railwayc status --json
-  railwayc logs -s web --json
-  railwayc variables -s web --json
-  railwayc variables --set "FEATURE_X=1" -s web
-  railwayc redeploy -s web
-  RAILWAY_TOKEN=… railwayc status        # one-shot, run from outside a project .env
+0 success · 2 auth (token missing or rejected) · 4 policy refusal: the project gate
+(capabilities/settings.json) on any verb, or a write on a read-only connection; ask
+the user, never lift a gate yourself · 5 environment (railway not on PATH, or
+unreachable) · 6 input (bad use of a railwayc-owned command, an unknown/ambiguous
+connection, or a query Railway's schema rejects) · 7 wrong project (doctor). Its own
+verbs never exit 3: Railway answers an unknown id as "Not Authorized" (2). Forwarded
+commands return RAILWAY's own exit code, not these, once past the gate. Each
+verb's page says what it answers.
 """
 
 from __future__ import annotations
@@ -284,6 +152,252 @@ RAILWAY_GRAPHQL_URL = "https://backboard.railway.com/graphql/v2"
 TOKEN_HEADER = "Project-Access-Token"
 TIMEOUT = httpx.Timeout(60.0)
 MAX_RETRIES = 3
+
+
+# The verb pages `railwayc help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for help, doctor, connections and ids
+# follow. A forwarded command's page is railwayc's layer over it, never a copy
+# of railway's own contract. A text several pages share is one constant.
+_HELP_FORWARD = """
+  Forwarded verbatim to `railway`, token injected, I/O transparent. railway
+  owns this command's arguments, flags and output: run `railway <cmd> --help`
+  for its own contract; railwayc adds nothing to it. `railwayc logs -s web`
+  runs `railway logs -s web` with RAILWAY_TOKEN set; stdout, stderr, and the
+  exit code are railway's, passed through untouched, so streaming, --json,
+  and colors behave exactly as in railway itself. --connection <id> (accepted
+  anywhere on the command line) selects the connection and is consumed by
+  railwayc, never forwarded (`railwayc help connections`).
+
+  Exit codes: once the command forwards, RAILWAY's own exit code, not
+  railwayc's — railwayc is transparent for everything it forwards (after the
+  gate). Before it forwards, railwayc's own layer: 2 token missing · 4 policy
+  refusal — the project gate (capabilities/settings.json), or a write verb on
+  a read-only connection (allow_write: false); ask the user, never lift a
+  gate yourself · 5 railway not on PATH · 6 an unknown/ambiguous connection.
+"""
+_HELP_FORWARD_READ = """
+  A read: it runs on a connection with allow_write: false.
+""" + _HELP_FORWARD
+_HELP_FORWARD_WRITE = """
+  WRITE: it mutates the Railway project. A connection with "allow_write":
+  false refuses it with exit 4, decided before the token resolves or
+  `railway` runs, and no flag lifts the gate. Writes default to allowed (a
+  project the consumer owns).
+""" + _HELP_FORWARD
+HELP_VERBS = {
+    "help": """\
+  `railway help` is the real CLI's surface, a separate thing: railwayc
+  reserves `help` for itself. Bare `railwayc`, and `railwayc -h` or `railwayc
+  --help` once past the policy gate, print the menu text alone. `railwayc help <verb>` answers the pages
+  of the verbs the menu names, the forwarded common reaches among them, and
+  refuses any other word; a forwarded command's own help is `railway <cmd>
+  --help`, or `railwayc <cmd> --help`, which forwards with the token.
+""",
+    "doctor": """\
+  railwayc's doctor, per connection (every configured one bare; one with
+  --connection): resolve its token and prove it over both paths railwayc
+  uses. The CLI path runs `railway status --json` with the token injected and
+  fills the top-level fields; the API path asks Railway's GraphQL API `{
+  projectToken { projectId environmentId } }` under the same token and fills
+  `api`, so a reader can tell which of the two paths failed. Emits
+  {ok, connections: {<id>: {project:{id,name}, workspace, environments:[…],
+  services:[…], api:{ok, project_id, environment_id | error, hint}}}}; a
+  failed CLI path carries `error` at the top level, a failed API path
+  carries it under `api`. railway's absence is reported per connection. Use
+  this for health — `railway whoami` does NOT work under a project token,
+  and the API's `me` query is refused for every token class, so neither is
+  asked. Outside any project it is a machine read: it uses the machine's own
+  connections read-only, unless a grant switched one off.
+
+  Optional, non-secret — RAILWAYC_EXPECT_PROJECT (project .env), or a
+  connection's "expect_project": if set, `doctor` asserts the token resolves
+  to that project (by name or id) and exits 7 on mismatch. The safety net
+  against pasting the wrong project's token into a project's .env.
+
+  Exit 0 all healthy / 2 token missing or rejected on either path / 5
+  railway not installed, or either path unreachable (on the API path a
+  network error, timeout, rate limit or 5xx after bounded retries) / 7 token
+  resolved to a project other than the expected one. Otherwise the first
+  failing connection's code.
+
+  Example: railwayc doctor
+""",
+    "backups": """\
+railwayc backups [--connection <id>]
+
+  railwayc's own read of Railway's GraphQL API (not a forward): the railway
+  CLI has no command for volume backups, so railwayc queries Railway's
+  GraphQL API directly with the same project token, sent as the
+  `Project-Access-Token` header. It is queries only — nothing railwayc calls
+  itself can mutate the project. It reads the token's project and
+  environment (`projectToken`), the project's volumes, and for every volume
+  instance in that environment its backup schedules
+  (`volumeInstanceBackupScheduleList`) and its backups
+  (`volumeInstanceBackupList`). Instances in other environments are outside
+  the token's scope and are not listed. It takes no arguments.
+
+  --connection <id> selects the connection (accepted anywhere on the command
+  line); unflagged, the registry's default applies (`railwayc help
+  connections`).
+
+  A read: it runs on a connection with allow_write: false.
+
+  Output, JSON on stdout:
+  {connection, project_id, environment_id, volumes:[{id, name,
+  instances:[{id, service_id, environment_id, schedules:[{id, name, kind,
+  cron, retention_seconds, created_at}], backups:[{id, external_id, name,
+  created_at, expires_at, schedule_id, creator_id, used_mb, referenced_mb,
+  volume_instance_size_mb}]}]}]}
+
+  Exit 0 / 2 the token is missing or rejected, or an id is outside its scope
+  (Railway answers both as "Not Authorized" and never as not-found) / 4 the
+  project gate / 5 network, timeout, rate-limited or 5xx after bounded
+  retries / 6 a bad argument, an unknown/ambiguous connection, or a query
+  Railway's schema rejects. It never exits 3: Railway answers an unknown id
+  as "Not Authorized" (2), not not-found.
+
+  Examples:
+    railwayc backups
+    railwayc backups --connection <id>
+""",
+    "connections": """\
+  The resolution report — every connection, every value, its winning tier
+  and source, secrets masked. Local only: no network, no token use.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. Its RAILWAY_TOKEN is a Railway PROJECT token (project →
+  Settings → Tokens), scoped to ONE project and ONE environment. Because it is
+  project-scoped, its home is the CONSUMING PROJECT's .env, not a global file.
+  It resolves through the credential cascade (`Where a secret resolves`,
+  above); a deployed box or a one-shot `RAILWAY_TOKEN=… railwayc …` sets it
+  in the process env. There is deliberately no token flag — a secret must not
+  touch argv. A Railway PROJECT token is scoped to one project + one environment,
+  so its natural home is the consuming project's .env (where install scaffolds
+  it); doctor's expect_project check (exit 7) catches a token that points at the
+  wrong project. One token = one project + one environment; a project with prod +
+  staging uses one token per environment — and declares them as connections,
+  kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "RAILWAY_<ID>_TOKEN",
+                  "expect_project": "<project name or id>",
+                  "allow_write": true }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  The entry names the env var holding its token ("secret_env"); the value
+  resolves through the same cascade above. "expect_project" is the optional
+  per-connection counterpart of RAILWAYC_EXPECT_PROJECT. "allow_write": false
+  makes the connection read-only: every forwarded command that mutates the
+  Railway project (up, down, redeploy, restart, add, deploy, domain,
+  environment, init, service, scale, connect, ssh, shell, `variables --set`,
+  and every `volume` subcommand except `volume list`) exits 4, and no flag
+  lifts the gate. Reading what protects the project is not a write: `volume
+  list` answers whether a volume exists and how full it is, which a read-only
+  connection is exactly the right credential to ask. Writes default to allowed
+  (a project the consumer owns).
+
+  Selection: --connection <id> (accepted anywhere on the command line; consumed
+  by railwayc, never forwarded). Unflagged, the registry's "default" pointer
+  applies, else the sole entry; several entries without a pointer is refused
+  as ambiguous (exit 6).
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  Optional, non-secret — RAILWAYC_EXPECT_PROJECT (project .env): if set, `doctor`
+  asserts the token resolves to that project (by name or id) and exits 7 on mismatch.
+  The safety net against pasting the wrong project's token into a project's .env.
+
+  Example: railwayc connections
+""",
+    "ids": """\
+  railwayc's identifiers are kept in capabilities/railwayc/identifiers.json,
+  or store rows once the agent moved. These and the other contract verbs are
+  railwayc's own, never forwarded.
+""",
+    "status": """\
+railwayc status [--json]
+
+  Project + services + deployment state, from `railway status`.
+""" + _HELP_FORWARD_READ + """
+  Examples:
+    railwayc status --json
+    RAILWAY_TOKEN=… railwayc status        # one-shot, run from outside a project .env
+""",
+    "logs": """\
+railwayc logs [-s SVC] [-e ENV] [--json]
+
+  Deploy / build logs, from `railway logs`; streaming passes straight through.
+""" + _HELP_FORWARD_READ + """
+  Example: railwayc logs -s web --json
+""",
+    "variables": """\
+railwayc variables [-s SVC] [--json]
+railwayc variables --set "K=V" [-s SVC]
+
+  Bare, read service variables, from `railway variables`. With --set, set a
+  variable (triggers a deploy): a WRITE. `variables` is gated by what it was
+  asked to do: on a connection with "allow_write": false, `variables --set`
+  exits 4 and the bare read runs.
+""" + _HELP_FORWARD + """
+  Examples:
+    railwayc variables -s web --json
+    railwayc variables --set "FEATURE_X=1" -s web
+""",
+    "redeploy": """\
+railwayc redeploy [-s SVC]
+
+  Redeploy the latest deployment, through `railway redeploy`.
+""" + _HELP_FORWARD_WRITE + """
+  Example: railwayc redeploy -s web
+""",
+    "restart": """\
+railwayc restart
+
+  Restart the latest deployment, through `railway restart`.
+""" + _HELP_FORWARD_WRITE + """
+  Example: railwayc restart
+""",
+    "up": """\
+railwayc up [-c]
+
+  Deploy from cwd, through `railway up`.
+""" + _HELP_FORWARD_WRITE + """
+  Example: railwayc up
+""",
+    "down": """\
+railwayc down
+
+  Remove the latest deploy, through `railway down`.
+""" + _HELP_FORWARD_WRITE + """
+  Example: railwayc down
+""",
+    "domain": """\
+railwayc domain
+
+  Add / generate / list domains, through `railway domain`. The whole verb is
+  a write, listing included.
+""" + _HELP_FORWARD_WRITE + """
+  Example: railwayc domain
+""",
+    "run": """\
+railwayc run -- <cmd>
+
+  Run a local command with the environment's vars, through `railway run`.
+  It is not among the write verbs, so it runs on a connection with
+  allow_write: false.
+""" + _HELP_FORWARD + """
+  Example: railwayc run -- <cmd>
+""",
+}
 
 
 # The shared capability code is the capabilities-contract library's, bound here

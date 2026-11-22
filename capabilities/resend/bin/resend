@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """resend — send-only email CLI over the Resend HTTP API (resend.com).
@@ -11,91 +11,31 @@
 USAGE
   resend <command> [options]
 
+This tool is designed to be invoked by agents. Run `resend help` to load this
+menu and `resend help <verb>` for one verb's whole contract, on demand — do
+not rely on memorised knowledge of its surface.
+
 One-way by construction: the surface can deliver mail from a verified sending
 domain and inspect that domain's status — it has no read, receive, or mailbox
 surface at all. Identity-free: it sends as whatever sender RESEND_API_KEY and
 the selected connection authorize.
 
-CONNECTIONS
-  Configuration requires an explicit connections registry, even for one
-  connection. Each entry names its key's env var ("secret_env"); the value
-  resolves through the credential cascade (`Where a secret resolves`, at the
-  end of this help). The secret has no flag — only its env-var NAME resolves
-  it, never the command line. The write gate is off by default, so a project that sends
-  declares a connection granting it as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "sender",
-      "connections": {
-        "sender": { "secret_env": "RESEND_API_KEY",
-                    "from": "Agent <agent@example.com>",
-                    "allow_write": true,
-                    "allow_to": ["owner@example.com", "*@example.com"] }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
-
-  Per-connection keys:
-    secret_env    env var holding the API key (resolved through the cascade)
-    from          default From for `send` (overridden by --from)
-    allow_write   the write gate — `send` leaves the system, so it is off
-                  unless the connection grants it; a refused send exits 4
-    allow_to      optional recipient allow-list: exact addresses or
-                  `*@domain` globs, matched case-insensitively against every
-                  recipient (to + cc + bcc). Present ⇒ a non-matching
-                  recipient is refused (exit 4). Absent ⇒ any recipient once
-                  allow_write grants sending. Committed policy — nothing in
-                  the cascade lifts it.
-
-  Selection: --connection <id> (accepted anywhere on the command line).
-  Unflagged, the registry's "default" pointer applies, else the sole entry;
-  several entries without a pointer is refused as ambiguous.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
+Configuration requires an explicit connections registry, even for one
+connection: each entry names the env var holding its key, its default From
+and, optionally, the recipients it may send to. How a connection is declared
+and selected is CONNECTIONS, on `resend help connections`.
 
 COMMANDS
-  connections
-      Where every connection's values resolve from (tier, source, secrets
-      masked). Local only — no network.
+  connections                 where every connection's values resolve from; local
+  doctor                      validate key + API reachability, per connection
+  send                        WRITE. deliver one email from the verified domain
+  domains                     the account's sending domains and their status
 
-  doctor [--connection <id>]
-      Validate key + API reachability (GET /domains) — every connection, or
-      one. A refused read from a valid sending-only key (401
-      restricted_api_key, historically 403) counts as healthy-restricted.
-      Exit 0 all healthy / 2 missing-or-rejected key / 5 unreachable.
-
-  send --to ADDR [--to ADDR ...] --subject SUBJ (--text BODY | --html BODY)
-       [--cc ADDR ...] [--bcc ADDR ...] [--from FROM] [--reply-to ADDR]
-       [--idempotency-key KEY]
-      Deliver one email via POST /emails and print {"id", "from", "to"}.
-      --text/--html accept a literal body or `-` to read it from stdin (one
-      of the two may be `-`, not both). --from falls back to the
-      connection's `from`; without either the send is refused (exit 6).
-      --idempotency-key makes retries of the same logical send safe —
-      Resend deduplicates on it for 24h.
-
-  domains
-      List the account's sending domains and their verification status
-      (GET /domains). Read-only inspection; a sending-only key is refused
-      this read (exit 2 restricted_api_key) — use doctor, which reads the
-      refusal as healthy-restricted.
-
-Contract commands (the same on every capability):
-  resend stub                                 One-line awareness text.
-  resend manifest --json                      Machine-readable declaration.
-  resend guide [<topic>]                      Guide topics / one guide body,
-                                               fetched live from the docs base.
-  resend ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-              [--note <text>]                  (capabilities/resend/identifiers.json,
-                                                or store rows once the agent moved).
-  resend refs                                 Menu of the project's reference
-                                               files for this capability.
-  resend inventory [--network]                What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
+THE WRITE GATE
+`send` leaves the system, so it is off unless the connection grants
+allow_write; a refused send exits 4. A connection's allow_to, where present,
+limits every recipient (to + cc + bcc) to its addresses and `*@domain` globs,
+and nothing in the cascade lifts it. Ask the user; never lift a gate yourself.
 
 EXIT CODES
   0 success · 2 auth/credentials · 3 not found · 4 policy refusal — the
@@ -185,6 +125,157 @@ _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" /
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / "resend" / "credentials.env"
 KEY_NAME = "RESEND_API_KEY"
+
+# The verb pages `resend help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections and ids follow.
+# A text several verbs own is one constant, added to each of their pages.
+_HELP_SELECT = """
+  Connection: --connection <id> (accepted anywhere on the command line) selects
+  it; unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous (`resend help
+  connections`). Outside any project this verb is refused: only connections
+  and doctor read the machine's own connections there.
+"""
+_HELP_EXIT = """
+  EXIT CODES
+  0 success · 2 auth/credentials · 3 not found · 4 policy refusal — the
+  project gate (capabilities/settings.json) on any verb, a send on a
+  connection without allow_write, or a recipient outside allow_to; ask the
+  user, never lift a gate yourself · 5 server/network · 6 input
+"""
+HELP_VERBS = {
+    "connections": """\
+  connections
+      Where every connection's values resolve from (tier, source, secrets
+      masked). Local only — no network.
+
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. Each entry names its key's env var ("secret_env"); the value
+  resolves through the credential cascade (`Where a secret resolves`,
+  above). The secret has no flag — only its env-var NAME resolves
+  it, never the command line. The write gate is off by default, so a project that sends
+  declares a connection granting it as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "sender",
+      "connections": {
+        "sender": { "secret_env": "RESEND_API_KEY",
+                    "from": "Agent <agent@example.com>",
+                    "allow_write": true,
+                    "allow_to": ["owner@example.com", "*@example.com"] }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  Per-connection keys:
+    secret_env    env var holding the API key (resolved through the cascade)
+    from          default From for `send` (overridden by --from)
+    allow_write   the write gate — `send` leaves the system, so it is off
+                  unless the connection grants it; a refused send exits 4
+    allow_to      optional recipient allow-list: exact addresses or
+                  `*@domain` globs, matched case-insensitively against every
+                  recipient (to + cc + bcc). Present ⇒ a non-matching
+                  recipient is refused (exit 4). Absent ⇒ any recipient once
+                  allow_write grants sending. Committed policy — nothing in
+                  the cascade lifts it.
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  A connection is written with `resend connection add` (`resend help
+  connection`).
+
+  Example: resend connections
+""",
+    "doctor": """\
+  doctor [--connection <id>]
+      Validate key + API reachability (GET /domains) — every connection, or
+      one. A refused read from a valid sending-only key (401
+      restricted_api_key, historically 403) counts as healthy-restricted.
+      Exit 0 all healthy / 2 missing-or-rejected key / 5 unreachable.
+
+  Output: {"ok": <every examined connection healthy>, "connections": {<id>:
+  {"ok": true, "domains": [{"name", "status"}]} for a full-access key,
+  {"ok": true, "restricted": true, "note"} for a sending-only key, or {"ok":
+  false, "error"[, "status"]} for a failure}}. The exit code is the first
+  failing connection's: 2 key missing or rejected, 5 unreachable, 6 a
+  connection missing 'secret_env' or one it cannot select. Outside any
+  project it is a machine read: it uses the machine's own connections
+  read-only, unless a grant switched one off.
+
+  Examples:
+    resend doctor
+    resend doctor --connection <id>
+""",
+    "send": """\
+resend send --to ADDR [--to ADDR ...] --subject SUBJ (--text BODY | --html BODY)
+            [--cc ADDR ...] [--bcc ADDR ...] [--from FROM] [--reply-to ADDR]
+            [--idempotency-key KEY] [--connection <id>]
+
+  WRITE. Deliver one email via POST /emails and print {"id", "from", "to"}.
+  --text/--html accept a literal body or `-` to read it from stdin (one
+  of the two may be `-`, not both). --from falls back to the
+  connection's `from`; without either the send is refused (exit 6).
+  --idempotency-key makes retries of the same logical send safe —
+  Resend deduplicates on it for 24h.
+
+  --to, --cc and --bcc repeat, one address each; --to and --subject are
+  required. --reply-to sets the Reply-To address.
+
+  The write gate: `send` leaves the system, so it is off unless the
+  connection grants allow_write; a refused send exits 4 before the key
+  resolves. Where the connection carries allow_to, every recipient (to + cc
+  + bcc) must match one of its exact addresses or `*@domain` globs,
+  case-insensitively, or the send exits 4 recipient_not_allowed. Committed
+  policy — nothing in the cascade lifts it; ask the user, never widen it
+  yourself.
+
+  Output: {"id": <Resend's email id>, "from": <the sender used>, "to":
+  [<each --to>]}.
+
+  Exit codes: 0 sent; 2 key missing or rejected; 4 the write gate, a
+  recipient outside allow_to, or the project gate; 5 server/network, after
+  retries on 429 and 5xx; 6 no From (no_sender), no body (no_body), both
+  bodies or an empty stdin body (input), an allow_to that is not a list
+  (bad_config), or a request Resend refused as invalid. A missing --to or
+  --subject is refused by the parser itself: exit 2, its usage on stderr.
+""" + _HELP_SELECT + """
+  Examples:
+    resend send --to <person@example.com> --subject "Report ready" --text "The report is ready."
+    printf '<p>Hi</p>' | resend send --to <person@example.com> --subject Hi --html -
+""" + _HELP_EXIT,
+    "ids": """\
+  For resend: the project identifiers envelope is
+  capabilities/resend/identifiers.json, or store rows once the agent moved.
+
+  Example: resend ids list
+""",
+    "domains": """\
+resend domains [--connection <id>]
+
+  List the account's sending domains and their verification status
+  (GET /domains). Read-only inspection; a sending-only key is refused
+  this read (exit 2 restricted_api_key) — use doctor, which reads the
+  refusal as healthy-restricted.
+
+  Output: a JSON array, one {"name", "status", "region", "created_at"} per
+  sending domain.
+
+  Exit codes: 0; 2 key missing, rejected or sending-only; 4 the project gate;
+  5 server/network; 6 a connection it cannot select.
+""" + _HELP_SELECT + """
+  Example: resend domains
+""" + _HELP_EXIT,
+}
 
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -512,7 +603,7 @@ def main() -> None:
 
     args = p.parse_args(cleaned)
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        _cmd_help()              # `--connection <id> help`: the same menu
         return
 
     reg, _ = _connections_registry()

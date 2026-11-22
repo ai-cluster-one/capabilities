@@ -3,145 +3,68 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """signoz — agent-first CLI for SigNoz telemetry and configuration APIs.
 
 It supports SigNoz Cloud and self-hosted Community/Enterprise installations.
-The management/query API and OTLP ingestion are deliberately separate:
-SIGNOZ_API_KEY reads or manages SigNoz, while SIGNOZ_INGESTION_KEY only
-authenticates Cloud telemetry ingestion. Self-hosted ingestion normally has no
-key. Run `signoz guide connections` for the exact deployment matrix.
+Agent-invoked: run `signoz help` to reload this menu and `signoz help <verb>`
+for one verb's whole contract, on demand. The management/query API and OTLP
+ingestion are deliberately separate: SIGNOZ_API_KEY reads or manages SigNoz,
+while SIGNOZ_INGESTION_KEY only authenticates Cloud telemetry ingestion.
+Self-hosted ingestion normally has no key. Run `signoz guide connections` for
+the exact deployment matrix, and `signoz doctor` first to prove a deployment
+answers.
 
 CONNECTIONS
-  An explicit connections registry is required. A connection resolves:
-    SIGNOZ_URL                 Management/query base URL (required).
-    SIGNOZ_API_KEY             Service-account/PAT API key (required, secret).
-    SIGNOZ_OTLP_ENDPOINT       OTLP endpoint (optional).
-    SIGNOZ_INGESTION_KEY       Cloud ingestion key (optional, secret).
-    SIGNOZ_CUSTOM_HEADERS      Extra proxy headers as JSON or K:V,K2:V2 (secret).
+An explicit connections registry is required, even for one deployment. A
+connection is one SigNoz deployment: its management URL and API key, and
+optionally its OTLP endpoint, Cloud ingestion key, proxy headers, environment
+scope and dimension map. Secrets are names of env vars, never literal values.
+The keys, their compatibility aliases, the registry shape and how a
+connection is selected are on `signoz help connections`; `signoz connections`
+reports how each value resolves, locally.
 
-  Compatibility aliases are accepted for existing setups:
-    SIGNOZ_API_URL -> SIGNOZ_URL
-    SIGNOZ_SERVICE_KEY -> SIGNOZ_API_KEY
-    SIGNOZ_ENDPOINT -> SIGNOZ_OTLP_ENDPOINT
-
-  Every setup declares at least one connection in
-  the project's connections or the user-level registry ("Where connections live" below):
-    {
-      "default": "production",
-      "connections": {
-        "production": {
-          "url": "https://signoz.example.com",
-          "api_key_env": "SIGNOZ_PROD_API_KEY",
-          "otlp_endpoint": "https://collector.example.com:4318",
-          "deployment": "self_hosted",
-          "environment": "production",
-          "dimensions": {
-            "agent": "agent_id",
-            "call": "call_id",
-            "room": "room_id"
-          },
-          "allow_write": false
-        },
-        "cloud": {
-          "url": "https://workspace.eu.signoz.cloud",
-          "api_key_env": "SIGNOZ_CLOUD_API_KEY",
-          "otlp_endpoint": "https://ingest.eu.signoz.cloud:443",
-          "ingestion_key_env": "SIGNOZ_CLOUD_INGESTION_KEY",
-          "deployment": "cloud",
-          "allow_write": false
-        }
-      }
-    }
-  Secrets are names of env vars, never literal values. Selection is
-  --connection <id>, then the registry default, then the sole entry.
-  
-  Optional "environment" scopes data queries to deployment.environment or
-  deployment.environment.name. Optional "scope_filter" provides a custom
-  Query Builder v5 filter expression for legacy or non-standard telemetry.
-  When both exist, scope_filter replaces environment-derived scope; CLI
-  --environment overrides both. Queries apply the connection's base scope
-  unless overridden with --environment, --all-environments, or --legacy-unscoped.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
+A connection's environment or scope filter scopes every data query unless the
+query overrides it, as each query verb's page says. Connection dimensions map
+the logical agent, call and room names to project-specific fields. Outside any
+project, connections and doctor are machine reads; every other verb that
+needs a connection is refused there.
 
 COMMANDS
-  signoz doctor [--connection ID]
-      Verify version, management API authentication, and OTLP configuration.
-      Without a connection flag checks every configured deployment.
-  signoz connections
-      Local resolution report; secrets are masked and no network is touched.
-  signoz version
-      Server version and edition metadata (the endpoint is intentionally public).
-  signoz ingestion
-      Render a secret-free OTLP environment plan for the selected deployment.
+  Deployment
+  signoz version                 server version and edition; the endpoint is public
+  signoz ingestion               a secret-free OTLP environment plan for the deployment
 
-  signoz services [--since 1h|--start MS --end MS]
-      Services observed in the time window.
-  signoz metrics [--search TEXT] [--limit N] [time options]
-      Metric catalog with type/unit/last-seen metadata.
-  signoz fields keys --signal logs|traces|metrics [--search TEXT]
-                    [--context resource|attribute|scope] [--metric NAME]
-  signoz fields values --signal ... --name FIELD [same options]
-      Discover queryable field names and observed values.
-  signoz logs search [--service NAME] [--agent-id ID] [--call-id ID]
-                     [--room-id ID] [--severity LEVEL] [--search TEXT]
-                     [--filter EXPR] [--environment ENV] [--all-environments]
-                     [--legacy-unscoped] [--limit N] [--offset N]
-                     [time options]
-  signoz traces search [--service NAME] [--agent-id ID] [--call-id ID]
-                       [--room-id ID] [--operation NAME] [--error yes|no]
-                       [--filter EXPR] [--select FIELD] [--environment ENV]
-                       [--all-environments] [--legacy-unscoped]
-                       [--limit N] [--offset N] [time options]
-  signoz trace <trace-id> [--select FIELD] [--since 6h|--start MS --end MS]
-      Query raw logs/spans through Query Builder v5. Shortcut filters combine
-      with --filter using AND. --environment overrides the connection's scope;
-      --all-environments queries all environments; --legacy-unscoped queries
-      historical data without deployment.environment attributes.
-      --select returns a span or resource attribute alongside a span's default
-      fields, so reading one needs no hand-written raw query. It is repeatable
-      and accepts a comma-separated list; names resolve against the same
-      catalogue `signoz fields keys` reports, and a name carried in several
-      contexts is qualified as context:name, for example
-      --select http.route,resource:host.name. Log rows already carry every
-      attribute in attributes_string and resources_string, so logs need no
-      --select.
-  signoz call <call-id> [--signal logs|traces|both] [--service NAME]
-                        [--filter EXPR] [--select FIELD] [--environment ENV]
-                        [--all-environments] [--legacy-unscoped] [--limit N]
-                        [time options]
-  signoz agent <agent-id> [same options]
-      Fetch correlated logs and traces for one domain identifier. Connection
-      dimensions map logical agent/call/room names to project-specific fields.
-      Environment scope applies unless overridden. --select carries the meaning
-      it has on `traces search` and reaches the traces half alone; under
-      --signal logs there is no such half, so it is refused rather than
-      silently ignored.
-  signoz query <file|->
-      Execute a complete Query Builder v5 JSON request from a file or stdin.
-      On servers before 0.117.0 a raw traces request pinned to one trace with
-      trace_id = '...' has its window narrowed to one hour, because those
-      servers repeat every row once per time bucket; the server derives the real
-      range from the trace, so the span set is unaffected.
+  Discovery
+  signoz services                services observed in a time window
+  signoz metrics                 the metric catalog: type, unit, last seen
+  signoz fields keys             the queryable field names of one signal
+  signoz fields values           the observed values of one field
 
-  signoz dashboards [<id>]      List dashboards or fetch one.
-  signoz alerts                 Current Alertmanager instances.
-  signoz rules [<id>]           Alert-rule definitions (v1/v2 by server version).
-  signoz views [<id>] [--source-page traces|logs|metrics]
-  signoz channels [<id>]        Saved Explorer views and notification channels.
+  Logs and traces
+  signoz logs search             raw log rows matching shortcut filters and an expression
+  signoz traces search           raw spans matching shortcut filters and an expression
+  signoz trace <trace-id>        the spans of one trace
+  signoz call <call-id>          correlated logs and traces for one call
+  signoz agent <agent-id>        correlated logs and traces for one agent
+  signoz query <file|->          a complete Query Builder v5 request, as given
 
-  signoz api <GET|POST|PUT|PATCH|DELETE> </api/...> [--data <file|->]
-      Authenticated escape hatch for a documented API not covered above.
-      Non-GET calls require the connection's allow_write=true policy.
+  Configuration
+  signoz dashboards [<id>]       list dashboards, or fetch one
+  signoz alerts                  current Alertmanager instances
+  signoz rules [<id>]            alert-rule definitions, v1 or v2 by server version
+  signoz views [<id>]            saved Explorer views, or one
+  signoz channels [<id>]         notification channels, or one
 
-Contract commands:
-  signoz stub · signoz manifest --json · signoz guide [connections|queries]
-  signoz ids list|get|set|rm · signoz refs · signoz inventory [--network]
+  Escape hatch
+  signoz api <METHOD> <path>     a documented API not covered above; WRITE unless GET
+
+I/O CONTRACT
+  Success is JSON on stdout. Failure is {"error": {"code","message","hint"?,
+  "status"?}} on stderr, with nothing on stdout; the exit code carries the
+  category.
 
 EXIT CODES
   0 success · 2 missing/rejected API credentials · 3 not found ·
@@ -262,6 +185,438 @@ DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
 STATE = False
 INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
 POST_INSTALL: list[dict] = []
+
+# The verb pages `signoz help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor and connections follow. A text
+# several verbs own is one constant, added to each of their pages.
+def _help_time(default: str) -> str:
+    return f"""
+  Time window: --since DURATION (default {default}; an integer plus s, m, h, d
+  or w, for example 30m or 7d) ends now; --start MS --end MS (epoch
+  milliseconds, given together, start below end) fix it instead.
+"""
+
+
+_HELP_SCOPE = """
+  Environment scope: the connection's "scope_filter", else its "environment"
+  (matched on deployment.environment and deployment.environment.name, which
+  of them the signal carries), is ANDed into the query. --environment ENV
+  overrides the connection's scope with that environment; --all-environments
+  queries all environments; --legacy-unscoped queries historical data without
+  deployment.environment attributes. The three are mutually exclusive (exit
+  6). An environment the signal carries no deployment.environment field for
+  exits 6 no_environment_field; use the connection's scope_filter for legacy
+  telemetry, or query unscoped.
+"""
+_HELP_SELECT = """
+  --select FIELD returns a span or resource attribute alongside a span's
+  default fields (trace_id, span_id, parent_span_id, name, duration_nano,
+  timestamp, has_error, status_code_string, service.name), so reading one
+  needs no hand-written raw query. It is repeatable and accepts a
+  comma-separated list; names resolve against the same catalogue `signoz
+  fields keys` reports, and a name carried in several contexts is qualified
+  as context:name, for example --select http.route,resource:host.name. A name
+  the catalogue does not know exits 3 unknown_field; one in several contexts,
+  unqualified, exits 6 ambiguous_field. Log rows already carry every
+  attribute in attributes_string and resources_string, so logs need no
+  --select.
+"""
+_HELP_TAIL = """
+  Connection: --connection <id> (accepted anywhere on the command line)
+  selects it; unflagged, the registry's "default" pointer applies, else the
+  sole entry (`signoz help connections`).
+
+  Output: one JSON document on stdout; a refusal is the JSON error envelope
+  {"error": {code, message, hint?, status?}} on stderr, with nothing on
+  stdout.
+
+  Exit codes: 0 success · 2 missing/rejected API credentials · 3 not found
+  (a 404 from SigNoz: the resource, or an endpoint the server version lacks)
+  · 4 project/write policy refusal (ask the user; never lift it yourself) ·
+  5 network/server/protocol failure (timeout, 429, 5xx, a non-JSON answer) ·
+  6 invalid input (a bad argument or connection entry, a 4xx SigNoz refused).
+"""
+HELP_VERBS = {
+    "doctor": """\
+For signoz:
+  Verify version, management API authentication, and OTLP configuration.
+  Without a connection flag checks every configured deployment; with
+  --connection <id> only that one. Each is proven by GET /api/v1/version
+  (public) and GET /api/v1/dashboards (protected, so the management key -
+  not merely the public route - is accepted).
+
+  Output: {ok, connections: {<id>: {ok, url, version, edition,
+  setup_completed, deployment, allow_write, ingestion}}}, ingestion being the
+  plan `signoz help ingestion` describes. The first deployment that fails
+  exits with its category: 2 a missing or rejected API key (an ingestion key
+  cannot query), 3 an endpoint the server lacks, 5 unreachable.
+
+  Examples:
+    signoz doctor
+    signoz doctor --connection <id>
+""",
+    "connections": """\
+For signoz:
+  Local resolution report; secrets are masked and no network is touched.
+  Each connection reports allow_write, deployment, dimensions, verify_tls,
+  environment and scope_filter where set, and keys: one row per key below,
+  with the env key it resolved from.
+
+  CONNECTIONS
+  An explicit connections registry is required. A connection resolves:
+    SIGNOZ_URL                 Management/query base URL (required).
+    SIGNOZ_API_KEY             Service-account/PAT API key (required, secret).
+    SIGNOZ_OTLP_ENDPOINT       OTLP endpoint (optional).
+    SIGNOZ_INGESTION_KEY       Cloud ingestion key (optional, secret).
+    SIGNOZ_CUSTOM_HEADERS      Extra proxy headers as JSON or K:V,K2:V2 (secret).
+
+  Compatibility aliases are accepted for existing setups:
+    SIGNOZ_API_URL -> SIGNOZ_URL
+    SIGNOZ_SERVICE_KEY -> SIGNOZ_API_KEY
+    SIGNOZ_ENDPOINT -> SIGNOZ_OTLP_ENDPOINT
+
+  Every setup declares at least one connection in the project's connections
+  or the user-level registry ("Where connections live", above on this page):
+    {
+      "default": "production",
+      "connections": {
+        "production": {
+          "url": "https://signoz.example.com",
+          "api_key_env": "SIGNOZ_PROD_API_KEY",
+          "otlp_endpoint": "https://collector.example.com:4318",
+          "deployment": "self_hosted",
+          "environment": "production",
+          "dimensions": {
+            "agent": "agent_id",
+            "call": "call_id",
+            "room": "room_id"
+          },
+          "allow_write": false
+        },
+        "cloud": {
+          "url": "https://workspace.eu.signoz.cloud",
+          "api_key_env": "SIGNOZ_CLOUD_API_KEY",
+          "otlp_endpoint": "https://ingest.eu.signoz.cloud:443",
+          "ingestion_key_env": "SIGNOZ_CLOUD_INGESTION_KEY",
+          "deployment": "cloud",
+          "allow_write": false
+        }
+      }
+    }
+  Secrets are names of env vars, never literal values; they resolve through
+  the cascade ("Where a secret resolves", above on this page). Selection is
+  --connection <id>, then the registry default, then the sole entry.
+
+  Optional "environment" scopes data queries to deployment.environment or
+  deployment.environment.name. Optional "scope_filter" provides a custom
+  Query Builder v5 filter expression for legacy or non-standard telemetry.
+  When both exist, scope_filter replaces environment-derived scope; CLI
+  --environment overrides both. Queries apply the connection's base scope
+  unless overridden with --environment, --all-environments, or --legacy-unscoped.
+  "dimensions" maps the logical agent, call and room names to the field each
+  is read from, one name for both signals or {"logs": ..., "traces": ...}.
+  Non-GET `api` calls require the connection's allow_write=true policy.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  Example: signoz connections
+""",
+    "version": """\
+signoz version
+
+  Server version and edition metadata (the endpoint is intentionally public):
+  one GET /api/v1/version, sent without the API key, so only the connection's
+  URL is needed. Takes no arguments (exit 6 otherwise).
+
+  Output: {connection, version, edition: community|enterprise,
+  setup_completed}.
+
+  Example: signoz version
+""" + _HELP_TAIL,
+    "ingestion": """\
+signoz ingestion
+
+  Render a secret-free OTLP environment plan for the selected deployment, from
+  the connection alone; no network is touched. Takes no arguments (exit 6
+  otherwise). The protocol is http/protobuf for an endpoint on port 4318,
+  else grpc. A Cloud deployment authenticates with the signoz-ingestion-key
+  header, named as ${SIGNOZ_INGESTION_KEY} and never its value; self-hosted
+  Community normally accepts OTLP without an ingestion key. A connection
+  "environment" adds OTEL_RESOURCE_ATTRIBUTES setting both
+  deployment.environment and deployment.environment.name.
+
+  Output: {connection, deployment, configured, ingestion_auth,
+  ingestion_key_set, env: {OTEL_EXPORTER_OTLP_ENDPOINT,
+  OTEL_EXPORTER_OTLP_PROTOCOL, OTEL_EXPORTER_OTLP_HEADERS (Cloud),
+  OTEL_RESOURCE_ATTRIBUTES (with an environment)}, note, environment?,
+  environment_note?}.
+
+  Example: signoz ingestion --connection <id>
+""" + _HELP_TAIL,
+    "services": """\
+signoz services [--since 1h|--start MS --end MS]
+
+  Services observed in the time window: one POST /api/v1/services. Answers
+  SigNoz's reply as it comes.
+""" + _help_time("1h") + """
+  Example: signoz services --since 6h
+""" + _HELP_TAIL,
+    "metrics": """\
+signoz metrics [--search TEXT] [--limit N] [--since 1h|--start MS --end MS]
+
+  Metric catalog with type/unit/last-seen metadata, for metrics seen in the
+  time window.
+
+  --search TEXT   metrics whose name contains TEXT
+  --limit N       at most N metrics (default 50; 1 to 1000, else exit 6)
+
+  From SigNoz 0.120.0 this is GET /api/v2/metrics, searched by the server;
+  before it, POST /api/v1/metrics, and --search filters the names here, the
+  answer then carrying client_side_search.
+""" + _help_time("1h") + """
+  Example: signoz metrics --search http --limit 20
+""" + _HELP_TAIL,
+    "fields keys": """\
+signoz fields keys --signal logs|traces|metrics [--search TEXT]
+                   [--context resource|attribute|scope] [--metric NAME]
+
+  Discover queryable field names: one GET /api/v1/fields/keys. The catalogue
+  `--select` and `--filter` names resolve against.
+
+  --signal S      logs, traces or metrics (required)
+  --search TEXT   field names containing TEXT
+  --context C     only fields of that context: resource, attribute or scope
+  --metric NAME   the fields of one metric (with --signal metrics)
+
+  Example: signoz fields keys --signal traces --search http
+""" + _HELP_TAIL,
+    "fields values": """\
+signoz fields values --signal logs|traces|metrics --name FIELD
+                     [--search TEXT] [--context resource|attribute|scope]
+                     [--metric NAME]
+
+  Discover the observed values of one field: one GET /api/v1/fields/values.
+
+  --name FIELD    the field whose values are listed (required)
+  --signal S      logs, traces or metrics (required)
+  --search TEXT   values containing TEXT
+  --context C     the field's context: resource, attribute or scope
+  --metric NAME   the metric the field belongs to (with --signal metrics)
+
+  Example: signoz fields values --signal logs --name service.name
+""" + _HELP_TAIL,
+    "logs search": """\
+signoz logs search [--service NAME] [--agent-id ID] [--call-id ID]
+                   [--room-id ID] [--severity LEVEL] [--search TEXT]
+                   [--filter EXPR] [--environment ENV] [--all-environments]
+                   [--legacy-unscoped] [--limit N] [--offset N]
+                   [--since 1h|--start MS --end MS]
+
+  Query raw logs through Query Builder v5 (POST /api/v5/query_range), newest
+  first. Shortcut filters combine with --filter using AND.
+
+  --service NAME     service.name = NAME
+  --agent-id ID      the connection's agent dimension field = ID
+  --call-id ID       the connection's call dimension field = ID
+  --room-id ID       the connection's room dimension field = ID
+  --severity LEVEL   severity_text = LEVEL
+  --search TEXT      body CONTAINS TEXT
+  --filter EXPR      a Query Builder v5 filter expression
+  --limit N          at most N rows (default 100; 1 to 10000)
+  --offset N         skip N rows (default 0; never negative)
+
+  Log rows already carry every attribute in attributes_string and
+  resources_string, so logs need no --select.
+""" + _HELP_SCOPE + _help_time("1h") + """
+  Output: SigNoz's query_range reply.
+
+  Example: signoz logs search --service <service> --severity ERROR --since 30m
+""" + _HELP_TAIL,
+    "traces search": """\
+signoz traces search [--service NAME] [--agent-id ID] [--call-id ID]
+                     [--room-id ID] [--operation NAME] [--error yes|no]
+                     [--filter EXPR] [--select FIELD] [--environment ENV]
+                     [--all-environments] [--legacy-unscoped]
+                     [--limit N] [--offset N] [--since 1h|--start MS --end MS]
+
+  Query raw spans through Query Builder v5 (POST /api/v5/query_range), newest
+  first. Shortcut filters combine with --filter using AND.
+
+  --service NAME     service.name = NAME
+  --agent-id ID      the connection's agent dimension field = ID
+  --call-id ID       the connection's call dimension field = ID
+  --room-id ID       the connection's room dimension field = ID
+  --operation NAME   the span name = NAME
+  --error yes|no     has_error = true or false
+  --filter EXPR      a Query Builder v5 filter expression
+  --limit N          at most N spans (default 100; 1 to 10000)
+  --offset N         skip N spans (default 0; never negative)
+""" + _HELP_SELECT + _HELP_SCOPE + _help_time("1h") + """
+  Output: SigNoz's query_range reply.
+
+  Example: signoz traces search --service <service> --error yes --select http.route
+""" + _HELP_TAIL,
+    "trace": """\
+signoz trace <trace-id> [--select FIELD] [--since 6h|--start MS --end MS]
+
+  The spans of one trace (trace_id = <trace-id>, up to 1000) through Query
+  Builder v5 (POST /api/v5/query_range). On servers before 0.117.0 the window
+  is narrowed to one hour, as `signoz help query` explains; the span set is
+  unaffected.
+""" + _HELP_SELECT + _help_time("6h") + """
+  Output: SigNoz's query_range reply.
+
+  Example: signoz trace <trace-id> --select http.route,resource:host.name
+""" + _HELP_TAIL,
+    "call": """\
+signoz call <call-id> [--signal logs|traces|both] [--service NAME]
+                      [--filter EXPR] [--select FIELD] [--environment ENV]
+                      [--all-environments] [--legacy-unscoped] [--limit N]
+                      [--since 24h|--start MS --end MS]
+
+  Fetch correlated logs and traces for one call: the connection's call
+  dimension field = <call-id> (`signoz help connections`), on each signal
+  asked for. `signoz agent` is the same for an agent id.
+
+  --signal S       logs, traces or both (default both)
+  --service NAME   service.name = NAME
+  --filter EXPR    a Query Builder v5 filter expression, ANDed in
+  --limit N        at most N rows per signal (default 100; 1 to 10000)
+
+  --select carries the meaning it has on `traces search` and reaches the
+  traces half alone; under --signal logs there is no such half, so it is
+  refused (exit 6) rather than silently ignored.
+""" + _HELP_SCOPE + _help_time("24h") + """
+  Output: {entity: "call", id, window: {start, end}, filters: {logs?,
+  traces?}, data: {logs?, traces?}, environment_scope? | scope_filter?}, each
+  filter the expression sent and each data SigNoz's query_range reply.
+
+  Example: signoz call <call-id> --signal both --since 2h
+""" + _HELP_TAIL,
+    "agent": """\
+signoz agent <agent-id> [--signal logs|traces|both] [--service NAME]
+                        [--filter EXPR] [--select FIELD] [--environment ENV]
+                        [--all-environments] [--legacy-unscoped] [--limit N]
+                        [--since 24h|--start MS --end MS]
+
+  Fetch correlated logs and traces for one agent: the connection's agent
+  dimension field = <agent-id> (`signoz help connections`), on each signal
+  asked for. `signoz call` is the same for a call id.
+
+  --signal S       logs, traces or both (default both)
+  --service NAME   service.name = NAME
+  --filter EXPR    a Query Builder v5 filter expression, ANDed in
+  --limit N        at most N rows per signal (default 100; 1 to 10000)
+
+  --select carries the meaning it has on `traces search` and reaches the
+  traces half alone; under --signal logs there is no such half, so it is
+  refused (exit 6) rather than silently ignored.
+""" + _HELP_SCOPE + _help_time("24h") + """
+  Output: {entity: "agent", id, window: {start, end}, filters: {logs?,
+  traces?}, data: {logs?, traces?}, environment_scope? | scope_filter?}, each
+  filter the expression sent and each data SigNoz's query_range reply.
+
+  Example: signoz agent <agent-id> --signal traces --select http.route
+""" + _HELP_TAIL,
+    "query": """\
+signoz query <file|->
+
+  Execute a complete Query Builder v5 JSON request from a file or stdin (-):
+  POST /api/v5/query_range, sent as given. No connection scope is added. A
+  file that cannot be read, or is not JSON, exits 6.
+
+  On servers before 0.117.0 a raw traces request pinned to one trace with
+  trace_id = '...' has its window narrowed to one hour, because those
+  servers repeat every row once per time bucket; the server derives the real
+  range from the trace, so the span set is unaffected.
+
+  Output: SigNoz's query_range reply.
+
+  Example: signoz query request.json
+""" + _HELP_TAIL,
+    "dashboards": """\
+signoz dashboards [<id>]
+
+  List dashboards or fetch one: GET /api/v2/dashboards[/<id>] from SigNoz
+  0.135.0, /api/v1/dashboards[/<id>] before it.
+
+  Output: SigNoz's reply. An unknown id exits 3.
+
+  Examples:
+    signoz dashboards
+    signoz dashboards <id>
+""" + _HELP_TAIL,
+    "alerts": """\
+signoz alerts
+
+  Current Alertmanager instances: GET /api/v1/alerts. Takes no arguments
+  (exit 6 otherwise).
+
+  Output: SigNoz's reply.
+
+  Example: signoz alerts
+""" + _HELP_TAIL,
+    "rules": """\
+signoz rules [<id>]
+
+  Alert-rule definitions (v1/v2 by server version): GET /api/v2/rules[/<id>]
+  from SigNoz 0.120.0, /api/v1/rules[/<id>] before it.
+
+  Output: SigNoz's reply. An unknown id exits 3.
+
+  Examples:
+    signoz rules
+    signoz rules <id>
+""" + _HELP_TAIL,
+    "views": """\
+signoz views [<id>] [--source-page traces|logs|metrics]
+
+  Saved Explorer views, or one: GET /api/v1/explorer/views[/<id>].
+
+  --source-page P   only the views of one Explorer page: traces, logs or
+                    metrics
+
+  Output: SigNoz's reply. An unknown id exits 3.
+
+  Example: signoz views --source-page traces
+""" + _HELP_TAIL,
+    "channels": """\
+signoz channels [<id>]
+
+  Notification channels, or one: GET /api/v1/channels[/<id>].
+
+  Output: SigNoz's reply. An unknown id exits 3.
+
+  Examples:
+    signoz channels
+    signoz channels <id>
+""" + _HELP_TAIL,
+    "api": """\
+signoz api <GET|POST|PUT|PATCH|DELETE> </api/...> [--data <file|->]
+
+  Authenticated escape hatch for a documented API not covered above. The path
+  is a relative /api/... path (exit 6 otherwise).
+
+  --data <file|->   the JSON request body, from a file or stdin; not accepted
+                    with GET (exit 6)
+
+  Write verb: non-GET calls require the connection's allow_write=true policy
+  (allow_write defaults to false); without it they exit 4 before any request
+  is made.
+
+  Output: SigNoz's JSON reply; {ok, status} for an empty one; {status,
+  content_type, body, truncated} for a reply that is not JSON, body cut at
+  1,000,000 characters.
+
+  Examples:
+    signoz api GET /api/v1/version
+    signoz api POST /api/v1/<endpoint> --data body.json
+""" + _HELP_TAIL,
+}
 
 TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 MAX_RETRIES = 3

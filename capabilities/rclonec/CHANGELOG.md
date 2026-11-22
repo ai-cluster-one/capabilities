@@ -1,5 +1,9 @@
 # rclonec — change log
 
+## 2026-11-22 — `rclonec help` is the menu, and `rclonec help <verb>` one verb's whole contract
+
+`rclonec help` printed the whole reference, about 13.4 KB with flags on 26 of its lines, and `rclonec help <anything>` was forwarded to `rclone help <anything>` through the selected connection. It is now the short complete menu of SHEBANG.md, "Agent-first help is the surface", under 4 KB: what the harness is, the forwarded `rclonec <command> [args...]`, `connections` and `doctor` each on one line, the model, what a connection is and the exit codes of rclonec's own layer, then the contract verbs and guides the library renders, with no flag on any line. `rclonec help <verb>` prints that verb's whole contract from `HELP_VERBS`: `rclonec help forward` holds the forwarding contract - the `--connection` selector, MODEL, the write gate on a read-only connection, where rclone comes from, the output and the exit codes; CONNECTIONS, the registry shape, `check_path` and the machine reads follow the library's page on `rclonec help connections`; and doctor's probe, its report and its exit codes follow the library's page on `rclonec help doctor`. An unknown path exits 6 `unknown_verb` with nothing on stdout and the hint to run `rclonec help`; rclone's own help stays `rclone help` on the real binary. The capability binds `capabilities-contract` 0.50 or later, which dispatches the layered help. Every other word is forwarded to `rclone` exactly as before, and no verb, flag, answer, JSON key or exit code changes.
+
 ## 2026-11-16 — `rclonec` declares its title and summary in Russian and Estonian
 
 The manifest carries `translations`, from the `TRANSLATIONS` constant: the title and summary in Russian (`ru`), Rclone, and Estonian (`et`), Rclone, each as `title` and `description`. English `title` and `summary` stay the source and the fallback. The capability binds `capabilities-contract` 0.49 or later, which emits them. Nothing else changes.

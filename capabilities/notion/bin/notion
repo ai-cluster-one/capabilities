@@ -3,105 +3,51 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
 """
 notion — agent-first CLI for publishing markdown to Notion pages.
 
 This tool is designed to be invoked by agents. Run `notion help` to load
-the full usage contract on demand — do not rely on memorised knowledge of
-its surface.
+this menu and `notion help <verb>` for one verb's whole contract, on demand
+— do not rely on memorised knowledge of its surface.
 
 CONNECTIONS
   Configuration requires an explicit connections registry, even for one
-  connection. Its NOTION_TOKEN (a Notion integration token) is
-  resolved through the credential cascade (`Where a secret resolves`, at
-  the end of this help). Never pass the token on the command line.
+  connection. Each connection is one Notion workspace, reached with a
+  Notion integration token that resolves through the credential cascade;
+  the token never comes on the command line. The registry shape, where
+  connections live and where a secret resolves are on
+  `notion help connections`.
 
-  A project that publishes to several Notion workspaces declares them as
-  connections, kept where "Where connections live" below says:
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": { "secret_env": "NOTION_<ID>_TOKEN", "allow_write": true }
-      }
-    }
-  Which registry is read, and in what order, depends on the project: see
-  "Where connections live" below.
+  Every verb takes the connection to use anywhere on the line (each verb's
+  page says how). Unflagged, the registry's "default" pointer applies, else
+  the sole entry; several entries without a pointer is refused as
+  ambiguous. A connection with "allow_write": false is read-only: publish,
+  create and upsert exit 4, and nothing lifts the gate. Every verb can act
+  as a different identity by naming the key that holds its token, never
+  the value (each verb's page says how); that never lifts the write gate.
 
-  The entry names the env var holding its token ("secret_env"); the value
-  resolves through the cascade above. "allow_write": false makes the
-  connection read-only: every mutating verb (publish, create, upsert)
-  exits 4, and no flag lifts the gate. Writes default to allowed (a
-  workspace the consumer owns).
+  Outside any project, connections and doctor are machine reads: they use
+  the machine's own connections read-only, unless a grant switched one off;
+  every other verb that needs a connection is refused there.
 
-  Selection: --connection <id> (accepted anywhere on the command line).
-  Unflagged, the registry's "default" pointer applies, else the sole entry;
-  several entries without a pointer is refused as ambiguous.
+COMMANDS
+  notion whoami                     the token's identity and workspace
+  notion children <parent>          the direct child pages of a page
+  notion get <page>                 one page as markdown, its title as the H1
+  notion publish <page> [<md>|-]    replace an existing page's body and title
+  notion create [<md>|-]            create a new page under a parent
+  notion upsert [<md>|-]            update the child with that exact title, or create it
 
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
-
-Global option (accepted anywhere on the line):
-  --token-env <KEY>   Act as a different identity by naming the env/cred KEY
-                      that holds the token (default NOTION_TOKEN; with a
-                      registry connection it overrides that entry's
-                      secret_env). Names the key, never the value (e.g.
-                      notion publish <page> --token-env NOTION_ALT_TOKEN).
-                      It never lifts a connection's write gate.
-
-Commands:
-  notion help                                 Print this document.
-  notion connections                          Where every connection's values
-                                              resolve from (tier, source,
-                                              secrets masked). Local only.
-  notion doctor [--connection <id>]           Health check — resolve token,
-                                              confirm identity + workspace —
-                                              every connection, or one.
-  notion whoami                               Identity + workspace.
-  notion children <parent>                    List direct child pages.
-  notion get <page>                           Fetch page as markdown (incl. title).
-  notion publish <page> [<md>|-]              Replace body + title of existing page.
-  notion create --parent <p> [--title T] [<md>|-]
-                                              Create new page under parent.
-  notion upsert --parent <p> [--title T] [<md>|-]
-                                              Update by exact title or create.
-
-Page references:
-  <page> / <parent> accept a bare UUID (dashed or 32-char) OR a full Notion
-  URL. The 32-hex slug is extracted from URLs automatically.
-
-Markdown input:
-  Any command that takes <md> accepts a file path, "-" for stdin, or no
-  argument (defaults to stdin).
-
-Title handling:
-  The local markdown file is the source of truth for both the title and the
-  body. If the first non-blank line is a level-1 heading (`# Title`), that
-  line is extracted as the page title and stripped from the body before
-  sending. This keeps local file and Notion page in sync via a single edit.
-
-  - `get`: prepends `# <page title>` to the returned markdown.
-  - `publish`: updates both the page body and (if the H1 changed) the title.
-  - `create` / `upsert`: title comes from the H1 when present; `--title`
-    is required only when the file has no leading H1. If both are given,
-    the H1 wins.
-
-Contract commands (the same on every capability):
-  notion stub                                 One-line awareness text.
-  notion manifest --json                      Machine-readable declaration.
-  notion guide [<topic>]                      Guide topics / one guide body,
-                                               fetched live from the docs base.
-  notion ids list|get <l>|set <l> <v>|rm <l>  The project identifiers envelope
-              [--note <text>]                  (capabilities/notion/identifiers.json,
-                                                or store rows once the agent moved).
-  notion refs                                 Menu of the project's reference
-                                               files for this capability.
-  notion inventory [--network]                What this capability holds in
-                                              this project (--network adds
-                                              remote detail).
+PAGES, MARKDOWN AND TITLES
+  A page or parent is a bare UUID (dashed or 32-char) or a full Notion URL.
+  Markdown comes from a file path, "-" for stdin, or stdin when no argument
+  is given. The local file is the source of truth for both the title and
+  the body: a leading `# Title` line is the page title, stripped from the
+  body before sending, and `get` puts it back. There is no workspace-wide
+  name lookup: to find a page by name, list a known parent's children.
 
 I/O contract:
   - Success: JSON on stdout, exit 0. (`get` emits raw markdown.)
@@ -112,19 +58,13 @@ Exit codes:
   0  success
   2  auth (unauthorized / restricted_resource / missing credentials)
   3  not found (object_not_found)
-  4  policy refusal — the project gate (store rows once the agent moved, else capabilities/settings.json) on any
-     verb, or a write verb on a read-only connection (allow_write: false).
-     Ask the user; never lift a gate yourself.
+  4  policy refusal — the project gate (store rows once the agent moved,
+     else capabilities/settings.json) on any verb, or a write verb on a
+     read-only connection (allow_write: false). Ask the user; never lift a
+     gate yourself.
   5  server / network (5xx, timeout, rate-limit exhausted)
   6  input / validation
   7  conflict (domain-specific: ambiguous title in upsert, concurrent edit)
-
-Quirks worth knowing:
-  - `POST /v1/search` is unavailable to PAT tokens (returns 0 results).
-    To locate a page by name, list a known parent's `children` and match
-    in the caller. There is no global workspace-wide name lookup.
-  - `upsert` matches direct children only; a grandchild with the same
-    title is not considered. Walk the tree explicitly if you need that.
 """
 
 import argparse
@@ -195,6 +135,255 @@ CREDENTIALS_ENV = CONFIG_DIR / "credentials.env"
 UUID_DASHED = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 UUID_PLAIN = re.compile(r"[0-9a-f]{32}")
 H1_RE = re.compile(r"\A(?:[ \t]*\n)*[ \t]*#[ \t]+([^\n]+?)[ \t]*(?:\n|\Z)")
+
+
+# The verb pages `notion help <verb>` answers (SHEBANG.md, "Agent-first help is
+# the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections and ids follow. A
+# text several verbs own is one constant, added to each of their pages.
+_HELP_CONN = """
+  --connection <id>   the connection to use, accepted anywhere on the line
+                      (also as --connection=<id>), by id or label.
+                      Unflagged, the registry's "default" pointer applies,
+                      else the sole entry; several entries without a pointer
+                      exit 6 `ambiguous_connection`, a name no connection
+                      has 6 `unknown_connection`, and no registry at all 6
+                      `connections_required`.
+  --token-env <KEY>   act as a different identity by naming the env/cred KEY
+                      that holds the token, accepted anywhere on the line
+                      (also as --token-env=<KEY>); default NOTION_TOKEN, and
+                      with a registry connection it overrides that entry's
+                      secret_env. Names the key, never the value (e.g.
+                      notion publish <page> --token-env NOTION_ALT_TOKEN).
+                      It never lifts a connection's write gate.
+
+  The token resolves through the credential cascade (`Where a secret
+  resolves`, on `notion help connections`) and never comes on the command
+  line. A key that resolves nowhere exits 2 `missing_token`; a connection
+  entry that names no secret_env exits 6 `no_secret_env`.
+"""
+_HELP_REF = """
+  <page> / <parent> accept a bare UUID (dashed or 32-char) OR a full Notion
+  URL. The 32-hex slug is extracted from URLs automatically. A value with no
+  UUID in it exits 6 `bad_page_ref`.
+"""
+_HELP_MD = """
+  <md>                the markdown: a file path, "-" for stdin, or no
+                      argument (defaults to stdin). Empty stdin exits 6
+                      `empty_stdin`; a path that does not exist exits 6
+                      `file_not_found`.
+"""
+_HELP_TITLE = """
+  Title handling: the local markdown file is the source of truth for both
+  the title and the body. If the first non-blank line is a level-1 heading
+  (`# Title`), that line is extracted as the page title and stripped from
+  the body before sending. This keeps local file and Notion page in sync via
+  a single edit.
+"""
+_HELP_WRITE = """
+  A write: it mutates Notion, so a connection with "allow_write": false
+  refuses it with exit 4 `read_only` before any token is read, and no flag
+  lifts the gate (--token-env included). Writes default to allowed (a
+  workspace the consumer owns). Ask the user; never lift a gate yourself.
+"""
+_HELP_PAGE_OUT = """
+  Output: {page_id, url, title, action} - the page as it now stands, action
+  being "updated" or "created".
+"""
+_HELP_TAIL = """
+  Notion's own errors carry Notion's code: unauthorized and
+  restricted_resource exit 2 (the token may not have access to this
+  resource), object_not_found exit 3 (verify the page UUID and that the
+  token can see it), validation_error exit 6, conflict_error exit 7 (the
+  resource was modified concurrently; retry). A 429 is retried after its
+  Retry-After, and a 5xx or a timeout after a short back-off, up to 3
+  attempts; then, and for any other API error, it exits 5 (`rate_limited`,
+  `server_error`, `timeout`, `network_error`, `invalid_response`,
+  `exhausted_retries`).
+
+  I/O: success is JSON on stdout, exit 0 (`get` emits raw markdown); an
+  error is {"error": {"code", "message", "hint", "status"}} on stderr,
+  non-zero exit.
+
+  Exit codes:
+  0  success
+  2  auth (unauthorized / restricted_resource / missing credentials)
+  3  not found (object_not_found)
+  4  policy refusal — the project gate (store rows once the agent moved,
+     else capabilities/settings.json) on any verb, or a write verb on a
+     read-only connection (allow_write: false). Ask the user; never lift a
+     gate yourself.
+  5  server / network (5xx, timeout, rate-limit exhausted)
+  6  input / validation
+  7  conflict (domain-specific: ambiguous title in upsert, concurrent edit)
+"""
+HELP_VERBS = {
+    "doctor": """\
+For notion:
+  Health check — resolve token, confirm identity + workspace — every
+  connection, or the one --connection <id> names (accepted anywhere on the
+  line). --token-env <KEY> checks the token that key holds instead of each
+  connection's secret_env. One GET /users/me per connection examined; a
+  broken connection is reported as a finding rather than stopping the run.
+
+  Output: {ok, connections: {<id>: {ok: true, name, workspace_name}}}; a
+  connection that is not healthy carries {ok: false, error}.
+
+  Exit codes: 0 only when every examined connection is healthy, else the
+  first failure's category - 2 the token resolves nowhere or Notion refuses
+  it (401/403), 5 another HTTP status, a network error or a bad response,
+  6 a connection missing 'secret_env'; 6 `connections_required` without a
+  registry; 4 policy.
+
+  Outside any project, doctor is a machine read: it uses the machine's own
+  connections read-only, unless a grant switched one off.
+
+  Example: notion doctor --connection <id>
+""",
+    "connections": """\
+For notion:
+  Where every connection's values resolve from (tier, source, secrets
+  masked). Local only. notion's own part of the report is {default,
+  connections: {<id>: {allow_write, keys: [...]}}}, each connection's one
+  key being the env var its secret_env names (or secret_env itself, unset,
+  where the entry names none); the contract adds the rest above.
+
+  Configuration requires an explicit connections registry, even for one
+  connection. Its NOTION_TOKEN (a Notion integration token) is resolved
+  through the credential cascade (`Where a secret resolves`, above). Never
+  pass the token on the command line.
+
+  A project that publishes to several Notion workspaces declares them as
+  connections, kept where "Where connections live" above says:
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": { "secret_env": "NOTION_<ID>_TOKEN", "allow_write": true }
+      }
+    }
+  Which registry is read, and in what order, depends on the project: see
+  "Where connections live" above.
+
+  The entry names the env var holding its token ("secret_env"); the value
+  resolves through the cascade above. "allow_write": false makes the
+  connection read-only: every mutating verb (publish, create, upsert)
+  exits 4, and no flag lifts the gate. Writes default to allowed (a
+  workspace the consumer owns).
+
+  Selection: --connection <id> (accepted anywhere on the command line).
+  Unflagged, the registry's "default" pointer applies, else the sole entry;
+  several entries without a pointer is refused as ambiguous.
+
+  Global option (accepted anywhere on the line):
+    --token-env <KEY>   Act as a different identity by naming the env/cred
+                        KEY that holds the token (default NOTION_TOKEN; with
+                        a registry connection it overrides that entry's
+                        secret_env). Names the key, never the value (e.g.
+                        notion publish <page> --token-env NOTION_ALT_TOKEN).
+                        It never lifts a connection's write gate.
+
+  Outside any project, connections and doctor are machine reads: they use
+  the machine's own connections read-only, unless a grant switched one off;
+  every other verb that needs a connection is refused there.
+""",
+    "ids": """\
+For notion:
+  The project identifiers envelope is capabilities/notion/identifiers.json,
+  or store rows once the agent moved.
+""",
+    "whoami": """\
+notion whoami [--connection <id>] [--token-env <KEY>]
+
+  Identity + workspace: who the token acts as, from GET /users/me.
+""" + _HELP_CONN + """
+  Output: {id, name, type, owner_type, workspace_name}, with owner_user (the
+  owning user's name) added when owner_type is "user".
+
+  Example: notion whoami --connection <id>
+""" + _HELP_TAIL,
+    "children": """\
+notion children <parent> [--connection <id>] [--token-env <KEY>]
+
+  List the direct child pages of <parent>, every page of them: only blocks
+  of type child_page, in Notion's order; grandchildren are not listed.
+""" + _HELP_REF + _HELP_CONN + """
+  Output: a JSON list [{id, title}].
+
+  `POST /v1/search` is unavailable to PAT tokens (returns 0 results). To
+  locate a page by name, list a known parent's `children` and match in the
+  caller. There is no global workspace-wide name lookup.
+
+  Example: notion children <parent-page-url>
+""" + _HELP_TAIL,
+    "get": """\
+notion get <page> [--connection <id>] [--token-env <KEY>]
+
+  Fetch the page as markdown, including its title: `# <page title>` is
+  prepended to the returned markdown (left out for a page with no title),
+  so the output round-trips through publish.
+""" + _HELP_REF + _HELP_CONN + _HELP_TITLE + """
+  Output: the raw markdown on stdout, not JSON.
+
+  Example: notion get <page-id> > page.md
+""" + _HELP_TAIL,
+    "publish": """\
+notion publish <page> [<md>|-] [--connection <id>] [--token-env <KEY>]
+
+  Replace the body and title of an existing page: the whole body is
+  replaced with the markdown, and the title is updated when the file's H1
+  differs from the page's current title. A file without a leading H1 leaves
+  the title as it is.
+""" + _HELP_REF + _HELP_MD + _HELP_CONN + _HELP_TITLE + _HELP_WRITE + _HELP_PAGE_OUT + """
+  action is "updated". A page with no property of type title exits 5
+  `no_title_property`.
+
+  Example: notion publish <page-id> page.md
+""" + _HELP_TAIL,
+    "create": """\
+notion create --parent <p> [--title T] [<md>|-] [--connection <id>]
+              [--token-env <KEY>]
+
+  Create a new page under the parent page.
+
+  --parent <p>        the parent page, a UUID or URL; required
+  --title T           the title for the new page; optional if the file has
+                      a leading `# H1`
+""" + _HELP_MD + """
+  The title comes from the H1 when present; --title is required only when
+  the file has no leading H1. If both are given, the H1 wins. Neither exits
+  6 `missing_title`.
+""" + _HELP_REF + _HELP_CONN + _HELP_TITLE + _HELP_WRITE + _HELP_PAGE_OUT + """
+  action is "created".
+
+  Example: notion create --parent <parent-page-id> page.md
+""" + _HELP_TAIL,
+    "upsert": """\
+notion upsert --parent <p> [--title T] [<md>|-] [--connection <id>]
+              [--token-env <KEY>]
+
+  Update by exact title or create: the direct child page of the parent
+  whose title is exactly the resolved title is published (as `publish`
+  does), else a new page is created under the parent (as `create` does).
+
+  --parent <p>        the parent page, a UUID or URL; required
+  --title T           the exact title to match; optional if the file has a
+                      leading `# H1`
+""" + _HELP_MD + """
+  The title comes from the H1 when present; --title is required only when
+  the file has no leading H1. If both are given, the H1 wins. Neither exits
+  6 `missing_title`.
+
+  `upsert` matches direct children only; a grandchild with the same title
+  is not considered. Walk the tree explicitly if you need that. More than
+  one direct child with the title exits 7 `ambiguous_title`: use
+  `publish <id>` against a specific page to disambiguate.
+""" + _HELP_REF + _HELP_CONN + _HELP_TITLE + _HELP_WRITE + _HELP_PAGE_OUT + """
+  action is "updated" for a matched page, "created" for a new one.
+
+  Example: notion upsert --parent <parent-page-id> page.md
+""" + _HELP_TAIL,
+}
 
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -673,7 +862,7 @@ def main() -> None:
     args = p.parse_args(cleaned)
 
     if args.cmd == "help":
-        sys.stdout.write((__doc__ or "").lstrip("\n"))
+        _cmd_help()
         return
 
     reg, _ = _connections_registry()

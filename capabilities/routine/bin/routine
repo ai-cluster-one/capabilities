@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -12,53 +12,36 @@ Routine is the project-side mechanism for repeatable procedures: one markdown
 file per recipe under `.routines/`, with front matter surfaced into every
 session as an index. This CLI lists, validates, and renders that index, and
 keeps routines as versioned documents in the project's store. It does not
-execute routines.
+execute routines. Reads answer plain text by default and JSON on request
+(each verb's page says how); writes answer JSON.
 
-USAGE
-  routine <command> [options]
+THE ROUTINES FOLDER
+  routine list                  the project's routines, where they live
+  routine validate              check every routine file's front matter shape
+  routine index                 the routine index, rendered from front matter
+  routine groom <name|path>     the agent procedure to review one routine, or all
 
-Commands:
-  routine help
-      Print this contract.
+ROUTINES IN THE STORE
+  A routine in the store is a document of the project the command runs in,
+  by the project's durable id: a name, which is its front matter's `name`
+  and its file's stem, and its versions. A version holds the title,
+  description and body, with who saved it, when, and why. One version is
+  active; a save adds a new version and never changes an old one, and
+  retiring a routine deletes nothing, so every version stays readable - a
+  task or automation that followed a routine names the version id it
+  followed. Without a store every verb here exits 6 `store_not_configured`.
 
-  routine doctor
-      Find the consuming project, count `.routines/**/*.md`, and report whether
-      the routine folder exists. No network, no mutation.
+  routine show <name>           the active version, or another, in the file form
+  routine history <name>        every version, newest first
+  routine diff <name> [A] [B]   a unified diff of two versions in the file form
+  routine save <name>           the file form as the routine's new active version
+  routine retire <name>         retire a routine; its versions stay in the store
+  routine import [DIR]          every *.md file under DIR into the store, at once
+  routine export [DIR]          each routine's active version, out to DIR
 
-  routine list [--json]
-      List the project's routines where they live, by the rule `titles`
-      states: where the store holds an active routine of this project, what
-      `list --store` lists; otherwise the routine files under `.routines/`
-      and their parsed front matter. Every routine --json lists carries
-      `origin` (`own`, or `global` for a global routine) and `enabled`,
-      whether it is on for this agent; a routine file is its own and on.
-
-  routine validate [--json]
-      Check that every routine markdown file has exactly the expected front
-      matter shape for indexing: `name`, one-line `description`, name matching
-      the filename stem, and no duplicate names.
-
-  routine index [--json]
-      Render the routine index from front matter. The markdown form is the same
-      one-line menu shape used by consuming-project context compilers.
-
-  routine groom <name|path|--all>
-      Emit the agent procedure for semantic quality review of one routine, or
-      of the whole `.routines/` corpus. Judgment stays with the calling agent;
-      this command supplies the target inventory and review flow.
-
-Routines in the store:
-  A routine in the store is a document of the project the command runs in, by
-  the project's durable id: a name, which is its front matter's `name` and
-  its file's stem, and its versions. A version holds the title, description
-  and body, with who saved it, when, and why. One version is active; a save
-  adds a new version and never changes an old one, and retiring a routine
-  deletes nothing, so every version stays readable - a task or automation
-  that followed a routine names the version id it followed. Reads answer
-  plain text by default and JSON with --json; writes answer JSON. Without a
-  store every verb below exits 6 `store_not_configured`.
-
-  The file form, read and written byte for byte:
+THE FILE FORM
+  A routine is read from and written as the file a routines folder holds,
+  byte for byte:
 
     ---
     name: <name>
@@ -69,159 +52,65 @@ Routines in the store:
 
   The keys in this order, each once, each `key: value` on one line; the body
   is every byte after the closing `---` line, kept exactly. Values are taken
-  as written: a quoted value keeps its quotes. `name` must equal the routine's
-  name. Input that does not read back byte for byte is refused (exit 6
-  `not_canonical`, naming the line), with one exception: front matter
-  whose keys stand in another order, or that carries keys other than these
-  three, is read for name, title and description, the other keys dropped;
-  the answer marks that routine `normalised` and says what changed, because
-  its export is the canonical form rather than the file read.
+  as written: a quoted value keeps its quotes. `name` must equal the
+  routine's name. Input that does not read back byte for byte is refused
+  (exit 6 `not_canonical`, naming the line), with one exception: front
+  matter whose keys stand in another order, or that carries keys other than
+  these three, is read for name, title and description, the other keys
+  dropped; the answer marks that routine `normalised` and says what changed,
+  because its export is the canonical form rather than the file read.
 
-  routine list --store [--json]
-      Every routine of the project in the store with its active version:
-      name, version, title, description - and every global routine it has
-      enabled, marked global with its author, unless a routine of its own
-      has the same name: that one is listed instead, marked as shadowing it.
-      A routine of its own that is switched off is listed too, `enabled`
-      false, and still shadows a global one of its name.
-  routine show <name> [--version ID] [--global] [--json]
-      The active version, or the version ID names, in the file form. --json
-      adds the version id, who saved it, when, and its note; the version id is
-      what `save --base` names and what a follower records. Without --version
-      and --global, a project whose store holds no routine of its own, nor a
-      global one it has enabled, is answered from its routines folder, by the
-      rule `titles` states: the file under it whose stem is the name, as
-      written; --json gives `source: folder`, its path and its text.
-  routine history <name> [--global] [--json]
-      Every version, newest first: id, when, by whom, the note, and which one
-      is active.
-  routine diff <name> [A] [B] [--global]
-      A unified diff of two versions in the file form. Bare: the active
-      version against the one saved before it (against nothing when it is the
-      only one). With A alone: A against the active version.
-
-  Without --global, show, history and diff read the project's routine of
-  that name, else the global one it has enabled.
-
-  ID, A and B are a version's whole id or a prefix of six or more characters
-  that names one version of the routine.
-
-  Writing (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY, and exit 4
-  `system_agent` in a system agent, whose doctrine no edit changes):
-  routine save <name> --from FILE|- [--base ID] [--note TEXT]
-      Save the file form read from FILE, or stdin with `-`, as the routine's
-      new active version; a name not in use starts a new routine. --base names
-      the version the edit was made from: the save is refused (exit 7
-      `stale_base`, naming the active version) when it is no longer the active
-      one, because another save came first. Without --base the active version
-      at the time of the save is the base. --note says why. Safe to repeat:
-      content equal to the active version's adds no version and answers
-      `"changed": false`.
-  routine retire <name> [--global]
-      Retire the routine: it leaves list, show and export, its versions stay
-      in the store, and its name is free for a new routine. Not idempotent: a
-      repeat finds no routine of that name and exits 3.
-  routine import [DIR]
-      Read every `*.md` file under DIR, subfolders included, into the store as
-      the routine its stem names: a new routine with one version, a new
-      version where the active version differs, nothing where it is equal. DIR
-      defaults to the project's routines layer, as `capabilities path --json`
-      names it under layers.routines. Every file is read and checked before
-      anything is written, and all of it is written in one transaction; any
-      file that does not read, or two files of one name, refuse the whole
-      import, naming each. Other files are reported as skipped. Routines in
-      the store with no file in DIR are left as they are. Safe to repeat.
-  routine export [DIR]
-      Write each routine's active version into DIR in the file form: into the
-      one file under DIR, subfolders included, whose stem is its name, else as
-      DIR/<name>.md; a file already equal is left alone. DIR defaults as for
-      import. Files in DIR that hold no routine are reported and left alone.
-      Export reads the store and writes only DIR.
-
-Global routines:
+GLOBAL ROUTINES
   A global routine belongs to no project: it is written once for every agent
   in the store, and reaches a project only once that project enables it. The
-  project that first saves it with --global is its author, and only the
-  current author saves a new version of it, retires it, or hands it on; any
-  other project is refused (exit 4 `not_author`). A project that enables one
-  follows its active version, and a routine of its own of the same name
-  shadows it.
+  project that first saves it as a global routine is its author, and only
+  the current author saves a new version of it, retires it, or hands it on;
+  any other project is refused (exit 4 `not_author`). A project that enables
+  one follows its active version, and a routine of its own of the same name
+  shadows it. Every reading and writing verb above can address the global
+  one of a name instead of the project's own; each verb's page says how.
 
-  routine list --store --global [--json]
-      Every global routine with its active version and its author project;
-      run in a project, --json marks each `enabled` or not for it.
-  routine save <name> --from FILE|- --global [--base ID] [--note TEXT]
-  routine retire <name> --global
-  routine show|history|diff <name> ... --global
-      The verbs above, on the global routine of that name; reading one needs
-      no project.
-  routine transfer <name> --to PROJECT_ID
-      Make the project PROJECT_ID the global routine's author. Run by its
-      current author alone; the receiver cannot take it.
-  routine enable <name> [--global]
-  routine disable <name> [--global]
-      Switch the routine of that name on or off for this agent: its own
-      routine, else the global one; --global names the global one. A global
-      routine enabled is in `list --store`, `show`, `titles`, and the
-      routine index the manager builds; recorded with who enabled it and
-      when, and disabling removes the record. A routine of the agent's own
-      switched off leaves the routine index the manager builds, and stays
-      in the store, `list` and every other verb, recorded with who switched
-      it off and when; enabling it clears that. Answers `origin` (`own` or
-      `global`) and `enabled`. Safe to repeat: answers `"changed": false`.
+  routine transfer <name>       hand a global routine to another author project
+  routine enable <name>         switch a routine on for this agent, own or global
+  routine disable <name>        switch it off again
 
-  enable, disable and transfer are writes (exit 4 `read_only_switch` under
-  CAPABILITIES_READ_ONLY).
-
-  The tables are routine_documents (one row per routine: project, or none
-  and its author project for a global one, name, created, retired, and
-  for a project's own when it is switched off),
-  routine_versions (one row per version) and routine_enablements (one row
-  per global routine a project has enabled), in the schema
-  the project's store setting names, migrated under the `routine` ledger. One
-  version per routine is active, which the store enforces; it refuses any
-  change to a version other than clearing `active`, and any delete.
-
-The agent's routines and their titles:
+THE AGENT'S ROUTINES AND THEIR TITLES
   These read and write the agent's routines where they live: in the store
   when it holds an active routine of this project, else in the routines
-  layer as `capabilities path --json` names it - the rule the manager builds
-  the routine index by. A store that is set but does not answer is read past
-  to the folder with a warning; a write is refused instead.
+  layer as the manager names it - the rule the manager builds the routine
+  index by. A store that is set but does not answer is read past to the
+  folder with a warning; a write is refused instead.
 
-  routine titles [--json]
-      Each routine with its name, title, description and source (`folder`
-      with its path, or `store` with its active version, marked global for
-      a global routine the project has enabled). A routine without
-      a title is titled by its name; title_source says which (`front_matter`
-      or `name`). The answer names the source, and warns of each folder file
-      it skips.
-  routine title <name> <title>
-  routine title <name> --clear
-      Set the routine's display title, one line of at most 120 characters, or
-      remove it so the name titles it. In the folder the file's `title:` line
-      is written after `name:` as a JSON string; in
-      the store a new version holds that same title and the active version's
-      description and body. Answers the routine as `titles` lists it and
-      `changed` (`["title"]`, or `[]` when it already held that title). Exit 3
-      for a routine that is not there, exit 4 `read_only_switch` under
-      CAPABILITIES_READ_ONLY.
+  routine titles                each routine with its title, and where it lives
+  routine title <name> <title>  set a routine's display title, or clear it
 
-Contract commands:
-  routine stub
-  routine manifest --json
-  routine guide [<topic>]
-  routine connections
-  routine ids list|get|set|rm
-  routine refs
-  routine inventory [--network]
-  routine migrate [status]      bring the store tables up to this version / report
+  save, retire, import, transfer, enable, disable and title are writes: exit
+  4 `read_only_switch` under CAPABILITIES_READ_ONLY, and exit 4
+  `system_agent` in a system agent, whose doctrine no edit changes.
 
-Exit codes:
-  0 success · 3 not found · 4 disabled by project policy, the read-only switch,
-  a change to a global routine by a project that is not its author ·
-  5 store unreachable or busy · 6 input/validation, no store, no project
-  identity · 7 stale base
+STORE
+  The tables are routine_documents (one row per routine: project, or none
+  and its author project for a global one, name, created, retired, and for
+  a project's own when it is switched off), routine_versions (one row per
+  version) and routine_enablements (one row per global routine a project has
+  enabled), in the schema the project's store setting names, migrated under
+  the `routine` ledger. One version per routine is active, which the store
+  enforces; it refuses any change to a version other than clearing
+  `active`, and any delete.
+
+I/O
+  Success is plain text or JSON on stdout; failure is
+  {"error": {"code", "message", "hint"?}} on stderr.
+
+EXIT CODES
+  0 success
+  3 not found - no consuming project, no routine of that name, no version
+  4 policy - routine not enabled, the read-only switch, a system agent, a
+    change to a global routine by a project that is not its author
+  5 store - unreachable or busy
+  6 input - a malformed argument or file, validation findings, no store
+    configured, no project or project identity
+  7 stale - the base a save names is no longer the active version
 """
 
 from __future__ import annotations
@@ -279,6 +168,456 @@ POST_INSTALL: list = []
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
 CREDENTIALS_ENV = _CONFIG_HOME / "routine" / "credentials.env"
 _STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+
+
+# The verb pages `routine help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor, connections and migrate
+# follow. A text several verbs own is one constant, added to each of their
+# pages.
+_HELP_IDS = """
+  ID, A and B are a version's whole id or a prefix of six or more characters
+  that names one version of the routine.
+"""
+_HELP_SEEN = """
+  Without --global, show, history and diff read the project's routine of
+  that name, else the global one it has enabled.
+"""
+_HELP_WRITE = """
+  A write: exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY, and exit 4
+  `system_agent` in a system agent, whose doctrine no edit changes.
+"""
+_HELP_GLOBAL_ROUTINES = """
+  GLOBAL ROUTINES
+  A global routine belongs to no project: it is written once for every agent
+  in the store, and reaches a project only once that project enables it. The
+  project that first saves it with --global is its author, and only the
+  current author saves a new version of it, retires it, or hands it on; any
+  other project is refused (exit 4 `not_author`). A project that enables one
+  follows its active version, and a routine of its own of the same name
+  shadows it. Reading one needs no project.
+"""
+_HELP_WHERE = """
+  WHERE THE AGENT'S ROUTINES LIVE
+  In the store when it holds an active routine of this project, else in the
+  routines layer as `capabilities path --json` names it - the rule the
+  manager builds the routine index by. A store that is set but does not
+  answer is read past to the folder with a warning; a write is refused
+  instead.
+"""
+_HELP_TAIL = """
+  I/O
+  Success is plain text or JSON on stdout; failure is
+  {"error": {"code", "message", "hint"?}} on stderr. An unknown flag or a
+  missing argument exits 6 `input`.
+
+  EXIT CODES
+  0 success
+  3 not found - no consuming project, no routine of that name, no version
+  4 policy - routine not enabled, the read-only switch, a system agent, a
+    change to a global routine by a project that is not its author
+  5 store - unreachable or busy
+  6 input - a malformed argument or file, validation findings, no store
+    configured, no project or project identity
+  7 stale - the base a save names is no longer the active version
+"""
+_HELP_SWITCH = """\
+routine enable <name> [--global]
+routine disable <name> [--global]
+
+  Switch the routine of that name on or off for this agent: its own
+  routine, else the global one; --global names the global one. A global
+  routine enabled is in `list --store`, `show`, `titles`, and the routine
+  index the manager builds; recorded with who enabled it and when, and
+  disabling removes the record. A routine of the agent's own switched off
+  leaves the routine index the manager builds, and stays in the store,
+  `list` and every other verb, recorded with who switched it off and when;
+  enabling it clears that. Answers `origin` (`own` or `global`) and
+  `enabled`. Safe to repeat: answers `"changed": false`.
+
+  --global   the global routine of that name, even where the agent has a
+             routine of its own of that name
+
+  Output: {name, project, origin, enabled, changed}; enabling a global
+  routine adds `author`, and `shadowed_by_project_routine` where a routine
+  of the agent's own has its name.
+
+  Exit codes: 0; 3 no routine of the agent's own nor a global one of that
+  name; 4 policy, the read-only switch, system_agent; 5 store; 6 a
+  malformed name, no store configured, no project or project identity.
+
+  Examples:
+    routine enable shared-review --global
+    routine disable weekly-review
+""" + _HELP_WRITE + _HELP_GLOBAL_ROUTINES + _HELP_TAIL
+HELP_VERBS = {
+    "doctor": """\
+For routine:
+  Finds the consuming project, counts the routine files under its
+  `.routines/` folder, `.routines/**/*.md`, and reports whether the routine
+  folder exists and whether every file's front matter holds as `routine
+  validate` checks it. No network, no mutation: it reaches no store and no
+  connection. It takes no argument (exit 6 `input` for one).
+
+  Output: {ok, project, routines_dir, exists, count, valid, findings:
+  [{path, severity, message}]}. Outside a project it answers {ok: false,
+  project: null, routines_dir: null, count: 0} and exits 3.
+
+  Exit codes: 0 the project was found, its routines valid or not; 3 no
+  consuming project.
+
+  Example: routine doctor
+""",
+    "connections": """\
+For routine:
+  None: routine reaches no system of its own. The store is the project's,
+  resolved through the shared library (STORE, on `routine help`), so its
+  report holds no connection: {"connections": {}}, with the policy state
+  the library adds beside it.
+""",
+    "migrate": """\
+For routine:
+  Brings the routine tables up to this version, or reports where they
+  stand. The tables and the ledger are STORE, on `routine help`; any verb
+  that reaches the store migrates them too.
+""",
+    "list": """\
+routine list [--json]
+routine list --store [--global] [--json]
+
+  List the project's routines where they live, by the rule `titles`
+  states: where the store holds an active routine of this project, what
+  `list --store` lists; otherwise the routine files under `.routines/`
+  and their parsed front matter. Every routine --json lists carries
+  `origin` (`own`, or `global` for a global routine) and `enabled`,
+  whether it is on for this agent; a routine file is its own and on.
+
+  With --store, every routine of the project in the store with its active
+  version: name, version, title, description - and every global routine it
+  has enabled, marked global with its author, unless a routine of its own
+  has the same name: that one is listed instead, marked as shadowing it. A
+  routine of its own that is switched off is listed too, `enabled` false,
+  and still shadows a global one of its name.
+
+  With --store --global, every global routine with its active version and
+  its author project; run in a project, --json marks each `enabled` or not
+  for it. Reading the global routines needs no project.
+
+  --store    the routines in the project's store, whether or not it holds one
+  --global   with --store, the global routines instead of the project's;
+             without --store it is refused (exit 6 `input`)
+  --json     the structured answer
+
+  Output from the folder: one line per file - `OK` or `ERROR`, the name
+  (`-` where it has none), the path, and the description or the error,
+  tab-separated. With --json: [{path, name, description, error, origin,
+  enabled}].
+
+  Output from the store: one line per routine - name, the first 8
+  characters of the version id, description, and `(global, by <author>)`,
+  `(shadows a global routine)` or `(off)` where they apply - or `no
+  routines in this project's store` / `no global routines in the store`.
+  With --json: {project, global, count, routines: [{name, version, title,
+  description, saved_at, global, origin, enabled?, author?,
+  shadows_global?}]}; `enabled` where a project is known.
+
+  A store that is set but does not answer is read past to the folder, with
+  a warning on stderr.
+
+  Exit codes: 0; 3 no consuming project; 4 policy; 5 store; 6 --global
+  without --store, no store configured with --store, no project or project
+  identity.
+
+  Examples:
+    routine list
+    routine list --store --global --json
+""" + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "validate": """\
+routine validate [--json]
+
+  Check that every routine markdown file under `.routines/` has exactly the
+  expected front matter shape for indexing: `name`, one-line
+  `description`, name matching the filename stem, and no duplicate names.
+  Each of these is a finding: no front matter or a malformed line in it, a
+  key other than `name` and `description`, a missing name or one that is not
+  kebab-case, a name other than the stem, a name already seen, a missing
+  description or one that is not one line.
+
+  --json   the structured answer
+
+  Output: `ok`, or one line per finding - its severity in capitals, the
+  path, the message, tab-separated. With --json: {ok, findings: [{path,
+  severity, message}]}.
+
+  Exit codes: 0 no findings; 3 no consuming project; 6 any finding.
+
+  Example: routine validate --json
+""" + _HELP_TAIL,
+    "index": """\
+routine index [--json]
+
+  Render the routine index from front matter. The markdown form is the same
+  one-line menu shape used by consuming-project context compilers: the
+  heading `# Routines (repeatable procedures)`, then one line per routine,
+  `- **[<name>](<path>)** — <description>`. Only a corpus that validates is
+  rendered.
+
+  --json   [{name, description, path}] instead of the markdown
+
+  Exit codes: 0; 3 no consuming project; 6 `invalid_routines` when `routine
+  validate` has findings.
+
+  Example: routine index
+""" + _HELP_TAIL,
+    "groom": """\
+routine groom <name|path>
+routine groom --all
+
+  Emit the agent procedure for semantic quality review of one routine, or
+  of the whole `.routines/` corpus. Judgment stays with the calling agent;
+  this command supplies the target inventory and review flow. <name|path>
+  is the routine's name, or its file's path - absolute, from the project
+  root, or from `.routines/`, `.md` optional.
+
+  --all   the whole corpus instead of one routine
+
+  Output: markdown on stdout - the standards to load, the targets, and the
+  shape of the review's answer.
+
+  Exit codes: 0; 3 no consuming project, a routine it does not know; 6
+  `invalid_routines` when `routine validate` has findings, `input` when
+  neither a routine nor --all is given.
+
+  Examples:
+    routine groom weekly-review
+    routine groom --all
+""" + _HELP_TAIL,
+    "show": """\
+routine show <name> [--version ID] [--global] [--json]
+
+  The active version, or the version ID names, in the file form. --json
+  adds the version id, who saved it, when, and its note; the version id is
+  what `save --base` names and what a follower records. Without --version
+  and --global, a project whose store holds no routine of its own, nor a
+  global one it has enabled, is answered from its routines folder, by the
+  rule `titles` states: the file under it whose stem is the name, as
+  written; --json gives `source: folder`, its path and its text.
+
+  --version ID   a version other than the active one
+  --global       the global routine of that name
+  --json         the structured answer
+
+  Output: the version in the file form (THE FILE FORM, on `routine help`).
+  With --json: {name, project, global, author?, version, active, title,
+  description, created_at, created_by, note, body, rendered}; from the
+  folder, {name, project, global, source, path, rendered}.
+
+  Exit codes: 0; 3 no routine of that name, no version of that id; 4
+  policy; 5 store; 6 a malformed name or version, a prefix naming several
+  versions (`ambiguous_version`), two folder files of that name
+  (`ambiguous_routine`), no store configured.
+
+  Example: routine show weekly-review --json
+""" + _HELP_IDS + _HELP_SEEN + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "history": """\
+routine history <name> [--global] [--json]
+
+  Every version, newest first: id, when, by whom, the note, and which one
+  is active.
+
+  --global   the global routine of that name
+  --json     the structured answer
+
+  Output: one line per version - id, when, by whom, and `(active)` and
+  ` - <note>` where they apply. With --json: {name, project, global,
+  author?, count, versions: [{version, active, title, description,
+  created_at, created_by, note}]}.
+
+  Exit codes: 0; 3 no routine of that name; 4 policy; 5 store; 6 a
+  malformed name, no store configured.
+
+  Example: routine history weekly-review
+""" + _HELP_SEEN + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "diff": """\
+routine diff <name> [A] [B] [--global]
+
+  A unified diff of two versions in the file form. Bare: the active
+  version against the one saved before it (against nothing when it is the
+  only one). With A alone: A against the active version. With A and B: A
+  against B.
+
+  --global   the global routine of that name
+
+  Output: the unified diff as plain text, each side labelled
+  `<name>.md@<first 8 characters of the version id>` (`/dev/null` for
+  nothing), or `no difference between <A> and <B>`.
+
+  Exit codes: 0; 3 no routine of that name, no version of that id; 4
+  policy; 5 store; 6 a malformed name or version, no store configured.
+
+  Example: routine diff weekly-review 3f2a9c
+""" + _HELP_IDS + _HELP_SEEN + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "save": """\
+routine save <name> --from FILE|- [--base ID] [--note TEXT] [--global]
+
+  Save the file form read from FILE, or stdin with `-`, as the routine's
+  new active version; a name not in use starts a new routine. The file's
+  `name` must be <name>. --base names the version the edit was made from:
+  the save is refused (exit 7 `stale_base`, naming the active version) when
+  it is no longer the active one, because another save came first. Without
+  --base the active version at the time of the save is the base. --note
+  says why. Safe to repeat: content equal to the active version's adds no
+  version and answers `"changed": false`.
+
+  --from FILE|-   the routine in the file form, from FILE or stdin; required
+  --base ID       the version the edit was made from
+  --note TEXT     why it changed
+  --global        save the global routine of that name, as its author
+
+  Output: {project, changed, name, outcome, version, base?, normalised?,
+  global?}: outcome `created`, `versioned` or `unchanged`; `normalised`
+  says what reading a front matter out of the file form changed (THE FILE
+  FORM, on `routine help`).
+
+  Exit codes: 0; 3 a --base that names no version; 4 policy, the read-only
+  switch, system_agent, not_author; 5 store; 6 input, not_canonical, no
+  store configured, no project or project identity; 7 stale_base, also for
+  a --base on a routine that is no longer there.
+
+  Example: routine save weekly-review --from weekly-review.md --base 3f2a9c --note "a step added"
+""" + _HELP_IDS + _HELP_WRITE + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "retire": """\
+routine retire <name> [--global]
+
+  Retire the routine: it leaves list, show and export, its versions stay
+  in the store, and its name is free for a new routine. Not idempotent: a
+  repeat finds no routine of that name and exits 3.
+
+  --global   retire the global routine of that name, as its author
+
+  Output: {name, project, retired, document, global?}.
+
+  Exit codes: 0; 3 no routine of that name; 4 policy, the read-only switch,
+  system_agent, not_author; 5 store; 6 a malformed name, no store
+  configured, no project or project identity.
+
+  Example: routine retire weekly-review
+""" + _HELP_WRITE + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "import": """\
+routine import [DIR]
+
+  Read every `*.md` file under DIR, subfolders included, into the store as
+  the routine its stem names: a new routine with one version, a new
+  version where the active version differs, nothing where it is equal. DIR
+  defaults to the project's routines layer, as `capabilities path --json`
+  names it under layers.routines. Every file is read and checked before
+  anything is written, and all of it is written in one transaction; any
+  file that does not read, or two files of one name, refuse the whole
+  import, naming each. Other files are reported as skipped. Routines in
+  the store with no file in DIR are left as they are. Each version it adds
+  is noted `imported from <path>`. Safe to repeat.
+
+  Output: {project, folder, counts, routines: [{name, path, outcome,
+  version, base?, normalised?}], skipped: [{path, outcome, reason}]}:
+  outcome `created`, `versioned` or `unchanged`. A refused import also
+  writes {"refused": [{path, reason}]} on stderr before its error.
+
+  Exit codes: 0; 4 policy, the read-only switch, system_agent; 5 store; 6
+  DIR not a folder, no routines layer (`no_routines_layer`),
+  not_canonical, no store configured, no project or project identity.
+
+  Example: routine import
+""" + _HELP_WRITE + _HELP_TAIL,
+    "export": """\
+routine export [DIR]
+
+  Write each routine's active version into DIR in the file form: into the
+  one file under DIR, subfolders included, whose stem is its name, else as
+  DIR/<name>.md; a file already equal is left alone. DIR defaults as for
+  import: the project's routines layer, as `capabilities path --json` names
+  it under layers.routines. Files in DIR that hold no routine are reported
+  and left alone. Export reads the store and writes only DIR, so it is no
+  write and runs under the read-only switch.
+
+  Output: {project, folder, counts, routines: [{name, path, version,
+  outcome, error?}], not_in_store}: outcome `written`, `unchanged`, or
+  `error` with the reason; not_in_store lists the files that hold no
+  routine.
+
+  Exit codes: 0; 4 policy; 5 store; 6 no routines layer
+  (`no_routines_layer`), a file it could not write, no store configured,
+  no project or project identity.
+
+  Example: routine export /tmp/routines-copy
+""" + _HELP_TAIL,
+    "transfer": """\
+routine transfer <name> --to PROJECT_ID
+
+  Make the project PROJECT_ID the global routine's author. Run by its
+  current author alone; the receiver cannot take it.
+
+  --to PROJECT_ID   the receiving project's declared id, as `capabilities
+                    path --json` shows it; required
+
+  Output: {name, global, from, author, changed}.
+
+  Exit codes: 0; 3 no global routine of that name; 4 policy, the read-only
+  switch, system_agent, not_author; 5 store; 6 a --to that is no project
+  id, no store configured, no project or project identity.
+
+  Example: routine transfer shared-review --to <PROJECT_ID>
+""" + _HELP_WRITE + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "enable": _HELP_SWITCH,
+    "disable": _HELP_SWITCH,
+    "titles": """\
+routine titles [--json]
+
+  Each routine with its name, title, description and source (`folder`
+  with its path, or `store` with its active version, marked global for a
+  global routine the project has enabled). A routine without a title is
+  titled by its name; title_source says which (`front_matter` or `name`).
+  The answer names the source, and warns of each folder file it skips.
+
+  --json   the structured answer
+
+  Output: one line per routine - name, title, description, tab-separated -
+  then `warning: <text>` for each warning, or `no routines in this
+  project's <source>`. With --json: {project, source, folder?, count,
+  routines: [{name, title, title_source, description, source, path?,
+  version?, global?}], warnings}.
+
+  Exit codes: 0; 4 policy; 6 no project, no routines layer.
+
+  Example: routine titles --json
+""" + _HELP_WHERE + _HELP_TAIL,
+    "title": """\
+routine title <name> <title>
+routine title <name> --clear
+
+  Set the routine's display title, one line of at most 120 characters, or
+  remove it so the name titles it. In the folder the file's `title:` line
+  is written after `name:` as a JSON string; in the store a new version
+  holds that same title and the active version's description and body.
+  Answers the routine as `titles` lists it and `changed` (`["title"]`, or
+  `[]` when it already held that title).
+
+  --clear   remove the title instead of setting one
+
+  Output: {project, source, routine, changed}.
+
+  Exit codes: 0; 3 a routine that is not there; 4 policy, the read-only
+  switch, system_agent, `global_routine` for a global routine the project
+  has enabled, whose title its author saves; 5 a store that does not
+  answer; 6 input (a title and --clear both, neither, an empty title, one
+  longer than 120 characters or of more than one line), duplicate_routine,
+  front_matter_unwritable, no project, no routines layer.
+
+  Examples:
+    routine title weekly-review "Weekly review"
+    routine title weekly-review --clear
+""" + _HELP_WRITE + _HELP_WHERE + _HELP_TAIL,
+}
 
 
 # The shared capability code is the capabilities-contract library's, bound here

@@ -2,106 +2,54 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.49,<1",
+#     "capabilities-contract>=0.50,<1",
 # ]
 # ///
-"""rclonec — a credential harness around the official `rclone` binary. It resolves one
-named connection into an rclone remote, injects it as configuration, and forwards your
-command verbatim to `rclone`. rclonec owns auth and readiness; the command surface
-stays rclone's own.
+"""rclonec - a credential harness around the official `rclone` binary. It
+resolves one named connection into an rclone remote, injects it as
+configuration, and forwards your command verbatim to `rclone`. It owns auth
+and readiness; the command surface stays rclone's own. Agent-invoked - run
+`rclonec help` to reload this menu and `rclonec help <verb>` for one verb's
+whole contract, on demand.
 
 USAGE
-  rclonec <command> [args...]   Forward to `rclone <command> [args...]` with the selected
-                                connection defined as a remote. Address the remote by the
-                                connection's label (or its id): `rclonec lsjson
-                                gdrive:Reports`.
-  rclonec connections           Where every connection's values resolve from (tier,
-                                source, secrets masked). Local only.
-  rclonec doctor [--connection <id>]
-                                Prove rclone is present and the connection reaches its
-                                backend — every connection, or one.
-  rclonec help                  Print this contract.
+  rclonec <command> [args...]   forward to `rclone <command> [args...]` with the selected connection defined as its one remote
+  rclonec connections           where every connection's values resolve from (tier, source, secrets masked); local only
+  rclonec doctor                prove rclone is present and each connection reaches its backend, every connection or one
 
-Contract commands (the same on every capability; rclonec's own, never forwarded):
-  rclonec stub                                  One-line awareness text.
-  rclonec manifest --json                       Machine-readable declaration.
-  rclonec guide [<topic>]                       Guide topics / one guide body.
-  rclonec ids list|get <l>|set <l> <v>|rm <l>   The project identifiers envelope.
-           [--note <text>]
-  rclonec refs                                  Menu of the project's reference files.
-  rclonec inventory [--network]                 What this capability holds in
-                                                this project (--network adds
-                                                remote detail).
-
-Agent-invoked. Run `rclonec help` to reload this contract; run `rclone help` (the real
-binary) for the full command surface — rclonec does NOT re-document or re-map it.
+Address the remote by the connection's label (or its id): `rclonec lsjson
+gdrive:Reports`. Run `rclone help` (the real binary) for the full command
+surface; this harness does NOT re-document or re-map it. How a command is
+forwarded - the remote it is given, how a connection is selected, the write
+gate on a read-only connection, where `rclone` comes from, and the exit code
+it returns - is `rclonec help forward`.
 
 MODEL
-  rclonec never maps, renames, or enumerates rclone commands. It is a thin configuration
-  and auth shim: it materializes ONE remote from the selected connection, points
-  RCLONE_CONFIG at the null device so no config file is read or written, and execs
-  `rclone`. stdout, stderr and the exit code are rclone's, passed through untouched, so
-  streaming, --json, progress and colors behave exactly as in rclone itself.
-
-  The child process knows exactly one remote — the selected connection, named for its
-  label, and for its id as well where the two differ. A connection
-  declared for Google Drive therefore cannot reach S3: that name is not defined in the
-  environment the child is given. The containment is a property of that environment,
-  not a check rclonec performs.
-
-  Because the config lives only in the child's environment, rclone refreshes an expiring
-  OAuth token in memory and persists nothing; the next run refreshes again from the
-  credential it was given. Nothing is written to disk, so the same connection runs
-  identically on a laptop and on a server.
-
-  rclone is not vendored. rclonec runs the `rclone` on PATH when there is one. Otherwise
-  the first verb that needs rclone fetches rclone's own standalone build for this
-  platform, checked against the release's SHA256SUMS, into
-  $XDG_STATE_HOME/rclonec/programs/rclone, as the user and without root, and every later
-  run uses it. `rclonec doctor` reports the path it resolved and the version it found, so
-  a missing or shadowed binary is diagnosed in one run rather than inferred.
+The harness never maps, renames or enumerates rclone commands. It
+materializes ONE remote from the selected connection in the child's
+environment alone, so no rclone config file is read or written, and execs
+`rclone`, whose stdout, stderr and exit code pass through untouched. The child
+knows exactly that one remote, so a connection declared for one backend cannot
+reach another. Its own verbs above and the contract verbs below are never
+forwarded; every other word is.
 
 CONNECTIONS
-  Configuration requires an explicit connections registry, even for one connection. An
-  entry names its rclone backend `type`, its non-secret `options`, and the env keys
-  holding its secrets. The connection's label becomes the remote name, so it must be
-  usable as one: letters, digits and underscore only.
+One connection is one rclone remote: its backend `type`, its non-secret
+`options`, the env keys holding its secrets, its write grant and the path
+doctor lists. A registry is required even for one connection, and the label
+becomes the remote name. Its shape, where it is kept and where a secret
+resolves are `rclonec help connections`.
 
-    {
-      "default": "<id>",
-      "connections": {
-        "<id>": {
-          "type": "drive",
-          "options": {"scope": "drive", "impersonate": "<user@domain>",
-                      "export_formats": "md,csv"},
-          "secret_env": {"service_account_credentials": "<ENV_KEY>"},
-          "allow_write": true
-        }
-      }
-    }
-
-  Every key under `options` and `secret_env` is an rclone backend option for that `type`,
-  spelled as rclone spells it (`rclone help backend <type>` prints the set). rclonec
-  passes them through and keeps no list of its own, so a backend option added upstream
-  works here the day it ships.
-
-  Secrets are named by env key and resolve through the credential cascade (`Where a
-  secret resolves`, at the end of this help). A secret must not touch argv, so
-  there is deliberately no flag for one.
-
-  `allow_write: false` makes the connection read-only. Verbs that mutate the remote exit
-  4, and so does a forwarded transfer whose DESTINATION is this remote; reading from it
-  stays available. Nothing in the cascade lifts the gate.
-
-  `check_path` names the path under the remote that `doctor` lists to prove the
-  connection, in place of the remote's top level - a bucket, or `bucket/prefix`, for a
-  key scoped to one bucket that may not list them all. It is rclonec's own field, sits
-  beside `options` rather than in it, and never reaches rclone's configuration; without
-  it doctor lists `<label>:`.
-
-  Outside any project, connections and doctor are machine reads: they use the
-  machine's own connections read-only, unless a grant switched one off; every
-  other verb that needs a connection is refused there.
+EXIT CODES
+A forwarded command exits with rclone's own code, which is not drawn from
+this table. The harness's own layer - connection resolution, the write gate,
+doctor, and finding rclone - exits:
+  0 success · 2 credentials (a secret's env key unset, or refused by the
+  backend) · 4 policy refusal - a write through a read-only connection, a
+  connection the project is not granted, the project gate; ask the user, never
+  lift a gate yourself · 5 rclone missing and not fetchable, unresponsive, or
+  the backend unreachable · 6 input (no connections registry, a connection that
+  cannot be built as a remote, an unknown or ambiguous connection)
 """
 
 import json
@@ -215,6 +163,180 @@ BACKEND_READ_SUBCOMMANDS = {"query", "get", "exportformats", "importformats", "d
 # Flags whose VALUE is a destination rclone writes to, whatever the positional args say.
 DEST_VALUE_FLAGS = {"--backup-dir", "--suffix-keep-extension"}
 assert not (READ_VERBS & WRITE_VERBS), "a verb is a read or a write, never both"
+
+# The verb pages `rclonec help <verb>` answers (SHEBANG.md, "Agent-first help
+# is the surface"): each verb's whole contract, the module docstring being the
+# menu. The contract library dispatches both and renders the contract verbs'
+# own pages, which the entries here for doctor and connections follow. The
+# forwarded surface is rclone's own and has no page per command; `forward`
+# holds the contract of forwarding itself.
+HELP_VERBS = {
+    "forward": """\
+rclonec <command> [args...] [--connection <id|label>]
+
+  Forwards `rclone <command> [args...]` with the selected connection defined
+  as a remote. Address the remote by the connection's label (or its id):
+  `rclonec lsjson gdrive:Reports`. Every word is forwarded but rclonec's own
+  verbs (doctor, connections) and the contract verbs the menu lists, which
+  are rclonec's own and never forwarded. `help` is one of them: `rclone help`
+  (the real binary) prints rclone's full command surface, which rclonec does
+  NOT re-document or re-map.
+
+  --connection <id|label> (or --connection=<id|label>) selects the
+  connection, by its id or else its label. It is rclonec's own selector,
+  accepted anywhere on the line, consumed here and never forwarded to
+  `rclone`. Unflagged, the registry's "default" pointer applies, else the
+  sole entry; several entries without a pointer is refused as ambiguous.
+  The connection is selected and its write gate decided BEFORE any secret
+  resolves or rclone is touched, so a write on a read-only connection
+  refuses (exit 4) and an unknown id refuses (exit 6) whether or not the
+  secrets resolve or rclone is installed.
+
+  MODEL
+  rclonec never maps, renames, or enumerates rclone commands. It is a thin
+  configuration and auth shim: it materializes ONE remote from the selected
+  connection, points RCLONE_CONFIG at the null device so no config file is
+  read or written, and execs `rclone`. stdout, stderr and the exit code are
+  rclone's, passed through untouched, so streaming, --json, progress and
+  colors behave exactly as in rclone itself. Inherited RCLONE_* variables are
+  dropped from the child's environment, so ambient environment can neither
+  redirect the remote nor lift a gate.
+
+  The child process knows exactly one remote - the selected connection,
+  named for its label, and for its id as well where the two differ. A
+  connection declared for Google Drive therefore cannot reach S3: that name
+  is not defined in the environment the child is given. The containment is a
+  property of that environment, not a check rclonec performs.
+
+  Because the config lives only in the child's environment, rclone refreshes
+  an expiring OAuth token in memory and persists nothing; the next run
+  refreshes again from the credential it was given. Nothing is written to
+  disk, so the same connection runs identically on a laptop and on a server.
+
+  rclone is not vendored. rclonec runs the `rclone` on PATH when there is
+  one. Otherwise the first verb that needs rclone fetches rclone's own
+  standalone build for this platform, checked against the release's
+  SHA256SUMS, into $XDG_STATE_HOME/rclonec/programs/rclone, as the user and
+  without root, and every later run uses it. `rclonec doctor` reports the
+  path it resolved and the version it found, so a missing or shadowed binary
+  is diagnosed in one run rather than inferred.
+
+  THE WRITE GATE
+  `allow_write: false` on the connection makes it read-only. Verbs that
+  mutate the remote exit 4, and so does a forwarded transfer whose
+  DESTINATION is this remote; reading from it stays available. Because
+  rclone's transfer verbs read or write by which side the remote is on, the
+  gate is decided on argument position: `move` and `moveto` are refused
+  naming the remote on either side (the source is emptied), a
+  destination-valued flag such as --backup-dir pointed at it is refused,
+  `backend` passes only its reading subcommands (query, get, exportformats,
+  importformats, drives), and a verb rclonec does not classify as a read is
+  refused rather than waved through. Which flags take a value is asked of the
+  installed rclone (`rclone help flags`); when it does not answer, a transfer
+  on a read-only connection is refused rather than guessed at. Nothing in the
+  cascade lifts the gate.
+
+  Outside any project a forwarded command, which needs a connection, is
+  refused; connections and doctor are machine reads there (`rclonec help
+  connections`).
+
+  Output: rclone's own stdout and stderr, untouched. A refusal by rclonec
+  itself is a JSON error envelope on stderr, with nothing on stdout.
+
+  Exit codes: rclone's own for a forwarded command. rclonec's own: 2
+  missing_secret (a secret's env key is unset); 4 read_only, or
+  connection_not_granted; 5 rclone_not_found (not on PATH and could not be
+  fetched) or rclone_exec_failed; 6 no_connections (no registry),
+  connection_required, bad_connection_id (a label that cannot be a remote
+  name), no_type, bad_check_path, unknown_connection, ambiguous_connection,
+  bad_default.
+
+  Examples:
+    rclonec lsjson gdrive:Reports
+    rclonec --connection gdrive copy gdrive:Reports ./reports
+""",
+    "doctor": """\
+  Proves rclone is present - the `rclone` on PATH, else the one rclonec
+  fetched, else fetched now (`rclonec help forward`) - and reports the path it
+  resolved and the version it found. Then, per connection (every connection,
+  or the one --connection names by its id or label), it lists the remote
+  under that connection's own configuration: `rclone lsd <label>:`, or
+  `rclone lsd <label>:<check_path>` where the connection names a check_path
+  (`rclonec help connections`). A credential problem (exit 2) and an
+  unreachable backend (exit 5) are told apart.
+
+  Output: when every connection is ready, on stdout
+    {"ok": true, "rclone": {"found", "path", "version"},
+     "connections": {<id>: {"ok", "remote", "type", "allow_write"}}}
+  Otherwise the same report under {"error": {"code": "not_ready", "message",
+  "report"}} on stderr, nothing on stdout, and the worst exit: 2 a secret's env
+  key unset or the credential refused; 5 rclone missing and not fetchable,
+  unresponsive, or the backend unreachable; 6 a connection that cannot be
+  built (no type, a label that cannot be a remote name, a check_path that is
+  not a string). A failing connection carries "error" (and "hint" where its
+  definition is at fault); "rclone" carries "error" and "hint" when no rclone
+  resolves. Exit 6 no_connections without a connections registry.
+
+  Outside any project doctor is a machine read: it uses the machine's own
+  connections read-only, unless a grant switched one off.
+
+  Examples:
+    rclonec doctor
+    rclonec doctor --connection gdrive
+""",
+    "connections": """\
+  CONNECTIONS
+  Configuration requires an explicit connections registry, even for one
+  connection. An entry names its rclone backend `type`, its non-secret
+  `options`, and the env keys holding its secrets. The connection's label
+  becomes the remote name, so it must be usable as one: letters, digits and
+  underscore only.
+
+    {
+      "default": "<id>",
+      "connections": {
+        "<id>": {
+          "type": "drive",
+          "options": {"scope": "drive", "impersonate": "<user@domain>",
+                      "export_formats": "md,csv"},
+          "secret_env": {"service_account_credentials": "<ENV_KEY>"},
+          "allow_write": true
+        }
+      }
+    }
+
+  Every key under `options` and `secret_env` is an rclone backend option for
+  that `type`, spelled as rclone spells it (`rclone help backend <type>`
+  prints the set). rclonec passes them through and keeps no list of its own,
+  so a backend option added upstream works here the day it ships.
+
+  Secrets are named by env key and resolve through the credential cascade
+  (`Where a secret resolves`, above). A secret must not touch argv, so there
+  is deliberately no flag for one.
+
+  `allow_write: false` makes the connection read-only. Verbs that mutate the
+  remote exit 4, and so does a forwarded transfer whose DESTINATION is this
+  remote; reading from it stays available. Nothing in the cascade lifts the
+  gate (`rclonec help forward`).
+
+  `check_path` names the path under the remote that `doctor` lists to prove
+  the connection, in place of the remote's top level - a bucket, or
+  `bucket/prefix`, for a key scoped to one bucket that may not list them all.
+  It is rclonec's own field, sits beside `options` rather than in it, and
+  never reaches rclone's configuration; without it doctor lists `<label>:`.
+
+  Outside any project, connections and doctor are machine reads: they use the
+  machine's own connections read-only, unless a grant switched one off; every
+  other verb that needs a connection is refused there.
+
+  Output: beside what the report above adds, each connection carries
+  "allow_write", "label", "remote" (`<label>:`) and "keys", one row per
+  value - its type, each option, and each secret by its env key with the
+  tier and source it resolved from, masked.
+
+  Example: rclonec connections
+""",
+}
 
 # The shared capability code is the capabilities-contract library's, bound here
 # into this script's namespace (SHEBANG.md, "The contract verbs").

@@ -31661,9 +31661,8 @@ HELP_MENU_CEILING = 8192
 # until its name is taken out, so the set only shrinks. A name is never added:
 # every bundle outside it, a new capability included, is held to the whole law.
 HELP_MENU_PENDING = frozenset({
-    "notion", "railwayc", "rclonec", "resend", "routine", "signoz", "simplbooks",
-    "skyscanner", "slack", "slacker", "stripe", "teams", "telegram",
-    "telegrambot", "vapic", "whatsapp", "windmill", "youtrack",
+    "simplbooks", "skyscanner", "slack", "slacker", "stripe", "teams",
+    "telegram", "telegrambot", "vapic", "whatsapp", "windmill", "youtrack",
 })
 
 _HELP_FLAG = re.compile(r"(?<![\w-])--?[A-Za-z]")

@@ -57,7 +57,8 @@ def test_help_documents_every_domain_command():
         assert f"signoz {command}" in help_text
     assert "SIGNOZ_API_KEY" in help_text
     assert "SIGNOZ_INGESTION_KEY" in help_text
-    assert help_text.count("[--select FIELD]") == 3
+    for command in ["traces search", "trace", "call", "agent"]:
+        assert "[--select FIELD]" in module.HELP_VERBS[command]
 
 
 def test_declared_connection_accepts_existing_aliases(tmp_path, monkeypatch):
