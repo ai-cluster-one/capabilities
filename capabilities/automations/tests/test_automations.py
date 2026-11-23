@@ -16,6 +16,7 @@ import tempfile
 import time
 import types
 import unittest
+import unittest.mock
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -888,6 +889,24 @@ environments = ["production"]
                                    self.root, None, answer)
         self.assertIn("bypassPermissions", claude_act)
         self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", claude_act)
+
+    def test_agent_env_drops_a_calling_sessions_markers(self) -> None:
+        # A daemon started from inside an interactive session inherits that
+        # session's entrypoint; every agent turn it ran then recorded the
+        # caller's entrypoint instead of a headless one.
+        import importlib.util as _ilu
+        spec = _ilu.spec_from_loader("automations_cli_env_test", loader=None)
+        cli = _ilu.module_from_spec(spec)
+        cli.__dict__["__file__"] = str(CLI)
+        exec(compile(CLI.read_text(), str(CLI), "exec"), cli.__dict__)
+        inherited = {"CLAUDE_CODE_ENTRYPOINT": "cli", "CLAUDECODE": "1",
+                     "CLAUDE_CODE_SSE_PORT": "4242", "KEEP_ME": "yes"}
+        with unittest.mock.patch.dict(os.environ, inherited):
+            env = cli.__dict__["_agent_env"]()
+        for name in ("CLAUDE_CODE_ENTRYPOINT", "CLAUDECODE", "CLAUDE_CODE_SSE_PORT"):
+            self.assertNotIn(name, env)
+        self.assertEqual(env["KEEP_ME"], "yes")
+        self.assertIn("PATH", env)
 
     def test_agent_command_resumes_and_forks_a_session(self) -> None:
         import importlib.util as _ilu

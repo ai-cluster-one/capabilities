@@ -229,7 +229,7 @@
       "level": 0,
       "lucide_icon": "timer",
       "path": "capabilities/automations",
-      "payload_sha256": "d538708f702ac994a8e72a7e35d8ff9165882e510755417e474aec8be77287b9",
+      "payload_sha256": "d3ccd3fa61b88b57d5f0a6ecc3ad91f3948eeec4bc340544e3d5831c8d5b0393",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
@@ -245,7 +245,7 @@
           "title": "Автоматизации"
         }
       },
-      "version": "2026-11-23 — Turns run on callva-harness-runner 0.13.1"
+      "version": "2026-11-23 — An `automations agent` turn is headless whoever started the process"
     },
     "calcomc": {
       "executable": [

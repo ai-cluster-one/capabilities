@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-11-23 — An `automations agent` turn is headless whoever started the process
+
+`automations agent` started `claude -p` and `codex exec` with the whole environment of the process that ran it. A scheduler started from inside an interactive Claude Code session keeps that session's variables, its entrypoint among them, so every agent turn its jobs ran recorded the calling session's entrypoint in its transcript and read as that session's own interactive work rather than a background run. The turn's environment now drops every variable the harness runner names in `SESSION_MARKERS` - the ones a calling Claude Code session leaves in its children's environment - as the runner does for its own turns, so the CLI records its own headless entrypoint (`sdk-cli` for `claude -p`). Every other variable still reaches the turn. No verb, flag, JSON key or exit code changes.
+
 ## 2026-11-23 — Turns run on callva-harness-runner 0.13.1
 
 Turns run on callva-harness-runner 0.13.1, in place of 0.12.3: claude runs through claude-agent-sdk 0.2.187, and Claude Code up to 2.1.330 runs without the runner's untested-version warning. The runner's 0.13.0 also adds a claude conversation kept open across turns, which this capability does not use; its turns run as before. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

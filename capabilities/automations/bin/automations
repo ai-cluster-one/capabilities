@@ -4315,7 +4315,15 @@ def _engine_binary(engine: str) -> str:
 
 
 def _agent_env() -> dict[str, str]:
-    env = dict(os.environ)
+    # A turn started here is headless, whoever started this process. The
+    # variables a calling Claude Code session leaves in its children's
+    # environment - its entrypoint among them - would make the CLI record the
+    # turn as that session's own, so they are removed, as the harness runner
+    # removes them for its turns, and the CLI names its own entrypoint.
+    import fnmatch
+    markers = _harness_runner().SESSION_MARKERS
+    env = {key: value for key, value in os.environ.items()
+           if not any(fnmatch.fnmatchcase(key, marker) for marker in markers)}
     extra = ["/opt/homebrew/bin", "/usr/local/bin",
              str(Path.home() / ".local" / "bin")]
     parts = [item for item in env.get("PATH", "").split(os.pathsep) if item]
