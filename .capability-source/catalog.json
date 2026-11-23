@@ -560,7 +560,7 @@
       "level": 0,
       "lucide_icon": "rocket",
       "path": "capabilities/deployment",
-      "payload_sha256": "b02b080a05adfe2c432ee09a257fdd04070ded9e1baf7c7c568975a84a3d7e3f",
+      "payload_sha256": "a1087772e8080fe1c60f86e1c0b8a5d0fe520296954abab4822a6c2f1beaea71",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to.",
@@ -576,7 +576,7 @@
           "title": "Развёртывание"
         }
       },
-      "version": "2026-11-22 — `deployment help` is the menu, and `deployment help <verb>` one verb's whole contract"
+      "version": "2026-11-23 — `deployment runner` is gone, and `deployment machine handover` has moved to the manager"
     },
     "directo": {
       "executable": [
