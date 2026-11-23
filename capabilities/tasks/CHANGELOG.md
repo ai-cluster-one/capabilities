@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-23 — Turns run on callva-harness-runner 0.13.1
+
+Turns run on callva-harness-runner 0.13.1, in place of 0.12.3: claude runs through claude-agent-sdk 0.2.187, and Claude Code up to 2.1.330 runs without the runner's untested-version warning. The runner's 0.13.0 also adds a claude conversation kept open across turns, which this capability does not use; its turns run as before. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-21 — `tasks help` is the menu, and every verb answers `tasks help <verb>` with its whole contract
 
 `tasks help` printed the whole reference, about 140 KB, and `tasks help <verb>` was refused as an unknown command. `tasks help` is now a menu under 8 KB: every verb on one line saying what it answers, under READING, WRITING, EXECUTION and SERVICE, then the contract verbs and the guides, a SECTIONS line naming the page that holds each section a page cites in capitals (FIELDS is on `tasks help add`, ESCALATION on `tasks help settings`, STORE on `tasks help migrate`), and the I/O and exit codes. `tasks help <verb>` takes the whole verb path, `tasks help meta set` or `tasks help workers lift`, and prints that verb's whole contract: the text the old help held for it, the sections it owns, its flags, its answer, its exit codes and an example. A section several verbs share has one page, and the others point to it. A path that names a group, `tasks help service`, lists its verbs, and a path that names no verb exits 6 `unknown_verb`, with nothing on stdout and a hint naming `tasks help`. Nothing the old help said is gone; it is on the page that owns it. It needs capabilities-contract 0.50. Only the shape of help changes: no verb, flag, answer, JSON key or exit code changes, and the hints that name a section of `tasks help` find it through the menu's SECTIONS line.

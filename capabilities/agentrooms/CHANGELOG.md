@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-11-23 — Turns run on callva-harness-runner 0.13.1
+
+Turns run on callva-harness-runner 0.13.1, in place of 0.12.3: claude runs through claude-agent-sdk 0.2.187, and Claude Code up to 2.1.330 runs without the runner's untested-version warning. The runner's 0.13.0 also adds a claude conversation kept open across turns, which this capability does not use; its turns run as before. Nothing a profile or a result does changes; no verb, flag or JSON key changes.
+
 ## 2026-11-21 — `agentrooms help` is the menu, and `agentrooms help <verb>` one verb's whole contract
 
 `agentrooms help` is the short complete menu of SHEBANG.md, "Agent-first help is the surface": what the capability is and what it refuses, every verb on one line saying what it answers, the service verbs, the contract verbs and guides the library renders, the I/O and the exit codes, with no flag on any line. `agentrooms help <verb>` takes the whole verb path (`help grant add`, `help service run`) and prints that verb's whole contract - its synopsis with every flag, what it does, its output, its exit codes and an example - from `HELP_VERBS`; a path naming a group (`help grant`, `help service`) lists its verbs, and an unknown one exits 6 `unknown_verb` with nothing on stdout and the hint to run `agentrooms help`. Every line of the former help moved verbatim to the page of the verb that owns it: CONNECTIONS to `help connections`, SERVICE to `help service run`, the machine settings to `help service init`, WORKERS to `help workers save`, Consent to each grant and held page, Directory and card to each directory and card page; the declared connection and settings sections are the library's `help connection` and `help settings`. `help` after `--connection <id>` answers the same. The capability binds `capabilities-contract` 0.50 or later, which dispatches the layered help. No other verb, flag, JSON key, output or exit code changes.

@@ -1,7 +1,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "callva-harness-runner==0.12.3",
+#     "callva-harness-runner==0.13.1",
 # ]
 # ///
 """The profiles a Slack dialogue turn or job may run on, and whether one fits.
@@ -28,7 +28,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-RUNNER_PIN = "callva-harness-runner==0.12.3"
+RUNNER_PIN = "callva-harness-runner==0.13.1"
 DEFAULT_PROFILE = "slacker-claude"
 DEFAULT_JOB_PROFILE = "slacker-job-claude"
 BUNDLED = ("slacker-claude", "slacker-codex", "slacker-job-claude",
