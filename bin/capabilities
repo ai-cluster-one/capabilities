@@ -18015,6 +18015,14 @@ def _node_origin(target):
     return _NODE_LENT["url"] if _NODE_LENT else target["connection"]
 
 
+def _node_origin_address(target, entry):
+    """The Coolify address a node row records as the connection it is created
+    through: the lent one's, else the base_url of the connection `target`
+    names; that connection's id only where it names no address."""
+    url = _NODE_LENT["url"] if _NODE_LENT else (entry or {}).get("base_url")
+    return url.rstrip("/") if _node_lent_address(url) else _node_origin(target)
+
+
 def _node_origin_is(target, recorded) -> bool:
     """Whether a node row's coolify connection is the one `target` reaches:
     the same id or lent address, or the address of the connection kept in
@@ -18302,8 +18310,14 @@ def _agent_node_reach(root, row, write):
         if not re.fullmatch(r"[a-zA-Z0-9.:-]+", address):
             raise NodeFailure("server_address", f"node {row['node']} records no usable "
                               "SSH address", 6)
+        # A connection visible here at that address that names an SSH key is
+        # how its servers are reached, as it is when Coolify is asked.
+        found = _node_visible_coolify(address=recorded)
+        ssh = ((found[1].get("value") or {}).get("ssh") if found else None)
+        key_path = (ssh.get("key_path") if isinstance(ssh, dict) else None) \
+            or _node_ssh_key(root, address)
         host = {"uuid": row["coolify_server"], "address": address, "name": None,
-                "key_path": _node_ssh_key(root, address), "url": recorded, "connection": None}
+                "key_path": key_path, "url": recorded, "connection": None}
         return {"connection": None}, host, _agent_node_container(root, host, row)
     target = _agent_node_target(row)
     entry = _node_connection(target, write)
@@ -18565,7 +18579,7 @@ def _agent_node_create(root, args):
     project_id, slug = _agent_node_project(root)
     target = {"connection": args.connection}
     # The grant and the write permission are read before anything is created.
-    _node_connection(target, write=True)
+    entry = _node_connection(target, write=True)
     if _agent_node_row(root, node) is not None:
         raise NodeFailure("node_exists", f"this agent already has node {node}", 6)
     # The node's id is minted here and registered with the row; enrolment
@@ -18575,6 +18589,10 @@ def _agent_node_create(root, args):
     if args.environment not in [row.get("name") for row in environments]:
         raise NodeFailure("environment_missing", f"the Coolify project has no "
                           f"{args.environment!r} environment; deployment creates none", 3)
+    # Whichever way the connection came, the row records the Coolify the node
+    # is made on by its address and the server by its SSH address, so every
+    # node row reads alike and exec, login and enrol reach it with nothing lent.
+    address = _node_server_host(root, target, entry, args.server)["address"]
     name = _agent_node_slug(slug) + "-" + _agent_node_slug(node)
     image = f"{AGENT_NODE_IMAGE}:{args.version}"
     compose = _agent_node_compose(project_id, image, args.memory)
@@ -18588,7 +18606,8 @@ def _agent_node_create(root, args):
         raise NodeFailure("provider_output", "service creation returned no uuid")
     try:
         row = _agent_node_manager(root, "node", "add", node_id, "--label", node, "--kind",
-                                  "server", "--coolify-connection", _node_origin(target),
+                                  "server", "--address", address,
+                                  "--coolify-connection", _node_origin_address(target, entry),
                                   "--coolify-server", args.server,
                                   "--coolify-resource", resource)["node"]
     except NodeFailure:
@@ -36292,11 +36311,14 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         created through a lent connection takes the same one lent again
         (exit 6 coolify_connection_required, lent_connection_mismatch). The
         node itself is reached over SSH to its server and docker exec into
-        its container; a node created through a lent connection is reached
-        through the server address its row records, which the first reach
-        with that connection lent (add, enrol) writes, so exec, login and
-        enrol reach it with nothing lent. <node> is the node's id, or the label exactly one of
-        the agent's nodes carries (node_ambiguous otherwise).
+        its container; a node whose row records its Coolify by address is
+        reached through the server address its row records, with the SSH key
+        a coolify connection visible here at that address names, else this
+        machine's SSH configuration, so exec, login and enrol reach it with
+        nothing lent; a lent node made before create recorded the address
+        has it written by its first reach with that connection lent (add,
+        enrol). <node> is the node's id, or the label exactly one of the
+        agent's nodes carries (node_ambiguous otherwise).
         image: the image's current release, the newest <major>.<minor>.<patch>
         tag its registry holds, read anonymously - the reference alone, or
         with --json {ok, version, image}; exit 5 image_release_unknown when
@@ -36308,8 +36330,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         ~/.claude, ~/.codex) and for ~/work, and only CAPABILITIES_PROJECT_ID
         and CAPABILITIES_PROJECT_ID_ROOT (/app); then a minted node id and
         its row (`node add <id> --label <label> --kind server` with the
-        connection, server and resource), the resource taken away again when
-        the row cannot be written. Answers {ok, node, image, memory,
+        server's SSH address, the Coolify address - the base_url of the
+        granted connection or the lent one's url, whichever way the
+        connection came - the server and the resource), the resource taken
+        away again when the row cannot be written; the server's address is
+        read before anything is made (exit 6 server_address). Answers {ok, node, image, memory,
         environment, volumes, handed, next}. Exit 6 node_exists,
         not_store_mode, 3 environment_missing.
         enrol: writes the node's id onto its config volume, makes its X25519

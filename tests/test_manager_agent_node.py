@@ -158,6 +158,7 @@ class Fake:
                 flags = dict(zip(args[3::2], args[4::2]))
                 self.rows[args[2]] = {"node": args[2], "label": flags["--label"],
                                       "kind": flags["--kind"],
+                                      "address": flags.get("--address"),
                                       "coolify_connection": flags["--coolify-connection"],
                                       "coolify_server": flags["--coolify-server"],
                                       "coolify_resource": flags["--coolify-resource"],
@@ -325,8 +326,11 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
         '  codex: {}\n'
         '  work: {}\n')
 
+    # Made through a granted connection, the row records the Coolify by its
+    # address and the server's address, as a lent connection's row does.
     assert lab.fake.rows[BOX1] == {"node": BOX1, "label": "box1", "kind": "server",
-                                     "coolify_connection": "infra",
+                                     "address": "203.0.113.7",
+                                     "coolify_connection": "https://coolify.invalid",
                                      "coolify_server": "srv-uuid",
                                      "coolify_resource": "svc-new", "public_key": None}
     answer = json.loads(capsys.readouterr().out)
@@ -1631,7 +1635,8 @@ def test_a_lent_node_is_reached_through_the_address_its_first_lent_reach_records
     assert lab.fake.rows[BOX1]["address"] == "203.0.113.7"
     # Nothing is lent now, and no coolify connection is granted or asked.
     lab.m._NODE_LENT.clear()
-    monkeypatch.setattr(lab.m, "_agent_node_records", lambda: pytest.fail("asked for a grant"))
+    monkeypatch.setattr(lab.m, "_agent_node_records", lambda: SimpleNamespace(
+        connections=lambda *a, **kw: {}))
     lab.fake.calls.clear()
     _target, host, container = lab.m._agent_node_reach(lab.root, lab.fake.rows[BOX1], write=True)
     assert (host["address"], container) == ("203.0.113.7", "abc123")
@@ -1644,8 +1649,6 @@ def test_a_lent_node_is_reached_through_the_address_its_first_lent_reach_records
     # A lent node whose row records no address still needs it lent: the
     # connections visible here are read for one kept in files at that
     # address, and none is.
-    monkeypatch.setattr(lab.m, "_agent_node_records", lambda: SimpleNamespace(
-        connections=lambda *a, **kw: {}))
     lab.fake.rows[BOX1]["address"] = None
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["true"]))
@@ -1673,3 +1676,27 @@ def test_a_node_made_through_a_connection_kept_in_files_is_reached_through_it(la
     with pytest.raises(lab.m.NodeFailure) as refused:
         lab.m._agent_node_target({**row, "coolify_connection": "https://other.invalid"})
     assert refused.value.code == "coolify_connection_required"
+
+
+def test_a_node_made_through_a_granted_connection_is_reached_by_its_address_and_key(
+        lab, monkeypatch, capsys):
+    # The granted connection names an SSH key; the row create writes reads as
+    # a lent node's, and exec reaches it with that key, asking Coolify nothing.
+    monkeypatch.setattr(lab.m, "_agent_node_records", lambda: SimpleNamespace(
+        connections=lambda *a, **k: {"infra": {"enabled": True, "allow_write": True, "value": {
+            "base_url": "https://coolify.invalid/", "ssh": {"key_path": "/keys/infra"}}}}))
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    row = lab.fake.rows[BOX1]
+    assert (row["address"], row["coolify_connection"]) == ("203.0.113.7",
+                                                           "https://coolify.invalid")
+    lab.fake.calls.clear()
+    ran = []
+    monkeypatch.setattr(lab.m.subprocess, "call", lambda argv, **kw: ran.append(argv) or 0)
+    with pytest.raises(SystemExit) as exited:
+        lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["true"]))
+    assert exited.value.code == 0 and ran[0][-2] == "root@203.0.113.7"
+    assert ran[0][ran[0].index("-i") + 1] == "/keys/infra"
+    assert not lab.fake.of("coolify")
+    # Update and remove still reach Coolify through that connection.
+    assert lab.m._agent_node_target(row) == {"connection": "infra"}
