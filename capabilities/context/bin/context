@@ -74,6 +74,18 @@ GLOBAL DOCUMENTS
   transfer, enable and disable are writes (exit 4 `read_only_switch` under
   CAPABILITIES_READ_ONLY).
 
+DRAFTS  (a draft is never read: list, show, history, diff, export and the
+  composed context see only versions)
+  context draft save <name>     the file form as the document's one draft
+  context draft show <name>     the draft, with its base and the active version
+  context draft discard <name>  remove the draft
+  context draft publish <name>  the draft as one new version, against its base
+
+  A document holds at most one draft. Saving it again writes over it and
+  adds no version; publish adds exactly one, or refuses (exit 7
+  `stale_base`, naming the draft's base and the active version) when
+  another save came after the base. save, discard and publish are writes.
+
 EXPORTING
   context export [DIR]          each document's active version, out to DIR
 
@@ -82,8 +94,9 @@ EXPORTING
 STORE
   The tables are context_documents (one row per document: project, or none
   and its author project for a global one, name, created, retired),
-  context_versions (one row per version) and context_enablements (one row
-  per global document a project has enabled), in the schema the project's
+  context_versions (one row per version), context_enablements (one row
+  per global document a project has enabled) and context_drafts (one row
+  per document with a draft), in the schema the project's
   store setting names, migrated under the `context` ledger: the
   AGENTKIT_DB_* keys in the project's .env.local and .env, then the same keys
   in the environment, then the machine's store setting that `capabilities
@@ -97,14 +110,15 @@ I/O
 
 EXIT CODES
   0 success
-  3 not found - no document of that name, no version of that id
+  3 not found - no document of that name, no version of that id, no draft
   4 policy - context not enabled, the read-only switch, a change to a global
     document by a project that is not its author
   5 store - unreachable or busy
   6 input - a malformed argument or file, no store configured, no project or
     project identity, a folder that does not resolve, text that looks like a
     secret in a global document
-  7 stale - the base a save names is no longer the active version
+  7 stale - the base a save or a publish names is no longer the active
+    version
 """
 
 import argparse
@@ -142,6 +156,8 @@ CRED_KEYS: list = []
 # Every verb that changes the store's documents; each is refused under the
 # read-only switch. `export` reads the store and writes only the folder named.
 WRITE_VERBS = {"save", "retire", "import", "transfer", "enable", "disable"}
+# The draft verbs that write; `draft show` reads.
+DRAFT_WRITES = {"save", "discard", "publish"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/context/guides/")
@@ -203,14 +219,15 @@ _HELP_TAIL = """
 
   EXIT CODES
   0 success
-  3 not found - no document of that name, no version of that id
+  3 not found - no document of that name, no version of that id, no draft
   4 policy - context not enabled, the read-only switch, a change to a global
     document by a project that is not its author
   5 store - unreachable or busy
   6 input - a malformed argument or file, no store configured, no project or
     project identity, a folder that does not resolve, text that looks like a
     secret in a global document
-  7 stale - the base a save names is no longer the active version
+  7 stale - the base a save or a publish names is no longer the active
+    version
 """
 _HELP_SWITCH = """\
 context enable <name>
@@ -283,10 +300,12 @@ context list [--global] [--json]
   --json     the structured answer
 
   Output: plain text, one line per document - name, load, order, title, and
-  `(global, by <author>)`, `(shadows a global document)` or `(enabled)`
-  where they apply - or `no project documents` / `no global documents`.
-  With --json: {scope, project, count, documents: [{name, version, title,
-  load, order, saved_at, origin, author?, enabled?, shadows_global?}]}.
+  `(global, by <author>)`, `(shadows a global document)`, `(enabled)` or
+  `(draft)` where they apply - or `no project documents` / `no global
+  documents`. The version and title are the active version's, never a
+  draft's. With --json: {scope, project, count, documents: [{name,
+  version, title, load, order, saved_at, origin, draft, author?, enabled?,
+  shadows_global?}]}; `draft` is true where the document holds a draft.
 
   Exit codes: 0; 4 policy; 5 store; 6 no store configured, no project.
 
@@ -437,6 +456,88 @@ context transfer <name> --to PROJECT_ID
 
   Example: context transfer guidelines/SHARED --to <PROJECT_ID>
 """ + _HELP_WRITE + _HELP_GLOBAL_DOCS + _HELP_TAIL,
+    "draft save": """\
+context draft save <name> --from FILE|- [--base ID] [--global]
+
+  Save the file form read from FILE, or stdin with `-`, as the document's
+  draft. Adds no version: list, show, history, diff, export and the
+  composed context still read the active version. A document holds one
+  draft; saving again writes over its text and keeps its base. The base
+  is the version the draft was made from: --base ID where given, else the
+  draft's base where one is already held, else the active version. The
+  document must exist: a new document starts with `context save`.
+
+  --from FILE|-   the document in the file form, from FILE or stdin; required
+  --base ID       the version the draft is made from
+  --global        the global document's draft, as its author
+
+  Output: {scope, project, name, outcome, changed, base, active, stale,
+  saved_at, saved_by}: outcome `created` or `saved`; `stale` is true when
+  the base is no longer the active version.
+
+  Exit codes: 0; 3 no document of that name, a --base that names no
+  version; 4 policy, the read-only switch, system_agent, not_author; 5
+  store; 6 input, not_canonical, secret_like_text.
+
+  Example: context draft save identity/MISSION --from - < MISSION.md
+""" + _HELP_IDS + _HELP_WRITE + _HELP_GLOBAL + _HELP_SECRET + _HELP_TAIL,
+    "draft show": """\
+context draft show <name> [--global] [--json]
+
+  The document's draft in the file form. --json adds its base, the active
+  version, whether the base is stale, and who saved it when.
+
+  --global   the global document's draft
+  --json     the structured answer
+
+  Output: the draft in the file form. With --json: {name, scope, project,
+  base, active, stale, saved_at, saved_by, content}.
+
+  Exit codes: 0; 3 no document of that name, no draft (`no_draft`); 4
+  policy; 5 store; 6 a malformed name.
+
+  Example: context draft show identity/MISSION --json
+""" + _HELP_GLOBAL + _HELP_TAIL,
+    "draft discard": """\
+context draft discard <name> [--global]
+
+  Remove the document's draft; its versions are untouched. Safe to
+  repeat: with no draft, answers `"changed": false`.
+
+  --global   the global document's draft, as its author
+
+  Output: {name, scope, project, changed, base}.
+
+  Exit codes: 0; 3 no document of that name; 4 policy, the read-only
+  switch, system_agent, not_author; 5 store; 6 a malformed name.
+
+  Example: context draft discard identity/MISSION
+""" + _HELP_WRITE + _HELP_GLOBAL + _HELP_TAIL,
+    "draft publish": """\
+context draft publish <name> [--base ID] [--note TEXT] [--global]
+
+  Turn the draft into the document's new active version, against the
+  draft's base, and remove the draft, in one transaction. When another
+  save came after the base, the publish is refused (exit 7 `stale_base`,
+  naming the draft's base and the active version) and the draft stays:
+  `context diff <name> <base>` shows what changed since, and publishing
+  again with --base naming the active version confirms the draft over it.
+  A draft equal to the active version adds no version, answers `"changed":
+  false`, and is removed.
+
+  --base ID     publish against this version instead of the draft's base
+  --note TEXT   why it changed
+  --global      publish the global document's draft, as its author
+
+  Output: {scope, project, changed, name, outcome, version, base?,
+  author?}: outcome `versioned` or `unchanged`, as `save` answers.
+
+  Exit codes: 0; 3 no document of that name, no draft (`no_draft`), a
+  --base that names no version; 4 policy, the read-only switch,
+  system_agent, not_author; 5 store; 7 stale_base.
+
+  Example: context draft publish identity/MISSION --note "scope widened"
+""" + _HELP_IDS + _HELP_WRITE + _HELP_GLOBAL + _HELP_TAIL,
     "enable": _HELP_SWITCH,
     "disable": _HELP_SWITCH,
     "export": """\
@@ -481,7 +582,7 @@ def _cmd_connections() -> None:
 # versions reference their document by a foreign key: both tables are this
 # capability's own and a document is retired rather than deleted, so the key
 # never blocks a write and refuses only a version of no document.
-LEDGER_MAJOR, LEDGER_MINOR = 2, 1
+LEDGER_MAJOR, LEDGER_MINOR = 2, 2
 _NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$"
 # The store's foreign keys (core 4.0): every agent and node column of this
 # owner keyed by what its parent takes with it - owned rows go with it, a
@@ -675,6 +776,31 @@ LEDGER_STEPS = [
         'The global document enabled: a context_documents row with no agent.';
     """),
     _M9Step("0007-keys", _M9_KEYS_SQL, core=(4, 0)),
+    # A draft is the one edit of a document not yet published: no reader
+    # reads it, publishing makes it one version, and discarding deletes it.
+    # A row per document, so a draft is written over in place rather than
+    # versioned; a second author would make the key (document_id, agent_id).
+    _M9Step("0008-drafts", """
+    CREATE TABLE context_drafts (
+        agent_id         text NOT NULL CHECK (agent_id <> '')
+                         REFERENCES agents (id) ON DELETE CASCADE,
+        document_id      uuid PRIMARY KEY REFERENCES context_documents (id) ON DELETE CASCADE,
+        base_version_id  uuid NOT NULL REFERENCES context_versions (id) ON DELETE CASCADE,
+        content          text NOT NULL,
+        saved_at         timestamptz NOT NULL DEFAULT now(),
+        saved_by         text NOT NULL CHECK (saved_by <> '')
+    );
+    COMMENT ON TABLE context_drafts IS
+        'The one unpublished edit of a document: never read as doctrine. Publishing adds it as one version of context_versions against its base and deletes the row; discarding deletes it.';
+    COMMENT ON COLUMN context_drafts.agent_id IS
+        'The agent that saved the draft: the document''s own agent, or a global document''s author.';
+    COMMENT ON COLUMN context_drafts.base_version_id IS
+        'The version the draft was made from; publishing is refused while another version is active.';
+    COMMENT ON COLUMN context_drafts.content IS
+        'The draft in the file form a save reads, front matter and body, checked when saved.';
+    COMMENT ON COLUMN context_drafts.saved_by IS
+        'Who saved it last: user@node.';
+    """, core=(4, 0)),
 ]
 
 
@@ -1012,7 +1138,8 @@ def cmd_list(args) -> None:
                      "(d.agent_id IS NOT NULL AND EXISTS (SELECT 1 FROM context_documents g "
                      "JOIN context_enablements e ON e.document_id = g.id "
                      "AND e.agent_id = d.agent_id WHERE g.agent_id IS NULL "
-                     "AND g.name = d.name AND g.retired_at IS NULL)) AS shadows_global "
+                     "AND g.name = d.name AND g.retired_at IS NULL)) AS shadows_global, "
+                     "EXISTS (SELECT 1 FROM context_drafts r WHERE r.document_id = d.id) AS draft "
                      "FROM context_documents d JOIN context_versions v "
                      "ON v.document_id = d.id AND v.active "
                      f"WHERE d.retired_at IS NULL AND {where} ORDER BY d.name",
@@ -1023,7 +1150,7 @@ def cmd_list(args) -> None:
             item = {"name": r["name"], "version": str(r["id"]), "title": r["title"],
                     "load": r["load"], "order": r["position"],
                     "saved_at": _moment(r["created_at"]),
-                    "origin": "global" if r["global"] else "own"}
+                    "origin": "global" if r["global"] else "own", "draft": r["draft"]}
             if r["global"]:
                 item["author"] = r["author_agent_id"]
                 if project is not None:
@@ -1043,6 +1170,7 @@ def cmd_list(args) -> None:
                        if r["global"] else "")
                     + ("  (shadows a global document)" if r["shadows_global"] else "")
                     + ("  (enabled)" if args.is_global and project and r["enabled"] else "")
+                    + ("  (draft)" if r["draft"] else "")
                     for r in rows))
 
 
@@ -1187,6 +1315,126 @@ def cmd_save(args) -> None:
                                     author=author)
     if args.is_global:
         outcome["author"] = author
+    _emit({"scope": _scope_label(project), "project": project,
+           "changed": outcome["outcome"] != "unchanged", **outcome})
+
+
+# ── drafts ──────────────────────────────────────────────────────────────────
+
+def _draft(conn, document_id, lock: bool = False) -> dict | None:
+    return _one(conn, "SELECT agent_id, document_id, base_version_id, content, saved_at, "
+                "saved_by FROM context_drafts WHERE document_id = %s"
+                + (" FOR UPDATE" if lock else ""), (document_id,))
+
+
+def _need_draft(conn, document: dict, lock: bool = False) -> dict:
+    found = _draft(conn, document["id"], lock)
+    if found is None:
+        _die(3, "no_draft", f"{document['name']!r} holds no draft",
+             f"`{NAME} draft save {document['name']} --from -` starts one")
+    return found
+
+
+def _draft_target(conn, args, name: str) -> tuple[str | None, str | None, dict]:
+    """The scope, the writing project and the locked document a draft write
+    addresses; a global document's draft is written by its author alone."""
+    project = _scope(args.is_global, write=True)
+    writer = _here(write=True) if args.is_global else project
+    document = _need_document(conn, project, name, lock=True)
+    if project is None:
+        _authored(document, writer)
+    return project, writer, document
+
+
+def cmd_draft_save(args) -> None:
+    name = _check_name(args.name)
+    try:
+        text = (sys.stdin.read() if args.source == "-"
+                else _read_text(Path(args.source)))
+        parse(text)
+    except OSError as exc:
+        _die(6, "input", f"--from {args.source}: {exc.strerror or exc}")
+    except Unreadable as exc:
+        _die(6, "not_canonical", f"--from {args.source} is not the file form: {exc}",
+             f"`{NAME} help` shows the file form; `{NAME} show {name}` prints one")
+    if args.is_global:
+        found = _secret_like(text)
+        if found:
+            _refuse_secret(f"--from {args.source}", found)
+    with _store() as conn:
+        with conn.transaction():
+            project, writer, document = _draft_target(conn, args, name)
+            held = _draft(conn, document["id"], lock=True)
+            active = _active(conn, document["id"])
+            if args.base:
+                base = _version(conn, document, args.base)["id"]
+            elif held is not None:
+                base = held["base_version_id"]
+            else:
+                base = active["id"]
+            saved = _one(conn, "INSERT INTO context_drafts (agent_id, document_id, "
+                         "base_version_id, content, saved_by) VALUES (%s, %s, %s, %s, %s) "
+                         "ON CONFLICT (document_id) DO UPDATE SET agent_id = excluded.agent_id, "
+                         "base_version_id = excluded.base_version_id, content = excluded.content, "
+                         "saved_at = now(), saved_by = excluded.saved_by "
+                         "RETURNING saved_at, saved_by",
+                         (writer, document["id"], base, text, _actor()))
+    _emit({"scope": _scope_label(project), "project": project, "name": name,
+           "outcome": "created" if held is None else "saved",
+           "changed": held is None or (held["content"], held["base_version_id"]) != (text, base),
+           "base": str(base), "active": str(active["id"]), "stale": base != active["id"],
+           "saved_at": _moment(saved["saved_at"]), "saved_by": saved["saved_by"]})
+
+
+def cmd_draft_show(args) -> None:
+    name = _check_name(args.name)
+    project = _scope(args.is_global, write=False)
+    with _store() as conn:
+        document = _need_document(conn, project, name)
+        draft = _need_draft(conn, document)
+        active = _active(conn, document["id"])
+    if args.json:
+        _emit({"name": name, "scope": _scope_label(project), "project": project,
+               "base": str(draft["base_version_id"]), "active": str(active["id"]),
+               "stale": draft["base_version_id"] != active["id"],
+               "saved_at": _moment(draft["saved_at"]), "saved_by": draft["saved_by"],
+               "content": draft["content"]})
+        return
+    sys.stdout.write(draft["content"])
+
+
+def cmd_draft_discard(args) -> None:
+    name = _check_name(args.name)
+    with _store() as conn:
+        with conn.transaction():
+            project, _writer, document = _draft_target(conn, args, name)
+            gone = _one(conn, "DELETE FROM context_drafts WHERE document_id = %s "
+                        "RETURNING base_version_id", (document["id"],))
+    _emit({"name": name, "scope": _scope_label(project), "project": project,
+           "changed": gone is not None,
+           "base": str(gone["base_version_id"]) if gone else None})
+
+
+def cmd_draft_publish(args) -> None:
+    name = _check_name(args.name)
+    note = args.note.strip() if args.note and args.note.strip() else None
+    with _store() as conn:
+        with conn.transaction():
+            project, writer, document = _draft_target(conn, args, name)
+            draft = _need_draft(conn, document, lock=True)
+            base = (_version(conn, document, args.base)["id"] if args.base
+                    else draft["base_version_id"])
+            active = _active(conn, document["id"])
+            if active["id"] != base:
+                _die(7, "stale_base", f"the draft of {name!r} is based on {base}, and "
+                     f"{active['id']} was saved after it and is the active version",
+                     f"`{NAME} diff {name} {base}` shows what changed since; publish again "
+                     f"with --base {active['id']} to publish the draft over it")
+            outcome = _save_version(conn, project, name, parse(draft["content"]), str(base),
+                                    note, _actor(), author=writer if project is None else None)
+            _rows(conn, "DELETE FROM context_drafts WHERE document_id = %s", (document["id"],))
+    if args.is_global:
+        outcome["author"] = writer
     _emit({"scope": _scope_label(project), "project": project,
            "changed": outcome["outcome"] != "unchanged", **outcome})
 
@@ -1456,6 +1704,22 @@ def _parser() -> argparse.ArgumentParser:
     transfer.add_argument("--to", required=True)
     for switch in ("enable", "disable"):
         verb(switch).add_argument("name")
+    draft = sub.add_parser("draft", add_help=False, allow_abbrev=False)
+    drafts = draft.add_subparsers(dest="draft_cmd", required=True)
+
+    def draft_verb(name: str) -> argparse.ArgumentParser:
+        one = drafts.add_parser(name, add_help=False, allow_abbrev=False)
+        one.add_argument("name")
+        one.add_argument("--global", dest="is_global", action="store_true")
+        return one
+    draft_save = draft_verb("save")
+    draft_save.add_argument("--from", dest="source", required=True)
+    draft_save.add_argument("--base")
+    draft_verb("show").add_argument("--json", action="store_true")
+    draft_verb("discard")
+    draft_publish = draft_verb("publish")
+    draft_publish.add_argument("--base")
+    draft_publish.add_argument("--note")
     verb("import").add_argument("dir", nargs="?")
     verb("export").add_argument("dir", nargs="?")
     return parser
@@ -1470,6 +1734,9 @@ def _parse(argv: list[str]):
     for action in parser._subparsers._group_actions:
         for one in action.choices.values():
             one.error = refuse
+            for inner in getattr(one._subparsers, "_group_actions", ()):
+                for leaf in inner.choices.values():
+                    leaf.error = refuse
     return parser.parse_args(argv)
 
 
@@ -1484,9 +1751,14 @@ def main() -> None:
     if args.cmd == "help":
         _cmd_help()
         return
-    if args.cmd in WRITE_VERBS:
-        _read_only_gate(f"`{NAME} {args.cmd}`")
-        _system_agent_gate(f"`{NAME} {args.cmd}`")
+    if args.cmd in WRITE_VERBS or (args.cmd == "draft" and args.draft_cmd in DRAFT_WRITES):
+        verb = args.cmd if args.cmd != "draft" else f"draft {args.draft_cmd}"
+        _read_only_gate(f"`{NAME} {verb}`")
+        _system_agent_gate(f"`{NAME} {verb}`")
+    if args.cmd == "draft":
+        {"save": cmd_draft_save, "show": cmd_draft_show, "discard": cmd_draft_discard,
+         "publish": cmd_draft_publish}[args.draft_cmd](args)
+        return
     if args.cmd == "doctor":
         cmd_doctor()
         return

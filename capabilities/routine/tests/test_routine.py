@@ -252,7 +252,8 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'routine' ORDER BY step")]
     assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
-                     "0005-enablements", "0006-disabled", "0007-agent-names", "0008-keys"]
+                     "0005-enablements", "0006-disabled", "0007-agent-names", "0008-keys",
+                     "0009-drafts"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["routine_versions_active"]
@@ -306,7 +307,7 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypa
     from capabilities_contract import db
     cli = load_module()
     old = [step for step in cli.LEDGER_STEPS
-           if step[0] not in ("0007-agent-names", "0008-keys")]
+           if step[0] not in ("0007-agent-names", "0008-keys", "0009-drafts")]
     with psycopg.connect(lab.cluster.url(lab.database), autocommit=True) as conn:
         db.migrate(conn, "routine", old, major=1, minor=2, schema=SCHEMA)
         conn.execute(f"SET search_path TO {SCHEMA}")
@@ -333,8 +334,8 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypa
         result = db.migrate(conn, "routine", cli.LEDGER_STEPS, major=cli.LEDGER_MAJOR,
                             minor=cli.LEDGER_MINOR, schema=SCHEMA)
         monkeypatch.delenv(db.UPGRADE_ENV)
-        assert result.applied == ["0007-agent-names", "0008-keys"]
-        assert (result.major, result.minor) == (2, 1)
+        assert result.applied == ["0007-agent-names", "0008-keys", "0009-drafts"]
+        assert (result.major, result.minor) == (2, 2)
         conn.execute(f"SET search_path TO {SCHEMA}")
         assert conn.execute("SELECT name, agent_id, author_agent_id FROM routine_documents "
                             "ORDER BY name").fetchall() == [
@@ -486,6 +487,125 @@ def test_a_new_name_starts_a_routine_and_its_only_version_diffs_against_nothing(
     assert (code, error["code"]) == (6, "input")
 
 
+# --- drafts ----------------------------------------------------------------------
+
+def _versions(lab, name: str) -> list[str]:
+    return [v["version"] for v in lab.ok("history", name, "--json")["versions"]]
+
+
+def test_saving_a_draft_twice_adds_no_version_and_no_reader_sees_it(lab):
+    lab.ok("import")
+    before = _versions(lab, "pitstop")
+    active = before[0]
+    first = FILES["pitstop.md"].replace("Üks rida.", "drafted once")
+    second = FILES["pitstop.md"].replace("Üks rida.", "drafted twice")
+    made = lab.ok("draft", "save", "pitstop", "--from", "-", stdin=first)
+    assert (made["scope"], made["outcome"], made["changed"], made["base"], made["stale"]) == (
+        "project", "created", True, active, False)
+    again = lab.ok("draft", "save", "pitstop", "--from", "-", stdin=second)
+    assert (again["outcome"], again["changed"], again["base"]) == ("saved", True, active)
+    assert _versions(lab, "pitstop") == before
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.routine_drafts") == [(1,)]
+    assert lab.run("draft", "show", "pitstop").stdout == second
+    shown = lab.ok("draft", "show", "pitstop", "--json")
+    assert (shown["base"], shown["active"], shown["content"]) == (active, active, second)
+    assert shown["saved_by"] == f"tester@{TEST_NODE}"
+    [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.routine_drafts",))
+    assert comment
+
+    # Every reader still reads the active version.
+    assert lab.run("show", "pitstop").stdout == FILES["pitstop.md"]
+    assert lab.ok("show", "pitstop", "--json")["version"] == active
+    assert "drafted" not in lab.run("diff", "pitstop").stdout
+    assert "drafted" not in json.dumps(lab.ok("titles", "--json"))
+    out = lab.tmp / "out"
+    lab.ok("export", str(out))
+    assert (out / "pitstop.md").read_text() == FILES["pitstop.md"]
+    listed = {r["name"]: r for r in lab.ok("list", "--store", "--json")["routines"]}
+    assert (listed["pitstop"]["draft"], listed["pitstop"]["version"]) == (True, active)
+    assert listed["defect-intake"]["draft"] is False
+    assert "(draft)" in next(line for line in lab.run("list", "--store").stdout.splitlines()
+                             if line.startswith("pitstop"))
+
+    code, error = lab.refused("draft", "save", "pitstop", "--from", "-", stdin="no front\n")
+    assert (code, error["code"]) == (6, "not_canonical")
+    code, error = lab.refused("draft", "save", "fresh", "--from", "-",
+                              stdin=first.replace("name: pitstop", "name: fresh"))
+    assert (code, error["code"]) == (3, "not_found")
+    code, error = lab.refused("draft", "show", "defect-intake")
+    assert (code, error["code"]) == (3, "no_draft")
+
+
+def test_publish_makes_one_version_against_the_base_and_refuses_a_moved_one(lab):
+    lab.ok("import")
+    base = _versions(lab, "pitstop")[0]
+    drafted = FILES["pitstop.md"].replace("Üks rida.", "drafted")
+    lab.ok("draft", "save", "pitstop", "--from", "-", stdin=drafted)
+    published = lab.ok("draft", "publish", "pitstop", "--note", "from the draft")
+    assert (published["outcome"], published["changed"], published["base"]) == (
+        "versioned", True, base)
+    assert _versions(lab, "pitstop") == [published["version"], base]
+    assert lab.run("show", "pitstop").stdout == drafted
+    assert lab.ok("history", "pitstop", "--json")["versions"][0]["note"] == "from the draft"
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.routine_drafts") == [(0,)]
+    code, error = lab.refused("draft", "publish", "pitstop")
+    assert (code, error["code"]) == (3, "no_draft")
+
+    # Another save moves the base under a held draft: publish names both and keeps it.
+    lab.ok("draft", "save", "pitstop", "--from", "-",
+           stdin=drafted.replace("drafted", "drafted again"))
+    moved = lab.ok("save", "pitstop", "--from", "-",
+                   stdin=drafted.replace("drafted", "saved directly"))
+    assert lab.ok("draft", "show", "pitstop", "--json")["stale"] is True
+    code, error = lab.refused("draft", "publish", "pitstop")
+    assert (code, error["code"]) == (7, "stale_base")
+    assert published["version"] in error["message"] and moved["version"] in error["message"]
+    assert _versions(lab, "pitstop")[0] == moved["version"]
+    assert lab.ok("draft", "show", "pitstop", "--json")["base"] == published["version"]
+    confirmed = lab.ok("draft", "publish", "pitstop", "--base", moved["version"])
+    assert (confirmed["outcome"], confirmed["base"]) == ("versioned", moved["version"])
+    assert len(_versions(lab, "pitstop")) == 4
+    assert "drafted again" in lab.run("show", "pitstop").stdout
+
+    # A draft equal to the active version adds none and is removed.
+    lab.ok("draft", "save", "pitstop", "--from", "-", stdin=lab.run("show", "pitstop").stdout)
+    same = lab.ok("draft", "publish", "pitstop")
+    assert (same["changed"], same["outcome"]) == (False, "unchanged")
+    assert len(_versions(lab, "pitstop")) == 4
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.routine_drafts") == [(0,)]
+
+
+def test_discard_removes_the_draft_and_leaves_the_versions(lab):
+    lab.ok("import")
+    before = _versions(lab, "pitstop")
+    lab.ok("draft", "save", "pitstop", "--from", "-",
+           stdin=FILES["pitstop.md"].replace("Üks rida.", "gone"))
+    gone = lab.ok("draft", "discard", "pitstop")
+    assert (gone["changed"], gone["base"]) == (True, before[0])
+    assert lab.ok("draft", "discard", "pitstop")["changed"] is False
+    assert _versions(lab, "pitstop") == before
+    assert not any(r["draft"] for r in lab.ok("list", "--store", "--json")["routines"])
+    code, error = lab.refused("draft", "show", "pitstop")
+    assert (code, error["code"]) == (3, "no_draft")
+
+
+def test_a_global_routine_s_draft_is_its_author_s(lab):
+    other = _other_project(lab)
+    lab.ok("save", "shared", "--from", "-", "--global", stdin=SHARED, **other)
+    text = SHARED.replace("# Shared", "# Shared draft")
+    code, error = lab.refused("draft", "save", "shared", "--global", "--from", "-", stdin=text)
+    assert (code, error["code"]) == (4, "not_author")
+    made = lab.ok("draft", "save", "shared", "--global", "--from", "-", stdin=text, **other)
+    assert made["scope"] == "global"
+    assert lab.run("show", "shared", "--global").stdout == SHARED
+    assert {r["name"]: r["draft"] for r in
+            lab.ok("list", "--store", "--global", "--json")["routines"]}["shared"] is True
+    assert lab.refused("draft", "publish", "shared", "--global")[1]["code"] == "not_author"
+    published = lab.ok("draft", "publish", "shared", "--global", **other)
+    assert (published["global"], published["outcome"]) == (True, "versioned")
+    assert lab.run("show", "shared", "--global").stdout == text
+
+
 # --- list, retire, the read-only switch ------------------------------------------
 
 def test_list_store_lists_the_store_and_retire_frees_a_name(lab):
@@ -552,7 +672,9 @@ def test_a_system_agent_s_routines_are_not_written(lab):
     lab.sql(f"INSERT INTO {SCHEMA}.agents (id, kind) VALUES (%s, 'system') "
             "ON CONFLICT (id) DO UPDATE SET kind = 'system'", (PROJECT_ID,))
     for args in (("save", "pitstop", "--from", "-"), ("retire", "pitstop"), ("import",),
-                 ("title", "pitstop", "Pit stop"), ("disable", "pitstop")):
+                 ("title", "pitstop", "Pit stop"), ("disable", "pitstop"),
+                 ("draft", "save", "pitstop", "--from", "-"), ("draft", "discard", "pitstop"),
+                 ("draft", "publish", "pitstop")):
         code, error = lab.refused(*args, stdin=FILES["pitstop.md"])
         assert (code, error["code"]) == (4, "system_agent"), args
     assert lab.run("list", "--store").returncode == 0
@@ -561,7 +683,9 @@ def test_a_system_agent_s_routines_are_not_written(lab):
 
 def test_the_read_only_switch_refuses_every_write(lab):
     lab.ok("import")
-    for args in (("save", "pitstop", "--from", "-"), ("retire", "pitstop"), ("import",)):
+    for args in (("save", "pitstop", "--from", "-"), ("retire", "pitstop"), ("import",),
+                 ("draft", "save", "pitstop", "--from", "-"), ("draft", "discard", "pitstop"),
+                 ("draft", "publish", "pitstop")):
         code, error = lab.refused(*args, stdin=FILES["pitstop.md"],
                                   CAPABILITIES_READ_ONLY="1")
         assert (code, error["code"]) == (4, "read_only_switch")

@@ -186,7 +186,7 @@
       "level": 0,
       "lucide_icon": "archive",
       "path": "capabilities/assets",
-      "payload_sha256": "37f2957cba85d94c2205a6e3406cab074c917f58d887ef3f1a767cc81b072c9a",
+      "payload_sha256": "12ddb83a406dd52ef5c98550297982e328733512379c0f6fc1b4cdd56b5a948b",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder.",
@@ -202,7 +202,7 @@
           "title": "Материалы"
         }
       },
-      "version": "2026-11-21 — `assets help` is the menu, and every verb answers `assets help <verb>` with its whole contract"
+      "version": "2026-11-23 — A document can hold one draft: saving it adds no version, and publishing it adds one against its base"
     },
     "automations": {
       "executable": [
@@ -435,7 +435,7 @@
       "level": 0,
       "lucide_icon": "book-open",
       "path": "capabilities/context",
-      "payload_sha256": "7c45e3ee47ada0a1e305a909f6039b9d8b5cdd4819a3a1c3a823bdbaa324d9e7",
+      "payload_sha256": "c555fcd20907b786e7a5feacfb557529bb81bfb3831185d8e3533e49c5c0beb9",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte.",
@@ -451,7 +451,7 @@
           "title": "Контекст"
         }
       },
-      "version": "2026-11-21 — `context help` is the menu, and `context help <verb>` one verb's whole contract"
+      "version": "2026-11-23 — A document can hold one draft: saving it adds no version, and publishing it adds one against its base"
     },
     "coolify": {
       "executable": [
@@ -1095,7 +1095,7 @@
       "level": 0,
       "lucide_icon": "list-ordered",
       "path": "capabilities/routine",
-      "payload_sha256": "9374a9411b9347445997b209283767cd4fe6086699b27b58ee0de592af946bba",
+      "payload_sha256": "b071a1c4da21da37c10f4308518caf0589b92b756d264947d55c2f11915b44d8",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte.",
@@ -1111,7 +1111,7 @@
           "title": "Процедуры"
         }
       },
-      "version": "2026-11-22 — `routine help` is the menu, and `routine help <verb>` one verb's whole contract"
+      "version": "2026-11-23 — A routine in the store can hold one draft: saving it adds no version, and publishing it adds one against its base"
     },
     "signoz": {
       "executable": [
@@ -1456,7 +1456,7 @@
       "level": 1,
       "lucide_icon": "users",
       "path": "capabilities/teams",
-      "payload_sha256": "b9792c8b0626b9dfee9be1743046ed98df56f8671c01652c79e128be9cf4f55a",
+      "payload_sha256": "375792c5749d6f4144cb03516fb5864180c21bb6c691ea575e7771698f95a41f",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
@@ -1472,7 +1472,7 @@
           "title": "Команды"
         }
       },
-      "version": "2026-11-23 — A document's own load decides what reaches a member; the team mode is gone, and a write that changes what members carry says what it costs them, at teams 1.3"
+      "version": "2026-11-23 — A team document can hold one draft: saving it adds no version, and publishing it adds one against its base, at teams 1.4"
     },
     "telegram": {
       "executable": [

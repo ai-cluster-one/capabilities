@@ -210,8 +210,10 @@ def test_the_ledger_creates_the_tables_with_their_comments_and_guard(lab):
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'teams' ORDER BY step")]
     assert steps == ["0001-teams", "0002-members", "0003-documents", "0004-versions",
-                     "0005-versions-guard", "0006-keys", "0007-ids", "0008-load-decides"]
-    for table in ("teams_teams", "teams_members", "teams_documents", "teams_versions"):
+                     "0005-versions-guard", "0006-keys", "0007-ids", "0008-load-decides",
+                     "0009-drafts"]
+    for table in ("teams_teams", "teams_members", "teams_documents", "teams_versions",
+                  "teams_drafts"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
         assert comment
     lab.team()
@@ -359,6 +361,135 @@ def test_the_manifest_carries_a_constant_contribution_and_no_connection(lab):
     assert (answer["default"], answer["connections"]) == (None, {})
 
 
+# --- drafts ----------------------------------------------------------------------
+
+def _versions(lab, team: str, doc: str) -> list[str]:
+    return [v["version"] for v in lab.ok("doc", "history", team, doc, "--json")["versions"]]
+
+
+def test_saving_a_draft_twice_adds_no_version_and_no_reader_or_member_sees_it(lab):
+    lab.team()
+    lab.register(AGENT)
+    lab.ok("members", "add", "crew", AGENT)
+    active = lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=STYLE)["version"]
+    lab.ok("doc", "save", "crew", "deploy", "--from", "-", stdin=DEPLOY)
+    section = lab.ok("section")
+    first, second = (STYLE.replace("One line", f"Drafted {n}") for n in ("once", "twice"))
+    made = lab.ok("doc", "draft", "save", "crew", "style", "--from", "-", stdin=first)
+    assert (made["team"], made["document"], made["outcome"], made["changed"], made["base"],
+            made["active"], made["stale"]) == ("crew", "style", "created", True, active,
+                                               active, False)
+    again = lab.ok("doc", "draft", "save", "crew", "style", "--from", "-", stdin=second)
+    assert (again["outcome"], again["changed"], again["base"]) == ("saved", True, active)
+    assert lab.ok("doc", "draft", "save", "crew", "style", "--from", "-",
+                  stdin=second)["changed"] is False
+    assert _versions(lab, "crew", "style") == [active]
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.teams_drafts") == [(1,)]
+    assert lab.ok("doc", "draft", "show", "crew", "style") == second
+    shown = lab.ok("doc", "draft", "show", "crew", "style", "--json")
+    assert (shown["base"], shown["active"], shown["stale"], shown["content"]) == (
+        active, active, False, second)
+    assert shown["saved_by"] == f"tester@{TEST_NODE}"
+
+    # Every reader still reads the active version, and no member carries the draft.
+    assert lab.ok("doc", "show", "crew", "style") == STYLE
+    assert lab.ok("doc", "show", "crew", "style", "--json")["version"] == active
+    assert lab.ok("section") == section
+    view = lab.ok("show", "crew", "--json")
+    assert {d["name"]: (d["draft"], d["version"]) for d in view["documents"]} == {
+        "style": (True, active), "deploy": (False, view["documents"][0]["version"])}
+    plain = lab.ok("show", "crew").splitlines()
+    assert next(line for line in plain if "style  always" in line).endswith("(draft)")
+    assert "(draft)" not in next(line for line in plain if "deploy  on-request" in line)
+
+    code, error = lab.refused("doc", "draft", "save", "crew", "style", "--from", "-",
+                              stdin="no front\n")
+    assert (code, error["code"]) == (6, "not_canonical")
+    code, error = lab.refused("doc", "draft", "save", "crew", "fresh", "--from", "-", stdin=first)
+    assert (code, error["code"]) == (3, "not_found")
+    code, error = lab.refused("doc", "draft", "show", "crew", "deploy")
+    assert (code, error["code"]) == (3, "no_draft")
+
+
+def test_publish_makes_one_version_against_the_base_and_refuses_a_moved_one(lab):
+    lab.team()
+    base = lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=STYLE)["version"]
+    drafted = STYLE.replace("One line", "Drafted")
+    lab.ok("doc", "draft", "save", "crew", "style", "--from", "-", stdin=drafted)
+    published = lab.ok("doc", "draft", "publish", "crew", "style", "--note", "from the draft")
+    assert (published["changed"], published["previous"], published["created"]) == (
+        True, base, False)
+    assert _versions(lab, "crew", "style") == [published["version"], base]
+    assert lab.ok("doc", "show", "crew", "style") == drafted
+    assert lab.ok("doc", "history", "crew", "style", "--json")["versions"][0]["note"] == (
+        "from the draft")
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.teams_drafts") == [(0,)]
+    code, error = lab.refused("doc", "draft", "publish", "crew", "style")
+    assert (code, error["code"]) == (3, "no_draft")
+
+    # Another save moves the base under a held draft: publish names both and keeps it.
+    lab.ok("doc", "draft", "save", "crew", "style", "--from", "-",
+           stdin=drafted.replace("Drafted", "Drafted again"))
+    moved = lab.ok("doc", "save", "crew", "style", "--from", "-",
+                   stdin=drafted.replace("Drafted", "Saved directly"))
+    assert lab.ok("doc", "draft", "show", "crew", "style", "--json")["stale"] is True
+    code, error = lab.refused("doc", "draft", "publish", "crew", "style")
+    assert (code, error["code"]) == (7, "stale_base")
+    assert published["version"] in error["message"] and moved["version"] in error["message"]
+    assert _versions(lab, "crew", "style")[0] == moved["version"]
+    assert "Drafted again" in lab.ok("doc", "draft", "show", "crew", "style")
+    confirmed = lab.ok("doc", "draft", "publish", "crew", "style", "--base", moved["version"])
+    assert (confirmed["changed"], confirmed["previous"]) == (True, moved["version"])
+    assert len(_versions(lab, "crew", "style")) == 4
+    assert "Drafted again" in lab.ok("doc", "show", "crew", "style")
+
+    # A draft equal to the active version adds none, and is removed.
+    lab.ok("doc", "draft", "save", "crew", "style", "--from", "-",
+           stdin=lab.ok("doc", "show", "crew", "style"))
+    same = lab.ok("doc", "draft", "publish", "crew", "style")
+    assert (same["changed"], same["version"]) == (False, confirmed["version"])
+    assert len(_versions(lab, "crew", "style")) == 4
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.teams_drafts") == [(0,)]
+
+
+def test_discard_removes_the_draft_and_leaves_the_versions(lab):
+    lab.team()
+    base = lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=STYLE)["version"]
+    lab.ok("doc", "draft", "save", "crew", "style", "--from", "-",
+           stdin=STYLE.replace("One line", "Gone"))
+    gone = lab.ok("doc", "draft", "discard", "crew", "style")
+    assert gone == {"team": "crew", "document": "style", "changed": True, "base": base}
+    assert lab.ok("doc", "draft", "discard", "crew", "style") == {
+        "team": "crew", "document": "style", "changed": False, "base": None}
+    assert _versions(lab, "crew", "style") == [base]
+    assert not any(d["draft"] for d in lab.ok("show", "crew", "--json")["documents"])
+    code, error = lab.refused("doc", "draft", "show", "crew", "style")
+    assert (code, error["code"]) == (3, "no_draft")
+
+
+def test_whoever_is_refused_a_save_is_refused_a_draft_write_and_may_still_read_it(lab):
+    lab.team()
+    lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=STYLE)
+    lab.ok("doc", "draft", "save", "crew", "style", "--from", "-",
+           stdin=STYLE.replace("One line", "Held"))
+    writes = (("doc", "save", "crew", "style", "--from", "-"),
+              ("doc", "draft", "save", "crew", "style", "--from", "-"),
+              ("doc", "draft", "discard", "crew", "style"),
+              ("doc", "draft", "publish", "crew", "style"))
+    for argv in writes:
+        code, error = lab.refused(*argv, stdin=STYLE, CAPABILITIES_READ_ONLY="1")
+        assert (code, error["code"]) == (4, "read_only_switch"), argv
+    assert "Held" in lab.ok("doc", "draft", "show", "crew", "style", CAPABILITIES_READ_ONLY="1")
+    settings = lab.project / "capabilities" / "settings.json"
+    settings.write_text(json.dumps({"capabilities": {"teams": {"enabled": False}}}))
+    for argv in writes:
+        code, _error = lab.refused(*argv, stdin=STYLE)
+        assert code == 4, argv
+    settings.write_text(json.dumps({"capabilities": {"teams": {"enabled": True}}}))
+    assert "Held" in lab.ok("doc", "draft", "show", "crew", "style")
+    assert lab.ok("doc", "show", "crew", "style") == STYLE
+
+
 # --- ids and names ---------------------------------------------------------------
 
 BASE_REF = os.environ.get("TEAMS_BASE_REF", "ccf7b821")
@@ -423,7 +554,7 @@ def test_a_store_at_teams_1_1_keeps_every_team_member_and_document_through_the_i
 
     view = lab.ok("show", "crew", "--json")
     assert lab.sql(f"SELECT major, minor FROM {SCHEMA}.schema_version "
-                   "WHERE owner = 'teams'") == [(1, 3)]
+                   "WHERE owner = 'teams'") == [(1, 4)]
     assert re.fullmatch(r"[0-9a-f]{12}", view["id"])
     assert sorted(view["members"]) == sorted([AGENT, OTHER])
     assert [(d["name"], d["enabled"]) for d in view["documents"]] == [
@@ -638,7 +769,7 @@ def test_the_step_that_retires_the_mode_changes_no_members_context(lab):
     for agent in (AGENT, OTHER):
         assert _section_of(lab, CLI, agent) == before[agent]
     assert lab.sql(f"SELECT major, minor FROM {SCHEMA}.schema_version "
-                   "WHERE owner = 'teams'") == [(1, 3)]
+                   "WHERE owner = 'teams'") == [(1, 4)]
     switched = lab.sql(f"SELECT v.team, v.document, v.load, v.created_by, v.note "
                        f"FROM {SCHEMA}.teams_versions v WHERE v.active "
                        "ORDER BY v.team, v.document")

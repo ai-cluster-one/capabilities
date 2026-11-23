@@ -235,7 +235,7 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'context' ORDER BY step")]
     assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
-                     "0005-enablements", "0006-agent-names", "0007-keys"]
+                     "0005-enablements", "0006-agent-names", "0007-keys", "0008-drafts"]
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["context_versions_active"]
@@ -285,7 +285,7 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypa
     from capabilities_contract import db
     cli = load_module()
     old = [step for step in cli.LEDGER_STEPS
-           if step[0] not in ("0006-agent-names", "0007-keys")]
+           if step[0] not in ("0006-agent-names", "0007-keys", "0008-drafts")]
     with psycopg.connect(lab.cluster.url(lab.database), autocommit=True) as conn:
         db.migrate(conn, "context", old, major=1, minor=1, schema=SCHEMA)
         conn.execute(f"SET search_path TO {SCHEMA}")
@@ -313,8 +313,8 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypa
         result = db.migrate(conn, "context", cli.LEDGER_STEPS, major=cli.LEDGER_MAJOR,
                             minor=cli.LEDGER_MINOR, schema=SCHEMA)
         monkeypatch.delenv(db.UPGRADE_ENV)
-        assert result.applied == ["0006-agent-names", "0007-keys"]
-        assert (result.major, result.minor) == (2, 1)
+        assert result.applied == ["0006-agent-names", "0007-keys", "0008-drafts"]
+        assert (result.major, result.minor) == (2, 2)
         conn.execute(f"SET search_path TO {SCHEMA}")
         assert conn.execute("SELECT name, agent_id, author_agent_id FROM context_documents "
                             "ORDER BY name").fetchall() == [
@@ -431,6 +431,114 @@ def test_save_adds_a_version_against_its_base_and_refuses_a_stale_one(lab):
 
     code, error = lab.refused("save", "identity/MISSION", "--from", "-", stdin="no front\n")
     assert (code, error["code"]) == (6, "not_canonical")
+
+
+# --- drafts ----------------------------------------------------------------------
+
+def _versions(lab, name: str) -> list[str]:
+    return [v["version"] for v in lab.ok("history", name, "--json")["versions"]]
+
+
+def test_saving_a_draft_twice_adds_no_version_and_no_reader_sees_it(lab):
+    lab.ok("import")
+    before = _versions(lab, "identity/MISSION")
+    active = before[0]
+    first = FILES["identity/MISSION.md"].replace("whole", "drafted once")
+    second = FILES["identity/MISSION.md"].replace("whole", "drafted twice")
+    made = lab.ok("draft", "save", "identity/MISSION", "--from", "-", stdin=first)
+    assert (made["outcome"], made["changed"], made["base"], made["stale"]) == (
+        "created", True, active, False)
+    again = lab.ok("draft", "save", "identity/MISSION", "--from", "-", stdin=second)
+    assert (again["outcome"], again["changed"], again["base"]) == ("saved", True, active)
+    assert _versions(lab, "identity/MISSION") == before
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.context_drafts") == [(1,)]
+    assert lab.run("draft", "show", "identity/MISSION").stdout == second
+    shown = lab.ok("draft", "show", "identity/MISSION", "--json")
+    assert (shown["base"], shown["active"], shown["content"]) == (active, active, second)
+    assert shown["saved_by"] == f"tester@{TEST_NODE}"
+
+    # Every reader still reads the active version.
+    assert lab.run("show", "identity/MISSION").stdout == FILES["identity/MISSION.md"]
+    assert lab.ok("show", "identity/MISSION", "--json")["version"] == active
+    assert "drafted" not in lab.run("diff", "identity/MISSION").stdout
+    out = lab.tmp / "out"
+    lab.ok("export", str(out))
+    assert (out / "identity/MISSION.md").read_text() == FILES["identity/MISSION.md"]
+    listed = {d["name"]: d for d in lab.ok("list", "--json")["documents"]}
+    assert listed["identity/MISSION"]["draft"] is True
+    assert listed["identity/MISSION"]["version"] == active
+    assert listed["guidelines/STYLE"]["draft"] is False
+    assert "(draft)" in next(line for line in lab.run("list").stdout.splitlines()
+                             if line.startswith("identity/MISSION"))
+
+    code, error = lab.refused("draft", "save", "identity/MISSION", "--from", "-",
+                              stdin="no front\n")
+    assert (code, error["code"]) == (6, "not_canonical")
+    code, error = lab.refused("draft", "save", "fresh/NONE", "--from", "-", stdin=first)
+    assert (code, error["code"]) == (3, "not_found")
+    code, error = lab.refused("draft", "show", "guidelines/STYLE")
+    assert (code, error["code"]) == (3, "no_draft")
+
+
+def test_publish_makes_one_version_against_the_base_and_refuses_a_moved_one(lab):
+    lab.ok("import")
+    base = _versions(lab, "identity/MISSION")[0]
+    drafted = FILES["identity/MISSION.md"].replace("whole", "drafted")
+    lab.ok("draft", "save", "identity/MISSION", "--from", "-", stdin=drafted)
+    published = lab.ok("draft", "publish", "identity/MISSION", "--note", "from the draft")
+    assert (published["outcome"], published["changed"], published["base"]) == (
+        "versioned", True, base)
+    assert _versions(lab, "identity/MISSION") == [published["version"], base]
+    assert lab.run("show", "identity/MISSION").stdout == drafted
+    assert lab.ok("history", "identity/MISSION", "--json")["versions"][0]["note"] == (
+        "from the draft")
+    assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.context_drafts") == [(0,)]
+    code, error = lab.refused("draft", "publish", "identity/MISSION")
+    assert (code, error["code"]) == (3, "no_draft")
+
+    # Another save moves the base under a held draft: publish names both and keeps it.
+    lab.ok("draft", "save", "identity/MISSION", "--from", "-",
+           stdin=drafted.replace("drafted", "drafted again"))
+    moved = lab.ok("save", "identity/MISSION", "--from", "-",
+                   stdin=drafted.replace("drafted", "saved directly"))
+    assert lab.ok("draft", "show", "identity/MISSION", "--json")["stale"] is True
+    code, error = lab.refused("draft", "publish", "identity/MISSION")
+    assert (code, error["code"]) == (7, "stale_base")
+    assert published["version"] in error["message"] and moved["version"] in error["message"]
+    assert _versions(lab, "identity/MISSION")[0] == moved["version"]
+    confirmed = lab.ok("draft", "publish", "identity/MISSION", "--base", moved["version"])
+    assert (confirmed["outcome"], confirmed["base"]) == ("versioned", moved["version"])
+    assert len(_versions(lab, "identity/MISSION")) == 4
+    assert "drafted again" in lab.run("show", "identity/MISSION").stdout
+
+
+def test_discard_removes_the_draft_and_leaves_the_versions(lab):
+    lab.ok("import")
+    before = _versions(lab, "identity/MISSION")
+    lab.ok("draft", "save", "identity/MISSION", "--from", "-",
+           stdin=FILES["identity/MISSION.md"].replace("whole", "gone"))
+    gone = lab.ok("draft", "discard", "identity/MISSION")
+    assert (gone["changed"], gone["base"]) == (True, before[0])
+    assert lab.ok("draft", "discard", "identity/MISSION")["changed"] is False
+    assert _versions(lab, "identity/MISSION") == before
+    assert not any(d["draft"] for d in lab.ok("list", "--json")["documents"])
+    code, error = lab.refused("draft", "show", "identity/MISSION")
+    assert (code, error["code"]) == (3, "no_draft")
+
+
+def test_a_global_document_s_draft_is_its_author_s(lab):
+    shared = lab.tmp / "shared"
+    shutil.copytree(lab.context, shared)
+    lab.ok("import", str(shared), "--global")
+    text = FILES["identity/MISSION.md"].replace("whole", "shared draft")
+    made = lab.ok("draft", "save", "identity/MISSION", "--global", "--from", "-", stdin=text)
+    assert made["scope"] == "global"
+    assert lab.run("show", "identity/MISSION", "--global").stdout == FILES["identity/MISSION.md"]
+    assert {d["name"]: d["draft"] for d in lab.ok("list", "--global", "--json")["documents"]}[
+        "identity/MISSION"] is True
+    published = lab.ok("draft", "publish", "identity/MISSION", "--global")
+    assert published["author"] == PROJECT_ID
+    assert lab.run("show", "identity/MISSION", "--global").stdout == text
 
 
 def test_a_new_name_starts_a_document_and_its_only_version_diffs_against_nothing(lab):
@@ -600,7 +708,10 @@ def test_a_system_agent_s_documents_are_not_written(lab):
             "ON CONFLICT (id) DO UPDATE SET kind = 'system'", (PROJECT_ID,))
     for args in (("save", "identity/MISSION", "--from", "-"), ("retire", "identity/MISSION"),
                  ("import",), ("transfer", "identity/MISSION", "--to", "prj_x"),
-                 ("enable", "identity/MISSION"), ("disable", "identity/MISSION")):
+                 ("enable", "identity/MISSION"), ("disable", "identity/MISSION"),
+                 ("draft", "save", "identity/MISSION", "--from", "-"),
+                 ("draft", "discard", "identity/MISSION"),
+                 ("draft", "publish", "identity/MISSION")):
         code, error = lab.refused(*args, stdin=FILES["identity/MISSION.md"])
         assert (code, error["code"]) == (4, "system_agent"), args
     assert lab.run("list").returncode == 0
@@ -611,7 +722,10 @@ def test_the_read_only_switch_refuses_every_write(lab):
     lab.ok("import")
     for args in (("save", "identity/MISSION", "--from", "-"), ("retire", "identity/MISSION"),
                  ("import",), ("transfer", "identity/MISSION", "--to", "prj_x"),
-                 ("enable", "identity/MISSION"), ("disable", "identity/MISSION")):
+                 ("enable", "identity/MISSION"), ("disable", "identity/MISSION"),
+                 ("draft", "save", "identity/MISSION", "--from", "-"),
+                 ("draft", "discard", "identity/MISSION"),
+                 ("draft", "publish", "identity/MISSION")):
         code, error = lab.refused(*args, stdin=FILES["identity/MISSION.md"],
                                   CAPABILITIES_READ_ONLY="1")
         assert (code, error["code"]) == (4, "read_only_switch")

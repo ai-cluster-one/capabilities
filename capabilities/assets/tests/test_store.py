@@ -31,7 +31,7 @@ def test_the_tables_have_the_planned_shape(world):  # noqa: F811
                 "AND table_name LIKE 'assets\\_%' ORDER BY table_name, ordinal_position"):
             columns.setdefault(table, []).append((column, kind, nullable, generated))
         assert set(columns) == {"assets_documents", "assets_versions", "assets_files",
-                                "assets_file_operations", "assets_premig_m9"}
+                                "assets_file_operations", "assets_premig_m9", "assets_drafts"}
         assert [c[0] for c in columns["assets_documents"]] == [
             "agent_id", "id", "kind", "name", "created_at", "created_by", "retired_at"]
         assert [c[0] for c in columns["assets_versions"]] == [
@@ -63,7 +63,7 @@ def test_the_tables_have_the_planned_shape(world):  # noqa: F811
             "SELECT step FROM schema_ledger WHERE owner = 'assets' ORDER BY applied_at, step")]
         assert ledger == ["0001-documents", "0002-versions", "0003-guards", "0004-files",
                           "0005-files-guard", "0006-file-operations", "0007-agent-names",
-                          "0008-keys"]
+                          "0008-keys", "0009-drafts"]
 
 
 def test_the_store_refuses_what_a_column_does_not_mean(world):  # noqa: F811
@@ -242,7 +242,7 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(world, monkey
     from capabilities_contract import db
     cli = _load_cli()
     old = [step for step in cli.TABLE_STEPS
-           if step[0] not in ("0007-agent-names", "0008-keys")]
+           if step[0] not in ("0007-agent-names", "0008-keys", "0009-drafts")]
     pid = "prj_" + "0a0b0c0d0e0f"
     root = world.project(pid=pid)
     conn = connect(world.schema)
@@ -275,8 +275,8 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(world, monkey
         result = db.migrate(conn, "assets", cli.TABLE_STEPS, major=cli.TABLES_MAJOR,
                             minor=cli.TABLES_MINOR, schema=world.schema)
         monkeypatch.delenv(db.UPGRADE_ENV)
-        assert result.applied == ["0007-agent-names", "0008-keys"]
-        assert (result.major, result.minor) == (2, 1)
+        assert result.applied == ["0007-agent-names", "0008-keys", "0009-drafts"]
+        assert (result.major, result.minor) == (2, 2)
         conn.execute(f'SET search_path TO "{world.schema}"')
         for table in ("assets_documents", "assets_files", "assets_file_operations"):
             assert conn.execute(f"SELECT agent_id FROM {table}").fetchall() == [(pid,)], table

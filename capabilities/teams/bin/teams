@@ -87,6 +87,19 @@ WRITING  (answers JSON; refused under the read-only switch)
   teams doc rename <team> <doc> <name>  give a document a new name; its id stays
   teams doc retire <team> <doc>    retire a document; every version stays
 
+DRAFTS  (a draft is never read: show, doc show, doc history and the Teams
+  section see only versions)
+  teams doc draft save <team> <doc>     the file form as the document's one draft
+  teams doc draft show <team> <doc>     the draft, with its base and the active version
+  teams doc draft discard <team> <doc>  remove the draft
+  teams doc draft publish <team> <doc>  the draft as one new version, against its base
+
+  A document holds at most one draft. Saving it again writes over it and
+  adds no version; publish adds exactly one, or refuses (exit 7
+  `stale_base`, naming the draft's base and the active version) when
+  another save came after the base. save, discard and publish are writes,
+  refused under the read-only switch.
+
 I/O
   Success is plain text or JSON on stdout; failure is
   {"error": {"code", "message", "hint"?}} on stderr.
@@ -94,13 +107,14 @@ I/O
 EXIT CODES
   0 success
   3 not found - no team, document or version of that id or name, or a
-    retired one
+    retired one, or no draft
   4 policy - teams not enabled, the read-only switch
   5 store - unreachable or busy
   6 input - a malformed argument or file, no store configured, no project or
     project identity where the verb needs this agent, a team that exists
     with another line, a name another team or document holds
-  7 stale - the base a save names is no longer the active version
+  7 stale - the base a save or a publish names is no longer the active
+    version
 """
 
 import argparse
@@ -138,7 +152,8 @@ CRED_KEYS: list = []
 # Every verb that changes the store's teams; each is refused under the
 # read-only switch. Nested verbs are named `<noun> <verb>`.
 WRITE_VERBS = {"create", "rename", "describe", "retire", "members add",
-               "members remove", "doc save", "doc on", "doc off", "doc rename", "doc retire"}
+               "members remove", "doc save", "doc on", "doc off", "doc rename", "doc retire",
+               "doc draft save", "doc draft discard", "doc draft publish"}
 WRITE_DEFAULT = True
 DOCS_BASE = ""
 STATE = False
@@ -251,8 +266,9 @@ _HELP_STORE = """
   The tables are teams_teams (one row per team, keyed by its id),
   teams_members (one row per member of a team, holding the team's id),
   teams_documents (one row per document, keyed by its id, holding its team's
-  id, with its switch) and teams_versions (one row per version, holding its
-  document's id), in the schema the project's store setting names, migrated
+  id, with its switch), teams_versions (one row per version, holding its
+  document's id) and teams_drafts (one row per document with a draft,
+  keyed by the document's id, holding its base version's id), in the schema the project's store setting names, migrated
   under the `teams` ledger. The store refuses a change of an id. Members,
   documents and versions also keep a copy of the current team and document
   name, with no key, which the store keeps equal to the name, a rename
@@ -294,11 +310,14 @@ teams show <team> [--json]
 """ + _HELP_READ + """
   Output, plain: `team:`, `id:`, `retired:` (a retired team), `description:`,
   `members:`, `tokens:` and `documents:` lines, then one line per document,
-  `<name>  <load>  on|off  ~<tokens> tokens  <line>  [<id>]`.
+  `<name>  <load>  on|off  ~<tokens> tokens  <line>  [<id>]`, with `(draft)`
+  after it where the document holds a draft. Every document's load, line,
+  version and size are its active version's, never a draft's.
   --json: {"id", "name", "description", "members", "tokens",
   "always_tokens", "documents": [{"id", "name", "enabled", "load",
-  "description", "version", "tokens"}], "created_at", "created_by",
-  "retired_at", "member"}, `member` present where this agent's id is known.
+  "description", "version", "tokens", "draft"}], "created_at", "created_by",
+  "retired_at", "member"}, `member` present where this agent's id is known;
+  `draft` is true where the document holds a draft.
 
   Exit codes: 0; 3 `not_found` for no team of that id or name, or a retired
   team named by its name.
@@ -540,6 +559,89 @@ teams doc retire <team> <doc>
 """ + _HELP_STORE_EXIT + _HELP_REFS + """
   Example: teams doc retire "Release crew" checklist
 """,
+    "doc draft save": """\
+teams doc draft save <team> <doc> --from FILE|- [--base ID]
+
+  Save the file form read from FILE, or stdin with `-`, as the document's
+  draft. Adds no version: show, doc show, doc history and the Teams
+  section still read the active version, and no member carries the draft.
+  A document holds one draft; saving again writes over its text and keeps
+  its base. The base is the version the draft was made from: --base ID
+  where given, else the draft's base where one is already held, else the
+  active version. The document must exist: a new document starts with
+  `teams doc save`. --from is required.
+""" + _HELP_VERSION + _HELP_WRITE + """
+  Output: {"team", "document", "outcome", "changed", "base", "active",
+  "stale", "saved_at", "saved_by"}: outcome `created` or `saved`;
+  `changed` is false where the draft and its base were already these;
+  `stale` is true when the base is no longer the active version.
+
+  Exit codes: 0; 3 `not_found` for no team or document of that id or name,
+  or a base version the document does not have; 4 `read_only_switch`; 6
+  `not_canonical` for input that is not the file form or not UTF-8,
+  `input` for a file it cannot read, `ambiguous_version`.
+""" + _HELP_STORE_EXIT + _HELP_FORM + _HELP_REFS + """
+  Example: teams doc draft save "Release crew" checklist --from checklist.md
+""",
+    "doc draft show": """\
+teams doc draft show <team> <doc> [--json]
+
+  The document's draft in the file form. --json adds its base, the active
+  version, whether the base is stale, and who saved it when. A retired
+  document answers to its id.
+""" + _HELP_READ + """
+  Output, plain: the draft in the file form, exactly. --json: {"team",
+  "document", "base", "active", "stale", "saved_at", "saved_by",
+  "content"}.
+
+  Exit codes: 0; 3 `not_found` for no team or document of that id or name,
+  `no_draft` for a document that holds none.
+""" + _HELP_STORE_EXIT + _HELP_REFS + """
+  Example: teams doc draft show "Release crew" checklist --json
+""",
+    "doc draft discard": """\
+teams doc draft discard <team> <doc>
+
+  Remove the document's draft; its versions are untouched. Safe to repeat:
+  with no draft, answers `"changed": false`.
+""" + _HELP_WRITE + """
+  Output: {"team", "document", "changed", "base"}, `base` the removed
+  draft's base, null where there was none.
+
+  Exit codes: 0; 3 `not_found` for no team or document of that id or name;
+  4 `read_only_switch`.
+""" + _HELP_STORE_EXIT + _HELP_REFS + """
+  Example: teams doc draft discard "Release crew" checklist
+""",
+    "doc draft publish": """\
+teams doc draft publish <team> <doc> [--base ID] [--note TEXT]
+
+  Turn the draft into the document's new active version, against the
+  draft's base, and remove the draft, in one transaction, saved as `doc
+  save` saves. When another save came after the base, the publish is
+  refused (exit 7 `stale_base`, naming the draft's base and the active
+  version) and the draft stays: `teams doc show <team> <doc> --version
+  <base>` reads what it was made from, and publishing again with --base
+  naming the active version confirms the draft over it. A draft equal to
+  the active version adds no version, answers `"changed": false`, and is
+  removed.
+
+  --base ID     publish against this version instead of the draft's base
+  --note TEXT   why it changed
+""" + _HELP_VERSION + _HELP_WRITE + """
+  Output: what `teams doc save` answers. A new version: {"team",
+  "document", "version", "previous", "created", "load", "tokens",
+  "changed": true, "reach"}, `previous` being the base; content equal to
+  the active version's: {"team", "document", "version", "changed": false}.
+
+  Exit codes: 0; 3 `not_found` for no team or document of that id or name,
+  or a base version the document does not have, `no_draft` for a document
+  that holds none; 4 `read_only_switch`; 6 `ambiguous_version`; 7
+  `stale_base`, also when another save changed the document at the same
+  moment.
+""" + _HELP_STORE_EXIT + _HELP_REACH + _HELP_SIZE + _HELP_REFS + """
+  Example: teams doc draft publish "Release crew" checklist --note "add the rollback step"
+""",
     "doctor": """\
   For teams: the store, the tables, and this agent's teams. teams reaches no
   system of its own and takes no connection.
@@ -617,7 +719,7 @@ def _manifest() -> dict:
 # and members, documents and versions reference it by a foreign key; a name is
 # a display name only. Every key between this capability's own tables refuses
 # only an orphan, since none of them deletes a referenced row.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 3
+LEDGER_MAJOR, LEDGER_MINOR = 1, 4
 _TEAM_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
 _DOC_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 # The store's foreign keys (core 4.0): every agent and node column of this
@@ -963,6 +1065,31 @@ LEDGER_STEPS = [
     _M9Step("0006-keys", _M9_KEYS_SQL, core=(4, 0)),
     ("0007-ids", _IDS_SQL),
     (_LOAD_STEP, _LOAD_SQL),
+    # Step 0009 (teams 1.4): a draft is the one edit of a document not yet
+    # published. No reader reads it and no member carries it; publishing makes
+    # it one version, and discarding deletes it. A row per document, so a draft
+    # is written over in place rather than versioned. Like every teams table it
+    # carries no agent_id: a team's documents are the store's, not an agent's.
+    # Additive, so a reader at 1.3 keeps working against 1.4.
+    ("0009-drafts", """
+    CREATE TABLE teams_drafts (
+        document_id      text PRIMARY KEY REFERENCES teams_documents (id) ON DELETE CASCADE,
+        base_version_id  uuid NOT NULL REFERENCES teams_versions (id) ON DELETE CASCADE,
+        content          text NOT NULL,
+        saved_at         timestamptz NOT NULL DEFAULT now(),
+        saved_by         text NOT NULL CHECK (saved_by <> '')
+    );
+    COMMENT ON TABLE teams_drafts IS
+        'The one unpublished edit of a team document: never read and never carried by a member. Publishing adds it as one version of teams_versions against its base and deletes the row; discarding deletes it.';
+    COMMENT ON COLUMN teams_drafts.document_id IS
+        'The id of the draft''s document; one draft per document.';
+    COMMENT ON COLUMN teams_drafts.base_version_id IS
+        'The version the draft was made from; publishing is refused while another version is active.';
+    COMMENT ON COLUMN teams_drafts.content IS
+        'The draft in the file form a save reads, front matter and body, checked when saved.';
+    COMMENT ON COLUMN teams_drafts.saved_by IS
+        'Who saved it last: user@node.';
+    """),
 ]
 
 
@@ -1287,14 +1414,16 @@ def _team_view(conn, team: dict, me: str | None) -> dict:
         (team["id"],))]
     documents = []
     for row in _rows(conn, "SELECT d.id AS document_id, d.name, d.enabled, v.id, "
-                     "v.description, v.load, v.body FROM teams_documents d "
+                     "v.description, v.load, v.body, EXISTS (SELECT 1 FROM teams_drafts r "
+                     "WHERE r.document_id = d.id) AS draft FROM teams_documents d "
                      "JOIN teams_versions v ON v.document_id = d.id AND v.active "
                      "WHERE d.team_id = %s AND d.retired_at IS NULL ORDER BY d.name",
                      (team["id"],)):
         documents.append({"id": row["document_id"], "name": row["name"],
                           "enabled": row["enabled"], "load": row["load"],
                           "description": row["description"],
-                          "version": str(row["id"]), "tokens": tokens(row["body"])})
+                          "version": str(row["id"]), "tokens": tokens(row["body"]),
+                          "draft": row["draft"]})
     view = {"id": team["id"], "name": team["name"], "description": team["description"],
             "members": members,
             "tokens": sum(d["tokens"] for d in documents if d["enabled"]),
@@ -1354,7 +1483,8 @@ def cmd_show(args) -> None:
         lines.insert(2, f"retired: {view['retired_at']}")
     for doc in view["documents"]:
         lines.append(f"  {doc['name']}  {doc['load']}  {'on' if doc['enabled'] else 'off'}  "
-                     f"~{doc['tokens']} tokens  {doc['description']}  [{doc['id']}]")
+                     f"~{doc['tokens']} tokens  {doc['description']}  [{doc['id']}]"
+                     + ("  (draft)" if doc["draft"] else ""))
     print("\n".join(lines))
 
 
@@ -1505,54 +1635,167 @@ def cmd_doc_save(args) -> None:
     except Unreadable as exc:
         _die(6, "not_canonical", f"{args.source} does not read as the file form: {exc}",
              f"`{NAME} help` shows the file form")
-    actor = _actor()
     dry = {"dry_run": True} if args.dry_run else {}
     import psycopg
     with _store() as conn:
         with conn.transaction() as tx:
             team = _team(conn, team_ref)
             document = _document(conn, team, doc_ref, lock=True)
-            before = _block_tokens(conn, team)
-            created = document is None
-            if created:
-                if args.base:
-                    _die(3, "not_found", f"team {team['name']!r} has no document {doc_ref!r} "
-                         "to be the base of this save", "save without --base to start the "
-                         "document")
-                name = _check_name(doc_ref, "document")
-                document = _one(conn, "INSERT INTO teams_documents (team_id, team, name, "
-                                "created_by) VALUES (%s, %s, %s, %s) RETURNING id, name",
-                                (team["id"], team["name"], name, actor))
-                active = None
-            else:
-                active = _active(conn, document)
-                if args.base:
-                    base = _version(conn, team, document, args.base)
-                    if not base["active"]:
-                        _die(7, "stale_base", f"{team['name']}/{document['name']} was saved "
-                             f"after {args.base}: its active version is {active['id']}",
-                             f"read it with `{NAME} doc show {team['id']} {document['id']}`, "
-                             "carry the edit over, and save with that version as --base")
-                if _same(active, fields):
-                    _emit({"team": team["name"], "document": document["name"],
-                           "version": str(active["id"]), "changed": False, **dry})
-                    return
-                conn.execute("UPDATE teams_versions SET active = false WHERE id = %s",
-                             (active["id"],))
-            made = _one(conn, "INSERT INTO teams_versions (document_id, team, document, "
-                        "description, load, body, created_by, note) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
-                        (document["id"], team["name"], document["name"],
-                         fields["description"], fields["load"], fields["body"], actor,
-                         args.note))
-            reach = _reach(conn, team, before)
+            answer = _save_version(conn, team, document, doc_ref, fields, args.base,
+                                   args.note, _actor())
             if args.dry_run:
                 raise psycopg.Rollback(tx)
+    if args.dry_run and answer["changed"]:
+        answer["version"] = None
+    _emit({**answer, **dry})
+
+
+def _save_version(conn, team: dict, document: dict | None, doc_ref: str, fields: dict,
+                  base_ref: str | None, note: str | None, actor: str) -> dict:
+    """The save `doc save` and `doc draft publish` make, inside the caller's
+    transaction with the document locked: a new active version, or none where
+    the content equals the active version's; the answer `doc save` gives."""
+    before = _block_tokens(conn, team)
+    created = document is None
+    if created:
+        if base_ref:
+            _die(3, "not_found", f"team {team['name']!r} has no document {doc_ref!r} "
+                 "to be the base of this save", "save without --base to start the "
+                 "document")
+        name = _check_name(doc_ref, "document")
+        document = _one(conn, "INSERT INTO teams_documents (team_id, team, name, "
+                        "created_by) VALUES (%s, %s, %s, %s) RETURNING id, name",
+                        (team["id"], team["name"], name, actor))
+        active = None
+    else:
+        active = _active(conn, document)
+        if base_ref:
+            base = _version(conn, team, document, base_ref)
+            if not base["active"]:
+                _die(7, "stale_base", f"{team['name']}/{document['name']} was saved "
+                     f"after {base_ref}: its active version is {active['id']}",
+                     f"read it with `{NAME} doc show {team['id']} {document['id']}`, "
+                     "carry the edit over, and save with that version as --base")
+        if _same(active, fields):
+            return {"team": team["name"], "document": document["name"],
+                    "version": str(active["id"]), "changed": False}
+        conn.execute("UPDATE teams_versions SET active = false WHERE id = %s",
+                     (active["id"],))
+    made = _one(conn, "INSERT INTO teams_versions (document_id, team, document, "
+                "description, load, body, created_by, note) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (document["id"], team["name"], document["name"],
+                 fields["description"], fields["load"], fields["body"], actor, note))
+    return {"team": team["name"], "document": document["name"], "version": str(made["id"]),
+            "previous": str(active["id"]) if active else None, "created": created,
+            "load": fields["load"], "tokens": tokens(fields["body"]), "changed": True,
+            "reach": _reach(conn, team, before)}
+
+
+# ── drafts ──────────────────────────────────────────────────────────────────
+
+def _draft(conn, document: dict, lock: bool = False) -> dict | None:
+    return _one(conn, "SELECT document_id, base_version_id, content, saved_at, saved_by "
+                "FROM teams_drafts WHERE document_id = %s" + (" FOR UPDATE" if lock else ""),
+                (document["id"],))
+
+
+def _need_draft(conn, team: dict, document: dict, lock: bool = False) -> dict:
+    found = _draft(conn, document, lock)
+    if found is None:
+        _die(3, "no_draft", f"{team['name']}/{document['name']} holds no draft",
+             f"`{NAME} doc draft save {team['id']} {document['id']} --from -` starts one")
+    return found
+
+
+def _draft_target(conn, args) -> tuple[dict, dict]:
+    """The team and the locked document a draft write addresses: the ones
+    `doc save` would write, the document already made."""
+    team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
+    team = _team(conn, team_ref)
+    return team, _need_document(conn, team, doc_ref, lock=True)
+
+
+def cmd_doc_draft_save(args) -> None:
+    _check_ref(args.team, "team")
+    _check_ref(args.doc, "document")
+    text = _read_source(args.source)
+    try:
+        parse(text)
+    except Unreadable as exc:
+        _die(6, "not_canonical", f"{args.source} does not read as the file form: {exc}",
+             f"`{NAME} help` shows the file form")
+    with _store() as conn:
+        with conn.transaction():
+            team, document = _draft_target(conn, args)
+            held = _draft(conn, document, lock=True)
+            active = _active(conn, document)
+            if args.base:
+                base = _version(conn, team, document, args.base)["id"]
+            elif held is not None:
+                base = held["base_version_id"]
+            else:
+                base = active["id"]
+            saved = _one(conn, "INSERT INTO teams_drafts (document_id, base_version_id, "
+                         "content, saved_by) VALUES (%s, %s, %s, %s) "
+                         "ON CONFLICT (document_id) DO UPDATE SET "
+                         "base_version_id = excluded.base_version_id, "
+                         "content = excluded.content, saved_at = now(), "
+                         "saved_by = excluded.saved_by RETURNING saved_at, saved_by",
+                         (document["id"], base, text, _actor()))
     _emit({"team": team["name"], "document": document["name"],
-           "version": None if args.dry_run else str(made["id"]),
-           "previous": str(active["id"]) if active else None, "created": created,
-           "load": fields["load"], "tokens": tokens(fields["body"]), "changed": True,
-           "reach": reach, **dry})
+           "outcome": "created" if held is None else "saved",
+           "changed": held is None or (held["content"], held["base_version_id"]) != (text, base),
+           "base": str(base), "active": str(active["id"]), "stale": base != active["id"],
+           "saved_at": _moment(saved["saved_at"]), "saved_by": saved["saved_by"]})
+
+
+def cmd_doc_draft_show(args) -> None:
+    team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
+    with _store() as conn:
+        team = _team(conn, team_ref, retired=True)
+        document = _need_document(conn, team, doc_ref, retired=True)
+        draft = _need_draft(conn, team, document)
+        active = _active(conn, document)
+    if args.json:
+        _emit({"team": team["name"], "document": document["name"],
+               "base": str(draft["base_version_id"]), "active": str(active["id"]),
+               "stale": draft["base_version_id"] != active["id"],
+               "saved_at": _moment(draft["saved_at"]), "saved_by": draft["saved_by"],
+               "content": draft["content"]})
+        return
+    sys.stdout.write(draft["content"])
+
+
+def cmd_doc_draft_discard(args) -> None:
+    with _store() as conn:
+        with conn.transaction():
+            team, document = _draft_target(conn, args)
+            gone = _one(conn, "DELETE FROM teams_drafts WHERE document_id = %s "
+                        "RETURNING base_version_id", (document["id"],))
+    _emit({"team": team["name"], "document": document["name"], "changed": gone is not None,
+           "base": str(gone["base_version_id"]) if gone else None})
+
+
+def cmd_doc_draft_publish(args) -> None:
+    with _store() as conn:
+        with conn.transaction():
+            team, document = _draft_target(conn, args)
+            draft = _need_draft(conn, team, document, lock=True)
+            base = (_version(conn, team, document, args.base)["id"] if args.base
+                    else draft["base_version_id"])
+            active = _active(conn, document)
+            where = f"{team['name']}/{document['name']}"
+            if active["id"] != base:
+                _die(7, "stale_base", f"the draft of {where} is based on {base}, and "
+                     f"{active['id']} was saved after it and is the active version",
+                     f"`{NAME} doc show {team['id']} {document['id']} --version {base}` reads "
+                     f"the base; publish again with --base {active['id']} to publish the "
+                     "draft over it")
+            answer = _save_version(conn, team, document, document["name"],
+                                   parse(draft["content"]), str(base), args.note, _actor())
+            conn.execute("DELETE FROM teams_drafts WHERE document_id = %s", (document["id"],))
+    _emit(answer)
 
 
 def cmd_doc_switch(args) -> None:
@@ -1900,6 +2143,19 @@ def _parser() -> argparse.ArgumentParser:
     doc_rename.add_argument("team")
     doc_rename.add_argument("doc")
     doc_rename.add_argument("name")
+    drafts = verb(doc, "draft").add_subparsers(dest="draft_verb", required=True)
+    for name in ("save", "show", "discard", "publish"):
+        one = verb(drafts, name)
+        one.add_argument("team")
+        one.add_argument("doc")
+        if name == "save":
+            one.add_argument("--from", dest="source", required=True)
+        if name in ("save", "publish"):
+            one.add_argument("--base")
+        if name == "show":
+            one.add_argument("--json", action="store_true")
+        if name == "publish":
+            one.add_argument("--note")
     return parser
 
 
@@ -1922,6 +2178,8 @@ def _parse(argv: list[str]):
 def _verb_name(args) -> str:
     if args.cmd == "members":
         return f"members {args.action}"
+    if args.cmd == "doc" and args.verb == "draft":
+        return f"doc draft {args.draft_verb}"
     if args.cmd == "doc":
         return f"doc {args.verb}"
     return args.cmd
@@ -1952,7 +2210,9 @@ def main() -> None:
      "members add": cmd_members, "members remove": cmd_members,
      "doc show": cmd_doc_show, "doc history": cmd_doc_history, "doc save": cmd_doc_save,
      "doc on": cmd_doc_switch, "doc off": cmd_doc_switch, "doc rename": cmd_doc_rename,
-     "doc retire": cmd_doc_retire}[verb](args)
+     "doc retire": cmd_doc_retire, "doc draft save": cmd_doc_draft_save,
+     "doc draft show": cmd_doc_draft_show, "doc draft discard": cmd_doc_draft_discard,
+     "doc draft publish": cmd_doc_draft_publish}[verb](args)
 
 
 if __name__ == "__main__":

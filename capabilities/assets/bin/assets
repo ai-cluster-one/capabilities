@@ -61,6 +61,19 @@ WRITING  (exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY)
   assets files link <name>        set or clear the document a file belongs to
   assets files rm <name>          delete a file's bytes, retire its record
 
+DRAFTS  (a draft is never read: list, show, history, diff, search and export
+  see only versions)
+  assets draft save <name>        a file or stdin as the document's one draft
+  assets draft show <name>        the draft, with its base and the active version
+  assets draft discard <name>     remove the draft
+  assets draft publish <name>     the draft as one new version, against its base
+
+  A document holds at most one draft, and only a saved document holds one.
+  Saving it again writes over it and adds no version; publish adds exactly
+  one, or refuses (exit 7 `stale_base`, naming the draft's base and the
+  active version) when another save came after the base. Save, discard and
+  publish are writes: exit 4 `read_only_switch` under CAPABILITIES_READ_ONLY.
+
 FILES  (reading; `files list` reads the store only)
   assets files list               every unretired file of this project
   assets files log [<name>]       the log of writes to the file records
@@ -79,7 +92,7 @@ EXIT CODES
   0 success
   2 the file store refused the connection's keys, or a key is unset
   3 not found: no unretired document or file of that name, no such version,
-    no DIR, no such bucket
+    no DIR, no such bucket, no draft (`no_draft`)
   4 policy: assets not enabled here, the read-only switch on a write, a write
     through a connection without allow_write, a connection not granted here
   5 the store or the file store cannot be reached
@@ -87,8 +100,8 @@ EXIT CODES
     project, no store configured, no file store connection
     (`connections_required`), an incomplete connection, `files rm` without a
     terminal or a yes given up front (`confirmation_required`)
-  7 stale_base: the version a save names as its base is no longer the active
-    one, or another write of the same name came first
+  7 stale_base: the version a save or a draft publish names as its base is no
+    longer the active one, or another write of the same name came first
   8 the bucket does not hold what the record says: `object_missing`, or
     `sha256_mismatch` when the bytes it returns differ in size or sha256
 """
@@ -138,7 +151,8 @@ CRED_KEYS = [       # a file store connection names its own keys; only the file 
      "note": "S3 secret access key of the file store; a connection names its own key via "
              "secret_access_key_env"},
 ]
-WRITE_VERBS = {"save", "retire", "import", "files add", "files link", "files rm"}
+WRITE_VERBS = {"save", "retire", "import", "files add", "files link", "files rm",
+               "draft save", "draft discard", "draft publish"}
 WRITE_DEFAULT = True    # the bucket, like the store, is the consumer's own
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/assets/guides/")
@@ -212,7 +226,9 @@ assets list
   Takes no argument.
 
   Output: {project, count, documents}; each document {name, kind, title,
-  version, created_at, saved_at}.
+  version, created_at, saved_at, draft}: the title and version are the
+  active version's, never a draft's, and `draft` is true where the document
+  holds a draft.
   Exit codes: 0; 4 policy; 5 the store cannot be reached; 6 no project, no
   store configured.
 
@@ -272,7 +288,7 @@ assets search <terms> [--limit N]
   stemming, any language; quoted phrases, `or` and `-` exclusion work as
   in a web search) over title and body, best match first, each with a
   headline of the matching text. --limit defaults to 20; `matched` says
-  how many matched in all.
+  how many matched in all. A draft is never searched.
 
   --limit N             at most N results, a whole number of 1 or more
 
@@ -310,6 +326,82 @@ assets save <name> --from FILE|- [--base ID] [--note TEXT]
   another write of the same name came first.
 
   Example: assets save plans/2026-10-20_rollout --from plan.md --base 3f2a9c --note "dates moved"
+""",
+    "draft save": """\
+assets draft save <name> --from FILE|- [--base ID]
+""" + _HELP_NAME + """
+  Save FILE (`-` reads stdin) as the document's draft. Adds no version:
+  list, show, history, diff, search and export still read the active
+  version. A document holds one draft; saving again writes over its text
+  and keeps its base. The base is the version the draft is made from:
+  --base ID where given, else the base of the draft already held, else the
+  active version. The document must exist: a new document starts with
+  `assets save`.
+""" + _HELP_VERSION + """
+  --from FILE|-         the body, from FILE or from stdin; required
+  --base ID             the version the draft is made from
+""" + _HELP_READ_ONLY + """
+  Output: {name, outcome, changed, base, active, stale, saved_at,
+  saved_by}: outcome `created` or `saved`, `changed` whether the text or
+  the base differ from the draft held, `stale` true when the base is no
+  longer the active version.
+  Exit codes: 0; 3 no FILE, no unretired document of that name, a --base
+  that names no version; 4 the read-only switch; 5 store; 6 a malformed
+  name or version, an ambiguous version prefix, a body that is not UTF-8
+  text, no project.
+
+  Example: assets draft save plans/2026-10-20_rollout --from plan.md
+""",
+    "draft show": """\
+assets draft show <name>
+""" + _HELP_NAME + """
+  The document's draft whole, with the version it is based on, the active
+  version, whether the base is stale, and who saved it when. Reads only:
+  it runs under the read-only switch.
+
+  Output: {name, base, active, stale, saved_at, saved_by, content}.
+  Exit codes: 0; 3 no unretired document of that name, no draft
+  (`no_draft`); 5 store; 6 a malformed name, no project.
+
+  Example: assets draft show plans/2026-10-20_rollout
+""",
+    "draft discard": """\
+assets draft discard <name>
+""" + _HELP_NAME + """
+  Remove the document's draft; its versions are untouched. Safe to repeat:
+  with no draft, answers `"changed": false`.
+""" + _HELP_READ_ONLY + """
+  Output: {name, changed, base}: `base` the removed draft's base, null when
+  there was none.
+  Exit codes: 0; 3 no unretired document of that name; 4 the read-only
+  switch; 5 store; 6 a malformed name, no project.
+
+  Example: assets draft discard plans/2026-10-20_rollout
+""",
+    "draft publish": """\
+assets draft publish <name> [--base ID] [--note TEXT]
+""" + _HELP_NAME + """
+  Save the draft as the document's new active version, as `save` saves
+  with --base naming the draft's base, and remove the draft, in one
+  transaction. When another save came after the base, the publish is
+  refused (exit 7 `stale_base`, naming the draft's base and the active
+  version) and the draft stays: `assets diff <name> <base>` shows what
+  changed since, and publishing again with --base naming the active
+  version publishes the draft over it. A draft whose body is the active
+  version's adds no version, answers `"changed": false`, and is removed.
+""" + _HELP_VERSION + """
+  --base ID             publish against this version instead of the draft's base
+  --note TEXT           why it changed; not empty
+""" + _HELP_READ_ONLY + """
+  Output: {document, version, created, document_created, replaced,
+  changed}: what `save` answers, and `changed` whether a version was added.
+  Exit codes: 0; 3 no unretired document of that name, no draft
+  (`no_draft`), a --base that names no version; 4 the read-only switch; 5
+  store; 6 a malformed name or version, an empty note, no project; 7
+  stale_base: the base is no longer the active version, or another write
+  of the same name came first.
+
+  Example: assets draft publish plans/2026-10-20_rollout --note "dates moved"
 """,
     "retire": """\
 assets retire <name>
@@ -974,7 +1066,13 @@ class _Bucket:
 # the step is applied: what happened to a file before then is not known, so
 # nothing is backfilled. The executable writes it, not the store, so an older
 # assets writing to a migrated store leaves no record; the help says so.
-TABLES_MAJOR, TABLES_MINOR = 2, 1
+# A draft is the one unpublished edit of a document, a row of assets_drafts per
+# document: no reader reads it, publishing saves it as one version through the
+# path a save takes and deletes the row, discarding deletes it. It is written
+# over in place rather than versioned, so it has no guard; its keys cascade
+# with its agent, its document and its base, which the documents and versions
+# guards let go only in the deliberate delete of their agent. Additive: 2.2.
+TABLES_MAJOR, TABLES_MINOR = 2, 2
 # The store's foreign keys (core 4.0): every agent and node column of this
 # owner keyed by what its parent takes with it - owned rows go with it, a
 # record keeps itself and loses the pointer - and its guards admitting the
@@ -1364,6 +1462,27 @@ TABLE_STEPS = [
         'Every write to an agent''s file records, one row each, written in the transaction of the write. Append-only: never edited or deleted.';
     """),
     _M9Step("0008-keys", _M9_KEYS_SQL, core=(4, 0)),
+    _M9Step("0009-drafts", """
+    CREATE TABLE assets_drafts (
+        agent_id         text NOT NULL CHECK (agent_id <> '')
+                         REFERENCES agents (id) ON DELETE CASCADE,
+        document_id      uuid PRIMARY KEY REFERENCES assets_documents (id) ON DELETE CASCADE,
+        base_version_id  uuid NOT NULL REFERENCES assets_versions (id) ON DELETE CASCADE,
+        content          text NOT NULL,
+        saved_at         timestamptz NOT NULL DEFAULT now(),
+        saved_by         text NOT NULL CHECK (saved_by <> '')
+    );
+    COMMENT ON TABLE assets_drafts IS
+        'The one unpublished edit of an asset document: never read by list, show, history, diff, search or export. Publishing saves it as one version of assets_versions against its base and deletes the row; discarding deletes it.';
+    COMMENT ON COLUMN assets_drafts.agent_id IS
+        'The agent whose document it is, as assets_documents.agent_id.';
+    COMMENT ON COLUMN assets_drafts.base_version_id IS
+        'The version the draft was made from; publishing is refused while another version is active.';
+    COMMENT ON COLUMN assets_drafts.content IS
+        'The draft body exactly as saved, the text a save reads; its title is taken from it when published.';
+    COMMENT ON COLUMN assets_drafts.saved_by IS
+        'Who saved it last: user@node.';
+    """, core=(4, 0)),
 ]
 
 
@@ -1839,14 +1958,16 @@ def cmd_list(_args) -> None:
     project = _project(write=False)
     conn = _open(_root())
     rows = _rows(conn, "SELECT d.name, d.kind, d.created_at, v.id AS version, v.title, "
-                       "v.created_at AS saved_at FROM assets_documents d LEFT JOIN "
+                       "v.created_at AS saved_at, EXISTS (SELECT 1 FROM assets_drafts r "
+                       "WHERE r.document_id = d.id) AS draft FROM assets_documents d LEFT JOIN "
                        "assets_versions v ON v.document_id = d.id AND v.active "
                        "WHERE d.agent_id = %s AND d.retired_at IS NULL ORDER BY d.name",
                  (project,))
     _emit({"project": project, "count": len(rows), "documents": [
         {"name": r["name"], "kind": r["kind"], "title": r["title"],
          "version": str(r["version"]) if r["version"] else None,
-         "created_at": _iso(r["created_at"]), "saved_at": _iso(r["saved_at"])}
+         "created_at": _iso(r["created_at"]), "saved_at": _iso(r["saved_at"]),
+         "draft": r["draft"]}
         for r in rows]})
 
 
@@ -1983,6 +2104,120 @@ def cmd_save(args) -> None:
     except psycopg.errors.CheckViolation as exc:
         _refused_by_store(exc)
     _emit(out)
+
+
+# ── drafts ───────────────────────────────────────────────────────────────────
+
+def _draft(conn, document_id, *, lock: bool = False) -> dict | None:
+    return _one(conn, "SELECT agent_id, document_id, base_version_id, content, saved_at, "
+                      "saved_by FROM assets_drafts WHERE document_id = %s"
+                      + (" FOR UPDATE" if lock else ""), (document_id,))
+
+
+def _need_draft(conn, document: dict, *, lock: bool = False) -> dict:
+    found = _draft(conn, document["id"], lock=lock)
+    if found is None:
+        _die(3, "no_draft", f"{document['name']!r} holds no draft",
+             f"`{NAME} draft save {document['name']} --from -` starts one")
+    return found
+
+
+def _need_active(conn, document: dict, *, lock: bool = False) -> dict:
+    active = _active(conn, document["id"], lock=lock)
+    if active is None:
+        _die(3, "version_not_found", f"{document['name']!r} has no active version")
+    return active
+
+
+def cmd_draft_save(args) -> None:
+    project = _project(write=True)
+    name = _checked_name(args.name)
+    if args.base is not None and not _VERSION_REF.fullmatch(args.base):
+        _die(6, "bad_version", f"{args.base!r} is not a version id",
+             f"give the whole id or its first 6 or more characters, as `{NAME} history` shows")
+    body = _read_body(args.source)
+    conn = _open(_root())
+    with conn.transaction():
+        document = _need_document(conn, project, name, lock=True)
+        held = _draft(conn, document["id"], lock=True)
+        active = _need_active(conn, document)
+        if args.base is not None:
+            base = _resolve_version(conn, document, args.base)["id"]
+        elif held is not None:
+            base = held["base_version_id"]
+        else:
+            base = active["id"]
+        saved = _one(conn, "INSERT INTO assets_drafts (agent_id, document_id, base_version_id, "
+                           "content, saved_by) VALUES (%s, %s, %s, %s, %s) "
+                           "ON CONFLICT (document_id) DO UPDATE SET agent_id = excluded.agent_id, "
+                           "base_version_id = excluded.base_version_id, "
+                           "content = excluded.content, saved_at = now(), "
+                           "saved_by = excluded.saved_by RETURNING saved_at, saved_by",
+                     (project, document["id"], base, body, _actor()))
+    _emit({"name": name, "outcome": "created" if held is None else "saved",
+           "changed": held is None or (held["content"], held["base_version_id"]) != (body, base),
+           "base": str(base), "active": str(active["id"]), "stale": base != active["id"],
+           "saved_at": _iso(saved["saved_at"]), "saved_by": saved["saved_by"]})
+
+
+def cmd_draft_show(args) -> None:
+    project = _project(write=False)
+    name = _checked_name(args.name)
+    conn = _open(_root())
+    document = _need_document(conn, project, name)
+    draft = _need_draft(conn, document)
+    active = _need_active(conn, document)
+    _emit({"name": name, "base": str(draft["base_version_id"]), "active": str(active["id"]),
+           "stale": draft["base_version_id"] != active["id"],
+           "saved_at": _iso(draft["saved_at"]), "saved_by": draft["saved_by"],
+           "content": draft["content"]})
+
+
+def cmd_draft_discard(args) -> None:
+    project = _project(write=True)
+    name = _checked_name(args.name)
+    conn = _open(_root())
+    with conn.transaction():
+        document = _need_document(conn, project, name, lock=True)
+        gone = _one(conn, "DELETE FROM assets_drafts WHERE document_id = %s "
+                          "RETURNING base_version_id", (document["id"],))
+    _emit({"name": name, "changed": gone is not None,
+           "base": str(gone["base_version_id"]) if gone else None})
+
+
+def cmd_draft_publish(args) -> None:
+    project = _project(write=True)
+    name = _checked_name(args.name)
+    if args.note is not None and not args.note.strip():
+        _die(6, "input", "--note says why the document changed; it is not empty")
+    if args.base is not None and not _VERSION_REF.fullmatch(args.base):
+        _die(6, "bad_version", f"{args.base!r} is not a version id",
+             f"give the whole id or its first 6 or more characters, as `{NAME} history` shows")
+    conn = _open(_root())
+    import psycopg
+    try:
+        with conn.transaction():
+            document = _need_document(conn, project, name, lock=True)
+            draft = _need_draft(conn, document, lock=True)
+            base = (_resolve_version(conn, document, args.base)["id"] if args.base is not None
+                    else draft["base_version_id"])
+            active = _need_active(conn, document, lock=True)
+            if active["id"] != base:
+                _die(7, "stale_base", f"the draft of {name!r} is based on version {base}, and "
+                     f"version {active['id']} was saved after it and is the active version",
+                     f"`{NAME} diff {name} {base}` shows what changed since; publish again "
+                     f"with --base {active['id']} to publish the draft over it")
+            out = _save(conn, project, name, draft["content"], base=str(base), note=args.note,
+                        actor=_actor())
+            _rows(conn, "DELETE FROM assets_drafts WHERE document_id = %s", (document["id"],))
+    except _StaleBase as exc:
+        _stale_refusal(name, exc.active)
+    except psycopg.errors.UniqueViolation:
+        _die(7, "stale_base", f"another save of {name!r} came first",
+             f"read it with `{NAME} show {name}` and publish again")
+    except psycopg.errors.CheckViolation as exc:
+        _refused_by_store(exc)
+    _emit({**out, "changed": out["created"]})
 
 
 def cmd_retire(args) -> None:
@@ -2596,6 +2831,18 @@ def _parser() -> _Parser:
     one = files.add_parser("log")
     one.add_argument("name", nargs="?")
     one.add_argument("--limit", type=_limit, default=100)
+    drafts = sub.add_parser("draft").add_subparsers(dest="draft_cmd", required=True,
+                                                    parser_class=_Parser)
+    one = drafts.add_parser("save")
+    one.add_argument("name")
+    one.add_argument("--from", dest="source", required=True)
+    one.add_argument("--base")
+    drafts.add_parser("show").add_argument("name")
+    drafts.add_parser("discard").add_argument("name")
+    one = drafts.add_parser("publish")
+    one.add_argument("name")
+    one.add_argument("--base")
+    one.add_argument("--note")
     return parser
 
 
@@ -2607,7 +2854,8 @@ def main() -> None:
         _cmd_help()
         return
     args = _parser().parse_args(argv)
-    verb = f"files {args.files_cmd}" if args.cmd == "files" else args.cmd
+    verb = (f"files {args.files_cmd}" if args.cmd == "files" else
+            f"draft {args.draft_cmd}" if args.cmd == "draft" else args.cmd)
     if verb in WRITE_VERBS:
         _read_only_gate(f"`{NAME} {verb}`")
     {"doctor": lambda a: cmd_doctor(a.connection), "list": cmd_list, "show": cmd_show,
@@ -2615,7 +2863,8 @@ def main() -> None:
      "retire": cmd_retire, "import": cmd_import, "export": cmd_export,
      "files add": cmd_files_add, "files link": cmd_files_link, "files get": cmd_files_get,
      "files rm": cmd_files_rm, "files list": cmd_files_list,
-     "files log": cmd_files_log}[verb](args)
+     "files log": cmd_files_log, "draft save": cmd_draft_save, "draft show": cmd_draft_show,
+     "draft discard": cmd_draft_discard, "draft publish": cmd_draft_publish}[verb](args)
 
 
 if __name__ == "__main__":

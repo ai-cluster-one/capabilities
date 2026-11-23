@@ -74,6 +74,18 @@ GLOBAL ROUTINES
   routine enable <name>         switch a routine on for this agent, own or global
   routine disable <name>        switch it off again
 
+DRAFTS  (a draft is never read: list, show, history, diff, titles, export
+  and the routine index see only versions)
+  routine draft save <name>     the file form as the routine's one draft
+  routine draft show <name>     the draft, with its base and the active version
+  routine draft discard <name>  remove the draft
+  routine draft publish <name>  the draft as one new version, against its base
+
+  A routine in the store holds at most one draft; a routine file has none.
+  Saving it again adds no version; publish adds one, or refuses (exit 7
+  `stale_base`, naming the draft's base and the active version) when
+  another save came after the base.
+
 THE AGENT'S ROUTINES AND THEIR TITLES
   These read and write the agent's routines where they live: in the store
   when it holds an active routine of this project, else in the routines
@@ -84,7 +96,8 @@ THE AGENT'S ROUTINES AND THEIR TITLES
   routine titles                each routine with its title, and where it lives
   routine title <name> <title>  set a routine's display title, or clear it
 
-  save, retire, import, transfer, enable, disable and title are writes: exit
+  save, retire, import, transfer, enable, disable, title and draft save,
+  discard and publish are writes: exit
   4 `read_only_switch` under CAPABILITIES_READ_ONLY, and exit 4
   `system_agent` in a system agent, whose doctrine no edit changes.
 
@@ -92,8 +105,8 @@ STORE
   The tables are routine_documents (one row per routine: project, or none
   and its author project for a global one, name, created, retired, and for
   a project's own when it is switched off), routine_versions (one row per
-  version) and routine_enablements (one row per global routine a project has
-  enabled), in the schema the project's store setting names, migrated under
+  version), routine_enablements (one row per global routine a project has
+  enabled) and routine_drafts (one row per routine with a draft), in the schema the project's store setting names, migrated under
   the `routine` ledger. One version per routine is active, which the store
   enforces; it refuses any change to a version other than clearing
   `active`, and any delete.
@@ -104,13 +117,15 @@ I/O
 
 EXIT CODES
   0 success
-  3 not found - no consuming project, no routine of that name, no version
+  3 not found - no consuming project, no routine of that name, no version,
+    no draft
   4 policy - routine not enabled, the read-only switch, a system agent, a
     change to a global routine by a project that is not its author
   5 store - unreachable or busy
   6 input - a malformed argument or file, validation findings, no store
     configured, no project or project identity
-  7 stale - the base a save names is no longer the active version
+  7 stale - the base a save or a publish names is no longer the active
+    version
 """
 
 from __future__ import annotations
@@ -157,6 +172,8 @@ CRED_KEYS: list = []
 # in the routines folder; each is refused under the read-only switch. `export`
 # reads the store and writes only the folder named.
 WRITE_VERBS = {"save", "retire", "import", "title", "enable", "disable", "transfer"}
+# The draft verbs that write; `draft show` reads.
+DRAFT_WRITES = {"save", "discard", "publish"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/routine/guides/")
@@ -214,13 +231,15 @@ _HELP_TAIL = """
 
   EXIT CODES
   0 success
-  3 not found - no consuming project, no routine of that name, no version
+  3 not found - no consuming project, no routine of that name, no version,
+    no draft
   4 policy - routine not enabled, the read-only switch, a system agent, a
     change to a global routine by a project that is not its author
   5 store - unreachable or busy
   6 input - a malformed argument or file, validation findings, no store
     configured, no project or project identity
-  7 stale - the base a save names is no longer the active version
+  7 stale - the base a save or a publish names is no longer the active
+    version
 """
 _HELP_SWITCH = """\
 routine enable <name> [--global]
@@ -316,11 +335,14 @@ routine list --store [--global] [--json]
 
   Output from the store: one line per routine - name, the first 8
   characters of the version id, description, and `(global, by <author>)`,
-  `(shadows a global routine)` or `(off)` where they apply - or `no
-  routines in this project's store` / `no global routines in the store`.
-  With --json: {project, global, count, routines: [{name, version, title,
-  description, saved_at, global, origin, enabled?, author?,
-  shadows_global?}]}; `enabled` where a project is known.
+  `(shadows a global routine)`, `(off)` or `(draft)` where they apply - or
+  `no routines in this project's store` / `no global routines in the
+  store`. The version, title and description are the active version's,
+  never a draft's. With --json: {project, global, count, routines: [{name,
+  version, title, description, saved_at, global, origin, draft, enabled?,
+  author?, shadows_global?}]}; `enabled` where a project is known, `draft`
+  true where the routine holds a draft. The folder's lines carry no draft
+  marker: a routine file has no draft.
 
   A store that is set but does not answer is read past to the folder, with
   a warning on stderr.
@@ -568,6 +590,96 @@ routine transfer <name> --to PROJECT_ID
 
   Example: routine transfer shared-review --to <PROJECT_ID>
 """ + _HELP_WRITE + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "draft save": """\
+routine draft save <name> --from FILE|- [--base ID] [--global]
+
+  Save the file form read from FILE, or stdin with `-`, as the routine's
+  draft. Adds no version: list, show, history, diff, titles, export and
+  the routine index still read the active version. A routine holds one
+  draft; saving again writes over its text and keeps its base. The base
+  is the version the draft was made from: --base ID where given, else the
+  draft's base where one is already held, else the active version. The
+  file's `name` must be <name>. The routine must be in the store: a new
+  routine starts with `routine save`, and a routine kept only as a file in
+  the routines folder has no draft - edit its file.
+
+  --from FILE|-   the routine in the file form, from FILE or stdin; required
+  --base ID       the version the draft is made from
+  --global        the global routine's draft, as its author
+
+  Output: {scope, project, name, outcome, changed, base, active, stale,
+  saved_at, saved_by}: scope `project` or `global`; outcome `created` or
+  `saved`; `stale` is true when the base is no longer the active version.
+
+  Exit codes: 0; 3 no routine of that name in the store, a --base that
+  names no version; 4 policy, the read-only switch, system_agent,
+  not_author; 5 store; 6 input, not_canonical, no store configured, no
+  project or project identity.
+
+  Example: routine draft save weekly-review --from - < weekly-review.md
+""" + _HELP_IDS + _HELP_WRITE + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "draft show": """\
+routine draft show <name> [--global] [--json]
+
+  The routine's draft in the file form, as it was saved. --json adds its
+  base, the active version, whether the base is stale, and who saved it
+  when. Without --global it is the draft of the project's own routine of
+  that name, never of a global one it has enabled.
+
+  --global   the global routine's draft
+  --json     the structured answer
+
+  Output: the draft in the file form. With --json: {name, scope, project,
+  base, active, stale, saved_at, saved_by, content}.
+
+  Exit codes: 0; 3 no routine of that name in the store, no draft
+  (`no_draft`); 4 policy; 5 store; 6 a malformed name, no store
+  configured, no project or project identity.
+
+  Example: routine draft show weekly-review --json
+""" + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "draft discard": """\
+routine draft discard <name> [--global]
+
+  Remove the routine's draft; its versions are untouched. Safe to repeat:
+  with no draft, answers `"changed": false`.
+
+  --global   the global routine's draft, as its author
+
+  Output: {name, scope, project, changed, base}.
+
+  Exit codes: 0; 3 no routine of that name in the store; 4 policy, the
+  read-only switch, system_agent, not_author; 5 store; 6 a malformed
+  name, no store configured, no project or project identity.
+
+  Example: routine draft discard weekly-review
+""" + _HELP_WRITE + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
+    "draft publish": """\
+routine draft publish <name> [--base ID] [--note TEXT] [--global]
+
+  Turn the draft into the routine's new active version, against the
+  draft's base, and remove the draft, in one transaction. When another
+  save came after the base, the publish is refused (exit 7 `stale_base`,
+  naming the draft's base and the active version) and the draft stays:
+  `routine diff <name> <base>` shows what changed since, and publishing
+  again with --base naming the active version confirms the draft over it.
+  A draft equal to the active version adds no version, answers `"changed":
+  false`, and is removed.
+
+  --base ID     publish against this version instead of the draft's base
+  --note TEXT   why it changed
+  --global      publish the global routine's draft, as its author
+
+  Output: {project, changed, name, outcome, version, base?, normalised?,
+  global?}: outcome `versioned` or `unchanged`, as `save` answers.
+
+  Exit codes: 0; 3 no routine of that name in the store, no draft
+  (`no_draft`), a --base that names no version; 4 policy, the read-only
+  switch, system_agent, not_author; 5 store; 6 a malformed name, no store
+  configured, no project or project identity; 7 stale_base.
+
+  Example: routine draft publish weekly-review --note "a step added"
+""" + _HELP_IDS + _HELP_WRITE + _HELP_GLOBAL_ROUTINES + _HELP_TAIL,
     "enable": _HELP_SWITCH,
     "disable": _HELP_SWITCH,
     "titles": """\
@@ -867,7 +979,7 @@ def cmd_groom(args) -> None:
 # versions reference their routine by a foreign key: both tables are this
 # capability's own and a routine is retired rather than deleted, so the key
 # never blocks a write and refuses only a version of no routine.
-LEDGER_MAJOR, LEDGER_MINOR = 2, 1
+LEDGER_MAJOR, LEDGER_MINOR = 2, 2
 _STORE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
 # The store's foreign keys (core 4.0): every agent and node column of this
 # owner keyed by what its parent takes with it - owned rows go with it, a
@@ -1082,6 +1194,31 @@ LEDGER_STEPS = [
         'The global routine enabled: a routine_documents row with no agent.';
     """),
     _M9Step("0008-keys", _M9_KEYS_SQL, core=(4, 0)),
+    # A draft is the one edit of a routine not yet published: no reader reads
+    # it, publishing makes it one version, and discarding deletes it. A row per
+    # routine, so a draft is written over in place rather than versioned; a
+    # second author would make the key (document_id, agent_id).
+    _M9Step("0009-drafts", """
+    CREATE TABLE routine_drafts (
+        agent_id         text NOT NULL CHECK (agent_id <> '')
+                         REFERENCES agents (id) ON DELETE CASCADE,
+        document_id      uuid PRIMARY KEY REFERENCES routine_documents (id) ON DELETE CASCADE,
+        base_version_id  uuid NOT NULL REFERENCES routine_versions (id) ON DELETE CASCADE,
+        content          text NOT NULL,
+        saved_at         timestamptz NOT NULL DEFAULT now(),
+        saved_by         text NOT NULL CHECK (saved_by <> '')
+    );
+    COMMENT ON TABLE routine_drafts IS
+        'The one unpublished edit of a routine: never read as a routine. Publishing adds it as one version of routine_versions against its base and deletes the row; discarding deletes it.';
+    COMMENT ON COLUMN routine_drafts.agent_id IS
+        'The agent that saved the draft: the routine''s own agent, or a global routine''s author.';
+    COMMENT ON COLUMN routine_drafts.base_version_id IS
+        'The version the draft was made from; publishing is refused while another version is active.';
+    COMMENT ON COLUMN routine_drafts.content IS
+        'The draft in the file form a save reads, front matter and body, checked when saved.';
+    COMMENT ON COLUMN routine_drafts.saved_by IS
+        'Who saved it last: user@node.';
+    """, core=(4, 0)),
 ]
 
 
@@ -1405,7 +1542,8 @@ def cmd_store_list(args) -> None:
                      "(d.agent_id IS NOT NULL AND EXISTS (SELECT 1 FROM routine_documents g "
                      "JOIN routine_enablements e ON e.document_id = g.id "
                      "AND e.agent_id = d.agent_id WHERE g.agent_id IS NULL "
-                     "AND g.name = d.name AND g.retired_at IS NULL)) AS shadows_global "
+                     "AND g.name = d.name AND g.retired_at IS NULL)) AS shadows_global, "
+                     "EXISTS (SELECT 1 FROM routine_drafts r WHERE r.document_id = d.id) AS draft "
                      "FROM routine_documents d JOIN routine_versions v "
                      "ON v.document_id = d.id AND v.active "
                      f"WHERE d.retired_at IS NULL AND {where} ORDER BY d.name", params)
@@ -1414,7 +1552,8 @@ def cmd_store_list(args) -> None:
         for r in rows:
             item = {"name": r["name"], "version": str(r["id"]), "title": r["title"],
                     "description": r["description"], "saved_at": _moment(r["created_at"]),
-                    "global": r["global"], "origin": "global" if r["global"] else "own"}
+                    "global": r["global"], "origin": "global" if r["global"] else "own",
+                    "draft": r["draft"]}
             if project is not None:
                 item["enabled"] = r["enabled"]
             if r["global"]:
@@ -1434,6 +1573,7 @@ def cmd_store_list(args) -> None:
                     + (f"  (global, by {r['author_agent_id']})" if r["global"] else "")
                     + ("  (shadows a global routine)" if r["shadows_global"] else "")
                     + ("  (off)" if project is not None and not r["enabled"] else "")
+                    + ("  (draft)" if r["draft"] else "")
                     for r in rows))
 
 
@@ -1629,6 +1769,133 @@ def cmd_save(args) -> None:
     if args.is_global:
         outcome["global"] = True
     _emit({"project": project, "changed": outcome["outcome"] != "unchanged", **outcome})
+
+
+# ── routines in the store: drafts ───────────────────────────────────────────
+
+def _draft(conn, document_id, lock: bool = False) -> dict | None:
+    return _one(conn, "SELECT agent_id, document_id, base_version_id, content, saved_at, "
+                "saved_by FROM routine_drafts WHERE document_id = %s"
+                + (" FOR UPDATE" if lock else ""), (document_id,))
+
+
+def _need_draft(conn, document: dict, lock: bool = False) -> dict:
+    found = _draft(conn, document["id"], lock)
+    if found is None:
+        _die(3, "no_draft", f"{document['name']!r} holds no draft",
+             f"`{NAME} draft save {document['name']} --from -` starts one")
+    return found
+
+
+def _draft_target(conn, args, name: str) -> tuple[str, dict]:
+    """The writing project and the locked routine a draft write addresses; a
+    global routine's draft is written by its author alone."""
+    project = _scope(write=True)
+    document = _need_document(conn, None if args.is_global else project, name, lock=True)
+    if args.is_global:
+        _authored(document, project)
+    return project, document
+
+
+def _scope_label(is_global: bool) -> str:
+    return "global" if is_global else "project"
+
+
+def cmd_draft_save(args) -> None:
+    name = _check_name(args.name)
+    try:
+        text = (sys.stdin.read() if args.source == "-"
+                else _read_text(Path(args.source)))
+        fields, _normalised = parse(text)
+        _name_matches(fields, name)
+    except OSError as exc:
+        _die(6, "input", f"--from {args.source}: {exc.strerror or exc}")
+    except Unreadable as exc:
+        _die(6, "not_canonical", f"--from {args.source} is not the file form: {exc}",
+             f"`{NAME} help` shows the file form; `{NAME} show {name}` prints one")
+    with _store() as conn:
+        with conn.transaction():
+            project, document = _draft_target(conn, args, name)
+            held = _draft(conn, document["id"], lock=True)
+            active = _active(conn, document["id"])
+            if args.base:
+                base = _version(conn, document, args.base)["id"]
+            elif held is not None:
+                base = held["base_version_id"]
+            else:
+                base = active["id"]
+            saved = _one(conn, "INSERT INTO routine_drafts (agent_id, document_id, "
+                         "base_version_id, content, saved_by) VALUES (%s, %s, %s, %s, %s) "
+                         "ON CONFLICT (document_id) DO UPDATE SET agent_id = excluded.agent_id, "
+                         "base_version_id = excluded.base_version_id, content = excluded.content, "
+                         "saved_at = now(), saved_by = excluded.saved_by "
+                         "RETURNING saved_at, saved_by",
+                         (project, document["id"], base, text, _actor()))
+    _emit({"scope": _scope_label(args.is_global), "project": project, "name": name,
+           "outcome": "created" if held is None else "saved",
+           "changed": held is None or (held["content"], held["base_version_id"]) != (text, base),
+           "base": str(base), "active": str(active["id"]), "stale": base != active["id"],
+           "saved_at": _moment(saved["saved_at"]), "saved_by": saved["saved_by"]})
+
+
+def cmd_draft_show(args) -> None:
+    name = _check_name(args.name)
+    project = _reader(args.is_global)
+    with _store() as conn:
+        document = _need_document(conn, None if args.is_global else project, name)
+        draft = _need_draft(conn, document)
+        active = _active(conn, document["id"])
+    if args.json:
+        _emit({"name": name, "scope": _scope_label(args.is_global), "project": project,
+               "base": str(draft["base_version_id"]), "active": str(active["id"]),
+               "stale": draft["base_version_id"] != active["id"],
+               "saved_at": _moment(draft["saved_at"]), "saved_by": draft["saved_by"],
+               "content": draft["content"]})
+        return
+    sys.stdout.write(draft["content"])
+
+
+def cmd_draft_discard(args) -> None:
+    name = _check_name(args.name)
+    with _store() as conn:
+        with conn.transaction():
+            project, document = _draft_target(conn, args, name)
+            gone = _one(conn, "DELETE FROM routine_drafts WHERE document_id = %s "
+                        "RETURNING base_version_id", (document["id"],))
+    _emit({"name": name, "scope": _scope_label(args.is_global), "project": project,
+           "changed": gone is not None,
+           "base": str(gone["base_version_id"]) if gone else None})
+
+
+def cmd_draft_publish(args) -> None:
+    name = _check_name(args.name)
+    note = args.note.strip() if args.note and args.note.strip() else None
+    with _store() as conn:
+        with conn.transaction():
+            project, document = _draft_target(conn, args, name)
+            draft = _need_draft(conn, document, lock=True)
+            base = (_version(conn, document, args.base)["id"] if args.base
+                    else draft["base_version_id"])
+            active = _active(conn, document["id"])
+            if active["id"] != base:
+                _die(7, "stale_base", f"the draft of {name!r} is based on {base}, and "
+                     f"{active['id']} was saved after it and is the active version",
+                     f"`{NAME} diff {name} {base}` shows what changed since; publish again "
+                     f"with --base {active['id']} to publish the draft over it")
+            fields, normalised = parse(draft["content"])
+            outcome = _save_version(conn, None if args.is_global else project, name, fields,
+                                    str(base), note, _actor(), author=project)
+            _rows(conn, "DELETE FROM routine_drafts WHERE document_id = %s", (document["id"],))
+    if normalised:
+        outcome["normalised"] = normalised
+    if args.is_global:
+        outcome["global"] = True
+    _emit({"project": project, "changed": outcome["outcome"] != "unchanged", **outcome})
+
+
+def cmd_draft(args) -> None:
+    {"save": cmd_draft_save, "show": cmd_draft_show, "discard": cmd_draft_discard,
+     "publish": cmd_draft_publish}[args.draft_cmd](args)
 
 
 def cmd_retire(args) -> None:
@@ -2175,12 +2442,28 @@ def main(argv: list[str] | None = None) -> None:
     title.add_argument("name")
     title.add_argument("title", nargs="?")
     title.add_argument("--clear", action="store_true")
+    drafts = store_verb("draft", cmd_draft).add_subparsers(dest="draft_cmd", required=True)
+
+    def draft_verb(name: str) -> argparse.ArgumentParser:
+        one = global_flag(drafts.add_parser(name, add_help=False, allow_abbrev=False))
+        one.error = refuse
+        one.add_argument("name")
+        return one
+    draft_save = draft_verb("save")
+    draft_save.add_argument("--from", dest="source", required=True)
+    draft_save.add_argument("--base")
+    draft_verb("show").add_argument("--json", action="store_true")
+    draft_verb("discard")
+    draft_publish = draft_verb("publish")
+    draft_publish.add_argument("--base")
+    draft_publish.add_argument("--note")
     args, extra = parser.parse_known_args(argv)
     if extra:
         _die(6, "input", f"unknown arguments: {' '.join(extra)}")
-    if args.cmd in WRITE_VERBS:
-        _read_only_gate(f"`{NAME} {args.cmd}`")
-        _system_agent_gate(f"`{NAME} {args.cmd}`")
+    if args.cmd in WRITE_VERBS or (args.cmd == "draft" and args.draft_cmd in DRAFT_WRITES):
+        verb = args.cmd if args.cmd != "draft" else f"draft {args.draft_cmd}"
+        _read_only_gate(f"`{NAME} {verb}`")
+        _system_agent_gate(f"`{NAME} {verb}`")
     if args.cmd == "list" and args.store:
         cmd_store_list(args)
         return

@@ -191,3 +191,96 @@ def test_projects_do_not_see_each_others_assets(world):  # noqa: F811
     assert world.ok(two, "list")["count"] == 0
     assert world.run(two, "show", "plans/shared-name").returncode == 3
     assert json.loads(world.run(two, "search", "One").stdout)["matched"] == 0
+
+
+# --- drafts ----------------------------------------------------------------------
+
+def _versions(world, root, name):  # noqa: F811
+    return [v["id"] for v in world.ok(root, "history", name)["versions"]]
+
+
+def test_saving_a_draft_twice_adds_no_version_and_no_reader_sees_it(world, tmp_path):  # noqa: F811
+    root = world.project()
+    body = b"# Plan\n\npublished text\n"
+    active = save(world, root, "plans/p", body)["version"]["id"]
+    save(world, root, "plans/q", b"# Q\n\nother\n")
+    first = world.ok(root, "draft", "save", "plans/p", "--from", "-",
+                     stdin=b"# Drafted\n\nzebra once\n")
+    assert (first["outcome"], first["changed"], first["base"], first["active"],
+            first["stale"]) == ("created", True, active, active, False)
+    again = world.ok(root, "draft", "save", "plans/p", "--from", "-",
+                     stdin=b"# Drafted\n\nzebra twice\n")
+    assert (again["outcome"], again["changed"], again["base"]) == ("saved", True, active)
+    assert _versions(world, root, "plans/p") == [active]
+    shown = world.ok(root, "draft", "show", "plans/p")
+    assert (shown["base"], shown["active"], shown["stale"], shown["content"]) == (
+        active, active, False, "# Drafted\n\nzebra twice\n")
+    assert shown["saved_by"] and shown["saved_at"]
+
+    # Every reader still reads the published version only.
+    version = world.ok(root, "show", "plans/p")["version"]
+    assert (version["id"], version["body"], version["title"]) == (active, body.decode(), "Plan")
+    assert world.ok(root, "diff", "plans/p")["to"]["id"] == active
+    assert world.ok(root, "search", "zebra")["matched"] == 0
+    listed = {d["name"]: d for d in world.ok(root, "list")["documents"]}
+    assert (listed["plans/p"]["draft"], listed["plans/p"]["version"],
+            listed["plans/p"]["title"]) == (True, active, "Plan")
+    assert listed["plans/q"]["draft"] is False
+    out = tmp_path / "out"
+    world.ok(root, "export", str(out))
+    assert (out / "plans/p.md").read_bytes() == body
+
+    missing = world.run(root, "draft", "save", "plans/none", "--from", "-", stdin=b"x\n")
+    assert missing.returncode == 3 and error(missing)["code"] == "not_found"
+    none = world.run(root, "draft", "show", "plans/q")
+    assert none.returncode == 3 and error(none)["code"] == "no_draft"
+
+
+def test_publish_adds_one_version_against_the_base_and_refuses_a_moved_one(world):  # noqa: F811
+    root = world.project()
+    base = save(world, root, "research/r", b"# R\n\nv1\n")["version"]["id"]
+    world.ok(root, "draft", "save", "research/r", "--from", "-", stdin=b"# R\n\ndrafted\n")
+    published = world.ok(root, "draft", "publish", "research/r", "--note", "from the draft")
+    assert (published["changed"], published["created"], published["replaced"]) == (
+        True, True, base)
+    assert _versions(world, root, "research/r") == [published["version"]["id"], base]
+    shown = world.ok(root, "show", "research/r")["version"]
+    assert (shown["body"], shown["note"]) == ("# R\n\ndrafted\n", "from the draft")
+    assert world.ok(root, "list")["documents"][0]["draft"] is False
+    gone = world.run(root, "draft", "publish", "research/r")
+    assert gone.returncode == 3 and error(gone)["code"] == "no_draft"
+
+    # Another save moves the base under a held draft: publish names both and keeps it.
+    held = published["version"]["id"]
+    world.ok(root, "draft", "save", "research/r", "--from", "-", stdin=b"# R\n\ndrafted again\n")
+    moved = save(world, root, "research/r", b"# R\n\nsaved directly\n")["version"]["id"]
+    assert world.ok(root, "draft", "show", "research/r")["stale"] is True
+    late = world.run(root, "draft", "publish", "research/r")
+    assert late.returncode == 7 and error(late)["code"] == "stale_base"
+    assert held in error(late)["message"] and moved in error(late)["message"]
+    assert _versions(world, root, "research/r") == [moved, held, base]
+    assert world.ok(root, "draft", "show", "research/r")["content"] == "# R\n\ndrafted again\n"
+    confirmed = world.ok(root, "draft", "publish", "research/r", "--base", moved)
+    assert (confirmed["changed"], confirmed["replaced"]) == (True, moved)
+    assert len(_versions(world, root, "research/r")) == 4
+    assert world.ok(root, "show", "research/r")["version"]["body"] == "# R\n\ndrafted again\n"
+
+
+def test_discard_removes_the_draft_and_the_read_only_switch_refuses_draft_writes(world):  # noqa: F811
+    root = world.project()
+    base = save(world, root, "notes/n", b"# N\n")["version"]["id"]
+    world.ok(root, "draft", "save", "notes/n", "--from", "-", stdin=b"# N\n\ngone\n")
+    for args in (("draft", "save", "notes/n", "--from", "-"), ("draft", "discard", "notes/n"),
+                 ("draft", "publish", "notes/n")):
+        done = world.run(root, *args, stdin=b"# N\n\nblocked\n", CAPABILITIES_READ_ONLY="1")
+        assert done.returncode == 4 and error(done)["code"] == "read_only_switch", args
+    shown = world.ok(root, "draft", "show", "notes/n", CAPABILITIES_READ_ONLY="1")
+    assert shown["content"] == "# N\n\ngone\n"
+    discarded = world.ok(root, "draft", "discard", "notes/n")
+    assert (discarded["changed"], discarded["base"]) == (True, base)
+    assert world.ok(root, "draft", "discard", "notes/n") == {
+        "name": "notes/n", "changed": False, "base": None}
+    assert _versions(world, root, "notes/n") == [base]
+    assert world.ok(root, "list")["documents"][0]["draft"] is False
+    none = world.run(root, "draft", "show", "notes/n")
+    assert none.returncode == 3 and error(none)["code"] == "no_draft"
