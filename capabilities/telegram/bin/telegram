@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.51,<1",
 #     "httpx>=0.27",
 #     "qrcode>=7.4",
 #     "telethon==1.45.0",
@@ -794,6 +794,46 @@ def _connection_prefill(cid: str, entry: dict) -> dict:
     field = next(f for f in CONN_FIELDS if f["key"] == "secret_env")
     own = _own_env_names(field, cid)[0]
     return {"fields": {"api_id": api_id, "secret_env": own}, "secrets": {own: api_hash}}
+
+
+def _connection_removed(cid: str, entry: dict, scope: str) -> list:
+    """What the contract's `connection remove` of a machine connection takes
+    away beside its record, once the record is gone: the session file it
+    signs in through on this machine (`_connection_session`), and the one it
+    had under its label while the config home's file kept it, each with its
+    journal, and its folder under the state directory where that leaves it
+    empty. A session another connection
+    still resolves to, and the machine's default session, are left. The
+    paths removed."""
+    if scope != "global":
+        return []
+    stems = [Path(_connection_session(cid, entry))]
+    label = entry.get("label")
+    if isinstance(label, str) and label not in ("", cid, ".", "..") and "/" not in label:
+        stems.append(_state_dir() / label / "session")
+    try:
+        others = _records().connections(NAME, include_disabled=True)
+    except StoreError:
+        return []   # what else resolves to a session cannot be told: none is removed
+    kept = {_session_file(str(DEFAULT_SESSION)).resolve()}
+    kept.update(_session_file(_connection_session(other, held.get("value") or {})).resolve()
+                for other, held in others.items() if other != cid)
+    removed = []
+    for stem in stems:
+        session = _session_file(str(stem))
+        if session.resolve() in kept:
+            continue
+        for path in (session, session.with_name(session.name + "-journal")):
+            if path.is_file():
+                with contextlib.suppress(OSError):
+                    path.unlink()
+                    removed.append(str(path))
+        folder = session.parent
+        with contextlib.suppress(OSError):
+            if folder.parent == _state_dir() and not any(folder.iterdir()):
+                folder.rmdir()
+                removed.append(str(folder))
+    return removed
 
 
 def _app_credentials(cid: str | None, entry: dict | None

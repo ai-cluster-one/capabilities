@@ -1,5 +1,9 @@
 # telegram — change log
 
+## 2026-11-23 — `telegram connection remove --machine` removes a connection for good, by its id or its label, with its session files here
+
+On a machine whose store holds the global rows, removing a machine connection by its label dropped its store row but left its entry in `~/.config/telegram/connections.json`, and the next `telegram doctor` or `telegram login` wrote that entry back into the store as a new connection under a new id. On capabilities-contract 0.51.0 the entry goes with the row, whether the file keys it by the connection's id or its label, and nothing writes an entry only that file declares back into the store. telegram defines the library's `_connection_removed` hook: removing a machine connection also removes the session files it signs in through on this machine - its own `<state-dir>/<id>/session.session`, the path its `session` field names, and the one it had under its label while the file kept it - with their journals, and the connection's folder under the state directory when that leaves it empty. A session another connection still resolves to, and the machine's default session, are left. The answer names what went in `state_removed`. A project's own connection is removed as before. The capability binds `capabilities-contract` 0.51 or later; no verb, flag or exit code changes.
+
 ## 2026-11-23 — Turns run on callva-harness-runner 0.13.1
 
 Turns run on callva-harness-runner 0.13.1, in place of 0.13.0: claude runs through claude-agent-sdk 0.2.187, and Claude Code up to 2.1.330 runs without the runner's untested-version warning. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

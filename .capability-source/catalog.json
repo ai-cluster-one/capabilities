@@ -1528,6 +1528,7 @@
         "tests/test_app_check.py",
         "tests/test_assistant_service.py",
         "tests/test_call_recorder_delivery.py",
+        "tests/test_connection_removed.py",
         "tests/test_connections_keys.py",
         "tests/test_daemon_launch_env.py",
         "tests/test_forwarded_messages.py",
@@ -1548,7 +1549,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "dc03e199d6507d318ed039170e100bd120652b42204e3e8ac63638b351c3e729",
+      "payload_sha256": "40dab1b04d54c39616ecb6549c2f1f8e57ba1e63791ceec6f2180a185eb1cdfc",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
@@ -1564,7 +1565,7 @@
           "title": "Telegram"
         }
       },
-      "version": "2026-11-23 — Turns run on callva-harness-runner 0.13.1"
+      "version": "2026-11-23 — `telegram connection remove --machine` removes a connection for good, by its id or its label, with its session files here"
     },
     "telegrambot": {
       "executable": [

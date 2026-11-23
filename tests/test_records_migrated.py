@@ -560,6 +560,40 @@ def test_a_moved_agent_removes_a_shared_connection_the_store_holds(moved):
     assert ("coolify", "mine") in _owners(lab)
 
 
+def test_a_moved_agent_removing_a_shared_connection_takes_its_config_home_entry(moved):
+    lab = moved
+    spec = {"base_url": "http://stray.invalid", "secret_env": "COOLIFY_TOKEN"}
+    lab.sql("INSERT INTO connections (capability, label, spec) VALUES "
+            "('coolify', 'stray', %s::jsonb), ('coolify', 'other', %s::jsonb)",
+            (json.dumps(spec), json.dumps(spec)))
+    stray, other = _cid(lab, "coolify", "stray"), _cid(lab, "coolify", "other")
+    # The config home keeps one under its label and the other under its id.
+    lab.file("~/coolify/connections.json",
+             {"connections": {"stray": spec, other: spec, "kept": spec}})
+    removed = lab.ok(COOLIFY, "connection", "remove", stray, "--machine")
+    assert removed["connection"] == stray and removed["label"] == "stray"
+    removed = lab.ok(COOLIFY, "connection", "remove", "other", "--machine")
+    assert removed["connection"] == other and removed["scope"] == "global"
+    assert ("coolify", "stray") not in _owners(lab) and ("coolify", "other") not in _owners(lab)
+    assert json.loads((lab.config / "coolify" / "connections.json").read_text()) == {
+        "connections": {"kept": spec}}
+
+
+def test_a_moved_agent_removes_a_machine_connection_only_the_config_home_declares(moved):
+    lab = moved
+    spec = {"base_url": "http://filed.invalid", "secret_env": "COOLIFY_TOKEN"}
+    home = lab.config / "coolify" / "connections.json"
+    lab.file("~/coolify/connections.json", {"connections": {"filed": spec, "kept": spec}})
+    # The project's scope never reaches the machine's file.
+    _code, error = lab.refused(COOLIFY, "connection", "remove", "filed", "--project")
+    assert error["code"] == "unknown_connection"
+    assert json.loads(home.read_text())["connections"] == {"filed": spec, "kept": spec}
+    removed = lab.ok(COOLIFY, "connection", "remove", "filed", "--machine")
+    assert removed["connection"] == "filed" and removed["scope"] == "global"
+    assert json.loads(home.read_text()) == {"connections": {"kept": spec}}
+    assert lab.sql("SELECT count(*) FROM connections") == [(0,)]
+
+
 # --- what a migrated agent reads ----------------------------------------------------
 
 def _rows_for_reads(lab: Lab) -> None:
