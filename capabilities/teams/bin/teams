@@ -28,14 +28,16 @@ and the body, with who saved it, when, and why. One version is active; a save
 adds a new version and never changes an old one. Each document is switched on
 or off for its team, and only one that is on reaches a member.
 
-A team is in one of two modes. In ordinary mode, the default, a member's
-context lists the team by its one line and how to read it; the member reads
-its documents on request. In always mode a member's context carries the
-team's enabled `always` documents whole, each headed by the team's name, and
-lists its enabled `on-request` documents by their line. `teams section`
-prints that part, the Teams section, for the agent it runs in, and the
-capabilities manager runs it at every composition while teams is enabled for
-the member (`teams help section`).
+A document's own load decides how it reaches a member. A member's context
+carries each team's enabled `always` documents whole, under the team's name,
+and lists its enabled `on-request` documents by their line; a team with no
+enabled `always` document is listed by its one line and how to read it. A
+save or a switch that changes what members carry answers how many tokens it
+adds to each member's context and how many agents it reaches, and can answer
+that first as a preview that writes nothing (`teams help doc save`). `teams
+section` prints that part, the Teams section, for the agent it runs in, and
+the capabilities manager runs it at every composition while teams is enabled
+for the member (`teams help section`).
 
 Any agent reads every team and writes through the usual gates: teams enabled
 for it, and no read-only switch. Teams belong to the store, not to an agent.
@@ -67,21 +69,20 @@ THE FILE FORM
 
 READING  (plain text by default; JSON on request)
   teams list                       the teams this agent is in, or every team
-  teams show <team>                a team: line, mode, members, size, documents
+  teams show <team>                a team: line, members, size, documents
   teams doc show <team> <doc>      a document's active version, or one named
   teams doc history <team> <doc>   every version of a document, newest first
   teams section                    the Teams section of this agent's context
 
 WRITING  (answers JSON; refused under the read-only switch)
-  teams create <team>              make a team, in ordinary or always mode
-  teams mode <team> ordinary|always   switch a team's mode
+  teams create <team>              make a team
   teams rename <team> <name>       give a team a new name; its id stays
   teams describe <team>            give a team a new line
   teams retire <team>              retire a team; its documents stay
   teams members add <team> <agent>     make the agent a member of the team
   teams members remove <team> <agent>  make the agent no longer a member
-  teams doc save <team> <doc>      save the file form as the active version
-  teams doc on <team> <doc>        switch a document on for its team
+  teams doc save <team> <doc>      save the file form as the active version, or preview it
+  teams doc on <team> <doc>        switch a document on for its team, or preview it
   teams doc off <team> <doc>       switch a document off; it keeps its versions
   teams doc rename <team> <doc> <name>  give a document a new name; its id stays
   teams doc retire <team> <doc>    retire a document; every version stays
@@ -98,7 +99,7 @@ EXIT CODES
   5 store - unreachable or busy
   6 input - a malformed argument or file, no store configured, no project or
     project identity where the verb needs this agent, a team that exists
-    with another line or mode, a name another team or document holds
+    with another line, a name another team or document holds
   7 stale - the base a save names is no longer the active version
 """
 
@@ -136,7 +137,7 @@ SCOPE = "project"
 CRED_KEYS: list = []
 # Every verb that changes the store's teams; each is refused under the
 # read-only switch. Nested verbs are named `<noun> <verb>`.
-WRITE_VERBS = {"create", "mode", "rename", "describe", "retire", "members add",
+WRITE_VERBS = {"create", "rename", "describe", "retire", "members add",
                "members remove", "doc save", "doc on", "doc off", "doc rename", "doc retire"}
 WRITE_DEFAULT = True
 DOCS_BASE = ""
@@ -200,18 +201,29 @@ _HELP_SIZE = """
   A size in tokens is an estimate: a quarter of the characters, rounded up.
   Each document carries the size of its active body; a team carries `tokens`,
   the size of its enabled documents together, and `always_tokens`, the size
-  of its enabled `always` documents, which is what the team adds to every
-  member's context in always mode.
+  of its enabled `always` documents, which is what the team adds whole to
+  every member's context.
 """
-_HELP_MODES = """
-  MODES
-  A team is in one of two modes:
+_HELP_LOADS = """
+  WHAT A MEMBER CARRIES
+  A document's load decides how it reaches a member of its team:
 
-    ordinary  (the default) a member's context lists the team by its one line
-              and how to read it; the member reads its documents on request.
-    always    a member's context carries the team's enabled `always`
-              documents whole, each headed by the team's name, and lists its
-              enabled `on-request` documents by their line.
+    always      its text stands whole in every member's context, under the
+                team's name.
+    on-request  it is listed by its line, with the command that reads it.
+
+  Only an enabled document reaches a member. A team with no enabled always
+  document is listed by its one line and how to read its instructions.
+"""
+_HELP_REACH = """
+  REACH
+  The answer's `reach` says what the write does to the members' context:
+  `agents`, how many agents are members of the team, and `tokens`, how many
+  tokens the team's part of each member's Teams section gains (below zero
+  where it shrinks), measured by composing that part before and after the
+  write in the same transaction, sized as SIZE says. --dry-run runs the
+  same write, answers the same with `"dry_run": true`, and rolls it back,
+  so a switch to always shows what it costs every member before it lands.
 """
 _HELP_VERSION = """
   ID is a version's whole id or a prefix of six or more characters that names
@@ -255,15 +267,15 @@ HELP_VERBS = {
     "list": """\
 teams list [--all] [--json]
 
-  The teams this agent is a member of, each with its mode, line and id.
+  The teams this agent is a member of, each with its line and id.
   With --all, every team in the store but a retired one, each marked
   `member` or not. An agent in no team is told so (exit 0).
 """ + _HELP_READ + """
-  Output, plain: one line per team, `<name>  <mode>  <line>  [<id>]`, with
-  `member` after the mode under --all for a team this agent is in; with no
-  team, a line saying so. --json: {"scope": "mine"|"all", "agent", "teams":
-  [{"id", "name", "description", "mode", "member"}]}, `member` present where
-  this agent's id is known.
+  Output, plain: one line per team, `<name>  <line>  [<id>]`, with `member`
+  after the name under --all for a team this agent is in; with no team, a
+  line saying so. --json: {"scope": "mine"|"all", "agent", "teams": [{"id",
+  "name", "description", "member"}]}, `member` present where this agent's id
+  is known.
 
   Exit codes: 0, an agent in no team included; 6 `no_project` outside a
   project, or `no_project_identity` in a project with no durable id, without
@@ -276,14 +288,14 @@ teams list [--all] [--json]
     "show": """\
 teams show <team> [--json]
 
-  The team: its id, line, mode, members, size, and every document but a
+  The team: its id, line, members, size, and every document but a
   retired one with its load, whether it is on, its line, size and id. A
   retired team answers to its id.
 """ + _HELP_READ + """
   Output, plain: `team:`, `id:`, `retired:` (a retired team), `description:`,
-  `mode:`, `members:`, `tokens:` and `documents:` lines, then one line per
-  document, `<name>  <load>  on|off  ~<tokens> tokens  <line>  [<id>]`.
-  --json: {"id", "name", "description", "mode", "members", "tokens",
+  `members:`, `tokens:` and `documents:` lines, then one line per document,
+  `<name>  <load>  on|off  ~<tokens> tokens  <line>  [<id>]`.
+  --json: {"id", "name", "description", "members", "tokens",
   "always_tokens", "documents": [{"id", "name", "enabled", "load",
   "description", "version", "tokens"}], "created_at", "created_by",
   "retired_at", "member"}, `member` present where this agent's id is known.
@@ -337,12 +349,12 @@ teams section
   The Teams section of this agent's context, as Markdown: a level-1
   `Teams` heading, the lines that say these teams bind the agent and that
   its own doctrine wins on conflict, then each team it is a member of
-  under a level-2 heading with its line. A team in ordinary mode adds how
-  to read its instructions; one in always mode adds its enabled always
-  documents whole, each under a level-3 heading - its own title where the
-  document opens with one, else its name - with its headings shifted two
-  levels deeper (never inside code), and its enabled on-request
-  documents as one level-3 group by their line. It carries nothing that
+  under a level-2 heading with its line. A team with enabled always
+  documents adds each whole, under a level-3 heading - its own title where
+  the document opens with one, else its name - with its headings shifted
+  two levels deeper (never inside code), and its enabled on-request
+  documents as one level-3 group by their line; a team with none adds how
+  to read its instructions. It carries nothing that
   changes from one session to the next. Nothing at all (exit 0) for an
   agent in no team, with no project identity or no store, or where the
   store has no teams tables. The capabilities manager runs it when it
@@ -358,36 +370,25 @@ teams section
 
   Exit codes: 0, nothing to print included; 4 where teams is not enabled;
   5 where the store is unreachable or busy; 6 a store setting it cannot use.
-""" + _HELP_MODES + """
+""" + _HELP_LOADS + """
   Example: teams section
 """,
     "create": """\
-teams create <team> --description TEXT [--always]
+teams create <team> --description TEXT
 
-  Make a team with that line, in ordinary mode, or in always mode with
-  --always. Safe to repeat: the same line and mode answer `"changed":
-  false`; a team of that name with another line or mode is refused (exit
-  6 `team_exists`) - `teams mode` switches the mode. --description is
-  required: one line of text, not empty, with no space at either end.
+  Make a team with that line. Safe to repeat: the same line answers
+  `"changed": false`; a team of that name with another line is refused
+  (exit 6 `team_exists`) - `teams describe` gives it a new line.
+  --description is required: one line of text, not empty, with no space at
+  either end. What its documents give a member is each document's own
+  load (`teams help doc save`).
 """ + _HELP_WRITE + """
-  Output: {"team", "id", "description", "mode", "changed"}.
+  Output: {"team", "id", "description", "changed"}.
 
   Exit codes: 0; 4 `read_only_switch`; 6 `team_exists`, or `input` for a
   name or line that is not one.
-""" + _HELP_STORE_EXIT + _HELP_MODES + _HELP_REFS + """
+""" + _HELP_STORE_EXIT + _HELP_LOADS + _HELP_REFS + """
   Example: teams create "Release crew" --description "How we ship; read before a release"
-""",
-    "mode": """\
-teams mode <team> ordinary|always
-
-  Switch the team's mode. Safe to repeat.
-""" + _HELP_WRITE + """
-  Output: {"team", "mode", "changed"}.
-
-  Exit codes: 0; 3 `not_found`; 4 `read_only_switch`; 6 `input` for a mode
-  other than ordinary or always.
-""" + _HELP_STORE_EXIT + _HELP_MODES + _HELP_REFS + """
-  Example: teams mode "Release crew" always
 """,
     "rename": """\
 teams rename <team> <name>
@@ -445,22 +446,37 @@ for _action in ("add", "remove"):
     HELP_VERBS[f"members {_action}"] = (
         f"teams members {_action} <team> <agent>\n" + _HELP_MEMBERS
         + f"\n  Example: teams members {_action} \"Release crew\" <agent-id>\n")
-_HELP_SWITCH = """
-  Switch the document on or off for its team. Off, it reaches no member
-  and keeps every version. Safe to repeat: answers `"changed": false`.
-""" + _HELP_WRITE + """
-  Output: {"team", "document", "enabled", "changed"}.
-
+_HELP_SWITCH_EXIT = """
   Exit codes: 0; 3 `not_found` for no team or document of that id or name;
   4 `read_only_switch`.
-""" + _HELP_STORE_EXIT + _HELP_REFS
-for _switch in ("on", "off"):
-    HELP_VERBS[f"doc {_switch}"] = (
-        f"teams doc {_switch} <team> <doc>\n" + _HELP_SWITCH
-        + f"\n  Example: teams doc {_switch} \"Release crew\" checklist\n")
+""" + _HELP_STORE_EXIT
+HELP_VERBS["doc on"] = """\
+teams doc on <team> <doc> [--dry-run]
+
+  Switch the document on for its team, so it reaches every member as its
+  load says. Safe to repeat: answers `"changed": false`. --dry-run answers
+  what the switch would do and writes nothing.
+""" + _HELP_WRITE + """
+  Output: {"team", "document", "enabled", "load", "changed", "reach"}, and
+  `"dry_run": true` under --dry-run; `load` is the active version's.
+""" + _HELP_SWITCH_EXIT + _HELP_REACH + _HELP_SIZE + _HELP_LOADS + _HELP_REFS + """
+  Examples:
+    teams doc on "Release crew" checklist --dry-run
+    teams doc on "Release crew" checklist
+"""
+HELP_VERBS["doc off"] = """\
+teams doc off <team> <doc>
+
+  Switch the document off for its team. Off, it reaches no member and
+  keeps every version. Safe to repeat: answers `"changed": false`.
+""" + _HELP_WRITE + """
+  Output: {"team", "document", "enabled", "changed"}.
+""" + _HELP_SWITCH_EXIT + _HELP_REFS + """
+  Example: teams doc off "Release crew" checklist
+"""
 HELP_VERBS.update({
     "doc save": """\
-teams doc save <team> <doc> --from FILE|- [--base ID] [--note TEXT]
+teams doc save <team> <doc> --from FILE|- [--base ID] [--note TEXT] [--dry-run]
 
   Save the file form read from FILE, or stdin with `-`, as the document's
   new active version; a name not in use starts a new document, switched
@@ -470,12 +486,15 @@ teams doc save <team> <doc> --from FILE|- [--base ID] [--note TEXT]
   the active version at the time of the save is the base. --note says
   why. Safe to repeat: content equal to the active version's adds no
   version and answers `"changed": false`. --from is required; --base on a
-  document that does not exist yet exits 3 `not_found`.
+  document that does not exist yet exits 3 `not_found`. --dry-run answers
+  what the save would do, refusals included, and writes nothing.
 """ + _HELP_VERSION + _HELP_WRITE + """
   Output, a new version: {"team", "document", "version", "previous",
-  "created", "tokens", "changed": true}, `previous` null and `created` true
-  for a new document. Content equal to the active version's: {"team",
-  "document", "version", "changed": false}.
+  "created", "load", "tokens", "changed": true, "reach"}, `previous` null
+  and `created` true for a new document; under --dry-run `version` is null
+  and `"dry_run": true` is added. Content equal to the active version's:
+  {"team", "document", "version", "changed": false}, with `"dry_run": true`
+  under --dry-run.
 
   Exit codes: 0; 3 `not_found` for no team, a --base on a new document, or a
   base version the document does not have; 4 `read_only_switch`; 6
@@ -484,8 +503,9 @@ teams doc save <team> <doc> --from FILE|- [--base ID] [--note TEXT]
   `ambiguous_version`, `name_taken` when another write took a new document's
   name at the same moment; 7 `stale_base`, also when another save changed the
   document at the same moment.
-""" + _HELP_STORE_EXIT + _HELP_FORM + _HELP_REFS + """
+""" + _HELP_STORE_EXIT + _HELP_FORM + _HELP_REACH + _HELP_SIZE + _HELP_LOADS + _HELP_REFS + """
   Examples:
+    teams doc save "Release crew" checklist --from checklist.md --dry-run
     teams doc save "Release crew" checklist --from checklist.md --note "add the rollback step"
     teams doc show "Release crew" checklist --json   # its version is the --base
     cat checklist.md | teams doc save "Release crew" checklist --from - --base 3f2a9c
@@ -597,7 +617,7 @@ def _manifest() -> dict:
 # and members, documents and versions reference it by a foreign key; a name is
 # a display name only. Every key between this capability's own tables refuses
 # only an orphan, since none of them deletes a referenced row.
-LEDGER_MAJOR, LEDGER_MINOR = 1, 2
+LEDGER_MAJOR, LEDGER_MINOR = 1, 3
 _TEAM_PATTERN = r"^[a-z0-9][a-z0-9-]*$"
 _DOC_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
 # The store's foreign keys (core 4.0): every agent and node column of this
@@ -805,6 +825,40 @@ CREATE TRIGGER teams_documents_renamed AFTER UPDATE OF name ON teams_documents
     EXECUTE FUNCTION teams_document_renamed();
 """
 
+# Step 0008 (teams 1.3): the team mode goes, and a document's own load decides
+# what reaches a member. A team in ordinary mode composed none of its always
+# documents, which would start reaching every member now, so each of them -
+# on or off, not retired - gets a new active version, its content unchanged
+# and its load on-request, whose note says why: `doc history` is its trail,
+# and no member's context grows by the step. `teams_teams.always` stays for
+# readers before 1.3, which composed a team's always documents only where it
+# is true: every team is set true and true is the default, so such a reader
+# sharing the store composes the always documents 1.3 composes. Nothing from
+# 1.3 reads it, and teams 2.0 drops it.
+_MIGRATION_ACTOR = "teams@step-0008"
+_LOAD_STEP = "0008-load-decides"
+_LOAD_SQL = r"""
+WITH switched AS (
+    UPDATE teams_versions v SET active = false
+    FROM teams_documents d JOIN teams_teams t ON t.id = d.team_id
+    WHERE v.document_id = d.id AND v.active AND v.load = 'always' AND NOT t.always
+      AND d.retired_at IS NULL
+    RETURNING v.document_id, v.description, v.body
+)
+INSERT INTO teams_versions (document_id, description, load, body, created_by, note)
+SELECT document_id, description, 'on-request', body, '""" + _MIGRATION_ACTOR + r"""',
+       'teams 1.3: the team mode is gone and a document''s load decides; this team was in '
+       'ordinary mode, where an always document reached no member, so it is switched to '
+       'on-request to keep every member''s context as it was'
+FROM switched;
+UPDATE teams_teams SET always = true WHERE NOT always;
+ALTER TABLE teams_teams ALTER COLUMN always SET DEFAULT true;
+COMMENT ON COLUMN teams_teams.always IS
+    'Kept for teams readers before 1.3, which composed a team''s always documents only where it is true; from 1.3 every team is true and nothing reads it. teams 2.0 drops it.';
+COMMENT ON COLUMN teams_versions.load IS
+    'always: composed whole into every member''s context while the document is on; on-request: listed by its line and read on request.';
+"""
+
 LEDGER_STEPS = [
     ("0001-teams", f"""
     CREATE TABLE teams_teams (
@@ -908,6 +962,7 @@ LEDGER_STEPS = [
     """),
     _M9Step("0006-keys", _M9_KEYS_SQL, core=(4, 0)),
     ("0007-ids", _IDS_SQL),
+    (_LOAD_STEP, _LOAD_SQL),
 ]
 
 
@@ -1133,11 +1188,7 @@ def _moment(moment) -> str | None:
     return moment.astimezone().strftime("%Y-%m-%dT%H:%M:%S%z") if moment else None
 
 
-def _mode(always: bool) -> str:
-    return "always" if always else "ordinary"
-
-
-_TEAM_COLUMNS = "id, name, description, always, created_at, created_by, retired_at"
+_TEAM_COLUMNS = "id, name, description, created_at, created_by, retired_at"
 
 
 def _team(conn, ref: str, lock: bool = False, retired: bool = False) -> dict:
@@ -1230,7 +1281,7 @@ def _version_view(version: dict, with_body: bool = True) -> dict:
 
 
 def _team_view(conn, team: dict, me: str | None) -> dict:
-    """A team whole: its id, line, mode, members, documents and size."""
+    """A team whole: its id, line, members, documents and size."""
     members = [row["agent_id"] for row in _rows(
         conn, "SELECT agent_id FROM teams_members WHERE team_id = %s ORDER BY agent_id",
         (team["id"],))]
@@ -1245,7 +1296,7 @@ def _team_view(conn, team: dict, me: str | None) -> dict:
                           "description": row["description"],
                           "version": str(row["id"]), "tokens": tokens(row["body"])})
     view = {"id": team["id"], "name": team["name"], "description": team["description"],
-            "mode": _mode(team["always"]), "members": members,
+            "members": members,
             "tokens": sum(d["tokens"] for d in documents if d["enabled"]),
             "always_tokens": sum(d["tokens"] for d in documents
                                  if d["enabled"] and d["load"] == "always"),
@@ -1263,17 +1314,16 @@ def cmd_list(args) -> None:
     me = _maybe_me() if args.all else _me()
     with _store() as conn:
         if args.all:
-            rows = _rows(conn, "SELECT t.id, t.name, t.description, t.always, "
+            rows = _rows(conn, "SELECT t.id, t.name, t.description, "
                          "EXISTS (SELECT 1 FROM teams_members m WHERE m.team_id = t.id "
                          "AND m.agent_id = %s) AS member FROM teams_teams t "
                          "WHERE t.retired_at IS NULL ORDER BY t.name", (me or "",))
         else:
-            rows = _rows(conn, "SELECT t.id, t.name, t.description, t.always, true AS member "
+            rows = _rows(conn, "SELECT t.id, t.name, t.description, true AS member "
                          "FROM teams_teams t JOIN teams_members m ON m.team_id = t.id "
                          "WHERE m.agent_id = %s AND t.retired_at IS NULL ORDER BY t.name",
                          (me,))
     teams = [{"id": row["id"], "name": row["name"], "description": row["description"],
-              "mode": _mode(row["always"]),
               **({"member": row["member"]} if me is not None else {})} for row in rows]
     if args.json:
         _emit({"scope": "all" if args.all else "mine", "agent": me, "teams": teams})
@@ -1284,7 +1334,7 @@ def cmd_list(args) -> None:
         return
     for team in teams:
         mark = "  member" if team.get("member") and args.all else ""
-        print(f"{team['name']}  {team['mode']}{mark}  {team['description']}  [{team['id']}]")
+        print(f"{team['name']}{mark}  {team['description']}  [{team['id']}]")
 
 
 def cmd_show(args) -> None:
@@ -1297,7 +1347,6 @@ def cmd_show(args) -> None:
         return
     lines = [f"team: {view['name']}", f"id: {view['id']}",
              f"description: {view['description']}",
-             f"mode: {view['mode']}",
              f"members: {', '.join(view['members']) if view['members'] else 'none'}",
              f"tokens: {view['tokens']} (enabled documents), always: {view['always_tokens']}",
              "documents:" if view["documents"] else "documents: none"]
@@ -1351,32 +1400,18 @@ def cmd_create(args) -> None:
     description = _check_line(args.description, "description")
     with _store() as conn:
         with conn.transaction():
-            made = _one(conn, "INSERT INTO teams_teams (name, description, always, created_by) "
-                        "VALUES (%s, %s, %s, %s) ON CONFLICT (name) DO NOTHING RETURNING id",
-                        (team, description, args.always, _actor()))
+            made = _one(conn, "INSERT INTO teams_teams (name, description, created_by) "
+                        "VALUES (%s, %s, %s) ON CONFLICT (name) DO NOTHING RETURNING id",
+                        (team, description, _actor()))
             changed = made is not None
             if not changed:
                 made = _team(conn, team)
-                if made["description"] != description or made["always"] != args.always:
+                if made["description"] != description:
                     _die(6, "team_exists", f"a team {team!r} exists already, with the line "
-                         f"{made['description']!r} in {_mode(made['always'])} mode",
-                         f"`{NAME} show {made['id']}` shows it; `{NAME} mode {made['id']}` "
-                         "switches its mode")
-    _emit({"team": team, "id": made["id"], "description": description,
-           "mode": _mode(args.always), "changed": changed})
-
-
-def cmd_mode(args) -> None:
-    ref = _check_ref(args.team, "team")
-    always = args.mode == "always"
-    with _store() as conn:
-        with conn.transaction():
-            found = _team(conn, ref, lock=True)
-            changed = found["always"] != always
-            if changed:
-                conn.execute("UPDATE teams_teams SET always = %s WHERE id = %s",
-                             (always, found["id"]))
-    _emit({"team": found["name"], "mode": args.mode, "changed": changed})
+                         f"{made['description']!r}",
+                         f"`{NAME} show {made['id']}` shows it; `{NAME} describe {made['id']}` "
+                         "gives it a new line")
+    _emit({"team": team, "id": made["id"], "description": description, "changed": changed})
 
 
 def _taken(kind: str, name: str) -> NoReturn:
@@ -1471,10 +1506,13 @@ def cmd_doc_save(args) -> None:
         _die(6, "not_canonical", f"{args.source} does not read as the file form: {exc}",
              f"`{NAME} help` shows the file form")
     actor = _actor()
+    dry = {"dry_run": True} if args.dry_run else {}
+    import psycopg
     with _store() as conn:
-        with conn.transaction():
+        with conn.transaction() as tx:
             team = _team(conn, team_ref)
             document = _document(conn, team, doc_ref, lock=True)
+            before = _block_tokens(conn, team)
             created = document is None
             if created:
                 if args.base:
@@ -1497,7 +1535,7 @@ def cmd_doc_save(args) -> None:
                              "carry the edit over, and save with that version as --base")
                 if _same(active, fields):
                     _emit({"team": team["name"], "document": document["name"],
-                           "version": str(active["id"]), "changed": False})
+                           "version": str(active["id"]), "changed": False, **dry})
                     return
                 conn.execute("UPDATE teams_versions SET active = false WHERE id = %s",
                              (active["id"],))
@@ -1507,24 +1545,39 @@ def cmd_doc_save(args) -> None:
                         (document["id"], team["name"], document["name"],
                          fields["description"], fields["load"], fields["body"], actor,
                          args.note))
-    _emit({"team": team["name"], "document": document["name"], "version": str(made["id"]),
+            reach = _reach(conn, team, before)
+            if args.dry_run:
+                raise psycopg.Rollback(tx)
+    _emit({"team": team["name"], "document": document["name"],
+           "version": None if args.dry_run else str(made["id"]),
            "previous": str(active["id"]) if active else None, "created": created,
-           "tokens": tokens(fields["body"]), "changed": True})
+           "load": fields["load"], "tokens": tokens(fields["body"]), "changed": True,
+           "reach": reach, **dry})
 
 
 def cmd_doc_switch(args) -> None:
     team_ref, doc_ref = _check_ref(args.team, "team"), _check_ref(args.doc, "document")
     enabled = args.verb == "on"
+    dry_run = enabled and args.dry_run
+    import psycopg
     with _store() as conn:
-        with conn.transaction():
+        with conn.transaction() as tx:
             team = _team(conn, team_ref)
             document = _need_document(conn, team, doc_ref, lock=True)
+            before = _block_tokens(conn, team)
             changed = document["enabled"] != enabled
             if changed:
                 conn.execute("UPDATE teams_documents SET enabled = %s WHERE id = %s",
                              (enabled, document["id"]))
-    _emit({"team": team["name"], "document": document["name"], "enabled": enabled,
-           "changed": changed})
+            if enabled:
+                extra = {"load": _active(conn, document)["load"], "changed": changed,
+                         "reach": _reach(conn, team, before),
+                         **({"dry_run": True} if dry_run else {})}
+            else:
+                extra = {"changed": changed}
+            if dry_run:
+                raise psycopg.Rollback(tx)
+    _emit({"team": team["name"], "document": document["name"], "enabled": enabled, **extra})
 
 
 def cmd_doc_rename(args) -> None:
@@ -1630,10 +1683,59 @@ def _section_document(name: str, body: str) -> list[str]:
     return [f"### {_one_line(name)}", "", shifted, ""]
 
 
+# The active version of every enabled document of the teams named, in the
+# order the Teams section lists them.
+_SECTION_DOCUMENTS = ("SELECT d.team_id, d.name, v.load, v.description, v.body "
+                      "FROM teams_documents d JOIN teams_versions v "
+                      "ON v.document_id = d.id AND v.active "
+                      "WHERE d.enabled AND d.retired_at IS NULL AND d.team_id = ANY(%s) "
+                      "ORDER BY d.team_id, d.name")
+
+
+def _team_block(team: dict, documents: list[dict]) -> list[str]:
+    """One team's part of the Teams section: a level-2 heading and its line,
+    then its enabled always documents whole and its enabled on-request ones
+    by their line - or, with no always document among them, how to read its
+    instructions. `documents` are the team's enabled ones."""
+    name = team["name"]
+    lines = [f"## {_one_line(name)}", ""]
+    always = [doc for doc in documents if doc["load"] == "always"]
+    if not always:
+        return lines + [f"{_one_line(team['description'])} Read its instructions on request: "
+                        f"`{NAME} show {shlex.quote(name)}`.", ""]
+    lines += [_one_line(team["description"]), ""]
+    for doc in always:
+        lines += _section_document(doc["name"], doc["body"])
+    on_request = [doc for doc in documents if doc["load"] == "on-request"]
+    if on_request:
+        lines += ["### On request", ""]
+        lines += [f"- `{NAME} doc show {shlex.quote(name)} {shlex.quote(doc['name'])}` "
+                  f"- {_one_line(doc['description'])}" for doc in on_request]
+        lines.append("")
+    return lines
+
+
+def _block_tokens(conn, team: dict) -> int:
+    """The size of the team's part of each member's Teams section now."""
+    return tokens("\n".join(_team_block(team, _rows(conn, _SECTION_DOCUMENTS, ([team["id"]],)))))
+
+
+def _reach(conn, team: dict, before: int) -> dict:
+    """What a write did to the members' context: how many agents the team
+    reaches and how many tokens its part of each one's section gained since
+    `before`, measured in the write's own transaction."""
+    agents = _one(conn, "SELECT count(*) AS agents FROM teams_members WHERE team_id = %s",
+                  (team["id"],))["agents"]
+    return {"agents": agents, "tokens": _block_tokens(conn, team) - before}
+
+
 def _section_rows(agent: str) -> tuple[list[dict], list[dict]] | None:
     """The teams `agent` is a member of and the active version of every
-    enabled document of those in always mode, read in a read-only transaction
-    that migrates nothing; None where there is no store or no teams tables."""
+    enabled document of theirs, read in a read-only transaction that
+    migrates nothing; None where there is no store or no teams tables. On a
+    store that has not yet taken step 0008, a team that was in ordinary mode
+    gives none of its always documents, as before 1.3, so installing this
+    version grows no member's context before the step runs."""
     import psycopg
     db = _db()
     try:
@@ -1647,16 +1749,18 @@ def _section_rows(agent: str) -> tuple[list[dict], list[dict]] | None:
     except db.DbError as exc:
         _db_refused(exc)
     try:
+        settled = _LOAD_STEP in db.status(conn, NAME, LEDGER_STEPS, major=LEDGER_MAJOR,
+                                          minor=LEDGER_MINOR).applied
         conn.read_only = True
         teams = _rows(conn, "SELECT t.id, t.name, t.description, t.always FROM teams_teams t "
                       "JOIN teams_members m ON m.team_id = t.id WHERE m.agent_id = %s "
                       "AND t.retired_at IS NULL ORDER BY t.name", (agent,))
-        always = [team["id"] for team in teams if team["always"]]
-        documents = _rows(conn, "SELECT d.team_id, d.name, v.load, v.description, v.body "
-                          "FROM teams_documents d JOIN teams_versions v "
-                          "ON v.document_id = d.id AND v.active "
-                          "WHERE d.enabled AND d.retired_at IS NULL AND d.team_id = ANY(%s) "
-                          "ORDER BY d.team_id, d.name", (always,)) if always else []
+        documents = _rows(conn, _SECTION_DOCUMENTS,
+                          ([team["id"] for team in teams],)) if teams else []
+        if not settled:
+            ordinary = {team["id"] for team in teams if not team["always"]}
+            documents = [doc for doc in documents
+                         if doc["team_id"] not in ordinary or doc["load"] != "always"]
         return teams, documents
     except psycopg.errors.UndefinedTable:
         return None
@@ -1679,23 +1783,7 @@ def section(agent: str | None) -> str:
              "You are a member of the teams below, and their rules bind you. Where a team's "
              "rule conflicts with your own doctrine further down, your own doctrine wins.", ""]
     for team in teams:
-        name = team["name"]
-        lines += [f"## {_one_line(name)}", ""]
-        if not team["always"]:
-            lines += [f"{_one_line(team['description'])} Read its instructions on request: "
-                      f"`{NAME} show {shlex.quote(name)}`.", ""]
-            continue
-        lines += [_one_line(team["description"]), ""]
-        own = [doc for doc in documents if doc["team_id"] == team["id"]]
-        for doc in own:
-            if doc["load"] == "always":
-                lines += _section_document(doc["name"], doc["body"])
-        on_request = [doc for doc in own if doc["load"] == "on-request"]
-        if on_request:
-            lines += ["### On request", ""]
-            lines += [f"- `{NAME} doc show {shlex.quote(name)} {shlex.quote(doc['name'])}` "
-                      f"- {_one_line(doc['description'])}" for doc in on_request]
-            lines.append("")
+        lines += _team_block(team, [doc for doc in documents if doc["team_id"] == team["id"]])
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1771,10 +1859,6 @@ def _parser() -> argparse.ArgumentParser:
     create = verb(sub, "create")
     create.add_argument("team")
     create.add_argument("--description", required=True)
-    create.add_argument("--always", action="store_true")
-    mode = verb(sub, "mode")
-    mode.add_argument("team")
-    mode.add_argument("mode", choices=("ordinary", "always"))
     rename = verb(sub, "rename")
     rename.add_argument("team")
     rename.add_argument("name")
@@ -1805,10 +1889,13 @@ def _parser() -> argparse.ArgumentParser:
     save.add_argument("--from", dest="source", required=True)
     save.add_argument("--base")
     save.add_argument("--note")
+    save.add_argument("--dry-run", action="store_true")
     for switch in ("on", "off", "retire"):
         one = verb(doc, switch)
         one.add_argument("team")
         one.add_argument("doc")
+        if switch == "on":
+            one.add_argument("--dry-run", action="store_true")
     doc_rename = verb(doc, "rename")
     doc_rename.add_argument("team")
     doc_rename.add_argument("doc")
@@ -1860,7 +1947,7 @@ def main() -> None:
     if args.cmd == "doctor":
         cmd_doctor()
         return
-    {"list": cmd_list, "show": cmd_show, "section": cmd_section, "create": cmd_create, "mode": cmd_mode,
+    {"list": cmd_list, "show": cmd_show, "section": cmd_section, "create": cmd_create,
      "rename": cmd_rename, "describe": cmd_describe, "retire": cmd_retire,
      "members add": cmd_members, "members remove": cmd_members,
      "doc show": cmd_doc_show, "doc history": cmd_doc_history, "doc save": cmd_doc_save,

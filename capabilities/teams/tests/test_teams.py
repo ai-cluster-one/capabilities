@@ -210,7 +210,7 @@ def test_the_ledger_creates_the_tables_with_their_comments_and_guard(lab):
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'teams' ORDER BY step")]
     assert steps == ["0001-teams", "0002-members", "0003-documents", "0004-versions",
-                     "0005-versions-guard", "0006-keys", "0007-ids"]
+                     "0005-versions-guard", "0006-keys", "0007-ids", "0008-load-decides"]
     for table in ("teams_teams", "teams_members", "teams_documents", "teams_versions"):
         [(comment,)] = lab.sql("SELECT obj_description(%s::regclass)", (f"{SCHEMA}.{table}",))
         assert comment
@@ -223,7 +223,7 @@ def test_the_ledger_creates_the_tables_with_their_comments_and_guard(lab):
         lab.sql(f"DELETE FROM {SCHEMA}.teams_versions")
 
 
-# --- teams, members and modes ----------------------------------------------------
+# --- teams and members ------------------------------------------------------------
 
 def test_a_team_is_made_once_and_a_repeat_with_the_same_line_changes_nothing(lab):
     assert lab.team()["changed"] is True
@@ -239,7 +239,7 @@ def test_a_team_is_made_once_and_a_repeat_with_the_same_line_changes_nothing(lab
 
 def test_list_answers_this_agents_teams_and_says_when_there_is_none(lab):
     lab.team("crew")
-    lab.team("ops", "--always")
+    lab.team("ops")
     lab.register(AGENT, OTHER)
     assert "is a member of no team" in lab.ok("list")
     assert lab.ok("members", "add", "ops", AGENT)["changed"] is True
@@ -247,7 +247,8 @@ def test_list_answers_this_agents_teams_and_says_when_there_is_none(lab):
     lab.ok("members", "add", "crew", OTHER)
     mine = lab.ok("list", "--json")
     assert mine["agent"] == AGENT
-    assert [(t["name"], t["mode"]) for t in mine["teams"]] == [("ops", "always")]
+    assert [t["name"] for t in mine["teams"]] == ["ops"]
+    assert "mode" not in mine["teams"][0]
     every = lab.ok("list", "--all", "--json")
     assert [(t["name"], t["member"]) for t in every["teams"]] == [("crew", False), ("ops", True)]
     assert lab.ok("members", "remove", "ops", AGENT)["changed"] is True
@@ -255,15 +256,14 @@ def test_list_answers_this_agents_teams_and_says_when_there_is_none(lab):
     assert lab.ok("list", "--json")["teams"] == []
 
 
-def test_the_mode_switches_and_a_repeat_changes_nothing(lab):
-    lab.team()
-    assert lab.ok("mode", "crew", "always") == {"team": "crew", "mode": "always",
-                                                "changed": True}
-    assert lab.ok("mode", "crew", "always")["changed"] is False
-    assert lab.ok("show", "crew", "--json")["mode"] == "always"
-    assert lab.ok("mode", "crew", "ordinary")["changed"] is True
-    code, error = lab.refused("mode", "none", "always")
-    assert (code, error["code"]) == (3, "not_found")
+def test_a_team_has_no_mode_to_set(lab):
+    made = lab.team()
+    assert "mode" not in made and "mode" not in lab.ok("show", "crew", "--json")
+    code, _error = lab.refused("mode", "crew", "always")
+    assert code == 6
+    code, _error = lab.refused("create", "two", "--description", "x", "--always")
+    assert code == 6
+    assert "teams mode" not in lab.ok("help") and "--always" not in lab.ok("help", "create")
 
 
 # --- documents -------------------------------------------------------------------
@@ -320,7 +320,7 @@ def test_a_document_switches_on_and_off_and_show_sizes_the_team(lab):
     assert (view["tokens"], view["always_tokens"]) == ((deploy + 3) // 4, 0)
     assert lab.ok("doc", "on", "crew", "style")["changed"] is True
     plain = lab.ok("show", "crew")
-    assert "mode: ordinary" in plain and "style  always  on" in plain
+    assert "mode:" not in plain and "style  always  on" in plain
     code, error = lab.refused("doc", "off", "crew", "none")
     assert (code, error["code"]) == (3, "not_found")
 
@@ -330,7 +330,7 @@ def test_a_document_switches_on_and_off_and_show_sizes_the_team(lab):
 def test_every_write_is_refused_under_the_read_only_switch_and_reads_still_answer(lab):
     lab.team()
     lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=STYLE)
-    for argv in (("create", "two", "--description", "x"), ("mode", "crew", "always"),
+    for argv in (("create", "two", "--description", "x"),
                  ("members", "add", "crew", AGENT), ("members", "remove", "crew", AGENT),
                  ("doc", "save", "crew", "style", "--from", "-"),
                  ("doc", "off", "crew", "style"), ("doc", "on", "crew", "style"),
@@ -340,7 +340,7 @@ def test_every_write_is_refused_under_the_read_only_switch_and_reads_still_answe
         code, error = lab.refused(*argv, stdin=STYLE, CAPABILITIES_READ_ONLY="1")
         assert (code, error["code"]) == (4, "read_only_switch"), argv
     assert lab.ok("doc", "show", "crew", "style", CAPABILITIES_READ_ONLY="1") == STYLE
-    assert lab.ok("show", "crew", "--json", CAPABILITIES_READ_ONLY="1")["mode"] == "ordinary"
+    assert lab.ok("show", "crew", "--json", CAPABILITIES_READ_ONLY="1")["name"] == "crew"
 
 
 def test_a_project_that_disables_teams_is_refused(lab):
@@ -423,7 +423,7 @@ def test_a_store_at_teams_1_1_keeps_every_team_member_and_document_through_the_i
 
     view = lab.ok("show", "crew", "--json")
     assert lab.sql(f"SELECT major, minor FROM {SCHEMA}.schema_version "
-                   "WHERE owner = 'teams'") == [(1, 2)]
+                   "WHERE owner = 'teams'") == [(1, 3)]
     assert re.fullmatch(r"[0-9a-f]{12}", view["id"])
     assert sorted(view["members"]) == sorted([AGENT, OTHER])
     assert [(d["name"], d["enabled"]) for d in view["documents"]] == [
@@ -450,7 +450,7 @@ def test_a_writer_and_a_reader_released_before_ids_keep_working_on_ids(lab):
     _old(lab, old, "doc", "on", "ops", "style")
     _old(lab, old, "mode", "ops", "always")
     view = lab.ok("show", "ops", "--json")
-    assert (view["mode"], view["members"]) == ("always", [AGENT])
+    assert view["members"] == [AGENT]
     [doc] = view["documents"]
     assert (doc["name"], doc["enabled"]) == ("style", True)
     assert lab.ok("doc", "show", "ops", doc["id"]) == STYLE.replace("One", "Each")
@@ -542,3 +542,134 @@ def test_retiring_frees_the_name_and_keeps_every_version(lab):
     assert lab.team("crew")["id"] != made["id"]
     assert lab.sql(f"SELECT count(*) FROM {SCHEMA}.teams_versions") == [(3,)]
     _mirrors_hold(lab)
+
+
+# --- what a member carries, and what a write costs it ---------------------------
+
+ON_REQUEST_STYLE = STYLE.replace("load: always", "load: on-request")
+LONG_STYLE = STYLE.replace("One line per paragraph.", "One line per paragraph. " * 20)
+
+
+def test_an_always_document_stands_whole_and_an_on_request_one_by_its_line(lab):
+    lab.team("crew")
+    lab.team("ops")
+    lab.register(AGENT)
+    for team in ("crew", "ops"):
+        lab.ok("members", "add", team, AGENT)
+    lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=STYLE)
+    lab.ok("doc", "save", "crew", "deploy", "--from", "-", stdin=DEPLOY)
+    lab.ok("doc", "save", "ops", "deploy", "--from", "-", stdin=DEPLOY)
+    section = lab.ok("section")
+    assert ("## crew\n\nThe crew: turn to it for releases.\n\n"
+            "### Style\n\nOne line per paragraph.\n\n"
+            "### On request\n\n- `teams doc show crew deploy` - Read before a release.\n") in section
+    assert ("## ops\n\nThe ops: turn to it for releases. Read its instructions on request: "
+            "`teams show ops`.\n") in section
+    lab.ok("doc", "off", "crew", "style")
+    assert "One line per paragraph." not in lab.ok("section")
+    assert "Read its instructions on request: `teams show crew`." in lab.ok("section")
+
+
+def test_switching_a_document_to_always_answers_its_tokens_and_reach_and_a_preview_writes_nothing(lab):
+    lab.team("crew")
+    lab.register(AGENT, OTHER)
+    for agent in (AGENT, OTHER):
+        lab.ok("members", "add", "crew", agent)
+    first = lab.ok("doc", "save", "crew", "style", "--from", "-",
+                   stdin=LONG_STYLE.replace("load: always", "load: on-request"))
+    assert first["reach"] == {"agents": 2, "tokens": 0}
+    section = lab.ok("section")
+
+    preview = lab.ok("doc", "save", "crew", "style", "--from", "-", "--dry-run", stdin=LONG_STYLE)
+    assert (preview["dry_run"], preview["version"], preview["load"]) == (True, None, "always")
+    assert preview["reach"]["agents"] == 2 and preview["reach"]["tokens"] > 0
+    assert lab.ok("section") == section
+    assert len(lab.ok("doc", "history", "crew", "style", "--json")["versions"]) == 1
+
+    saved = lab.ok("doc", "save", "crew", "style", "--from", "-", stdin=LONG_STYLE)
+    assert saved["reach"] == preview["reach"] and "dry_run" not in saved
+    grown = lab.ok("section")
+    assert "One line per paragraph." in grown
+    assert saved["reach"]["tokens"] == (len(grown) + 3) // 4 - (len(section) + 3) // 4
+
+    lab.ok("doc", "off", "crew", "style")
+    preview = lab.ok("doc", "on", "crew", "style", "--dry-run")
+    assert (preview["dry_run"], preview["load"], preview["reach"]) == (
+        True, "always", saved["reach"])
+    assert lab.ok("show", "crew", "--json")["documents"][0]["enabled"] is False
+    switched = lab.ok("doc", "on", "crew", "style")
+    assert (switched["enabled"], switched["changed"], switched["reach"]) == (
+        True, True, saved["reach"])
+    assert lab.ok("section") == grown
+
+
+# --- teams 1.2 to 1.3: the team mode goes ----------------------------------------
+
+MODE_REF = os.environ.get("TEAMS_MODE_REF", "32eeea4c")
+
+
+def test_the_step_that_retires_the_mode_changes_no_members_context(lab):
+    source = subprocess.run(["git", "-C", str(CAPABILITY), "show",
+                             f"{MODE_REF}:capabilities/teams/bin/teams"],
+                            capture_output=True, text=True)
+    if source.returncode != 0:
+        pytest.skip(f"the released teams at {MODE_REF} is not in this checkout")
+    old = lab.tmp / "teams-1.2"
+    old.write_text(source.stdout)
+    _old(lab, old, "create", "crew", "--description", "The crew.")
+    _old(lab, old, "create", "ops", "--description", "Operations.", "--always")
+    lab.register(AGENT, OTHER)
+    for team, agent in (("crew", AGENT), ("ops", AGENT), ("ops", OTHER)):
+        _old(lab, old, "members", "add", team, agent)
+    for team in ("crew", "ops"):
+        _old(lab, old, "doc", "save", team, "style", "--from", "-", stdin=STYLE)
+        _old(lab, old, "doc", "save", team, "deploy", "--from", "-", stdin=DEPLOY)
+    _old(lab, old, "doc", "save", "crew", "quiet", "--from", "-",
+         stdin=STYLE.replace("How we write.", "Switched off."))
+    _old(lab, old, "doc", "off", "crew", "quiet")
+    before = {agent: _section_of(lab, old, agent) for agent in (AGENT, OTHER)}
+    assert "One line per paragraph." in before[AGENT] and "## crew" in before[AGENT]
+    # Installed but not yet migrated: the section reads without migrating.
+    for agent in (AGENT, OTHER):
+        assert _section_of(lab, CLI, agent) == before[agent]
+    assert lab.sql(f"SELECT minor FROM {SCHEMA}.schema_version WHERE owner = 'teams'") == [(2,)]
+
+    lab.ok("migrate")
+    for agent in (AGENT, OTHER):
+        assert _section_of(lab, CLI, agent) == before[agent]
+    assert lab.sql(f"SELECT major, minor FROM {SCHEMA}.schema_version "
+                   "WHERE owner = 'teams'") == [(1, 3)]
+    switched = lab.sql(f"SELECT v.team, v.document, v.load, v.created_by, v.note "
+                       f"FROM {SCHEMA}.teams_versions v WHERE v.active "
+                       "ORDER BY v.team, v.document")
+    assert [(team, doc, load) for team, doc, load, _by, _note in switched] == [
+        ("crew", "deploy", "on-request"), ("crew", "quiet", "on-request"),
+        ("crew", "style", "on-request"), ("ops", "deploy", "on-request"),
+        ("ops", "style", "always")]
+    for team, doc, _load, by, note in switched:
+        if team == "crew" and doc != "deploy":
+            assert by == "teams@step-0008" and "ordinary mode" in note
+        else:
+            assert by != "teams@step-0008"
+    history = lab.ok("doc", "history", "crew", "style", "--json")["versions"]
+    assert [v["load"] for v in history] == ["on-request", "always"]
+    body = lab.ok("doc", "show", "crew", "style", "--json")["body"]
+    assert body == STYLE.split("---\n", 2)[2]
+    assert lab.sql(f"SELECT bool_and(always) FROM {SCHEMA}.teams_teams") == [(True,)]
+
+
+def _section_of(lab, cli: Path, agent: str) -> str:
+    """The Teams section `cli` prints for `agent`, from a project that declares it."""
+    project = lab.tmp / f"agent-{agent}"
+    if not project.exists():
+        (project / ".git").mkdir(parents=True)
+        envelope = project / "capabilities"
+        envelope.mkdir()
+        (envelope / "project.json").write_text(json.dumps(
+            {"schema": "capabilities.project.v1", "slug": "lab", "id": agent}))
+        (envelope / "settings.json").write_text(json.dumps(
+            {"capabilities": {"teams": {"enabled": True}}}))
+    done = subprocess.run([sys.executable, str(cli), "section"], cwd=project, env=lab.env(),
+                          text=True, capture_output=True, timeout=180)
+    assert done.returncode == 0, done.stderr
+    return done.stdout

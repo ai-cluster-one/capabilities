@@ -6,9 +6,10 @@ teams declaration names that command for the standing place, so the manager
 runs it and knows nothing of what it says; for a teams payload installed before
 it declared the command, the manager composes the same section itself. It is: the lines that say
 the teams bind it and its own doctrine wins on conflict, each team under a
-level-2 heading with its line, and for a team in always mode its enabled
-always documents whole under level-3 headings, their own headings shifted
-below them, and its enabled on-request documents as one level-3 group. The
+level-2 heading with its line, and for a team with enabled always documents
+those whole under level-3 headings, their own headings shifted below them,
+and its enabled on-request documents as one level-3 group; a team with none
+is its line and how to read it. The
 `teams` entry in the capability list keeps the ordinary form. The section
 carries nothing that changes between sessions, and an agent with teams
 disabled gets none of it. The module starts a throwaway PostgreSQL when
@@ -42,6 +43,7 @@ AGENT = "prj_" + "0a1b2c3d4e5f"
 OTHER = "prj_" + "1b2c3d4e5f60"
 STYLE = "---\ndescription: How we write.\nload: always\n---\n# Style\n\nOne line per paragraph.\n"
 DEPLOY = "---\ndescription: Read before a release.\nload: on-request\n---\nRelease from main.\n"
+STYLE_ON_REQUEST = STYLE.replace("load: always", "load: on-request")
 CLEARED = ("CAPABILITIES_", "CLAUDE", "AGENTKIT_DB_")
 
 
@@ -212,14 +214,20 @@ def _outline(text: str) -> list[str]:
 def _seed(lab: Lab) -> None:
     lab.teams("create", "crew", "--description", "The release crew: turn to it for releases.")
     lab.teams("create", "ops", "--description", "Operations: turn to it for the servers.")
-    lab.teams("create", "far", "--description", "A team this agent is not in.", "--always")
+    lab.teams("create", "far", "--description", "A team this agent is not in.")
     lab.register(AGENT, OTHER)
     for team in ("crew", "ops"):
         lab.teams("members", "add", team, AGENT)
     lab.teams("members", "add", "far", OTHER)
     for team in ("crew", "ops", "far"):
-        lab.teams("doc", "save", team, "style", "--from", "-", stdin=STYLE)
+        lab.teams("doc", "save", team, "style", "--from", "-",
+                  stdin=STYLE if team == "far" else STYLE_ON_REQUEST)
         lab.teams("doc", "save", team, "deploy", "--from", "-", stdin=DEPLOY)
+
+
+def _always(lab: Lab, team: str) -> None:
+    """The team's style document switched to always, so its documents reach a member."""
+    lab.teams("doc", "save", team, "style", "--from", "-", stdin=STYLE)
 
 
 def test_teams_is_core():
@@ -251,7 +259,7 @@ def test_an_ordinary_team_is_its_line_and_how_to_read_it(lab):
 
 def test_an_always_team_composes_its_documents_under_level_three_headings(lab):
     _seed(lab)
-    lab.teams("mode", "ops", "always")
+    _always(lab, "ops")
     lab.teams("doc", "save", "ops", "secrets-off", "--from", "-",
               stdin="---\ndescription: Switched off.\nload: always\n---\nNever shown.\n")
     lab.teams("doc", "off", "ops", "secrets-off")
@@ -270,7 +278,7 @@ def test_an_always_team_composes_its_documents_under_level_three_headings(lab):
 
 def test_the_section_is_the_same_in_every_session_and_follows_the_store(lab):
     _seed(lab)
-    lab.teams("mode", "crew", "always")
+    _always(lab, "crew")
     first = lab.fragment()
     assert lab.fragment() == first
     assert not re.search(r"\b20\d\d-\d\d-\d\d|Rendered|tokens", _teams(first))
@@ -288,7 +296,7 @@ def test_an_agent_in_no_team_has_no_teams_section(lab):
 
 def test_teams_disabled_removes_its_section_and_entry_and_nothing_else(lab):
     _seed(lab)
-    lab.teams("mode", "ops", "always")
+    _always(lab, "ops")
     other = lab.tmp / "registry" / "alpha"
     other.mkdir(parents=True)
     (other / "alpha").write_text("#!/bin/sh\n")
@@ -310,9 +318,10 @@ def test_teams_disabled_removes_its_section_and_entry_and_nothing_else(lab):
 
 
 def test_a_command_the_section_prints_quotes_a_name_that_holds_a_space(lab):
-    lab.teams("create", "Release crew", "--description", "The release crew.", "--always")
+    lab.teams("create", "Release crew", "--description", "The release crew.")
     lab.register(AGENT)
     lab.teams("members", "add", "Release crew", AGENT)
+    lab.teams("doc", "save", "Release crew", "style", "--from", "-", stdin=STYLE)
     lab.teams("doc", "save", "Release crew", "deploy rules", "--from", "-", stdin=DEPLOY)
     lab.teams("create", "ops", "--description", "Operations.")
     lab.teams("members", "add", "ops", AGENT)
@@ -327,7 +336,7 @@ def test_a_command_the_section_prints_quotes_a_name_that_holds_a_space(lab):
 
 def test_build_places_the_teams_section_before_the_agents_own_doctrine(lab):
     _seed(lab)
-    lab.teams("mode", "ops", "always")
+    _always(lab, "ops")
     mission = lab.project / "context" / "identity" / "MISSION.md"
     mission.parent.mkdir(parents=True)
     stored = ("---\ntitle: Mission\ndescription: Why.\nload: inline\norder: 1\n---\n"
