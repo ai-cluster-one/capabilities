@@ -67,10 +67,16 @@ class Fake:
         # The Coolify projects `projects` lists; one read by a uuid not among
         # them answers with a test and a production environment.
         self.projects: list[dict] = []
+        # Whether the agent's policy disables the coolify capability, so that
+        # its gate refuses every coolify run.
+        self.coolify_disabled = False
 
     def __call__(self, argv, root, *, stdin=None, timeout=120, check=True, env=None):
         self.calls.append({"argv": list(argv), "stdin": stdin, "env": env})
-        out = self.answer(list(argv), stdin)
+        out = (self.module.NodeFailure(
+                   "disabled", "coolify is disabled in this project (store:<schema>.policies)", 4)
+               if argv[0] == "coolify" and self.coolify_disabled
+               else self.answer(list(argv), stdin))
         if isinstance(out, Exception):
             raise out
         if isinstance(out, SimpleNamespace):
@@ -1482,9 +1488,67 @@ def lend(lab, monkeypatch, connection=LENT):
     lab.m._node_lend()
 
 
-def test_add_and_update_through_a_lent_connection_grant_nothing_and_keep_its_token(
-        lab, stream, monkeypatch, capsys):
-    # The agent holds no coolify grant: nothing may ask for one.
+class CoolifyApi:
+    """Answers the Coolify API of the lent instance over the lab's own state:
+    each request is answered as the coolify verb that makes it is, and
+    recorded with its method, path, query and body."""
+
+    VERBS = {("GET", "projects"): lambda p, q, b: ["projects", *p],
+             ("POST", "projects"): lambda p, q, b: (
+                 ["projects", "environment", "create", p[0], b["name"]] if p
+                 else ["projects", "create", b["name"]]),
+             ("GET", "servers"): lambda p, q, b: ["servers", *p],
+             ("GET", "services"): lambda p, q, b: ["services", *p],
+             ("GET", "applications"): lambda p, q, b: ["applications", *p],
+             ("POST", "services"): lambda p, q, b: ["service", "create"],
+             ("PATCH", "services"): lambda p, q, b: ["service", "set-compose", p[0],
+                                                     "--compose", "-"],
+             ("DELETE", "services"): lambda p, q, b: ["service", "delete", p[0]],
+             ("DELETE", "applications"): lambda p, q, b: ["app", "delete", p[0]],
+             ("POST", "deploy"): lambda p, q, b: ["deploy", q["uuid"]]}
+
+    def __init__(self, fake):
+        self.fake, self.requests = fake, []
+
+    def __call__(self, request, timeout=None):
+        import base64
+        import urllib.error
+        from urllib.parse import parse_qsl, urlsplit
+        url = urlsplit(request.full_url)
+        assert f"{url.scheme}://{url.netloc}" == LENT["url"], request.full_url
+        assert url.path.startswith("/api/v1/"), request.full_url
+        assert request.get_header("Authorization") == "Bearer " + LENT["token"]
+        method, query = request.get_method(), dict(parse_qsl(url.query))
+        body = json.loads(request.data) if request.data else None
+        self.requests.append({"method": method, "path": url.path[len("/api/v1"):],
+                              "query": query, "body": body})
+        collection, *rest = url.path[len("/api/v1/"):].split("/")
+        compose = (body or {}).get("docker_compose_raw")
+        stdin = base64.b64decode(compose).decode() if compose else None
+        out = self.fake.answer(["coolify", *self.VERBS[method, collection](rest, query, body)],
+                               stdin)
+        if isinstance(out, Exception):
+            status = {2: 401, 3: 404}.get(out.exit_code, 422)
+            raise urllib.error.HTTPError(request.full_url, status, "fixture", {},
+                                         io.BytesIO(b'{"message": "fixture"}'))
+        answer = io.BytesIO(out.encode())
+        answer.status, answer.headers = 200, {}
+        return answer
+
+
+@pytest.fixture
+def coolify_api(lab, monkeypatch):
+    import urllib.request
+    api = CoolifyApi(lab.fake)
+    monkeypatch.setattr(urllib.request, "urlopen", api)
+    return api
+
+
+def test_a_lent_connection_makes_and_reaches_a_node_whatever_the_agents_coolify_policy(
+        lab, stream, monkeypatch, capsys, coolify_api):
+    # The agent's policy disables coolify, and the agent holds no coolify
+    # grant: nothing lent may run coolify or ask for a grant.
+    lab.fake.coolify_disabled = True
     monkeypatch.setattr(lab.m, "_agent_node_records", lambda: pytest.fail("a lent connection asks no grant"))
     lend(lab, monkeypatch)
     lab.m.cmd_node_add(add_args())
@@ -1493,28 +1557,51 @@ def test_add_and_update_through_a_lent_connection_grant_nothing_and_keep_its_tok
     assert done["result"]["ok"] is True and done["result"]["created"] is True
     # The row names the Coolify it was made on, not a connection of the agent's.
     assert lab.fake.rows[BOX1]["coolify_connection"] == LENT["url"]
+    # The service is made as `coolify service create` makes it.
+    [create] = [r for r in coolify_api.requests if (r["method"], r["path"]) == ("POST", "/services")]
+    assert {k: v for k, v in create["body"].items() if k != "docker_compose_raw"} == {
+        "project_uuid": "prj-made", "server_uuid": "srv-uuid", "environment_name": "production",
+        "name": "lab-agent-box1", "instant_deploy": True}
 
     # A later update, by a caller that does not ask for events.
     lab.m._EVENTS_ON[0] = False
     lab.m.cmd_node_update(update_args())
     answer = json.loads(capsys.readouterr().out)
     assert answer["ok"] is True and answer["redeployed"] is True
+    assert [(r["method"], r["path"], r["query"]) for r in coolify_api.requests[-2:]] == [
+        ("PATCH", "/services/svc-new", {}), ("POST", "/deploy", {"uuid": "svc-new"})]
 
-    # Every coolify call that reaches the instance; `coolify help` reaches none.
-    coolify = [c for c in lab.fake.of("coolify") if c["argv"][1:] != ["help"]]
-    lent = {"COOLIFY_LENT_BASE_URL": LENT["url"], "COOLIFY_LENT_TOKEN": LENT["token"]}
-    assert coolify and all(c["env"] and {k: c["env"].get(k) for k in lent} == lent
-                           and "--connection" not in c["argv"] for c in coolify)
-    # Only coolify is lent it, and the token is on no command line, in no
-    # input, no answer and no row.
-    assert all(c["argv"][0] == "coolify" for c in lab.fake.calls if c["env"] is not None)
-    assert not [c for c in lab.fake.calls
-                if LENT["token"] in json.dumps(c["argv"]) or LENT["token"] in (c["stdin"] or "")]
+    # A command on the node, and the node taken away with its volumes.
+    monkeypatch.setattr(lab.m.subprocess, "call", lambda argv, **kw: 0)
+    with pytest.raises(SystemExit) as exited:
+        lab.m.cmd_node_exec(SimpleNamespace(node="box1", argv=["true"]))
+    assert exited.value.code == 0
+    lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
+    capsys.readouterr()
+    assert BOX1 not in lab.fake.rows
+    [delete] = [r for r in coolify_api.requests if r["method"] == "DELETE"]
+    assert (delete["path"], delete["query"]) == ("/services/svc-new", {
+        "delete_volumes": "true", "delete_configurations": "true", "docker_cleanup": "false",
+        "delete_connected_networks": "false"})
+
+    # No coolify ran, and the token travelled in the Authorization header
+    # alone: on no command line, in no input, no answer and no row.
+    assert not lab.fake.of("coolify")
+    assert not [c for c in lab.fake.calls if c["env"] is not None
+                or LENT["token"] in json.dumps(c["argv"]) or LENT["token"] in (c["stdin"] or "")]
     assert LENT["token"] not in said + json.dumps(answer) + json.dumps(lab.fake.rows)
 
 
+def test_a_lent_coolify_says_what_it_refused_as_coolify_would(lab, monkeypatch, coolify_api):
+    lend(lab, monkeypatch)
+    lab.fake.gone.add("svc-gone")
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m._node_lent_coolify(("services", "svc-gone"))
+    assert (refused.value.code, refused.value.exit_code) == ("not_found", 3)
+
+
 def test_a_lent_node_takes_the_same_connection_and_a_granted_one_no_lent_one(
-        lab, monkeypatch, capsys):
+        lab, monkeypatch, capsys, coolify_api):
     lend(lab, monkeypatch)
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
@@ -1537,7 +1624,7 @@ def test_a_lent_node_takes_the_same_connection_and_a_granted_one_no_lent_one(
 
 
 def test_a_lent_node_is_reached_through_the_address_its_first_lent_reach_records(
-        lab, stream, monkeypatch, capsys):
+        lab, stream, monkeypatch, capsys, coolify_api):
     lend(lab, monkeypatch)
     lab.m.cmd_node_add(add_args())
     capsys.readouterr()

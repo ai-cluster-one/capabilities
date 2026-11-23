@@ -17804,16 +17804,17 @@ def _agent_node_run(argv, root, *, stdin=None, timeout=120, check=True, env=None
 
 
 def _node_coolify(root, target, *args, stdin=None):
+    if _NODE_LENT:
+        # A lent connection is granted by no policy of the agent's, so it is
+        # never reached through the coolify capability, whose gate reads that
+        # policy: the manager makes the request to Coolify itself.
+        return _node_lent_coolify(args, stdin)
     selection = ["--connection", target["connection"]] if target.get("connection") else []
     # Contract dispatch requires the verb first; API argparse requires global
     # options before the verb. Neither path may fall back to another connection.
     command = (["coolify", *args, *selection] if args and args[0] == "ids"
                else ["coolify", *selection, *args])
-    # A connection lent to this run reaches coolify through its environment
-    # alone, never its argv; nothing else this run starts is given it.
-    env = ({**os.environ, "COOLIFY_LENT_BASE_URL": _NODE_LENT["url"],
-            "COOLIFY_LENT_TOKEN": _NODE_LENT["token"]} if _NODE_LENT else None)
-    p = _agent_node_run(command, root, stdin=stdin, timeout=900, env=env)
+    p = _agent_node_run(command, root, stdin=stdin, timeout=900)
     if args[:2] == ("ids", "get"):
         try:
             return json.loads(p.stdout)
@@ -17828,6 +17829,135 @@ def _node_coolify(root, target, *args, stdin=None):
 # The Coolify connection a caller lends this run on stdin (--coolify-stdin),
 # {url, token}: the run's only one, asked of no grant, written nowhere.
 _NODE_LENT: dict = {}
+
+# How long one request to a lent Coolify may take, and how often one that was
+# not answered, rate-limited or failed by the server is made, as coolify does.
+NODE_COOLIFY_SECONDS = 60
+NODE_COOLIFY_ATTEMPTS = 3
+NODE_COOLIFY_DELETE_FLAGS = ("delete_volumes", "delete_configurations", "docker_cleanup",
+                             "delete_connected_networks")
+
+
+def _node_lent_request(args, stdin):
+    """(method, path, params, body) of the Coolify API request the coolify verb
+    `args` makes, for each verb the node verbs run."""
+    import base64
+    positional, flags, i = [], {}, 0
+    while i < len(args):
+        word = args[i]
+        if word.startswith("--"):
+            given = i + 1 < len(args) and not args[i + 1].startswith("--")
+            flags[word] = args[i + 1] if given else True
+            i += 2 if given else 1
+        else:
+            positional.append(word)
+            i += 1
+
+    def compose():
+        if not (stdin or "").strip():
+            raise NodeFailure("input", "the Compose document is empty", 6)
+        return base64.b64encode(stdin.encode()).decode()
+
+    collections = {"app": "applications", "service": "services"}
+    match positional:
+        case ["projects"]:
+            return "GET", "/projects", None, None
+        case ["projects", "create", name]:
+            return "POST", "/projects", None, {"name": name}
+        case ["projects", "environment", "create", project, name]:
+            return "POST", f"/projects/{project}/environments", None, {"name": name}
+        case ["servers" | "projects" | "services" | "applications" as collection, uuid]:
+            return "GET", f"/{collection}/{uuid}", None, None
+        case ["service", "create"]:
+            body = {"project_uuid": flags["--project"], "server_uuid": flags["--server"],
+                    "environment_name": flags["--environment"],
+                    "docker_compose_raw": compose()}
+            if flags.get("--name"):
+                body["name"] = flags["--name"]
+            if flags.get("--instant-deploy"):
+                body["instant_deploy"] = True
+            return "POST", "/services", None, body
+        case ["service", "set-compose", uuid]:
+            return "PATCH", f"/services/{uuid}", None, {"docker_compose_raw": compose()}
+        case ["app" | "service" as kind, "delete", uuid] if flags.get("--yes"):
+            params = {flag: str(bool(flags.get("--" + flag.replace("_", "-")))).lower()
+                      for flag in NODE_COOLIFY_DELETE_FLAGS}
+            return "DELETE", f"/{collections[kind]}/{uuid}", params, None
+        case ["deploy", uuid]:
+            return "POST", "/deploy", {"uuid": uuid}, None
+    raise NodeFailure("input", f"`coolify {' '.join(positional[:2])}` has no request "
+                      "for a lent connection", 6)
+
+
+def _node_coolify_http(method, url, token, body):
+    """One request to Coolify: (status, text, headers). OSError where it could
+    not be made, TimeoutError where it was not answered in time."""
+    import urllib.error
+    import urllib.request
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {token}", "Accept": "application/json",
+        "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=NODE_COOLIFY_SECONDS) as r:
+            return r.status, r.read().decode("utf-8", "replace"), dict(r.headers or {})
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace"), dict(e.headers or {})
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, TimeoutError):
+            raise TimeoutError(str(e.reason)) from None
+        raise
+
+
+def _node_lent_coolify(args, stdin=None):
+    """Coolify's answer, through the connection lent to this run, to what the
+    coolify verb `args` asks: JSON, or {} for an empty answer. A refusal is a
+    NodeFailure with coolify's own code and exit: 2 unauthorized, 3 not_found,
+    5 when Coolify does not answer, 6 otherwise."""
+    from urllib.parse import urlencode
+    method, path, params, body = _node_lent_request(list(args), stdin)
+    url = (_NODE_LENT["url"] + "/api/v1" + path
+           + (f"?{urlencode(params)}" if params else ""))
+    for attempt in range(1, NODE_COOLIFY_ATTEMPTS + 1):
+        last = attempt == NODE_COOLIFY_ATTEMPTS
+        try:
+            status, text, headers = _node_coolify_http(method, url, _NODE_LENT["token"], body)
+        except TimeoutError:
+            if not last:
+                time.sleep(attempt * 1.5)
+                continue
+            raise NodeFailure("timeout", f"request timed out: {method} {path}", 5) from None
+        except OSError as e:
+            raise NodeFailure("network_error", f"network error: {e}", 5) from None
+        if status == 429 or status >= 500:
+            if not last:
+                try:
+                    time.sleep(float(headers.get("Retry-After") or attempt * 1.5))
+                except ValueError:
+                    time.sleep(attempt * 1.5)
+                continue
+            if status == 429:
+                raise NodeFailure("rate_limited", "rate-limited by Coolify", 5)
+            raise NodeFailure("server_error", f"Coolify returned {status}", 5)
+        if status >= 400:
+            message = text.strip()[:400] or "unknown error"
+            try:
+                answer = json.loads(text)
+                if isinstance(answer, dict):
+                    message = str(answer.get("message") or answer.get("error") or message)
+            except ValueError:
+                pass
+            if status in (401, 403):
+                raise NodeFailure("unauthorized", message, 2)
+            if status == 404:
+                raise NodeFailure("not_found", message, 3)
+            raise NodeFailure("invalid_request", message, 6)
+        if not text.strip():
+            return {}
+        try:
+            return json.loads(text)
+        except ValueError:
+            raise NodeFailure("provider_output", "coolify returned malformed JSON") from None
 
 
 def _node_lend():
@@ -19380,7 +19510,8 @@ def cmd_node_update(args):
     if not _agent_node_is_own(root, host, resource, project_id):
         raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
                           f"{AGENT_NODE_IMAGE} for this agent; nothing was changed", 6)
-    if "service set-compose" not in _agent_node_run(["coolify", "help"], root).stdout:
+    if not _NODE_LENT and "service set-compose" not in _agent_node_run(["coolify", "help"],
+                                                                         root).stdout:
         raise NodeFailure("provider_not_ready", "the coolify capability here has no "
                           "`service set-compose`; update it (`capabilities update coolify`)", 6)
     image = f"{AGENT_NODE_IMAGE}:{args.version}"
