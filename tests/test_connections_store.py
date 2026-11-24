@@ -1661,6 +1661,42 @@ def test_a_machine_connection_an_agent_is_granted_is_not_removed(lab):
     assert _stored_connections(lab) == ["mach"]
 
 
+def test_unset_global_removes_the_grant_every_agent_inherits_and_nothing_else(lab):
+    _global_rows_in_force(lab)
+    _add_machine(lab, "mach")
+    _add_machine(lab, "kept")
+    other = "prj_" + "9f8e7d6c5b4a"
+    _register_rows(lab, agents=(other,))
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        for agent, label, write, default in ((None, "mach", True, True),
+                                             (None, "kept", False, False),
+                                             (other, "mach", True, True)):
+            conn.execute("INSERT INTO grants (agent_id, capability, connection_id, "
+                         "enabled, allow_write, is_default) VALUES (%s, 'coolify', "
+                         "(SELECT id FROM connections WHERE label = %s), %s, %s, %s)",
+                         (agent, label, agent is not None, write, default))
+    query = ("SELECT g.agent_id, c.label, g.enabled, g.allow_write, g.is_default "
+             "FROM grants g JOIN connections c ON c.id = g.connection_id "
+             "ORDER BY c.label, g.agent_id NULLS FIRST")
+    before = _rows(lab, query)
+    refused = _outside(lab, MANAGER, "unset", "coolify", "grant", "mach")
+    assert refused.returncode == 6 and _error(refused)["code"] == "input"
+    assert _rows(lab, query) == before
+    pointer = _ok(_outside(lab, MANAGER, "unset", "coolify", "setting",
+                           "connection.default", "--global"))
+    assert pointer["removed"] is True
+    grant = _ok(_outside(lab, MANAGER, "unset", "coolify", "grant", "mach", "--global"))
+    assert grant["removed"] is True and grant["records"]["mode"] == "store"
+    assert _rows(lab, query) == [row for row in before
+                                 if not (row[0] is None and row[1] == "mach")]
+    listed = _ok(_outside(lab, MANAGER, "connections", "list", "coolify"))
+    mach = next(c for c in listed["capabilities"]["coolify"] if c["label"] == "mach")
+    assert [g["agent"] for g in mach["grants"]] == [other]
+    again = _ok(_outside(lab, MANAGER, "unset", "coolify", "grant", "mach", "--global"))
+    assert again["removed"] is False
+
+
 def test_a_project_in_files_mode_writes_no_connection_to_a_file_once_the_global_rows_are_in_force(lab):
     _global_rows_in_force(lab)
     registry = lab["envelope"] / "coolify" / "connections.json"

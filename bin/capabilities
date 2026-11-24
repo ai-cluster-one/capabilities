@@ -142,6 +142,7 @@ PROJECT VERBS (run inside a consuming project)
   references export   export references to files
   get <name>          read one configuration record
   set <name>          write one project configuration record
+  unset <name>        remove one global grant or default
   connections list    every connection the store holds
   connections import  move project records into the store
   connections seal    seal file values into the vault
@@ -550,7 +551,8 @@ READ_ONLY_REFUSED_VERBS = ("agent archive", "agent convert", "agent restore",
                            "secrets set",
                            "service move", "service restart", "service start",
                            "service stop",
-                           "set", "store set", "store unset", "store upgrade", "unplace")
+                           "set", "store set", "store unset", "store upgrade", "unplace",
+                           "unset")
 
 
 def _read_only_gate(verb: str) -> None:
@@ -24549,6 +24551,41 @@ def cmd_set(name: str, collection: str, key: str,
     _emit(answer)
 
 
+def cmd_unset(name: str, collection: str, key: str, global_scope: bool) -> None:
+    """Remove one global record every agent inherits: a capability's grant on
+    a connection for every agent, or its default pointer for every agent.
+    The rows are the store's where its global rows are in force, else the
+    config home's files; no other global row is touched."""
+    if not global_scope:
+        _die(6, "input", "unset removes a global record and needs --global",
+             f"a project's own grant is switched off with `capabilities set {name} "
+             f"grant <connection> '{{\"enabled\": false}}'`")
+    if collection == "setting" and key != "connection.default":
+        _die(6, "record_writer",
+             f"capabilities unset removes no global setting but connection.default, "
+             f"not {key!r}", "run `capabilities help unset`")
+    if collection not in {"grant", "setting"}:
+        _die(6, "record_writer",
+             f"capabilities unset does not own collection {collection!r}",
+             "removable here: grant, setting connection.default; a policy entry "
+             "is removed with `capabilities inherit <name> --global`")
+    store = _store_module()
+    adapter = _global_records(_project_root())
+    try:
+        removed = adapter.delete(name, collection, key, scope="global")
+        source = adapter.scope_source(
+            name, "grant" if collection == "setting" else collection, "global")
+        kept = adapter.global_kept()
+    except store.StoreError as exc:
+        _die(_store_error_exit(exc), exc.slug, exc.message, exc.hint)
+    finally:
+        adapter.close()
+    _emit({"unset": {"capability": name, "collection": collection, "key": key,
+                     "scope": "global"},
+           "removed": bool(removed),
+           "records": {"mode": kept, "source": source}})
+
+
 def _connection_key(adapter, name: str, wanted: str) -> str:
     """The id of `name`'s connection `wanted` names, by its id or by its
     label; the store keeps every label apart from every id, so a word that
@@ -37630,6 +37667,27 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         it reached and what is still to be sealed. A store
         that cannot be reached is exit 5 store_unreachable.
 """),
+    (('unset',),
+     """\
+  unset <name> grant <connection> --global
+  unset <name> setting connection.default --global
+        Remove one record every agent inherits from the global scope: the
+        grant for every agent on a connection of <name> (named by its id or
+        its label), or <name>'s default pointer for every agent. Where the
+        store's global rows are in force they are its `grants` rows with no
+        agent and no node, else the config home's files. A grant's enabled
+        and allow_write are cleared and its row goes, unless the row also
+        carries the default pointer: unset the default pointer, then the
+        grant, and the row is gone. No other global row and no agent's own
+        grant is touched; an agent's own grant is switched off with `set
+        <name> grant <connection> '{"enabled": false}'` in its project, and
+        a global policy entry is removed with `inherit <name> --global`.
+        Inside a project or outside one, the database `store show` names
+        here. JSON {unset {capability, collection, key, scope}, removed,
+        records {mode, source}}; removed is false where there was nothing to
+        remove. Exit 6 without --global or for another collection or setting,
+        4 under the read-only switch, 5 when the store cannot be reached.
+"""),
     (('connections list',),
      """\
   connections list [<name> ...]
@@ -38497,6 +38555,10 @@ def main() -> None:
         if len(pos) != 4:
             _die(6, "input", "set needs <name> <collection> <key> <json-or-string>")
         cmd_set(pos[0], pos[1], pos[2], pos[3], opt("--note"))
+    elif cmd == "unset":
+        if len(pos) != 3:
+            _die(6, "input", "unset needs <name> <collection> <key> --global")
+        cmd_unset(pos[0], pos[1], pos[2], flag("--global"))
     elif cmd == "doctor":
         cmd_doctor()
     elif cmd == "audit":
