@@ -1973,6 +1973,48 @@ def test_node_run_writes_this_nodes_state_on_its_beat_and_after_a_change(lab, tm
 
 
 
+def test_node_run_writes_its_state_row_every_two_seconds_and_the_rest_on_the_slower_cadence(
+        lab, tmp_path):
+    """Between whole writes, each beat of node run writes the node's state row
+    alone, about every 2 seconds, with the share of its CPU in use; the
+    sign-ins are written on the slower cadence, not on every beat."""
+    import time
+    here = _service_lab(lab)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "supervisorctl").write_text("#!/bin/sh\n")
+    (bin_dir / "supervisorctl").chmod(0o755)
+    env = {**lab["env"], **here, "SUPERVISOR_SERVER_URL": "unix:///tmp/test.sock",
+           "PATH": f"{bin_dir}{os.pathsep}{lab['env']['PATH']}"}
+
+    def logins():
+        return _rows(lab, f"SELECT checked_at FROM node_logins WHERE node = '{NODE}'")
+
+    node_run = subprocess.Popen([str(MANAGER), "node", "run", "--supervisor",
+                                 str(tmp_path / "jobs"), "--every", "300"],
+                                cwd=lab["project"], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+    try:
+        assert _wait_for(logins, 40)
+        stamps, checked, shares = set(), set(), []
+        deadline = time.monotonic() + 9
+        while time.monotonic() < deadline:
+            [(reported, share)] = _rows(lab, "SELECT reported_at, cpu_percent FROM "
+                                             f"node_states WHERE node = '{NODE}'")
+            stamps.add(reported)
+            shares.append(share)
+            checked.update(row[0] for row in logins())
+            time.sleep(0.25)
+    finally:
+        node_run.terminate()
+        _out, err = node_run.communicate(timeout=60)
+    assert node_run.returncode == 0, err
+    gaps = [(b - a).total_seconds() for a, b in zip(sorted(stamps), sorted(stamps)[1:])]
+    assert len(stamps) >= 3 and all(gap < 5 for gap in gaps), gaps
+    assert len(checked) <= 2, checked
+    assert all(share is not None and 0 <= share <= 100 for share in shares), shares
+
+
 def test_a_slow_probe_does_not_hold_back_the_state_beat_on_a_mac(lab, tmp_path):
     """On a node whose tools - or whose many agents' sessions - take long to
     answer, the state row is still written at start and on every beat, and

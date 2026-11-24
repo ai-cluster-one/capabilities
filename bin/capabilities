@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.47,<1",
+#     "capabilities-contract>=0.52,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -387,7 +387,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.50.0"
+CONTRACT_LIBRARY_RELEASE = "0.52.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -12502,10 +12502,17 @@ def _node_launcher_text(job: dict, manager: str) -> str:
 # holds a live session here (node_sessions): `node
 # state report` once, `node run` on its own beat. The row stands for the node
 # for the contract's NODE_STATE_FRESH_SECONDS; after that it reads unreachable.
+# `node run` writes the row alone on every beat, so a reader sees the node's
+# load as it is now, and the rest - each agent's sign-ins, what the store holds
+# of agents no longer here, its own last lines - on the slower detail cadence.
 # The tools' sign-ins and the sessions are each tool's and capability's own
 # answer, which takes a process each, so they are asked on a slower cadence.
 
-NODE_STATE_BEAT_SECONDS = 15
+NODE_STATE_BEAT_SECONDS = 2
+NODE_STATE_DETAIL_SECONDS = 15
+# How long a node with no earlier sample of its CPU of its own - a one-off
+# report, or the first beat - waits between the two it measures its share by.
+NODE_CPU_SAMPLE_SECONDS = 0.25
 # How many of its last printed lines a node process holds for the store, which
 # keeps its own bound of them (the contract's NODE_LOG_LINES).
 NODE_LOG_KEEP_LINES = 200
@@ -12632,6 +12639,117 @@ def _node_booted_at():
     return datetime.fromtimestamp(boot, timezone.utc)
 
 
+_NODE_CPU_LAST: dict = {}
+
+
+def _node_mac_cpu_ticks() -> tuple[float, float] | None:
+    """(busy, all) of the Mac's CPU ticks since boot, every core together,
+    from the kernel's host_statistics(HOST_CPU_LOAD_INFO), asked through
+    libSystem rather than a process; None where it does not answer."""
+    import ctypes
+    try:
+        lib = _NODE_CPU_LAST.get("libsystem")
+        if lib is None:
+            lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            lib.mach_host_self.restype = ctypes.c_uint
+            lib.host_statistics.argtypes = (ctypes.c_uint, ctypes.c_int,
+                                            ctypes.POINTER(ctypes.c_uint),
+                                            ctypes.POINTER(ctypes.c_uint))
+            lib.host_statistics.restype = ctypes.c_int
+            # The host port is asked once: each ask adds a right to it.
+            _NODE_CPU_LAST["libsystem"], _NODE_CPU_LAST["host"] = lib, lib.mach_host_self()
+        # HOST_CPU_LOAD_INFO is flavor 3, four counters: user, system, idle, nice.
+        ticks, count = (ctypes.c_uint * 4)(), ctypes.c_uint(4)
+        if lib.host_statistics(_NODE_CPU_LAST["host"], 3, ticks, ctypes.byref(count)) != 0:
+            return None
+    except (OSError, AttributeError):
+        return None
+    user, system, idle, nice = (float(t) for t in ticks)
+    return user + system + nice, user + system + idle + nice
+
+
+def _node_cpu_allotted() -> float | None:
+    """How many CPUs this node may use: the cgroup's quota where it sets one
+    below the CPUs this process may run on, else those CPUs."""
+    try:
+        cpus = float(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        cpus = float(os.cpu_count() or 0)
+    quota = None
+    try:
+        limit, _, period = Path("/sys/fs/cgroup/cpu.max").read_text().partition(" ")
+        if limit.strip() != "max" and float(period) > 0:
+            quota = float(limit) / float(period)
+    except (OSError, ValueError):
+        try:
+            limit = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+            period = float(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+            if limit > 0 and period > 0:
+                quota = limit / period
+        except (OSError, ValueError):
+            pass
+    found = [c for c in (cpus, quota) if c]
+    return min(found) if found else None
+
+
+def _node_cpu_sample() -> tuple[str, float, float] | None:
+    """(source, busy, whole) now, so that the share of the node's whole
+    allotted CPU in use between two samples of one source is their busy
+    difference over their whole difference: a container's - a cgroup below
+    the root - its CPU seconds over the seconds passed times the CPUs it is
+    allotted; a machine's, its busy ticks over all of them from /proc/stat,
+    or a Mac's from the kernel. None where the node does not say."""
+    if sys.platform == "darwin":
+        ticks = _node_mac_cpu_ticks()
+        return ("mac", *ticks) if ticks else None
+    cgroup = Path("/sys/fs/cgroup")
+    used = None
+    if (cgroup / "cpu.max").exists():
+        # cgroup v2 shows cpu.max only below the root: this node is the cgroup.
+        used = _node_memory_stat(cgroup / "cpu.stat", "usage_usec") / 1e6 or None
+    elif Path("/.dockerenv").exists() or Path("/run/.containerenv").exists():
+        for usage in ("cpuacct/cpuacct.usage", "cpu,cpuacct/cpuacct.usage"):
+            found = _node_int(_node_first_line(cgroup / usage))
+            if found is not None:
+                used = found / 1e9
+                break
+    if used is not None:
+        allotted = _node_cpu_allotted()
+        return ("cgroup", used, time.monotonic() * allotted) if allotted else None
+    try:
+        fields = Path("/proc/stat").read_text().split("\n", 1)[0].split()
+        # cpu user nice system idle iowait irq softirq steal: guest time is in user.
+        user, nice, system, idle, iowait, irq, softirq, steal = (
+            float(v) for v in (fields[1:9] + ["0"] * 8)[:8])
+    except (OSError, ValueError):
+        return None
+    if fields[0] != "cpu":
+        return None
+    busy = user + nice + system + irq + softirq + steal
+    return "proc", busy, busy + idle + iowait
+
+
+def _node_cpu_percent() -> float | None:
+    """The share of this node's whole allotted CPU in use since its last
+    sample, 0 to 100 - every core it may run on busy is 100 - measured over
+    NODE_CPU_SAMPLE_SECONDS where it has no earlier sample of the same
+    source; None where the node does not say."""
+    last = _NODE_CPU_LAST.get("sample")
+    now = _node_cpu_sample()
+    if now is None:
+        return None
+    if last is None or last[0] != now[0]:
+        time.sleep(NODE_CPU_SAMPLE_SECONDS)
+        last, now = now, _node_cpu_sample()
+        if now is None or now[0] != last[0]:
+            return None
+    _NODE_CPU_LAST["sample"] = now
+    whole = now[2] - last[2]
+    if whole <= 0:
+        return None
+    return round(min(max((now[1] - last[1]) / whole * 100.0, 0.0), 100.0), 1)
+
+
 def _node_facts() -> dict:
     """What this node says of itself that costs no process to learn, in the
     store tier's node_state_put terms; each None where the machine does not say."""
@@ -12651,7 +12769,8 @@ def _node_facts() -> dict:
         disk_used, disk_total = disk.used, disk.total
     except (OSError, StopIteration):
         disk_used = disk_total = None
-    return {"load": load, "cpu_count": cpus or None, "memory_used_bytes": used,
+    return {"load": load, "cpu_count": cpus or None, "cpu_percent": _node_cpu_percent(),
+            "memory_used_bytes": used,
             "memory_limit_bytes": limit or None, "disk_used_bytes": disk_used,
             "disk_total_bytes": disk_total or None, "booted_at": _node_booted_at(),
             "boot_line": _node_first_line(os.environ.get(NODE_BOOT_LINE_FILE_ENV)),
@@ -12993,6 +13112,7 @@ class _NodeManager:
         self.folders: dict[str, Path] = {}
         self.moved = False
         self.state_due = 0.0
+        self.detail_due = 0.0
         self.probe_due = 0.0
         self.probe: tuple | None = None
         self.probe_asked = False
@@ -13486,12 +13606,15 @@ class _NodeManager:
             self.needed, self.harness = answer["needed"], answer["harness"]
 
     def report_state(self) -> None:
-        """Write this node's state, with what the tools and the sessions
-        answered last; they are asked again once the probe cadence has
-        passed, and what they answer is written as soon as it comes. A write
-        that fails is said once and changes nothing else."""
+        """Write this node's state row, and once the detail cadence has passed,
+        a reconcile changed a job or a probe answered, the rest with it: what
+        the tools and the sessions answered last, and this manager's own last
+        lines. The tools and the sessions are asked again once the probe
+        cadence has passed, and what they answer is written as soon as it
+        comes. A write that fails is said once and changes nothing else."""
         now = time.monotonic()
         self.state_due = now + NODE_STATE_BEAT_SECONDS
+        whole = self.moved or self.probed() or now >= self.detail_due
         self.moved = False
         self.take_probe()
         if self.probe is None and (now >= self.probe_due or self.probe_asked):
@@ -13506,12 +13629,15 @@ class _NodeManager:
                                              getattr(exc, "message", exc),
                                              getattr(exc, "hint", None)))
             return
-        lines = self.log.take()
+        lines = self.log.take() if whole else None
         try:
             with conn.transaction():
-                _node_state_write(conn, self.here, _node_facts(), self.logins, self.sessions,
-                                  sorted(self.folders), self.needed)
-                self.write_logs(conn, lines)
+                if not whole:
+                    self.store.node_state_put(conn, self.here, **_node_facts())
+                else:
+                    _node_state_write(conn, self.here, _node_facts(), self.logins,
+                                      self.sessions, sorted(self.folders), self.needed)
+                    self.write_logs(conn, lines)
         except Exception as exc:
             if lines is not None:
                 self.log.again()
@@ -13521,8 +13647,10 @@ class _NodeManager:
             return
         finally:
             conn.close()
-        # Sessions written once are not written again until they are asked again.
-        self.sessions = None
+        if whole:
+            self.detail_due = now + NODE_STATE_DETAIL_SECONDS
+            # Sessions written once are not written again until they are asked again.
+            self.sessions = None
         if self.said.get("state") is not None:
             self.say("writes this node's state again")
         self.said["state"] = None
@@ -36431,7 +36559,7 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         every agent on it, with this agent's own sign-ins there from
         node_logins: {ok, project, agent_id, nodes [{node,
         label, disabled_at, reachable, cannot_read_store, load_1, load_5, load_15, cpu_count,
-        memory_used_bytes, memory_limit_bytes, disk_used_bytes,
+        cpu_percent, memory_used_bytes, memory_limit_bytes, disk_used_bytes,
         disk_total_bytes, booted_at, uptime_seconds, boot_line,
         image_version, claude_login, claude_account, claude_needed,
         claude_override, claude_expected, codex_login, codex_account,
@@ -36452,7 +36580,10 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         store got there - reads unreachable whatever its row says, and
         cannot_read_store {store_major, since, last_seen_at, message,
         command} says why and what brings it up (as `store upgrade --check`
-        names it); null otherwise. Memory is the container's under a memory limit, its usage
+        names it); null otherwise. cpu_percent is the share of the node's
+        whole allotted CPU in use over the moments before the row was
+        written, 0 to 100: every core it may run on busy is 100, and on a
+        container node its cgroup's quota is the whole. Memory is the container's under a memory limit, its usage
         less the file cache it can give back, else the machine's; disk is
         the filesystem holding the home; booted_at is the container's
         start on a container node, the machine's boot otherwise. boot_line
@@ -36686,12 +36817,14 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         seconds (default 60, 5 to 3600) and within seconds of a placement
         change, announced by the manager's placement writes, and answers a
         `service restart` for one of its programs. It reports the node seen
-        on each reconcile, and writes this node's state (`node state
-        report`) every 15 seconds, apart from its reconcile interval, and
-        right after a reconcile that changed a job, asking the tools'
+        on each reconcile, and writes this node's state row about every 2
+        seconds, apart from its reconcile interval, so its load and
+        cpu_percent read as they are now; every 15 seconds and right after a
+        reconcile that changed a job it writes the whole state (`node state
+        report`), asking the tools'
         sign-ins, the sessions and the harness of the services placed here
         again every 60 seconds; a write that fails
-        is said once on stderr and changes nothing else. With the state it
+        is said once on stderr and changes nothing else. With the whole state it
         writes its own last lines as this folder's agent's manager log
         (node_logs, `node state` logs), once a line came since
         the last write, and drops the lines of each service no longer placed

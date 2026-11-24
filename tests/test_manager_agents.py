@@ -848,6 +848,7 @@ def test_a_node_reports_its_state_and_the_agent_reads_every_nodes(lab):
     assert state["image_version"] == "0.0.12"
     assert state["boot_line"] == "running agent lab as node box-one"
     assert state["cpu_count"] >= 1 and state["load_1"] >= 0
+    assert 0 <= state["cpu_percent"] <= 100
     assert 0 <= state["memory_used_bytes"] and state["memory_limit_bytes"] > 0
     assert 0 < state["disk_used_bytes"] < state["disk_total_bytes"]
     assert state["booted_at"] and state["uptime_seconds"] >= 0
