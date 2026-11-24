@@ -49,6 +49,7 @@ STORE VERBS
   store show          each level of a project's store cascade
   store doctor        prove the store in force works
   store upgrade       cross a schema major, or say if one is due
+  store prune         list, or drop, what migrations left behind
   store unset         remove this machine's store setting
 
 VAULT VERBS
@@ -22793,6 +22794,229 @@ def cmd_store_upgrade(events: bool) -> None:
               "capabilities update"]})
 
 
+# `store prune`: what the store's migrations left behind and nothing reads -
+# the pre-images a step kept of what it changed (`<owner>_premig_*`) and the
+# refusing stubs a major step left under a name it moved (db.moved_stub) -
+# listed, and dropped only on --apply, after a proven dump. A column is never
+# its business: it is its owner's, and leaves by that owner's next major step.
+STORE_PRUNE_PREIMAGE = "_premig_"
+# What db.moved_stub's view reads as once the server prints it back.
+_STORE_PRUNE_STUB = re.compile(r"'::text\)+::integer IS NULL")
+
+
+def _store_leftovers(setting) -> list[dict]:
+    """Every pre-image table and refusing stub view in the store's schema,
+    read in one transaction, changing nothing: {name, kind, owner, bytes,
+    rows?, comment}, comment being the store's own words on it, which name
+    the step that made it."""
+    db = _db_module()
+    store = _store_module()
+    from psycopg import sql
+    schema = setting.schema
+    ident = sql.Identifier(schema)
+    conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
+                      transaction=True)
+    out = []
+    try:
+        with conn.transaction():
+            rows = conn.execute(
+                "SELECT c.relname, c.relkind, pg_total_relation_size(c.oid), "
+                "obj_description(c.oid, 'pg_class'), "
+                "CASE WHEN c.relkind = 'v' THEN pg_get_viewdef(c.oid) END "
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = %s AND (c.relkind = 'v' OR (c.relkind IN ('r', 'p') "
+                "AND NOT c.relispartition AND strpos(c.relname, %s) > 1)) "
+                "ORDER BY c.relname", (schema, STORE_PRUNE_PREIMAGE)).fetchall()
+            for name, kind, size, comment, definition in rows:
+                if kind == "v":
+                    if definition and _STORE_PRUNE_STUB.search(definition):
+                        out.append({"name": name, "kind": "stub", "owner": None,
+                                    "bytes": int(size), "comment": comment})
+                    continue
+                count = conn.execute(sql.SQL("SELECT count(*) FROM {}.{}").format(
+                    ident, sql.Identifier(name))).fetchone()[0]
+                out.append({"name": name, "kind": "pre-image",
+                            "owner": name.split(STORE_PRUNE_PREIMAGE, 1)[0], "bytes": int(size),
+                            "rows": int(count), "comment": comment})
+    finally:
+        conn.close()
+    return out
+
+
+def _store_prune_library_reads() -> dict[str, str]:
+    """{table: where} of every pre-image the installed store library names as
+    a table others read, which it may read itself at any time."""
+    found = {}
+    for module, label in ((_db_module(), "capabilities_contract.db"),
+                          (_store_module(), "the store tier")):
+        for attr, value in sorted(vars(module).items()):
+            if attr.isupper() and isinstance(value, str) and STORE_PRUNE_PREIMAGE in value \
+                    and not value.endswith("_"):
+                found.setdefault(value, f"{label}.{attr}")
+    return found
+
+
+def _store_prune_plan(root: Path | None) -> dict:
+    """What `store prune` answers, changing nothing; the setting, the survey
+    and the key ride along under `_` for --apply."""
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+    except db.DbError as exc:
+        error = _db_error(exc)
+        _die(3 if exc.slug == "store_not_configured" else 6, error["code"],
+             error["message"], error.get("hint"))
+    key = _store_upgrade_key(setting)
+    params = _store_params(setting)
+    try:
+        survey = _store_survey(setting)
+        leftovers = _store_leftovers(setting)
+    except Exception as exc:  # DbError, psycopg.Error: the store did not answer
+        error = (_db_error(exc) if isinstance(exc, db.DbError) else
+                 {"code": "store_unreachable", "message": _store_scrub(exc, setting)})
+        _die(5, error["code"], error["message"],
+             error.get("hint") or "check the database setting with `capabilities store doctor`")
+    readers = _store_upgrade_readers(setting, survey) if survey["major"] is not None else []
+    answered = {entry["owner"] for entry in readers}
+    not_answered = sorted(owner for owner in survey["owners"] if owner not in answered)
+    unsettled = [entry for entry in readers if entry["state"] != "current"]
+    behind = [node for node in _store_nodes_answer(survey)
+              if not node["disabled"] and not node["reads_store"]]
+    library = _store_prune_library_reads()
+    for entry in leftovers:
+        reads = []
+        for owner in unsettled:
+            reads.append({"code": "owner_not_current", "owner": owner["owner"],
+                          "message": f"the {owner['owner']} tables stand {owner['state']} "
+                                     "against the release installed here, and a step not yet "
+                                     "applied may read any pre-image or stub",
+                          "hint": f"migrate {owner['owner']} (`capabilities update`), "
+                                  "then plan again"})
+        if entry["kind"] == "pre-image" and entry["owner"] not in answered:
+            reads.append({"code": "owner_not_answered", "owner": entry["owner"],
+                          "message": f"no release installed here answers for {entry['owner']}, "
+                                     "whose own steps may still read it",
+                          "hint": f"plan on a machine that has {entry['owner']} installed"})
+        if entry["name"] in library:
+            reads.append({"code": "read_by_library", "where": library[entry["name"]],
+                          "message": f"the store library names it as a table it and every "
+                                     f"owner's steps read ({library[entry['name']]})",
+                          "hint": "it can go once no release of the library names it"})
+        if entry["kind"] == "stub" and behind:
+            reads.append({"code": "node_behind",
+                          "nodes": [node["label"] or node["node"] for node in behind],
+                          "message": "a release of an older major still runs on "
+                                     + ", ".join(node["label"] or node["node"]
+                                                 for node in behind)
+                                     + ", and the stub is what it reads to learn what to run",
+                          "hint": "bring each node up (`capabilities store upgrade --check` "
+                                  "names how), then plan again"})
+        entry["read_by"] = reads
+        entry["drop"] = not reads
+    drop = [entry["name"] for entry in leftovers if entry["drop"]]
+    keep = [entry["name"] for entry in leftovers if not entry["drop"]]
+    answer = {
+        "ok": True, "applied": False,
+        "store": {"key": key, "level": setting.level, "schema": setting.schema,
+                  "host": params.get("host"), "port": params.get("port"),
+                  "database": params.get("dbname"), "major": survey["major"]},
+        "owners": [{"owner": entry["owner"], "by": entry["by"],
+                    "capability": entry.get("capability"), "state": entry["state"]}
+                   for entry in readers],
+        "not_answered": not_answered,
+        "nodes_behind": [node["label"] or node["node"] for node in behind],
+        "leftovers": leftovers, "drop": drop, "keep": keep,
+        "bytes": {"drop": sum(e["bytes"] for e in leftovers if e["drop"]),
+                  "keep": sum(e["bytes"] for e in leftovers if not e["drop"])},
+        "message": (f"{len(leftovers)} leftovers in the store: {len(drop)} nothing reads, "
+                    f"{len(keep)} kept for what still reads them" if leftovers
+                    else "the store holds no pre-image and no stub"),
+        "next": (["capabilities store prune --apply"] if drop else []),
+    }
+    answer["_"] = {"setting": setting, "survey": survey, "key": key}
+    return answer
+
+
+def cmd_store_prune(apply: bool) -> None:
+    """`store prune [--apply]`: the plan, changing nothing; with --apply, a
+    proven dump of the store's schema first, the plan made again, and then
+    every leftover both plans let go dropped in one transaction, RESTRICT."""
+    os.environ.pop(_db_module().UPGRADE_ENV, None)
+    if apply:
+        _read_only_gate("store prune --apply")
+    root = _project_root()
+    plan = _store_prune_plan(root)
+    carried = plan.pop("_")
+    if not apply:
+        _emit(plan)
+        return
+    plan.update(applied=True, backup=None, dropped=[])
+    if not plan["drop"]:
+        plan["message"] = "nothing to drop: " + plan["message"]
+        plan["next"] = []
+        _emit(plan)
+        return
+    setting, survey, key = carried["setting"], carried["survey"], carried["key"]
+    server = survey["server_major"]
+    tools = {"pg_dump": _pg_tool("pg_dump", server),
+             "pg_restore": _pg_tool("pg_restore", server)}
+    if any(tool is None or tool["major"] < server for tool in tools.values()):
+        fetch = _pg_client_plan(server)
+        if fetch is None:
+            _die(5, "pg_dump_missing", "pg_dump and pg_restore of the store's server "
+                 f"(PostgreSQL {server}) are not installed here, so the dump taken before "
+                 "anything is dropped cannot be made; nothing was dropped",
+                 _pg_install_hint(server))
+        try:
+            tools.update(_pg_client_fetch(fetch))
+        except _UpgradeFailed as exc:
+            _die(exc.exit_code, exc.code, exc.message + "; nothing was dropped", exc.hint)
+    try:
+        dump = _store_dump(setting, survey, key, tools)
+    except _UpgradeFailed as exc:
+        _die(exc.exit_code, exc.code, exc.message + "; nothing was dropped",
+             "fix what it says and run `capabilities store prune --apply` again")
+    plan["backup"] = dump
+    # The store may have moved while the dump was taken: only what both plans
+    # let go is dropped, and only what the store still holds.
+    again = _store_prune_plan(root)
+    again.pop("_")
+    drop = [entry for entry in again["leftovers"]
+            if entry["drop"] and entry["name"] in set(plan["drop"])]
+    db = _db_module()
+    store = _store_module()
+    import psycopg
+    from psycopg import sql
+    conn = db.connect(application_name=store.STORE_APPLICATION, setting=setting,
+                      transaction=True)
+    try:
+        with conn.transaction():
+            conn.execute("SET LOCAL lock_timeout = '10s'")
+            for entry in drop:
+                what = sql.SQL("VIEW" if entry["kind"] == "stub" else "TABLE")
+                try:
+                    conn.execute(sql.SQL("DROP {} {}.{} RESTRICT").format(
+                        what, sql.Identifier(setting.schema), sql.Identifier(entry["name"])))
+                except psycopg.Error as exc:
+                    raise _UpgradeFailed(5, "prune_failed",
+                                         f"dropping {entry['name']} failed: "
+                                         + _store_scrub(str(exc).strip(), setting)
+                                         + f"; nothing was dropped, and the dump taken first "
+                                           f"is {dump['path']}",
+                                         "remove what holds it, or plan again") from exc
+    except _UpgradeFailed as exc:
+        _die(exc.exit_code, exc.code, exc.message, exc.hint)
+    finally:
+        conn.close()
+    dropped = {entry["name"] for entry in drop}
+    for entry in again["leftovers"]:
+        entry["dropped"] = entry["name"] in dropped
+    again.update(applied=True, backup=dump, dropped=sorted(dropped), next=[])
+    again["message"] = (f"dropped {len(dropped)} leftovers after the proven dump at "
+                        f"{dump['path']}; " + again["message"])
+    _emit(again)
+
+
 def _deny_rule(name: str) -> str:
     return f"Bash({name}:*)"
 
@@ -34767,7 +34991,9 @@ STORE VERBS
   until it has moved into the store (see migrate); from then they are rows
   of the contract's tables in the store, beside the tables each capability
   migrates for itself. These verbs never create a table, but store
-  upgrade, which migrates every owner across a schema major.
+  upgrade, which migrates every owner across a schema major, and never
+  drop one, but store prune --apply, which drops only what the store's
+  migrations left behind and nothing reads.
 """,
     'vault': """\
 VAULT VERBS
@@ -35533,6 +35759,55 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         {manager, release} before the new manager carries on, ending in done
         {result} or error {exit, error}. Exit 4 under the read-only switch.
         capabilities guide store-upgrade says how to go through it.
+"""),
+    (('store prune',),
+     """\
+  store prune [--plan] [--json]
+        Change nothing, and list what the migrations of the store this
+        folder resolves (the cascade above) left behind in its schema: each
+        pre-image table, named <owner>_premig_*, which a step kept of what it
+        changed, and each refusing stub, the view a major step left under a
+        name it moved, which holds no data and fails every read with what to
+        run. A column is never listed: it is its owner's, and leaves only by
+        that owner's next major step. Each is judged by what could still read
+        it, and is kept when anything could: every owner on the store that
+        an installed release does not answer as current (it is asked as
+        `store upgrade --check` asks it, and a step not yet applied may read
+        any pre-image or stub), owner_not_current; for a pre-image, its owner
+        when no release installed here answers for it, owner_not_answered;
+        a pre-image the installed store library names as a table it and
+        every owner's steps read, read_by_library; for a stub, an enabled
+        node the store holds that cannot read the store's major yet,
+        node_behind. JSON {ok, applied: false, store {key, level, schema,
+        host, port, database, major}, owners [{owner, by, capability?,
+        state}], not_answered [owner the store records that no release here
+        answers for], nodes_behind [label], leftovers [{name, kind
+        (pre-image | stub), owner (pre-image; null for a stub), bytes, rows
+        (pre-image), comment (the store's own words on it, which name the
+        step that made it; null where it has none), read_by [{code, owner?,
+        where?, nodes?, message, hint}], drop}], drop [name], keep [name],
+        bytes {drop, keep}, message, next}. Exit 0 whatever it finds, 3 when
+        no level answers, 5 when the store does not answer, 6 with the
+        library's code when the level in force is refused. Output is always
+        JSON, so --json changes nothing.
+"""),
+    (('store prune',),
+     """\
+  store prune --apply [--json]
+        Drop what the plan above lets go, and nothing else. First a dump of
+        the store's schema, taken and proven as `store upgrade` takes it
+        (pg_dump of the server's major, fetched where `store upgrade` would
+        fetch it, to $XDG_DATA_HOME/capabilities/backups/<store key>/<UTC
+        time>.dump, proven by `pg_restore --list`); then the plan is made
+        again, and every leftover both plans let go is dropped in one
+        transaction, RESTRICT, so one that something else depends on fails
+        the whole drop. Answers as the plan, with applied: true, backup
+        {path, bytes, sha256, taken_at, proven}, dropped [name], and dropped
+        on each leftover; with nothing to drop it takes no dump and answers
+        backup null. A missing or failed dump (exit 5 pg_dump_missing,
+        dump_failed; 6 dump_unproven) and a failed drop (exit 5
+        prune_failed, which names the dump) drop nothing. Exit 4 under the
+        read-only switch.
 """),
     (('store unset',),
      """\
@@ -37985,8 +38260,15 @@ def main() -> None:
                 cmd_store_upgrade_check()
             else:
                 cmd_store_upgrade("--events" in rest)
+        elif sub == "prune":
+            extra = [arg for arg in rest[1:] if arg not in ("--plan", "--apply", "--json")]
+            if extra or ("--plan" in rest and "--apply" in rest):
+                _die(6, "input", "store prune takes --plan or --apply, and --json",
+                     "capabilities store prune [--plan] | capabilities store prune --apply")
+            cmd_store_prune("--apply" in rest)
         else:
-            _die(6, "input", "store needs a subcommand: set, show, doctor, upgrade or unset",
+            _die(6, "input", "store needs a subcommand: set, show, doctor, upgrade, prune or "
+                 "unset",
                  "run `capabilities help`")
     elif cmd == "path":
         if pos:
