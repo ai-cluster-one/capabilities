@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.53,<1",
 # ]
 # ///
 """deployment - project deployment standard for agent-readable runtime specs.
@@ -1074,7 +1074,8 @@ def _inventory(_network: bool) -> dict:
     root = _project_root()
     if root is None:
         return {"metrics": [{"label": "services", "value": 0,
-                             "note": "not inside a project"}]}
+                             "note": "not inside a project"},
+                            _tile("servers", 0, "targets", note="not inside a project")]}
     runtime, err = _read_json(_runtime_path(root))
     if err or not isinstance(runtime, dict):
         return {"metrics": [{"label": "services", "value": 0,
@@ -1106,7 +1107,7 @@ def _inventory(_network: bool) -> dict:
     return {
         "metrics": [
             {"label": "services", "value": len(services)},
-            {"label": "targets", "value": len(targets)},
+            _tile("servers", len(targets), "targets"),
             {"label": "profile", "value": str(runtime.get("profile") or "generic")},
         ],
         "items": items,

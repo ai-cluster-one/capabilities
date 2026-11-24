@@ -1,5 +1,9 @@
 # automations — change log
 
+## 2026-11-24 — `automations inventory` marks its two counts as tile counts, and the icon is `zap`
+
+A reader drawing the capability's tile on an agent's page now takes both counts from the inventory answer itself: the `automations` metric carries `kind` `total` and `glyph` `page`, and the `active here` metric carries `kind` `active` and `glyph` `pulse`. The `automations` metric outside a project and in a project with no configuration, where it is 0, carries the same tile; when the definitions do not load it carries none, since the count is not known, and the `enabled` metric that stands in for `active here` when the running daemon published no node carries none. Labels, values, notes and their order are unchanged, and the report stays local. `LUCIDE_ICON` is `zap`, in place of `timer`; `icon.png` is unchanged. The capability binds `capabilities-contract` 0.53 or later, which supplies the tile helper. No verb, flag or exit code changes.
+
 ## 2026-11-23 — An `automations agent` turn is headless whoever started the process
 
 `automations agent` started `claude -p` and `codex exec` with the whole environment of the process that ran it. A scheduler started from inside an interactive Claude Code session keeps that session's variables, its entrypoint among them, so every agent turn its jobs ran recorded the calling session's entrypoint in its transcript and read as that session's own interactive work rather than a background run. The turn's environment now drops every variable the harness runner names in `SESSION_MARKERS` - the ones a calling Claude Code session leaves in its children's environment - as the runner does for its own turns, so the CLI records its own headless entrypoint (`sdk-cli` for `claude -p`). Every other variable still reaches the turn. No verb, flag, JSON key or exit code changes.

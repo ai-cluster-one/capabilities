@@ -227,14 +227,26 @@ def test_the_state_lives_under_the_projects_capability_state(project):
 
 def test_inventory_reports_the_service_stopped_without_a_daemon(project, monkeypatch):
     monkeypatch.setattr(mod, "_service_connection", lambda wanted: ("main", {}))
-    assert mod.INVENTORY == {"network": "none"}
-    assert mod._inventory(False) == {"service": {
-        "state": "stopped", "detail": "no daemon runs for this project", "ok": True}}
+    assert mod._inventory(False)["service"] == {
+        "state": "stopped", "detail": "no daemon runs for this project", "ok": True}
     (project / "capabilities" / "tasks" / "service" / "config.toml").unlink()
     service = mod._inventory(False)["service"]
     assert "not initialized" in service["detail"]
     # The verdict is `service doctor`'s, judged without the store.
     assert service["ok"] is False and "no service settings" in service["problem"]
+
+
+def test_a_bare_inventory_defers_the_tile_counts_and_opens_no_store(project, monkeypatch):
+    monkeypatch.setattr(mod, "_service_connection", lambda wanted: ("main", {}))
+
+    def no_store(*_a, **_k):
+        raise AssertionError("a bare inventory asked the store")
+
+    monkeypatch.setattr(mod, "_connect", no_store)
+    assert mod.INVENTORY == {"network": "optional"}
+    report = mod._inventory(False)
+    assert "metrics" not in report
+    assert [one["label"] for one in report["deferred"]] == ["in progress", "waiting for you"]
 
 
 def test_inventory_names_what_the_doctor_finds_wrong_with_what_serves_it(project, monkeypatch):

@@ -730,3 +730,24 @@ def test_the_read_only_switch_refuses_every_write(lab):
                                   CAPABILITIES_READ_ONLY="1")
         assert (code, error["code"]) == (4, "read_only_switch")
     assert lab.run("list", CAPABILITIES_READ_ONLY="1").returncode == 0
+
+
+def test_inventory_defers_the_count_bare_and_counts_this_project_s_live_documents(lab):
+    bare = lab.ok("inventory")
+    assert bare["metrics"] == [] and [d["label"] for d in bare["deferred"]] == ["documents"]
+    [(table,)] = lab.sql("SELECT to_regclass(%s)::text", (f"{SCHEMA}.context_documents",))
+    assert table is None
+    storeless = {k: v for k, v in lab.env().items() if not k.startswith("AGENTKIT_DB_")}
+    unset = subprocess.run([sys.executable, str(CLI), "inventory"], cwd=lab.project,
+                           env=storeless, text=True, capture_output=True, timeout=180)
+    assert unset.returncode == 0 and json.loads(unset.stdout)["deferred"]
+
+    lab.ok("import")
+    lab.ok("retire", "product/deep/NOTE")
+    lab.ok("save", "shared/RULES", "--global", "--from", "-", stdin=FILES["identity/MISSION.md"])
+    _in(lab, _other(lab), "save", "elsewhere/ONLY", "--from", "-",
+        stdin=FILES["identity/MISSION.md"])
+    counted = lab.ok("inventory", "--network")
+    assert counted["metrics"] == [{"label": "documents", "value": 2, "kind": "documents",
+                                   "glyph": "page"}]
+    assert counted["network"] is True and counted["deferred"] == []

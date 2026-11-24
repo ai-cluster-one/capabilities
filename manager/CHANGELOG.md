@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-24 — A capability's `inventory` metric can be a tile count, with the glyph drawn beside it
+
+An `inventory` metric may carry `kind` (`active`, `total`, `in_progress`, `waiting`, `documents`, `servers`, `connections`) and `glyph` (`pulse`, `page`, `hand`, `server`, `plug`), so a reader draws a capability's tile on an agent's page from its own answer. The standard states both closed sets, the library's `_tile` builds such a metric, and the envelope refuses anything outside them with `bad_tile`. A count the store holds is deferred bare and answered under `--network`, as every network-backed figure is. The package ships with capabilities-contract 0.53 (`CONTRACT_LIBRARY_RELEASE` 0.53.0). A metric without either field, and every existing answer, is unchanged; no verb, flag or existing JSON key changes.
+
 ## 2026-11-24 — A node `node create` makes keeps the manager and the capabilities on a `capabilities` volume, which `node update --version` adds to an older node
 
 `node create`, and the Compose document `node update <node> --version <tag>` writes, declare a sixth named volume, `capabilities`, at the node user's `~/.capabilities`. From `agent-node` 0.0.17 the image carries no manager and no capability: the node installs the latest manager and the system capabilities on that volume at its first boot, with uv, its Python and the capabilities' environments beside them, and a restart or a new image tag leaves them as they were, so what a node runs changes only through `capabilities node update`. A node created before mounts nothing at `~/.capabilities`, so `node update --version` adds the volume new and empty and names it in `volumes_added`; its first boot on the new image installs the latest, as a fresh node's does. An image before 0.0.17 on the new volume still runs, carrying its own manager and catalogue as before.

@@ -515,6 +515,36 @@ def test_the_one_time_command_puts_each_waiting_person_task_once(lab):
     assert (code, error["code"]) == (6, "inbox_unavailable")
 
 
+def test_inventory_counts_this_projects_tasks_in_progress_and_waiting_on_a_person(lab):
+    import psycopg
+
+    add(lab, "t-person", "--status", "waiting", "--assignee", PERSON, inbox=False)
+    add(lab, "t-other-person", "--status", "waiting", "--assignee", OTHER_PERSON, inbox=False)
+    reviewer(lab)
+    add(lab, "t-worker", "--status", "waiting", "--assignee", "reviewer", inbox=False)
+    # The manager names this one an agent, so it waits on no person.
+    add(lab, "t-helper", "--status", "waiting", "--assignee", "helper-agent", inbox=False)
+    add(lab, "t-todo", "--status", "todo", "--assignee", PERSON, inbox=False)
+    held = add(lab, "t-held", "--status", "todo", inbox=False)
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        # Another project's tasks in the same store count for it, not here.
+        conn.execute(f"""insert into {lab['schema']}.tasks_tasks
+                             (agent_id, type, title, status, assignee)
+                         values ('prj_elsewhere000', 'probe', 'theirs', 'waiting', %s)""",
+                     (PERSON,))
+    # An open raise is what shows a task in progress.
+    ok(tasks(lab, "claim", "--key", held, "--worker", "supervisor"))
+    bare = ok(tasks(lab, "inventory"))
+    assert bare["metrics"] == []
+    assert [one["label"] for one in bare["deferred"]] == ["in progress", "waiting for you"]
+    report = ok(tasks(lab, "inventory", "--network"))
+    assert report["deferred"] == []
+    assert [(m["kind"], m["label"], m["value"], m["glyph"]) for m in report["metrics"]] == [
+        ("in_progress", "in progress", 1, "pulse"),
+        ("waiting", "waiting for you", 2, "hand")]
+    assert report["service"]["state"] == "stopped"
+
+
 # --- A supervisor passing a task to the owner ---------------------------------
 
 def test_a_supervisor_gives_the_question_on_its_move_under_its_grant(lab):

@@ -252,6 +252,16 @@ def test_a_bundled_runtime_without_a_target_says_so(tmp_path: Path) -> None:
     assert any("no target declared" in f["message"] for f in json.loads(sync.stdout)["findings"])
 
 
+def test_inventory_counts_the_targets_as_the_tiles_servers(tmp_path: Path) -> None:
+    root, env = _project(tmp_path, contextkit=False)
+    for target in ("staging", "edge"):
+        assert _run(root, env, "init", "--profile", "agent-box", "--target", target,
+                    "--provider", "manual").returncode == 0
+    metrics = json.loads(_run(root, env, "inventory").stdout)["metrics"]
+    assert [m for m in metrics if "kind" in m] == [
+        {"label": "targets", "value": 2, "kind": "servers", "glyph": "server"}]
+
+
 def _declare_node(root: Path, target: str, node: object) -> None:
     path = root / "deployment" / "targets" / target / "target.json"
     data = json.loads(path.read_text())

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.53,<1",
 #     "httpx>=0.27",
 #     "psycopg[binary]>=3.2",
 # ]
@@ -158,7 +158,7 @@ DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/assets/guides/")
 STATE = False
 TABLES = True       # the four assets_* tables, built by _tables()
-INVENTORY = None    # what assets holds is in the store; reading it is `assets list`
+INVENTORY = {"network": "optional"}   # what assets holds is in the store, reached over the network
 POST_INSTALL: list[dict] = []
 
 # What a person is asked for (SHEBANG.md, "What a person is asked for"):
@@ -672,7 +672,10 @@ For assets:
 """,
     "inventory": """\
 For assets:
-  Empty: what assets holds is the store's; reading it is `assets list` and
+  One tile count, `assets`: the documents and the files this project holds
+  live, not retired, together. They are the store's, so a bare run names the
+  count in `deferred` and opens no store; --network counts them from the
+  store's records and reaches no bucket. Reading them is `assets list` and
   `assets files list`.
 """,
 }
@@ -736,6 +739,28 @@ def _connections_report() -> dict:
 
 def _cmd_connections() -> None:
     _emit(_connections_report())
+
+
+def _inventory(network: bool) -> dict:
+    """The assets this project holds live, documents and files together, as a
+    tile's count.
+
+    Both are the store's, reached over the network, so a bare run names the
+    count as deferred and opens nothing; --network counts what `assets list`
+    and `assets files list` read: this project's documents and file records
+    not retired. A file is counted by its record, so no bucket is reached.
+    Outside a project there is no project to count for."""
+    if not network:
+        return {"deferred": [{"label": "assets",
+                              "note": "kept in the project's store; run with --network"}]}
+    if _project_root() is None or not _project_id(write=False):
+        return {"deferred": [{"label": "assets", "note": "no project here to count for"}]}
+    project = _project(write=False)
+    conn = _open(_root())
+    row = _one(conn, "SELECT (SELECT count(*) FROM assets_documents WHERE agent_id = %(p)s "
+               "AND retired_at IS NULL) + (SELECT count(*) FROM assets_files "
+               "WHERE agent_id = %(p)s AND retired_at IS NULL) AS n", {"p": project})
+    return {"metrics": [_tile("documents", row["n"], "assets")]}
 
 
 class _BucketError(Exception):

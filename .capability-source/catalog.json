@@ -186,7 +186,7 @@
       "level": 0,
       "lucide_icon": "archive",
       "path": "capabilities/assets",
-      "payload_sha256": "12ddb83a406dd52ef5c98550297982e328733512379c0f6fc1b4cdd56b5a948b",
+      "payload_sha256": "aa432f9dc2c9b212a682d74a56243681be2107d954449351947cf0671aab8889",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder.",
@@ -202,7 +202,7 @@
           "title": "Материалы"
         }
       },
-      "version": "2026-11-23 — A document can hold one draft: saving it adds no version, and publishing it adds one against its base"
+      "version": "2026-11-24 — `assets inventory` counts this project's assets as a tile, and only with --network"
     },
     "automations": {
       "executable": [
@@ -227,9 +227,9 @@
       ],
       "icon": true,
       "level": 0,
-      "lucide_icon": "timer",
+      "lucide_icon": "zap",
       "path": "capabilities/automations",
-      "payload_sha256": "d3ccd3fa61b88b57d5f0a6ecc3ad91f3948eeec4bc340544e3d5831c8d5b0393",
+      "payload_sha256": "9dd84b78dde8f5069c7589bbde564c59c4d26baf1a420b8cfb7a1f126e280049",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
@@ -245,7 +245,7 @@
           "title": "Автоматизации"
         }
       },
-      "version": "2026-11-23 — An `automations agent` turn is headless whoever started the process"
+      "version": "2026-11-24 — `automations inventory` marks its two counts as tile counts, and the icon is `zap`"
     },
     "calcomc": {
       "executable": [
@@ -435,7 +435,7 @@
       "level": 0,
       "lucide_icon": "book-open",
       "path": "capabilities/context",
-      "payload_sha256": "c555fcd20907b786e7a5feacfb557529bb81bfb3831185d8e3533e49c5c0beb9",
+      "payload_sha256": "7f674c8faa0cfdabbcfc19d5bcaa3e81a191b0fc4308e792cecd220b20d107ae",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte.",
@@ -451,7 +451,7 @@
           "title": "Контекст"
         }
       },
-      "version": "2026-11-23 — A document can hold one draft: saving it adds no version, and publishing it adds one against its base"
+      "version": "2026-11-24 — `context inventory` counts this project's documents as a tile, and only with --network"
     },
     "coolify": {
       "executable": [
@@ -560,7 +560,7 @@
       "level": 0,
       "lucide_icon": "rocket",
       "path": "capabilities/deployment",
-      "payload_sha256": "1ce8e3bfad426ac2444e79dd4b7ded69a5ce992ebd0f28f6743f4352a1543b75",
+      "payload_sha256": "1b74d2ab411e8b5321ad15b3b6e52dcc350054b7379795335bb0d2ab76a1a299",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to.",
@@ -576,7 +576,7 @@
           "title": "Развёртывание"
         }
       },
-      "version": "2026-11-24 — `node create --repository` gives the node a `capabilities` volume, and the agent-node guide says the manager and the capabilities live there"
+      "version": "2026-11-24 — `deployment inventory` marks its targets as the tile's servers"
     },
     "directo": {
       "executable": [
@@ -932,7 +932,7 @@
       "level": 0,
       "lucide_icon": "brain",
       "path": "capabilities/memory",
-      "payload_sha256": "4bfff355acc4ad3f8ae49cc299df9c6fc81cc404314d8ae012fa6930a86e4974",
+      "payload_sha256": "159a5d1c6bd4443f9e81facb91983e7719b0dab89a62e9fb2038fd9257aaa03f",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a constant block in every session's context that says how to record and search them, and a grooming pass, run on a schedule, that consolidates the entries.",
@@ -948,7 +948,7 @@
           "title": "Память"
         }
       },
-      "version": "2026-11-23 — Turns run on callva-harness-runner 0.13.1"
+      "version": "2026-11-24 — `memory inventory` counts this project's active entries as a tile, and only with --network"
     },
     "notion": {
       "executable": [
@@ -1093,9 +1093,9 @@
       ],
       "icon": true,
       "level": 0,
-      "lucide_icon": "list-ordered",
+      "lucide_icon": "scroll",
       "path": "capabilities/routine",
-      "payload_sha256": "b071a1c4da21da37c10f4308518caf0589b92b756d264947d55c2f11915b44d8",
+      "payload_sha256": "c8f12170243a7f4192124e5f2ec90fc780ca031c50da9976a51d8f1d5b09e483",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte.",
@@ -1111,7 +1111,7 @@
           "title": "Процедуры"
         }
       },
-      "version": "2026-11-23 — A routine in the store can hold one draft: saving it adds no version, and publishing it adds one against its base"
+      "version": "2026-11-24 — `routine inventory` counts the project's routines where it keeps them, and the icon is `scroll`"
     },
     "signoz": {
       "executable": [
@@ -1423,9 +1423,9 @@
       ],
       "icon": true,
       "level": 0,
-      "lucide_icon": "list-checks",
+      "lucide_icon": "circle-check",
       "path": "capabilities/tasks",
-      "payload_sha256": "3d1b4b8d349f489d9997a100bd55fd9f2b386cc05b6932961f239b415b7ae126",
+      "payload_sha256": "d9cb0ab6df379180173744d840d3294c29341254a731e42d2b47788062cffb4e",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
@@ -1441,7 +1441,7 @@
           "title": "Задачи"
         }
       },
-      "version": "2026-11-23 — Turns run on callva-harness-runner 0.13.1"
+      "version": "2026-11-24 — `tasks inventory --network` counts the tasks in progress and the tasks waiting for you, and the icon is `circle-check`"
     },
     "teams": {
       "executable": [
@@ -1456,7 +1456,7 @@
       "level": 1,
       "lucide_icon": "users",
       "path": "capabilities/teams",
-      "payload_sha256": "375792c5749d6f4144cb03516fb5864180c21bb6c691ea575e7771698f95a41f",
+      "payload_sha256": "566ab1b95a6dc9f532a9757cd50f99c074a52d61cea5ccf288d0eb23ad1b74f9",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
@@ -1472,7 +1472,7 @@
           "title": "Команды"
         }
       },
-      "version": "2026-11-23 — A team document can hold one draft: saving it adds no version, and publishing it adds one against its base, at teams 1.4"
+      "version": "2026-11-24 — `teams inventory` counts the teams this agent is in as a tile, and only with --network"
     },
     "telegram": {
       "executable": [
@@ -1796,6 +1796,6 @@
       "version": "2026-11-22 — `youtrack help` is the menu, and `youtrack help <verb>` one verb's whole contract"
     }
   },
-  "contract_library": "0.52.0",
+  "contract_library": "0.53.0",
   "store_major": 4
 }

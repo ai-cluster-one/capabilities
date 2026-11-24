@@ -1312,6 +1312,16 @@ environments = ["production"]
             daemon.wait(timeout=15)
 
     @needs_store
+    def test_inventory_counts_carry_their_tile_kind_and_glyph(self) -> None:
+        # A reader draws the capability's tile from these two metrics alone.
+        self.define("nightly", script_path="capabilities/automations/scripts/job.py",
+                    schedule="0 3 * * *", node=PRODUCTION)
+        metrics = json.loads(self.cli("inventory").stdout)["metrics"]
+        self.assertEqual([(m["label"], m["value"], m["kind"], m["glyph"]) for m in metrics],
+                         [("automations", 6, "total", "page"),
+                          ("active here", 5, "active", "pulse")])
+
+    @needs_store
     def test_inventory_item_carries_id_description_and_schedule_as_data(self) -> None:
         # A reader addresses an automation by its id and reads its schedule
         # without parsing display text; the contract's item has no such fields,

@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-24 — `deployment inventory` marks its targets as the tile's servers
+
+A reader drawing the capability's tile on an agent's page now takes the count of servers from the inventory answer itself: the `targets` metric carries `kind` `servers` and `glyph` `server`, with its label, value and place unchanged. Outside a project the answer adds that metric with 0, since no project holds a target there; a project whose deployment declaration does not read gains none, since its targets are not counted. The `services` and `profile` metrics, the items and the report's locality are unchanged. The capability binds `capabilities-contract` 0.53 or later, which supplies the tile helper. No verb, flag or exit code changes.
+
 ## 2026-11-24 — `node create --repository` gives the node a `capabilities` volume, and the agent-node guide says the manager and the capabilities live there
 
 `deployment node create --repository` declares a sixth named volume, `capabilities`, at the node user's `~/.capabilities`, as `capabilities node create` does, so a node built `FROM` the standard image keeps the manager and the capabilities its first boot installs there across a rebuild. `guides/agent-node.md` no longer says the image carries the manager with the whole catalogue or that each boot brings the capabilities to the catalogue the image names: from `agent-node` 0.0.17 they live on that volume, and change only through `capabilities node update`.

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.53,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -133,6 +133,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import difflib
+import io
 import json
 import os
 import re
@@ -146,7 +147,7 @@ from typing import NoReturn
 
 NAME = "routine"
 TITLE = "Routines"
-LUCIDE_ICON = "list-ordered"
+LUCIDE_ICON = "scroll"
 SUMMARY = ("Routine CLI for project repeatable procedures — list, validate, "
            "and render `.routines` recipes, and keep routines as versioned documents "
            "in the project's store: show, save with a base, history, diff, retire, "
@@ -179,7 +180,7 @@ DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/routine/guides/")
 STATE = False
 TABLES = True        # routine_* tables in the project's store, built by _tables()
-INVENTORY = None     # or {"network": "none"|"optional"|"required"} with an _inventory(network) builder
+INVENTORY = {"network": "optional"}   # a store holding the routines is read only with --network
 POST_INSTALL: list = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -2259,6 +2260,55 @@ def _agent_routines(write: bool) -> dict:
     routines = _folder_routines(folder, warnings)
     return {"project": str(root), "source": "folder", "folder": str(folder),
             "count": len(routines), "routines": routines, "warnings": warnings}
+
+
+def _inventory(network: bool) -> dict:
+    """How many routines this project holds where it keeps them, as one tile.
+
+    Where they are kept is the rule `titles` reads by: the store once it holds
+    an active routine of this project, else the routines folder. With no store
+    configured the folder is the only home, and counting it is local. With one
+    configured, only the store can say which home it is, so a bare run names
+    the count as deferred without opening it, and `--network` reads it."""
+    root = _project_root()
+    if root is None:
+        return {"metrics": [_tile("documents", 0, "routines", note="not inside a project")]}
+    db = _db()
+    try:
+        db.resolve_setting(root)
+        stored = True
+    except db.DbError as exc:
+        stored = exc.slug != "store_not_configured"
+    if stored and not network:
+        return {"deferred": [{"label": "routines",
+                              "note": "the store decides where they are kept; "
+                                      f"`{NAME} inventory --network` counts them"}]}
+    if stored:
+        import psycopg
+        project = _project_id(write=False)
+        try:
+            rows = _stored_routines(root, str(project)) if project else []
+        except (db.DbError, psycopg.Error) as exc:
+            said = (f"{exc.slug}: {exc.message}" if isinstance(exc, db.DbError)
+                    else _one_line(str(exc))[:300])
+            return {"deferred": [{"label": "routines",
+                                  "note": f"the store did not answer: {said}"}]}
+        if rows:
+            return {"metrics": [_tile("documents", len(rows), "routines",
+                                      note="in the store")]}
+    errors = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(errors):
+            folder = _folder(None)
+    except SystemExit:
+        try:
+            said = json.loads(errors.getvalue().strip().splitlines()[-1])["error"]["code"]
+        except (ValueError, KeyError, IndexError, TypeError):
+            said = "unresolved"
+        return {"deferred": [{"label": "routines",
+                              "note": f"the routines folder is not resolved: {said}"}]}
+    return {"metrics": [_tile("documents", len(_folder_routines(folder, [])), "routines",
+                              note="in the routines folder")]}
 
 
 def cmd_titles(args) -> None:

@@ -1,5 +1,9 @@
 # tasks — change log
 
+## 2026-11-24 — `tasks inventory --network` counts the tasks in progress and the tasks waiting for you, and the icon is `circle-check`
+
+`tasks inventory` declares its network as `optional`, where it was `none`, and answers two tile counts for this project from the store. `in progress` (kind `in_progress`, glyph `pulse`) counts the tasks an open raise holds, the status every reader is shown as `in_progress`. `waiting for you` (kind `waiting`, glyph `hand`) counts the tasks shown `waiting` whose assignee is a person, judged as the Inbox judges one: a name that is no worker of this project, no project of this store, and no agent or capability the manager names, the manager being asked once per run and only when a waiting name is left to judge. A bare `tasks inventory` opens no store and names both counts in `deferred`; `tasks inventory --network` reads them over one store connection that migrates nothing and waits out no outage, and a store that cannot be read, or a project that declares no id, leaves them in `deferred` with the reason rather than failing the answer. The `service` block is read as before, bare and with `--network`. The manifest's `lucide_icon` is `circle-check`, in place of `list-checks`; `icon.png` is unchanged. The capability binds `capabilities-contract` 0.53 or later, which carries the tile kinds and glyphs. No verb, flag or JSON key is removed or renamed.
+
 ## 2026-11-23 — Turns run on callva-harness-runner 0.13.1
 
 Turns run on callva-harness-runner 0.13.1, in place of 0.12.3: claude runs through claude-agent-sdk 0.2.187, and Claude Code up to 2.1.330 runs without the runner's untested-version warning. The runner's 0.13.0 also adds a claude conversation kept open across turns, which this capability does not use; its turns run as before. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

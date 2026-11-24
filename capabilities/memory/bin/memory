@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.53,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.13.1",
 # ]
@@ -185,7 +185,7 @@ DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/memory/guides/")
 STATE = False       # nothing of memory's own is kept on this machine; entries are the store's
 TABLES = True       # memory_* tables in the project's store, built by _tables()
-INVENTORY = None    # what memory holds is in the store; reading it is `memory status`
+INVENTORY = {"network": "optional"}   # the entries are the store's, reached over the network
 POST_INSTALL: list[dict] = []
 # The block the manager composes after the stub line in every session's
 # context, carried whole in the declaration. It is constant - no entry, count
@@ -333,8 +333,9 @@ For memory:
 """,
     "inventory": """\
 For memory:
-  The empty answer: memory keeps nothing on this machine; the entries are
-  the store's (`memory status`).
+  One tile count, `entries`: this project's active entries, as `memory
+  status` counts them. They are the store's, so a bare run names the count
+  in `deferred` and opens no store; --network counts them.
 """,
     "migrate": """\
 For memory:
@@ -691,6 +692,23 @@ def _cmd_connections() -> None:
     """Memory reaches no system of its own: the store is the project's, resolved
     through the shared library, so there is nothing to resolve here."""
     _emit({"default": None, "connections": {}})
+
+
+def _inventory(network: bool) -> dict:
+    """This project's active entries, as a tile's count.
+
+    They are the store's, reached over the network, so a bare run names the
+    count as deferred and opens nothing; --network counts them as `memory
+    status` does. Outside a project there is no project to count for."""
+    if not network:
+        return {"deferred": [{"label": "entries",
+                              "note": "kept in the project's store; run with --network"}]}
+    if _project_root() is None or not _project_id(write=False):
+        return {"deferred": [{"label": "entries", "note": "no project here to count for"}]}
+    project = _project(write=False)
+    with _guarded(), _open_store(_root()) as store:
+        active = store.counts(project)["entries"]["active"]
+    return {"metrics": [_tile("documents", active, "entries")]}
 
 
 # ── the engine, the project, the store ──────────────────────────────────────

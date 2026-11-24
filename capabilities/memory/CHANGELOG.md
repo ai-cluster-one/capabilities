@@ -1,5 +1,9 @@
 # memory — change log
 
+## 2026-11-24 — `memory inventory` counts this project's active entries as a tile, and only with --network
+
+`memory inventory` answered the empty envelope; the capability now declares its inventory `optional`. A bare run still opens no store: it names `entries` in `deferred`, as a count the store keeps. With --network it answers one metric, `entries`, with `kind` `documents` and `glyph` `page`: this project's active entries, as `memory status` counts them. Outside a project, or in one with no durable id, --network names the count in `deferred` and reaches no store; with no store configured or none reachable it refuses as every reading verb does, exit 6 `store_not_configured` or exit 5 `store_unreachable`. The capability binds `capabilities-contract` 0.53 or later, which supplies the tile helper. No other verb, flag, answer or exit code changes.
+
 ## 2026-11-23 — Turns run on callva-harness-runner 0.13.1
 
 Turns run on callva-harness-runner 0.13.1, in place of 0.12.3: claude runs through claude-agent-sdk 0.2.187, and Claude Code up to 2.1.330 runs without the runner's untested-version warning. The runner's 0.13.0 also adds a claude conversation kept open across turns, which this capability does not use; its turns run as before. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

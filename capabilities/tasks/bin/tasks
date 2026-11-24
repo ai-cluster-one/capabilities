@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.53,<1",
 #     "psycopg[binary]>=3.2",
 #     "callva-harness-runner==0.13.1",
 #     "pyyaml>=6",
@@ -2800,7 +2800,7 @@ from typing import Mapping, NoReturn
 
 NAME = 'tasks'
 TITLE = "Tasks"
-LUCIDE_ICON = "list-checks"
+LUCIDE_ICON = "circle-check"
 SUMMARY = ("Task tracker over a PostgreSQL store - tasks with a goal and the "
            "append-only record of what was done about them, so work that may be "
            "picked up now surfaces on its own.")
@@ -2921,7 +2921,7 @@ DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/tasks/guides/")
 STATE = True        # the service's pid, fingerprint, status and log, per project
 TABLES = True       # tasks_* tables in the project's store, built by _tables()
-INVENTORY = {"network": "none"}   # the service's state on this machine; the queue is the store's
+INVENTORY = {"network": "optional"}   # the service's state here; the tile counts are the store's
 POST_INSTALL: list[dict] = []
 SERVICE = {
     # How many nodes run it at once (service.placement). Turns are claimed row by row
@@ -12921,35 +12921,102 @@ def _service_module():
     return module
 
 
+# The tile counts, as (kind, label): read from the store, so a bare inventory
+# names them deferred and only `--network` opens the store for them.
+_INVENTORY_TILES = (("in_progress", "in progress"), ("waiting", "waiting for you"))
+
+
 def _inventory(network: bool) -> dict:
-    """The service's state, read from what it left on this machine: whether a
-    daemon runs for this project, its lanes and how many turns it is running,
-    and `service doctor`'s verdict without the store's checks. The queue
-    itself is the store's and is not counted here. Local, and nothing is
-    written."""
+    """The service's state, read from what it left on this machine, and the
+    tile counts for this project, which are the store's: bare they are named
+    deferred and the store is not opened; `--network` reads them over one
+    store connection. Nothing is written."""
     if _project_root() is None:
         return {"service": {"state": "stopped", "detail": "not in a project",
                             "ok": False, "problem": "not in a project"}}
+    report = {"service": _inventory_service()}
+    if not network:
+        report["deferred"] = [{"label": label, "note": f"read from the store; "
+                               f"`{NAME} inventory --network` counts it"}
+                              for _kind, label in _INVENTORY_TILES]
+        return report
+    counted, why = _inventory_counts()
+    if counted is None:
+        report["deferred"] = [{"label": label, "note": why}
+                              for _kind, label in _INVENTORY_TILES]
+        return report
+    report["metrics"] = [
+        _tile("in_progress", counted["in_progress"], "in progress"),
+        _tile("waiting", counted["waiting"], "waiting for you")]
+    return report
+
+
+def _inventory_counts() -> tuple[dict | None, str | None]:
+    """How many tasks of this project an open raise holds (`in_progress`, the
+    status a reader is shown), and how many wait on a person, on one store
+    connection that migrates nothing and waits out no outage: the counts, or
+    None and why they could not be read. A person is judged as the Inbox
+    judges one (`_a_person`): no worker of this project and no project of
+    this store, nor an agent or capability the manager names, which it is
+    asked once per run and only when a waiting name is left to judge."""
+    import psycopg
+
+    project = _declared_project()
+    if not project:
+        return None, "this project declares no id, so it has no tasks to count"
+    try:
+        setting = _store_setting(raising=True)
+        globals()["SCHEMA"] = setting.schema
+        with _connect(None, raising=True, waiting=False, migrating=False,
+                      setting=setting) as conn, conn.cursor() as cur:
+            cur.execute(f"""select s.status, s.assignee, count(*) as n
+                              from (select {_shown_status('t')} as status, t.assignee
+                                      from {SCHEMA}.tasks_tasks t
+                                     where t.agent_id = %s) s
+                             where s.status in ('in_progress', 'waiting')
+                             group by s.status, s.assignee""", (project,))
+            rows = cur.fetchall()
+            counted = {"in_progress": 0, "waiting": 0}
+            seen: dict = {}
+            for row in rows:
+                if row["status"] == "in_progress":
+                    counted["in_progress"] += row["n"]
+                    continue
+                if _a_person(cur, project, row["assignee"], seen):
+                    counted["waiting"] += row["n"]
+            conn.rollback()
+    except Refusal as refused:
+        return None, f"{refused.code}: {refused.message}"
+    except psycopg.Error as exc:
+        return None, "the store did not answer: " + " ".join(str(exc).split())[:200]
+    return counted, None
+
+
+def _inventory_service() -> dict:
+    """The service's state, read from what it left on this machine: whether a
+    daemon runs for this project, its lanes and how many turns it is running,
+    and `service doctor`'s verdict without the store's checks. Local, and
+    nothing is written."""
     module = _service_module()
     state = _service_state_dir()
     pid = module.read_pid(state)
     verdict = _inventory_verdict(module)
     if not module.pid_alive(pid):
         initialized = _service_settings_initialized()
-        return {"service": {"state": "stopped",
-                            "detail": "no daemon runs for this project" + (
-                                "" if initialized else "; its settings are not initialized"),
-                            **verdict}}
+        return {"state": "stopped",
+                "detail": "no daemon runs for this project" + (
+                    "" if initialized else "; its settings are not initialized"),
+                **verdict}
     published = module.read_status(state) or {}
     lanes = ", ".join(str(row.get("worker")) for row in published.get("lanes") or []
                       if isinstance(row, dict))
     served_by = ("served by the machine service, " if published.get("mode") == "machine"
                  else "")
-    return {"service": {"state": "running",
-                        "detail": f"{served_by}pid {pid}, lanes {lanes or 'none'}, "
-                                  f"{len(published.get('turns') or [])} turn(s) running, "
-                                  f"woken by {published.get('wake_by') or 'the poll'}",
-                        **verdict}}
+    return {"state": "running",
+            "detail": f"{served_by}pid {pid}, lanes {lanes or 'none'}, "
+                      f"{len(published.get('turns') or [])} turn(s) running, "
+                      f"woken by {published.get('wake_by') or 'the poll'}",
+            **verdict}
 
 
 def _inventory_verdict(module) -> dict:

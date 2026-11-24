@@ -804,3 +804,25 @@ def _section_of(lab, cli: Path, agent: str) -> str:
                           text=True, capture_output=True, timeout=180)
     assert done.returncode == 0, done.stderr
     return done.stdout
+
+
+def test_inventory_defers_the_count_bare_and_counts_the_teams_this_agent_is_in(lab):
+    bare = lab.ok("inventory")
+    assert bare["metrics"] == [] and [d["label"] for d in bare["deferred"]] == ["teams"]
+    assert lab.sql("SELECT to_regclass(%s)::text", (f"{SCHEMA}.teams_teams",)) == [(None,)]
+    storeless = {k: v for k, v in lab.env().items() if not k.startswith("AGENTKIT_DB_")}
+    unset = subprocess.run([sys.executable, str(CLI), "inventory"], cwd=lab.project,
+                           env=storeless, text=True, capture_output=True, timeout=180)
+    assert unset.returncode == 0 and json.loads(unset.stdout)["deferred"]
+
+    for name in ("crew", "ops", "old", "theirs"):
+        lab.team(name)
+    lab.register(AGENT, OTHER)
+    for name in ("crew", "ops", "old"):
+        lab.ok("members", "add", name, AGENT)
+    lab.ok("members", "add", "theirs", OTHER)
+    lab.ok("retire", "old")
+    counted = lab.ok("inventory", "--network")
+    assert counted["metrics"] == [{"label": "teams", "value": 2, "kind": "total",
+                                   "glyph": "page"}]
+    assert counted["network"] is True and counted["deferred"] == []

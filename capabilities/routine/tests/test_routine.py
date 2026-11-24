@@ -775,6 +775,31 @@ def _other_project(lab: Lab) -> dict:
     return {"CLAUDE_PROJECT_DIR": str(other)}
 
 
+def test_inventory_counts_the_routines_where_they_are_kept_and_reads_the_store_only_when_asked(lab):
+    def routines(*args: str, **extra) -> tuple[list, list]:
+        report = lab.ok("inventory", *args, **extra)
+        return ([(m["label"], m["value"], m["kind"], m["glyph"], m["note"])
+                 for m in report["metrics"]], [d["label"] for d in report["deferred"]])
+
+    tile = ("routines", 3, "documents", "page")
+    assert routines(AGENTKIT_DB_URL=None, AGENTKIT_DB_SCHEMA=None) == (
+        [(*tile, "in the routines folder")], [])
+    dead = f"postgresql://{ADMIN}@127.0.0.1:{_free_port()}/none?sslmode=disable"
+    assert routines(AGENTKIT_DB_URL=dead) == ([], ["routines"])
+    assert routines("--network", AGENTKIT_DB_URL=dead) == ([], ["routines"])
+    assert routines() == ([], ["routines"])
+    assert routines("--network") == ([(*tile, "in the routines folder")], [])
+
+    lab.ok("import")
+    other = _other_project(lab)
+    lab.ok("save", "elsewhere", "--from", "-", stdin=SHARED.replace("shared", "elsewhere"),
+           **other)
+    assert routines() == ([], ["routines"])
+    assert routines("--network") == ([(*tile, "in the store")], [])
+    assert routines("--network", **other) == (
+        [("routines", 1, "documents", "page", "in the store")], [])
+
+
 def test_a_global_routine_reaches_a_project_only_once_it_is_enabled(lab):
     other = _other_project(lab)
     saved = lab.ok("save", "shared", "--from", "-", "--global", stdin=SHARED, **other)

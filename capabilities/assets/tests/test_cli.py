@@ -5,9 +5,10 @@ back byte for byte."""
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
-from _cli import error, needs_store, world  # noqa: F401
+from _cli import CLI_PATH, connect, error, needs_store, world  # noqa: F401
 
 pytestmark = needs_store
 
@@ -284,3 +285,36 @@ def test_discard_removes_the_draft_and_the_read_only_switch_refuses_draft_writes
     assert world.ok(root, "list")["documents"][0]["draft"] is False
     none = world.run(root, "draft", "show", "notes/n")
     assert none.returncode == 3 and error(none)["code"] == "no_draft"
+
+
+# --- inventory -------------------------------------------------------------------
+
+def test_inventory_defers_the_count_bare_and_counts_this_project_s_live_assets(world):  # noqa: F811
+    root = world.project()
+    bare = world.ok(root, "inventory")
+    assert bare["metrics"] == [] and [d["label"] for d in bare["deferred"]] == ["assets"]
+    with connect(world.schema) as conn:
+        assert conn.execute("SELECT to_regclass('assets_documents')").fetchone()[0] is None
+    storeless = {k: v for k, v in world.env().items() if not k.startswith("AGENTKIT_DB_")}
+    unset = subprocess.run([str(CLI_PATH), "inventory"], cwd=root, env=storeless,
+                           capture_output=True, timeout=180)
+    assert unset.returncode == 0 and json.loads(unset.stdout)["deferred"], unset.stderr
+
+    save(world, root, "plans/kept", b"# Kept\n")
+    save(world, root, "plans/gone", b"# Gone\n")
+    world.ok(root, "retire", "plans/gone")
+    save(world, world.project("other"), "plans/theirs", b"# Theirs\n")
+    project = world.ok(root, "list")["project"]
+    with connect(world.schema) as conn:
+        for name, retired in (("research/live.bin", False), ("research/old.bin", True)):
+            row = conn.execute("SELECT gen_random_uuid()").fetchone()[0]
+            conn.execute("INSERT INTO assets_files (agent_id, id, name, media_type, bytes, "
+                         "sha256, storage_key, created_by) VALUES (%s, %s, %s, "
+                         "'application/octet-stream', 3, %s, %s, 'tester')",
+                         (project, row, name, "0" * 64, f"{project}/{row}/{name}"))
+            if retired:
+                conn.execute("UPDATE assets_files SET retired_at = now() WHERE id = %s", (row,))
+    counted = world.ok(root, "inventory", "--network")
+    assert counted["metrics"] == [{"label": "assets", "value": 2, "kind": "documents",
+                                   "glyph": "page"}]
+    assert counted["network"] is True and counted["deferred"] == []

@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.53,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -158,7 +158,7 @@ WRITE_DEFAULT = True
 DOCS_BASE = ""
 STATE = False
 TABLES = True       # teams_* tables in the project's store, built by _tables()
-INVENTORY = None
+INVENTORY = {"network": "optional"}   # the teams are the store's, reached over the network
 POST_INSTALL: list[dict] = []
 # The block the manager composes after the stub line: which commands read a
 # team. The agent's own teams stand in their own section ahead of its
@@ -678,10 +678,12 @@ teams doc draft publish <team> <doc> [--base ID] [--note TEXT]
   `teams help <verb>`.
 """,
     "inventory": """\
-  For teams: empty. The teams are the store's, not this project's (`teams
-  list`).
+  For teams: one tile count, `teams`: the teams this agent is a member of,
+  not retired, as `teams list` names them. They are the store's, so a bare
+  run names the count in `deferred` and opens no store; --network counts
+  them.
 
-  Example: teams inventory
+  Example: teams inventory --network
 """,
     "migrate": """\
   For teams: bring the tables up to this version, or report where they stand.
@@ -703,6 +705,25 @@ def _cmd_connections() -> None:
     """teams reaches no system of its own: the store is the project's,
     resolved through the shared library, so there is nothing to resolve here."""
     _emit({"default": None, "connections": {}})
+
+
+def _inventory(network: bool) -> dict:
+    """The teams this agent is a member of, as a tile's count.
+
+    They are the store's, reached over the network, so a bare run names the
+    count as deferred and opens nothing; --network counts what `teams list`
+    names: the teams not retired with this agent among their members.
+    Outside a project there is no agent to count for."""
+    if not network:
+        return {"deferred": [{"label": "teams",
+                              "note": "kept in the store; run with --network"}]}
+    me = _maybe_me()
+    if me is None:
+        return {"deferred": [{"label": "teams", "note": "no agent here to count for"}]}
+    with _store() as conn:
+        row = _one(conn, "SELECT count(*) AS n FROM teams_teams t JOIN teams_members m "
+                   "ON m.team_id = t.id WHERE m.agent_id = %s AND t.retired_at IS NULL", (me,))
+    return {"metrics": [_tile("total", row["n"], "teams", glyph="page")]}
 
 
 def _manifest() -> dict:

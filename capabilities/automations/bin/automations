@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.53,<1",
 #     "callva-harness-runner==0.13.1",
 # ]
 # ///
@@ -952,7 +952,7 @@ automations service declaration
 
 NAME = "automations"
 TITLE = "Automations"
-LUCIDE_ICON = "timer"
+LUCIDE_ICON = "zap"
 SUMMARY = (
     "Project-local scheduler and subprocess runner with versioned config, "
     "store-backed run history, concurrency, retries, timeouts, and cancellation."
@@ -1182,8 +1182,8 @@ def _inventory(_network: bool) -> dict:
     of the declaration and the running daemon, and none of the run ledger's."""
     root = _project_root()
     if root is None:
-        return {"metrics": [{"label": "automations", "value": 0,
-                             "note": "not inside a project"}],
+        return {"metrics": [_tile("total", 0, "automations",
+                                  note="not inside a project")],
                 "service": {"state": "not configured", "detail": "not inside a project",
                             "ok": False, "problem": "not inside a project"}}
     state = _state_path(root)
@@ -1191,8 +1191,8 @@ def _inventory(_network: bool) -> dict:
     running = _pid_alive(pid)
     live = ({"state": "running", "detail": f"pid {pid}"} if running else None)
     if not _config_initialized(root):
-        return {"metrics": [{"label": "automations", "value": 0,
-                             "note": "no configuration in this project"}],
+        return {"metrics": [_tile("total", 0, "automations",
+                                  note="no configuration in this project")],
                 "service": {**(live or {"state": "not initialized",
                                         "detail": "no configuration in this project"}),
                             "ok": False, "problem": "no configuration in this project"}}
@@ -1222,11 +1222,11 @@ def _inventory(_network: bool) -> dict:
                          "value": sum(1 for item in declared if item["enabled"]),
                          "note": "the running daemon published no node"}
     else:
-        active_metric = {"label": "active here", "value": active,
-                         "note": f"node: {node} ({whose})"}
+        active_metric = _tile("active", active, "active here",
+                              note=f"node: {node} ({whose})")
     return {
         "metrics": [
-            {"label": "automations", "value": len(declared)},
+            _tile("total", len(declared), "automations"),
             active_metric,
         ],
         "items": items,

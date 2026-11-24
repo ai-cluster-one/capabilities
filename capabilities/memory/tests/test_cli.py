@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from _cli import World, drop_schema, error, needs_store, new_schema, project_id
+from _cli import World, drop_schema, dsn_url, error, needs_store, new_schema, project_id
 
 
 @pytest.fixture
@@ -217,6 +217,29 @@ def test_export_and_inventory(world, tmp_path):
     assert inventory["service"] is None
     assert tree(root) == before
 
+
+
+@needs_store
+def test_inventory_defers_the_count_bare_and_counts_this_project_s_active_entries(world, tmp_path):
+    root = world.project("p")
+    bare = world.ok(root, "inventory")
+    assert bare["metrics"] == [] and [d["label"] for d in bare["deferred"]] == ["entries"]
+    import psycopg
+    with psycopg.connect(dsn_url(), autocommit=True) as conn:
+        assert conn.execute("SELECT to_regclass(%s)", (f'"{world.schema}".memory_entries',)
+                            ).fetchone()[0] is None
+    storeless = World(tmp_path / "storeless", None)
+    assert storeless.ok(storeless.project("q"), "inventory")["deferred"]
+
+    for title in ("one", "two", "three"):
+        world.ok(root, "add", f"{title} holds", "--title", title)
+    gone = world.ok(root, "add", "gone", "--title", "gone")["entry"]
+    world.ok(root, "drop", gone["short"], "--reason", "x")
+    world.ok(world.project("other"), "add", "theirs", "--title", "theirs")
+    counted = world.ok(root, "inventory", "--network")
+    assert counted["metrics"] == [{"label": "entries", "value": 3, "kind": "documents",
+                                   "glyph": "page"}]
+    assert counted["network"] is True and counted["deferred"] == []
 
 @needs_store
 def test_migrate_reports_and_applies(world):

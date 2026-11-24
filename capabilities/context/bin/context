@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.50,<1",
+#     "capabilities-contract>=0.53,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -163,7 +163,7 @@ DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/context/guides/")
 STATE = False
 TABLES = True       # context_* tables in the project's store, built by _tables()
-INVENTORY = None
+INVENTORY = {"network": "optional"}   # the documents are the store's, reached over the network
 POST_INSTALL: list[dict] = []
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -278,7 +278,10 @@ For context:
 """,
     "inventory": """\
 For context:
-  Empty: the documents are the store's; reading them is `context list`.
+  One tile count, `documents`: the doctrine documents this project holds
+  live, not retired - its own, not the global ones it enables. They are the
+  store's, so a bare run names the count in `deferred` and opens no store;
+  --network counts them. Reading them is `context list`.
 """,
     "migrate": """\
 For context:
@@ -574,6 +577,26 @@ def _cmd_connections() -> None:
     """context reaches no system of its own: the store is the project's,
     resolved through the shared library, so there is nothing to resolve here."""
     _emit({"default": None, "connections": {}})
+
+
+def _inventory(network: bool) -> dict:
+    """The doctrine documents this project holds live, as a tile's count.
+
+    They are the store's, reached over the network, so a bare run names the
+    count as deferred and opens nothing; --network counts what `context list`
+    reads of this project's own: each document not retired, with its active
+    version. Outside a project there is no project to count for."""
+    if not network:
+        return {"deferred": [{"label": "documents",
+                              "note": "kept in the project's store; run with --network"}]}
+    if _project_root() is None or not _project_id(write=False):
+        return {"deferred": [{"label": "documents", "note": "no project here to count for"}]}
+    project = _here(write=False)
+    with _store() as conn:
+        row = _one(conn, "SELECT count(*) AS n FROM context_documents d JOIN context_versions v "
+                   "ON v.document_id = d.id AND v.active "
+                   "WHERE d.retired_at IS NULL AND d.agent_id = %s", (project,))
+    return {"metrics": [_tile("documents", row["n"])]}
 
 
 # ── the tables ──────────────────────────────────────────────────────────────
