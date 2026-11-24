@@ -1520,6 +1520,7 @@ TRANSLATIONS = {
                             'toa kohta ühe jätkatava harness-seansi kaudu.')},
 }
 SCOPE = "user"   # a person's own account (`login --global`) is the machine's; each agent's token is its project's
+CONN_KINDS = ("own",)   # an account is its agent's own identity on the homeserver, never granted to another agent
 CRED_KEYS: list[dict] = []   # no machine setup: each connection carries its homeserver
 WRITE_VERBS = {"open", "invite", "join", "leave", "post", "mark", "unmark", "serve", "grant",
                "remove", "archive", "block", "directory", "card"}

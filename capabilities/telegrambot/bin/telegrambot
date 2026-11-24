@@ -144,6 +144,7 @@ TRANSLATIONS = {
                             'tarnitud standardi järgi; vestlusest ei hoia keegi koopiat.')},
 }
 SCOPE = "project"   # each bot is one agent's own
+CONN_KINDS = ("own",)   # a bot is the agent's own identity outside, never granted to another agent
 CRED_KEYS: list[dict] = []   # every value is the connection's own (CONN_FIELDS)
 
 # What a person is asked for (SHEBANG.md, "What a person is asked for"):

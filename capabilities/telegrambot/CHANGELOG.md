@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-24 — A telegrambot connection is its agent's own account, never granted to another agent
+
+`CONN_KINDS = ("own",)` declares every telegrambot connection one agent's own bot, its identity outside, so the manager refuses a grant giving one to any agent but the one that owns it (`connection_own_kind`). A connection an agent adds in its own folder is its own as before; nothing it does changes, and no verb, flag or JSON key changes.
+
 ## 2026-11-23 — Turns run on callva-harness-runner 0.13.1
 
 Turns run on callva-harness-runner 0.13.1, in place of 0.12.3: claude runs through claude-agent-sdk 0.2.187, and Claude Code up to 2.1.330 runs without the runner's untested-version warning. The runner's 0.13.0 also adds a claude conversation kept open across turns, which this capability does not use; its turns run as before. Nothing a profile or a result does changes; no verb, flag or JSON key changes.

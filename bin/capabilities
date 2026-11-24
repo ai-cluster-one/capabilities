@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.52,<1",
+#     "capabilities-contract>=0.54,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -56,6 +56,7 @@ VAULT VERBS
   key generate        make the agent's first key
   key set             take the agent's key on stdin
   key change          replace the agent's key
+  key recover         a new key, every entry re-delivered
   secrets help        the vault and its verbs, whole
   secrets list        the vault's names, never a value
   secrets show        print one secret
@@ -63,6 +64,7 @@ VAULT VERBS
   secrets rm          remove secrets
   secrets raw         the vault as KEY=value text, or set it
   secrets move        move env-file keys into the vault
+  secrets migrate     seal older vaults again, the new way
 
 DEVELOPMENT VERBS
   dev start <name>    open an isolated development session
@@ -146,6 +148,7 @@ PROJECT VERBS (run inside a consuming project)
   connections list    every connection the store holds
   connections import  move project records into the store
   connections seal    seal file values into the vault
+  connections rebuild  deliver every granted copy again
   migrate             move file configuration into the store
 
 VERIFICATION VERBS
@@ -389,7 +392,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.53.0"
+CONTRACT_LIBRARY_RELEASE = "0.54.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -2600,6 +2603,65 @@ def _levels_problems(script: Path) -> list[str]:
     return _levels_declared(text)[1]
 
 
+# Which kinds a capability's connections can be (SHEBANG.md, "Connection kinds"):
+# a person's account the store shares and grants to agents, or one agent's own
+# account, its identity outside, never granted to another agent.
+CONNECTION_KINDS = ("shared", "own")
+
+
+def _conn_kinds_declared(text: str) -> tuple[tuple, str | None]:
+    """A capability's `CONN_KINDS` as its source declares it, read without
+    running it: (kinds, None), every kind where it declares none - undeclared
+    means shareable - or (every kind, problem) where the declaration is not a
+    literal non-empty tuple of kinds."""
+    import ast
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return CONNECTION_KINDS, None
+    node = None
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign):
+            targets = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+            targets = [stmt.target]
+        else:
+            continue
+        if any(isinstance(t, ast.Name) and t.id == "CONN_KINDS" for t in targets):
+            node = stmt.value
+    if node is None:
+        return CONNECTION_KINDS, None
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+        value = None
+    if (not isinstance(value, tuple) or not value
+            or not all(kind in CONNECTION_KINDS for kind in value)):
+        return CONNECTION_KINDS, (f"CONN_KINDS must be a non-empty tuple of "
+                            f"{' and '.join(repr(k) for k in CONNECTION_KINDS)}")
+    return tuple(kind for kind in CONNECTION_KINDS if kind in value), None
+
+
+def _conn_kinds_problems(script: Path) -> list[str]:
+    """The connection kinds declaration a capability fails, checked where it
+    is validated."""
+    try:
+        text = script.read_text()
+    except (OSError, UnicodeDecodeError):
+        return []
+    problem = _conn_kinds_declared(text)[1]
+    return [problem] if problem else []
+
+
+def _conn_kinds(name: str) -> tuple:
+    """The kinds the installed capability's connections can be."""
+    try:
+        text = _script_path(name).read_text()
+    except (OSError, UnicodeDecodeError):
+        return CONNECTION_KINDS
+    return _conn_kinds_declared(text)[0]
+
+
 def _level_refusal(name: str, levels: dict) -> dict | None:
     """Why this manager does not take a payload of `name` declaring `levels`,
     as an error {code, message, hint}, else None: it needs a newer manager
@@ -2866,6 +2928,10 @@ def _snapshot(name: str, script: Path, registry: Path | None = None) -> dict:
     if problems:
         _die(6, "machine_reads_invalid",
              f"{name}: MACHINE_READS or LINK_METHODS fails validation",
+             "; ".join(problems))
+    problems = _conn_kinds_problems(script)
+    if problems:
+        _die(6, "conn_kinds_invalid", f"{name}: CONN_KINDS fails validation",
              "; ".join(problems))
     (reg / "stub").write_text(stub_out.strip() + "\n")
     _write_json(reg / "manifest.json", manifest)
@@ -9055,10 +9121,10 @@ def _kernel_store_report(setting) -> dict:
 
 
 # ---------------------------------------------------------------- the agent's vault
-# Each agent's secrets are rows of the store, sealed with the agent's own key,
-# AGENT_ENCRYPTION_KEY, which lives in the agent's environment and never in the
-# store, or for the public sealing key that key gives, which the agent's row
-# publishes (capabilities_contract.vault). The manager carries the verbs that
+# Each agent's secrets are rows of the store, sealed to the public key its own
+# key, AGENT_ENCRYPTION_KEY, gives - the key lives in the agent's environment
+# and never in the store - by the agent itself or by the platform
+# (capabilities_contract.vault, capabilities_contract.platform). The manager carries the verbs that
 # keep the key and the secrets; every capability reads a secret from the vault
 # first, before the files and the environment of its credential cascade.
 
@@ -9151,11 +9217,14 @@ def _vault_write_key(root: Path, key: bytes) -> Path:
 def cmd_key(rest: list[str]) -> None:
     vault = _vault_module()
     sub = rest[0] if rest else None
-    if sub not in ("generate", "set", "change") or rest[1:]:
-        _die(6, "input", "key needs one subcommand and nothing else: generate, set or change",
-             "run `capabilities help`")
+    if sub not in ("generate", "set", "change", "recover") or rest[1:]:
+        _die(6, "input", "key needs one subcommand and nothing else: generate, set, change "
+             "or recover", "run `capabilities help`")
     _read_only_gate(f"key {sub}")
     root = _require_project()
+    if sub == "recover":
+        _emit(_key_recover(root))
+        return
     if sub == "set":
         text = _vault_stdin("the key").strip()
         try:
@@ -9211,20 +9280,35 @@ def cmd_key(rest: list[str]) -> None:
     _emit(answer)
 
 
+def _vault_pin(conn, agent_id: str, key: bytes | None, rows: list) -> bytes | None:
+    """The platform key the agent pinned; where it pinned none, the one the
+    store publishes, pinned now by this process that holds the agent's key -
+    unless the read-only switch is on, which changes nothing."""
+    vault = _vault_module()
+    if key is None:
+        return None
+    pin = vault.pin_of(key, agent_id, rows)
+    if (pin is None and not _store_module().read_only_switch()
+            and vault.recorded_key(conn, agent_id)[1] == vault.fingerprint(key)):
+        pin = vault.take_pin(conn, key, agent_id, updated_by=_vault_actor())
+    return pin
+
+
 def _vault_listing(conn, agent_id: str, key: bytes | None) -> tuple[list, str | None]:
     vault = _vault_module()
     recorded = _vault_registered(conn, agent_id)
     current = vault.fingerprint(key) if key is not None else recorded
     rows = vault.rows(conn, agent_id)
     stamp = _store_module()._stamp
+    pin = _vault_pin(conn, agent_id, key, rows)
     return [{"name": r["name"], "readable": current is not None
              and r["key_fingerprint"] == current,
              "updated_at": stamp(r["updated_at"]), "updated_by": r["updated_by"],
-             "_row": r} for r in rows], recorded
+             "_row": r, "_pin": pin} for r in rows if r["name"] != vault.PIN_NAME], recorded
 
 
 def _vault_public(entries: list) -> list:
-    return [{k: v for k, v in e.items() if k != "_row"} for e in entries]
+    return [{k: v for k, v in e.items() if k not in ("_row", "_pin")} for e in entries]
 
 
 # `secrets move`: the agent's keys from its .env files into its vault, each
@@ -9370,7 +9454,9 @@ def _vault_move(root: Path) -> dict:
         def seal(conn, agent_id):
             _vault_key_matches(conn, agent_id, key)
             fp = vault.fingerprint(key)
-            held = {r["name"]: r for r in vault.rows(conn, agent_id)}
+            rows = vault.rows(conn, agent_id)
+            held = {r["name"]: r for r in rows}
+            pin = _vault_pin(conn, agent_id, key, rows)
             made, actor = [], _vault_actor()
             for name in sorted(readers):
                 value = values[candidates[name][0]][name]
@@ -9380,7 +9466,7 @@ def _vault_move(root: Path) -> dict:
                          "the vault holds it sealed under another key; set it again or "
                          "remove it there first")
                 elif row is not None and vault.unseal(
-                        key, agent_id, name, row["ciphertext"]) != value:
+                        key, agent_id, name, row["ciphertext"], pin) != value:
                     keep(name, [str(paths[f]) for f in candidates[name]],
                          "the vault already holds a different value for it")
                 elif row is None:
@@ -9576,6 +9662,11 @@ def cmd_connections_seal(rest: list[str]) -> None:
         root, lambda conn, agent_id: (_vault_key_matches(conn, agent_id, key),
                                       vault.recipients(conn, [agent_id]))[1])
     folders = _seal_folders(root)
+    # A shared connection's secret is the platform's to deliver, so the
+    # --share pass below needs the platform key here: made on first need where
+    # this machine may hold it, and each capability names what it could not
+    # share where it is not.
+    _kernel_run(root, lambda conn, _agent: _platform_if_here(conn, root))
     out: dict = {"ok": True, "agent": folders[0][0],
                  "published": bool((published.get(folders[0][0]) or (None, None))[1]),
                  "agents": [{"agent": a, "folder": str(f)} for a, f in folders],
@@ -9611,15 +9702,125 @@ def cmd_connections_seal(rest: list[str]) -> None:
     _emit(out)
 
 
+# ---------------------------------------------------------------- the platform
+# The platform keypair is the one writer of every vault entry an agent did not
+# write itself (capabilities_contract.platform). The manager makes it on first
+# need, in a file only its user reads under its config home - never on a node,
+# and never in a backup home - and the store publishes only its public key. It
+# keeps its own copy of every secret, delivers a shared connection's secret into
+# the vault of each agent granted it, takes it out on a revoke, re-delivers an
+# agent's entries when its key is replaced, and migrates the vaults an older
+# release wrote.
+
+def _platform_lib():
+    try:
+        from capabilities_contract import platform
+    except ImportError as exc:
+        _die(5, "vault_missing",
+             f"the platform of {CONTRACT_LIBRARY} cannot be loaded: {exc}",
+             "update the capabilities manager, whose script header pins the library")
+    return platform
+
+
+def _platform_refused(exc) -> NoReturn:
+    _die(5 if exc.slug == "vault_unwritable" else 6, exc.slug, exc.message, exc.hint)
+
+
+def _platform_node_mark(root: Path | None) -> str | None:
+    """Where this process reads its agent's key from where that is a node's
+    place - the process environment, or the machine's shared.env - else None."""
+    vault = _vault_module()
+    _text, where = vault.key_source(root)
+    if where == "env" or where == str(vault.shared_env_path()):
+        return where
+    return None
+
+
+def _platform_here(conn, root: Path | None, create: bool = True):
+    """This machine's platform keypair, its public key published: made here on
+    first need where `create`, but never where this machine keeps its agent's
+    key as a node does."""
+    platform = _platform_lib()
+    vault = _vault_module()
+    try:
+        if create and platform.load() is None and vault.platform_published(conn) is None:
+            mark = _platform_node_mark(root)
+            if mark is not None:
+                _die(6, "platform_key_not_here",
+                     f"this machine keeps its agent's key in {mark}, as a node does, and the "
+                     "platform key is never made on a node",
+                     "make it on the machine that keeps the agents' folders, with "
+                     "`capabilities secrets migrate` there")
+        return platform.ensure(conn, create_missing=create)
+    except vault.VaultError as exc:
+        _platform_refused(exc)
+
+
+def _platform_if_here(conn, root: Path | None):
+    """This machine's platform keypair where it holds one or may make it now
+    (`_platform_here`), else None: where the store publishes a platform key
+    another machine holds, or this machine keeps its agent's key as a node
+    does. A platform key file that is not one is still refused."""
+    platform = _platform_lib()
+    vault = _vault_module()
+    try:
+        local = platform.load()
+    except vault.VaultError as exc:
+        _platform_refused(exc)
+    if local is None and (vault.platform_published(conn) is not None
+                          or _platform_node_mark(root) is not None):
+        return None
+    return _platform_here(conn, root)
+
+
+def _folder_key(folder: Path, own: bool,
+                node: bool = False) -> tuple[bytes | None, str | None, str | None]:
+    """(the agent's key, where this machine keeps it, why it cannot be used)
+    for an agent's folder here: this process's own folder as the cascade finds
+    it, another agent's from its folder's .env.local or .env alone, since the
+    machine's shared.env and this process's environment are this agent's. A
+    key in a node's environment is taken only where `node` allows it."""
+    vault = _vault_module()
+    if own:
+        text, where = vault.key_source(folder)
+    else:
+        text = where = None
+        for fname in (".env.local", ".env"):
+            value = vault._env_file(folder / fname).get(vault.KEY_ENV)
+            if value:
+                text, where = value, str(folder / fname)
+                break
+    if not text:
+        return None, None, "no key in its folder here"
+    if not node and (where == "env" or where == str(vault.shared_env_path())):
+        return None, where, f"its key lives in {where}, a node's environment"
+    try:
+        return vault.parse_key(text), where, None
+    except vault.VaultError as exc:
+        return None, where, exc.message
+
+
+def _shared_connection_of(conn, cid: str) -> tuple | None:
+    """(capability, label) of a connection the store shares, None for an
+    agent's own or none."""
+    row = conn.execute("SELECT capability, label, owner_agent_id FROM connections "
+                       "WHERE id = %s", (cid,)).fetchone()
+    return (row[0], row[1]) if row is not None and row[2] is None else None
+
+
 def _grant_seal(root: Path, name: str, cid: str) -> dict | None:
-    """Seal a connection the store shares into the vault of the agent just
-    granted it: from what it resolves in this folder, and else from the
-    folder here of another agent granted it, whose capability seals it for
-    this agent's public key. None for a connection the store does not share;
-    else {sealed, by, pending, hint?}."""
+    """Deliver a connection the store shares into the vault of the agent just
+    granted it, from the platform's copy, sent by the platform; where the
+    platform keeps no copy yet, the capability writes one here from what it
+    resolves in this folder (its `connection seal <id> --share`), and the
+    platform delivers that. None for a connection the store does not share;
+    else {sealed, by, pending, refused?, hint?}."""
     store = _store_module()
+    vault = _vault_module()
+    platform = _platform_lib()
     adapter = _records_for(root)
     try:
+        cid = adapter.connection_id(name, cid) or cid
         grantees = adapter.shared_grantees(name, cid) if hasattr(
             adapter, "shared_grantees") else None
     except store.StoreError:
@@ -9629,37 +9830,383 @@ def _grant_seal(root: Path, name: str, cid: str) -> dict | None:
     if grantees is None:
         return None
     agent_id = _kernel_agent_id(root)
-    result: dict = {"sealed": [], "by": [], "pending": []}
+    actor = _vault_actor()
 
-    def run(agent: str, folder: Path) -> list:
-        answers, refusing, _unread = _seal_runs(folder, folder == root, [cid, "--share"],
-                                                names=[name])
-        if refusing and folder == root:
+    key, _where, _why = _folder_key(root, True)
+
+    def deliver(conn, _agent):
+        plat = _platform_if_here(conn, root)
+        if plat is None:
+            return False
+        if key is not None and vault.recorded_key(conn, agent_id)[1] == vault.fingerprint(key):
+            # The manager holds this agent's key here: it pins both ways itself.
+            platform.write_agent_pin(conn, plat, agent_id, key, updated_by=actor)
+        if not platform.copies(conn, connection_id=cid):
+            return None
+        return platform.deliver_connection(conn, plat, cid, agents=[agent_id],
+                                           updated_by=actor)
+
+    done, _setting = _kernel_run(root, deliver)
+    result: dict = {"sealed": [], "by": ["platform"], "pending": []}
+    if done is False:
+        result["pending"] = ["the platform key is not on this machine"]
+        result["hint"] = ("the platform delivers it where its key is: run `capabilities "
+                          "connections rebuild` on that machine")
+        return result
+    if done is None:
+        _answers, refusing, _unread = _seal_runs(root, True, [cid, "--share"], names=[name])
+        if refusing:
             result["refused"] = refusing[0]
-        res = ((answers.get(name) or {}).get("connections") or {}).get(cid) or {}
-        mine = (res.get("sealed") or {}).get(agent_id) or []
-        if mine:
-            result["sealed"] = sorted(set(result["sealed"]) | set(mine))
-            result["by"].append(agent)
-        return [k for k in res.get("unresolved") or []] if folder == root else []
-
-    pending = run(agent_id, root)
-    if pending:
-        try:
-            others = [(a, f) for a, f in _seal_folders(root) if a in grantees and a != agent_id]
-        except SystemExit:
-            others = []
-        for agent, folder in others:
-            run(agent, folder)
-            if set(pending) <= set(result["sealed"]):
-                break
-    result["pending"] = sorted(set(pending) - set(result["sealed"]))
-    if result["pending"]:
-        result["hint"] = (f"no folder here resolves {', '.join(result['pending'])} for this "
-                          f"agent: run `capabilities connections seal` in the folder of an agent "
-                          f"granted {cid} that resolves it, or give the secret again with "
-                          f"`{name} connection add {cid} --replace --stdin` there")
+        done, _setting = _kernel_run(root, deliver)
+    if done is None:
+        result["pending"] = ["the platform keeps no copy of its secret"]
+        result["hint"] = (f"no value of {cid} resolves here: give it on this machine with "
+                          f"`{name} connection add {cid} --global --replace --stdin`, or take "
+                          "it from the vaults that hold it with `capabilities secrets migrate`")
+        return result
+    result["sealed"] = sorted((done["sealed"].get(agent_id) or {}))
+    if done["refused"]:
+        result["refused"] = done["refused"][0]
+        result["pending"] = [done["refused"][0]["code"]]
+        result["hint"] = done["refused"][0].get("hint")
     return result
+
+
+def _grant_revoke(root: Path, name: str, cid: str) -> dict | None:
+    """Take a connection the store shares out of the vault of the agent whose
+    grant was switched off: {removed}; None for one the store does not share."""
+    platform = _platform_lib()
+    agent_id = _kernel_agent_id(root)
+
+    def revoke(conn, _agent):
+        found = conn.execute(
+            "SELECT id FROM connections WHERE capability = %s AND (id = %s OR label = %s) "
+            "AND owner_agent_id IS NULL", (name, cid, cid)).fetchone()
+        if found is None:
+            return None
+        return platform.revoke(conn, found[0], agent_id)
+
+    removed, _setting = _kernel_run(root, revoke)
+    return None if removed is None else {"removed": removed}
+
+
+def _grant_kind_refusal(root: Path, name: str, cid: str) -> None:
+    """Refuse to grant a connection of a capability whose connections are each
+    one agent's own account to any agent but the one that owns it."""
+    if "shared" in _conn_kinds(name):
+        return
+    agent_id = _kernel_agent_id(root)
+
+    def owner(conn, _agent):
+        return conn.execute(
+            "SELECT id, owner_agent_id FROM connections WHERE capability = %s "
+            "AND (id = %s OR label = %s)", (name, cid, cid)).fetchone()
+
+    found, _setting = _kernel_run(root, owner)
+    if found is None or found[1] == agent_id:
+        return
+    whose = f"agent {found[1]}'s own" if found[1] else "shared by the store"
+    _die(6, "connection_own_kind",
+         f"a {name} connection is always one agent's own account and never granted to "
+         f"another agent: {found[0]} is {whose}",
+         f"add this agent's own with `{name} connection add <label>` in its folder")
+
+
+def cmd_connections_rebuild(rest: list[str]) -> None:
+    """`connections rebuild`: every granted copy made again from the platform's
+    copies, the grants and the agents' pinned public keys."""
+    if rest:
+        _die(6, "input", "connections rebuild takes nothing more", "run `capabilities help`")
+    _read_only_gate("connections rebuild")
+    root = _require_project()
+    platform = _platform_lib()
+    actor = _vault_actor()
+
+    def rebuild(conn, _agent):
+        plat = _platform_here(conn, root, create=False)
+        out = []
+        found = conn.execute(
+            "SELECT DISTINCT p.connection_id, c.capability, c.label FROM platform_secrets p "
+            "JOIN connections c ON c.id = p.connection_id ORDER BY 2, 3").fetchall()
+        for cid, capability, label in found:
+            done = platform.deliver_connection(conn, plat, cid, updated_by=actor)
+            out.append({"connection": cid, "capability": capability, "label": label,
+                        "sealed": done["sealed"], "refused": done["refused"]})
+        return out
+
+    done, setting = _kernel_run(root, rebuild)
+    changed = sum(1 for row in done for names in row["sealed"].values()
+                  for outcome in names.values() if outcome != "unchanged")
+    _emit({"ok": True, "connections": done, "changed": changed,
+           "refused": [{"connection": row["connection"], **r} for row in done
+                       for r in row["refused"]],
+           "store": _kernel_store_report(setting)})
+
+
+def _key_recover(root: Path) -> dict:
+    """`key recover`: a new key for the agent of this folder, written where
+    this machine keeps it, its public key published and pinned, and every
+    entry re-delivered from the platform's copies, its own included."""
+    vault = _vault_module()
+    platform = _platform_lib()
+    mark = _platform_node_mark(root)
+    agent = _kernel_agent_id(root)
+    if mark is not None:
+        _die(6, "key_on_node",
+             f"agent {agent}'s key lives in {mark}, a node's environment, where the manager "
+             "delivers no key",
+             "recover it on the machine that keeps the agent's folder, then give the node "
+             "its new key")
+    key = vault.parse_key(vault.generate_key())
+    actor = _vault_actor()
+
+    def recover(conn, agent_id):
+        plat = _platform_here(conn, root)
+        recorded = _vault_registered(conn, agent_id)
+        before = platform.pinned_public(agent_id)
+        own, unopened = {}, []
+        for name, blob in platform.copies(conn, agent_id=agent_id).items():
+            value = platform.open_copy(plat, name, blob, agent_id=agent_id, agent_public=before)
+            if value is None:
+                unopened.append(name)
+            else:
+                own[name] = value
+        vault.record_key(conn, agent_id, vault.fingerprint(key))
+        vault.publish(conn, agent_id, key)
+        platform.pin_agent(agent_id, vault.public_key(key), replace=True)
+        vault.write_pin(conn, key, agent_id, plat.public, updated_by=actor)
+        delivered = platform.deliver(conn, plat, agent_id, own, updated_by=actor)
+        for name, value in own.items():
+            # Sent by the platform now, so it opens whichever key the agent holds next.
+            platform.put_copy(conn, plat, name, value, agent_id=agent_id, updated_by=actor)
+        granted = {}
+        refused = []
+        for (cid,) in conn.execute(
+                "SELECT DISTINCT g.connection_id FROM grants g JOIN connections c "
+                "ON c.id = g.connection_id WHERE g.agent_id = %s AND g.enabled "
+                "AND c.owner_agent_id IS NULL ORDER BY 1", (agent_id,)).fetchall():
+            done = platform.deliver_connection(conn, plat, cid, agents=[agent_id],
+                                               updated_by=actor)
+            if done["sealed"].get(agent_id):
+                granted[cid] = done["sealed"][agent_id]
+            refused += [{"connection": cid, **r} for r in done["refused"]]
+        lost = sorted(n for (n,) in conn.execute(
+            "SELECT name FROM secrets WHERE agent_id = %s AND key_fingerprint <> %s",
+            (agent_id, vault.fingerprint(key))).fetchall())
+        changed_file = _write_env_local_keys(root, {vault.KEY_ENV: vault.encode_key(key)})
+        return recorded, delivered, granted, refused, lost, unopened, changed_file
+
+    (recorded, delivered, granted, refused, lost, unopened, _changed), setting = \
+        _kernel_run(root, recover)
+    answer = {"ok": True, "agent": agent, "fingerprint": vault.fingerprint(key),
+              "previous_fingerprint": recorded, "public_key": vault.public_text(key),
+              "written": str(root / ".env.local"), "delivered": delivered,
+              "connections": granted, "refused": refused,
+              "store": _kernel_store_report(setting)}
+    if lost:
+        answer["unreadable"] = lost
+        answer["note"] = (f"{len(lost)} entr(y/ies) the platform keeps no copy of stay sealed "
+                          "for the previous key; set each again with `capabilities secrets set`")
+    if unopened:
+        answer["copies_unopened"] = unopened
+    return answer
+
+
+def _ends(value: str) -> str:
+    """The last characters of a secret, as few as tell copies apart."""
+    keep = 4 if len(value) >= 16 else max(1, len(value) // 4)
+    return "…" + value[-keep:]
+
+
+def _parse_picks(args: list[str]) -> dict:
+    """{(connection, NAME): agent} from `--pick <connection>:<NAME>=<agent>`."""
+    picks: dict = {}
+    i = 0
+    while i < len(args):
+        word = args[i]
+        if word == "--pick" and i + 1 < len(args):
+            value, i = args[i + 1], i + 2
+        elif word.startswith("--pick="):
+            value, i = word.split("=", 1)[1], i + 1
+        else:
+            _die(6, "input", f"unknown secrets migrate argument {word!r}",
+                 "secrets migrate [--pick <connection>:<NAME>=<agent>]...")
+        m = re.fullmatch(r"([^:=\s]+):([A-Za-z_][A-Za-z0-9_]*)=([^=\s]+)", value)
+        if not m:
+            _die(6, "input", f"--pick {value!r} is not <connection>:<NAME>=<agent>")
+        picks[(m.group(1), m.group(2))] = m.group(3)
+    return picks
+
+
+def _secrets_migrate(root: Path, picks: dict) -> dict:
+    """`secrets migrate`: each vault an older release wrote, where its agent's
+    key is on this machine, sealed again in the new form, and each shared
+    connection given the platform's copy from the vault copies that agree."""
+    vault = _vault_module()
+    platform = _platform_lib()
+    actor = _vault_actor()
+    own_agent = _kernel_agent_id(root)
+    here = []
+    for agent_id, folder in _seal_folders(root):
+        key, where, why = _folder_key(folder, folder == root, node=folder == root)
+        here.append((agent_id, folder, key, where, why))
+
+    def migrate(conn, _agent):
+        # Where the platform key is not here - a node, or a machine beside the
+        # one that keeps it - each agent's own part is migrated alone: its
+        # entries sealed again, the platform key the store publishes pinned,
+        # and the platform's copies of its own entries sent; the shared
+        # connections are the platform's machine's to migrate.
+        published = vault.platform_published(conn)
+        local = platform.load() is not None
+        plat = (_platform_here(conn, root)
+                if local or (published is None and _platform_node_mark(root) is None)
+                else None)
+        shared = {cid: (capability, label, spec) for cid, capability, label, spec in
+                  conn.execute("SELECT id, capability, label, spec FROM connections "
+                               "WHERE owner_agent_id IS NULL ORDER BY capability, label")}
+        granted: dict = {}
+        for cid, agent_id in conn.execute(
+                "SELECT DISTINCT connection_id, agent_id FROM grants WHERE enabled "
+                "AND agent_id IS NOT NULL"):
+            if cid in shared:
+                granted.setdefault(agent_id, set()).add(cid)
+        claims: dict = {}
+        for cid, (_cap, _label, spec) in shared.items():
+            for value in (spec or {}).values():
+                if (isinstance(value, str) and re.fullmatch(r"[A-Z_][A-Z0-9_]{0,254}", value)
+                        and value != vault.PIN_NAME):
+                    claims.setdefault(value, set()).add(cid)
+        agents, not_here, seen = [], [], {}
+        candidates: dict = {}
+        for agent_id, folder, key, where, why in here:
+            if key is None:
+                not_here.append({"agent": agent_id, "folder": str(folder), "reason": why})
+                continue
+            recorded = vault.recorded_key(conn, agent_id)[1]
+            if recorded != vault.fingerprint(key):
+                not_here.append({"agent": agent_id, "folder": str(folder),
+                                 "reason": "the key in its folder is not the one its vault is "
+                                           "kept under"})
+                continue
+            vault.publish(conn, agent_id, key)
+            done = vault.reseal(conn, key, agent_id, updated_by=actor)
+            if plat is not None:
+                platform.write_agent_pin(conn, plat, agent_id, key, updated_by=actor)
+                trusted = plat.public
+            else:
+                # The platform key this agent trusts: its pin, taken now where
+                # the store publishes one it has not pinned.
+                trusted = vault.take_pin(conn, key, agent_id, updated_by=actor)
+            copies = platform.copies(conn, agent_id=agent_id)
+            values = {}
+            held = vault.rows(conn, agent_id)
+            pin = vault.pin_of(key, agent_id, held)
+            for row in held:
+                if row["name"] == vault.PIN_NAME or row["key_fingerprint"] != recorded:
+                    continue
+                value = vault.unseal(key, agent_id, row["name"], row["ciphertext"], pin)
+                if value is None:
+                    continue
+                values[row["name"]] = value
+                if row["name"] not in copies and trusted is not None:
+                    vault.put_copy_row(conn, vault.seal_box(
+                        vault._public_secret(key), trusted,
+                        vault.copy_scope(agent_id=agent_id), row["name"], value),
+                        row["name"], agent_id=agent_id, updated_by=actor)
+            seen[agent_id] = values
+            for name, value in values.items():
+                for cid in claims.get(name, ()):
+                    if cid in granted.get(agent_id, ()):
+                        candidates.setdefault((cid, name), {}).setdefault(value, []).append(
+                            agent_id)
+            agents.append({"agent": agent_id, "folder": str(folder), "key": where,
+                           "resealed": done["resealed"], "unreadable": done["unreadable"]})
+        if plat is None:
+            return agents, not_here, [], [], [], [], [], []
+        for agent_id in sorted(set(granted) - {a for a, *_ in here}):
+            not_here.append({"agent": agent_id, "folder": None,
+                             "reason": "no folder of it on this machine; the platform delivers "
+                                       "its granted connections, and its own entries stay as "
+                                       "they are until it is migrated where its key is"})
+        made, kept, disagree, unknown_picks = [], [], [], []
+        for (cid, name), by_value in sorted(candidates.items()):
+            capability, label, _spec = shared[cid]
+            row = {"connection": cid, "capability": capability, "label": label, "name": name}
+            held = platform.copies(conn, connection_id=cid).get(name)
+            if held is not None:
+                kept.append(row)
+                continue
+            if len(claims.get(name, ())) > 1:
+                disagree.append({**row, "reason": "another shared connection names the same "
+                                                  "key, so it is the connection's own to "
+                                                  "neither", "copies": []})
+                continue
+            pick = picks.pop((cid, name), None)
+            if len(by_value) == 1:
+                value = next(iter(by_value))
+            elif pick is not None and pick in seen and name in seen[pick] \
+                    and seen[pick][name] in by_value:
+                value = seen[pick][name]
+            else:
+                if pick is not None:
+                    unknown_picks.append({**row, "agent": pick})
+                disagree.append({**row, "copies": [
+                    {"agents": sorted(holders), "ends": _ends(value)}
+                    for value, holders in sorted(by_value.items(),
+                                                 key=lambda kv: sorted(kv[1]))]})
+                continue
+            platform.put_copy(conn, plat, name, value, connection_id=cid, updated_by=actor)
+            made.append({**row, "from": sorted(by_value[value])})
+        for (cid, name), agent_id in sorted(picks.items()):
+            unknown_picks.append({"connection": cid, "name": name, "agent": agent_id})
+        delivered = []
+        for cid in sorted({row["connection"] for row in made + kept}):
+            done = platform.deliver_connection(conn, plat, cid, updated_by=actor)
+            delivered.append({"connection": cid, "sealed": done["sealed"],
+                              "refused": done["refused"]})
+        # The same account under more than one connection: the same secret
+        # value, or the same identity, in one capability. Listed only.
+        by_secret: dict = {}
+        for agent_id, values in seen.items():
+            for name, value in values.items():
+                for cid in claims.get(name, ()):
+                    by_secret.setdefault((shared[cid][0], value), set()).add(cid)
+        owned = {}
+        for cid, capability, label, owner, spec in conn.execute(
+                "SELECT id, capability, label, owner_agent_id, spec FROM connections "
+                "ORDER BY capability, label"):
+            owned[cid] = (capability, label, owner)
+            identity = (spec or {}).get("identity")
+            if isinstance(identity, dict) and identity.get("id"):
+                by_secret.setdefault((capability, "identity:" + str(identity["id"])),
+                                     set()).add(cid)
+        duplicates = []
+        for (capability, _value), cids in sorted(by_secret.items(), key=lambda kv: kv[0][0]):
+            if len(cids) > 1:
+                group = [{"connection": c, "label": owned[c][1], "owner": owned[c][2]}
+                         for c in sorted(cids)]
+                if group not in [d["connections"] for d in duplicates]:
+                    duplicates.append({"capability": capability, "connections": group})
+        return agents, not_here, made, kept, disagree, unknown_picks, delivered, duplicates
+
+    (agents, not_here, made, kept, disagree, unknown_picks, delivered, duplicates), setting = \
+        _kernel_run(root, migrate)
+    answer = {"ok": True, "agent": own_agent, "agents": agents, "not_here": not_here,
+              "platform": "here" if platform.load() is not None else "elsewhere",
+              "platform_copies": made, "already_copied": kept, "disagreeing": disagree,
+              "delivered": delivered, "duplicates": duplicates,
+              "store": _kernel_store_report(setting)}
+    if unknown_picks:
+        answer["picks_unused"] = unknown_picks
+    if disagree:
+        answer["hint"] = ("copies of a shared connection disagree: nothing is chosen for it. "
+                          "Pick the current one with `capabilities secrets migrate --pick "
+                          "<connection>:<NAME>=<agent>` (an agent holding that copy)")
+    if duplicates:
+        answer["duplicates_note"] = ("connections of one account are listed only; nothing "
+                                     "is merged or removed")
+    return answer
 
 
 def cmd_secrets(rest: list[str]) -> None:
@@ -9669,9 +10216,9 @@ def cmd_secrets(rest: list[str]) -> None:
         sys.stdout.write(_help_vault())
         return
     vault = _vault_module()
-    if sub not in ("list", "show", "set", "rm", "raw", "move"):
-        _die(6, "input", "secrets needs a subcommand: list, show, set, rm, raw or move",
-             "run `capabilities secrets help`")
+    if sub not in ("list", "show", "set", "rm", "raw", "move", "migrate"):
+        _die(6, "input", "secrets needs a subcommand: list, show, set, rm, raw, move or "
+             "migrate", "run `capabilities secrets help`")
     root = _require_project()
 
     if sub == "move":
@@ -9679,6 +10226,12 @@ def cmd_secrets(rest: list[str]) -> None:
             _die(6, "input", "secrets move takes nothing more")
         _read_only_gate("secrets move")
         _emit(_vault_move(root))
+        return
+
+    if sub == "migrate":
+        picks = _parse_picks(args)
+        _read_only_gate("secrets migrate")
+        _emit(_secrets_migrate(root, picks))
         return
 
     def name_of(value: str) -> str:
@@ -9730,16 +10283,19 @@ def cmd_secrets(rest: list[str]) -> None:
 
         def read_one(conn, agent_id):
             _vault_key_matches(conn, agent_id, key, record=False)
-            return [r for r in vault.rows(conn, agent_id) if r["name"] == name]
+            held = vault.rows(conn, agent_id)
+            return ([r for r in held if r["name"] == name and name != vault.PIN_NAME],
+                    _vault_pin(conn, agent_id, key, held))
 
-        found, _setting = _kernel_run(root, read_one)
+        (found, pin), _setting = _kernel_run(root, read_one)
         if not found:
             _die(3, "not_set", f"the vault holds no {name}")
-        value = vault.unseal(key, _kernel_agent_id(root), name, found[0]["ciphertext"]) \
+        value = vault.unseal(key, _kernel_agent_id(root), name, found[0]["ciphertext"], pin) \
             if found[0]["key_fingerprint"] == vault.fingerprint(key) else None
         if value is None:
             _die(6, "secret_unreadable",
-                 f"{name} was sealed under another key and cannot be read",
+                 f"{name} was sealed under another key, or by a sender this agent does not "
+                 "trust, and cannot be read",
                  f"set it again with `capabilities secrets set {name}`")
         sys.stdout.write(value + "\n")
         return
@@ -9787,8 +10343,8 @@ def cmd_secrets(rest: list[str]) -> None:
         agent_id = _kernel_agent_id(root)
         values, unreadable = {}, []
         for e in entries:
-            value = vault.unseal(key, agent_id, e["name"], e["_row"]["ciphertext"]) \
-                if e["readable"] else None
+            value = vault.unseal(key, agent_id, e["name"], e["_row"]["ciphertext"],
+                                 e["_pin"]) if e["readable"] else None
             if value is None:
                 unreadable.append(e["name"])
             else:
@@ -9809,8 +10365,9 @@ def cmd_secrets(rest: list[str]) -> None:
         entries = _vault_listing(conn, agent_id, key)[0]
         held = {}
         for e in entries:
-            held[e["name"]] = (vault.unseal(key, agent_id, e["name"], e["_row"]["ciphertext"])
-                               if e["readable"] else None, e["readable"])
+            held[e["name"]] = (vault.unseal(key, agent_id, e["name"], e["_row"]["ciphertext"],
+                                            e["_pin"]) if e["readable"] else None,
+                               e["readable"])
         actor = _vault_actor()
         written, unchanged = [], []
         for name, value in sorted(wanted.items()):
@@ -24528,6 +25085,10 @@ def cmd_set(name: str, collection: str, key: str,
             # A store row carries the project id as its agent, so the write
             # takes the id only once it is verified for this invocation.
             _project_id_for_write(root)
+        if (collection == "grant" and in_store and isinstance(value, dict)
+                and value.get("enabled") is True and name in _installed()):
+            # An agent's own account is never granted to another agent.
+            _grant_kind_refusal(root, name, key)
         done = adapter.set(name, collection, key, value,
                            actor="capabilities set", note=note)
         if collection == "connection" and isinstance(done, str) and done:
@@ -24548,10 +25109,17 @@ def cmd_set(name: str, collection: str, key: str,
     if (collection == "grant" and in_store and isinstance(value, dict)
             and value.get("enabled") is True and name in _installed()):
         # A connection the store shares carries its secret in the vault of
-        # every agent granted it, this one now included.
+        # every agent granted it, this one now included, delivered by the
+        # platform from its own copy.
         sealed = _grant_seal(root, name, key)
         if sealed is not None:
             answer["vault"] = sealed
+    elif (collection == "grant" and in_store and isinstance(value, dict)
+            and value.get("enabled") is False):
+        # A revoke takes the connection's secret out of the agent's vault.
+        removed = _grant_revoke(root, name, key)
+        if removed is not None:
+            answer["vault"] = removed
     _emit(answer)
 
 
@@ -32428,6 +32996,7 @@ def _audit_script(
     failures += [f"connections/machine-reads: {p}" for p in _machine_reads_problems(
         script, out if rc == 0 else None, env=env)]
     failures += [f"levels: {p}" for p in _levels_problems(script)]
+    failures += [f"connections/kinds: {p}" for p in _conn_kinds_problems(script)]
 
     # The effective gate, exercised in a sandbox: project override, inherited
     # global enable, and default deny. Safe declaration verbs are intentionally
@@ -33356,6 +33925,7 @@ def _catalog_payload(root: Path, audit: bool) -> tuple[dict, dict[str, list[str]
             problems += [f"connections/machine-reads: {p}"
                          for p in _machine_reads_problems(script)]
             problems += [f"levels: {p}" for p in _levels_problems(script)]
+            problems += [f"connections/kinds: {p}" for p in _conn_kinds_problems(script)]
         problems += _bundle_library_problems(capdir)
         problems += _bundle_icon_problems(capdir)
         if problems:
@@ -33433,6 +34003,7 @@ def _catalog_payload_scoped(
                 problems += [f"connections/machine-reads: {p}"
                              for p in _machine_reads_problems(script)]
                 problems += [f"levels: {p}" for p in _levels_problems(script)]
+                problems += [f"connections/kinds: {p}" for p in _conn_kinds_problems(script)]
             problems += _bundle_library_problems(capdir)
             problems += _bundle_icon_problems(capdir)
             if problems:
@@ -35040,25 +35611,41 @@ STORE VERBS
 VAULT VERBS
   Each agent has one encryption key, AGENT_ENCRYPTION_KEY (see `capabilities help environment`),
   and a vault of named secrets in its store that only that key opens: each a
-  row of secrets, sealed with XChaCha20-Poly1305, the agent id and
-  the name bound to it. The store keeps the fingerprint of the agent's key on
-  its row of agents, never the key, and beside it the agent's
-  public sealing key (vault_public_key), the X25519 public key the key gives,
-  so another writer seals a value only the agent's key opens - a shared
-  connection's secret for each agent granted it - without holding the key;
-  keeping the key is the owner's. The key verbs, a secret written here and
-  `connections seal` publish it; a key that changes leaves it unpublished
-  until one of them runs again. The vault is the first home of an agent's
+  row of secrets, sealed to the agent's public key (vault_public_key, the
+  X25519 public key the key gives) with the sender's own key, the agent id
+  and the name bound to it, so whoever opens it learns who sent it. The
+  store keeps the fingerprint of the agent's key on its row of agents, never
+  the key; keeping the key is the owner's. The key verbs, a secret written
+  here and `connections seal` publish the public key; a key that changes
+  leaves it unpublished until one of them runs again. An agent opens only
+  the entries it sent itself and those the platform sent: the platform is a
+  keypair this manager makes on first need, in a file only its user reads
+  ($XDG_CONFIG_HOME/capabilities/platform/key), never on a node and never
+  in the store, which publishes only its public key; each agent pins that
+  key in its own vault, sealed by its own key, the first time a process
+  holding the key sees it, and the platform pins each agent's public key
+  at first sight beside its own. The platform keeps its own copy of every
+  secret - a shared connection's, and each agent's own, sent by that agent
+  - and is the only writer of another agent's entries: a grant delivers a
+  shared connection's secret from its copy, a revoke takes it out, a
+  changed value reaches every grantee, `connections rebuild` delivers every
+  granted copy again and `key recover` re-delivers an agent's entries under
+  a new key. Entries an older release wrote still open where the agent's
+  own key sealed them; one sealed for its public key by anyone else opens
+  only until the agent pins the platform key, and `secrets migrate` seals
+  them all again the new way. The vault is the first home of an agent's
   secrets: a capability's `connection add` and `setup set` seal a secret
   given on stdin into it by default, and write a file only with --file, at
-  --global or --machine where no grantee's vault takes it, or where no vault
-  takes it here, saying why. Every capability resolves a value its
+  --global or --machine for a connection the store does not share yet, or
+  where no vault takes it here, saying why. Every capability resolves a value its
   connections name through the credential cascade and asks the vault first,
   before the project's .env files, its credentials.env and shared.env and the
   process environment, which still answer every name the vault does not
   hold: a connection whose values are in the vault resolves them the same on
   every node holding the agent's key. A connection the store shares carries
-  its secret in each granted agent's vault. A row sealed under another key than
+  its secret in each granted agent's vault, delivered by the platform; a
+  capability writes it only where the platform key is, and is refused with
+  where to write it elsewhere. A row sealed under another key than
   the agent's present one is unreadable: kept, reported, and read again only
   once it is set again. Each verb stands in the current project and its
   store, and answers JSON unless it says otherwise.
@@ -35886,6 +36473,25 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         unreadable; the answer names how many (unreadable) and the previous
         fingerprint. Set those secrets again.
 """),
+    (('key recover',),
+     """\
+  key recover
+        Give the agent of this folder a new key where its key was lost or
+        changed: write it into the project's .env.local, record its
+        fingerprint, publish its public key and pin it on the platform, pin
+        the platform key in its vault, and re-deliver every entry from the
+        platform's copies - its own entries and every connection the store
+        shares and grants it - sealed for the new key, so nothing the
+        platform keeps a copy of is lost. Needs the platform key on this
+        machine (made on first need). JSON {ok, agent, fingerprint,
+        previous_fingerprint, public_key, written, delivered {NAME: created |
+        replaced | unchanged}, connections {connection: {NAME: outcome}},
+        refused, unreadable?, note?}: unreadable names the entries the
+        platform keeps no copy of, which stay sealed for the previous key.
+        Exit 6 key_on_node where this folder's key lives in a node's
+        environment (the process environment or shared.env), where the
+        manager delivers no key: it is reported, not delivered.
+"""),
     (('secrets help',),
      """\
   secrets help
@@ -35952,6 +36558,37 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         not_reading names the capabilities that refuse to resolve a connection
         here. `connections seal` writes the values the machine's files hold
         into each connection instead, and leaves every file as it is.
+"""),
+    (('secrets migrate',),
+     """\
+  secrets migrate [--pick <connection>:<NAME>=<agent>]...
+        Bring the vaults an older release wrote to the new form, for every
+        agent whose key is on this machine - this folder's, and the folder
+        here of every other agent the store links to this node: each entry
+        its own key sealed, or another sealed for its public key, is sealed
+        again with the same key and value, no agent is given a new key, the
+        platform key is made on first need and pinned in each vault, and the
+        platform takes its copy of each of the agent's own entries. Each
+        connection the store shares that agents here are granted gets the
+        platform's copy from the vault copies they hold, and the platform
+        delivers it to every agent granted it, on other nodes too. Where the
+        copies of one connection's key disagree nothing is chosen for it:
+        disagreeing lists each copy with its last characters only and the
+        agents holding it, and only an explicit --pick, naming an agent that
+        holds the copy to keep, writes it. Connections that look like one
+        account - the same secret or identity under one capability - are
+        listed under duplicates, never merged or removed. Where the platform
+        key is not on this machine - a node, whose agent's key lives in its
+        environment - only each agent's own part runs: its entries sealed
+        again, the platform key the store publishes pinned, and the
+        platform's copies of its own entries sent (platform: elsewhere).
+        Running it again changes nothing. JSON {ok, agent, agents [{agent,
+        folder, key, resealed, unreadable}], not_here [{agent, folder,
+        reason}], platform (here | elsewhere), platform_copies,
+        already_copied, disagreeing [{connection,
+        capability, label, name, copies [{agents, ends}]}], delivered,
+        duplicates [{capability, connections}], picks_unused?, hint?}. An
+        agent whose key lives only on a node is named in not_here.
 """),
     (('dev start',),
      """\
@@ -37665,11 +38302,19 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         write stamps the
         project id, so it refuses (exit 6) where the id is not verified, and
         `records.mode` answers `store` with the table as `source`. A grant
-        that enables a connection the store shares also seals its secret into
-        this agent's vault, as `<name> connection seal <id> --share` here,
-        else in the folder here of another agent granted it, for this
-        agent's public key; vault {sealed, by, pending, hint} says which keys
-        it reached and what is still to be sealed. A store
+        that enables a connection the store shares also has the platform
+        deliver its secret into this agent's vault from the platform's copy,
+        the platform key made here on first need; where the platform keeps
+        no copy yet, `<name> connection seal <id> --share` here writes one
+        from what this folder resolves; where the platform key is on another
+        machine, pending says so and `connections rebuild` there delivers it.
+        vault {sealed, by, pending, refused?,
+        hint?} says which keys it reached and what is still to be sealed. A
+        grant that switches it off takes those keys out of the agent's vault
+        (vault {removed}). A grant enabling a connection of a capability
+        whose CONN_KINDS is ("own",) - each connection one agent's own
+        account - for an agent that does not own it is refused, exit 6
+        connection_own_kind, with nothing written. A store
         that cannot be reached is exit 5 store_unreachable.
 """),
     (('unset',),
@@ -37765,6 +38410,21 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         `place` would. Exit 4 under the
         read-only switch, 5 when the store cannot be reached.
 """),
+    (('connections rebuild',),
+     """\
+  connections rebuild
+        Deliver every granted copy again from the platform's copies, the
+        grants and the agents' pinned public keys: every connection the store
+        shares and the platform keeps a copy of reaches the vault of every
+        agent an enabled grant gives it to, sealed by the platform. An entry
+        already holding the same value from the platform is left as it is,
+        so running it any number of times is safe. An agent whose published
+        public key is not the one the platform pinned is refused
+        (agent_key_changed) until `key recover` pins its new one. Needs the
+        platform key on this machine. JSON {ok, connections [{connection,
+        capability, label, sealed {agent: {NAME: created | replaced |
+        unchanged}}, refused}], changed, refused}.
+"""),
     (('connections seal',),
      """\
   connections seal
@@ -37777,8 +38437,10 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         `<name> connection seal` in this agent's folder and in the folder here
         of every other agent the store links to this node: first each agent's
         own, which also publishes its public sealing key, then with --share,
-        so a connection the store shares is sealed for every agent granted
-        it, for its public key, those on other nodes included - under the
+        so a connection the store shares becomes the platform's copy, which
+        the platform delivers to every agent granted it, those on other nodes
+        included - the platform key made here on first need, and refused
+        with where to run it on a node - under the
         keys that are the connection's own only, since a vault answers for
         every connection of its agent: a key another connection or a setup
         field may read too reaches no other agent's vault (not_shared), and
@@ -38549,8 +39211,10 @@ def main() -> None:
             cmd_connections_import()
         elif rest[:1] == ["seal"]:
             cmd_connections_seal(rest[1:])
+        elif rest[:1] == ["rebuild"]:
+            cmd_connections_rebuild(rest[1:])
         else:
-            _die(6, "input", "connections needs the subcommand list, import or seal",
+            _die(6, "input", "connections needs the subcommand list, import, seal or rebuild",
                  "run `capabilities help`")
     elif cmd == "get":
         if len(pos) != 3:
