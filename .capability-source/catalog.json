@@ -560,7 +560,7 @@
       "level": 0,
       "lucide_icon": "rocket",
       "path": "capabilities/deployment",
-      "payload_sha256": "a1087772e8080fe1c60f86e1c0b8a5d0fe520296954abab4822a6c2f1beaea71",
+      "payload_sha256": "1ce8e3bfad426ac2444e79dd4b7ded69a5ce992ebd0f28f6743f4352a1543b75",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to.",
@@ -576,7 +576,7 @@
           "title": "Развёртывание"
         }
       },
-      "version": "2026-11-23 — `deployment runner` is gone, and `deployment machine handover` has moved to the manager"
+      "version": "2026-11-24 — `node create --repository` gives the node a `capabilities` volume, and the agent-node guide says the manager and the capabilities live there"
     },
     "directo": {
       "executable": [

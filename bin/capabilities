@@ -18241,13 +18241,17 @@ AGENT_NODE_MEMORY = "2g"
 # The state the image keeps, each on a volume of the node's own: the store
 # setting, the secrets, the node key and the node id (.config), capability
 # state, the harness logins, and the agent's work - the checkouts and git
-# worktrees it develops in. The tools stay the image's, so a new tag brings
-# new tools.
+# worktrees it develops in - and the manager's home with the capabilities and
+# what they run on (~/.capabilities), which the image carries none of: the
+# node installs them there on its first boot, and they change only through
+# `node update`. The system tools stay the image's, so a new tag brings new
+# system tools and leaves the manager and the capabilities as they were.
 AGENT_NODE_VOLUMES = (("config", "/home/agent/.config"),
                       ("state", "/home/agent/.local/state"),
                       ("claude", "/home/agent/.claude"),
                       ("codex", "/home/agent/.codex"),
-                      ("work", "/home/agent/work"))
+                      ("work", "/home/agent/work"),
+                      ("capabilities", "/home/agent/.capabilities"))
 # Under the node user's home, on its config volume.
 AGENT_NODE_KEY = ".config/agent-node/node-key.pem"
 AGENT_NODE_STATE = "/tmp/agent-node.state"
@@ -36767,7 +36771,8 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         create: a Compose service of the image's tag in that Coolify
         project's existing environment on that server, with the memory
         limit, a volume for each state path (~/.config, ~/.local/state,
-        ~/.claude, ~/.codex) and for ~/work, and only CAPABILITIES_PROJECT_ID
+        ~/.claude, ~/.codex), for ~/work and for ~/.capabilities, the
+        manager and the capabilities, and only CAPABILITIES_PROJECT_ID
         and CAPABILITIES_PROJECT_ID_ROOT (/app); then a minted node id and
         its row (`node add <id> --label <label> --kind server` with the
         server's SSH address, the Coolify address - the base_url of the

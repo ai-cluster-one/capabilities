@@ -623,8 +623,10 @@ deployment node create <node> --project <uuid> --server <uuid>
   GitHub App (`coolify sources` lists their uuids), else as public. The
   node is a Coolify application with no domain, no automatic deploy on
   push, the memory limit, a volume of its own for each state path of the
-  image (~/.config, ~/.local/state, ~/.claude, ~/.codex) and for ~/work,
-  where the agent keeps its checkouts and git worktrees, and only
+  image (~/.config, ~/.local/state, ~/.claude, ~/.codex), for ~/work,
+  where the agent keeps its checkouts and git worktrees, and for
+  ~/.capabilities, where the node keeps the manager and the capabilities
+  it installs on its first boot, and only
   CAPABILITIES_PROJECT_ID and CAPABILITIES_PROJECT_ID_ROOT (/app) in its
   environment. It takes host paths, each bound at the same path in the
   container: --docker-socket the host's /var/run/docker.sock, and each
@@ -6580,13 +6582,18 @@ AGENT_NODE_MEMORY = "2g"
 # The state the image keeps, each on a volume of the node's own: the store
 # setting, the secrets, the node key and the node id (.config), capability
 # state, the harness logins, and the agent's work - the checkouts and git
-# worktrees it develops in. The tools stay the image's, so a new tag brings
-# new tools.
+# worktrees it develops in - and the manager's home with the capabilities and
+# what they run on (~/.capabilities), which the image carries none of: the
+# node installs them there on its first boot, and they change only through
+# `capabilities node update`. The system tools stay the image's, so a rebuild
+# brings new system tools and leaves the manager and the capabilities as they
+# were.
 AGENT_NODE_VOLUMES = (("config", "/home/agent/.config"),
                       ("state", "/home/agent/.local/state"),
                       ("claude", "/home/agent/.claude"),
                       ("codex", "/home/agent/.codex"),
-                      ("work", "/home/agent/work"))
+                      ("work", "/home/agent/work"),
+                      ("capabilities", "/home/agent/.capabilities"))
 # The standard image's current release is the newest version its registry
 # holds: a release publishes ghcr.io/agenium-dev/agent-node:<version> and moves
 # :latest to it, and the tags it pushes first for each architecture carry a

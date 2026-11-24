@@ -61,7 +61,8 @@ class Fake:
                                           ("state", "/home/agent/.local/state"),
                                           ("claude", "/home/agent/.claude"),
                                           ("codex", "/home/agent/.codex"),
-                                          ("work", "/home/agent/work"))]
+                                          ("work", "/home/agent/work"),
+                                          ("capabilities", "/home/agent/.capabilities"))]
         self.memory = 2 << 30
         self.image_config = {"Env": ["PATH=/usr/bin"], "Volumes": None}
         self.containers = "abc123\n"
@@ -283,7 +284,7 @@ def test_create_builds_a_node_from_a_repository_with_the_socket_and_same_path_di
     coolify = [c for c in lab.fake.of("coolify")]
     verbs = [c["argv"][3:5] for c in coolify]
     assert verbs == [["projects", "prj-uuid"], ["app", "create"], ["app", "update"],
-                     ["env", "bulk"]] + [["storage", "add"]] * 7 + [["deploy", "app-new"]]
+                     ["env", "bulk"]] + [["storage", "add"]] * 8 + [["deploy", "app-new"]]
     create = coolify[1]["argv"]
     for flag, value in (("--project", "prj-uuid"), ("--server", "srv-uuid"),
                         ("--environment", "test"), ("--private-deploy-key", "key-uuid"),
@@ -299,13 +300,14 @@ def test_create_builds_a_node_from_a_repository_with_the_socket_and_same_path_di
     # Only the two keys, as for a node of the standard image.
     assert coolify[3]["stdin"] == ("CAPABILITIES_PROJECT_ID=prj_00000000a1a1\n"
                                    "CAPABILITIES_PROJECT_ID_ROOT=/app\n")
-    storages = [c["argv"][5:] for c in coolify[4:11]]
+    storages = [c["argv"][5:] for c in coolify[4:12]]
     assert storages == [
         ["app-new", "--volume", "config", "--mount-path", "/home/agent/.config"],
         ["app-new", "--volume", "state", "--mount-path", "/home/agent/.local/state"],
         ["app-new", "--volume", "claude", "--mount-path", "/home/agent/.claude"],
         ["app-new", "--volume", "codex", "--mount-path", "/home/agent/.codex"],
         ["app-new", "--volume", "work", "--mount-path", "/home/agent/work"],
+        ["app-new", "--volume", "capabilities", "--mount-path", "/home/agent/.capabilities"],
         ["app-new", "--host-path", "/var/run/docker.sock", "--mount-path", "/var/run/docker.sock"],
         ["app-new", "--host-path", "/srv/product", "--mount-path", "/srv/product"]]
 

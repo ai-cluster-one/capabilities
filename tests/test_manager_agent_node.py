@@ -60,7 +60,8 @@ class Fake:
                                           ("state", "/home/agent/.local/state"),
                                           ("claude", "/home/agent/.claude"),
                                           ("codex", "/home/agent/.codex"),
-                                          ("work", "/home/agent/work"))]
+                                          ("work", "/home/agent/work"),
+                                          ("capabilities", "/home/agent/.capabilities"))]
         self.memory = 2 << 30
         self.image_config = {"Env": ["PATH=/usr/bin"], "Volumes": None}
         self.containers = "abc123\n"
@@ -319,12 +320,14 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
         '      - "claude:/home/agent/.claude"\n'
         '      - "codex:/home/agent/.codex"\n'
         '      - "work:/home/agent/work"\n'
+        '      - "capabilities:/home/agent/.capabilities"\n'
         'volumes:\n'
         '  config: {}\n'
         '  state: {}\n'
         '  claude: {}\n'
         '  codex: {}\n'
-        '  work: {}\n')
+        '  work: {}\n'
+        '  capabilities: {}\n')
 
     # Made through a granted connection, the row records the Coolify by its
     # address and the server's address, as a lent connection's row does.
@@ -1043,7 +1046,8 @@ def test_update_moves_a_standard_image_node_to_the_tag_and_waits_for_its_agent(l
     assert answer["image"] == answer["running_image"] == "ghcr.io/agenium-dev/agent-node:0.0.10"
     assert answer["previous_image"] == "ghcr.io/agenium-dev/agent-node:0.0.1"
     assert answer["health"] == "healthy" and answer["state"].startswith("running agent")
-    assert answer["volumes"] == ["config", "state", "claude", "codex", "work"]
+    assert answer["volumes"] == ["config", "state", "claude", "codex", "work",
+                                 "capabilities"]
     # The retired identity key is dropped and named, never its value.
     assert answer["memory"] == "2g" and answer["env_dropped"] == ["AGENT_NODE_NAME"]
     assert answer["volumes_added"] == []
@@ -1117,6 +1121,20 @@ def test_update_gives_a_node_created_before_its_work_volume_that_volume(lab, cap
         "prj_00000000a1a1", "ghcr.io/agenium-dev/agent-node:0.0.10", "2g")
     answer = json.loads(capsys.readouterr().out)
     assert answer["volumes_added"] == ["work"] and answer["redeployed"] is True
+
+
+def test_update_gives_a_node_created_before_its_capabilities_volume_that_volume(lab, capsys):
+    # A node whose image carried the manager and the capabilities mounts
+    # nothing at ~/.capabilities: the update adds the volume new and empty, and
+    # the node's first boot on it installs them there.
+    lab.m.cmd_node_create(create_args())
+    lab.fake.mounts[:] = [m for m in lab.fake.mounts
+                          if m["Destination"] != "/home/agent/.capabilities"]
+    capsys.readouterr()
+    lab.m.cmd_node_update(update_args())
+    assert '"capabilities:/home/agent/.capabilities"' in lab.fake.compose
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["volumes_added"] == ["capabilities"] and answer["redeployed"] is True
 
 
 def test_update_on_the_tag_adds_a_missing_volume(lab, capsys):

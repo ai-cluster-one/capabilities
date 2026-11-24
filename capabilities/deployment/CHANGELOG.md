@@ -1,5 +1,9 @@
 # deployment — change log
 
+## 2026-11-24 — `node create --repository` gives the node a `capabilities` volume, and the agent-node guide says the manager and the capabilities live there
+
+`deployment node create --repository` declares a sixth named volume, `capabilities`, at the node user's `~/.capabilities`, as `capabilities node create` does, so a node built `FROM` the standard image keeps the manager and the capabilities its first boot installs there across a rebuild. `guides/agent-node.md` no longer says the image carries the manager with the whole catalogue or that each boot brings the capabilities to the catalogue the image names: from `agent-node` 0.0.17 they live on that volume, and change only through `capabilities node update`.
+
 ## 2026-11-23 — `deployment runner` is gone, and `deployment machine handover` has moved to the manager
 
 Every node runs an agent-node image whose supervisor runs `capabilities node run`, so no launcher an older deployment compiled is left to run `deployment runner`. The runner is removed with its own supervisor, the lease and service-row turns it took where the manager was too old to, its lock and its child handling: `deployment runner` is answered as any verb deployment does not have (exit 2), and its help page and menu line are gone. `deployment machine handover` and its `--dry-run` run nothing and exit 6 `moved`, naming `capabilities node install --apply`, which hands this Mac's old machine agents over; it is listed with the other moved forms, and the THIS MACHINE menu section is gone. On a machine that still runs `deployment runner` programs or holds an old machine agent loaded, the manager's `capabilities update` keeps the installed deployment, which still has both, until the machine is moved. `deployment services` still reads the record `capabilities node supervise` keeps under `capabilities/deployment/state/runners/` and the lease, and every other verb answers as before.
