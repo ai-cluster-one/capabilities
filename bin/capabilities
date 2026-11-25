@@ -9282,10 +9282,12 @@ def cmd_key(rest: list[str]) -> None:
 
 def _vault_pin(conn, agent_id: str, key: bytes | None, rows: list) -> tuple:
     """(the platform key the agent pinned, the platform key it trusts): the
-    one this machine's platform key file holds, pinned now by this process
-    that holds the agent's key where the pin is another or none - unless the
-    read-only switch is on, which changes nothing - else its pin. The
-    platform key the store publishes is never taken."""
+    one this machine's platform key file holds, pinned again now by this
+    process that holds the agent's key where the pin is another or was taken
+    away (`take_pin`) - unless the read-only switch is on, which changes
+    nothing - else its pin. An agent the platform never pinned stays
+    unpinned here: its first pin is the platform's (a grant or `secrets
+    migrate`). The platform key the store publishes is never taken."""
     vault = _vault_module()
     if key is None:
         return None, None
@@ -9293,7 +9295,6 @@ def _vault_pin(conn, agent_id: str, key: bytes | None, rows: list) -> tuple:
     if (not _store_module().read_only_switch()
             and vault.recorded_key(conn, agent_id)[1] == vault.fingerprint(key)):
         pin = vault.take_pin(conn, key, agent_id, updated_by=_vault_actor())
-        return pin, pin
     return pin, vault.local_platform() or pin
 
 
@@ -9842,20 +9843,24 @@ def _grant_seal(root: Path, name: str, cid: str) -> dict | None:
     actor = _vault_actor()
 
     key, _where, _why = _folder_key(root, True)
+    pinned: list = []
 
     def deliver(conn, _agent):
         plat = _platform_if_here(conn, root)
         if plat is None:
             return False
         if key is not None and vault.recorded_key(conn, agent_id)[1] == vault.fingerprint(key):
-            # The manager holds this agent's key here: it pins both ways itself.
-            platform.write_agent_pin(conn, plat, agent_id, key, updated_by=actor)
+            # The manager holds this agent's key here: it pins both ways itself,
+            # an agent's first pin after sealing again what the pin closes.
+            if platform.write_agent_pin(conn, plat, agent_id, key, updated_by=actor):
+                pinned.append(agent_id)
         if not platform.copies(conn, connection_id=cid):
             return None
         return platform.deliver_connection(conn, plat, cid, agents=[agent_id],
                                            updated_by=actor)
 
     done, _setting = _kernel_run(root, deliver)
+    platform.record_vault_pins(pinned)  # committed
     result: dict = {"sealed": [], "by": ["platform"], "pending": []}
     if done is False:
         result["pending"] = ["the platform key is not on this machine"]
@@ -10007,6 +10012,7 @@ def _key_recover(root: Path) -> dict:
 
     (recorded, delivered, granted, refused, lost, unopened, _changed), setting = \
         _kernel_run(root, recover)
+    platform.record_vault_pins([agent])  # committed
     answer = {"ok": True, "agent": agent, "fingerprint": vault.fingerprint(key),
               "previous_fingerprint": recorded, "public_key": vault.public_text(key),
               "written": str(root / ".env.local"), "delivered": delivered,
@@ -10102,7 +10108,8 @@ def _secrets_migrate(root: Path, picks: dict) -> dict:
             vault.publish(conn, agent_id, key)
             done = vault.reseal(conn, key, agent_id, updated_by=actor)
             if plat is not None:
-                platform.write_agent_pin(conn, plat, agent_id, key, updated_by=actor)
+                if platform.write_agent_pin(conn, plat, agent_id, key, updated_by=actor):
+                    pinned.append(agent_id)
                 trusted = plat.public
             else:
                 # The platform key this agent trusts: its pin, None where it
@@ -10201,8 +10208,10 @@ def _secrets_migrate(root: Path, picks: dict) -> dict:
                     duplicates.append({"capability": capability, "connections": group})
         return agents, not_here, made, kept, disagree, unknown_picks, delivered, duplicates
 
+    pinned: list = []
     (agents, not_here, made, kept, disagree, unknown_picks, delivered, duplicates), setting = \
         _kernel_run(root, migrate)
+    platform.record_vault_pins(pinned)  # committed
     answer = {"ok": True, "agent": own_agent, "agents": agents, "not_here": not_here,
               "platform": "here" if platform.load() is not None else "elsewhere",
               "platform_copies": made, "already_copied": kept, "disagreeing": disagree,

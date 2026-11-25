@@ -272,6 +272,47 @@ def test_migration_reseals_old_vaults_loses_nothing_and_stops_where_copies_disag
     assert all(a["resealed"] == [] for a in again["agents"])
 
 
+def test_a_grant_before_migration_keeps_what_an_older_release_delivered(lab):
+    """The first grant on a machine makes the platform key and pins the agent before
+    `secrets migrate` ran: what an older release delivered (format 2) is sealed again
+    as the agent's own first, so neither grantee loses it, and the machine file's
+    other value does not win over it."""
+    _import(lab)
+    _global_rows_in_force(lab)
+    _ok(_manager(lab, "key", "generate"))
+    peer = _peer(lab)
+    _ok(_manager(peer, "key", "generate"))
+    _install(lab, "coolify")
+    _ok(_feed(lab, json.dumps({"secret_env": "seed-0000"}), COOLIFY, "connection", "add",
+              "personal", "--global", "--field", f"base_url={lab['url']}", "--stdin"))
+    [(cid,)] = _sql(lab, "SELECT id FROM connections WHERE label = 'personal'")
+    for agent in (PROJECT_ID, PEER_ID):
+        _sql(lab, "INSERT INTO grants (agent_id, capability, connection_id, enabled) "
+                  "VALUES (%s, 'coolify', %s, true)", (agent, cid))
+    here = _here(lab)
+    _sql(lab, "INSERT INTO nodes (id, label, kind) VALUES (%s, 'lab-node', 'mac') "
+              "ON CONFLICT (id) DO NOTHING", (here,))
+    for agent, folder in ((PROJECT_ID, lab["project"]), (PEER_ID, peer["project"])):
+        _sql(lab, "INSERT INTO agent_nodes (agent_id, node, folder) VALUES (%s, %s, %s) "
+                  "ON CONFLICT DO NOTHING", (agent, here, str(folder)))
+    mine, theirs = vault.parse_key(_key_text(lab)), vault.parse_key(_key_text(peer))
+    for agent, key in ((PROJECT_ID, mine), (PEER_ID, theirs)):
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("SET search_path TO lab")
+            vault.put_row(conn, agent, NAME, vault.seal_for(
+                vault.public_key(key), agent, NAME, "shared-old-0001"), vault.fingerprint(key))
+    assert not (Path(lab["config"]) / "capabilities" / "platform" / "key").exists()
+    _ok(_manager(lab, "set", "coolify", "grant", "personal", '{"enabled": true}'))
+    assert _pin(lab, mine) is not None
+    assert _show(lab, NAME) == _show(peer, NAME) == "shared-old-0001"
+    found = _ok(_manager(lab, "secrets", "migrate"))
+    assert found["disagreeing"] == []
+    assert _show(lab, NAME) == _show(peer, NAME) == "shared-old-0001"
+    assert vault.pin_of(theirs, PEER_ID, _sql(
+        lab, "SELECT name, ciphertext, key_fingerprint FROM secrets WHERE agent_id = %s",
+        (PEER_ID,))) is not None
+
+
 def test_where_the_platform_key_is_elsewhere_an_agent_migrates_its_own_part(lab):
     """A node: the agent's key lives in its environment, and the platform key the
     store publishes is held on another machine, so it is never pinned from there."""
