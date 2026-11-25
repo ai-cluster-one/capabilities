@@ -246,12 +246,59 @@ def test_a_main_identifier_marks_one_field_that_is_no_secret(lab, fields, proble
     ({"settings": {"homes": [{"scope": "project", "path": "a.json", "format": "json"}],
                    "keys": [{"key": "k", "label": "K", "help": "h", "scope": "project",
                              "apply": "whenever"}]}}, "apply"),
+    *[({"settings": {"homes": [{"scope": "project", "path": "a.json", "format": "json"}],
+                     "keys": [{"key": "mode", "label": "M", "help": "h", "type": "enum",
+                               "choices": ["a", "b"], "scope": "project", "apply": "reload"},
+                              {"key": "k", "label": "K", "help": "h", "scope": "project",
+                               "apply": "reload", **extra}]}}, problem)
+      for extra, problem in [
+          ({"when": {"key": "nothing", "equals": "a"}}, "names no key"),
+          ({"when": {"key": "k", "equals": "a"}}, "the key itself"),
+          ({"when": {"key": "mode", "equals": "c"}}, "when.equals"),
+          ({"when": {"key": "mode"}}, "key and equals"),
+          ({"type": "integer", "unit": "seconds", "group": " "}, ".group"),
+          ({"unit": "seconds"}, "for an integer or a number"),
+          ({"type": "integer", "unit": ""}, ".unit is not"),
+          ({"type": "integer", "multiline": True}, "multiline is for a string"),
+          ({"multiline": "yes"}, "multiline is not a boolean")]],
 ])
 def test_the_manager_refuses_a_malformed_declaration(lab, broken, problem):
     manifest = json.loads(_run(lab, "manifest").stdout)
     manifest.update(broken)
     problems = M._validate_manifest(NAME, manifest)
     assert any(problem in p for p in problems), problems
+
+
+def test_settings_keys_say_their_section_condition_text_and_unit(lab):
+    """A key's group, its condition on another key, multi-line text and unit
+    are carried by the manifest and the settings report, validate, and leave
+    the key read and written as before."""
+    text = _fixture_text().replace(
+        '"type": "integer", "default": 60, "minimum": 1, "scope": "project",\n'
+        '         "apply": "reload"},',
+        '"type": "integer", "default": 60, "minimum": 1, "scope": "project",\n'
+        '         "apply": "reload", "group": "Limits", "unit": "seconds"},', 1).replace(
+        '"choices": ["a", "b"], "scope": "global", "apply": "next_call"},',
+        '"choices": ["a", "b"], "scope": "global", "apply": "next_call",\n'
+        '         "group": "Greeting"},\n'
+        '        {"key": "greeting", "label": "Greeting", "help": "What is said.",\n'
+        '         "scope": "global", "apply": "next_call", "group": "Greeting",\n'
+        '         "multiline": True, "when": {"key": "mode", "equals": "b"}},', 1)
+    assert '"unit": "seconds"' in text and '"multiline": True' in text
+    lab["script"].write_text(text)
+    manifest = json.loads(_run(lab, "manifest").stdout)
+    keys = {k["key"]: k for k in manifest["settings"]["keys"]}
+    assert keys["poll_seconds"]["unit"] == "seconds"
+    assert keys["poll_seconds"]["group"] == "Limits"
+    assert keys["greeting"]["when"] == {"key": "mode", "equals": "b"}
+    assert keys["greeting"]["multiline"] is True
+    assert M._validate_manifest(NAME, manifest) == []
+    written = _run(lab, "settings", "set", "greeting", "Hello,\nhow can I help?")
+    assert written.returncode == 0, written.stderr
+    report = json.loads(_run(lab, "settings", "--scope", "global").stdout)
+    greeting = next(k for k in report["keys"] if k["key"] == "greeting")
+    assert greeting["value"] == "Hello,\nhow can I help?"
+    assert greeting["when"] == {"key": "mode", "equals": "b"}
 
 
 # --- connection add | remove ---------------------------------------------------

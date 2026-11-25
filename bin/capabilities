@@ -2197,7 +2197,52 @@ def _validate_fields(where: str, fields, setting: bool = False) -> list[str]:
                 problems.append(f"{at}.apply {field.get('apply')!r} not {'|'.join(SETTING_APPLY)}")
             if field.get("secret"):
                 problems.append(f"{at} is a secret, and settings hold none")
+            # How a panel draws the key: its section, text over several
+            # lines, the unit beside a number (SHEBANG.md, Settings).
+            if "group" in field and (
+                    not isinstance(field["group"], str) or not field["group"].strip()
+                    or "\n" in field["group"]):
+                problems.append(f"{at}.group is not one line of non-empty text")
+            if "multiline" in field:
+                if not isinstance(field["multiline"], bool):
+                    problems.append(f"{at}.multiline is not a boolean")
+                elif field["multiline"] and field.get("type", "string") != "string":
+                    problems.append(f"{at}.multiline is for a string, not "
+                                    f"{field.get('type')!r}")
+            if "unit" in field:
+                if not isinstance(field["unit"], str) or not field["unit"].strip():
+                    problems.append(f"{at}.unit is not non-empty text")
+                elif field.get("type") not in ("integer", "number"):
+                    problems.append(f"{at}.unit is for an integer or a number, not "
+                                    f"{field.get('type', 'string')!r}")
     return problems
+
+
+def _setting_condition_problems(at: str, field: dict, keys: list) -> list[str]:
+    """`when` on a settings key: `{key, equals}`, shown only while another key
+    declared at the same scope holds that value (SHEBANG.md, Settings)."""
+    when = field["when"]
+    if not isinstance(when, dict) or set(when) != {"key", "equals"}:
+        return [f"{at}.when is not an object of key and equals"]
+    if not isinstance(when["key"], str) or not when["key"].strip():
+        return [f"{at}.when.key is not a key"]
+    if when["key"] == field.get("key"):
+        return [f"{at}.when.key names the key itself"]
+    other = next((k for k in keys if isinstance(k, dict) and k.get("key") == when["key"]
+                  and k.get("scope") == field.get("scope")), None)
+    if other is None:
+        return [f"{at}.when.key {when['key']!r} names no key declared at "
+                f"{field.get('scope')!r}"]
+    kind, value = other.get("type", "string"), when["equals"]
+    fits = {"integer": isinstance(value, int) and not isinstance(value, bool),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+            "boolean": isinstance(value, bool),
+            "enum": value in (other.get("choices") or []) and isinstance(value, str),
+            "list": False, "object": False}.get(kind, isinstance(value, str))
+    if not fits:
+        return [f"{at}.when.equals {value!r} is not a value {when['key']!r} "
+                f"({kind}) can hold"]
+    return []
 
 
 def _validate_service_sign_ins(name: str, declared) -> list[str]:
@@ -2355,6 +2400,9 @@ def _validate_settings_declaration(declared) -> list[str]:
                     and key["scope"] not in scopes:
                 problems.append(f"settings.keys[{index}] lives at {key['scope']!r}, "
                                 "where no home is declared")
+            if isinstance(key, dict) and "when" in key:
+                problems += _setting_condition_problems(
+                    f"settings.keys[{index}]", key, declared["keys"])
     return problems
 
 
