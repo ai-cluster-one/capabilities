@@ -118,3 +118,34 @@ def test_the_audit_holds_a_given_verdict_to_its_shape():
     assert problems({"state": "running", "ok": False, "problem": "it is stale"}) == []
     assert problems({"state": "running", "ok": "yes"}) != []
     assert problems({"state": "running", "ok": False}) != []
+
+
+def test_naming_capabilities_reads_the_records_of_those_alone(monkeypatch, tmp_path):
+    asked = []
+
+    class Records:
+        def connections(self, name, include_disabled=False):
+            asked.append(name)
+            return {}
+
+        def get(self, name, collection, key):
+            asked.append(name)
+            return None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(M, "_policy_views", lambda root: ({}, {}))
+    monkeypatch.setattr(M, "_installed", lambda: {"alpha": {}, "beta": {}, "gamma": {}})
+    monkeypatch.setattr(M, "_effective_gate_state", lambda *args: ("enabled", "project"))
+    monkeypatch.setattr(M, "_load_snapshots", lambda name: (None, {"summary": name}))
+    monkeypatch.setattr(M, "_records_for", lambda root: Records())
+    monkeypatch.setattr(M, "_capability_tier", lambda name: None)
+    monkeypatch.setattr(M, "_has_icon", lambda path: False)
+    monkeypatch.setattr(M, "_registry_dir", lambda name: tmp_path)
+
+    assert [row["name"] for row in M._inventory_rows(tmp_path, ["beta"])] == ["beta"]
+    assert set(asked) == {"beta"}
+    asked.clear()
+    assert [row["name"] for row in M._inventory_rows(tmp_path)] == ["alpha", "beta", "gamma"]
+    assert set(asked) == {"alpha", "beta", "gamma"}

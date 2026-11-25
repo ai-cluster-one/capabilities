@@ -1796,6 +1796,6 @@
       "version": "2026-11-22 — `youtrack help` is the menu, and `youtrack help <verb>` one verb's whole contract"
     }
   },
-  "contract_library": "0.55.0",
+  "contract_library": "0.56.0",
   "store_major": 4
 }

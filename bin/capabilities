@@ -392,7 +392,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.55.0"
+CONTRACT_LIBRARY_RELEASE = "0.56.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -5951,15 +5951,20 @@ def cmd_list() -> None:
         out["enabled_not_installed"] = enabled_not_installed
     _emit(out)
 
-def _inventory_rows(root: Path) -> list[dict]:
+def _inventory_rows(root: Path, wanted: list[str] | None = None) -> list[dict]:
     """One row per effective-enabled capability, from the registry snapshots
-    and the project's own records — no capability is executed to build it."""
+    and the project's own records — no capability is executed to build it.
+    Given `wanted`, only those capabilities are read, so naming one costs the
+    records of that one."""
     project_caps, global_caps = _policy_views(root)
     installed = _installed()
+    only = set(wanted or ())
     adapter = _records_for(root)
     rows: list[dict] = []
     try:
         for name in sorted(installed):
+            if only and name not in only:
+                continue
             effective, source = _effective_gate_state(
                 name, project_caps.get(name), global_caps.get(name))
             if effective != "enabled":
@@ -6062,7 +6067,7 @@ def cmd_inventory(detail: bool, network: bool, wanted: list[str]) -> None:
     exactly one per capability. Either way they are spent at the same time,
     which is the whole reason this lives here rather than in every caller."""
     root = _require_project()
-    rows = _inventory_rows(root)
+    rows = _inventory_rows(root, wanted)
     if wanted:
         known = {row["name"] for row in rows}
         missing = [n for n in wanted if n not in known]
