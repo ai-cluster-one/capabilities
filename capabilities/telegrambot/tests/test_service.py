@@ -333,6 +333,12 @@ def test_a_turn_hands_work_to_a_job_that_is_delivered(tmp_path, home, telegram, 
         assert found.returncode == 0, found.stderr
         job = json.loads(found.stdout)
         assert job["chat_id"] == 42 and job["origin_message_id"] == 7   # the turn's, not ours
+        # Adding to its own draft hands nothing over, so the turn is not ended for it.
+        added = subprocess.run(python + ["jobs", "amend", job["id"][:8], "only Q3"],
+                               env=env, capture_output=True, text=True, cwd=str(root))
+        assert added.returncode == 0, added.stderr
+        outbox = Path(env["TELEGRAMBOT_PROGRESS_OUTBOX"])
+        assert '"amended"' not in (outbox.read_text() if outbox.exists() else "")
         done = subprocess.run(python + ["jobs", "submit", job["id"][:8],
                                         "--confirm-active-jobs-checked"],
                               env=env, capture_output=True, text=True, cwd=str(root))

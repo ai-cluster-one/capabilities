@@ -616,7 +616,8 @@ class JobRegister:
         self.amendments: list[tuple] = []
 
     def open_jobs(self, chat_id=None, topic_id=None, *, actor_id=None, include_drafts=False):
-        return [dict(r) for r in self.rows if r["state"] in ("waiting", "running")
+        states = ("waiting", "running") + (("draft",) if include_drafts else ())
+        return [dict(r) for r in self.rows if r["state"] in states
                 and r["chat_id"] == chat_id and r["topic_id"] == topic_id
                 and (actor_id is None or r["requested_by"] == actor_id)]
 
@@ -672,6 +673,22 @@ def test_a_turn_is_given_its_chats_open_jobs_by_the_service(tmp_path):
     dialogue.offer_update(update(10, "and now?"))
     drain(dialogue, clock)
     assert "Open jobs here: none" in runner.calls[1]["prompt"]
+    # A draft the turn has not submitted yet is in the chat's view too.
+    dialogue.jobs = Jobs([running_job(id="0123abcd-0000-0000-0000-000000000000",
+                                      state="draft", description="only Q3")])
+    dialogue.offer_update(update(11, "Q3 only"))
+    drain(dialogue, clock)
+    assert "- job 0123abcd draft, asked by Ann, from #5: only Q3" in runner.calls[2]["prompt"]
+
+
+def test_a_chat_that_narrows_its_reactions_still_gets_a_marker(tmp_path):
+    dialogue, store, api, runner, clock = make(tmp_path, DELEGATING)
+    dialogue.jobs = Jobs([running_job()])
+    api.get_chat = lambda chat: {"id": chat, "available_reactions": [
+        {"type": "emoji", "emoji": "👌"}, {"type": "emoji", "emoji": "🔥"}]}
+    dialogue.offer_update(update(9, "only Q3, please", reply_to_message={"message_id": 5}))
+    drain(dialogue, clock)
+    assert d.AMEND_REACTION == "👨‍💻" and api.reactions == [(ANN, 9, "👌")]
 
 
 def test_a_reply_to_a_running_job_is_added_to_it_and_no_turn_answers_it(tmp_path):

@@ -1613,7 +1613,7 @@
       "level": 0,
       "lucide_icon": "bot-message-square",
       "path": "capabilities/telegrambot",
-      "payload_sha256": "b30436e0eb3162b29e93060a84071795734249731632551372c9b1ebdc8caa24",
+      "payload_sha256": "cff0af16f77d73de83b4d00a8e755099e34c98334d3df30a9ddbbca629d9b61d",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's own Telegram channel through a bot - new messages and every write over the HTTP Bot API, history read back from Telegram by message number through an MTProto session the bot's token signs in, the chats and people the bot has seen, and the agent's prompts over the shipped standard; nothing keeps a copy of the conversation.",
@@ -1629,7 +1629,7 @@
           "title": "Telegram-бот"
         }
       },
-      "version": "2026-11-24 — A telegrambot connection is its agent's own account, never granted to another agent"
+      "version": "2026-11-25 — A turn that adds to its own draft still answers, and work handed to a job is marked 👨‍💻"
     },
     "vapic": {
       "executable": [

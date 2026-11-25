@@ -1,5 +1,9 @@
 # telegrambot — change log
 
+## 2026-11-25 — A turn that adds to its own draft still answers, and work handed to a job is marked 👨‍💻
+
+A turn that opened a draft job and added to it with `jobs amend` before submitting - as the delegation prompt tells it to - was taken for one that had handed its message over and was cut short after its grace, so the person got no reply, often only a reaction, while the draft sat unsubmitted. Adding to a draft no longer counts as a handover: the turn runs to its end and its reply is sent. Adding to a waiting, running or finished job, and submitting one, hand the message over as before. `Channel state` now lists the chat's drafts beside its waiting and running jobs; a reply to a draft's message still starts a turn rather than being added to the draft. The reaction marking a message that went to background work is 👨‍💻 in place of ✍, and a chat that narrows its reactions without it gets 👀, 👌, 👍 or else the first reaction it allows, rather than a refused reaction and no marker. No verb, flag, setting or JSON key changes.
+
 ## 2026-11-24 — A telegrambot connection is its agent's own account, never granted to another agent
 
 `CONN_KINDS = ("own",)` declares every telegrambot connection one agent's own bot, its identity outside, so the manager refuses a grant giving one to any agent but the one that owns it (`connection_own_kind`). A connection an agent adds in its own folder is its own as before; nothing it does changes, and no verb, flag or JSON key changes.

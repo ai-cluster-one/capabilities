@@ -57,7 +57,10 @@ HANDOFF_GRACE = 8.0
 # What a message handed to a job, rather than answered, is marked with when the
 # turn says nothing of its own: a reaction, so the job's own answer stays the
 # only one and nothing of the job's brief reaches the chat.
-AMEND_REACTION = "✍"
+AMEND_REACTION = "👨‍💻"
+# What marks it instead in a chat whose reactions leave that one out: the first
+# of these the chat allows, else the first reaction it allows at all.
+AMEND_REACTION_FALLBACKS = ("👀", "👌", "👍")
 # How many messages the service sent for a job it remembers, so a reply to one
 # of them reaches that job.
 JOB_MESSAGES_KEPT = 500
@@ -846,11 +849,23 @@ class Dialogue:
             while len(self.job_messages) > JOB_MESSAGES_KEPT:
                 self.job_messages.popitem(last=False)
 
-    def channel_jobs(self, chat, topic, *, actor_id=None) -> list[dict]:
-        """The waiting and running jobs of one chat or topic, as the register holds them."""
+    def channel_jobs(self, chat, topic, *, actor_id=None, include_drafts=False) -> list[dict]:
+        """The waiting and running jobs of one chat or topic, as the register holds
+        them, and its drafts too with `include_drafts`."""
         if self.jobs is None:
             return []
-        return self.jobs.register.open_jobs(chat, topic or 0, actor_id=actor_id)
+        return self.jobs.register.open_jobs(chat, topic or 0, actor_id=actor_id,
+                                            include_drafts=include_drafts)
+
+    def mark_handed_over(self, chat, message_id) -> None:
+        """Mark a message that went to a job with AMEND_REACTION, or with what the
+        chat allows in its place, so a chat that narrows its reactions still
+        shows a marker rather than a refused reaction."""
+        allowed = self.gate_module.allowed_emoji(self.available_reactions(chat))
+        emoji = next((one for one in (AMEND_REACTION, *AMEND_REACTION_FALLBACKS)
+                      if one in allowed), allowed[0] if allowed else None)
+        if emoji:
+            self.api.react(chat, message_id, emoji)
 
     def linked_job(self, job) -> dict | None:
         """The open job a message is a reply to: its origin message, or a message
@@ -892,17 +907,17 @@ class Dialogue:
             self.store.finish(self.agent_id, self.connection, job["chat_id"],
                               job["topic_id"] or 0, [job["message_id"]])
         with contextlib.suppress(Exception):
-            self.api.react(job["chat_id"], job["message_id"], AMEND_REACTION)
+            self.mark_handed_over(job["chat_id"], job["message_id"])
         self.stats["added_to_job"] += 1
         self.log(f"{job['chat_id']} #{job['message_id']} added to job {row['id'][:8]}")
         return True
 
     def jobs_state(self, chat, topic) -> list[str]:
-        """The `Channel state` lines naming the chat's open jobs."""
+        """The `Channel state` lines naming the chat's open jobs, drafts included."""
         if self.jobs is None:
             return []
         try:
-            rows = self.channel_jobs(chat, topic)
+            rows = self.channel_jobs(chat, topic, include_drafts=True)
         except Exception as exc:
             return [f"Open jobs here: unknown, the register did not answer ({type(exc).__name__})"]
         if not rows:
@@ -1759,7 +1774,7 @@ class Dialogue:
                 else:
                     self.note_job_message(chat, [last["message_id"]], run.handoff.get("id"))
                     with contextlib.suppress(Exception):
-                        self.api.react(last["chat_id"], last["message_id"], AMEND_REACTION)
+                        self.mark_handed_over(last["chat_id"], last["message_id"])
                 outcome = "handed_off"
                 return
             if run.amended is not None:
@@ -1769,7 +1784,7 @@ class Dialogue:
                     self.note_job_message(chat, self.say(last, answer), run.amended["id"])
                 else:
                     with contextlib.suppress(Exception):
-                        self.api.react(last["chat_id"], last["message_id"], AMEND_REACTION)
+                        self.mark_handed_over(last["chat_id"], last["message_id"])
                 outcome = "added_to_job"
                 return
             if run.stopped:
@@ -1809,9 +1824,10 @@ class Dialogue:
             self.log(f"{chat}{'/' + str(topic) if topic else ''} #{ids[0]} turn {outcome}")
 
     def watch_handoff(self, run: Run, ended: threading.Event, first) -> None:
-        """A turn that submits a job, or adds to one of its chat's jobs, has handed
-        the work over: it is given a short grace to say its line and then ended,
-        and the job's answer is the only one."""
+        """A turn that submits a job, or adds to one of its chat's submitted jobs,
+        has handed the work over: it is given a short grace to say its line and
+        then ended, and the job's answer is the only one. Adding to a draft is no
+        handover - the CLI does not report it - so that turn answers as usual."""
         while not ended.wait(HANDOFF_POLL):
             with contextlib.suppress(Exception):
                 row = self.jobs.register.submitted_from(first["chat_id"],
