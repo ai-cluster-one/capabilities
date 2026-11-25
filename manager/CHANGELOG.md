@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-25 — `init --template` makes no Git repository
+
+Creating an agent from a template no longer runs `git init`: the new agent's folder holds no `.git`, as an agent created by `init` already does not. Everything else the creation writes - to the folder and to the store - is unchanged. The answer keeps its `git` key, now `{present: false, initialized: false, checkpoint: {required: false, created: false}}`; a folder that already held a `.git` is answered as before, `present: true` with its `path`. `bootstrap` still makes its repository and checkpoint. No verb, flag or exit code changes.
+
 ## 2026-11-25 — A capability call spends one round trip, not eight, checking its tables, and `inventory <name>` reads that capability's records alone
 
 A read-only capability call such as `context list` answered its store checks one statement at a time: each `migrate` whose steps were all applied read the core's tables, then its own, in transactions of about eight round trips each, and the store-major read took four. capabilities-contract 0.56.0 answers an applied `migrate` - the core's steps and the owner's together - in one read, and `store_major` in one read, each one round trip on an idle transaction connection; anything not yet applied, or a refusal, is judged by the locked path exactly as before. On a store 55 ms away `context list --json` went from 39 round trips and about 2.5 s to 9 round trips and about 0.9 s, with the same output. `capabilities inventory <name>` reads the connections and default pointer of the named capabilities only, rather than of every enabled one, so `inventory context --detail` went from 46 round trips to 19 there, with the same rows. No verb, flag, output or exit code changes. The package ships with capabilities-contract 0.56.0.

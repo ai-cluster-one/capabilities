@@ -1466,7 +1466,10 @@ def test_init_template_creates_an_agent_in_the_store_from_a_template(lab, tmp_pa
     answer = json.loads(result.stdout)
     assert [(c["name"], c["result"]) for c in answer["capabilities"]] == [("absent-cap", "failed")]
     folder = made.folder
-    assert (folder / ".git").is_dir()
+    # A new agent gets no Git repository, and the answer says none was made.
+    assert not (folder / ".git").exists()
+    assert answer["git"] == {"present": False, "initialized": False,
+                             "checkpoint": {"required": False, "created": False}}
     _no_contextkit(folder)
     # The template's body layers are written to the store by the capabilities that own them.
     template = made.templates / "agents" / "demo"

@@ -32219,14 +32219,18 @@ def cmd_init_template(template_id: str, name: str | None, new_id: str | None = N
              + ", ".join(present[:5]) + (", ..." if len(present) > 5 else ""),
              "nothing was changed; choose an empty folder, or bind an existing project "
              "with `capabilities bootstrap`")
-    # The agent starts in the store: refuse it before the repository is made.
+    # The agent starts in the store: refuse it before the folder is touched.
     _preflight_new_agent(root)
     if new_id is not None:
         _refuse_held_new_id(root, new_id)
     creation = _Creation(root)
     creation.arm()
+    # A new agent gets no Git repository; `git` answers whether the folder holds one.
+    git = {"present": False, "initialized": False,
+           "checkpoint": {"required": False, "created": False}}
+    if (root / ".git").exists():
+        git.update(present=True, path=str(root / ".git"))
     try:
-        git = _ck_prepare_git(root, yes=True)
         if name is None:
             name = secrets.choice(template["agent_names"])
         result = _init(claude=True, codex=False, layers=True, name=name, creation=creation,
@@ -37131,10 +37135,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
      """\
   init --template <id> [--name <name>] [--new-id <id>]
         Create a new agent in an empty folder (a .git or .DS_Store aside)
-        from one of the agent templates: git init, the agent --with-layers
-        binds (through the new-agent path above, so it starts in the store
-        and is refused there), the template's context, routines and assets
-        written to the agent's store by `context import`, `routine import`
+        from one of the agent templates, with no Git repository made: the
+        agent --with-layers binds (through the new-agent path above, so it
+        starts in the store and is refused there), the template's context,
+        routines and assets written to the agent's store by `context import`,
+        `routine import`
         and `assets import`, its icon, name - --name, or one the template
         offers - description and onboarding in the agent row, under
         --new-id where given (refused as init refuses it, before the folder
@@ -37142,10 +37147,10 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         through `list`,
         both hosts wired by `hooks install`, and the first build. The folder
         gets no .contextkit/ and no body folders. Answers {project, created,
-        imported, template, ok, git, identity {id, name, description,
-        icon_sha}, onboarding, capabilities [{name, result, effective,
-        detail}], hooks, build}; exits 1 with the agent created when a
-        capability could not be enabled. A step that fails leaves the folder
+        imported, template, ok, git {present, initialized: false, path?,
+        checkpoint}, identity {id, name, description, icon_sha}, onboarding,
+        capabilities [{name, result, effective, detail}], hooks, build}; exits
+        1 with the agent created when a capability could not be enabled. A step that fails leaves the folder
         as it was and no agent registered, and exits with that step's error
         (capability_missing, exit 5, where context, routine or assets is not
         installed; layer_import_failed with the import's own exit). Exit 6
