@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 MANAGER = Path(__file__).parents[1] / "bin" / "capabilities"
 
@@ -19,12 +21,18 @@ def _project(tmp_path: Path) -> Path:
     return project
 
 
-def _watched(env: dict[str, str], watched: bool) -> dict:
+# The host a watched hook runs under: it holds a terminal and starts the hook
+# in a session of its own, with none, as Codex starts its hooks.
+_HOST = "import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], start_new_session=True).returncode)"
+
+
+def _watched(env: dict[str, str], watched: bool) -> tuple[list[str], dict]:
     """Run as a session a person watches, or as one nobody does: Claude's own
-    attended marker, and a controlling terminal for a host that states none."""
+    attended marker, and for a host that states none a terminal held above the
+    hook, or none anywhere above it."""
     env["CLAUDE_CODE_SESSION_ATTENDED"] = "1" if watched else "0"
     if not watched:
-        return {"start_new_session": True}
+        return [], {"start_new_session": True}
     import fcntl
     import pty
     import termios
@@ -34,7 +42,16 @@ def _watched(env: dict[str, str], watched: bool) -> dict:
         os.setsid()
         fcntl.ioctl(terminal, termios.TIOCSCTTY, 0)
 
-    return {"preexec_fn": attach, "pass_fds": (terminal,)}
+    return [sys.executable, "-c", _HOST], {"preexec_fn": attach, "pass_fds": (terminal,)}
+
+
+def _skip_on_a_terminal() -> None:
+    """A hook this run starts has the run's own terminal above it, so it cannot run unwatched."""
+    try:
+        os.close(os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY))
+    except OSError:
+        return
+    pytest.skip("the test run holds a terminal, so no hook it starts runs unwatched")
 
 
 def _run(tmp_path: Path, project: Path, *args: str,
@@ -46,9 +63,9 @@ def _run(tmp_path: Path, project: Path, *args: str,
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "CLAUDE_PROJECT_DIR": str(project),
     })
-    session = _watched(env, watched)
+    host, session = _watched(env, watched)
     return subprocess.run(
-        [sys.executable, str(MANAGER), *args],
+        [*host, sys.executable, str(MANAGER), *args],
         cwd=project,
         env=env,
         text=True,
@@ -119,6 +136,7 @@ def test_claude_hook_speaks_only_when_the_loaded_copy_is_missing_or_stale(
 
 
 def test_hook_tells_a_session_nobody_watches_nothing(tmp_path: Path) -> None:
+    _skip_on_a_terminal()
     project = _project(tmp_path)
     _json(_run(tmp_path, project, "init", "--claude", "--codex"))
     context = project / ".claude" / "rules" / "CAPABILITIES.md"
@@ -136,6 +154,29 @@ def test_hook_tells_a_session_nobody_watches_nothing(tmp_path: Path) -> None:
     (project / "AGENTS.md").write_text("# Project notes\n")
     assert _hook(tmp_path, project, "codex", watched=False) == ""
     assert "did not load in this session" in _hook(tmp_path, project, "codex")
+
+
+def test_codex_hook_asks_its_transcript_which_client_started_the_session(tmp_path: Path) -> None:
+    # Codex runs every hook with no terminal above it once its TUI hands the
+    # session to its app-server daemon; the transcript names the client.
+    project = _project(tmp_path)
+    _json(_run(tmp_path, project, "init", "--codex"))
+    context = project / ".codex" / "generated" / "capabilities.md"
+    transcript = tmp_path / "rollout.jsonl"
+
+    def hook(originator: str, watched: bool) -> str:
+        transcript.write_text(json.dumps({"type": "session_meta", "payload": {
+            "id": "session", "originator": originator, "source": "vscode"}}) + "\n")
+        context.unlink()
+        result = _run(tmp_path, project, "context", "--codex", watched=watched, stdin=json.dumps({
+            "session_id": "session", "transcript_path": str(transcript), "cwd": str(project),
+            "hook_event_name": "SessionStart", "source": "startup"}))
+        assert result.returncode == 0, result.stderr
+        assert context.is_file()
+        return result.stdout
+
+    assert "created the capability context" in hook("codex-tui", watched=False)
+    assert hook("codex_python_sdk", watched=True) == ""
 
 
 def test_hook_tells_a_resumed_session_of_no_stale_copy(tmp_path: Path) -> None:

@@ -29174,22 +29174,82 @@ def _session_start_payload() -> dict | None:
     return None
 
 
-def _session_watched(host: str) -> bool:
+def _session_watched(host: str, payload: dict | None = None) -> bool:
     """Whether a person watches the host session this SessionStart hook runs in.
 
     Claude Code states it in `CLAUDE_CODE_SESSION_ATTENDED` for every process
-    a session starts. A host that states nothing is watched when the hook has
-    a controlling terminal: a service daemon has none, so its turns are not.
+    a session starts. Codex names the client that started the session as the
+    `originator` of its transcript: a session an SDK started is a program's,
+    `codex exec` is decided by its terminal, and any other client - the TUI,
+    an editor, the desktop app - is a person's. Otherwise a session is watched
+    when the hook or a process above it holds a controlling terminal: a
+    service daemon and every turn it starts hold none.
     """
     if host == "claude":
         attended = os.environ.get("CLAUDE_CODE_SESSION_ATTENDED")
         if attended in ("0", "1"):
             return attended == "1"
+    if host == "codex":
+        originator = _codex_originator(payload)
+        if originator is not None and originator != "codex_exec":
+            return "sdk" not in originator.lower()
     try:
         os.close(os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY))
     except OSError:
-        return False
+        return _ancestor_has_terminal()
     return True
+
+
+def _codex_originator(payload: dict | None) -> str | None:
+    """The client Codex records as having started this session, from the
+    `session_meta` line that opens the transcript the hook payload names."""
+    path = payload.get("transcript_path") if isinstance(payload, dict) else None
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        with open(path, "rb") as transcript:
+            meta = json.loads(transcript.readline(4 * 1024 * 1024))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict) or meta.get("type") != "session_meta":
+        return None
+    session = meta.get("payload")
+    originator = session.get("originator") if isinstance(session, dict) else None
+    return originator if isinstance(originator, str) and originator else None
+
+
+def _ancestor_has_terminal() -> bool:
+    """Whether a process above this one holds a controlling terminal."""
+    parents: dict[int, tuple[int, bool]] = {}
+    proc = Path("/proc")
+    if (proc / "self" / "stat").exists():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+                fields = stat[stat.rindex(")") + 2:].split()
+                parents[int(entry.name)] = (int(fields[1]), int(fields[4]) != 0)
+            except (OSError, ValueError, IndexError):
+                continue
+    else:
+        try:
+            listing = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,tty="],
+                                     capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+        for line in listing.splitlines():
+            fields = line.split()
+            if len(fields) == 3 and fields[0].isdigit() and fields[1].isdigit():
+                parents[int(fields[0])] = (int(fields[1]), fields[2].strip("?-") != "")
+    pid, seen = os.getppid(), set()
+    while pid > 1 and pid not in seen and pid in parents:
+        seen.add(pid)
+        ppid, terminal = parents[pid]
+        if terminal:
+            return True
+        pid = ppid
+    return False
 
 
 def _session_resumed(payload: dict | None) -> bool:
@@ -29255,7 +29315,7 @@ def cmd_context(host: str) -> None:
     if payload is not None:
         notice = _session_notice(host, _session_resumed(payload))
         if notice is not None:
-            if _session_watched(host):
+            if _session_watched(host, payload):
                 sys.stdout.write(notice)
             return
     root = _require_project()
@@ -30369,13 +30429,14 @@ def cmd_session_start(host: str) -> None:
     # A project that is no agent keeps the manager's own session notice. The
     # context is rebuilt for every session; a session nobody watches is told
     # nothing, since whatever it is told reaches whoever its output reaches.
-    resumed = _session_resumed(_session_start_payload())
+    payload = _session_start_payload()
+    resumed = _session_resumed(payload)
     root = _project_root()
     if root is None or not _agent_project(root.resolve()):
         notice = _session_notice(host, resumed)
     else:
         notice = _ck_session_notice(root.resolve(), host, resumed)
-    if notice and _session_watched(host):
+    if notice and _session_watched(host, payload):
         sys.stdout.write(notice)
 
 
@@ -38217,8 +38278,9 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         .claude/rules/CONTEXT.md not linked). A session the host payload marks
         `source: resume` is not told of a created or changed context, and a
         session nobody watches is told nothing: Claude's
-        CLAUDE_CODE_SESSION_ATTENDED=0, or for a host that states nothing, no
-        controlling terminal, as a service's turns have. It always exits 0 and the
+        CLAUDE_CODE_SESSION_ATTENDED=0; a Codex session whose transcript names an
+        SDK as the client that started it, as a service's turns are; otherwise no
+        controlling terminal above the hook. It always exits 0 and the
         context reaches the agent through the host's own file loading. In a
         project with neither a .contextkit/config.toml binding nor a project
         id it gives the notice `context` gives as a hook.

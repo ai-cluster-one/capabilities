@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 MANAGER = Path(__file__).parents[1] / "bin" / "capabilities"
 YOUTRACK = Path(__file__).parents[1] / "capabilities" / "youtrack" / "bin" / "youtrack"
@@ -627,12 +629,18 @@ def _contextkit_wired(tmp_path: Path) -> Path:
     return project
 
 
-def _watched(env: dict[str, str], watched: bool) -> dict:
+# The host a watched hook runs under: it holds a terminal and starts the hook
+# in a session of its own, with none, as Codex starts its hooks.
+_HOST = "import subprocess, sys; sys.exit(subprocess.run(sys.argv[1:], start_new_session=True).returncode)"
+
+
+def _watched(env: dict[str, str], watched: bool) -> tuple[list[str], dict]:
     """Run as a session a person watches, or as one nobody does: Claude's own
-    attended marker, and a controlling terminal for a host that states none."""
+    attended marker, and for a host that states none a terminal held above the
+    hook, or none anywhere above it."""
     env["CLAUDE_CODE_SESSION_ATTENDED"] = "1" if watched else "0"
     if not watched:
-        return {"start_new_session": True}
+        return [], {"start_new_session": True}
     import fcntl
     import pty
     import termios
@@ -642,7 +650,16 @@ def _watched(env: dict[str, str], watched: bool) -> dict:
         os.setsid()
         fcntl.ioctl(terminal, termios.TIOCSCTTY, 0)
 
-    return {"preexec_fn": attach, "pass_fds": (terminal,)}
+    return [sys.executable, "-c", _HOST], {"preexec_fn": attach, "pass_fds": (terminal,)}
+
+
+def _skip_on_a_terminal() -> None:
+    """A hook this run starts has the run's own terminal above it, so it cannot run unwatched."""
+    try:
+        os.close(os.open("/dev/tty", os.O_RDONLY | os.O_NOCTTY))
+    except OSError:
+        return
+    pytest.skip("the test run holds a terminal, so no hook it starts runs unwatched")
 
 
 def _hooks_run(tmp_path: Path, project: Path, *args: str, stdin: str | None = None,
@@ -656,8 +673,9 @@ def _hooks_run(tmp_path: Path, project: Path, *args: str, stdin: str | None = No
         "CODEX_HOME": str(tmp_path / "codex"),
         "PATH": f"{tmp_path / 'bin'}{os.pathsep}{env.get('PATH', '')}",
     })
-    return subprocess.run([sys.executable, str(MANAGER), *args], cwd=project, env=env, text=True,
-                          capture_output=True, timeout=60, input=stdin, **_watched(env, watched))
+    host, session = _watched(env, watched)
+    return subprocess.run([*host, sys.executable, str(MANAGER), *args], cwd=project, env=env, text=True,
+                          capture_output=True, timeout=60, input=stdin, **session)
 
 
 def test_session_start_rebuilds_the_context_and_tells_the_session_only_what_it_must(tmp_path: Path) -> None:
@@ -702,6 +720,7 @@ def _session_payload(project: Path, source: str) -> str:
 
 
 def test_session_start_tells_a_session_nobody_watches_nothing(tmp_path: Path) -> None:
+    _skip_on_a_terminal()
     project = _contextkit_wired(tmp_path)
     output = project / ".contextkit" / "generated" / "context.md"
     mission = project / "context" / "identity" / "MISSION.md"
