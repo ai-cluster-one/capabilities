@@ -125,6 +125,11 @@ PID_FILE = "daemon.pid"
 FINGERPRINT_FILE = "daemon.fingerprint"
 STATUS_FILE = "daemon.json"
 LOG_FILE = "daemon.log"
+# The code this daemon runs, set by the executable that loads it: a digest of
+# that executable and this module as they were read when it started. It is
+# published, so a later executable can tell a daemon running other code,
+# which reckons its declaration differently and only a restart brings current.
+CODE: str | None = None
 PAUSE_FILE = "paused.json"
 # The line of every worker no line names, as a line pause names it.
 DEFAULT_LINE = "default"
@@ -767,6 +772,7 @@ class ProjectSlot:
             "state": state,
             "reason": why,
             "fingerprint": self.declaration["fingerprint"],
+            "code": CODE,
             "wake_by": ("notification" if listening and self.notification_installed
                         else "poll"),
             "notification": {"channel": self.host.channel, "listening": listening,

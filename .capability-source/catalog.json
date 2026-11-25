@@ -1425,7 +1425,7 @@
       "level": 0,
       "lucide_icon": "circle-check",
       "path": "capabilities/tasks",
-      "payload_sha256": "d9cb0ab6df379180173744d840d3294c29341254a731e42d2b47788062cffb4e",
+      "payload_sha256": "5951b7ac7856a5288c38634cc86bcf7d7869aee76edefb13ad369b2c6b98b686",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Task tracker over a PostgreSQL store - tasks with a goal and the append-only record of what was done about them, so work that may be picked up now surfaces on its own.",
@@ -1441,7 +1441,7 @@
           "title": "Задачи"
         }
       },
-      "version": "2026-11-24 — `tasks inventory --network` counts the tasks in progress and the tasks waiting for you, and the icon is `circle-check`"
+      "version": "2026-11-25 — A daemon running other code than the installed tasks is told to restart, not to reload"
     },
     "teams": {
       "executable": [

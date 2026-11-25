@@ -2341,7 +2341,12 @@ SERVICE
   each turn reads its worker and profile afresh anyway. What a reload cannot change needs `stop` and `start`: the
   connection and the store and schema it reaches, the project the daemon
   stands in, its state directory, the environment the daemon was started with,
-  and the executable itself.
+  and the executable itself. The daemon publishes a digest of the code it
+  started with, `code` in `service status`; a daemon whose code is not this
+  executable's, or that publishes none, may reckon its fingerprint
+  differently, so while its declaration reads stale `service doctor` reports
+  `restart_needed` in place of `declaration_stale`, naming `stop` and `start`,
+  and a reload it does not take is refused saying the same.
 
   --timeout S           how long to wait for the new fingerprint; default 30
   --machine             the machine settings, and each project its own
@@ -12918,6 +12923,15 @@ def _service_module():
         spec.loader.exec_module(module)
     finally:
         sys.dont_write_bytecode = previous
+    # The code that runs here: this executable and the module beside it. A
+    # daemon publishes the one it started with.
+    digest = hashlib.sha256()
+    for part in (Path(__file__).resolve(), path):
+        try:
+            digest.update(part.read_bytes())
+        except OSError:
+            digest.update(b"absent")
+    module.CODE = digest.hexdigest()
     return module
 
 
@@ -14748,7 +14762,7 @@ def _service_status(module) -> dict:
                     "poll_seconds",
                     "max_parallel", "shutdown_grace_seconds",
                     "lanes", "idle", "turns", "deferred", "next_wake", "last_wake",
-                    "reload_error", "stopping", "line_pause"):
+                    "reload_error", "stopping", "line_pause", "code"):
             answer[key] = published.get(key)
         answer["current"] = _fingerprint_current(module.read_fingerprint(state),
                                                  _service_fingerprint_parts())
@@ -14956,6 +14970,13 @@ def _wake_overdue(module, status: dict) -> float | None:
     return late if late > 2 * module.ROUND_TRIP_SECONDS else None
 
 
+def _daemon_code_differs(module, status: dict) -> bool:
+    """Whether the running daemon published code other than this executable's.
+    A daemon that published a status with no code predates the publishing of
+    it, so runs other code; one that published no status yet cannot be told."""
+    return "code" in status and status["code"] != getattr(module, "CODE", None)
+
+
 def _service_serving_problems(module, status: dict) -> tuple[list[str], dict | None]:
     """What `service doctor` finds wrong with whatever serves this project,
     from what it left on this machine: a running daemon's overdue wake or
@@ -14977,9 +14998,19 @@ def _service_serving_problems(module, status: dict) -> tuple[list[str], dict | N
         if _fingerprint_current(loaded, parts) is False:
             stale = {"loaded": loaded,
                      "current": None if parts[1] is None else ".".join(parts)}
-            problems.append("the running daemon loaded a declaration that has changed "
-                            "since: settings, a worker, a profile or a stored hook it names; "
-                            f"`{NAME} service reload` hands it the one standing now")
+            if _daemon_code_differs(module, status):
+                # Its own code reckons the fingerprint it publishes, so a
+                # reload leaves it unequal to the one reckoned here.
+                stale["restart"] = True
+                problems.append(f"the running daemon, started {status['started_at']}, "
+                                f"runs other code than this {NAME}, which reckons its "
+                                "declaration differently, so a reload cannot bring it "
+                                f"current; restart it: `{NAME} service stop` and "
+                                f"`{NAME} service start`, or restart whatever supervises it")
+            else:
+                problems.append("the running daemon loaded a declaration that has changed "
+                                "since: settings, a worker, a profile or a stored hook it "
+                                f"names; `{NAME} service reload` hands it the one standing now")
     machine = status.get("machine")
     if machine is not None:
         # A joined project is well while the machine process serves it, paused
@@ -15066,7 +15097,9 @@ def cmd_service_doctor(wanted: str | None, args: list[str]) -> None:
     serving, stale = _service_serving_problems(module, status)
     problems += serving
     if stale is not None:
-        answer["declaration_stale"] = stale
+        # A declaration a reload hands over, or a daemon whose code only a
+        # restart brings onto the declaration standing.
+        answer["restart_needed" if stale.pop("restart", False) else "declaration_stale"] = stale
     answer["ok"] = not problems
     if problems:
         answer["problems"] = problems
@@ -15193,6 +15226,14 @@ def cmd_service_reload(args: list[str]) -> None:
             _emit({"reloaded": True, **answer})
             return
         _time.sleep(0.1)
+    published = module.read_status(state)
+    if published and _daemon_code_differs(module, {"code": published.get("code")}):
+        _die(5, "service_reload_failed",
+             f"the daemon, started {published.get('started_at')}, runs other code than "
+             f"this {NAME}, which reckons its declaration differently, so it cannot "
+             "publish the declaration reckoned here",
+             f"restart it: `{NAME} service stop` and `{NAME} service start`, or restart "
+             "whatever supervises it")
     _die(5, "service_reload_failed",
          f"the daemon did not publish the new declaration within {timeout:g}s",
          f"it may have rejected it; `{NAME} service logs` says why")

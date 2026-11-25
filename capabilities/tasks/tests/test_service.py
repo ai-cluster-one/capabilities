@@ -837,6 +837,32 @@ def test_each_lane_runs_at_most_its_cap_and_all_at_most_theirs(
         assert sum(expected.values()) <= across
 
 
+def test_a_daemon_running_other_code_is_told_to_restart_not_to_reload(monkeypatch, tmp_path):
+    """A daemon started by other code reckons its fingerprint by that code, so a
+    reload never makes it equal to the one reckoned here: its stale declaration
+    is reported as a restart needed, while a daemon of this code that is behind
+    is still told to reload. A daemon that published no code predates it."""
+    module = mod._service_module()
+    assert module.CODE and module.CODE == mod._service_module().CODE
+    monkeypatch.setattr(module, "read_fingerprint", lambda state: "older.declaration")
+    monkeypatch.setattr(mod, "_service_fingerprint_parts", lambda: ("disk", "store"))
+    monkeypatch.setattr(mod, "_service_state_dir", lambda: tmp_path)
+    status = {"running": True, "started_at": "2026-11-23T23:44:00+00:00"}
+    for code in (None, "other"):
+        problems, stale = mod._service_serving_problems(module, {**status, "code": code})
+        assert stale == {"loaded": "older.declaration", "current": "disk.store",
+                         "restart": True}
+        [problem] = problems
+        assert "service stop" in problem and "service reload" not in problem
+    problems, stale = mod._service_serving_problems(module, {**status, "code": module.CODE})
+    assert stale == {"loaded": "older.declaration", "current": "disk.store"}
+    [problem] = problems
+    assert "service reload` hands it" in problem
+    # A status not yet published cannot tell the code: the reload is named.
+    problems, stale = mod._service_serving_problems(module, {"running": True})
+    assert "restart" not in stale and "service reload` hands it" in problems[0]
+
+
 @needs_store
 def test_reload_publishes_the_new_fingerprint_and_leaves_running_turns(
         project, store, capsys):
