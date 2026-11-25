@@ -627,7 +627,26 @@ def _contextkit_wired(tmp_path: Path) -> Path:
     return project
 
 
-def _hooks_run(tmp_path: Path, project: Path, *args: str, stdin: str | None = None):
+def _watched(env: dict[str, str], watched: bool) -> dict:
+    """Run as a session a person watches, or as one nobody does: Claude's own
+    attended marker, and a controlling terminal for a host that states none."""
+    env["CLAUDE_CODE_SESSION_ATTENDED"] = "1" if watched else "0"
+    if not watched:
+        return {"start_new_session": True}
+    import fcntl
+    import pty
+    import termios
+    _, terminal = pty.openpty()
+
+    def attach() -> None:
+        os.setsid()
+        fcntl.ioctl(terminal, termios.TIOCSCTTY, 0)
+
+    return {"preexec_fn": attach, "pass_fds": (terminal,)}
+
+
+def _hooks_run(tmp_path: Path, project: Path, *args: str, stdin: str | None = None,
+               watched: bool = True):
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),
@@ -638,7 +657,7 @@ def _hooks_run(tmp_path: Path, project: Path, *args: str, stdin: str | None = No
         "PATH": f"{tmp_path / 'bin'}{os.pathsep}{env.get('PATH', '')}",
     })
     return subprocess.run([sys.executable, str(MANAGER), *args], cwd=project, env=env, text=True,
-                          capture_output=True, timeout=60, input=stdin)
+                          capture_output=True, timeout=60, input=stdin, **_watched(env, watched))
 
 
 def test_session_start_rebuilds_the_context_and_tells_the_session_only_what_it_must(tmp_path: Path) -> None:
@@ -675,6 +694,62 @@ def test_session_start_rebuilds_the_context_and_tells_the_session_only_what_it_m
     assert failed.stdout.startswith("# Project Context Session Notice\n\nThe capabilities manager could not rebuild the "
                                     "generated context: ")
     assert "`capabilities hooks check` names the repair." in failed.stdout
+
+
+def _session_payload(project: Path, source: str) -> str:
+    return json.dumps({"session_id": "session", "transcript_path": "transcript", "cwd": str(project),
+                       "hook_event_name": "SessionStart", "source": source})
+
+
+def test_session_start_tells_a_session_nobody_watches_nothing(tmp_path: Path) -> None:
+    project = _contextkit_wired(tmp_path)
+    output = project / ".contextkit" / "generated" / "context.md"
+    mission = project / "context" / "identity" / "MISSION.md"
+
+    for host in ("claude", "codex"):
+        first = _hooks_run(tmp_path, project, "session-start", "--host", host,
+                           stdin=_session_payload(project, "startup"), watched=False)
+        assert (first.returncode, first.stdout, first.stderr) == (0, "", "")
+        assert output.is_file()
+
+        mission.write_text(f"---\ntitle: Mission\ndescription: Why.\nload: inline\norder: 1\n---\n# Mission\n\n{host}\n")
+        stale = _hooks_run(tmp_path, project, "session-start", "--host", host,
+                           stdin=_session_payload(project, "startup"), watched=False)
+        assert (stale.returncode, stale.stdout) == (0, "")
+        assert host in output.read_text()
+
+    (project / ".contextkit" / "config.toml").write_text("not [valid\n")
+    failed = _hooks_run(tmp_path, project, "session-start", "--host", "claude",
+                        stdin=_session_payload(project, "startup"), watched=False)
+    assert (failed.returncode, failed.stdout, failed.stderr) == (0, "", "")
+
+
+def test_session_start_tells_a_resumed_session_of_no_stale_context(tmp_path: Path) -> None:
+    project = _contextkit_wired(tmp_path)
+    output = project / ".contextkit" / "generated" / "context.md"
+    mission = project / "context" / "identity" / "MISSION.md"
+
+    created = _hooks_run(tmp_path, project, "session-start", "--host", "claude",
+                         stdin=_session_payload(project, "resume"))
+    assert (created.returncode, created.stdout) == (0, "")
+    assert output.is_file()
+
+    mission.write_text("---\ntitle: Mission\ndescription: Why.\nload: inline\norder: 1\n---\n# Mission\n\nResumed.\n")
+    for host in ("claude", "codex"):
+        resumed = _hooks_run(tmp_path, project, "session-start", "--host", host,
+                             stdin=_session_payload(project, "resume"))
+        assert (resumed.returncode, resumed.stdout) == (0, "")
+    assert "Resumed." in output.read_text()
+
+    mission.write_text("---\ntitle: Mission\ndescription: Why.\nload: inline\norder: 1\n---\n# Mission\n\nFresh.\n")
+    fresh = _hooks_run(tmp_path, project, "session-start", "--host", "claude",
+                       stdin=_session_payload(project, "startup"))
+    assert "the loaded copy is stale" in fresh.stdout
+
+    (project / ".contextkit" / "config.toml").write_text("not [valid\n")
+    failed = _hooks_run(tmp_path, project, "session-start", "--host", "claude",
+                        stdin=_session_payload(project, "resume"))
+    assert "could not rebuild the generated context" in failed.stdout
 
 
 def test_hooks_install_points_contextkit_hooks_at_session_start(tmp_path: Path) -> None:

@@ -19,8 +19,26 @@ def _project(tmp_path: Path) -> Path:
     return project
 
 
+def _watched(env: dict[str, str], watched: bool) -> dict:
+    """Run as a session a person watches, or as one nobody does: Claude's own
+    attended marker, and a controlling terminal for a host that states none."""
+    env["CLAUDE_CODE_SESSION_ATTENDED"] = "1" if watched else "0"
+    if not watched:
+        return {"start_new_session": True}
+    import fcntl
+    import pty
+    import termios
+    _, terminal = pty.openpty()
+
+    def attach() -> None:
+        os.setsid()
+        fcntl.ioctl(terminal, termios.TIOCSCTTY, 0)
+
+    return {"preexec_fn": attach, "pass_fds": (terminal,)}
+
+
 def _run(tmp_path: Path, project: Path, *args: str,
-         stdin: str | None = None) -> subprocess.CompletedProcess[str]:
+         stdin: str | None = None, watched: bool = True) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.update({
         "HOME": str(tmp_path / "home"),
@@ -28,6 +46,7 @@ def _run(tmp_path: Path, project: Path, *args: str,
         "CAPABILITIES_HOME": str(tmp_path / "registry"),
         "CLAUDE_PROJECT_DIR": str(project),
     })
+    session = _watched(env, watched)
     return subprocess.run(
         [sys.executable, str(MANAGER), *args],
         cwd=project,
@@ -37,6 +56,7 @@ def _run(tmp_path: Path, project: Path, *args: str,
         stdin=subprocess.DEVNULL if stdin is None else None,
         capture_output=True,
         timeout=30,
+        **session,
     )
 
 
@@ -52,8 +72,10 @@ def _payload(project: Path, source: str = "startup") -> str:
     })
 
 
-def _hook(tmp_path: Path, project: Path, host: str) -> str:
-    result = _run(tmp_path, project, "context", f"--{host}", stdin=_payload(project))
+def _hook(tmp_path: Path, project: Path, host: str, source: str = "startup",
+          watched: bool = True) -> str:
+    result = _run(tmp_path, project, "context", f"--{host}",
+                  stdin=_payload(project, source), watched=watched)
     assert result.returncode == 0, result.stderr
     return result.stdout
 
@@ -94,6 +116,47 @@ def test_claude_hook_speaks_only_when_the_loaded_copy_is_missing_or_stale(
     assert "## demo" in context.read_text()
 
     assert _hook(tmp_path, project, "claude") == ""
+
+
+def test_hook_tells_a_session_nobody_watches_nothing(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _json(_run(tmp_path, project, "init", "--claude", "--codex"))
+    context = project / ".claude" / "rules" / "CAPABILITIES.md"
+
+    context.unlink()
+    assert _hook(tmp_path, project, "claude", watched=False) == ""
+    assert context.is_file()
+
+    _install_snapshot(tmp_path, "demo", "Create and update demo records.")
+    _enable_by_hand(project, "demo")
+    for host in ("claude", "codex"):
+        assert _hook(tmp_path, project, host, watched=False) == ""
+    assert "## demo" in context.read_text()
+
+    (project / "AGENTS.md").write_text("# Project notes\n")
+    assert _hook(tmp_path, project, "codex", watched=False) == ""
+    assert "did not load in this session" in _hook(tmp_path, project, "codex")
+
+
+def test_hook_tells_a_resumed_session_of_no_stale_copy(tmp_path: Path) -> None:
+    project = _project(tmp_path)
+    _json(_run(tmp_path, project, "init", "--claude"))
+    context = project / ".claude" / "rules" / "CAPABILITIES.md"
+
+    context.unlink()
+    assert _hook(tmp_path, project, "claude", source="resume") == ""
+    assert context.is_file()
+
+    _install_snapshot(tmp_path, "demo", "Create and update demo records.")
+    _enable_by_hand(project, "demo")
+    assert _hook(tmp_path, project, "claude", source="resume") == ""
+    assert "## demo" in context.read_text()
+
+    (project / "capabilities" / "settings.json").write_text(json.dumps({
+        "capabilities": {"demo": {"enabled": "yes"}},
+    }))
+    assert "could not rebuild the capability context" in _hook(
+        tmp_path, project, "claude", source="resume")
 
 
 def test_terminal_run_keeps_its_json_result(tmp_path: Path) -> None:
