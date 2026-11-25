@@ -40,7 +40,8 @@ OTHER_NODE = "srv-discard"
 # is brought to its shape by. They cross the store's major, which only the
 # store upgrade does: a process runs as part of it under UPGRADING.
 CORE_STEPS = ["0039-core", "0040-connection-ids", "0041-keys",
-              "0042-connection-created-at", "0043-agent-archived", "0044-node-cpu-percent"]
+              "0042-connection-created-at", "0043-agent-archived", "0044-node-cpu-percent",
+              "0045-platform-key", "0046-connection-secret-keys"]
 UPGRADING = {"CAPABILITIES_STORE_UPGRADE": "1"}
 
 
@@ -244,7 +245,7 @@ def dry_runs_change_nothing(w: World, version: str) -> dict:
     assert dry["applied"] is False and dry["would_write"] is True
     # The core has no version before its step: the tables are still owner
     # `capabilities`, at `version`.
-    assert dry["tables_to_upgrade"]["core"] == {"from": None, "to": "4.3", "steps": CORE_STEPS}
+    assert dry["tables_to_upgrade"]["core"] == {"from": None, "to": "4.5", "steps": CORE_STEPS}
     assert w.sql("SELECT major, minor FROM schema_version WHERE owner = 'capabilities'") \
         == [tuple(int(part) for part in version.split("."))]
     assert "tables_upgraded" not in dry
@@ -298,7 +299,7 @@ def test_dry_runs_on_a_store_at_1_1_or_1_2_change_nothing_and_apply_upgrades(wor
         assert refused["code"] == "store_upgrade_needed", flags
     applied = world.answer(world.manager(root, "migrate", "--global", "--apply", **UPGRADING))
     assert applied["state"] == "migrated" and applied["changed"] is True
-    assert applied["tables_upgraded"] == {"steps": CORE_STEPS, "version": "4.3"}
+    assert applied["tables_upgraded"] == {"steps": CORE_STEPS, "version": "4.5"}
     assert world.sql("SELECT owner, major, minor FROM schema_version WHERE owner IN "
                      "('capabilities', 'core') ORDER BY owner") \
         == [("capabilities", 2, 0), ("core", 4, 3)]

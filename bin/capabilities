@@ -392,7 +392,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.54.0"
+CONTRACT_LIBRARY_RELEASE = "0.55.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -4127,11 +4127,55 @@ def cmd_update(name: str | None) -> None:
     reconciled = _core_reconcile()
     if reconciled["written"]:
         answer["core_enabled"] = reconciled["written"]
+    recorded = _record_connection_secret_keys(_project_root())
+    if recorded:
+        answer["secret_keys_recorded"] = recorded
     if any(entry.get("changed") for entry in results):
         pruned = _prune_environments()
         if pruned:
             answer["pruned_environments"] = pruned
     _emit(answer)
+
+
+def _record_connection_secret_keys(root: Path | None) -> list[str]:
+    """Have each installed capability record in the store the secret names of
+    its connections whose rows hold none (`connections.secret_keys`, core
+    4.5): rows older than the store recording them, and rows this manager
+    wrote, which it cannot name the secrets of, since only the capability's
+    own `connections` report knows them. Each capability with such a row runs
+    its own `connections` in `root`, which records them (capabilities-contract
+    0.55). The capabilities it ran, in order; nothing where no store answers,
+    where the store's core predates the names, or under the read-only switch.
+    Never fails the caller."""
+    if _store_module().read_only_switch():
+        return []
+    db = _db_module()
+    try:
+        setting = db.resolve_setting(root)
+        conn = db.connect(application_name=_store_module().STORE_APPLICATION,
+                          setting=setting, transaction=True)
+    except Exception:
+        return []
+    try:
+        # Read through the row's JSON, so a store whose core predates the
+        # names answers none rather than failing.
+        due = [name for (name,) in conn.execute(
+            "SELECT DISTINCT c.capability FROM connections c "
+            "WHERE to_jsonb(c) -> 'secret_keys' = 'null'::jsonb "
+            "ORDER BY c.capability").fetchall()]
+    except Exception:
+        due = []
+    finally:
+        conn.close()
+    installed = set(_installed())
+    ran = []
+    for name in due:
+        if name not in installed:
+            continue
+        _run_script(CAP_HOME / name / name, ["connections", "--json"],
+                    cwd=root or Path.home(), timeout=120)
+        ran.append(name)
+    return ran
 
 
 def _release_library(value: object) -> str | None:
@@ -25138,6 +25182,11 @@ def cmd_set(name: str, collection: str, key: str,
         removed = _grant_revoke(root, name, key)
         if removed is not None:
             answer["vault"] = removed
+    if collection == "connection" and in_store:
+        # This manager cannot name a connection's secrets; its capability does.
+        recorded = _record_connection_secret_keys(root)
+        if recorded:
+            answer["secret_keys_recorded"] = recorded
     _emit(answer)
 
 
@@ -25648,8 +25697,8 @@ def _import_records_verify(files, stored, plan: dict) -> None:
 
 def cmd_connections_list(names: list[str]) -> None:
     """Every connection the store holds, per capability, with its owner -
-    shared, or one agent's own - when the store made its row, and every grant
-    on it."""
+    shared, or one agent's own - when the store made its row, the names of the
+    secrets it resolves, and every grant on it."""
     unknown = [n for n in names if n.startswith("-")]
     if unknown:
         _die(6, "input", f"unknown connections list option {unknown[0]!r}",
@@ -25667,11 +25716,12 @@ def cmd_connections_list(names: list[str]) -> None:
     only = " WHERE c.capability = ANY(%s)" if names else ""
     params = (names,) if names else ()
     try:
-        # When the store made the row is read through the row's JSON, so a
-        # store whose core predates it (4.1) answers null rather than failing.
+        # When the store made the row and the names of its secrets are read
+        # through the row's JSON, so a store whose core predates them (4.1,
+        # 4.5) answers null rather than failing.
         connections = conn.execute(
             "SELECT c.capability, c.id, c.owner_agent_id, a.name, c.label, "
-            "to_jsonb(c) ->> 'created_at' "
+            "to_jsonb(c) ->> 'created_at', to_jsonb(c) -> 'secret_keys' "
             "FROM connections c "
             "LEFT JOIN agents a ON a.id = c.owner_agent_id" + only
             + " ORDER BY c.capability, c.label", params).fetchall()
@@ -25700,11 +25750,13 @@ def cmd_connections_list(names: list[str]) -> None:
             "agent": agent, "agent_name": agent_name, "node": node, "enabled": enabled,
             "allow_write": allow_write, "is_default": bool(is_default)})
     out: dict = {}
-    for capability, connection, owner, owner_name, label, created_at in connections:
+    for capability, connection, owner, owner_name, label, created_at, secret_keys \
+            in connections:
         out.setdefault(capability, []).append({
             "connection": connection, "label": label or connection,
             "owner": owner, "owner_name": owner_name,
             "shared": owner is None, "created_at": created_at,
+            "secret_keys": secret_keys if isinstance(secret_keys, list) else None,
             "grants": held.get((capability, connection), [])})
     _emit({"store": {"schema": setting.schema}, "capabilities": out})
 
@@ -25790,6 +25842,8 @@ def cmd_connections_import() -> None:
     kept = [*envelope.glob("*/connections.json"), *envelope.glob("*/identifiers.json")]
     if (envelope / "settings.json").is_file():
         kept.append(envelope / "settings.json")
+    # The rows written here hold no secret names: each capability records its own.
+    recorded = _record_connection_secret_keys(root)
     _emit({"ok": True, "project": str(root), "agent_id": agent_id,
            "node": node, "mode": "store", "previous_mode": previous,
            "identity": str(identity_file),
@@ -25802,6 +25856,7 @@ def cmd_connections_import() -> None:
            "identifiers": records_imported["identifiers"],
            "policy": records_imported["policy"],
            "service": records_imported["service"],
+           "secret_keys_recorded": recorded,
            "files_kept": sorted(str(p) for p in kept)})
 
 
@@ -38479,10 +38534,13 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         project's own, written with its grant. Each grant names its agent
         (null: the grant for every agent), node (null: every node), enabled,
         allow_write (null falls to the capability's WRITE_DEFAULT) and
-        is_default; a registered agent's name rides beside its id. Reads only.
+        is_default; a registered agent's name rides beside its id. Each
+        connection carries created_at, when the store made its row, and
+        secret_keys, the names of the secrets it resolves as its capability's
+        own `connections` names them (null where not recorded). Reads only.
         JSON {store {schema}, capabilities {<name> [{connection, label, owner,
-        owner_name, shared, grants [{agent, agent_name, node, enabled,
-        allow_write, is_default}]}]}}. Exit 6 tables_behind where the store's
+        owner_name, shared, created_at, secret_keys, grants [{agent,
+        agent_name, node, enabled, allow_write, is_default}]}]}}. Exit 6 tables_behind where the store's
         tables predate owners, 5 when the store cannot be reached.
 """),
     (('connections import',),

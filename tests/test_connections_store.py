@@ -782,6 +782,55 @@ def test_a_store_connection_added_in_the_project_is_its_own_and_granted(lab):
     assert removed["action"] == "remove" and "fresh" not in _stored_connections(lab)
 
 
+def _secret_keys(lab) -> dict:
+    return dict(_rows(lab, "SELECT label, secret_keys FROM connections "
+                           "WHERE capability = 'coolify'"))
+
+
+def _reported_secrets(report: dict) -> dict:
+    return {label: [k["key"] for k in entry["keys"] if k["secret"]]
+            for label, entry in _labelled(report).items()}
+
+
+def test_each_connection_records_the_secret_names_its_capabilitys_own_report_gives(lab):
+    # The manager's import writes the rows, and cannot name their secrets.
+    _import(lab)
+    assert _secret_keys(lab) == {"box": None, "spare": None, "off": None}
+    # The capability's own `connections` records them, for every row of its own,
+    # the one this project's grant withholds included, as its report gives them.
+    report = _ok(_coolify(lab, "connections"))
+    stored = _secret_keys(lab)
+    assert stored == {"box": ["COOLIFY_TOKEN"], "spare": ["COOLIFY_TOKEN"],
+                      "off": ["COOLIFY_TOKEN"]}
+    reported = _reported_secrets(report)
+    assert reported and all(stored[label] == keys for label, keys in reported.items())
+    listed = _ok(_manager(lab, "connections", "list", "coolify"))["capabilities"]["coolify"]
+    assert {entry["label"]: entry["secret_keys"] for entry in listed} == stored
+    # An add, an edit and a rename record the names of the row as it then is.
+    env = lab["project"] / ".env"
+    env.write_text(env.read_text() + "FRESH_TOKEN=fresh-token-1234\n"
+                   "OTHER_TOKEN=other-token-1234\n")
+    _ok(_coolify(lab, "connection", "add", "fresh", "--project",
+                 "--field", f"base_url={lab['url']}", "--env", "secret_env=FRESH_TOKEN"))
+    assert _secret_keys(lab)["fresh"] == ["FRESH_TOKEN"]
+    _ok(_coolify(lab, "connection", "add", "fresh", "--replace", "--project",
+                 "--field", f"base_url={lab['url']}", "--env", "secret_env=OTHER_TOKEN"))
+    assert _secret_keys(lab)["fresh"] == ["OTHER_TOKEN"]
+    _ok(_coolify(lab, "connection", "rename", "fresh", "fresher"))
+    assert _secret_keys(lab)["fresher"] == ["OTHER_TOKEN"]
+    assert _reported_secrets(_ok(_coolify(lab, "connections")))["fresher"] == ["OTHER_TOKEN"]
+    # A write by the manager, which cannot name them, leaves them unknown rather
+    # than wrong, until the capability records them again.
+    _ok(_manager(lab, "set", "coolify", "connection", "spare", json.dumps(
+        {"base_url": lab["url"], "secret_env": "SPARE_TOKEN"})))
+    assert _secret_keys(lab)["spare"] is None
+    _ok(_coolify(lab, "connections"))
+    assert _secret_keys(lab)["spare"] == ["SPARE_TOKEN"]
+    # A removed connection takes its names with its row.
+    _ok(_coolify(lab, "connection", "remove", "fresher"))
+    assert "fresher" not in _secret_keys(lab)
+
+
 def _peer(lab) -> dict:
     """A second agent on the same store: a project of its own with the lab's
     store setting and secret, and no connection of its own."""
