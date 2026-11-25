@@ -250,18 +250,18 @@ def test_migration_reseals_old_vaults_loses_nothing_and_stops_where_copies_disag
                           vault.seal_for(vault.public_key(key), agent, NAME, shared), fp)
     found = _ok(_manager(lab, "secrets", "migrate"))
     assert sorted(a["agent"] for a in found["agents"]) == sorted([PROJECT_ID, PEER_ID])
-    assert all(sorted(a["resealed"]) == [NAME, "OWN_TOKEN"] for a in found["agents"])
+    assert all(a["resealed"] == [NAME] for a in found["agents"])
     assert found["platform_copies"] == []
     [stop] = found["disagreeing"]
     assert (stop["connection"], stop["name"]) == (cid, NAME)
     assert sorted(c["ends"] for c in stop["copies"]) == ["…aaaa", "…bbbb"]
     assert "old-shared" not in json.dumps(found) and "new-shared" not in json.dumps(found)
     assert found["hint"] and "--pick" in found["hint"]
-    # Nothing is chosen: each vault keeps its own copy, sealed the new way.
+    # Nothing is chosen: each vault keeps its own copy, sealed under its own key.
     assert _show(lab, NAME) == "old-shared-value-aaaa" and _show(peer, NAME) == "new-shared-value-bbbb"
     assert _show(lab, "OWN_TOKEN") == "own-a-0001" and _show(peer, "OWN_TOKEN") == "own-b-0001"
     assert {bytes(c)[0] for (c,) in _sql(lab, "SELECT ciphertext FROM secrets")} == {
-        vault.SEALED_FORMAT_BOX}
+        vault.SEALED_FORMAT}
     picked = _ok(_manager(lab, "secrets", "migrate", "--pick", f"{cid}:{NAME}={PEER_ID}"))
     assert [(c["connection"], c["name"]) for c in picked["platform_copies"]] == [(cid, NAME)]
     assert picked["disagreeing"] == [] and "picks_unused" not in picked
@@ -274,7 +274,7 @@ def test_migration_reseals_old_vaults_loses_nothing_and_stops_where_copies_disag
 
 def test_where_the_platform_key_is_elsewhere_an_agent_migrates_its_own_part(lab):
     """A node: the agent's key lives in its environment, and the platform key the
-    store publishes is held on another machine."""
+    store publishes is held on another machine, so it is never pinned from there."""
     _import(lab)
     _ok(_manager(lab, "key", "generate"))
     text = _key_text(lab)
@@ -295,10 +295,19 @@ def test_where_the_platform_key_is_elsewhere_an_agent_migrates_its_own_part(lab)
     found = _ok(_manager(node, "secrets", "migrate"))
     assert found["platform"] == "elsewhere" and found["not_here"] == []
     [agent] = found["agents"]
-    assert sorted(agent["resealed"]) == ["GRANTED_TOKEN", "OWN_TOKEN"]
+    assert agent["resealed"] == ["GRANTED_TOKEN"]
     assert _show(node, "OWN_TOKEN") == "own-node-0001"
     assert _show(node, "GRANTED_TOKEN") == "granted-node-0001"
-    # The platform, wherever it is, opens the copies the agent sent it.
+    # The agent holds no pin and the key the store publishes is not taken for one, so
+    # no copy is sent anywhere.
+    assert _sql(lab, "SELECT count(*) FROM platform_secrets") == [(0,)]
+    assert _sql(lab, "SELECT count(*) FROM secrets WHERE name = %s", (vault.PIN_NAME,)) == [(0,)]
+    # Once the agent pins the platform key - written where its key and the platform's
+    # are both held - its own part sends the platform its copies, which the platform opens.
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        vault.write_pin(conn, key, PROJECT_ID, vault.public_key(elsewhere))
+    _ok(_manager(node, "secrets", "migrate"))
     copies = dict(_sql(lab, "SELECT name, ciphertext FROM platform_secrets "
                             "WHERE agent_id = %s", (PROJECT_ID,)))
     scope = vault.copy_scope(agent_id=PROJECT_ID)
@@ -307,6 +316,117 @@ def test_where_the_platform_key_is_elsewhere_an_agent_migrates_its_own_part(lab)
             for name, blob in copies.items()} == {"OWN_TOKEN": "own-node-0001",
                                                   "GRANTED_TOKEN": "granted-node-0001"}
     assert not (Path(lab["config"]) / "capabilities" / "platform" / "key").exists()
+
+
+def _attack(lab, peer) -> bytes:
+    """The peer, holding the store's login and its own key alone, takes this agent's
+    pin out and publishes its own public key as the platform's: the peer's key."""
+    theirs = vault.parse_key(_key_text(peer))
+    _sql(lab, "DELETE FROM secrets WHERE agent_id = %s AND name = %s",
+         (PROJECT_ID, vault.PIN_NAME))
+    _sql(lab, "UPDATE store_state SET platform_public_key = %s", (vault.public_text(theirs),))
+    return theirs
+
+
+def _forge(lab, mine: bytes, theirs: bytes, name: str, value: str) -> None:
+    with lab["cluster"].admin(lab["database"]) as conn:
+        conn.execute("SET search_path TO lab")
+        vault.put_row(conn, PROJECT_ID, name, vault.seal_box(
+            vault._public_secret(theirs), vault.public_key(mine), PROJECT_ID, name, value),
+            vault.fingerprint(mine), "peer")
+
+
+def _pin(lab, mine: bytes) -> bytes | None:
+    return vault.pin_of(mine, PROJECT_ID, _sql(
+        lab, "SELECT name, ciphertext, key_fingerprint FROM secrets WHERE agent_id = %s",
+        (PROJECT_ID,)))
+
+
+def _attacker_opens(lab, mine: bytes, theirs: bytes) -> list:
+    scope = vault.copy_scope(agent_id=PROJECT_ID)
+    opened = [vault.open_box(vault._public_secret(theirs), scope, name, bytes(blob),
+                             [vault.public_key(mine)])
+              for name, blob in _sql(lab, "SELECT name, ciphertext FROM platform_secrets "
+                                          "WHERE agent_id = %s", (PROJECT_ID,))]
+    return [value for value in opened if value is not None]
+
+
+def test_the_platform_key_the_store_publishes_is_never_pinned_with_or_without_its_file(lab):
+    peer, cid = _shared_account(lab)
+    _ok(_manager(lab, "set", "coolify", "grant", "personal", '{"enabled": true}'))
+    mine = vault.parse_key(_key_text(lab))
+    held = Path(lab["config"]) / "capabilities" / "platform" / "key"
+    real = vault.public_key(vault.parse_key(held.read_text().strip()))
+    for machine, own in (("platform", "OWN_HERE"), ("node", "OWN_ON_NODE")):
+        if machine == "node":
+            held.rename(held.with_suffix(".away"))
+        theirs = _attack(lab, peer)
+        # What re-pinned from the store before: the manager's secrets verbs.
+        _ok(_manager(lab, "secrets", "list"))
+        _show(lab, NAME)
+        _forge(lab, mine, theirs, NAME, "evil-6666")
+        assert _show(lab, NAME) is None, machine
+        key = next(k for k in _ok(_coolify(lab, "connections"))["connections"][cid]["keys"]
+                   if k["key"] == NAME)
+        assert key["tier"] != "vault", (machine, key)
+        _ok(_feed(lab, "own-secret-7777\n", MANAGER, "secrets", "set", own))
+        assert _show(lab, own) == "own-secret-7777"
+        # Where the platform key file is the pin is written from it; where it is not
+        # a missing pin stays missing.
+        assert _pin(lab, mine) == (real if machine == "platform" else None), machine
+        assert _attacker_opens(lab, mine, theirs) == [], machine
+    copied = {n for (n,) in _sql(lab, "SELECT name FROM platform_secrets WHERE agent_id = %s",
+                                 (PROJECT_ID,))}
+    assert "OWN_HERE" in copied and "OWN_ON_NODE" not in copied
+
+
+def test_a_key_published_before_the_platform_exists_is_never_pinned(lab):
+    _import(lab)
+    _global_rows_in_force(lab)
+    _ok(_manager(lab, "key", "generate"))
+    peer = _peer(lab)
+    _ok(_manager(peer, "key", "generate"))
+    mine, theirs = vault.parse_key(_key_text(lab)), vault.parse_key(_key_text(peer))
+    _sql(lab, "UPDATE store_state SET platform_public_key = %s", (vault.public_text(theirs),))
+    _forge(lab, mine, theirs, "PLANTED_TOKEN", "evil-6666")
+    _ok(_manager(lab, "secrets", "list"))
+    assert _show(lab, "PLANTED_TOKEN") is None
+    _ok(_feed(lab, "own-secret-7777\n", MANAGER, "secrets", "set", "OWN_TOKEN"))
+    assert _pin(lab, mine) is None
+    assert _sql(lab, "SELECT count(*) FROM platform_secrets") == [(0,)]
+
+
+def _as_0_53_reads(key: bytes, agent: str, name: str, blob: bytes) -> str | None:
+    """What a release on capabilities-contract 0.53 opens of a row: its ciphertext
+    alone, in format 1 or format 2."""
+    blob = bytes(blob)
+    if blob[:1] == bytes([vault.SEALED_FORMAT]):
+        return vault._unseal_symmetric(key, agent, name, blob)
+    if blob[:1] == bytes([vault.SEALED_FORMAT_PUBLIC]):
+        return vault._unseal_public(key, agent, name, blob)
+    return None
+
+
+def test_what_this_release_writes_opens_under_the_release_before_it(lab):
+    peer, cid = _shared_account(lab)
+    mine, theirs = vault.parse_key(_key_text(lab)), vault.parse_key(_key_text(peer))
+
+    def opened(agent, key):
+        return {name: _as_0_53_reads(key, agent, name, blob) for name, blob in _sql(
+            lab, "SELECT name, ciphertext FROM secrets WHERE agent_id = %s AND name <> %s",
+            (agent, vault.PIN_NAME))}
+
+    _ok(_manager(lab, "set", "coolify", "grant", "personal", '{"enabled": true}'))
+    _ok(_manager(peer, "set", "coolify", "grant", "personal", '{"enabled": true}'))
+    assert opened(PROJECT_ID, mine) == opened(PEER_ID, theirs) == {NAME: "shared-token-0001"}
+    _ok(_feed(lab, json.dumps({"secret_env": "shared-token-0002"}), COOLIFY,
+              "connection", "add", "personal", "--global", "--replace", "--stdin"))
+    _ok(_feed(lab, "own-secret-7777\n", MANAGER, "secrets", "set", "OWN_TOKEN"))
+    _ok(_manager(lab, "connections", "rebuild"))
+    _ok(_manager(lab, "secrets", "migrate"))
+    assert opened(PROJECT_ID, mine) == {NAME: "shared-token-0002", "OWN_TOKEN": "own-secret-7777"}
+    assert opened(PEER_ID, theirs) == {NAME: "shared-token-0002"}
+    assert _show(lab, NAME) == _show(peer, NAME) == "shared-token-0002"
 
 
 def test_an_agents_own_account_is_never_granted_to_another_agent(lab):

@@ -9280,18 +9280,28 @@ def cmd_key(rest: list[str]) -> None:
     _emit(answer)
 
 
-def _vault_pin(conn, agent_id: str, key: bytes | None, rows: list) -> bytes | None:
-    """The platform key the agent pinned; where it pinned none, the one the
-    store publishes, pinned now by this process that holds the agent's key -
-    unless the read-only switch is on, which changes nothing."""
+def _vault_pin(conn, agent_id: str, key: bytes | None, rows: list) -> tuple:
+    """(the platform key the agent pinned, the platform key it trusts): the
+    one this machine's platform key file holds, pinned now by this process
+    that holds the agent's key where the pin is another or none - unless the
+    read-only switch is on, which changes nothing - else its pin. The
+    platform key the store publishes is never taken."""
     vault = _vault_module()
     if key is None:
-        return None
+        return None, None
     pin = vault.pin_of(key, agent_id, rows)
-    if (pin is None and not _store_module().read_only_switch()
+    if (not _store_module().read_only_switch()
             and vault.recorded_key(conn, agent_id)[1] == vault.fingerprint(key)):
         pin = vault.take_pin(conn, key, agent_id, updated_by=_vault_actor())
-    return pin
+        return pin, pin
+    return pin, vault.local_platform() or pin
+
+
+def _vault_open(key: bytes, agent_id: str, row: dict, trust: tuple) -> str | None:
+    """The value of a row of the agent's vault as the library's one rule opens
+    it, `trust` the (pin, trusted) `_vault_pin` answers."""
+    return _vault_module().unseal(key, agent_id, row["name"], row["ciphertext"], trust[0],
+                                  row.get("box"), trust[1])
 
 
 def _vault_listing(conn, agent_id: str, key: bytes | None) -> tuple[list, str | None]:
@@ -9300,11 +9310,11 @@ def _vault_listing(conn, agent_id: str, key: bytes | None) -> tuple[list, str | 
     current = vault.fingerprint(key) if key is not None else recorded
     rows = vault.rows(conn, agent_id)
     stamp = _store_module()._stamp
-    pin = _vault_pin(conn, agent_id, key, rows)
+    trust = _vault_pin(conn, agent_id, key, rows)
     return [{"name": r["name"], "readable": current is not None
              and r["key_fingerprint"] == current,
              "updated_at": stamp(r["updated_at"]), "updated_by": r["updated_by"],
-             "_row": r, "_pin": pin} for r in rows if r["name"] != vault.PIN_NAME], recorded
+             "_row": r, "_pin": trust} for r in rows if r["name"] != vault.PIN_NAME], recorded
 
 
 def _vault_public(entries: list) -> list:
@@ -9456,7 +9466,7 @@ def _vault_move(root: Path) -> dict:
             fp = vault.fingerprint(key)
             rows = vault.rows(conn, agent_id)
             held = {r["name"]: r for r in rows}
-            pin = _vault_pin(conn, agent_id, key, rows)
+            trust = _vault_pin(conn, agent_id, key, rows)
             made, actor = [], _vault_actor()
             for name in sorted(readers):
                 value = values[candidates[name][0]][name]
@@ -9465,8 +9475,7 @@ def _vault_move(root: Path) -> dict:
                     keep(name, [str(paths[f]) for f in candidates[name]],
                          "the vault holds it sealed under another key; set it again or "
                          "remove it there first")
-                elif row is not None and vault.unseal(
-                        key, agent_id, name, row["ciphertext"], pin) != value:
+                elif row is not None and _vault_open(key, agent_id, row, trust) != value:
                     keep(name, [str(paths[f]) for f in candidates[name]],
                          "the vault already holds a different value for it")
                 elif row is None:
@@ -10054,9 +10063,10 @@ def _secrets_migrate(root: Path, picks: dict) -> dict:
     def migrate(conn, _agent):
         # Where the platform key is not here - a node, or a machine beside the
         # one that keeps it - each agent's own part is migrated alone: its
-        # entries sealed again, the platform key the store publishes pinned,
-        # and the platform's copies of its own entries sent; the shared
-        # connections are the platform's machine's to migrate.
+        # entries sealed again, and the platform's copies of its own entries
+        # sent where it already pins a platform key; nothing is pinned from
+        # the store, and the shared connections are the platform's machine's
+        # to migrate.
         published = vault.platform_published(conn)
         local = platform.load() is not None
         plat = (_platform_here(conn, root)
@@ -10095,8 +10105,8 @@ def _secrets_migrate(root: Path, picks: dict) -> dict:
                 platform.write_agent_pin(conn, plat, agent_id, key, updated_by=actor)
                 trusted = plat.public
             else:
-                # The platform key this agent trusts: its pin, taken now where
-                # the store publishes one it has not pinned.
+                # The platform key this agent trusts: its pin, None where it
+                # holds none.
                 trusted = vault.take_pin(conn, key, agent_id, updated_by=actor)
             copies = platform.copies(conn, agent_id=agent_id)
             values = {}
@@ -10105,7 +10115,8 @@ def _secrets_migrate(root: Path, picks: dict) -> dict:
             for row in held:
                 if row["name"] == vault.PIN_NAME or row["key_fingerprint"] != recorded:
                     continue
-                value = vault.unseal(key, agent_id, row["name"], row["ciphertext"], pin)
+                value = vault.unseal(key, agent_id, row["name"], row["ciphertext"], pin,
+                                     row["box"], trusted)
                 if value is None:
                     continue
                 values[row["name"]] = value
@@ -10287,10 +10298,10 @@ def cmd_secrets(rest: list[str]) -> None:
             return ([r for r in held if r["name"] == name and name != vault.PIN_NAME],
                     _vault_pin(conn, agent_id, key, held))
 
-        (found, pin), _setting = _kernel_run(root, read_one)
+        (found, trust), _setting = _kernel_run(root, read_one)
         if not found:
             _die(3, "not_set", f"the vault holds no {name}")
-        value = vault.unseal(key, _kernel_agent_id(root), name, found[0]["ciphertext"], pin) \
+        value = _vault_open(key, _kernel_agent_id(root), found[0], trust) \
             if found[0]["key_fingerprint"] == vault.fingerprint(key) else None
         if value is None:
             _die(6, "secret_unreadable",
@@ -10343,8 +10354,7 @@ def cmd_secrets(rest: list[str]) -> None:
         agent_id = _kernel_agent_id(root)
         values, unreadable = {}, []
         for e in entries:
-            value = vault.unseal(key, agent_id, e["name"], e["_row"]["ciphertext"],
-                                 e["_pin"]) if e["readable"] else None
+            value = _vault_open(key, agent_id, e["_row"], e["_pin"]) if e["readable"] else None
             if value is None:
                 unreadable.append(e["name"])
             else:
@@ -10365,9 +10375,8 @@ def cmd_secrets(rest: list[str]) -> None:
         entries = _vault_listing(conn, agent_id, key)[0]
         held = {}
         for e in entries:
-            held[e["name"]] = (vault.unseal(key, agent_id, e["name"], e["_row"]["ciphertext"],
-                                            e["_pin"]) if e["readable"] else None,
-                               e["readable"])
+            held[e["name"]] = (_vault_open(key, agent_id, e["_row"], e["_pin"])
+                               if e["readable"] else None, e["readable"])
         actor = _vault_actor()
         written, unchanged = [], []
         for name, value in sorted(wanted.items()):
@@ -35611,9 +35620,12 @@ STORE VERBS
 VAULT VERBS
   Each agent has one encryption key, AGENT_ENCRYPTION_KEY (see `capabilities help environment`),
   and a vault of named secrets in its store that only that key opens: each a
-  row of secrets, sealed to the agent's public key (vault_public_key, the
-  X25519 public key the key gives) with the sender's own key, the agent id
-  and the name bound to it, so whoever opens it learns who sent it. The
+  row of secrets, the agent id and the name bound to it - an entry the
+  agent writes sealed under its own key, and one the platform delivers
+  sealed to the agent's public key (vault_public_key, the X25519 public key
+  the key gives) twice, once as every release reads it and once beside it
+  with the platform's own key, so whoever opens that copy learns who sent
+  it. The
   store keeps the fingerprint of the agent's key on its row of agents, never
   the key; keeping the key is the owner's. The key verbs, a secret written
   here and `connections seal` publish the public key; a key that changes
@@ -35621,19 +35633,21 @@ VAULT VERBS
   the entries it sent itself and those the platform sent: the platform is a
   keypair this manager makes on first need, in a file only its user reads
   ($XDG_CONFIG_HOME/capabilities/platform/key), never on a node and never
-  in the store, which publishes only its public key; each agent pins that
-  key in its own vault, sealed by its own key, the first time a process
-  holding the key sees it, and the platform pins each agent's public key
-  at first sight beside its own. The platform keeps its own copy of every
+  in the store, which publishes its public key for display only; an agent
+  trusts only the platform key it pinned in its own vault, sealed by its
+  own key, or the platform key file on its own machine, from which a
+  process holding the agent's key there writes the pin, and the platform
+  pins each agent's public key at first sight beside its own. The
+  platform keeps its own copy of every
   secret - a shared connection's, and each agent's own, sent by that agent
   - and is the only writer of another agent's entries: a grant delivers a
   shared connection's secret from its copy, a revoke takes it out, a
   changed value reaches every grantee, `connections rebuild` delivers every
   granted copy again and `key recover` re-delivers an agent's entries under
-  a new key. Entries an older release wrote still open where the agent's
-  own key sealed them; one sealed for its public key by anyone else opens
-  only until the agent pins the platform key, and `secrets migrate` seals
-  them all again the new way. The vault is the first home of an agent's
+  a new key. An entry sealed for the agent's public key without the
+  platform's copy beside it, as an older release wrote one, opens only
+  until the agent pins the platform key, and `secrets migrate` seals each
+  again under the agent's own key. The vault is the first home of an agent's
   secrets: a capability's `connection add` and `setup set` seal a secret
   given on stdin into it by default, and write a file only with --file, at
   --global or --machine for a connection the store does not share yet, or
@@ -36565,9 +36579,10 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         Bring the vaults an older release wrote to the new form, for every
         agent whose key is on this machine - this folder's, and the folder
         here of every other agent the store links to this node: each entry
-        its own key sealed, or another sealed for its public key, is sealed
-        again with the same key and value, no agent is given a new key, the
-        platform key is made on first need and pinned in each vault, and the
+        another sealed for its public key without the platform's copy beside
+        it is sealed again under the agent's own key with the same value, no
+        agent is given a new key, the platform key is made on first need and
+        pinned in each vault, and the
         platform takes its copy of each of the agent's own entries. Each
         connection the store shares that agents here are granted gets the
         platform's copy from the vault copies they hold, and the platform
@@ -36580,8 +36595,9 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         listed under duplicates, never merged or removed. Where the platform
         key is not on this machine - a node, whose agent's key lives in its
         environment - only each agent's own part runs: its entries sealed
-        again, the platform key the store publishes pinned, and the
-        platform's copies of its own entries sent (platform: elsewhere).
+        again and, where it already pins a platform key, the platform's
+        copies of its own entries sent; nothing is pinned from the platform
+        key the store publishes (platform: elsewhere).
         Running it again changes nothing. JSON {ok, agent, agents [{agent,
         folder, key, resealed, unreadable}], not_here [{agent, folder,
         reason}], platform (here | elsewhere), platform_copies,
