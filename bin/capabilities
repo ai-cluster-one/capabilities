@@ -19297,6 +19297,9 @@ AGENT_NODE_KEY = ".config/agent-node/node-key.pem"
 AGENT_NODE_LEGACY_KEY = ".config/agent-node/legacy-agent.env"
 # The first image whose boot path puts that kept key back in the legacy root.
 AGENT_NODE_LEGACY_KEY_SINCE = (0, 0, 18)
+# The first image whose boot path waits for no agent - the only kind `node
+# create` makes, since it tells a node none; an image before it waits for one.
+AGENT_NODE_PLACED_SINCE = (0, 0, 18)
 AGENT_NODE_STATE = "/tmp/agent-node.state"
 # Where an agent lives on a node unless placed elsewhere - ~/work/<slug>, on the
 # node's work volume - and the file the node's manager keeps each agent's state
@@ -19803,6 +19806,16 @@ def _agent_node_release():
     return {"version": version, "image": f"{AGENT_NODE_IMAGE}:{version}"}
 
 
+def _agent_node_image_placed(version):
+    """Refuse, node_image_old (exit 6), a release tag before the first image a
+    node told no agent raises agents on; a tag that is no release is taken."""
+    if (AGENT_NODE_RELEASE.fullmatch(version or "")
+            and tuple(int(part) for part in version.split(".")) < AGENT_NODE_PLACED_SINCE):
+        raise NodeFailure("node_image_old", f"image {version} waits for an agent the node is "
+                          "told, and a node made now is told none; take "
+                          f"{'.'.join(map(str, AGENT_NODE_PLACED_SINCE))} or later", 6)
+
+
 def cmd_node_image(args):
     release = _agent_node_release()
     _emit({"ok": True, **release} if args.json else release["image"])
@@ -19830,6 +19843,7 @@ def _agent_node_create(root, args):
         args.version = _agent_node_release()["version"]
     if not AGENT_NODE_VERSION.fullmatch(args.version or ""):
         raise NodeFailure("input", "--version takes the standard image's tag", 6)
+    _agent_node_image_placed(args.version)
     if not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory or ""):
         raise NodeFailure("input", "--memory takes a size such as 2g or 1536m", 6)
     _project_id, slug = _agent_node_project(root)
@@ -20535,6 +20549,8 @@ def cmd_node_add(args):
     version = args.version
     if row is None and version is None:
         version = _agent_node_release()["version"]
+    if row is None:
+        _agent_node_image_placed(version)
     with _NodeStep("project") as check:
         project, project_name, made = _agent_node_coolify_project(root, target, args.project,
                                                                   _agent_node_slug(slug))
@@ -38628,7 +38644,9 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         away again when the row cannot be written; the server's address is
         read before anything is made (exit 6 server_address). Answers {ok, node, image, memory,
         environment, volumes, handed, next}. Exit 6 node_exists,
-        not_store_mode, 3 environment_missing.
+        not_store_mode, node_image_old (a tag before 0.0.18, whose boot
+        path waits for an agent; add refuses it too, before any step), 3
+        environment_missing.
         enrol: the node's own steps - writes the node's id onto its config
         volume, makes its X25519 key pair there and records the public key
         on its row, writes the store setting with the node's own `store

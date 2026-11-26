@@ -313,7 +313,7 @@ def lab(tmp_path, monkeypatch):
 
 def create_args(**extra):
     return SimpleNamespace(**{"node": "box1", "project": "prj-uuid", "server": "srv-uuid",
-                              "environment": "test", "version": "0.0.1", "memory": "2g",
+                              "environment": "test", "version": "0.0.18", "memory": "2g",
                               "connection": None, "repository": None, "branch": None,
                               "dockerfile": None, "context": None, "deploy_key": None,
                               "github_app": None, "docker_socket": False, "host_dir": None,
@@ -345,7 +345,7 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
     assert create["stdin"] == (
         'services:\n'
         '  agent:\n'
-        '    image: "ghcr.io/agenium-dev/agent-node:0.0.1"\n'
+        '    image: "ghcr.io/agenium-dev/agent-node:0.0.18"\n'
         '    restart: unless-stopped\n'
         '    mem_limit: "2g"\n'
         '    volumes:\n'
@@ -1320,7 +1320,7 @@ def test_update_reports_a_node_that_did_not_come_back(lab, capsys, health, state
 
 
 def add_args(**extra):
-    return SimpleNamespace(**{"node": "box1", "server": "srv-uuid", "version": "0.0.1",
+    return SimpleNamespace(**{"node": "box1", "server": "srv-uuid", "version": "0.0.18",
                               "memory": "2g", "project": None, "environment": "production",
                               "services": "", "connection": None, "wait": 0, "events": True,
                               **extra})
@@ -1514,7 +1514,7 @@ class Registry:
 def registry(lab, monkeypatch):
     import urllib.request
     fake = Registry([["probe", "0.0.1", "latest", "0.0.9", "0.0.10-amd64"],
-                     ["0.0.10-arm64", "0.0.10", "0.0.2"]])
+                     ["0.0.10-arm64", "0.0.10", "0.0.18", "0.0.2"]])
     monkeypatch.setattr(urllib.request, "urlopen", fake)
     return fake
 
@@ -1522,11 +1522,11 @@ def registry(lab, monkeypatch):
 def test_node_image_names_the_newest_release_its_registry_holds(lab, registry, capsys):
     lab.m.cmd_node_image(SimpleNamespace(json=True))
     assert json.loads(capsys.readouterr().out) == {
-        "ok": True, "version": "0.0.10", "image": "ghcr.io/agenium-dev/agent-node:0.0.10"}
+        "ok": True, "version": "0.0.18", "image": "ghcr.io/agenium-dev/agent-node:0.0.18"}
     assert registry.urls[0] == ("https://ghcr.io/token?scope=repository:"
                                 "agenium-dev/agent-node:pull")
     lab.m.cmd_node_image(SimpleNamespace(json=False))
-    assert capsys.readouterr().out.strip() == "ghcr.io/agenium-dev/agent-node:0.0.10"
+    assert capsys.readouterr().out.strip() == "ghcr.io/agenium-dev/agent-node:0.0.18"
 
 
 def test_node_image_says_when_the_registry_cannot_name_a_release(lab, monkeypatch):
@@ -1546,13 +1546,31 @@ def test_node_image_says_when_the_registry_cannot_name_a_release(lab, monkeypatc
 
 def test_create_and_add_without_a_version_take_the_current_release(lab, registry, capsys):
     lab.m.cmd_node_create(create_args(version=None))
-    assert json.loads(capsys.readouterr().out)["image"] == "ghcr.io/agenium-dev/agent-node:0.0.10"
+    assert json.loads(capsys.readouterr().out)["image"] == "ghcr.io/agenium-dev/agent-node:0.0.18"
     lab.fake.rows.clear()
     lab.fake.calls.clear()
     lab.m.cmd_node_add(add_args(version=None, events=False))
-    assert json.loads(capsys.readouterr().out)["image"] == "ghcr.io/agenium-dev/agent-node:0.0.10"
+    assert json.loads(capsys.readouterr().out)["image"] == "ghcr.io/agenium-dev/agent-node:0.0.18"
     [create] = [c for c in lab.fake.of("coolify") if c["argv"][3:5] == ["service", "create"]]
-    assert 'image: "ghcr.io/agenium-dev/agent-node:0.0.10"' in create["stdin"]
+    assert 'image: "ghcr.io/agenium-dev/agent-node:0.0.18"' in create["stdin"]
+
+
+@pytest.mark.parametrize("verb", ["create", "add"])
+def test_create_and_add_refuse_an_image_that_waits_for_an_agent_before_making_anything(
+        lab, monkeypatch, verb):
+    import urllib.request
+    make = {"create": lambda **a: lab.m.cmd_node_create(create_args(**a)),
+            "add": lambda **a: lab.m.cmd_node_add(add_args(events=False, **a))}[verb]
+    for version in ("0.0.17", "0.0.1"):
+        with pytest.raises(lab.m.NodeFailure) as refused:
+            make(version=version)
+        assert refused.value.code == "node_image_old" and refused.value.exit_code == 6
+    # The registry's newest release is taken the same way when none is given.
+    monkeypatch.setattr(urllib.request, "urlopen", Registry([["0.0.9", "0.0.17", "latest"]]))
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        make(version=None)
+    assert refused.value.code == "node_image_old"
+    assert not lab.fake.rows and not lab.fake.of("coolify")
 
 
 LENT = {"url": "https://coolify.lent.invalid", "token": "lent-secret"}

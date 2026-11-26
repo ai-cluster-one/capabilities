@@ -560,7 +560,7 @@
       "level": 0,
       "lucide_icon": "rocket",
       "path": "capabilities/deployment",
-      "payload_sha256": "2592b5b8f269d97d66898547f11d0ececbe808b5f0745b59a9bb804e276b8ea0",
+      "payload_sha256": "4a458a4011ee8340802965eee67c5eb933946d981d507a675654efb6f422914c",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project deployment standard - declare the services a project runs, compile them into a container image, and describe the targets they deploy to.",
