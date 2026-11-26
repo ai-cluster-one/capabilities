@@ -34,6 +34,13 @@ class Fake:
                                     "ASSETS_FILES_ACCESS_KEY_ID=files-secret\n"
                                     "DRIVE_SA_JSON=drive-secret\n")
         self.state = "running agent prj_00000000a1a1 as node box1"
+        # What the node's manager says of the agent in its agents file, and
+        # what the key script answers.
+        self.agent_state = "raised"
+        self.key_answer = None
+        # Where each of the agent's services runs, by node, and which are shared.
+        self.services: dict[str, set] = {}
+        self.shared: set[str] = set()
         self.gone: set[str] = set()
         self.apps: set[str] = set()
         self.fail_storage = False
@@ -157,18 +164,41 @@ class Fake:
                 if self.fail_add:
                     return self.module.NodeFailure("store_unreachable", "fixture", 5)
                 flags = dict(zip(args[3::2], args[4::2]))
-                self.rows[args[2]] = {"node": args[2], "label": flags["--label"],
-                                      "kind": flags["--kind"],
+                self.rows[args[2]] = {"node": args[2], "label": flags.get("--label"),
+                                      "kind": flags.get("--kind"),
                                       "address": flags.get("--address"),
-                                      "coolify_connection": flags["--coolify-connection"],
-                                      "coolify_server": flags["--coolify-server"],
-                                      "coolify_resource": flags["--coolify-resource"],
+                                      "coolify_connection": flags.get("--coolify-connection"),
+                                      "coolify_server": flags.get("--coolify-server"),
+                                      "coolify_resource": flags.get("--coolify-resource"),
                                       "public_key": None}
+                if "--folder" in flags:
+                    self.rows[args[2]]["folder"] = flags["--folder"]
                 return json.dumps({"node": self.rows[args[2]]})
             if args[:2] == ["node", "set"]:
-                for flag, value in zip(args[3::2], args[4::2]):
-                    self.rows[args[2]][flag[2:].replace("-", "_")] = value
+                rest = args[3:]
+                while rest:
+                    flag = rest.pop(0)
+                    if flag in ("--master", "--no-master", "--may-write", "--no-may-write"):
+                        self.rows[args[2]][flag.removeprefix("--no-").removeprefix("--")
+                                           .replace("-", "_").replace("master", "is_master")
+                                           ] = not flag.startswith("--no-")
+                    else:
+                        self.rows[args[2]][flag[2:].replace("-", "_")] = rest.pop(0)
                 return json.dumps({"node": self.rows[args[2]]})
+            if args[:2] == ["service", "status"]:
+                return json.dumps({"services": [
+                    {"capability": name, "placed_on": sorted(where),
+                     "instances": [{"node": n, "pid": 7} for n in sorted(where)]}
+                    for name, where in sorted(self.services.items())]})
+            if args[:2] in (["service", "move"], ["service", "start"], ["service", "stop"]):
+                name, node = args[2], args[args.index("--node") + 1]
+                if args[1] == "move" and name in self.shared:
+                    return self.module.NodeFailure("placement_shared", "fixture", 6)
+                where = self.services.setdefault(name, set())
+                if args[1] == "move":
+                    where.clear()
+                where.discard(node) if args[1] == "stop" else where.add(node)
+                return json.dumps({"placed_on": sorted(where)})
             if args[:2] == ["node", "remove"]:
                 return json.dumps({"removed": self.rows.pop(args[2])})
             if args[:2] == ["secrets", "list"]:
@@ -202,11 +232,16 @@ class Fake:
             if inner[:2] == ["sh", "-c"]:
                 return KEY + "\n"
             if inner[:2] == ["python3", "-c"] and "AGENT_ENCRYPTION_KEY" in inner[2]:
-                return ""
+                return json.dumps(self.key_answer or {
+                    "ok": True, "folder": inner[3], "moved_shared_key_to": None,
+                    "shared_key_removed": False})
             if inner[:2] == ["python3", "-c"]:
                 return json.dumps({name: len(keys) for name, keys in json.loads(stdin).items()})
             if inner[:1] == ["capabilities"]:
                 return json.dumps({"ok": True})
+            if inner == ["cat", self.module.AGENT_NODE_AGENTS]:
+                return json.dumps({"node": BOX1, "agents": {"prj_00000000a1a1": {
+                    "state": self.agent_state, "line": self.agent_state}}})
             if inner[:1] == ["cat"]:
                 return self.state
             raise AssertionError(inner)
@@ -269,6 +304,8 @@ def lab(tmp_path, monkeypatch):
         ["store", "set", "--host", "db.invalid", "--database", "agents", "--user", "agent",
          "--schema", "agentkit", "--password-stdin"], "store-secret\n"))
     monkeypatch.setattr(m.time, "sleep", lambda seconds: None)
+    # No other agent lives on the lab's node.
+    monkeypatch.setattr(m, "_agent_node_neighbours", lambda root, node: [])
     # The id `node create` mints for the node it makes.
     monkeypatch.setattr(m.secrets, "token_hex", lambda n: BOX1)
     return SimpleNamespace(m=m, fake=fake, root=root, usable=usable, node_run=node_run)
@@ -303,17 +340,14 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
                         ("--environment", "test"), ("--name", "lab-agent-box1")):
         assert argv[argv.index(flag) + 1] == value
     assert "--instant-deploy" in argv
-    # The whole document: the image, its memory limit, its volumes and the two
-    # keys it is told - no node identity - and nothing to build or clone.
+    # The whole document: the image, its memory limit and its volumes - no
+    # agent and no node identity - and nothing to build or clone.
     assert create["stdin"] == (
         'services:\n'
         '  agent:\n'
         '    image: "ghcr.io/agenium-dev/agent-node:0.0.1"\n'
         '    restart: unless-stopped\n'
         '    mem_limit: "2g"\n'
-        '    environment:\n'
-        '      CAPABILITIES_PROJECT_ID: "prj_00000000a1a1"\n'
-        '      CAPABILITIES_PROJECT_ID_ROOT: "/app"\n'
         '    volumes:\n'
         '      - "config:/home/agent/.config"\n'
         '      - "state:/home/agent/.local/state"\n'
@@ -338,6 +372,7 @@ def test_create_makes_a_resource_of_the_standard_image_and_registers_its_row(lab
                                      "coolify_resource": "svc-new", "public_key": None}
     answer = json.loads(capsys.readouterr().out)
     assert answer["node"]["coolify_resource"] == "svc-new"
+    assert answer["handed"] == []
     assert answer["next"] == f"capabilities node enrol {BOX1}"
 
 
@@ -360,7 +395,7 @@ def test_create_refuses_a_node_the_agent_has_and_takes_back_a_resource_it_cannot
 def test_enrol_gives_the_node_its_key_secrets_placements_and_store(lab, capsys):
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
-    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="tasks,automations", wait=30))
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="tasks,automations", wait=30, machine=False))
 
     assert lab.fake.rows[BOX1]["public_key"] == KEY
     docker = [c for c in lab.fake.of("ssh") if "docker exec" in c["argv"][-1]]
@@ -379,16 +414,24 @@ def test_enrol_gives_the_node_its_key_secrets_placements_and_store(lab, capsys):
     places = [c["argv"][1:] for c in lab.fake.of("capabilities") if c["argv"][1] == "place"]
     assert places == [["place", "tasks", "--node", BOX1],
                       ["place", "automations", "--node", BOX1]]
-    # The store setting is what the node raises on, so it is written last.
-    order = [i for i, c in enumerate(lab.fake.calls)
-             if c in (secrets, store) or c["argv"][1:2] == ["place"]]
-    assert lab.fake.calls.index(store) == max(order)
+    # The node's own steps first, the store setting last of them; then the
+    # agent's link with its folder; its services only once the node says it
+    # is raised.
+    [link] = [c for c in lab.fake.of("capabilities") if c["argv"][1:3] == ["node", "set"]
+              and "--folder" in c["argv"]]
+    assert link["argv"][-2:] == ["--folder", "/home/agent/work/lab-agent"]
+    [raised] = [c for c in docker if c["argv"][-1].endswith(lab.m.AGENT_NODE_AGENTS)]
+    calls = lab.fake.calls
+    assert calls.index(store) < calls.index(link) < calls.index(secrets) < calls.index(raised)
+    assert calls.index(raised) < min(i for i, c in enumerate(calls)
+                                     if c["argv"][1:2] == ["place"])
 
     answer = json.loads(capsys.readouterr().out)
     assert answer["ok"] is True and answer["placed"] == ["tasks", "automations"]
     assert (answer["node"], answer["label"]) == (BOX1, "box1")
     assert answer["unplaced"] == {"tasks": ["mac"]}
     assert answer["secrets"] == {"telegram": ["TELEGRAM_BOT_TOKEN"]}
+    assert (answer["folder"], answer["state"]) == ("/home/agent/work/lab-agent", "raised")
     assert "bot-secret" not in json.dumps(answer)
 
 
@@ -397,7 +440,7 @@ def test_enrol_leaves_the_coolify_token_the_node_was_created_through_here(lab, m
     monkeypatch.setattr(lab.m, "_usable_capabilities", lambda root: ["coolify", "telegram"])
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
-    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=False))
 
     [secrets] = [c for c in lab.fake.of("ssh")
                  if "docker exec" in c["argv"][-1] and "python3" in c["argv"][-1]]
@@ -423,7 +466,7 @@ def test_enrol_carries_every_usable_capabilitys_connections_and_names_what_it_sk
                         lambda root: ["assets", "coolify", "rclonec", "telegram"])
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
-    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=False))
 
     [secrets] = [c for c in lab.fake.of("ssh")
                  if "docker exec" in c["argv"][-1] and "python3" in c["argv"][-1]]
@@ -459,7 +502,7 @@ def test_enrol_names_each_secret_a_capability_reads_from_the_environment_alone(
     monkeypatch.setenv("TELEGRAM_SESSION", "session-secret")
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
-    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=False))
     out = capsys.readouterr().out
     answer = json.loads(out)
     # Its service reads them from its environment and no connection reports
@@ -482,7 +525,7 @@ def test_enrol_names_the_secrets_of_a_capability_with_no_connection_to_report(
                         lambda name: (manifest, None) if name == "slack" else (None, "x"))
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
-    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=False))
     answer = json.loads(capsys.readouterr().out)
     assert answer["environment_only"] == {"slack": ["SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"]}
     assert [row["capability"] for row in answer["secrets_skipped"]] == ["slack"]
@@ -503,7 +546,7 @@ def test_enrol_skips_and_names_a_capability_whose_connections_cannot_run_or_time
     monkeypatch.setattr(lab.m, "_agent_node_run", probe)
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
-    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=False))
     answer = json.loads(capsys.readouterr().out)
     skipped = {row["capability"]: row["reason"] for row in answer["secrets_skipped"]
                if "key" not in row}
@@ -545,7 +588,7 @@ def test_enrol_gives_the_node_the_agents_key_instead_of_a_secret_its_vault_holds
     lab.fake.telegram_tier = tier
     lab.m.cmd_node_create(create_args())
     capsys.readouterr()
-    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=False))
 
     docker = [c for c in lab.fake.of("ssh") if "docker exec" in c["argv"][-1]]
     [placed] = [c for c in docker if "AGENT_ENCRYPTION_KEY" in c["argv"][-1]]
@@ -554,8 +597,9 @@ def test_enrol_gives_the_node_the_agents_key_instead_of_a_secret_its_vault_holds
         assert AGENT_KEY not in " ".join(call["argv"])
     # The one file secret is in the vault, so no capability's file is written.
     assert not [c for c in docker if "credentials.env" in c["argv"][-1]]
-    [store] = [c for c in docker if "capabilities store set" in c["argv"][-1]]
-    assert lab.fake.calls.index(placed) < lab.fake.calls.index(store)
+    # It goes into the agent's own folder on the node, never the shared file.
+    assert shlex.split(placed["argv"][-1])[-4:-2] == ["/home/agent/work/lab-agent",
+                                                      "prj_00000000a1a1"]
     answer = json.loads(capsys.readouterr().out)
     assert answer["key"] == {"placed": True, "fingerprint": "f" * 64}
     assert answer["secrets"] == {} and answer["secrets_in_vault"] == {
@@ -570,16 +614,16 @@ def test_enrol_refuses_a_key_that_does_not_open_the_vault_before_touching_the_no
     lab.m.cmd_node_create(create_args())
     before = len(lab.fake.of("ssh"))
     with pytest.raises(lab.m.NodeFailure) as refused:
-        lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+        lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=False))
     assert refused.value.code == "key_mismatch"
     assert len(lab.fake.of("ssh")) == before
 
 
 def test_enrol_reports_a_node_that_did_not_raise_its_agent(lab, capsys):
     lab.m.cmd_node_create(create_args())
-    lab.fake.state = "idle: waiting for store-setting"
+    lab.fake.agent_state = "waiting for its key"
     with pytest.raises(lab.m.NodeFailure) as failed:
-        lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=0))
+        lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=0, machine=False))
     assert failed.value.code == "node_not_raised"
 
 
@@ -643,7 +687,7 @@ def test_a_node_is_made_only_for_an_agent_that_lives_in_the_store(lab, monkeypat
 def test_enrol_and_remove_reach_a_node_built_from_a_repository(lab, capsys):
     built(lab)
     capsys.readouterr()
-    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30))
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=False))
     assert json.loads(capsys.readouterr().out)["ok"] is True
 
     lab.fake.config = {"Image": "app-new:0123abc",
@@ -1032,10 +1076,11 @@ def test_update_moves_a_standard_image_node_to_the_tag_and_waits_for_its_agent(l
                        ["deploy", "svc-new"]]
     # The whole document node create writes, with the new tag, and no read of
     # the Compose Coolify hides from a token without read:sensitive.
-    created = next(c["stdin"] for c in lab.fake.of("coolify") if "create" in c["argv"])
-    assert lab.fake.compose == created.replace("agent-node:0.0.1", "agent-node:0.0.10")
+    # The lab's container is a node created before agents were placed, told
+    # its one agent: the document keeps the two keys it was told.
     assert lab.fake.compose == lab.m._agent_node_compose(
-        "prj_00000000a1a1", "ghcr.io/agenium-dev/agent-node:0.0.10", "2g")
+        "ghcr.io/agenium-dev/agent-node:0.0.10", "2g",
+        lab.m._agent_node_environment("prj_00000000a1a1"))
     # Through the connection the row names, and nothing deleted.
     assert all(c["argv"][1:3] == ["--connection", "infra"] for c in lab.fake.of("coolify")
                if c["argv"][1:2] != ["help"])
@@ -1070,7 +1115,8 @@ def test_update_writes_the_memory_limit_it_is_given(lab, capsys, version):
     lab.m.cmd_node_update(update_args(version=version, memory="5g"))
     # On the tag or off it, a new limit writes the document and redeploys it.
     assert lab.fake.compose == lab.m._agent_node_compose(
-        "prj_00000000a1a1", f"ghcr.io/agenium-dev/agent-node:{version}", "5g")
+        f"ghcr.io/agenium-dev/agent-node:{version}", "5g",
+        lab.m._agent_node_environment("prj_00000000a1a1"))
     assert [c["argv"][3:] for c in lab.fake.of("coolify")
             if c["argv"][3:4] == ["deploy"]] == [["deploy", "svc-new"]]
     answer = json.loads(capsys.readouterr().out)
@@ -1118,7 +1164,8 @@ def test_update_gives_a_node_created_before_its_work_volume_that_volume(lab, cap
     capsys.readouterr()
     lab.m.cmd_node_update(update_args())
     assert lab.fake.compose == lab.m._agent_node_compose(
-        "prj_00000000a1a1", "ghcr.io/agenium-dev/agent-node:0.0.10", "2g")
+        "ghcr.io/agenium-dev/agent-node:0.0.10", "2g",
+        lab.m._agent_node_environment("prj_00000000a1a1"))
     answer = json.loads(capsys.readouterr().out)
     assert answer["volumes_added"] == ["work"] and answer["redeployed"] is True
 
@@ -1295,8 +1342,8 @@ def test_add_takes_a_node_from_nothing_to_raised_and_says_each_step(lab, stream,
 
     said = capsys.readouterr().out
     assert steps(said) == [(name, state) for name in (
-        "project", "environment", "create", "container", "id", "key_pair", "encryption_key",
-        "secrets", "place", "store", "raised") for state in ("started", "done")]
+        "project", "environment", "create", "container", "id", "key_pair", "store", "link",
+        "encryption_key", "secrets", "raised", "place") for state in ("started", "done")]
     checks = {e["step"]: e for e in events(said) if e.get("state") == "done"}
     # No project carried the agent's name: one is made, with its environment.
     assert checks["project"]["check"] == {"uuid": "prj-made", "name": "lab-agent",
@@ -1330,13 +1377,20 @@ def test_raised_says_what_the_node_is_doing_each_time_its_line_changes(lab, stre
         "raising agent prj_00000000a1a1: bringing its capabilities to the catalogue: 3 of 3 "
         "(telegram)",
         "raising agent prj_00000000a1a1: composing its context",
-        "running agent prj_00000000a1a1 as node box1",
     ])
     exec_ = m._agent_node_exec
+    listed = []
 
     def node_exec(root, host, container, argv, **kw):
+        # The node lists the agent once its boot path's lines have been said.
+        if argv == ["cat", m.AGENT_NODE_AGENTS]:
+            return exec_(root, host, container, argv, **kw) if listed else ""
         if argv == ["cat", m.AGENT_NODE_STATE]:
-            return next(lines)
+            line = next(lines, None)
+            if line is None:
+                listed.append(True)
+                return "running as node b0b100000001: 1 agent"
+            return line
         return exec_(root, host, container, argv, **kw)
 
     monkeypatch.setattr(m, "_agent_node_exec", node_exec)
@@ -1353,8 +1407,8 @@ def test_raised_says_what_the_node_is_doing_each_time_its_line_changes(lab, stre
          "item": "telegram"},
         {"step": "raised", "node": BOX1, "doing": "raising agent prj_00000000a1a1: "
                                                   "composing its context"},
-        {"step": "raised", "node": BOX1,
-         "doing": "running agent prj_00000000a1a1 as node box1"}]
+        {"step": "raised", "node": BOX1, "doing": "running as node b0b100000001: 1 agent"},
+        {"step": "raised", "node": BOX1, "doing": "raised"}]
     assert progress[2]["state"] == doing + ": 1 of 3 (assets)"
     # Each is said inside raised, between its start and its end.
     names = [(e["event"], e.get("step"), e.get("state")) for e in said]
@@ -1390,14 +1444,14 @@ def test_add_again_after_a_failure_keeps_what_is_done_and_resumes(lab, stream, c
 
     # Then it comes up, but the agent does not rise in time.
     lab.fake.containers = "abc123\n"
-    lab.fake.state = "idle: waiting for store-setting"
+    lab.fake.agent_state = "waiting for its key"
     with pytest.raises(lab.m.NodeFailure) as failed:
         lab.m.cmd_node_add(add_args())
     assert failed.value.code == "node_not_raised"
     assert steps(capsys.readouterr().out)[-1] == ("raised", "failed")
 
     # The third run finds the project, the environment and the node done.
-    lab.fake.state = "running agent prj_00000000a1a1 as node box1"
+    lab.fake.agent_state = "raised"
     lab.m.cmd_node_add(add_args())
     said = capsys.readouterr().out
     checks = {e["step"]: e["check"] for e in events(said) if e.get("state") == "done"}
@@ -1718,3 +1772,253 @@ def test_a_node_made_through_a_granted_connection_is_reached_by_its_address_and_
     assert not lab.fake.of("coolify")
     # Update and remove still reach Coolify through that connection.
     assert lab.m._agent_node_target(row) == {"connection": "infra"}
+
+
+# ── a node that hosts several agents ─────────────────────────────────────────
+
+def test_create_hands_no_agent_and_defaults_to_memory_for_a_few_agents(lab):
+    assert lab.m.AGENT_NODE_MEMORY == "6g"
+    assert "environment:" not in lab.m._agent_node_compose("img:1", "6g")
+
+
+def test_enrol_machine_enrols_the_node_alone_and_waits_for_its_manager(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.fake.state = f"running as node {BOX1}: 0 agents"
+    lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="", wait=30, machine=True))
+    answer = json.loads(capsys.readouterr().out)
+    assert answer == {"ok": True, "node": BOX1, "label": "box1", "public_key": KEY,
+                      "store": "written", "state": f"running as node {BOX1}: 0 agents",
+                      "machine": True}
+    docker = [c["argv"][-1] for c in lab.fake.of("ssh") if "docker exec" in c["argv"][-1]]
+    # Nothing of an agent: no key, no secrets, no link with a folder, no place.
+    assert not [c for c in docker if "python3" in c]
+    assert not [c for c in lab.fake.of("capabilities") if "--folder" in c["argv"]
+                or c["argv"][1] == "place"]
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_enrol(SimpleNamespace(node="box1", services="tasks", wait=30,
+                                             machine=True))
+    assert refused.value.code == "input"
+
+
+def test_place_links_hands_the_key_into_the_agents_folder_then_places_its_services(
+        lab, monkeypatch, capsys):
+    _agent_key(lab, monkeypatch)
+    # A node another agent lives on, not yet this agent's, named by its id.
+    other = "c0c100000002"
+    lab.fake.rows.clear()
+    known = {"node": other, "label": "shared", "kind": "server", "address": "203.0.113.7",
+             "coolify_connection": "infra", "coolify_server": "srv-uuid",
+             "coolify_resource": "svc-new", "public_key": None}
+    node_add = lab.fake.answer
+
+    def answer(argv, stdin):
+        if argv[:3] == ["capabilities", "node", "add"] and argv[3] == other:
+            lab.fake.rows[other] = {**known, "folder": argv[-1]}
+            return json.dumps({"node": lab.fake.rows[other], "linked": True})
+        return node_add(argv, stdin)
+    monkeypatch.setattr(lab.fake, "answer", answer)
+    lab.m.cmd_node_place(SimpleNamespace(node=other, folder=None, services="tasks", wait=30))
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True and out["folder"] == "/home/agent/work/lab-agent"
+    assert out["placed"] == ["tasks"] and out["state"] == "raised"
+    assert out["key"] == {"placed": True, "fingerprint": "f" * 64, "moved_shared_key_to": None}
+    calls = lab.fake.calls
+    [link] = [c for c in calls if c["argv"][:4] == ["capabilities", "node", "add", other]]
+    assert link["argv"][-2:] == ["--folder", "/home/agent/work/lab-agent"]
+    [key] = [c for c in calls if c["argv"][0] == "ssh" and "AGENT_ENCRYPTION_KEY" in c["argv"][-1]]
+    assert key["stdin"] == AGENT_KEY and AGENT_KEY not in " ".join(key["argv"])
+    assert shlex.split(key["argv"][-1])[-4:] == [
+        "/home/agent/work/lab-agent", "prj_00000000a1a1", lab.m.AGENT_NODE_LEGACY_KEY, "0.0.18"]
+    [place] = [c for c in calls if c["argv"][1:2] == ["place"]]
+    assert calls.index(link) < calls.index(key) < calls.index(place)
+
+
+@pytest.mark.parametrize("said,code", [({"ok": False, "legacy_image": True}, "node_image_old"),
+                                       ({"ok": False, "bound": "prj_00000000b2b2"},
+                                        "folder_bound")])
+def test_place_refuses_a_node_that_would_lose_a_key_or_a_folder_of_another_agent(
+        lab, monkeypatch, capsys, said, code):
+    _agent_key(lab, monkeypatch)
+    lab.m.cmd_node_create(create_args())
+    lab.fake.key_answer = said
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_place(SimpleNamespace(node="box1", folder=None, services="tasks",
+                                             wait=30))
+    assert refused.value.code == code and refused.value.exit_code == 6
+    assert not [c for c in lab.fake.calls if c["argv"][1:2] == ["place"]]
+
+
+def test_place_waits_for_the_node_to_raise_the_agent_and_places_nothing_until_it_does(
+        lab, monkeypatch, capsys):
+    _agent_key(lab, monkeypatch)
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.fake.agent_state = "waiting for its key"
+    with pytest.raises(lab.m.NodeFailure) as failed:
+        lab.m.cmd_node_place(SimpleNamespace(node="box1", folder="/home/agent/work/x",
+                                             services="tasks", wait=0))
+    assert failed.value.code == "node_not_raised"
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["ok"] is False and answer["state"] == "waiting for its key"
+    assert answer["folder"] == "/home/agent/work/x"
+    assert not [c for c in lab.fake.calls if c["argv"][1:2] == ["place"]]
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_place(SimpleNamespace(node="box1", folder="work/x", services="",
+                                             wait=0))
+    assert refused.value.code == "input"
+
+
+def _two_nodes(lab, master=True):
+    lab.m.cmd_node_create(create_args())
+    second = "c0c100000002"
+    lab.fake.rows[BOX1].update(is_master=master, folder="/home/agent/work/lab-agent")
+    lab.fake.rows[second] = {**lab.fake.rows[BOX1], "node": second, "label": "box2",
+                             "is_master": False, "folder": None}
+    return second
+
+
+def test_move_places_on_the_new_node_then_moves_each_service_then_leaves_the_old(
+        lab, monkeypatch, capsys):
+    _agent_key(lab, monkeypatch)
+    second = _two_nodes(lab)
+    lab.fake.services = {"tasks": {BOX1}, "automations": {BOX1}}
+    lab.fake.shared = {"automations"}
+    del lab.fake.calls[:]
+    capsys.readouterr()
+    lab.m.cmd_node_move(SimpleNamespace(origin="box1", target="box2", folders=[], wait=30))
+    out = json.loads(capsys.readouterr().out)
+    [moved] = out["agents"]
+    assert out["ok"] is True and moved == {
+        "ok": True, "agent_id": "prj_00000000a1a1", "from": BOX1, "to": second,
+        "folder": "/home/agent/work/lab-agent", "services": ["automations", "tasks"],
+        "master_moved": True, "removed": True, "stopped_at": None}
+    verbs = [c["argv"][1:] for c in lab.fake.of("capabilities")
+             if c["argv"][1] in ("service", "node") and c["argv"][2] not in ("list", "status")]
+    # Linked with its folder on the new node, an exclusive service moved in one
+    # step, a shared one started there and then stopped on the old node, the
+    # master moved, and only then the link to the old node removed.
+    assert verbs == [
+        ["node", "set", second, "--folder", "/home/agent/work/lab-agent"],
+        ["service", "move", "automations", "--node", second, "--wait", "30"],
+        ["service", "start", "automations", "--node", second, "--wait", "30"],
+        ["service", "stop", "automations", "--node", BOX1, "--wait", "30"],
+        ["service", "move", "tasks", "--node", second, "--wait", "30"],
+        ["node", "set", BOX1, "--no-master"],
+        ["node", "set", second, "--master", "--may-write"],
+        ["node", "remove", BOX1]]
+    assert lab.fake.services == {"tasks": {second}, "automations": {second}}
+
+
+def test_move_stops_at_the_first_step_that_does_not_settle(lab, monkeypatch, capsys):
+    _agent_key(lab, monkeypatch)
+    _two_nodes(lab)
+    lab.fake.services = {"tasks": {BOX1}}
+    lab.fake.agent_state = "failing to raise: its context could not be built"
+    capsys.readouterr()
+    with pytest.raises(lab.m.NodeFailure) as failed:
+        lab.m.cmd_node_move(SimpleNamespace(origin="box1", target="box2", folders=[], wait=0))
+    assert failed.value.code == "node_not_raised"
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False and out["agents"][0]["stopped_at"] == "place"
+    # Nothing of the agent moved: its service still runs on the old node alone.
+    assert lab.fake.services == {"tasks": {BOX1}}
+    assert not [c for c in lab.fake.calls if c["argv"][1:3] in (["service", "move"],
+                                                                ["node", "remove"])]
+
+
+def test_memory_changes_the_limit_on_the_tag_the_node_runs(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.m.cmd_node_memory(SimpleNamespace(node="box1", memory="8g", wait=30))
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["memory"] == {"before": "2g", "after": "8g"} and answer["restarted"] is True
+    assert lab.fake.compose == lab.m._agent_node_compose(
+        "ghcr.io/agenium-dev/agent-node:0.0.1", "8g",
+        lab.m._agent_node_environment("prj_00000000a1a1"))
+    lab.fake.memory = 8 << 30
+    lab.fake.compose = None
+    lab.m.cmd_node_memory(SimpleNamespace(node="box1", memory="8g", wait=30))
+    assert json.loads(capsys.readouterr().out)["restarted"] is False
+    assert lab.fake.compose is None
+
+
+def test_update_of_a_node_handed_no_agent_keeps_it_so_and_waits_for_its_manager(lab, capsys):
+    lab.m.cmd_node_create(create_args())
+    capsys.readouterr()
+    lab.fake.config = {**lab.fake.config, "Env": ["PATH=/usr/bin"]}
+    lab.fake.state = f"running as node {BOX1}: 2 agents"
+    lab.m.cmd_node_update(update_args())
+    assert lab.fake.compose == lab.m._agent_node_compose(
+        "ghcr.io/agenium-dev/agent-node:0.0.10", "2g")
+    answer = json.loads(capsys.readouterr().out)
+    assert answer["ok"] is True and answer["state"] == f"running as node {BOX1}: 2 agents"
+
+
+def test_remove_refuses_a_node_other_agents_live_on(lab, monkeypatch):
+    lab.m.cmd_node_create(create_args())
+    monkeypatch.setattr(lab.m, "_agent_node_neighbours",
+                        lambda root, node: ["prj_00000000b2b2"])
+    with pytest.raises(lab.m.NodeFailure) as refused:
+        lab.m.cmd_node_remove(SimpleNamespace(node="box1", yes=True))
+    assert refused.value.code == "node_shared"
+    assert not [c for c in lab.fake.of("coolify") if "delete" in c["argv"]]
+
+
+def _place_key(lab, tmp_path, *, legacy=True, version="0.0.18", resident=True, key="K2"):
+    """Run the key script for real, as the node runs it, in a scratch home."""
+    import os
+    import subprocess
+    home = tmp_path / "home"
+    app = tmp_path / "app"
+    (home / ".config" / "capabilities").mkdir(parents=True, exist_ok=True)
+    app.mkdir(exist_ok=True)
+    env = {"HOME": str(home), "PATH": os.environ["PATH"],
+           "AGENT_NODE_VERSION_FILE": str(tmp_path / "VERSION")}
+    (tmp_path / "VERSION").write_text(version + "\n")
+    if legacy:
+        env.update(CAPABILITIES_PROJECT_ID="prj_00000000a1a1",
+                   CAPABILITIES_PROJECT_ID_ROOT=str(app))
+    if resident:
+        agents = home / ".local/state/capabilities/node/agents.json"
+        agents.parent.mkdir(parents=True, exist_ok=True)
+        agents.write_text("{}")
+    folder = home / "work" / "beta"
+    done = subprocess.run(["python3", "-c", lab.m._AGENT_NODE_PLACE_KEY, str(folder),
+                           "prj_00000000b2b2", lab.m.AGENT_NODE_LEGACY_KEY,
+                           ".".join(map(str, lab.m.AGENT_NODE_LEGACY_KEY_SINCE))],
+                          input=key, capture_output=True, text=True, env=env, check=True)
+    return json.loads(done.stdout), home, app, folder
+
+
+def test_the_key_script_keeps_a_legacy_agents_key_on_a_volume_and_shares_none(lab, tmp_path):
+    shared = tmp_path / "home/.config/capabilities/shared.env"
+    shared.parent.mkdir(parents=True)
+    shared.write_text("TRANSCRIBE_KEY=t\nAGENT_ENCRYPTION_KEY=K1\n")
+    said, home, app, folder = _place_key(lab, tmp_path)
+    assert said == {"ok": True, "folder": str(folder), "moved_shared_key_to": str(app),
+                    "shared_key_removed": True}
+    # The second agent's key in its own folder, bound to it; the first's moved
+    # into its root and kept on the config volume; shared.env keeps the rest.
+    assert (folder / ".env.local").read_text().splitlines() == [
+        "CAPABILITIES_PROJECT_ID=prj_00000000b2b2",
+        f"CAPABILITIES_PROJECT_ID_ROOT={folder}", "AGENT_ENCRYPTION_KEY=K2"]
+    assert (app / ".env.local").read_text() == "AGENT_ENCRYPTION_KEY=K1\n"
+    kept = home / lab.m.AGENT_NODE_LEGACY_KEY
+    assert kept.read_text() == "CAPABILITIES_PROJECT_ID=prj_00000000a1a1\nAGENT_ENCRYPTION_KEY=K1\n"
+    assert shared.read_text() == "TRANSCRIBE_KEY=t\n"
+    for path in (folder / ".env.local", app / ".env.local", kept):
+        assert path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("version,resident", [("0.0.17", True), ("0.0.18", False)])
+def test_the_key_script_writes_nothing_where_the_node_would_lose_a_shared_key(
+        lab, tmp_path, version, resident):
+    shared = tmp_path / "home/.config/capabilities/shared.env"
+    shared.parent.mkdir(parents=True)
+    shared.write_text("AGENT_ENCRYPTION_KEY=K1\n")
+    said, home, app, folder = _place_key(lab, tmp_path, version=version, resident=resident)
+    assert said == {"ok": False, "folder": str(folder), "legacy_image": True}
+    assert shared.read_text() == "AGENT_ENCRYPTION_KEY=K1\n"
+    assert not folder.exists() and not (app / ".env.local").exists()
+    assert not (home / lab.m.AGENT_NODE_LEGACY_KEY).exists()

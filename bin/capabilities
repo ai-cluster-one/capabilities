@@ -109,7 +109,10 @@ PROJECT VERBS (run inside a consuming project)
   node remove         remove a node
   node image          the standard agent node's image
   node create         create a hosted node's resource
-  node enrol          start a created hosted node
+  node enrol          start a created node
+  node place          put this agent on a node
+  node move           move this agent to a node
+  node memory         a node's memory limit
   node update         update a node, or say what is newer
   node exec           run a command on a hosted node
   node login          sign a hosted node in to a tool
@@ -9129,7 +9132,7 @@ AGENT_HERE_FIRST = ("EXISTS (SELECT 1 FROM agent_nodes h "
 # base64.
 NODE_FIELDS = ("label", "kind", "address", "target", "coolify_connection",
                "coolify_server", "coolify_resource", "public_key")
-NODE_LINK_FIELDS = ("is_master", "may_write")
+NODE_LINK_FIELDS = ("is_master", "may_write", "folder")
 # What a node reads as: its id as `node`, its own fields, the link's.
 NODE_COLUMNS = ("node", "label", "kind", "address", "is_master", "may_write", "target",
                 "last_seen_at", "coolify_connection", "coolify_server",
@@ -12822,6 +12825,13 @@ def _node_values(opts: dict) -> dict:
     if key is not None and not re.fullmatch(r"[A-Za-z0-9+/]{43}=", key):
         _die(6, "input", "--public-key takes the node's X25519 public key: its 32 bytes "
              "in base64")
+    if "--folder" in opts:
+        folder = opts["--folder"].strip()
+        if folder and not (folder.startswith("/") and folder == os.path.normpath(folder)
+                           and folder != "/"):
+            _die(6, "input", "--folder takes the agent's folder on that node as an absolute "
+                 "path, such as /home/agent/work/<slug>")
+        values["folder"] = folder or None
     for on, off, column in (("--master", "--no-master", "is_master"),
                             ("--may-write", "--no-may-write", "may_write")):
         if on in opts and off in opts:
@@ -13053,6 +13063,12 @@ def _announce(root: Path, channel: str, scope: str) -> bool:
         return False
     finally:
         conn.close()
+
+
+def _node_link_scope(node: str) -> str:
+    """The scope a change of which agents live on `node` is announced under,
+    on the placement channel, which that node's manager follows."""
+    return f"node:{node}"
 
 
 def _announce_placement(root: Path) -> None:
@@ -13792,11 +13808,95 @@ class _NodeLogTail:
             self.fresh = bool(self.lines)
 
 
+# An agent's state on a server node, as its node manager raises it: its folder
+# made and bound, its key the one its vault is kept under, its context built.
+NODE_AGENT_RAISED = "raised"
+NODE_AGENT_WAITING_KEY = "waiting for its key"
+NODE_AGENT_FAILING = "failing to raise"
+# Where a server node keeps its agents' folders, under the node user's home,
+# and where it retires the folder of an agent that left.
+NODE_WORK_DIR = "work"
+NODE_LEFT_DIR = ".left"
+
+
+def _node_agents_file() -> Path:
+    """The file a server node's manager keeps the state of each agent living
+    there in, which node deployment and the node's machine services read."""
+    return _STATE_HOME / "capabilities" / "node" / "agents.json"
+
+
+def _node_agent_held(agent_id: str) -> str | None:
+    """Why the agent is not raised on this node, as its node manager last
+    said, or None: an agent the file does not list, and a machine whose
+    manager keeps no such file (a Mac), hold nothing back."""
+    try:
+        listed = json.loads(_node_agents_file().read_text())
+        entry = (listed.get("agents") or {}).get(agent_id)
+    except (OSError, ValueError, AttributeError):
+        return None
+    if not isinstance(entry, dict) or entry.get("state") == NODE_AGENT_RAISED:
+        return None
+    return f"agent {agent_id} is {entry.get('line') or entry.get('state')}"
+
+
+def _node_agent_line(entry: dict) -> str:
+    """An agent's state on this node as said: `raised`, `waiting for its key`,
+    or `failing to raise: <why>`."""
+    if entry["state"] == NODE_AGENT_FAILING and entry.get("why"):
+        return f"{NODE_AGENT_FAILING}: {entry['why']}"
+    return entry["state"]
+
+
+def _node_retire_folder(folder: Path) -> Path:
+    """Take the agent's key out of `folder`'s .env.local and move the folder
+    to `<its parent>/.left/<name>-<YYYY-MM-DD>`, with a suffix where that is
+    taken; the path it was moved to. Nothing is deleted."""
+    env = folder / ".env.local"
+    lines = env.read_text(encoding="utf-8").splitlines()
+    kept = [line for line in lines if line.strip().partition("=")[0].strip()
+            .removeprefix("export ").strip() != "AGENT_ENCRYPTION_KEY"]
+    if kept != lines:
+        _atomic_write_text(env, "\n".join(kept) + ("\n" if kept else ""))
+        env.chmod(0o600)
+    from datetime import datetime, timezone
+    left = folder.parent / NODE_LEFT_DIR
+    left.mkdir(exist_ok=True)
+    base = f"{folder.name}-{datetime.now(timezone.utc).date().isoformat()}"
+    target, n = left / base, 2
+    while target.exists():
+        target, n = left / f"{base}-{n}", n + 1
+    folder.rename(target)
+    return target
+
+
 class _NodeManager:
     """`node run` on a node whose supervisor is Supervisor: each job is a
     program file in the include directory its configuration names, applied
     with `supervisorctl update`, which starts what is new, stops what went and
-    leaves every other program running."""
+    leaves every other program running.
+
+    On a server node, run for every service (no --services), it first raises
+    every agent that lives there: the node's links that record a folder, of
+    agents not archived. For each, on every reconcile: it makes the folder
+    where it is missing and binds it to the agent (CAPABILITIES_PROJECT_ID
+    and its root in its .env.local, as `agent materialize` does), never
+    taking a folder bound to another agent; checks that the folder resolves
+    the agent's AGENT_ENCRYPTION_KEY (its .env.local, else the machine's
+    shared.env) and that it is the key the agent's vault is kept under, where
+    the store records one; and the first time all of that holds installs the
+    capabilities its gate enables that the node lacks, wires the session
+    hooks and builds its context, as the boot path did for the one agent a
+    node had. Only a raised agent's services run: one waiting for its key or
+    failing to raise has its own services held and is left off a machine
+    service, and the rest of the node goes on. Each agent's state is said in
+    the node's log, which every agent living there keeps as its manager log,
+    and kept in `_node_agents_file()`; the node's state line (the file
+    AGENT_NODE_STATE_FILE names) reads `running as node <id>: <n> agents`
+    and how many wait for their key or fail to raise. A folder directly
+    under ~/work bound to an agent with no link to this node any more is
+    retired: its key taken out and the folder moved to
+    ~/work/.left/<name>-<date>; nothing is retired on a reconcile that could
+    not read the store. A Mac's node manager raises and retires nothing."""
 
     def __init__(self, root: Path, include: Path, server_url: str, every: int,
                  only: set[str] | None = None):
@@ -13859,6 +13959,16 @@ class _NodeManager:
         self.started_on = self.manager_target()
         # What it prints, kept for this node's log in the store.
         self.log = _NodeLogTail()
+        # Whether it raises the agents living on this node (a server node's
+        # manager run for every service), what the store last said of them,
+        # each agent's state as raising it last found it, and the node's
+        # state line as last written.
+        self.raises = False
+        self.kind: str | None = None
+        self.living: list[tuple] = []
+        self.linked: set[str] = set()
+        self.raising: dict[str, dict] = {}
+        self.node_line: str | None = None
 
     def say(self, message: str) -> None:
         line = f"[capabilities node {self.here}] {message}"
@@ -13925,6 +14035,16 @@ class _NodeManager:
                     "UPDATE nodes SET last_seen_at = now() "
                     "WHERE id = %s RETURNING disabled_at IS NOT NULL",
                     (self.here,)).fetchone()
+                if self.raises:
+                    kind = conn.execute("SELECT kind FROM nodes WHERE id = %s",
+                                        (self.here,)).fetchone()
+                    self.kind = kind[0] if kind else None
+                    self.living = conn.execute(
+                        "SELECT l.agent_id, l.folder, a.vault_key FROM agent_nodes l "
+                        "JOIN agents a ON a.id = l.agent_id WHERE l.node = %s "
+                        "AND l.folder IS NOT NULL AND a.archived_at IS NULL "
+                        "ORDER BY l.agent_id", (self.here,)).fetchall() if kind else []
+                    self.linked = {row[0] for row in agents}
         except Exception as exc:
             self.say_once("store", type(exc).__name__,
                           "cannot read the store, so every job stays as it is: "
@@ -13949,8 +14069,14 @@ class _NodeManager:
         folders: dict[str, Path] = {}
         slugs: dict[str, str | None] = {}
         own = _folder_agent_id(self.root)
+        held: dict[str, str] = {}
         for agent_id, folder, slug in agents:
             slugs[agent_id] = slug
+            raising = self.raising.get(agent_id)
+            if raising is not None and raising["state"] != NODE_AGENT_RAISED:
+                # Living here and not raised: none of its services runs yet.
+                held[agent_id] = f"agent {agent_id} is {_node_agent_line(raising)}"
+                continue
             path = _node_agent_folder(self.root, own, agent_id, folder)
             if path is None:
                 self.say_once(f"agent:{agent_id}", folder,
@@ -13975,6 +14101,9 @@ class _NodeManager:
                 # a service of a release this node has not taken yet, and one
                 # left to what runs it here (--services) is judged there.
                 retire[(agent_id, capability)] = installed_at
+                continue
+            if agent_id in held:
+                unrun[(agent_id, capability)] = ("agent_not_raised", held[agent_id])
                 continue
             if agent_id not in folders:
                 unrun[(agent_id, capability)] = (
@@ -14021,6 +14150,10 @@ class _NodeManager:
                                              "capability": capability, "machine": True,
                                              "folder": str(self.root), "agents": []})
                 job["agents"].append(agent_id)
+                if own is None and job["folder"] == str(self.root):
+                    # A node run in no agent's folder starts the machine
+                    # service in the folder of the first agent it serves.
+                    job["folder"] = str(folders[agent_id])
                 continue
             name = self.job_name(agent_id, capability, slugs.get(agent_id))
             jobs[name] = {"name": name, "agent_id": agent_id, "capability": capability,
@@ -14028,6 +14161,179 @@ class _NodeManager:
         self.unrun_now = unrun
         self.retire_now = retire
         return jobs
+
+    # the agents living on a server node
+    def raise_agents(self) -> None:
+        """Raise each agent living on this server node, say what changed,
+        keep the agents' states and the node's state line, and retire the
+        folders of agents that left. On a node of another kind, or one the
+        store holds no row of, it raises and retires nothing."""
+        server = self.kind == "server"
+        current: dict[str, dict] = {}
+        for agent_id, folder, recorded in (self.living if server else []):
+            before = self.raising.get(agent_id)
+            path = Path(folder)
+            state, why = self.raise_one(agent_id, path, recorded)
+            if state == NODE_AGENT_RAISED and not (
+                    before and before["state"] == NODE_AGENT_RAISED
+                    and before["folder"] == folder):
+                self.prepare(agent_id, path)
+            if before and (before["state"], before["why"], before["folder"]) == (
+                    state, why, folder):
+                current[agent_id] = before
+                continue
+            current[agent_id] = {"folder": folder, "state": state, "why": why,
+                                 "since": _supervise_now_iso()}
+            self.say(f"agent {agent_id}: {_node_agent_line(current[agent_id])}"
+                     + (f" in {folder}" if state == NODE_AGENT_RAISED else ""))
+        for agent_id in sorted(set(self.raising) - set(current)):
+            self.say(f"agent {agent_id}: no longer lives on this node")
+        changed = current != self.raising or not _node_agents_file().exists()
+        self.raising = current
+        if changed and server:
+            try:
+                path = _node_agents_file()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_text(path, json.dumps({"node": self.here, "agents": {
+                    agent_id: {**entry, "line": _node_agent_line(entry)}
+                    for agent_id, entry in sorted(current.items())}}, indent=2) + "\n")
+            except OSError as exc:
+                self.say_once("agents_file", str(exc), f"cannot keep the agents' states: {exc}")
+        if server:
+            self.write_node_line()
+            self.retire_left()
+
+    def raise_one(self, agent_id: str, folder: Path,
+                  recorded: str | None) -> tuple[str, str | None]:
+        """(its state, why) for one agent living here: its folder made and
+        bound where it is missing, then its key checked."""
+        from capabilities_contract import vault
+        try:
+            if not folder.is_absolute() or folder in _home_dirs():
+                return NODE_AGENT_FAILING, f"its folder {folder} is not a folder of its own"
+            bound = _folder_agent_id(folder)
+            if bound and bound != agent_id:
+                return NODE_AGENT_FAILING, f"{folder} is bound to agent {bound}"
+            if bound != agent_id:
+                made = not folder.exists()
+                folder.mkdir(parents=True, exist_ok=True)
+                _write_env_local_keys(folder, {PROJECT_ID_ENV: agent_id,
+                                               PROJECT_ID_ROOT_ENV: str(folder)})
+                # The manager composes context only for a folder bound to
+                # ContextKit; the binding carries nothing of the agent.
+                (folder / ".contextkit").mkdir(exist_ok=True)
+                binding = folder / ".contextkit" / "config.toml"
+                if not binding.exists():
+                    binding.write_text("")
+                self.say(f"agent {agent_id}: {folder} " + ("made and " if made else "")
+                         + "bound to it")
+            text, where = vault.key_source(folder)
+        except OSError as exc:
+            return NODE_AGENT_FAILING, f"{folder}: {exc.strerror or exc}"
+        if not text:
+            if not recorded:
+                # An agent whose store records no vault key has no vault to
+                # open, and is raised without one, as a node raised it before.
+                return NODE_AGENT_RAISED, None
+            return NODE_AGENT_WAITING_KEY, f"no AGENT_ENCRYPTION_KEY in {folder / '.env.local'}"
+        try:
+            key = vault.parse_key(text)
+        except vault.VaultError:
+            return NODE_AGENT_FAILING, f"the AGENT_ENCRYPTION_KEY in {where} is not a key"
+        if recorded and vault.fingerprint(key) != recorded:
+            return NODE_AGENT_FAILING, (f"the AGENT_ENCRYPTION_KEY in {where} is not the key "
+                                        "its vault is kept under")
+        return NODE_AGENT_RAISED, None
+
+    def prepare(self, agent_id: str, folder: Path) -> bool:
+        """What raising an agent does once its folder and key hold, each with
+        the manager in its folder: the capabilities its gate enables that this
+        node lacks installed, the session hooks wired, its context built.
+        Whether the context was built. Each that fails is said and holds
+        nothing back, as the boot path that raised a node's one agent said it
+        and ran the agent's services all the same."""
+        env = {k: v for k, v in os.environ.items()
+               if k not in (PROJECT_ID_ENV, PROJECT_ID_ROOT_ENV, "CLAUDE_PROJECT_DIR",
+                            "SUPERVISOR_SERVER_URL", "SUPERVISOR_ENABLED",
+                            "SUPERVISOR_PROCESS_NAME", "SUPERVISOR_GROUP_NAME")}
+
+        def manager(*argv: str, timeout: int = 900) -> tuple[int, str]:
+            try:
+                done = subprocess.run([self.manager, *argv], cwd=str(folder), env=env,
+                                      stdin=subprocess.DEVNULL, capture_output=True,
+                                      text=True, timeout=timeout)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return 1, str(exc)
+            return done.returncode, done.stdout if done.returncode == 0 else (
+                done.stderr.strip().splitlines() or [""])[-1]
+
+        rc, out = manager("list", "--json", timeout=120)
+        try:
+            missing = json.loads(out).get("enabled_not_installed") or [] if rc == 0 else []
+        except (ValueError, AttributeError):
+            missing = []
+        for name in missing:
+            rc, said = manager("install", name, "--allow")
+            self.say(f"agent {agent_id}: installed {name}, which its gate enables" if rc == 0
+                     else f"agent {agent_id}: could not install {name}, which its gate "
+                          f"enables: {said[:300]}")
+        rc, said = manager("hooks", "install", "--claude", "--codex", timeout=300)
+        if rc:
+            self.say(f"agent {agent_id}: could not wire the session hooks in {folder}: "
+                     f"{said[:300]}")
+        rc, said = manager("build", timeout=600)
+        if rc:
+            self.say(f"context of {agent_id} in {folder}: the build failed: {said[:300]}")
+            return False
+        self.say(f"context of {agent_id} in {folder}: built")
+        return True
+
+    def write_node_line(self) -> None:
+        """The node's state line, where the image names its file: how many
+        agents live here, and how many wait for their key or fail to raise."""
+        path = os.environ.get(NODE_BOOT_LINE_FILE_ENV)
+        if not path:
+            return
+        count = len(self.raising)
+        waiting = sum(1 for e in self.raising.values() if e["state"] == NODE_AGENT_WAITING_KEY)
+        failing = sum(1 for e in self.raising.values() if e["state"] == NODE_AGENT_FAILING)
+        line = f"running as node {self.here}: {count} agent{'' if count == 1 else 's'}"
+        if waiting:
+            line += f", {waiting} " + (NODE_AGENT_WAITING_KEY if waiting == 1
+                                       else "waiting for their keys")
+        if failing:
+            line += f", {failing} {NODE_AGENT_FAILING}"
+        if line == self.node_line:
+            return
+        try:
+            Path(path).write_text(line + "\n")
+            self.node_line = line
+        except OSError as exc:
+            self.say_once("node_line", str(exc),
+                          f"could not write the node's state line to {path}: {exc}")
+
+    def retire_left(self) -> None:
+        """Retire each folder directly under ~/work bound to an agent with no
+        link to this node any more: its key taken out, the folder moved under
+        ~/work/.left."""
+        work = Path.home() / NODE_WORK_DIR
+        try:
+            folders = sorted(path for path in work.iterdir() if not path.name.startswith(".")
+                             and path.is_dir() and not path.is_symlink())
+        except OSError:
+            return
+        for folder in folders:
+            bound = _parse_env_file(folder / ".env.local").get(PROJECT_ID_ENV)
+            if not bound or not PROJECT_ID_RE.match(bound) or bound in self.linked:
+                continue
+            try:
+                target = _node_retire_folder(folder)
+            except OSError as exc:
+                self.say_once(f"retire_folder:{folder}", str(exc),
+                              f"agent {bound}: could not retire {folder}: {exc}")
+                continue
+            self.say(f"agent {bound}: no longer linked to this node, so {folder} is retired "
+                     f"to {target}, without its key")
 
     def retire(self, retired: dict[tuple[str, str], datetime]) -> None:
         """Take each placement in `retired` - its capability installed here,
@@ -14169,6 +14475,8 @@ class _NodeManager:
             return False
         agents, placed = answer
         self.moved = False
+        if self.raises:
+            self.raise_agents()
         self.agents = [row[0] for row in agents]
         self.placed = [(agent_id, capability) for agent_id, capability, *_rest in placed]
         desired = self.desired(agents, placed)
@@ -14235,7 +14543,8 @@ class _NodeManager:
             | {(NODE_RESTART_CHANNEL, f"{agent_id}/{job['capability']}/{self.here}")
                for job in self.jobs.values()
                for agent_id in (job.get("agents") or [job["agent_id"]])}
-            | {(NODE_UPDATE_CHANNEL, self.here), (NODE_PROBE_CHANNEL, self.here)}))
+            | {(NODE_UPDATE_CHANNEL, self.here), (NODE_PROBE_CHANNEL, self.here),
+               (NODE_PLACEMENT_CHANNEL, _node_link_scope(self.here))}))
         if keys == self.follow_keys or not keys:
             return
         db = self.db
@@ -14379,16 +14688,19 @@ class _NodeManager:
         new ones came, and, once the store has been read, drop the lines of
         each service no longer placed here for an agent it serves."""
         own = _folder_agent_id(self.root)
-        if own and lines is not None:
-            self.store.node_log_put(conn, own, self.here, self.store.NODE_LOG_MANAGER, lines,
-                                    secrets=_setting_secrets(self.setting)
-                                    if self.setting is not None else ())
+        # On a server node every agent living here keeps this manager's lines.
+        keepers = ({own} if own else set()) | set(self.raising)
+        if lines is not None:
+            for agent_id in sorted(keepers):
+                self.store.node_log_put(conn, agent_id, self.here, self.store.NODE_LOG_MANAGER,
+                                        lines, secrets=_setting_secrets(self.setting)
+                                        if self.setting is not None else ())
         if not self.read_once:
             return
-        for agent_id in sorted(set(self.folders) | ({own} if own else set())):
+        for agent_id in sorted(set(self.folders) | keepers):
             kept = {capability for placed_agent, capability in self.placed
                     if placed_agent == agent_id}
-            if agent_id == own:
+            if agent_id in keepers:
                 kept.add(self.store.NODE_LOG_MANAGER)
             self.store.node_logs_prune(conn, agent_id, self.here, sorted(kept))
 
@@ -14723,7 +15035,10 @@ def _node_run(args: list[str]) -> None:
     low, high = NODE_RUN_BOUNDS
     if not every.isdigit() or not low <= int(every) <= high:
         _die(6, "input", f"--every takes whole seconds from {low} to {high}")
-    root = _require_project()
+    # A server node's manager stands in no agent's folder once the node holds
+    # agents of its own (each raised in its folder); it then runs in the node
+    # user's home. A Mac's runs in the folder `node install` was run in.
+    root = (_project_root() or Path.home()) if include else _require_project()
     include_dir = Path(include) if include else _node_launchd_dir()
     try:
         include_dir.mkdir(parents=True, exist_ok=True)
@@ -14748,6 +15063,7 @@ def _node_run(args: list[str]) -> None:
         where = f"launchd ({_launch_agents_dir()})"
     else:
         manager = _NodeManager(root, include_dir, url, int(every), only)
+        manager.raises = only is None
         where = str(include_dir)
     manager.say(f"keeps a job per service placed on this node in {where}, "
                 f"reconciling every {every}s and on each placement change")
@@ -16943,6 +17259,11 @@ class _MachineSupervisor(_Supervisor):
                 path = Path(folder) if folder else None
                 if (path is None or _folder_agent_id(path) != agent_id) and agent_id == own:
                     path = self.root
+                held = _node_agent_held(agent_id)
+                if held:
+                    # Not raised on this node yet: left off the machine process.
+                    self.say_once(("held", agent_id, held), f"{held}, so it is not served here")
+                    continue
                 if path is not None and _folder_agent_id(path) == agent_id:
                     agents[agent_id] = path
             self.agents = agents
@@ -18943,15 +19264,17 @@ def _node_ssh_argv(host, *, tty=False, user="root"):
     return argv + [f"{user}@{host['address']}"]
 
 
-def _node_ssh(root, host, script, *, stdin=None, timeout=120):
+def _node_ssh(root, host, script, *, stdin=None, timeout=120, check=True):
     return _agent_node_run(_node_ssh_argv(host) + [script], root, stdin=stdin,
-                     timeout=timeout).stdout.strip()
+                           timeout=timeout, check=check).stdout.strip()
 
 
 AGENT_NODE_IMAGE = "ghcr.io/agenium-dev/agent-node"
+# The root a node created before agents were placed binds its one agent to.
 AGENT_NODE_ROOT = "/app"
 AGENT_NODE_SERVICE = "agent"
-AGENT_NODE_MEMORY = "2g"
+# A few agents with live harness sessions.
+AGENT_NODE_MEMORY = "6g"
 # The state the image keeps, each on a volume of the node's own: the store
 # setting, the secrets, the node key and the node id (.config), capability
 # state, the harness logins, and the agent's work - the checkouts and git
@@ -18968,7 +19291,22 @@ AGENT_NODE_VOLUMES = (("config", "/home/agent/.config"),
                       ("capabilities", "/home/agent/.capabilities"))
 # Under the node user's home, on its config volume.
 AGENT_NODE_KEY = ".config/agent-node/node-key.pem"
+# Under the node user's home, on its config volume: the key of the agent a node
+# made before agents were placed was told, kept once a second agent takes it
+# out of the machine's shared.env (the image's entrypoint reads the same path).
+AGENT_NODE_LEGACY_KEY = ".config/agent-node/legacy-agent.env"
+# The first image whose boot path puts that kept key back in the legacy root.
+AGENT_NODE_LEGACY_KEY_SINCE = (0, 0, 18)
 AGENT_NODE_STATE = "/tmp/agent-node.state"
+# Where an agent lives on a node unless placed elsewhere - ~/work/<slug>, on the
+# node's work volume - and the file the node's manager keeps each agent's state
+# in (`_node_agents_file()` under the image's XDG_STATE_HOME).
+AGENT_NODE_WORK = "/home/agent/work"
+AGENT_NODE_AGENTS = "/home/agent/.local/state/capabilities/node/agents.json"
+# The node's state line once its manager runs, and the one an image before
+# agents were placed wrote once it ran its one agent.
+AGENT_NODE_RUNNING = "running as node"
+AGENT_NODE_RUNNING_AGENT = "running agent"
 # How often `raised` reads that line, and the count the boot path ends it in
 # while it works through a list: `<doing>: <done> of <total> (<item>)`.
 AGENT_NODE_STATE_POLL_SECONDS = 5
@@ -19018,25 +19356,91 @@ print(json.dumps(written))
 """
 
 
-# Run in the node: set AGENT_ENCRYPTION_KEY, read from stdin, in the machine's
-# shared.env under the node's config home, mode 0600, every other line kept,
-# printing nothing. The node's root is not on a volume; its config home is.
-_AGENT_NODE_KEY = r"""
-import os, sys, tempfile
+# Run in the node: put the agent's AGENT_ENCRYPTION_KEY, read from stdin, into
+# the .env.local of its folder there (argv[1]), binding the folder to the agent
+# (argv[2]) where it is bound to none, mode 0600, every other line kept. A folder
+# bound to another agent is left as it is. Before that, a key the machine's
+# shared.env holds - where a node made before agents were placed keeps its one
+# agent's key - is moved into the legacy root's .env.local
+# (CAPABILITIES_PROJECT_ID_ROOT, /app) where that root is bound and holds none,
+# and taken out of shared.env, so no agent's folder falls back on another's key.
+# The legacy root is on no volume, so the key is also kept, with the agent it
+# opens, in argv[3] under the node user's home (AGENT_NODE_LEGACY_KEY, on the
+# config volume), from which the image's boot path puts it back in the root
+# after the container is made again. A node whose manager keeps no agents file
+# raises no placed agent, and an image before argv[4] does not put that key
+# back, so where shared.env holds a key on such a node nothing is written.
+# Prints {ok, folder, moved_shared_key_to, shared_key_removed}, or {ok: false,
+# bound} or {ok: false, legacy_image}; never a key.
+_AGENT_NODE_PLACE_KEY = r"""
+import json, os, sys, tempfile
 from pathlib import Path
+KEY, ID, ROOT = "AGENT_ENCRYPTION_KEY", "CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"
+def read(path):
+    try:
+        return path.read_text().splitlines()
+    except FileNotFoundError:
+        return []
+def name(line):
+    return line.split("=", 1)[0].strip().removeprefix("export ").strip() if "=" in line else None
+def value(lines, key):
+    found = None
+    for line in lines:
+        if name(line) == key:
+            found = line.split("=", 1)[1].strip().strip('"').strip("'")
+    return found or None
+def put(lines, key, text):
+    return [line for line in lines if name(line) != key] + [key + "=" + text]
+def write(path, lines):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".env.")
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n" if lines else "")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+def release(path):
+    try:
+        return tuple(int(p) for p in Path(path).read_text().strip().split("."))
+    except (OSError, ValueError):
+        return ()
 key = sys.stdin.read().strip()
 if not key or "\n" in key:
     sys.exit("no key came on stdin")
-path = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "capabilities" / "shared.env"
-path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-lines = path.read_text().splitlines() if path.is_file() else []
-kept = [line for line in lines
-        if line.split("=", 1)[0].strip().removeprefix("export ").strip() != "AGENT_ENCRYPTION_KEY"]
-fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".shared.")
-with os.fdopen(fd, "w") as f:
-    f.write("\n".join(kept + ["AGENT_ENCRYPTION_KEY=" + key]) + "\n")
-os.chmod(tmp, 0o600)
-os.replace(tmp, path)
+folder, agent = Path(sys.argv[1]), sys.argv[2]
+legacy = Path(os.environ.get(ROOT) or "/app")
+legacy_id = os.environ.get(ID, "").strip() or None
+def bound(root, lines):
+    return value(lines, ID) or (legacy_id if root == legacy else None)
+here = read(folder / ".env.local")
+if bound(folder, here) not in (None, agent):
+    print(json.dumps({"ok": False, "folder": str(folder), "bound": bound(folder, here)}))
+    sys.exit(0)
+config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+shared = config / "capabilities" / "shared.env"
+shared_lines = read(shared)
+shared_key = value(shared_lines, KEY)
+moved = None
+if shared_key:
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    since = tuple(int(p) for p in sys.argv[4].split("."))
+    if not (state / "capabilities" / "node" / "agents.json").is_file() \
+            or release(os.environ.get("AGENT_NODE_VERSION_FILE") or "/opt/agent/VERSION") < since:
+        print(json.dumps({"ok": False, "folder": str(folder), "legacy_image": True}))
+        sys.exit(0)
+    legacy_lines = read(legacy / ".env.local")
+    legacy_agent = bound(legacy, legacy_lines)
+    if legacy.is_dir() and legacy_agent and not value(legacy_lines, KEY):
+        write(Path.home() / sys.argv[3], [ID + "=" + legacy_agent, KEY + "=" + shared_key])
+        write(legacy / ".env.local", put(legacy_lines, KEY, shared_key))
+        moved = str(legacy)
+    write(shared, [line for line in shared_lines if name(line) != KEY])
+folder.mkdir(parents=True, exist_ok=True)
+here = read(folder / ".env.local")
+if not bound(folder, here):
+    here = put(put(here, ID, agent), ROOT, str(folder))
+write(folder / ".env.local", put(here, KEY, key))
+print(json.dumps({"ok": True, "folder": str(folder), "moved_shared_key_to": moved,
+                  "shared_key_removed": bool(shared_key)}))
 """
 
 
@@ -19124,21 +19528,24 @@ def _agent_node_name(value):
 
 
 def _agent_node_environment(project_id):
-    """The two keys a node is told, and nothing else. Its identity is not in
-    its environment: its id is put on its config volume at enrolment, and its
-    label is its row's."""
+    """The two keys a node created before agents were placed was told: the
+    agent it runs and the root it binds, which it reads as one placement of
+    that agent there. A node created now is told nothing: the store says which
+    agents live on it. Its identity is not in its environment either: its id
+    is put on its config volume at enrolment, and its label is its row's."""
     return {"CAPABILITIES_PROJECT_ID": project_id,
             "CAPABILITIES_PROJECT_ID_ROOT": AGENT_NODE_ROOT}
 
 
-def _agent_node_compose(project_id, image, memory):
-    """The node's Compose document: the standard image, its memory limit, its
-    volumes and the two keys it is told - nothing else."""
-    environment = _agent_node_environment(project_id)
+def _agent_node_compose(image, memory, environment=None):
+    """The node's Compose document: the standard image, its memory limit and
+    its volumes - and, for a node created before agents were placed, the two
+    keys it was told (`environment`), nothing else."""
     lines = ["services:", f"  {AGENT_NODE_SERVICE}:", f"    image: {json.dumps(image)}",
-             "    restart: unless-stopped", f"    mem_limit: {json.dumps(memory)}",
-             "    environment:"]
-    lines += [f"      {key}: {json.dumps(value)}" for key, value in environment.items()]
+             "    restart: unless-stopped", f"    mem_limit: {json.dumps(memory)}"]
+    if environment:
+        lines += ["    environment:"]
+        lines += [f"      {key}: {json.dumps(value)}" for key, value in environment.items()]
     lines += ["    volumes:"]
     lines += [f"      - {json.dumps(name + ':' + path)}" for name, path in AGENT_NODE_VOLUMES]
     lines += ["volumes:"] + [f"  {name}: {{}}" for name, _path in AGENT_NODE_VOLUMES]
@@ -19197,10 +19604,10 @@ def _agent_node_container(root, host, row):
     return containers[0]
 
 
-def _agent_node_exec(root, host, container, argv, *, stdin=None, timeout=120):
+def _agent_node_exec(root, host, container, argv, *, stdin=None, timeout=120, check=True):
     flags = ["-i"] if stdin is not None else []
     return _node_ssh(root, host, shlex.join(["docker", "exec", *flags, container, *argv]),
-                     stdin=stdin, timeout=timeout)
+                     stdin=stdin, timeout=timeout, check=check)
 
 
 def _usable_capabilities(root: Path) -> list[str]:
@@ -19425,7 +19832,7 @@ def _agent_node_create(root, args):
         raise NodeFailure("input", "--version takes the standard image's tag", 6)
     if not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory or ""):
         raise NodeFailure("input", "--memory takes a size such as 2g or 1536m", 6)
-    project_id, slug = _agent_node_project(root)
+    _project_id, slug = _agent_node_project(root)
     target = {"connection": args.connection}
     # The grant and the write permission are read before anything is created.
     entry = _node_connection(target, write=True)
@@ -19444,7 +19851,7 @@ def _agent_node_create(root, args):
     address = _node_server_host(root, target, entry, args.server)["address"]
     name = _agent_node_slug(slug) + "-" + _agent_node_slug(node)
     image = f"{AGENT_NODE_IMAGE}:{args.version}"
-    compose = _agent_node_compose(project_id, image, args.memory)
+    compose = _agent_node_compose(image, args.memory)
     created = _node_coolify(root, target, "service", "create", "--compose", "-",
                             "--project", args.project, "--server", args.server,
                             "--environment", args.environment,
@@ -19466,8 +19873,7 @@ def _agent_node_create(root, args):
     return {"ok": True, "node": row, "image": image, "memory": args.memory,
             "environment": {"project": args.project, "name": args.environment},
             "volumes": [{"name": name, "path": path} for name, path in AGENT_NODE_VOLUMES],
-            "handed": ["CAPABILITIES_PROJECT_ID", "CAPABILITIES_PROJECT_ID_ROOT"],
-            "next": f"capabilities node enrol {node_id}"}
+            "handed": [], "next": f"capabilities node enrol {node_id}"}
 
 
 def _agent_node_services(value):
@@ -19510,15 +19916,30 @@ class _NodeStep:
 def cmd_node_enrol(args):
     root = _agent_node_root()
     node = _agent_node_name(args.node)
-    _agent_node_project(root)
+    project_id, slug = _agent_node_project(root)
     services = _agent_node_services(args.services)
+    if args.machine and services:
+        raise NodeFailure("input", "--machine enrols the node alone; place services with "
+                          "`capabilities node place`", 6)
     row = _agent_node_row(root, node)
     if row is None:
         raise NodeFailure("node_unknown", f"this agent has no node {node}", 6)
+    if args.machine:
+        store_args, password = _agent_node_store_args(root)
+        reached = _agent_node_reach(root, row, write=True)
+        answer = _agent_node_enrol_machine(root, row, args.wait, store_args, password, reached)
+        _emit(answer)
+        if not answer["ok"]:
+            raise NodeFailure("node_not_raised", f"node {row['node']} did not start its "
+                              f"service manager within {args.wait} seconds; its state reads "
+                              f"{answer['state']!r}", 5)
+        return
     inputs = _agent_node_enrol_inputs(root)
     reached = _agent_node_reach(root, row, write=True)
+    folder = _agent_node_folder(None, slug, row)
     try:
-        answer = _agent_node_enrol(root, row, services, args.wait, inputs, reached)
+        answer = _agent_node_enrol(root, row, project_id, folder, services, args.wait, inputs,
+                                   reached)
     except NodeFailure as failure:
         # A node that did not rise still has its answer said, then the refusal.
         if hasattr(failure, "answer"):
@@ -19527,14 +19948,25 @@ def cmd_node_enrol(args):
     _emit(answer)
 
 
-def _agent_node_enrol(root, row, services, wait, inputs, reached):
-    """Enrol the node `row` names, each part a step, and answer what enrol
-    answers; whether the agent rose is the answer's ok."""
+def _agent_node_folder(given, slug, row=None):
+    """The agent's folder on a node: --folder, an absolute path; else the
+    folder its link to the node records already, so placing it again keeps it
+    where it lives; else ~/work/<slug>."""
+    if given is None:
+        return (row or {}).get("folder") or f"{AGENT_NODE_WORK}/{_agent_node_slug(slug)}"
+    if not (given.startswith("/") and given == os.path.normpath(given) and given != "/"):
+        raise NodeFailure("input", "--folder takes the agent's folder on the node as an "
+                          "absolute path, such as /home/agent/work/<slug>", 6)
+    return given
+
+
+def _agent_node_machine_steps(root, row, store_args, password, reached):
+    """The node's own steps - its id, its key pair, the store setting - with
+    nothing of an agent; its public key."""
     node = row["node"]
-    store_args, password, key, fingerprint, in_vault = inputs
     _target, host, container = reached
     # The node's id goes onto its config volume first, with the node's own
-    # manager: everything after it, the raised agent too, runs as that node.
+    # manager: everything after it, the raised agents too, runs as that node.
     with _NodeStep("id", node=node) as check:
         _agent_node_exec(root, host, container, ["capabilities", "node", "id", "--set", node])
         check["node"] = node
@@ -19545,21 +19977,82 @@ def _agent_node_enrol(root, row, services, wait, inputs, reached):
             raise NodeFailure("node_key", "the node did not answer with an X25519 public key", 5)
         _agent_node_manager(root, "node", "set", node, "--public-key", public_key)
         check["public_key"] = public_key
-    # The agent's key and secrets go first and the store setting last: the
-    # setting is what the waiting node raises the agent on, so it finds them
-    # all there. The key opens the agent's vault, so a secret the vault holds
-    # is neither carried nor reported skipped; a secret kept only in a file
-    # here still is carried. The coolify connection the node was created
-    # through stays here: the row names it, and the node does not hold its
-    # token.
-    with _NodeStep("encryption_key", node=node) as check:
-        if key is not None:
-            _agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_KEY],
-                             stdin=key)
-        check.update({"placed": key is not None, "fingerprint": fingerprint})
+    # The store setting is what the waiting node starts its service manager on.
+    with _NodeStep("store", node=node) as check:
+        _agent_node_exec(root, host, container, ["capabilities", *store_args], stdin=password)
+        check["written"] = True
+    return public_key
+
+
+def _agent_node_enrol_machine(root, row, wait, store_args, password, reached):
+    """`enrol --machine`: the node's own steps, then wait for its service
+    manager to run, with no agent or one."""
+    node = row["node"]
+    _target, host, container = reached
+    public_key = _agent_node_machine_steps(root, row, store_args, password, reached)
+    with _NodeStep("raised", node=node) as check:
+        deadline = time.monotonic() + wait
+        state = said = ""
+        while True:
+            state = _agent_node_exec(root, host, container, ["cat", AGENT_NODE_STATE],
+                                     timeout=60, check=False)
+            if state and state != said:
+                said = state
+                _agent_node_progress("raised", node, state)
+            if (state.startswith((AGENT_NODE_RUNNING, AGENT_NODE_RUNNING_AGENT))
+                    or time.monotonic() >= deadline):
+                break
+            time.sleep(AGENT_NODE_STATE_POLL_SECONDS)
+        check["state"] = state
+    return {"ok": state.startswith((AGENT_NODE_RUNNING, AGENT_NODE_RUNNING_AGENT)),
+            "node": node, "label": row.get("label"), "public_key": public_key,
+            "store": "written", "state": state, "machine": True}
+
+
+def _agent_node_enrol(root, row, project_id, folder, services, wait, inputs, reached):
+    """Enrol the node `row` names and place this agent on it, each part a
+    step, and answer what enrol answers; whether the agent rose is the
+    answer's ok."""
+    node = row["node"]
+    store_args, password, key, fingerprint, in_vault = inputs
+    public_key = _agent_node_machine_steps(root, row, store_args, password, reached)
+    _agent_node_link(root, node, folder)
+    _agent_node_hand_key(root, node, project_id, folder, key, fingerprint, reached)
+    secrets, held, written, skipped, environment_only = _agent_node_carry(
+        root, row, services, in_vault, reached)
+    ok, state, failure = _agent_node_raise_wait(root, node, project_id, wait, reached)
+    answer = {"ok": ok, "node": node, "label": row.get("label"),
+              "public_key": public_key,
+              "key": {"placed": key is not None, "fingerprint": fingerprint},
+              "secrets": {name: sorted(keys) for name, keys in secrets.items()},
+              "secrets_in_vault": held, "secrets_written": written,
+              "secrets_skipped": skipped, "environment_only": environment_only,
+              "store": "written", "placed": [], "unplaced": {}, "state": state,
+              "folder": folder}
+    if environment_only:
+        answer["environment_only_hint"] = (
+            "each key is read from the process environment alone - a target's container "
+            "environment, say - so no node receives it: keep its value in a connection of "
+            "the capability, then enrol again")
+    if failure is not None:
+        failure.answer = answer
+        raise failure
+    answer["placed"], answer["unplaced"] = _agent_node_place_services(root, node, services)
+    return answer
+
+
+def _agent_node_carry(root, row, services, in_vault, reached):
+    """`secrets`: every secret key of a connection each usable capability (and
+    each of `services`) resolves here that the agent's vault does not hold,
+    but the coolify connection the node was created through, written into
+    the node's credential files; the key opens the vault, so a secret the
+    vault holds is neither carried nor reported skipped. (secrets, held,
+    written, skipped, environment_only)."""
+    node = row["node"]
+    _target, host, container = reached
     with _NodeStep("secrets", node=node) as check:
-        reached = _node_coolify_word(row["coolify_connection"])
-        withheld = ({} if _node_lent_address(reached) else {"coolify": {reached}})
+        word = _node_coolify_word(row["coolify_connection"])
+        withheld = ({} if _node_lent_address(word) else {"coolify": {word}})
         secrets, skipped, environment_only = _agent_node_secrets(
             root, sorted({*_usable_capabilities(root), *services}), withheld)
         held = {}
@@ -19577,10 +20070,123 @@ def _agent_node_enrol(root, row, services, wait, inputs, reached):
                 kept.append(entry)
         skipped = kept
         held = {name: sorted(keys) for name, keys in held.items() if keys}
-        written = json.loads(_agent_node_exec(root, host, container, ["python3", "-c", _AGENT_NODE_SECRETS],
+        written = json.loads(_agent_node_exec(root, host, container,
+                                              ["python3", "-c", _AGENT_NODE_SECRETS],
                                               stdin=json.dumps(secrets)) or "{}") if secrets else {}
         check.update({"written": written, "in_vault": held,
                       "skipped": [entry.get("key") for entry in skipped]})
+    return secrets, held, written, skipped, environment_only
+
+
+def _agent_node_is_raised(entry):
+    return isinstance(entry, dict) and entry.get("state") == NODE_AGENT_RAISED
+
+
+def _agent_node_link(root, node, folder):
+    """`link`: the agent's link to `node` with its folder there - made, or its
+    folder set where the link is there already; the node's row."""
+    with _NodeStep("link", node=node) as check:
+        row = _agent_node_row(root, node)
+        if row is None:
+            linked = _agent_node_manager(root, "node", "add", node, "--folder", folder)
+        elif row.get("folder") != folder:
+            linked = _agent_node_manager(root, "node", "set", row["node"], "--folder", folder)
+        else:
+            linked = {"node": row}
+        check.update({"folder": folder, "linked": row is None})
+    return linked.get("node") or _agent_node_row(root, node)
+
+
+def _agent_node_hand_key(root, node, project_id, folder, key, fingerprint, reached):
+    """`encryption_key`: the agent's key into its folder on the reached node;
+    where the machine's shared.env key went, or None. With no key here the
+    folder is bound to the agent all the same, and nothing is handed."""
+    _target, host, container = reached
+    with _NodeStep("encryption_key", node=node) as check:
+        moved = None
+        if key is not None:
+            out = _agent_node_exec(root, host, container,
+                                   ["python3", "-c", _AGENT_NODE_PLACE_KEY, folder, project_id,
+                                    AGENT_NODE_LEGACY_KEY,
+                                    ".".join(map(str, AGENT_NODE_LEGACY_KEY_SINCE))],
+                                   stdin=key)
+            try:
+                placed = json.loads(out)
+            except ValueError:
+                raise NodeFailure("node_command_failed", "the node did not say where it put "
+                                  "the agent's key", 5) from None
+            if placed.get("legacy_image"):
+                raise NodeFailure("node_image_old", f"node {node} keeps its one agent's key in "
+                                  "its shared.env and runs an image or a manager that raises "
+                                  "no placed agent or does not keep that key; update it "
+                                  "first (`capabilities node update "
+                                  f"{node} --version <tag>`, then `capabilities node "
+                                  "update` on the node)", 6)
+            if not placed.get("ok"):
+                raise NodeFailure("folder_bound", f"{folder} on node {node} is bound to agent "
+                                  f"{placed.get('bound')}; place this agent in a folder of "
+                                  "its own with --folder", 6)
+            moved = placed.get("moved_shared_key_to")
+        check.update({"placed": key is not None, "fingerprint": fingerprint, "folder": folder,
+                      "moved_shared_key_to": moved})
+    return moved
+
+
+def _agent_node_agent_state(root, host, container, agent):
+    """(the agent's entry in the node's agents file, or None while the node
+    does not list it; what to say of it: its line, else the node's state
+    line)."""
+    out = _agent_node_exec(root, host, container, ["cat", AGENT_NODE_AGENTS], timeout=60,
+                           check=False)
+    try:
+        entry = (json.loads(out).get("agents") or {}).get(agent)
+    except (ValueError, AttributeError):
+        entry = None
+    if isinstance(entry, dict):
+        return entry, str(entry.get("line") or entry.get("state") or "")
+    line = _agent_node_exec(root, host, container, ["cat", AGENT_NODE_STATE], timeout=60,
+                            check=False)
+    return None, line or f"the node does not list agent {agent} yet"
+
+
+def _agent_node_raised(root, node, agent, wait, reached):
+    """`raised`: wait up to `wait` seconds until the node says `agent` is
+    raised; what it last said. One that is not raised by then fails the step
+    with node_not_raised, carrying that as its `state`."""
+    _target, host, container = reached
+    with _NodeStep("raised", node=node) as check:
+        deadline = time.monotonic() + wait
+        said = ""
+        while True:
+            entry, state = _agent_node_agent_state(root, host, container, agent)
+            if state and state != said:
+                said = state
+                _agent_node_progress("raised", node, state)
+            if _agent_node_is_raised(entry) or time.monotonic() >= deadline:
+                break
+            time.sleep(AGENT_NODE_STATE_POLL_SECONDS)
+        check["state"] = state
+        if not _agent_node_is_raised(entry):
+            failure = NodeFailure("node_not_raised", f"node {node} did not raise agent "
+                                  f"{agent} within {wait} seconds; it reads {state!r}", 5)
+            failure.state = state
+            raise failure
+    return state
+
+
+def _agent_node_raise_wait(root, node, agent, wait, reached):
+    """(whether the node raised `agent`, what it last said, the failure to
+    raise once the answer is said, or None)."""
+    try:
+        return True, _agent_node_raised(root, node, agent, wait, reached), None
+    except NodeFailure as failure:
+        if failure.code != "node_not_raised":
+            raise
+        return False, failure.state, failure
+
+
+def _agent_node_place_services(root, node, services):
+    """Place each service on the node; (placed, unplaced)."""
     placed = []
     unplaced: dict[str, list[str]] = {}
     for name in services:
@@ -19591,41 +20197,256 @@ def _agent_node_enrol(root, row, services, wait, inputs, reached):
                 unplaced[name] = moved["unplaced_from"]
             check.update({"placed_on": moved.get("placed_on"),
                           "unplaced_from": moved.get("unplaced_from") or []})
-    with _NodeStep("store", node=node) as check:
-        _agent_node_exec(root, host, container, ["capabilities", *store_args], stdin=password)
-        check["written"] = True
-    with _NodeStep("raised", node=node) as check:
-        deadline = time.monotonic() + wait
-        state = said = ""
-        while True:
-            state = _agent_node_exec(root, host, container, ["cat", AGENT_NODE_STATE],
-                                     timeout=60)
-            if state and state != said:
-                said = state
-                _agent_node_progress("raised", node, state)
-            if state.startswith("running agent") or time.monotonic() >= deadline:
-                break
-            time.sleep(AGENT_NODE_STATE_POLL_SECONDS)
-        check["state"] = state
-        answer = {"ok": state.startswith("running agent"), "node": node,
-                  "label": row.get("label"), "public_key": public_key,
-                  "key": {"placed": key is not None, "fingerprint": fingerprint},
-                  "secrets": {name: sorted(keys) for name, keys in secrets.items()},
-                  "secrets_in_vault": held,
-                  "secrets_written": written, "secrets_skipped": skipped,
-                  "environment_only": environment_only, "store": "written", "placed": placed,
-                  "unplaced": unplaced, "state": state}
-        if environment_only:
-            answer["environment_only_hint"] = (
-                "each key is read from the process environment alone - a target's container "
-                "environment, say - so no node receives it: keep its value in a connection of "
-                "the capability, then enrol again")
-        if not answer["ok"]:
-            failure = NodeFailure("node_not_raised", f"node {node} did not raise its agent "
-                                  f"within {wait} seconds; its state reads {state!r}", 5)
-            failure.answer = answer
-            raise failure
+    return placed, unplaced
+
+
+# ── place ────────────────────────────────────────────────────────────────────
+
+def _agent_node_target_row(root, node):
+    """The node a placement names: one of this agent's nodes by id or label,
+    else any node by its id, which the link then makes one of this agent's."""
+    row = _agent_node_row(root, node)
+    if row is not None:
+        return row
+    if not re.fullmatch(r"[0-9a-f]{12}", node):
+        raise NodeFailure("node_unknown", f"this agent has no node {node}; name a node "
+                          "another agent lives on by its id", 6)
+    return None
+
+
+def cmd_node_place(args):
+    root = _agent_node_root()
+    node = _agent_node_name(args.node)
+    project_id, slug = _agent_node_project(root)
+    services = _agent_node_services(args.services)
+    row = _agent_node_target_row(root, node)
+    folder = _agent_node_folder(args.folder, slug, row)
+    key, fingerprint, in_vault = _agent_node_vault(root)
+    try:
+        answer = _agent_node_place(root, row["node"] if row else node, project_id, folder,
+                                   key, fingerprint, in_vault, services, args.wait)
+    except NodeFailure as failure:
+        if hasattr(failure, "answer"):
+            _emit(failure.answer)
+        raise
+    _emit(answer)
+
+
+def _agent_node_place(root, node, project_id, folder, key, fingerprint, in_vault, services,
+                      wait):
+    """Place the agent on `node` (an id): link, key, secrets, raised, then its
+    services; the answer `place` gives. A node that does not raise it is a
+    NodeFailure carrying the answer."""
+    # The link first: a node not yet this agent's is read once it is.
+    row = _agent_node_link(root, node, folder)
+    reached = _agent_node_reach(root, row, write=True)
+    moved = _agent_node_hand_key(root, node, project_id, folder, key, fingerprint, reached)
+    secrets, held, written, skipped, environment_only = _agent_node_carry(
+        root, row, services, in_vault, reached)
+    ok, state, failure = _agent_node_raise_wait(root, node, project_id, wait, reached)
+    answer = {"ok": ok, "node": node, "label": row.get("label"),
+              "agent_id": project_id, "folder": folder,
+              "key": {"placed": key is not None, "fingerprint": fingerprint,
+                      "moved_shared_key_to": moved},
+              "secrets": {name: sorted(keys) for name, keys in secrets.items()},
+              "secrets_in_vault": held, "secrets_written": written,
+              "secrets_skipped": skipped, "environment_only": environment_only,
+              "state": state, "placed": [], "unplaced": {}}
+    if failure is not None:
+        failure.answer = answer
+        raise failure
+    answer["placed"], answer["unplaced"] = _agent_node_place_services(root, node, services)
     return answer
+
+
+# ── move ─────────────────────────────────────────────────────────────────────
+
+def cmd_node_move(args):
+    root = _agent_node_root()
+    origin, target = _agent_node_name(args.origin), _agent_node_name(args.target)
+    folders = []
+    for given in args.folders:
+        path = (Path(root) / given).resolve() if not Path(given).is_absolute() else Path(given)
+        if not path.is_dir():
+            raise NodeFailure("input", f"{given} is not an agent's folder", 6)
+        folders.append(path)
+    answer = {"ok": False, "from": origin, "to": target, "agents": []}
+    try:
+        answer["agents"].append(_agent_node_move(root, origin, target, args.wait))
+        for folder in folders:
+            answer["agents"].append(_agent_node_move_elsewhere(folder, origin, target,
+                                                               args.wait))
+    except NodeFailure as failure:
+        # The answer so far is said, then the refusal; no further agent moves.
+        if hasattr(failure, "answer") and failure.answer is not answer:
+            answer["agents"].append(failure.answer)
+        _emit(answer)
+        raise
+    answer["ok"] = True
+    _emit(answer)
+
+
+def _agent_node_move_elsewhere(folder, origin, target, wait):
+    """Move the agent of another folder, in a run of its own in that folder,
+    so it is read as that agent; the Coolify lent to this run is lent to it
+    too. Its answer."""
+    argv = ["capabilities", "node", "move", origin, target, "--wait", str(wait)]
+    stdin = None
+    if _NODE_LENT:
+        argv.append("--coolify-stdin")
+        stdin = json.dumps({"url": _NODE_LENT["url"], "token": _NODE_LENT["token"]})
+    p = _agent_node_run(argv, folder, stdin=stdin, timeout=None, check=False)
+    try:
+        moved = json.loads(p.stdout)["agents"][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        moved = {"ok": False, "folder": str(folder), "stopped_at": "move"}
+    if p.returncode:
+        error = {}
+        for text in reversed((p.stderr or "").strip().splitlines()):
+            try:
+                error = json.loads(text)["error"]
+                break
+            except (ValueError, KeyError, TypeError):
+                continue
+        failure = NodeFailure(error.get("code") or "move_failed", error.get("message")
+                              or f"the move of the agent in {folder} failed (exit "
+                              f"{p.returncode})", p.returncode)
+        failure.answer = moved
+        raise failure
+    return moved
+
+
+def _agent_node_move(root, origin, target, wait):
+    """Move this folder's agent from `origin` to `target`, step by step; its
+    answer. A step that does not settle is a NodeFailure carrying the answer
+    so far."""
+    project_id, slug = _agent_node_project(root)
+    source = _agent_node_row(root, origin)
+    if source is None:
+        raise NodeFailure("node_unknown", f"agent {project_id} does not live on node {origin}", 6)
+    destination = _agent_node_target_row(root, target)
+    target_id = destination["node"] if destination else target
+    if target_id == source["node"]:
+        raise NodeFailure("input", f"node {origin} and node {target} are one node", 6)
+    key, fingerprint, in_vault = _agent_node_vault(root)
+    folder = _agent_node_folder(None, slug, destination)
+    answer = {"ok": False, "agent_id": project_id, "from": source["node"], "to": target_id,
+              "folder": folder, "services": [], "master_moved": False, "removed": False,
+              "stopped_at": None}
+
+    def stop(step, failure):
+        answer["stopped_at"] = step
+        failure.answer = answer
+        return failure
+
+    # 1. Placed and raised on the new node, with no service yet.
+    try:
+        _agent_node_place(root, target_id, project_id, folder, key, fingerprint, in_vault, [],
+                          wait)
+    except NodeFailure as failure:
+        raise stop("place", failure) from None
+    # 2. Each service placed on the old node moves. An exclusive one is placed on
+    # the new node and unplaced from the old in one transaction (`service move`),
+    # the new node taking its lease only once the old one has let it go; a shared
+    # one, which may run on both, is started on the new node, then stopped on the
+    # old.
+    status = {entry.get("capability"): entry for entry in
+              _agent_node_manager(root, "service", "status").get("services") or []}
+    services = sorted(name for name, entry in status.items()
+                      if source["node"] in (entry.get("placed_on") or []))
+    answer["services"] = services
+    for name in services:
+        try:
+            with _NodeStep("move_service", node=target_id, service=name) as check:
+                try:
+                    moved = _agent_node_manager(root, "service", "move", name, "--node",
+                                                target_id, "--wait", str(wait))
+                except NodeFailure as failure:
+                    if failure.code != "placement_shared":
+                        raise
+                    moved = _agent_node_manager(root, "service", "start", name, "--node",
+                                                target_id, "--wait", str(wait))
+                    _agent_node_manager(root, "service", "stop", name, "--node",
+                                        source["node"], "--wait", str(wait))
+                check.update({"placed_on": moved.get("placed_on"),
+                              "unplaced_from": moved.get("unplaced_from") or []})
+        except NodeFailure as failure:
+            raise stop("move_service", failure) from None
+    # 3. Each running on the new node and none on the old.
+    try:
+        with _NodeStep("services_moved", node=target_id) as check:
+            deadline = time.monotonic() + wait
+            said = None
+            while True:
+                where = _agent_node_running_on(root, services)
+                pending = sorted(name for name in services
+                                 if target_id not in where.get(name, ())
+                                 or source["node"] in where.get(name, ()))
+                state = (f"{len(services) - len(pending)} of {len(services)} services moved"
+                         + (f" ({', '.join(pending)})" if pending else ""))
+                if state != said:
+                    said = state
+                    _agent_node_progress("services_moved", target_id, state)
+                if not pending:
+                    break
+                if time.monotonic() >= deadline:
+                    raise NodeFailure("services_not_moved", f"within {wait} seconds "
+                                      + ", ".join(f"{name} runs on "
+                                                  f"{', '.join(sorted(where.get(name, ()))) or 'no node'}"
+                                                  for name in pending)
+                                      + f", not on node {target_id} alone", 5)
+                time.sleep(AGENT_NODE_STATE_POLL_SECONDS)
+            check["running_on"] = {name: sorted(where.get(name, ())) for name in services}
+    except NodeFailure as failure:
+        raise stop("services_moved", failure) from None
+    # 4. The master follows the agent.
+    if source.get("is_master"):
+        try:
+            with _NodeStep("master", node=target_id) as check:
+                _agent_node_manager(root, "node", "set", source["node"], "--no-master")
+                _agent_node_manager(root, "node", "set", target_id, "--master", "--may-write")
+                check["master"] = target_id
+        except NodeFailure as failure:
+            raise stop("master", failure) from None
+        answer["master_moved"] = True
+    # 5. Removed from the old node, whose manager retires its folder there.
+    try:
+        with _NodeStep("remove", node=source["node"]) as check:
+            _agent_node_manager(root, "node", "remove", source["node"])
+            check["removed"] = True
+    except NodeFailure as failure:
+        raise stop("remove", failure) from None
+    answer.update(ok=True, removed=True)
+    return answer
+
+
+def _agent_node_running_on(root, services):
+    """{service: the nodes its instances run on}, from `service status`."""
+    status = {entry.get("capability"): entry for entry in
+              _agent_node_manager(root, "service", "status").get("services") or []}
+    return {name: {row.get("node") for row in (status.get(name) or {}).get("instances") or []
+                   if row.get("pid")}
+            for name in services}
+
+
+# ── memory ───────────────────────────────────────────────────────────────────
+
+def cmd_node_memory(args):
+    """`node memory <node> <size>`: `node update` with the tag the node runs
+    and the new memory limit, restarting it only where the limit changes."""
+    from types import SimpleNamespace
+    if not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory or ""):
+        raise NodeFailure("input", "the size is one such as 6g or 1536m", 6)
+    answer = _agent_node_update(SimpleNamespace(node=args.node, version=None,
+                                                memory=args.memory, wait=args.wait))
+    result = {"ok": answer["ok"], "node": answer["node"], "label": answer.get("label"),
+              "memory": {"before": answer["previous_memory"], "after": answer["memory"]},
+              "restarted": answer["redeployed"], "state": answer["state"]}
+    _emit(result)
+    if not answer["ok"]:
+        raise NodeFailure("node_not_raised", f"node {answer['node']} did not come back "
+                          f"within {args.wait} seconds; its state reads "
+                          f"{answer['state']!r}", 5)
 
 
 def _agent_node_progress(step, node, state):
@@ -19697,7 +20518,7 @@ def cmd_node_add(args):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", args.environment or ""):
         raise NodeFailure("input", "--environment takes an environment's name", 6)
     services = _agent_node_services(args.services)
-    _project_id, slug = _agent_node_project(root)
+    project_id, slug = _agent_node_project(root)
     target = {"connection": args.connection}
     # Everything that can refuse without writing is read before the first write.
     _node_connection(target, write=True)
@@ -19741,7 +20562,8 @@ def cmd_node_add(args):
     with _NodeStep("container", node=node) as check:
         reached = _agent_node_up(root, row, args.wait)
         check["container"] = reached[2]
-    answer = _agent_node_enrol(root, row, services, args.wait, inputs, reached)
+    answer = _agent_node_enrol(root, row, project_id, _agent_node_folder(None, slug, row),
+                               services, args.wait, inputs, reached)
     answer.update({"project": {"uuid": project, "name": project_name},
                    "environment": args.environment, "created": created is not None,
                    "resource": row.get("coolify_resource")})
@@ -19772,9 +20594,16 @@ def _agent_node_is_own(root, host, resource, project_id, kind="service"):
             return False
     named = f"CAPABILITIES_PROJECT_ID={project_id}"
     image = (resource if kind == "application" else AGENT_NODE_IMAGE) + ":"
+
+    def told(config):
+        # A node created before agents were placed is told its one agent; one
+        # created since is told none, and is the node of every agent linked to it.
+        env = config.get("Env") or []
+        return named in env or (kind != "application" and not any(
+            str(entry).startswith("CAPABILITIES_PROJECT_ID=") for entry in env))
     return len(configs) == len(ids) and all(
-        isinstance(c, dict) and str(c.get("Image") or "").startswith(image)
-        and named in (c.get("Env") or []) for c in configs)
+        isinstance(c, dict) and str(c.get("Image") or "").startswith(image) and told(c)
+        for c in configs)
 
 
 def cmd_node_exec(args):
@@ -20180,6 +21009,11 @@ def cmd_node_remove(args):
         if not _agent_node_is_own(root, host, resource, project_id, kind):
             raise NodeFailure("node_resource_not_own", f"resource {resource} does not run "
                               f"{AGENT_NODE_IMAGE} for this agent; nothing was deleted", 6)
+        others = _agent_node_neighbours(root, node)
+        if others:
+            raise NodeFailure("node_shared", f"node {node} is also the node of "
+                              + ", ".join(others) + "; move them off it (`capabilities node "
+                              "move`) before deleting it; nothing was deleted", 6)
         try:
             _agent_node_delete(root, target, kind, resource)
             deleted = True
@@ -20189,6 +21023,19 @@ def cmd_node_remove(args):
     _agent_node_manager(root, "node", "remove", node)
     _emit({"ok": True, "node": node, "resource": resource, "resource_deleted": deleted,
            "volumes_deleted": deleted, "row_removed": True})
+
+
+def _agent_node_neighbours(root, node):
+    """The other agents linked to `node`, as the store holds them."""
+    def read(conn, agent_id):
+        return [row[0] for row in conn.execute(
+            "SELECT agent_id FROM agent_nodes WHERE node = %s AND agent_id <> %s "
+            "ORDER BY agent_id", (node, agent_id)).fetchall()]
+    try:
+        others, _setting = _kernel_run(root, read)
+    except _KernelRefusal as exc:
+        raise NodeFailure(exc.code, exc.message, 6) from None
+    return others
 
 
 def _agent_node_kind(root, target, resource):
@@ -20313,12 +21160,15 @@ def _agent_node_document(root, host, resource, project_id, node):
     if limit <= 0:
         raise NodeFailure("node_document_unconfirmed", f"the agent container of resource "
                           f"{resource} has no memory limit to keep; nothing was changed", 6)
-    wanted = _agent_node_environment(project_id)
     keys = {}
     for entry in env:
         if entry not in image_env:
             key, _sep, value = entry.partition("=")
             keys[key] = value
+    # A node created before agents were placed keeps the two keys it was told;
+    # one created since is told none.
+    wanted = (_agent_node_environment(project_id) if "CAPABILITIES_PROJECT_ID" in keys
+              else {})
     wrong = sorted(key for key, value in wanted.items() if keys.get(key) != value)
     dropped = sorted(key for key in keys if key in _AGENT_NODE_RETIRED_ENV
                      and _agent_node_retired_env_droppable(key, keys[key], node))
@@ -20332,14 +21182,26 @@ def _agent_node_document(root, host, resource, project_id, node):
                              + " would be dropped" if extra else "")
                           + "; nothing was changed", 6)
     return {"image": str(config.get("Image") or ""), "memory": _agent_node_memory(limit),
-            "env_dropped": dropped, "volumes_added": added}
+            "env_dropped": dropped, "volumes_added": added, "environment": wanted}
 
 
 def cmd_node_update(args):
-    root = _agent_node_root()
-    node = _agent_node_name(args.node)
     if not AGENT_NODE_VERSION.fullmatch(args.version or ""):
         raise NodeFailure("input", "--version takes the standard image's tag", 6)
+    answer = _agent_node_update(args)
+    answer.pop("previous_memory", None)
+    _emit(answer)
+    if not answer["ok"]:
+        raise NodeFailure("node_not_raised", f"node {answer['node']} did not come back on "
+                          f"{answer['image']} with its service manager running within "
+                          f"{args.wait} seconds; its state reads {answer['state']!r}", 5)
+
+
+def _agent_node_update(args):
+    """`node update`'s whole answer, with nothing printed; a version of None
+    keeps the tag the node runs (`node memory`)."""
+    root = _agent_node_root()
+    node = _agent_node_name(args.node)
     if args.wait < 0:
         raise NodeFailure("input", "--wait takes a number of seconds", 6)
     if args.memory is not None and not AGENT_NODE_MEMORY_LIMIT.fullmatch(args.memory):
@@ -20382,13 +21244,19 @@ def cmd_node_update(args):
                                                                          root).stdout:
         raise NodeFailure("provider_not_ready", "the coolify capability here has no "
                           "`service set-compose`; update it (`capabilities update coolify`)", 6)
-    image = f"{AGENT_NODE_IMAGE}:{args.version}"
     # `node create` wrote the service's Compose document, so the whole of it is
     # written again rather than read, which a token without read:sensitive
     # cannot: what the document holds besides the tag is established from the
     # node's container first, and nothing changes unless it agrees.
     found = _agent_node_document(root, host, resource, project_id, node)
     previous = found["image"]
+    if args.version is None:
+        args.version = previous.rpartition(":")[2] if previous.startswith(
+            AGENT_NODE_IMAGE + ":") else ""
+        if not AGENT_NODE_VERSION.fullmatch(args.version):
+            raise NodeFailure("node_document_unconfirmed", f"node {node} runs {previous!r}, "
+                              f"not a tag of {AGENT_NODE_IMAGE}; nothing was changed", 6)
+    image = f"{AGENT_NODE_IMAGE}:{args.version}"
     # --memory replaces the limit the container runs with; without it that
     # limit is kept.
     memory = (found["memory"] if args.memory is None
@@ -20402,14 +21270,14 @@ def cmd_node_update(args):
     redeployed = rewrite or _agent_node_running(root, host, row) is None
     if rewrite:
         _node_coolify(root, target, "service", "set-compose", resource, "--compose", "-",
-                      stdin=_agent_node_compose(project_id, image, memory))
+                      stdin=_agent_node_compose(image, memory, found["environment"]))
     if redeployed:
         _node_coolify(root, target, "deploy", resource)
     deadline = time.monotonic() + args.wait
     while True:
         running = _agent_node_running(root, host, row)
         up = (running is not None and running[1] == image and running[2] in ("", "healthy")
-              and running[3].startswith("running agent"))
+              and running[3].startswith((AGENT_NODE_RUNNING, AGENT_NODE_RUNNING_AGENT)))
         if up or time.monotonic() >= deadline:
             break
         time.sleep(10)
@@ -20421,13 +21289,8 @@ def cmd_node_update(args):
               "volumes": [name for name, _path in AGENT_NODE_VOLUMES],
               "volumes_added": found["volumes_added"],
               "container": container, "running_image": now_image, "health": health,
-              "state": state}
-    if not up:
-        _emit(answer)
-        raise NodeFailure("node_not_raised", f"node {node} did not come back on {image} with "
-                          f"its agent running within {args.wait} seconds; its state reads "
-                          f"{state!r}", 5)
-    _emit(answer)
+              "state": state, "previous_memory": found["memory"]}
+    return answer
 
 
 # The options of each form `node` takes for the standard agent node: valued,
@@ -20438,7 +21301,10 @@ _AGENT_NODE_FORMS = {
     "image": (set(), {"--json"}),
     "create": ({"--project", "--server", "--environment", "--version", "--memory",
                 "--connection"}, {"--coolify-stdin"}),
-    "enrol": ({"--services", "--wait"}, {"--coolify-stdin"}),
+    "enrol": ({"--services", "--wait"}, {"--coolify-stdin", "--machine"}),
+    "memory": ({"--wait"}, {"--coolify-stdin"}),
+    "place": ({"--folder", "--services", "--wait"}, {"--coolify-stdin"}),
+    "move": ({"--wait"}, {"--coolify-stdin"}),
     "add": ({"--server", "--version", "--memory", "--project", "--environment",
              "--services", "--connection", "--wait"}, {"--events", "--coolify-stdin"}),
     "update": ({"--version", "--memory", "--wait"}, {"--coolify-stdin"}),
@@ -20450,7 +21316,7 @@ _AGENT_NODE_FORMS = {
 # remove (a registry row): what they take besides the node.
 _AGENT_NODE_REGISTRY_FORMS = {
     "add": ({"--label", "--kind", "--address", "--target", "--coolify-connection",
-             "--coolify-server", "--coolify-resource", "--public-key"},
+             "--coolify-server", "--coolify-resource", "--public-key", "--folder"},
             {"--master", "--no-master", "--may-write", "--no-may-write", "--json"}),
     "update": ({"--node"}, {"--check", "--json"}),
     "remove": (set(), {"--json"}),
@@ -20502,8 +21368,9 @@ def _agent_node_int(opts: dict, name: str, default: int) -> int:
 
 
 def _agent_node_verb(sub: str, args: list[str]) -> None:
-    """`node image|create|enrol|add|update|remove|exec|login` for the standard
-    agent node: parsed, gated as deployment gates them, then run."""
+    """`node image|create|enrol|memory|place|move|add|update|remove|exec|login`
+    for the standard agent node: parsed, gated as deployment gates them, then
+    run."""
     from types import SimpleNamespace
     command: list[str] = []
     if "--" in args:
@@ -20516,12 +21383,17 @@ def _agent_node_verb(sub: str, args: list[str]) -> None:
     usage = {
         "image": "capabilities node image [--json]",
         "create": "capabilities node create <label> --project <uuid> --server <uuid> "
-                  "--environment <name> [--version <tag>] [--memory 2g] "
+                  "--environment <name> [--version <tag>] [--memory 6g] "
                   "[--connection <id> | --coolify-stdin]",
         "enrol": "capabilities node enrol <node> [--services <name,...>] [--wait 300] "
-                 "[--coolify-stdin]",
+                 "[--machine] [--coolify-stdin]",
+        "memory": "capabilities node memory <node> <size> [--wait 600] [--coolify-stdin]",
+        "place": "capabilities node place <node> [--folder <abs path>] "
+                 "[--services <name,...>] [--wait 300] [--coolify-stdin]",
+        "move": "capabilities node move <from> <to> [<agent folder>...] [--wait 300] "
+                "[--coolify-stdin]",
         "add": "capabilities node add <label> --server <uuid> [--version <tag>] "
-               "[--memory 2g] [--services <name,...>] [--project <uuid>] "
+               "[--memory 6g] [--services <name,...>] [--project <uuid>] "
                "[--environment production] [--connection <id>] [--wait 600] [--events] "
                "[--coolify-stdin]",
         "update": "capabilities node update <node> --version <tag> [--memory <size>] "
@@ -20531,10 +21403,11 @@ def _agent_node_verb(sub: str, args: list[str]) -> None:
         "login": "capabilities node login <node> <claude|codex|gh|capability> "
                  "[--connection <id>] [--method <id>] --events",
     }[sub]
-    wanted = {"image": 0, "login": 2}.get(sub, 1)
-    if len(pos) != wanted:
+    wanted = {"image": 0, "login": 2, "memory": 2, "move": 2}.get(sub, 1)
+    if len(pos) != wanted and not (sub == "move" and len(pos) > wanted):
         _die(6, "input", f"node {sub} takes {wanted or 'no'} positional argument"
-             + ("s" if wanted != 1 else ""), usage)
+             + ("s" if wanted != 1 else "") + (" and agent folders" if sub == "move" else ""),
+             usage)
     for name in {"create": ("--project", "--server", "--environment"),
                  "add": ("--server",)}.get(sub, ()):
         if name not in opts:
@@ -20549,6 +21422,17 @@ def _agent_node_verb(sub: str, args: list[str]) -> None:
                              connection=opts.get("--connection"), coolify_stdin=lent)
     elif sub == "enrol":
         ns = SimpleNamespace(node=pos[0], services=opts.get("--services", ""),
+                             wait=_agent_node_int(opts, "--wait", 300), coolify_stdin=lent,
+                             machine=bool(opts.get("--machine")))
+    elif sub == "memory":
+        ns = SimpleNamespace(node=pos[0], memory=pos[1],
+                             wait=_agent_node_int(opts, "--wait", 600), coolify_stdin=lent)
+    elif sub == "place":
+        ns = SimpleNamespace(node=pos[0], folder=opts.get("--folder"),
+                             services=opts.get("--services", ""),
+                             wait=_agent_node_int(opts, "--wait", 300), coolify_stdin=lent)
+    elif sub == "move":
+        ns = SimpleNamespace(origin=pos[0], target=pos[1], folders=pos[2:],
                              wait=_agent_node_int(opts, "--wait", 300), coolify_stdin=lent)
     elif sub == "add":
         ns = SimpleNamespace(node=pos[0], server=opts["--server"], version=opts.get("--version"),
@@ -20578,6 +21462,7 @@ def _agent_node_verb(sub: str, args: list[str]) -> None:
     if sub != "image":
         _read_only_gate(f"node {sub}")
     run = {"image": cmd_node_image, "create": cmd_node_create, "enrol": cmd_node_enrol,
+           "memory": cmd_node_memory, "place": cmd_node_place, "move": cmd_node_move,
            "add": cmd_node_add, "update": cmd_node_update, "remove": cmd_node_remove,
            "exec": cmd_node_exec, "login": cmd_node_login}[sub]
     try:
@@ -20612,7 +21497,7 @@ def cmd_node(args: list[str]) -> None:
         return
     root = _require_project()
     valued = {"--label", "--kind", "--address", "--target", "--coolify-connection",
-              "--coolify-server", "--coolify-resource", "--public-key"}
+              "--coolify-server", "--coolify-resource", "--public-key", "--folder"}
     toggles = {"--master", "--no-master", "--may-write", "--no-may-write"}
     import psycopg
     if sub == "list":
@@ -20649,7 +21534,7 @@ def cmd_node(args: list[str]) -> None:
     if sub not in ("add", "set", "remove", "seen"):
         _die(6, "input", "node needs a subcommand: add, set, list, remove, seen, state, "
              "expect, update, disable, enable, id, rekey, run, supervise, image, create, "
-             "enrol, exec or login",
+             "enrol, memory, place, move, exec or login",
              "run `capabilities help`")
     _read_only_gate(f"node {sub}")
     if sub == "add":
@@ -20690,7 +21575,19 @@ def cmd_node(args: list[str]) -> None:
     if sub == "set" and not values:
         _die(6, "input", "node set needs at least one of --label, --kind, --address, "
              "--target, --master, --no-master, --may-write, --no-may-write, "
-             "--coolify-connection, --coolify-server, --coolify-resource, --public-key")
+             "--coolify-connection, --coolify-server, --coolify-resource, --public-key, "
+             "--folder")
+
+    def folder_free(conn, agent_id, node):
+        """Refuse a folder another agent lives in on that node."""
+        if link_values.get("folder"):
+            held = conn.execute("SELECT agent_id FROM agent_nodes WHERE node = %s "
+                                "AND folder = %s AND agent_id <> %s",
+                                (node, link_values["folder"], agent_id)).fetchone()
+            if held:
+                raise _KernelRefusal("folder_taken", f"{link_values['folder']} is the folder "
+                                     f"of agent {held[0]} on node {node}",
+                                     "give this agent a folder of its own there")
 
     def work(conn, agent_id):
         if sub == "add":
@@ -20737,6 +21634,7 @@ def cmd_node(args: list[str]) -> None:
                 _node_update(conn, node, node_values)
             if link_values.get("is_master"):
                 _refuse_second_master(conn, agent_id, node)
+            folder_free(conn, agent_id, node)
             columns = ["agent_id", "node", *link_values]
             conn.execute(
                 f"INSERT INTO agent_nodes ({', '.join(columns)}) "
@@ -20752,6 +21650,7 @@ def cmd_node(args: list[str]) -> None:
             return agent_id, before[0], True
         if link_values.get("is_master"):
             _refuse_second_master(conn, agent_id, node)
+        folder_free(conn, agent_id, node)
         if node_values:
             _node_update(conn, node, node_values)
         if link_values:
@@ -20770,6 +21669,10 @@ def cmd_node(args: list[str]) -> None:
         # Another writer made a master between the check and the write.
         _die(6, "master_exists", "this agent already has a master node",
              "run `capabilities node list` to see it")
+    if sub == "remove" or "folder" in link_values:
+        # The node's manager raises the agent there, or retires its folder,
+        # now rather than at its next reconcile.
+        _announce(root, NODE_PLACEMENT_CHANNEL, _node_link_scope(row["node"]))
     answer = {"ok": True, "project": str(root), "agent_id": agent_id,
               "store": _kernel_store_report(setting)}
     if sub == "remove":
@@ -37597,7 +38500,7 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
   node add <id> --label TEXT --kind mac|server [--address HOST]
            [--target NAME] [--master] [--may-write]
            [--coolify-connection ID --coolify-server UUID
-            --coolify-resource UUID] [--public-key KEY]
+            --coolify-resource UUID] [--public-key KEY] [--folder PATH]
         Register a node of this project's agent, registering the agent first
         where needed. <id> is the id `node id` answers on that machine, or,
         for a machine that predates node ids such as a deployment target's
@@ -37623,7 +38526,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         names none of them). coolify_connection reads as that id, else
         that address.
         --public-key is the node's X25519 public key, its 32 bytes in base64
-        (`node enrol` records it). An agent has at most one
+        (`node enrol` records it). --folder is the agent's folder on that
+        node, an absolute path: on a server node the agent then lives there,
+        raised by the node's manager (`node run`), which is told at once; a
+        folder another agent has on that node exits 6 folder_taken. An
+        agent has at most one
         master: --master while another node is master exits 6 master_exists
         naming it. A node already registered exits 6 node_exists. Answers
         {ok, project, agent_id, node, changed, store}.
@@ -37634,15 +38541,16 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
            [--target NAME] [--master | --no-master]
            [--may-write | --no-may-write] [--coolify-connection ID]
            [--coolify-server UUID] [--coolify-resource UUID]
-           [--public-key KEY]
+           [--public-key KEY] [--folder PATH]
         Change a registered node's fields; an empty value clears one, but a
         label is never empty. <node> is its id, or a label exactly one of
         the agent's nodes carries (node_ambiguous otherwise). The label,
         kind, address, target, Coolify resource and key are the node's own,
         in its registry row, so renaming a node changes that one row and no
-        row that names it; master and may-write are the agent's link's.
-        Exit 6 node_unknown for a node not registered, master_exists as for
-        add. Answers as add, changed false when nothing moved.
+        row that names it; master, may-write and folder are the agent's
+        link's. Exit 6 node_unknown for a node not registered, master_exists
+        and folder_taken as for add. Answers as add, changed false when
+        nothing moved.
 """),
     (('node remove',),
      """\
@@ -37651,16 +38559,22 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         registry row once no agent lives on it and no automation definition
         is pinned to it, with what the node owns (its state, leases and
         node-scoped records); a record of what ran there keeps its row and
-        loses the node. Answers {ok, project, agent_id, removed, store}.
-        Exit 6 node_unknown for a node not registered.
+        loses the node. A server node's manager then retires the agent's
+        folder there to ~/work/.left/<name>-<date>, without its key. Answers
+        {ok, project, agent_id, removed, store}. Exit 6 node_unknown for a
+        node not registered.
 """),
-    (('node image', 'node create', 'node enrol', 'node add', 'node update', 'node remove', 'node exec', 'node login'),
+    (('node image', 'node create', 'node enrol', 'node place', 'node move', 'node memory', 'node add', 'node update', 'node remove', 'node exec', 'node login'),
      """\
   node image [--json]
   node create <label> --project <uuid> --server <uuid> --environment <name>
-              [--version <tag>] [--memory 2g] [--connection <id> | --coolify-stdin]
-  node enrol <node> [--services <name,...>] [--wait 300] [--coolify-stdin]
-  node add <label> --server <uuid> [--version <tag>] [--memory 2g]
+              [--version <tag>] [--memory 6g] [--connection <id> | --coolify-stdin]
+  node enrol <node> [--services <name,...>] [--wait 300] [--machine] [--coolify-stdin]
+  node place <node> [--folder <abs path>] [--services <name,...>] [--wait 300]
+             [--coolify-stdin]
+  node move <from> <to> [<agent folder>...] [--wait 300] [--coolify-stdin]
+  node memory <node> <size> [--wait 600] [--coolify-stdin]
+  node add <label> --server <uuid> [--version <tag>] [--memory 6g]
            [--services <name,...>] [--project <uuid>] [--environment production]
            [--connection <id>] [--wait 600] [--events] [--coolify-stdin]
   node update <node> --version <tag> [--memory <size>] [--wait 600]
@@ -37669,9 +38583,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
   node exec <node> -- <command> [<arg>...]
   node login <node> claude|codex|gh|<capability> [--connection <id>]
              [--method <id>] --events
-        The standard agent node: a Coolify resource of a store-only agent
-        running ghcr.io/agenium-dev/agent-node, which carries no agent and
-        no secret. These forms are the manager's alone: `deployment node`
+        The standard agent node: a Coolify resource running
+        ghcr.io/agenium-dev/agent-node, which carries no agent and no
+        secret; the store says which agents live on it - each agent whose
+        link to it records a folder, ~/work/<slug> unless placed elsewhere -
+        and its manager (`node run`) raises each of them there. These forms are the manager's alone: `deployment node`
         refuses each of them (exit 6 moved, naming the command here) and
         keeps only the node Coolify builds from a repository (`deployment
         node create --repository`), whose row these verbs reach as any
@@ -37700,10 +38616,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         it when no --version is given.
         create: a Compose service of the image's tag in that Coolify
         project's existing environment on that server, with the memory
-        limit, a volume for each state path (~/.config, ~/.local/state,
-        ~/.claude, ~/.codex), for ~/work and for ~/.capabilities, the
-        manager and the capabilities, and only CAPABILITIES_PROJECT_ID
-        and CAPABILITIES_PROJECT_ID_ROOT (/app); then a minted node id and
+        limit (6g by default: a few agents with live harness sessions), a
+        volume for each state path (~/.config, ~/.local/state, ~/.claude,
+        ~/.codex), for ~/work and for ~/.capabilities, the manager and the
+        capabilities, and nothing in its environment: the node is handed no
+        agent (handed is empty); then a minted node id and
         its row (`node add <id> --label <label> --kind server` with the
         server's SSH address, the Coolify address - the base_url of the
         granted connection or the lent one's url, whichever way the
@@ -37712,25 +38629,68 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         read before anything is made (exit 6 server_address). Answers {ok, node, image, memory,
         environment, volumes, handed, next}. Exit 6 node_exists,
         not_store_mode, 3 environment_missing.
-        enrol: writes the node's id onto its config volume, makes its X25519
-        key pair there and records the public key on its row, places the
-        agent's AGENT_ENCRYPTION_KEY (exit 6 key_mismatch when it does not
-        open the vault) and every secret key of a connection each usable
-        capability resolves here that the vault does not hold, but the coolify
-        connection the node was created through, places each --services
-        service on it (`place <name> --node <node>`), writes the store
-        setting last with the node's own `store set`, and waits up to --wait
-        seconds for its agent to run (exit 5 node_not_raised). Secrets travel
-        on standard input and are never printed; the answer names what was
-        written, held in the vault, skipped and why, and environment_only. A
+        enrol: the node's own steps - writes the node's id onto its config
+        volume, makes its X25519 key pair there and records the public key
+        on its row, writes the store setting with the node's own `store
+        set` - then places this agent on it as place does: link, its
+        AGENT_ENCRYPTION_KEY into its folder (exit 6 key_mismatch, before
+        any step, when it does not open the vault), secrets, raised, and
+        only then each --services service (`place <name> --node <node>`).
+        With --machine it enrols the node alone, an agent placed later, and
+        waits up to --wait seconds for its state line to read `running as
+        node` (answer {ok, node, label, public_key, store, state, machine}).
+        Secrets travel on standard input and are never printed; the answer
+        names what was written, held in the vault, skipped and why,
+        environment_only, the agent's folder and its state there. A
         capability whose `<name> connections` exits non-zero, cannot be run
         or does not finish in 120 seconds is skipped and named with the
         reason; the other capabilities' secrets still travel.
+        place <node>: places this agent on a node, each part a step: link
+        records its link with its folder there (`node add|set <node>
+        --folder`: --folder, else the folder its link records, else
+        /home/agent/work/<slug>), not its master and not writing;
+        encryption_key hands its AGENT_ENCRYPTION_KEY on standard input into
+        that folder's .env.local (0600, the folder made and bound where it
+        is missing; a folder bound to another agent exits 6 folder_bound) -
+        where the node's shared.env holds a key, a node made before agents
+        were placed, it is first moved into the bound legacy root's
+        .env.local (CAPABILITIES_PROJECT_ID_ROOT, /app) and kept on the
+        config volume (~/.config/agent-node/legacy-agent.env), which the
+        boot path puts back in the root after the container is made again,
+        then taken out of shared.env, so no agent falls back on another's
+        key; a node whose manager keeps no agents file or whose image is
+        before 0.0.18 is refused there with nothing written (exit 6
+        node_image_old); secrets carries what enrol carries; raised waits up
+        to --wait seconds until the node's agents file
+        (~/.local/state/capabilities/node/agents.json) says the agent is
+        raised - folder bound, key opening its vault, context built (exit 5
+        node_not_raised after printing the answer); place then places each
+        --services service. <node> is one of this agent's nodes, or any
+        node's id. Answers {ok, node, label, agent_id, folder, key {placed,
+        fingerprint, moved_shared_key_to}, secrets, secrets_in_vault,
+        secrets_written, secrets_skipped, environment_only, state, placed,
+        unplaced}.
+        move <from> <to> [<agent folder>...]: moves this agent, then the
+        agent of each folder named, one after another, in an order that
+        never runs one service in two places: placed on <to> as place does,
+        with no service, and raised there; each service placed on <from>
+        moved (`service move`, or for a shared service `service start` on
+        <to> then `service stop` on <from>); waits until `service status`
+        shows each running on <to> and none on <from>; where <from> was its
+        master, <to> made its master; then its link to <from> removed (`node
+        remove <from>`), whose manager retires its folder there. It stops at
+        the first step that does not settle, saying which, and moves no
+        further agent. Answers {ok, from, to, agents [{ok, agent_id, from,
+        to, folder, services, master_moved, removed, stopped_at}]}; exit 5
+        node_not_raised, services_not_moved, or the failing command's own.
+        memory <node> <size>: changes a node's memory limit as update does
+        with the tag it runs, redeploying it only where the limit changes.
+        Answers {ok, node, label, memory {before, after}, restarted, state}.
         add <label> --server: project (--project, else the one named after
         the agent, made when missing), environment (made when missing),
         create, container (until it runs, exit 5 node_not_running), then
-        enrol's steps id, key_pair, encryption_key, secrets, place, store and
-        raised. A step that finds its work done keeps it, so the same command
+        enrol's steps id, key_pair, store, link, encryption_key, secrets, raised and
+        place. A step that finds its work done keeps it, so the same command
         again resumes; a node of that label on another server or connection
         exits 6 node_exists before anything is written. With --events each
         step is a JSON line on stdout, step {step, state started|done|failed,
@@ -37748,9 +38708,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         kept, after reading its one agent container over SSH and refusing,
         changing nothing, unless its volumes, memory limit and environment are
         the ones that document holds (exit 6 node_volumes_unconfirmed,
-        node_document_unconfirmed); then waits up to --wait seconds for it to
-        run the tag healthy with its agent running (exit 5 node_not_raised
-        after printing the answer). A node built from a repository exits 6
+        node_document_unconfirmed) - a node created before agents were
+        placed keeps the two keys it was told, one created since is told
+        none; then waits up to --wait seconds for it to run the tag healthy
+        with its service manager running (exit 5 node_not_raised after
+        printing the answer). A node built from a repository exits 6
         node_built_from_repository, a resource not running the image for
         this agent node_resource_not_own, a coolify without `service
         set-compose` provider_not_ready.
@@ -37758,7 +38720,8 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         volumes and configuration, then its row; a resource already gone
         leaves only the row, one not running the image (or, built from a
         repository, its own build) for this agent exits 6
-        node_resource_not_own with nothing deleted. Without --yes and
+        node_resource_not_own, and one another agent is linked to exits 6
+        node_shared, with nothing deleted. Without --yes and
         --coolify-stdin, `node remove <node>` is the registry's alone, above.
         exec: runs one command in the node's container with no terminal,
         standard input forwarded, its output byte for byte and its exit code
@@ -38105,6 +39068,29 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         written after that install stays, since it may name a service of a
         release this node has not taken yet, as does one whose capability is
         not installed here or is left to what runs it here (--services).
+        Run in no agent's folder, it runs in the node user's home, and a
+        machine program starts in the folder of the first agent it serves.
+        On a node whose row's kind is server, without --services, it first
+        raises every agent living there - each link to this node that
+        records a folder, of an agent not archived - on each reconcile and
+        within seconds of a link change (`node add|set --folder`, `node
+        remove`): the folder made and bound to the agent where it is missing
+        (never one bound to another agent), its AGENT_ENCRYPTION_KEY checked
+        against the fingerprint its vault is kept under (an agent whose
+        store records none needs none), and, the first time that holds, the
+        capabilities its gate enables that the node lacks installed, its
+        session hooks wired and its context built (each that fails said, as
+        the boot path said it). An agent waiting for its
+        key or failing to raise has its services held (unusable,
+        agent_not_raised) and is left off every machine program, and the
+        rest of the node goes on. Each agent's state is said on stderr, kept
+        in ~/.local/state/capabilities/node/agents.json and written in the
+        manager log of every agent living there; the line the image's state
+        file holds (AGENT_NODE_STATE_FILE) reads `running as node <id>: <n>
+        agents`, with how many wait for their key or fail to raise. A folder
+        directly under ~/work bound to an agent no longer linked to this node
+        is retired: its key taken out of its .env.local and the folder moved
+        to ~/work/.left/<name>-<date>; nothing is deleted.
         Exit 6 supervisor_required,
         supervisor_unreachable or node_run_running.
 """),
