@@ -1,0 +1,985 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "capabilities-contract>=0.50,<1",
+#     "callva-harness-runner==0.13.1",
+#     "callva-livekit>=0.1.72",
+#     "livekit-agents>=1.8.5,<2",
+#     "livekit-api>=1.2.2,<2",
+#     "livekit-plugins-openai>=1.8.5,<2",
+# ]
+# ///
+"""lkagent — an agent's own phone line on a LiveKit server: GPT Live is the voice and the
+agent's own harness session in its folder is the backend it hands each turn to."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+HELP = """lkagent — an agent's own phone line on a LiveKit server (Cloud or self-hosted).
+
+This is the menu; `lkagent help <verb>` is one verb's whole contract.
+
+GPT Live, under client delegation, is the voice: it holds the conversation and hands each
+turn it cannot answer to the line's backend, the agent's own harness session in its folder,
+one session for the whole call. The call's lifecycle - how it opens, how long it may run,
+a silent line, hanging up, reporting a finished call to a webhook - is callva-livekit's.
+The worker takes one call at a time, and records each call when it ends.
+
+MODEL
+  A connection is one LiveKit server: its URL, API key and API secret. The worker
+  registers on it under the line's agent name, and answers only what is dispatched to
+  that name: an inbound call through a SIP dispatch rule naming it, an outbound call
+  placed by `lkagent call`. Buying a number and the SIP trunks and dispatch rules are set
+  up in LiveKit and the carrier (`lkagent guide twilio-number`); this capability reads
+  them and never changes them.
+
+  The line's numbers are its settings (`numbers`). A call is taken only on one of them -
+  an inbound call on the number it called, an outbound one on the number it is placed
+  from - and the backend runs under that number's instructions and rights: the
+  capabilities it may run and whether it is read-only. A call on any other number is
+  hung up at once and recorded as failed.
+
+  Each finished call is a row of lkagent_calls in the project's store: who, which way,
+  when, how it ended, the whole transcript and the call.ended body the webhook gets.
+  A project with no store records nothing and says so once on the service log.
+
+COMMANDS
+  Readiness
+    lkagent doctor                 is the line ready: connection, key, backend, routing
+    lkagent service doctor         what the worker would start with, without starting it
+
+  Calls
+    lkagent call <number>          place an outgoing call from one of the line's numbers
+
+  The worker
+    lkagent service run            run the worker in the foreground until stopped
+
+THE WRITE GATE
+  `call` reaches a person outside the system, so it needs the connection's write grant
+  (WRITE_DEFAULT is false). Ask the user; never lift a gate yourself.
+
+EXIT CODES
+  0 success · 2 credentials (a LiveKit key, secret or the OpenAI key missing or refused)
+  · 3 not found · 4 policy (the project gate, or `call` on a connection without
+  allow_write) · 5 network (LiveKit did not answer, or refused the dispatch) · 6 input
+  (bad arguments, an ambiguous or unconfigured number, settings it cannot read)
+"""
+
+_HELP_SETTINGS = """
+  The line's settings are read when the worker starts; restart it after a change.
+  Rights have one home, the number: `numbers` is a list of objects
+    {"number": "+<country><number>", "instructions": "<text>",
+     "allowed_capabilities": ["<capability>", ...] or ["*"], "read_only": true|false}
+  A call on a number is bound by that entry: its instructions are added to the backend's
+  system prompt after backend_prompt, allowed_capabilities is what the backend session
+  may run (none when empty, every one with "*"), and read_only puts it under the
+  read-only switch. A number is matched on its digits.
+
+  The OpenAI key GPT Live runs on is the machine's OPENAI_API_KEY (`lkagent help setup`),
+  resolved from the agent's vault first; it is no setting.
+
+  Examples:
+    lkagent settings set numbers '[{"number": "+15550100", "instructions": "Answer for the front desk.", "allowed_capabilities": ["tasks"], "read_only": false}]'
+    lkagent settings set outbound_trunk ST_<id>
+    lkagent settings set recording true
+"""
+
+HELP_VERBS = {
+    "doctor": """\
+  lkagent doctor [--connection <id>] [--offline]
+      Is the line ready: the connection's values, the OpenAI key, the backend harness,
+      the line's numbers, and (unless --offline) LiveKit accepting the key and secret
+      (rooms listed) and the SIP dispatch rules that route to the line's agent name,
+      with the phone numbers they route. Read-only; never prints a secret.
+
+  Output: {ok, checks: {connection, openai_key, backend, line, livekit?, sip?},
+  warnings: [...]}. `sip` is {agent_name, rules: [{id, name, kind, trunk_ids,
+  numbers}], numbers, rules_read, inbound_trunks_read}; it reads LiveKit's SIP service
+  (ListSIPDispatchRule, ListSIPInboundTrunk). A rule routes to the line when its room
+  configuration dispatches the line's agent name; its numbers are its own, else those of
+  the inbound trunks it applies to. No rule routing to the line, or a server with no SIP
+  service, is a warning, not a failure. LiveKit's API does not give the project's SIP
+  URI; `lkagent guide twilio-number` says where it is.
+
+  Exit 0 ready / 2 a value missing or refused / 5 is not used: an unreachable server is
+  `livekit.ok: false`, exit 2.
+
+  Examples:
+    lkagent doctor
+    lkagent doctor --offline
+""",
+    "call": """\
+  lkagent call <number> [--from <line number>] [--task <text>] [--connection <id>]
+      Place an outgoing call: dispatch the worker into a new room with the line's call
+      configuration, the task as the {{task}} variable, and dial <number> through the
+      `outbound_trunk` setting with --from as the caller id. --from is one of the line's
+      `numbers`; without it the only configured number is used. The call runs under that
+      number's instructions and rights. Needs the worker running (`lkagent service run`)
+      and the connection's write grant.
+
+  <number> and --from are given as +<country code><number>.
+  Output: {room, dispatch_id, agent_name, number, from}.
+  Exit 0 dispatched / 2 credentials missing / 4 no write grant / 5 LiveKit refused the
+  dispatch or the dial / 6 a bad number, no number configured, --from not one of the
+  line's numbers or several configured and none named (ambiguous_number), no
+  outbound_trunk, or the worker never prepared the line.
+
+  Example:
+    lkagent call +15550123 --from +15550100 --task "Confirm tomorrow's delivery window."
+""",
+    "service run": """\
+  lkagent service run [--dev]
+      Run the worker in the foreground in this agent's folder until stopped: register
+      on the connection's LiveKit server under the line's agent name and answer every
+      call dispatched to it, one at a time. It first brings lkagent_calls up to date in
+      the project's store; without a store it runs and records no call, saying so once.
+      --dev runs LiveKit's development mode (reload on change, verbose logs).
+
+  Needs the project to enable lkagent explicitly, the connection, OPENAI_API_KEY, and
+  a `claude` or `codex` the backend runs on. Settings are read as it starts.
+  Exit 0 stopped / 2 credentials missing / 4 not enabled in this project / 6 input.
+""",
+    "service doctor": """\
+  lkagent service doctor [--connection <id>]
+      What `service run` would start with, without starting it: the agent name, the
+      server URL, the agent's folder and state directory, the settings, the
+      connection, whether outgoing calls have a trunk, the line's numbers, and whether
+      calls are recorded (the store resolves and the project has an agent id). Local;
+      no secret printed.
+
+  Output: {ok, agent_name, url, agent_root, state_dir, settings, connection, outbound,
+  numbers, calls_recorded: {recorded, reason}}.
+  Exit 0 / 2 credentials missing / 6 input.
+""",
+    "settings": _HELP_SETTINGS,
+}
+
+NAME = "lkagent"
+TITLE = "LiveKit Agent"
+LUCIDE_ICON = "phone"
+SUMMARY = ("An agent's own phone line on a LiveKit server - GPT Live is the voice and hands "
+           "each turn it delegates to the agent's own harness session in its folder; takes "
+           "calls on its configured numbers, places outgoing ones, and records each call.")
+# The title and summary in Russian and Estonian; English stays the source and the fallback
+# (SHEBANG.md, the manifest table). The title is a name and is not translated.
+TRANSLATIONS = {
+    "ru": {"title": "LiveKit Agent",
+           "description": ("Собственная телефонная линия агента на сервере LiveKit - голосом "
+                           "служит GPT Live, который передаёт каждую реплику, требующую работы, "
+                           "собственной сессии агента в его папке; принимает звонки на "
+                           "настроенные номера, совершает исходящие и записывает каждый звонок.")},
+    "et": {"title": "LiveKit Agent",
+           "description": ("Agendi oma telefoniliin LiveKiti serveris - hääleks on GPT Live, mis "
+                           "annab iga tööd nõudva pöörde üle agendi enda seansile tema kaustas; "
+                           "võtab kõnesid vastu seadistatud numbritel, teeb väljaminevaid kõnesid "
+                           "ja salvestab iga kõne.")},
+}
+SCOPE = "project"
+CRED_KEYS = [
+    {"key": "OPENAI_API_KEY", "secret": True, "required": True,
+     "note": "GPT Live, the line's voice"},
+]
+CONN_FIELDS = [
+    {"key": "url", "label": "Server URL", "type": "string", "required": True,
+     "help": "The LiveKit server, wss://<project>.livekit.cloud or a self-hosted one."},
+    {"key": "api_key_env", "label": "API key", "type": "string", "secret": True,
+     "required": True, "env": "LKAGENT_{ID}_API_KEY",
+     "help": "The LiveKit API key."},
+    {"key": "secret_env", "label": "API secret", "type": "string", "secret": True,
+     "required": True, "env": "LKAGENT_{ID}_API_SECRET",
+     "help": "The LiveKit API secret."},
+]
+SETUP_FIELDS = [
+    {"key": "OPENAI_API_KEY", "label": "OpenAI API key", "type": "string", "secret": True,
+     "required": True, "shared": "OPENAI_API_KEY",
+     "help": "The OpenAI key GPT Live, the line's voice, runs on."},
+]
+WRITE_VERBS = {"call"}
+WRITE_DEFAULT = False   # a call reaches a person outside the system
+MACHINE_READS = ("connections", "doctor")
+DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
+             "main/capabilities/lkagent/guides/")
+STATE = True            # the call configuration and the authority files
+TABLES = True           # lkagent_calls in the project's store, built by _tables()
+INVENTORY = {"network": "optional"}   # the SIP routing is LiveKit's, read under --network
+POST_INSTALL: list = []
+
+VOICES = ["alloy", "ash", "aster", "ballad", "beacon", "bossa", "cedar", "cinder", "coral",
+          "delta", "echo", "gleam", "marin", "meridian", "quartz", "ripple", "sage",
+          "shimmer", "stone", "tempo", "verse", "vesper", "willow"]
+SETTINGS = {
+    "homes": [{"scope": "project", "path": "settings.json", "format": "json"}],
+    "keys": [
+        {"key": "numbers", "label": "Numbers", "type": "list", "default": [],
+         "scope": "project", "apply": "restart",
+         "help": "The line's numbers, each {number, instructions, allowed_capabilities, "
+                 "read_only}: a call is taken only on one of them and runs under its "
+                 "instructions and rights; `lkagent help settings` shows the shape."},
+        {"key": "agent_name", "label": "Agent name", "type": "string", "default": "",
+         "scope": "project", "apply": "restart",
+         "help": "The dispatch name the worker registers under, which dispatch rules and "
+                 "`lkagent call` name; empty is lkagent-<connection id>."},
+        {"key": "outbound_trunk", "label": "Outbound trunk", "type": "string", "default": "",
+         "scope": "project", "apply": "restart",
+         "help": "The outbound SIP trunk id (ST_...) outgoing calls dial through."},
+        {"key": "recording", "label": "Record calls", "type": "boolean", "default": False,
+         "scope": "project", "apply": "restart",
+         "help": "Record each call's session; off, nothing is recorded. A recording "
+                 "travels only to the object storage callva-livekit is given."},
+        {"key": "voice", "label": "Voice", "type": "enum", "choices": VOICES,
+         "default": "marin", "scope": "project", "apply": "restart",
+         "help": "The GPT Live voice the line speaks in."},
+        {"key": "voice_prompt", "label": "Voice prompt", "type": "string", "default": "",
+         "scope": "project", "apply": "restart", "multiline": True,
+         "help": "What the voice is told; who it is (the agent's name and description) and "
+                 "where the session stands follow it. Empty uses AgentKit's voice mode "
+                 "prompt. {{variables}} are filled in."},
+        {"key": "agent_speaks_first", "label": "Agent speaks first", "type": "boolean",
+         "default": True, "scope": "project", "apply": "restart",
+         "help": "The voice opens the call; off, it says nothing until the caller speaks."},
+        {"key": "greeting_type", "label": "Greeting", "type": "enum",
+         "choices": ["prompt", "exact", "instruction"], "default": "prompt",
+         "scope": "project", "apply": "restart",
+         "help": "How the call opens: prompt (automatic) greets as the voice prompt says; "
+                 "exact asks the voice to say greeting_exact; instruction greets as "
+                 "greeting_instruction says."},
+        {"key": "greeting_exact", "label": "Greeting text", "type": "string", "default": "",
+         "scope": "project", "apply": "restart",
+         "help": "The line the call opens with when greeting_type is exact. {{variables}} are "
+                 "filled in."},
+        {"key": "greeting_instruction", "label": "Greeting instruction", "type": "string",
+         "default": "", "scope": "project", "apply": "restart",
+         "help": "How to greet when greeting_type is instruction; empty greets as the voice "
+                 "prompt says. {{variables}} are filled in."},
+        {"key": "max_duration_seconds", "label": "Max call duration", "type": "number",
+         "default": 600, "minimum": 0, "scope": "project", "apply": "restart",
+         "unit": "seconds",
+         "help": "The call is ended when it has run this long; 0 is no limit."},
+        {"key": "call_silence_timeout_seconds", "label": "Call silence timeout",
+         "type": "number", "default": 30, "minimum": 0, "scope": "project",
+         "apply": "restart", "unit": "seconds",
+         "help": "Seconds of total silence before the call is ended - after the last "
+                 "liveness turn where they are on; 0 never ends it on silence."},
+        {"key": "user_silence_timeout_seconds", "label": "User silence timeout",
+         "type": "number", "default": 0, "minimum": 0, "scope": "project",
+         "apply": "restart", "unit": "seconds",
+         "help": "Seconds of silence - nobody speaking and no backend turn running - before "
+                 "the backend takes a liveness turn; 0 is off. 10 when engaging the user when "
+                 "idle."},
+        {"key": "max_prompt_attempts", "label": "Max prompt attempts", "type": "number",
+         "default": 0, "minimum": 0, "scope": "project", "apply": "restart",
+         "help": "Liveness turns in a row while the caller says nothing; the caller's words "
+                 "give them back. 0 is off. 3 when engaging the user when idle."},
+        {"key": "liveness_instruction", "label": "When the line goes quiet", "type": "string",
+         "default": "", "scope": "project", "apply": "restart", "multiline": True,
+         "help": "What the backend is told, after what was said since its last turn, when the "
+                 "line goes quiet; written for the voice, so the backend is told to fulfil any "
+                 "request it would hand on. Empty uses the built-in instruction."},
+        {"key": "backend_harness", "label": "Backend harness", "type": "enum",
+         "choices": ["claude", "codex"], "default": "claude", "scope": "project",
+         "apply": "restart",
+         "help": "The harness the backend session runs on, in the agent's folder."},
+        {"key": "backend_model", "label": "Backend model", "type": "string",
+         "default": "claude-sonnet-5-5", "scope": "project", "apply": "restart",
+         "help": "The backend session's model, as its harness names it."},
+        {"key": "backend_effort", "label": "Backend effort", "type": "string",
+         "default": "", "scope": "project", "apply": "restart",
+         "help": "The backend session's effort, as its harness names it (low, medium, high, "
+                 "...); empty leaves the harness's own."},
+        {"key": "backend_prompt", "label": "Backend prompt", "type": "string", "default": "",
+         "scope": "project", "apply": "restart", "multiline": True,
+         "help": "Added to the backend session's system prompt, before the number's "
+                 "instructions and the end_call tool's description; empty adds nothing. "
+                 "{{variables}} are filled in."},
+        {"key": "backend_progress", "label": "Progress to the voice", "type": "boolean",
+         "default": True, "scope": "project", "apply": "restart",
+         "help": "While the backend works, each step as it lands - its thinking, what it "
+                 "writes between steps, and each tool call as a short label - reaches the "
+                 "voice as a silent note. Claude backend only."},
+        {"key": "backend_timeout", "label": "Backend timeout", "type": "number",
+         "default": 600, "minimum": 30, "maximum": 3600, "scope": "project",
+         "apply": "restart", "unit": "seconds",
+         "help": "Seconds the backend may work without a break - its turn and every "
+                 "handover that joined it - before it is interrupted."},
+        {"key": "webhook_url", "label": "Webhook", "type": "string", "default": "",
+         "scope": "project", "apply": "restart",
+         "help": "Where callva-livekit reports each call: call.started, and call.ended "
+                 "carrying the session report with the whole transcript. Empty sends "
+                 "nothing."},
+    ]}
+SERVICE = {
+    "placement": "exclusive",
+    "name": "line",
+    "summary": ("Registers this agent's LiveKit worker and answers the calls dispatched to "
+                "it on the line's numbers, one at a time: GPT Live speaks, the agent's "
+                "harness session answers its delegations under the number's rights and "
+                "meets a silent line, callva-livekit ends the call on its limits and "
+                "reports it to the webhook, and each call is recorded in the store."),
+    "verbs": ["run", "doctor"],
+    "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/lkagent",
+}
+
+_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
+CREDENTIALS_ENV = _CONFIG_HOME / NAME / "credentials.env"
+_STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state"))
+_HERE = Path(__file__).resolve().parent
+# The bundle's folder: a source checkout keeps the executable under bin/, an installed
+# bundle at its root; service/ sits in the bundle's folder either way.
+_BUNDLE = _HERE.parent if _HERE.name == "bin" else _HERE
+
+from capabilities_contract.capability import bind as _contract_bind  # noqa: E402
+
+_contract_bind(globals(), "core")
+_contract_bind(globals(), "store")
+_contract_bind(globals(), "connections")
+
+
+# ── the call record's table ─────────────────────────────────────────────────
+
+from capabilities_contract.db import Step  # noqa: E402  (bound with the tiers above)
+
+TABLES_MAJOR, TABLES_MINOR = 1, 0
+TABLE_STEPS = [
+    # 1.0: one row per call, written when it ends. A row is the agent's own and goes with
+    # it (ON DELETE CASCADE): its calls are nobody else's record.
+    Step("0001-calls", """
+    CREATE TABLE lkagent_calls (
+        id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        agent_id            text NOT NULL CHECK (agent_id <> '')
+                            REFERENCES agents (id) ON DELETE CASCADE,
+        call_id             text NOT NULL CHECK (call_id <> ''),
+        direction           text NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+        from_number         text,
+        caller_name         text,
+        to_number           text,
+        started_at          timestamptz,
+        ended_at            timestamptz,
+        duration_seconds    numeric CHECK (duration_seconds >= 0),
+        status              text NOT NULL
+                            CHECK (status IN ('completed', 'no_answer', 'failed')),
+        ended_by            text
+                            CHECK (ended_by IN ('agent', 'user', 'silence', 'duration',
+                                                'no_answer')),
+        failure_reason      text,
+        transcript          jsonb NOT NULL DEFAULT '[]'::jsonb
+                            CHECK (jsonb_typeof(transcript) = 'array'),
+        outcome             text,
+        tags                text[],
+        backend_session_id  text,
+        task                text,
+        scheduled_at        timestamptz,
+        recording_url       text,
+        body                jsonb NOT NULL CHECK (jsonb_typeof(body) = 'object'),
+        CONSTRAINT lkagent_calls_call_key UNIQUE (agent_id, call_id)
+    );
+    CREATE INDEX lkagent_calls_ended ON lkagent_calls (agent_id, ended_at DESC);
+    COMMENT ON TABLE lkagent_calls IS
+        'One row per call of an agent''s phone line, written by the lkagent worker when the call ends, from callva-livekit''s call.ended body.';
+    COMMENT ON COLUMN lkagent_calls.agent_id IS
+        'The agent whose line took or placed the call.';
+    COMMENT ON COLUMN lkagent_calls.call_id IS
+        'LiveKit''s call id as callva-livekit reports it (call.id), unique per agent.';
+    COMMENT ON COLUMN lkagent_calls.from_number IS
+        'The calling number: the caller''s on an inbound call, the line''s own on an outbound one.';
+    COMMENT ON COLUMN lkagent_calls.caller_name IS
+        'The calling party''s name where the SIP participant carries one.';
+    COMMENT ON COLUMN lkagent_calls.to_number IS
+        'The called number: the line''s own on an inbound call, the person''s on an outbound one.';
+    COMMENT ON COLUMN lkagent_calls.started_at IS
+        'When someone was on the call; for a call that never began, when it was placed or arrived.';
+    COMMENT ON COLUMN lkagent_calls.duration_seconds IS
+        'From started_at to ended_at, in seconds; null for a call that never began.';
+    COMMENT ON COLUMN lkagent_calls.status IS
+        'completed, no_answer (nobody took it: unanswered, rejected or cancelled), or failed.';
+    COMMENT ON COLUMN lkagent_calls.ended_by IS
+        'Who decided the call was over: agent, user, silence, duration or no_answer; null where nothing claimed it.';
+    COMMENT ON COLUMN lkagent_calls.failure_reason IS
+        'Why the call never began: not answered, a carrier refusal, or a number the line takes no call on.';
+    COMMENT ON COLUMN lkagent_calls.transcript IS
+        'Both sides in the order they spoke, [{role, text, at}], role user (the person) or assistant (the voice), at ISO 8601 UTC, from LiveKit''s session report.';
+    COMMENT ON COLUMN lkagent_calls.outcome IS
+        'The session''s outcome tag, where one was set.';
+    COMMENT ON COLUMN lkagent_calls.tags IS
+        'The session''s tags, where any were set.';
+    COMMENT ON COLUMN lkagent_calls.backend_session_id IS
+        'The harness session (claude or codex) the call''s backend ran in.';
+    COMMENT ON COLUMN lkagent_calls.task IS
+        'The task an outbound call was placed with (`lkagent call --task`).';
+    COMMENT ON COLUMN lkagent_calls.scheduled_at IS
+        'When a scheduled call was due; null until calls are scheduled.';
+    COMMENT ON COLUMN lkagent_calls.recording_url IS
+        'Where the call''s recording is; null until recordings are kept.';
+    COMMENT ON COLUMN lkagent_calls.body IS
+        'The whole call.ended body, the same body the webhook gets.';
+    """, core=(4, 0)),
+]
+
+
+def _tables():
+    """The steps and version of the lkagent_* tables, for the contract's `migrate`."""
+    return TABLE_STEPS, TABLES_MAJOR, TABLES_MINOR
+
+
+# ── settings and connection ─────────────────────────────────────────────────
+
+def _line_module():
+    """The service's own logic (service/line.py), free of LiveKit sessions."""
+    service = str(_BUNDLE / "service")
+    if service not in sys.path:
+        sys.path.insert(0, service)
+    import line  # noqa: PLC0415
+
+    return line
+
+
+def _settings_check(scope: str, document: dict) -> list[str]:
+    """What the line's own reader finds wrong in a settings document about to be written."""
+    if not isinstance(document, dict):
+        return ["the settings document is an object"]
+    return _line_module().numbers_problems(document.get("numbers"))
+
+
+def _line_settings() -> dict:
+    documents = {}
+    for home in _settings_homes():
+        _, document, error = _settings_read(home)
+        if error:
+            _die(6, "settings_unreadable", error)
+        documents[home["scope"]] = document or {}
+    return {decl["key"]: _settings_value(decl, documents)[0] for decl in SETTINGS["keys"]}
+
+
+def _connection(wanted: str | None) -> tuple[str, dict]:
+    reg, _ = _connections_registry()
+    if reg is None:
+        _die(6, "connections_required", "the line has no LiveKit connection",
+             f"add one: {NAME} connection add <id> --stdin <<< "
+             "'{\"url\": \"wss://...\", \"api_key_env\": \"<key>\", \"secret_env\": \"<secret>\"}'")
+    cid, entry = _select_connection(reg, wanted)
+    return cid, dict(entry or {})
+
+
+def _resolved(entry: dict, field: str) -> str | None:
+    name = entry.get(field)
+    return _resolve_env_key(name)[0] if name else None
+
+
+def _livekit_env(cid: str, entry: dict) -> tuple[dict, list]:
+    """LIVEKIT_* for the worker and the API client, and what is missing."""
+    env, missing = {}, []
+    if entry.get("url"):
+        env["LIVEKIT_URL"] = entry["url"]
+    else:
+        missing.append("url")
+    for field, var in (("api_key_env", "LIVEKIT_API_KEY"), ("secret_env", "LIVEKIT_API_SECRET")):
+        value = _resolved(entry, field)
+        if value:
+            env[var] = value
+        else:
+            missing.append(field)
+    return env, missing
+
+
+def _agent_name(cid: str, settings: dict) -> str:
+    """The dispatch name the worker registers under: the setting, else lkagent-<connection>."""
+    named = settings.get("agent_name")
+    return (named.strip() if isinstance(named, str) else "") or f"{NAME}-{cid}"
+
+
+def _openai_key() -> tuple[str | None, str | None, Path | str | None]:
+    """OPENAI_API_KEY through the credential cascade: the agent's vault first, then the
+    project's env files, the machine's shared.env and credentials.env, the environment."""
+    return _resolve_env_key("OPENAI_API_KEY")
+
+
+def _state_dir() -> Path:
+    root = _project_root()
+    slug = (root.name if root else "no-project")
+    return _STATE_HOME / "capabilities" / "projects" / slug / NAME
+
+
+def _connections_report() -> dict:
+    """Every connection, every field and the OpenAI key, where each resolves from, secrets
+    masked. Local: settings are files, and no system a connection names is asked."""
+    reg, _ = _connections_registry()
+    conns = reg["connections"]
+    try:
+        settings = _line_settings()
+    except SystemExit:
+        settings = {}
+    report: dict = {"default": reg.get("default") or
+                    (next(iter(conns)) if len(conns) == 1 else None), "connections": {}}
+    for cid, entry in conns.items():
+        entry = entry if isinstance(entry, dict) else {}
+        keys = []
+        for field in CONN_FIELDS:
+            key, secret = field["key"], bool(field.get("secret"))
+            required = bool(field.get("required"))
+            if secret:
+                name = entry.get(key)
+                value, tier, source = _resolve_env_key(name) if name else (None, None, None)
+                keys.append(_key_report(name or key, True, required, value, tier, source))
+            else:
+                value = entry.get(key)
+                keys.append(_key_report(key, False, required, value,
+                                        "connection" if value else None, None))
+        for spec in CRED_KEYS:
+            value, tier, source = _resolve_env_key(spec["key"])
+            keys.append(_key_report(spec["key"], True, bool(spec.get("required")), value,
+                                    tier, source))
+        report["connections"][cid] = {
+            "allow_write": bool(entry.get("allow_write", WRITE_DEFAULT)),
+            "agent_name": _agent_name(cid, settings), "keys": keys}
+    return report
+
+
+def _cmd_connections() -> None:
+    _emit(_connections_report())
+
+
+def _pid_file() -> Path:
+    return _state_dir() / "worker.pid"
+
+
+# ── what LiveKit routes to the line ─────────────────────────────────────────
+
+LIVEKIT_API = None
+"""Makes the LiveKit API client from the connection's environment; tests put a fake here."""
+
+
+def _livekit_api(env: dict):
+    if LIVEKIT_API is not None:
+        return LIVEKIT_API(env)
+    from livekit import api
+
+    return api.LiveKitAPI(env["LIVEKIT_URL"], env["LIVEKIT_API_KEY"], env["LIVEKIT_API_SECRET"])
+
+
+async def _sip_read(lk) -> tuple[list, list]:
+    """The project's SIP dispatch rules and inbound trunks, as plain objects, from LiveKit's
+    SIP service (livekit-api: SipService.list_dispatch_rule, list_inbound_trunk)."""
+    from google.protobuf.json_format import MessageToDict
+    from livekit import api
+
+    rules = await lk.sip.list_dispatch_rule(api.ListSIPDispatchRuleRequest())
+    trunks = await lk.sip.list_inbound_trunk(api.ListSIPInboundTrunkRequest())
+
+    def plain(message) -> dict:
+        return MessageToDict(message, preserving_proto_field_name=True)
+
+    return [plain(r) for r in rules.items], [plain(t) for t in trunks.items]
+
+
+def _routing(rules: list, trunks: list, agent_name: str) -> dict:
+    """The dispatch rules that route calls to `agent_name` - those whose room configuration
+    dispatches it - and the phone numbers they route: a rule's own numbers where it names
+    any, else those of the inbound trunks it applies to (every inbound trunk where it
+    names none)."""
+    numbers_of = {t.get("sip_trunk_id"): list(t.get("numbers") or []) for t in trunks}
+    routed, numbers = [], set()
+    for rule in rules:
+        agents = ((rule.get("room_config") or {}).get("agents")) or []
+        if not any((a or {}).get("agent_name") == agent_name for a in agents):
+            continue
+        trunk_ids = list(rule.get("trunk_ids") or [])
+        reach = list(rule.get("numbers") or []) or [
+            n for tid in (trunk_ids or list(numbers_of)) for n in numbers_of.get(tid, [])]
+        routed.append({"id": rule.get("sip_dispatch_rule_id"), "name": rule.get("name") or None,
+                       "kind": next(iter(rule.get("rule") or {}), None),
+                       "trunk_ids": trunk_ids, "numbers": sorted(set(reach))})
+        numbers.update(reach)
+    return {"agent_name": agent_name, "rules": routed, "numbers": sorted(numbers),
+            "rules_read": len(rules), "inbound_trunks_read": len(trunks)}
+
+
+async def _sip_check(lk, agent_name: str) -> tuple[dict, list[str]]:
+    """What LiveKit routes to the line, and the warnings it raises: none routed, or no SIP
+    service that answers."""
+    try:
+        rules, trunks = await _sip_read(lk)
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {str(exc)[:300]}"
+        return ({"ok": False, "agent_name": agent_name, "error": error},
+                [f"LiveKit's SIP service did not answer ({error}); no call can reach the line "
+                 "until the server has SIP"])
+    found = {"ok": True, **_routing(rules, trunks, agent_name)}
+    warnings = []
+    if not found["rules"]:
+        warnings.append(f"no SIP dispatch rule routes to {agent_name}, so no inbound call "
+                        f"reaches the line; `{NAME} guide twilio-number` sets one up")
+    return found, warnings
+
+
+# ── inventory ───────────────────────────────────────────────────────────────
+
+def _inventory(network: bool) -> dict:
+    """The worker's state and the line's numbers, from this machine; under --network the
+    dispatch rules and phone numbers LiveKit routes to the line."""
+    pid, state = None, "stopped"
+    with __import__("contextlib").suppress(Exception):
+        pid = int(_pid_file().read_text().strip())
+        os.kill(pid, 0)
+        state = "running"
+    service = {"state": state, **({"detail": f"pid {pid}"} if state == "running" else {})}
+    metrics, items, deferred = [], [], []
+    try:
+        settings = _line_settings()
+    except SystemExit:
+        settings = {}
+        deferred.append({"label": "numbers", "note": "the line's settings could not be read"})
+    numbers = [n for n in (settings.get("numbers") or []) if isinstance(n, dict)]
+    metrics.append({"label": "numbers", "value": len(numbers)})
+    for entry in numbers:
+        allowed = entry.get("allowed_capabilities") or []
+        items.append({"group": "numbers", "name": str(entry.get("number")),
+                      "state": "read-only" if entry.get("read_only") is True else "read-write",
+                      "detail": ("every capability" if "*" in allowed
+                                 else ", ".join(allowed) or "no capability")})
+    if not network:
+        deferred.append({"label": "dispatch rules",
+                         "note": "the SIP dispatch rules routing to the line and the phone "
+                                 "numbers they route, read from LiveKit with --network"})
+        return {"metrics": metrics, "items": items, "deferred": deferred, "service": service}
+    try:
+        cid, entry = _connection(None)
+    except SystemExit:
+        deferred.append({"label": "dispatch rules", "note": "no single LiveKit connection to read"})
+        return {"metrics": metrics, "items": items, "deferred": deferred, "service": service}
+    env, missing = _livekit_env(cid, entry)
+    if missing:
+        deferred.append({"label": "dispatch rules",
+                         "note": f"the connection lacks {', '.join(missing)}"})
+        return {"metrics": metrics, "items": items, "deferred": deferred, "service": service}
+    import asyncio
+
+    async def read():
+        async with _livekit_api(env) as lk:
+            return await _sip_check(lk, _agent_name(cid, settings))
+
+    try:
+        found, _warnings = asyncio.run(read())
+    except Exception as exc:
+        found = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+    if not found.get("ok"):
+        deferred.append({"label": "dispatch rules", "note": found.get("error")})
+        return {"metrics": metrics, "items": items, "deferred": deferred, "service": service}
+    metrics += [{"label": "dispatch rules", "value": len(found["rules"]),
+                 "note": f"routing to {found['agent_name']}"},
+                {"label": "phone numbers routed", "value": len(found["numbers"])}]
+    for rule in found["rules"]:
+        items.append({"group": "dispatch rules", "name": rule["name"] or rule["id"],
+                      "state": "routes", "detail": ", ".join(rule["numbers"]) or "any number",
+                      "attributes": [{"label": "id", "value": rule["id"]},
+                                     {"label": "kind", "value": rule["kind"]},
+                                     {"label": "trunks",
+                                      "value": ", ".join(rule["trunk_ids"]) or "every inbound"}]})
+    configured = {_line_module().digits(n.get("number")) for n in numbers}
+    for number in found["numbers"]:
+        items.append({"group": "phone numbers", "name": number,
+                      "state": "configured" if _line_module().digits(number) in configured
+                      else "not configured",
+                      "detail": f"routed to {found['agent_name']}"})
+    return {"metrics": metrics, "items": items, "deferred": deferred, "service": service}
+
+
+# ── doctor ──────────────────────────────────────────────────────────────────
+
+def cmd_doctor(wanted: str | None, offline: bool) -> None:
+    report: dict = {"ok": True, "checks": {}, "warnings": []}
+
+    def check(name: str, ok: bool, **detail) -> None:
+        report["checks"][name] = {"ok": ok, **detail}
+        if not ok:
+            report["ok"] = False
+
+    _doctor_gate(_connections_report(), wanted)
+    settings = _line_settings()
+    reg, _ = _connections_registry()
+    entry, cid = None, None
+    if reg is None:
+        check("connection", False, error="no LiveKit connection",
+              hint=f"{NAME} connection add <id> --stdin")
+    else:
+        cid, entry = _select_connection(reg, wanted)
+        entry = dict(entry or {})
+        env, missing = _livekit_env(cid, entry)
+        check("connection", not missing, id=cid, url=entry.get("url"), missing=missing,
+              agent_name=_agent_name(cid, settings),
+              outbound_trunk=bool(settings.get("outbound_trunk")))
+    value, tier, source = _openai_key()
+    check("openai_key", bool(value), key="OPENAI_API_KEY", tier=tier,
+          source=str(source) if source else None)
+    del value
+    try:
+        from callva import harness_runner as hr
+
+        profile = hr.Profile.from_dict(_line_module().backend_profile(settings))
+        probe_ = hr.probe(profile.harness)
+        check("backend", bool(probe_.found), harness=profile.harness, model=profile.model,
+              effort=profile.effort, version=probe_.version, error=probe_.error)
+    except Exception as exc:
+        check("backend", False, error=f"{type(exc).__name__}: {exc}")
+    numbers = [n for n in (settings.get("numbers") or []) if isinstance(n, dict)]
+    check("line", True, numbers=[{"number": n.get("number"),
+                                  "allowed_capabilities": n.get("allowed_capabilities") or [],
+                                  "read_only": n.get("read_only") is True} for n in numbers],
+          recording=settings.get("recording") is True, voice=settings.get("voice"),
+          agent_speaks_first=settings.get("agent_speaks_first"),
+          greeting_type=settings.get("greeting_type"),
+          max_duration_seconds=settings.get("max_duration_seconds"),
+          liveness=bool(settings.get("user_silence_timeout_seconds")
+                        and settings.get("max_prompt_attempts")),
+          webhook=bool(settings.get("webhook_url")))
+    if not numbers:
+        report["warnings"].append(f"the line has no numbers, so it takes no call; `{NAME} help "
+                                  "settings` shows how to add one")
+    if not offline and entry is not None and report["checks"]["connection"]["ok"]:
+        import asyncio
+
+        async def probe():
+            from livekit import api
+
+            env, _ = _livekit_env(cid, entry)
+            async with _livekit_api(env) as lk:
+                rooms = await lk.room.list_rooms(api.ListRoomsRequest())
+                sip = await _sip_check(lk, _agent_name(cid, settings))
+                return len(rooms.rooms), sip
+
+        try:
+            rooms, (sip, warnings) = asyncio.run(probe())
+            check("livekit", True, rooms=rooms)
+            report["checks"]["sip"] = sip
+            report["warnings"] += warnings
+        except Exception as exc:
+            check("livekit", False, error=f"{type(exc).__name__}: {str(exc)[:300]}")
+    _emit(report)
+    if not report["ok"]:
+        sys.exit(2)
+
+
+# ── call ────────────────────────────────────────────────────────────────────
+
+def _caller_number(numbers: list, wanted: str | None) -> dict:
+    """The line's number an outgoing call is placed from: the one --from names, else the
+    only one configured; exit 6 where none is configured, --from names none of them, or
+    several are configured and none is named."""
+    line = _line_module()
+    configured = [n for n in (numbers or []) if isinstance(n, dict) and n.get("number")]
+    if not configured:
+        _die(6, "no_number", "the line has no numbers to call from",
+             f"add one to the `numbers` setting: `{NAME} help settings`")
+    if wanted:
+        entry = line.number_entry(configured, wanted)
+        if entry is None:
+            _die(6, "number_not_configured", f"{wanted} is not one of the line's numbers",
+                 "--from takes one of: " + ", ".join(str(n["number"]) for n in configured))
+        return entry
+    if len(configured) > 1:
+        _die(6, "ambiguous_number",
+             f"the line has {len(configured)} numbers and the call names none",
+             "pass --from <number>, one of: "
+             + ", ".join(str(n["number"]) for n in configured))
+    return configured[0]
+
+
+def _outbound_requests(*, agent_name: str, room: str, config: dict, number: str,
+                       caller: str, trunk: str):
+    """The dispatch that sends the worker into the call's room, with callva-livekit's
+    envelope - the direction, both numbers and the call's configuration - and the SIP
+    participant that dials `number` from the line's number `caller`."""
+    from livekit import api
+
+    metadata = json.dumps({"callva": {"direction": "outbound", "to": number, "from": caller,
+                                      "config": config}}, ensure_ascii=False)
+    dispatch = api.CreateAgentDispatchRequest(agent_name=agent_name, room=room,
+                                              metadata=metadata)
+    dial = api.CreateSIPParticipantRequest(
+        room_name=room, sip_trunk_id=trunk, sip_call_to=number, sip_number=caller,
+        participant_identity=f"sip_{number.strip().lstrip('+')}",
+        wait_until_answered=False)
+    return dispatch, dial
+
+
+def cmd_call(wanted: str | None, number: str, task: str | None, caller: str | None) -> None:
+    cid, entry = _connection(wanted)
+    _write_gate(cid, bool(entry.get("allow_write", WRITE_DEFAULT)), "call")
+    if not number.strip().lstrip("+").isdigit():
+        _die(6, "bad_number", f"{number!r} is not a phone number", "give it as +<digits>")
+    settings = _line_settings()
+    line_number = _caller_number(settings.get("numbers") or [], caller)["number"]
+    config_file = _state_dir() / "call-config.json"
+    try:
+        config = json.loads(config_file.read_text())
+    except (OSError, ValueError):
+        _die(6, "worker_not_prepared", "the line's call configuration is not written",
+             f"start the worker first: {NAME} service run")
+    variables = {"number": number}
+    if task and task.strip():
+        variables["task"] = task.strip()
+    config.setdefault("agent", {}).setdefault("prompt_variables", {}).update(variables)
+    trunk = (settings.get("outbound_trunk") or "").strip()
+    if not trunk:
+        _die(6, "no_outbound_trunk", "the line names no outbound SIP trunk",
+             f"create an outbound trunk in LiveKit and `{NAME} settings set outbound_trunk "
+             "ST_<id>`")
+    env, missing = _livekit_env(cid, entry)
+    if missing:
+        _die(2, "missing_credentials", f"the connection lacks {', '.join(missing)}")
+    import asyncio
+    import uuid
+
+    room = f"{NAME}-out-{uuid.uuid4().hex[:12]}"
+    agent_name = _agent_name(cid, settings)
+    dispatch_request, dial_request = _outbound_requests(
+        agent_name=agent_name, room=room, config=config, number=number, caller=line_number,
+        trunk=trunk)
+
+    async def dispatch():
+        async with _livekit_api(env) as lk:
+            made = await lk.agent_dispatch.create_dispatch(dispatch_request)
+            # The dial is the dispatcher's; the worker waits for the pickup.
+            await lk.sip.create_sip_participant(dial_request)
+            return made
+
+    try:
+        made = asyncio.run(dispatch())
+    except Exception as exc:
+        _die(5, "dispatch_failed", f"{type(exc).__name__}: {str(exc)[:300]}")
+    _emit({"room": room, "dispatch_id": made.id, "agent_name": agent_name, "number": number,
+           "from": line_number})
+
+
+# ── service ─────────────────────────────────────────────────────────────────
+
+def _calls_store(agent_id: str | None, migrate: bool) -> dict:
+    """Whether finished calls are recorded here: a store resolves for the project and the
+    project has an agent id. With `migrate`, lkagent_calls is brought up to date first."""
+    if not agent_id:
+        return {"recorded": False, "reason": "the project has no agent id "
+                                             "(`capabilities init` binds one)"}
+    try:
+        from capabilities_contract import db
+    except ImportError:
+        return {"recorded": False, "reason": "the shared database library is not installed"}
+    try:
+        setting = db.resolve_setting(_project_root())
+    except db.DbError as exc:
+        return {"recorded": False, "reason": f"{exc.slug}: {exc.message}"}
+    if not migrate:
+        return {"recorded": True, "reason": None}
+    conn = None
+    try:
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+        db.migrate(conn, NAME, TABLE_STEPS, major=TABLES_MAJOR, minor=TABLES_MINOR)
+    except db.DbError as exc:
+        return {"recorded": False, "reason": f"{exc.slug}: {exc.message}"}
+    finally:
+        if conn is not None:
+            conn.close()
+    return {"recorded": True, "reason": None}
+
+
+def _service_plan(wanted: str | None, migrate: bool = False) -> tuple[dict, dict]:
+    """The environment and line the worker starts with; secrets only in the first."""
+    cid, entry = _connection(wanted)
+    env, missing = _livekit_env(cid, entry)
+    if missing:
+        _die(2, "missing_credentials", f"the connection lacks {', '.join(missing)}")
+    settings = _line_settings()
+    key = _openai_key()[0]
+    if not key:
+        _die(2, "missing_credentials", "OPENAI_API_KEY does not resolve",
+             "store it in the agent's vault: capabilities secrets set OPENAI_API_KEY, or "
+             f"`{NAME} setup set --stdin`")
+    env["OPENAI_API_KEY"] = key
+    root = _project_root()
+    agent_id = _project_id(write=True, refuse=False) if root is not None else None
+    line = {"settings": settings, "connection": cid,
+            "agent_root": str(root) if root else os.getcwd(),
+            "state_dir": str(_state_dir()), "agent_id": agent_id,
+            "calls": _calls_store(agent_id, migrate)}
+    env["LKAGENT_AGENT_NAME"] = _agent_name(cid, settings)
+    return env, line
+
+
+def cmd_service(args, wanted: str | None) -> None:
+    env, line = _service_plan(wanted, migrate=args.service_cmd == "run")
+    settings = line["settings"]
+    if args.service_cmd == "doctor":
+        _emit({"ok": True, "agent_name": env["LKAGENT_AGENT_NAME"], "url": env["LIVEKIT_URL"],
+               "agent_root": line["agent_root"], "state_dir": line["state_dir"],
+               "settings": settings, "connection": line["connection"],
+               "outbound": bool(settings.get("outbound_trunk")),
+               "numbers": [n.get("number") for n in settings.get("numbers") or []
+                           if isinstance(n, dict)],
+               "calls_recorded": line["calls"]})
+        return
+    os.environ.update(env)
+    os.environ["LKAGENT_LINE"] = json.dumps(line)
+    _pid_file().parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _pid_file().write_text(str(os.getpid()))
+    if not line["calls"]["recorded"]:
+        print(json.dumps({"warning": f"calls are not recorded: {line['calls']['reason']}"}),
+              file=sys.stderr)
+    sys.path.insert(0, str(_BUNDLE / "service"))
+    import worker  # noqa: PLC0415 - heavy, and only for the running service
+
+    worker.run("dev" if args.dev else "start")
+
+
+# ── main ────────────────────────────────────────────────────────────────────
+
+def _parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=NAME, description=HELP, allow_abbrev=False,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("doctor", allow_abbrev=False)
+    d.add_argument("--offline", action="store_true")
+    c = sub.add_parser("call", allow_abbrev=False)
+    c.add_argument("number")
+    c.add_argument("--from", dest="caller")
+    c.add_argument("--task")
+    s = sub.add_parser("service", allow_abbrev=False)
+    ss = s.add_subparsers(dest="service_cmd", required=True)
+    r = ss.add_parser("run", allow_abbrev=False)
+    r.add_argument("--dev", action="store_true")
+    ss.add_parser("doctor", allow_abbrev=False)
+    return p
+
+
+def main() -> None:
+    _gate()
+    argv = sys.argv[1:]
+    if argv[:1] == ["manifest"]:
+        _emit({**_manifest_core(), "service": SERVICE})
+        return
+    _contract(argv)
+    wanted, cleaned, i = None, [], 0
+    while i < len(argv):
+        if argv[i] == "--connection" and i + 1 < len(argv):
+            wanted = argv[i + 1]
+            i += 2
+            continue
+        if argv[i].startswith("--connection="):
+            wanted = argv[i].split("=", 1)[1]
+            i += 1
+            continue
+        cleaned.append(argv[i])
+        i += 1
+    args = _parser().parse_args(cleaned)
+    if args.cmd == "doctor":
+        cmd_doctor(wanted, args.offline)
+    elif args.cmd == "call":
+        cmd_call(wanted, args.number, args.task, args.caller)
+    elif args.cmd == "service":
+        cmd_service(args, wanted)
+
+
+if __name__ == "__main__":
+    main()
