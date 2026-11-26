@@ -25131,7 +25131,9 @@ def _joined_by_enable(conn, node: str, capability: str) -> list[tuple]:
 
 def _placement_mode_check(name: str, mode: str | None) -> None:
     """Refuse a mode `name` cannot be served in: shared where its installed
-    service declares no machine command."""
+    service declares no machine command, own where it declares a machine
+    command and no project command (`service.deploy.command`), so nothing
+    could run an agent's own service of it."""
     if mode is None:
         return
     if mode not in PLACEMENT_MODES:
@@ -25142,6 +25144,14 @@ def _placement_mode_check(name: str, mode: str | None) -> None:
              "no machine service of it can serve an agent: it runs only as each agent's "
              "own service",
              f"place it with --mode own, or without --mode: `capabilities place {name} "
+             "--node <node>`")
+    if (mode == "own" and _service_machine_argv(name)
+            and _node_service_command(name)[1] is not None):
+        _die(6, "no_project_service",
+             f"{name}'s service declares no project command (service.deploy.command), so "
+             "no service of an agent's own can run it: the machine service on the node "
+             "serves the agents placed there",
+             f"place it with --mode shared, or without --mode: `capabilities place {name} "
              "--node <node>`")
 
 
@@ -38056,7 +38066,8 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         keeps its mode, and a new placement is shared where <name>'s installed
         service declares a machine command (service.machine.command), else
         own; shared where it declares none is refused (exit 6
-        no_machine_service). A row that records no mode - written before
+        no_machine_service), and so is own where it declares a machine
+        command and no project command (exit 6 no_project_service). A row that records no mode - written before
         modes, or by enable --node - is served as before: by the agent's own
         service where <name> declares a project command, else by the machine
         service. unplace --mode takes the service off only where its
@@ -38069,7 +38080,8 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         (service.machine.join enabled) needs no placement: every agent with
         <name> enabled, explicitly or inherited, is served by the machine
         service of each node it lives on. A placement written for it says
-        where it is served instead - shared on that node, or own - and
+        where it is served instead - by that node's machine service, which is
+        how an agent on a server node is served there and nowhere else - and
         unplacing the last one returns it to being served by enable.
         A service's descriptor declares how many nodes run it at once
         (service.placement): exclusive, the default, runs on one node at a

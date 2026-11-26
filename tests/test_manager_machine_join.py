@@ -199,8 +199,8 @@ def _seed(lab: Lab) -> None:
     lab.sql("INSERT INTO policies (agent_id, capability, node, enabled) VALUES "
             "(%s, 'memory', NULL, false), (%s, 'memory', %s, false)",
             (AGENTS["disabled"], AGENTS["off_here"], MAC))
-    # One agent placed on a server node to be served by its own service there, one
-    # placed here in mode shared, as `capabilities place` writes them.
+    # One agent placed on a server node, served by its own service there, one
+    # placed here in mode shared: a placement of either mode says where it is served.
     lab.sql("INSERT INTO policies (agent_id, capability, node, enabled, service, mode) "
             "VALUES (%s, 'memory', %s, true, true, 'own'), "
             "(%s, 'memory', %s, true, true, 'shared')",
@@ -262,3 +262,23 @@ def test_service_machine_join_takes_placement_or_enabled_and_nothing_else():
     assert validate("memory", _machine(join="placement"), verbs) == []
     assert validate("memory", _machine(join="always"), verbs) == [
         "service.machine.join must be one of placement, enabled"]
+
+
+def test_own_is_refused_for_a_service_with_a_machine_command_and_no_project_command(
+        monkeypatch, capsys):
+    check = M["_placement_mode_check"]
+    scope = check.__globals__
+    monkeypatch.setitem(scope, "_service_machine_argv",
+                        lambda name: ["memory", "service", "run", "--machine"])
+    monkeypatch.setitem(scope, "_node_service_command",
+                        lambda name: ([], "memory's service declares no deploy command"))
+    with pytest.raises(SystemExit) as refused:
+        check("memory", "own")
+    assert refused.value.code == 6
+    assert json.loads(capsys.readouterr().err)["error"]["code"] == "no_project_service"
+    check("memory", "shared")
+    check("memory", None)
+    # A service that declares a project command too keeps its own mode.
+    monkeypatch.setitem(scope, "_node_service_command",
+                        lambda name: (["tasks", "service", "run"], None))
+    check("tasks", "own")
