@@ -958,6 +958,7 @@
         "guides/service.md",
         "guides/writing.md",
         "icon.png",
+        "service/engine.py",
         "tests/_cli.py",
         "tests/fakes/claude",
         "tests/test_adopt.py",
@@ -965,14 +966,15 @@
         "tests/test_groom.py",
         "tests/test_memory_folder.py",
         "tests/test_pure.py",
+        "tests/test_service.py",
         "tests/test_store.py"
       ],
       "icon": true,
       "level": 0,
       "lucide_icon": "brain",
       "path": "capabilities/memory",
-      "payload_sha256": "159a5d1c6bd4443f9e81facb91983e7719b0dab89a62e9fb2038fd9257aaa03f",
-      "requires_manager": 0,
+      "payload_sha256": "2819cfa045b4fc2fc3ab5df806e5b530584d68be5e816864ff07e6f3f797c9dc",
+      "requires_manager": 2,
       "store_major": 4,
       "summary": "Project memory over a PostgreSQL store - conclusions recorded one entry at a time and searched on demand, a constant block in every session's context that says how to record and search them, and a grooming pass, run on a schedule, that consolidates the entries.",
       "tier": "core",
@@ -987,7 +989,7 @@
           "title": "Память"
         }
       },
-      "version": "2026-11-24 — `memory inventory` counts this project's active entries as a tile, and only with --network"
+      "version": "2026-11-26 — Memory grooms itself through its own bundled service, with no schedule set up"
     },
     "notion": {
       "executable": [

@@ -40,7 +40,7 @@ MANIFEST_REL = ".capability-source/manager-release.json"
 CATALOG_REL = ".capability-source/catalog.json"
 BUNDLE = REPO / "capabilities" / "resend"
 M = runpy.run_path(str(MANAGER), run_name="manager_compat_levels_test")
-LEVEL_LINE = "MANAGER_LEVEL = 1\n"
+LEVEL_LINE = "MANAGER_LEVEL = 2\n"
 REQUIRES_LINE = 'MANAGER_REQUIRES: dict = {"teams": 1}\n'
 COMPAT_KEYS = {"manager_level", "unmet", "update_needed", "next"}
 UNMET_KEYS = {"name", "needs", "installed", "required", "required_by", "command"}
@@ -228,7 +228,7 @@ def test_levels_are_read_from_the_script_without_running_it() -> None:
         levels, problems = declared(bad)
         assert levels["LEVEL"] == 0
         assert problems == ["LEVEL must be a literal non-negative integer"]
-    assert M["MANAGER_LEVEL"] == 1 and M["MANAGER_REQUIRES"] == {"teams": 1}
+    assert M["MANAGER_LEVEL"] == 2 and M["MANAGER_REQUIRES"] == {"teams": 1}
 
 
 def test_install_refuses_a_level_that_is_not_a_literal(tmp_path: Path) -> None:
@@ -310,17 +310,17 @@ def test_a_manifest_and_a_catalogue_without_levels_read_as_level_zero() -> None:
 def test_an_older_manager_refuses_a_capability_needing_a_newer_one(tmp_path: Path) -> None:
     env = _env(tmp_path)
     proc = _call(env, tmp_path, "install", "resend", "--from",
-                 str(_bundle(tmp_path / "needs-2", _script(1, 2, "needs-2"))))
+                 str(_bundle(tmp_path / "needs-3", _script(1, 3, "needs-3"))))
     assert proc.returncode == 6
     error = _error(proc)
     assert error["code"] == "manager_too_old"
-    assert "resend" in error["message"] and "level 2" in error["message"] \
-        and "level 1" in error["message"]
+    assert "resend" in error["message"] and "level 3" in error["message"] \
+        and "level 2" in error["message"]
     assert "capabilities self-update" in error["hint"]
     assert not _installed(env).exists()
 
     root = tmp_path / "src"
-    _tree(root / "main", "main", capability=_script(1, 2, "main"), offered=(1, 2))
+    _tree(root / "main", "main", capability=_script(1, 3, "main"), offered=(1, 3))
     with _serve(root) as base:
         env["CAPABILITIES_SOURCE"] = f"{base}/main"
         _install_canonical(tmp_path, env, base, _script(tag="installed"))
@@ -360,17 +360,17 @@ def test_compat_names_each_pair_installed_below_the_others_minimum(tmp_path: Pat
     """A capability installed by a newer manager, read by an older one; and an
     old capability read by a newer manager that requires more of it."""
     env = _env(tmp_path)
-    newer = _tree(tmp_path / "newer", "newer", level=2)
+    newer = _tree(tmp_path / "newer", "newer", level=3)
     _run(env, tmp_path, "install", "resend", "--from",
-         str(_bundle(tmp_path / "b", _script(0, 2, "b"))), manager=newer)
+         str(_bundle(tmp_path / "b", _script(0, 3, "b"))), manager=newer)
     assert _compat(env, tmp_path, MANAGER) == {
-        "manager_level": 1,
-        "unmet": [{"name": "resend", "needs": "manager", "installed": 1, "required": 2,
+        "manager_level": 2,
+        "unmet": [{"name": "resend", "needs": "manager", "installed": 2, "required": 3,
                    "required_by": "resend", "command": "capabilities self-update"}],
         "update_needed": True, "next": ["capabilities self-update"]}
-    demanding = _tree(tmp_path / "demanding", "demanding", level=2, requires={"resend": 1})
+    demanding = _tree(tmp_path / "demanding", "demanding", level=3, requires={"resend": 1})
     assert _compat(env, tmp_path, demanding) == {
-        "manager_level": 2,
+        "manager_level": 3,
         "unmet": [{"name": "resend", "needs": "capability", "installed": 0, "required": 1,
                    "required_by": "capabilities", "command": "capabilities update resend"}],
         "update_needed": True, "next": ["capabilities update resend"]}
@@ -383,8 +383,8 @@ def test_either_order_ends_with_no_unmet_pair(tmp_path: Path, order: str) -> Non
     env = _env(tmp_path)
     link = _outgoing(tmp_path, env)
     root = tmp_path / "src"
-    _tree(root / "main", "main", level=2, requires={"resend": 1},
-          capability=_script(1, 2, "main"), offered=(1, 2))
+    _tree(root / "main", "main", level=3, requires={"resend": 1},
+          capability=_script(1, 3, "main"), offered=(1, 3))
     with _serve(root) as base:
         env["CAPABILITIES_SOURCE"] = f"{base}/main"
         _install_canonical(tmp_path, env, base, _script(tag="installed"))
@@ -395,21 +395,21 @@ def test_either_order_ends_with_no_unmet_pair(tmp_path: Path, order: str) -> Non
             assert _installed_levels(env)["LEVEL"] == 0
         checked = _run(env, tmp_path, "self-update", "--check", manager=link)
         assert set(checked["compat"]) == COMPAT_KEYS | {"available"}
-        assert checked["compat"]["manager_level"] == 1
+        assert checked["compat"]["manager_level"] == 2
         assert checked["compat"]["unmet"] == []
-        assert checked["compat"]["available"] == {"level": 2, "requires": {"resend": 1},
+        assert checked["compat"]["available"] == {"level": 3, "requires": {"resend": 1},
                                                   "brings": ["resend"]}
         result = _run(env, tmp_path, "self-update", manager=link)
         assert result["self_update"] == "updated"
         assert result["brought_capabilities"] == [
             {"name": "resend", "installed": 0, "required": 1, "level": 1}]
         assert link.resolve().read_text().rstrip().endswith("# the main manager")
-        assert _installed_levels(env) == {"LEVEL": 1, "REQUIRES_MANAGER": 2}
+        assert _installed_levels(env) == {"LEVEL": 1, "REQUIRES_MANAGER": 3}
         if order == "self-update-then-update":
             updated = _run(env, tmp_path, "update", manager=link)
             assert "refused" not in updated["updated"][0]
     assert _compat(env, tmp_path, link) == {
-        "manager_level": 2, "unmet": [], "update_needed": False, "next": []}
+        "manager_level": 3, "unmet": [], "update_needed": False, "next": []}
 
 
 @pytest.mark.parametrize("case", ["brings", "refuses", "rolls-back"])

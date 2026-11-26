@@ -418,7 +418,7 @@ STORE_UPGRADE_COMMAND = "capabilities store upgrade"
 # `update` and `self-update` never leave a manager and a capability below each
 # other's minimum. A level rises only when a release gains something another
 # release will require.
-MANAGER_LEVEL = 1
+MANAGER_LEVEL = 2
 # teams 1 composes its own Teams section through its declared command; this
 # manager composes none for a teams that does not.
 MANAGER_REQUIRES: dict = {"teams": 1}
@@ -1960,8 +1960,12 @@ def _validate_service_deploy(deploy: object) -> list[str]:
 
 
 SERVICE_MACHINE_SCHEMA = "capabilities.service.machine.v1"
-SERVICE_MACHINE_KEYS = ("schema", "command", "doctor", "projects", "config", "state")
+SERVICE_MACHINE_KEYS = ("schema", "command", "doctor", "projects", "config", "state", "join")
 SERVICE_MACHINE_VERBS = ("run", "status", "doctor")
+# How an agent joins a machine service (`service.machine.join`): by a shared
+# placement, as every machine service did before the key, or by having the
+# capability enabled at all, for a service that is an agent's life function.
+SERVICE_MACHINE_JOINS = ("placement", "enabled")
 
 
 def _validate_service_machine(name: str, machine: object, verbs: object) -> list[str]:
@@ -1997,6 +2001,9 @@ def _validate_service_machine(name: str, machine: object, verbs: object) -> list
         if field in machine and (not isinstance(machine[field], str)
                                  or not machine[field]):
             problems.append(f"service.machine.{field} must be a non-empty string")
+    if "join" in machine and machine["join"] not in SERVICE_MACHINE_JOINS:
+        problems.append(
+            f"service.machine.join must be one of {', '.join(SERVICE_MACHINE_JOINS)}")
     listed = verbs if isinstance(verbs, list) else []
     missing = [verb for verb in SERVICE_MACHINE_VERBS if verb not in listed]
     if missing:
@@ -13938,6 +13945,9 @@ class _NodeManager:
         # whose rows in service_instances this process wrote.
         self.unrun: dict[tuple[str, str], tuple[str, str]] = {}
         self.unrun_now: dict[tuple[str, str], tuple[str, str]] = {}
+        # The (agent, capability) pairs the last store read served by enable
+        # rather than by a placement row (JOINED_BY_ENABLE_SQL).
+        self.by_enable: set[tuple[str, str]] = set()
         # The placements on this node whose capability, installed here after
         # the placement was written, declares no service: each is taken off
         # this node's own row, by the moment that install was made.
@@ -14049,6 +14059,15 @@ class _NodeManager:
                     "JOIN agent_nodes l ON l.agent_id = p.agent_id "
                     "AND l.node = p.node WHERE p.node = %s AND p.enabled AND p.service "
                     "ORDER BY p.agent_id, p.capability", (self.here,)).fetchall()
+                # A machine service joined by enable serves each agent here
+                # that has it enabled and places it nowhere, as if placed
+                # here in mode shared.
+                by_enable = {(row[0], capability)
+                             for capability in sorted(_installed())
+                             for row in _joined_by_enable(conn, self.here, capability)}
+                self.by_enable = by_enable
+                placed = list(placed) + [(agent_id, capability, "shared", None)
+                                         for agent_id, capability in sorted(by_enable)]
                 disabled = conn.execute(
                     "UPDATE nodes SET last_seen_at = now() "
                     "WHERE id = %s RETURNING disabled_at IS NOT NULL",
@@ -14119,6 +14138,15 @@ class _NodeManager:
                 # a service of a release this node has not taken yet, and one
                 # left to what runs it here (--services) is judged there.
                 retire[(agent_id, capability)] = installed_at
+                continue
+            if (agent_id, capability) in getattr(self, "by_enable", ()) and (
+                    agent_id in held or agent_id not in folders
+                    or not _placement_runs_machine(capability, recorded)
+                    or _machine_state(capability) == "quarantined"
+                    or (self.only is not None and capability not in self.only)):
+                # Joined by enable and not placed by anyone: where its machine
+                # service cannot serve it here, nothing was asked to run, so
+                # nothing is reported as not running.
                 continue
             if agent_id in held:
                 unrun[(agent_id, capability)] = ("agent_not_raised", held[agent_id])
@@ -15203,8 +15231,10 @@ def _node_install_manager(path: Path, *argv: str) -> tuple[dict | None, str]:
 # capability's own config home) names the projects its one machine process
 # serves. The node manager alone writes it: `node supervise <name> --machine`
 # puts there each agent placed on this node in mode shared whose leases it
-# holds, and takes off each it put there that it no longer serves, so the list
-# follows the placements in the store. An entry it did not write - one a
+# holds - and, for a service joined by enable (`service.machine.join`), each
+# agent here that has the capability enabled and places it nowhere - and takes
+# off each it put there that it no longer serves, so the list follows the
+# placements and the policy in the store. An entry it did not write - one a
 # `service join` of an older release put there - stays until that agent is
 # served here and given up again.
 
@@ -17086,8 +17116,9 @@ def _supervise_machine_command(name: str) -> tuple[list[str], list[str]]:
 
 class _SupervisePlacement(_SuperviseStore):
     """The agents that live on this node and place one service here to be
-    served by its machine service (mode shared), as the store holds them,
-    read the way the node manager reads them."""
+    served by its machine service (mode shared), with those a service joined
+    by enable serves here unplaced (JOINED_BY_ENABLE_SQL), as the store holds
+    them, read the way the node manager reads them."""
 
     def __init__(self, root: Path, node: str):
         super().__init__(root)
@@ -17105,10 +17136,13 @@ class _SupervisePlacement(_SuperviseStore):
                 "WHERE p.node = %s AND p.capability = %s "
                 "AND p.enabled AND p.service ORDER BY l.agent_id",
                 (self.node, capability)).fetchall()
+            joined = _joined_by_enable(conn, self.node, capability)
             return {"agents": [(agent_id, folder) for agent_id, folder, mode, _slug in rows
-                               if _placement_mode(capability, mode) == "shared"],
+                               if _placement_mode(capability, mode) == "shared"]
+                    + [(agent_id, folder) for agent_id, folder, _slug in joined],
                     "slugs": {agent_id: slug for agent_id, _folder, _mode, slug in rows
-                              if slug}}
+                              if slug}
+                    | {agent_id: slug for agent_id, _folder, slug in joined if slug}}
         return self._run(work)
 
 
@@ -25052,6 +25086,47 @@ def _placement_runs_machine(name: str, recorded) -> bool:
     """Whether a placement row of `name` is served by the node's machine
     service: its mode is shared and the installed service declares one."""
     return _placement_mode(name, recorded) == "shared" and bool(_service_machine_argv(name))
+
+
+def _service_machine_join(name: str) -> str:
+    """How an agent joins `name`'s machine service here: `enabled` where the
+    installed service declares a machine command and `service.machine.join`
+    `enabled`, so having the capability enabled is joining; else
+    `placement`, a shared placement."""
+    service = _installed_service(name) if name in _installed() else None
+    machine = service.get("machine") if isinstance(service, dict) else None
+    return ("enabled" if isinstance(machine, dict) and machine.get("join") == "enabled"
+            and _service_machine_argv(name) else "placement")
+
+
+# The agents living on a node that a machine service joined by enable serves
+# there with no placement written: each linked to the node with a folder and
+# not archived, whose store policy resolves the capability enabled - its own
+# row for the node, its own row for every node, then the global rows the same
+# way, the first that holds one deciding - and that places the service on no
+# node itself, since a placement it writes (`capabilities place`, shared or
+# its own) says where it is served instead.
+JOINED_BY_ENABLE_SQL = (
+    "SELECT l.agent_id, l.folder, a.slug FROM agent_nodes l "
+    "JOIN agents a ON a.id = l.agent_id "
+    "WHERE l.node = %(node)s AND l.folder IS NOT NULL AND a.archived_at IS NULL "
+    "AND NOT EXISTS (SELECT 1 FROM policies q WHERE q.agent_id = l.agent_id "
+    "AND q.capability = %(capability)s AND q.node IS NOT NULL AND q.enabled AND q.service) "
+    "AND coalesce((SELECT p.enabled FROM policies p WHERE p.capability = %(capability)s "
+    "AND (p.agent_id = l.agent_id OR p.agent_id IS NULL) "
+    "AND (p.node = %(node)s OR p.node IS NULL) "
+    "ORDER BY p.agent_id IS NULL, p.node IS NULL LIMIT 1), false) "
+    "ORDER BY l.agent_id")
+
+
+def _joined_by_enable(conn, node: str, capability: str) -> list[tuple]:
+    """[(agent_id, folder, slug)] that `capability`'s machine service serves
+    on `node` because each has it enabled (JOINED_BY_ENABLE_SQL); [] where
+    its installed service is not joined by enable."""
+    if _service_machine_join(capability) != "enabled":
+        return []
+    return [tuple(row) for row in conn.execute(
+        JOINED_BY_ENABLE_SQL, {"node": node, "capability": capability}).fetchall()]
 
 
 def _placement_mode_check(name: str, mode: str | None) -> None:
@@ -37990,6 +38065,12 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         placed_before, what the node's row held before it: null where the
         service was not placed there, else the mode it recorded, unrecorded
         for a row from before modes.
+        A service whose machine declaration is joined by enable
+        (service.machine.join enabled) needs no placement: every agent with
+        <name> enabled, explicitly or inherited, is served by the machine
+        service of each node it lives on. A placement written for it says
+        where it is served instead - shared on that node, or own - and
+        unplacing the last one returns it to being served by enable.
         A service's descriptor declares how many nodes run it at once
         (service.placement): exclusive, the default, runs on one node at a
         time, so place takes it off every other node in the same write - this
@@ -39062,7 +39143,10 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         own or without one - has one program for the node instead, named
         <capability>.machine, running `node supervise <name> --machine` in
         this folder while any agent here places it so; one placed in mode own
-        keeps its agent's program. A placement recording no mode is run as
+        keeps its agent's program. A service joined by enable
+        (service.machine.join enabled) counts, as placed here in mode shared,
+        every agent linked here with a folder that has <name> enabled and
+        places it on no node, and reports none of them as not running. A placement recording no mode is run as
         before modes: by its agent's program where the service declares a
         project command, else by the machine program.
         --services limits it to those capabilities, the ones this
@@ -39303,8 +39387,10 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
   node supervise <name> --machine [--every N] [--restart POLICY]
         What a node-run job runs for a service that declares one per machine
         (service.machine.command): one process on this node for every agent
-        here that places it in mode shared. Each reconcile it reads those
-        agents from the store, takes each one's service lease on this node
+        here that places it in mode shared - or, for a service joined by
+        enable (service.machine.join enabled), that has <name> enabled and
+        places it on no node. Each reconcile it reads those agents from the
+        store, takes each one's service lease on this node
         (mode shared; an agent whose own service holds it live is left to
         that service, its row and lines untouched) and its lease where the
         service is exclusive, puts each agent whose leases it holds on the

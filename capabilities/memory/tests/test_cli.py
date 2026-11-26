@@ -32,7 +32,7 @@ def tree(root: Path) -> str:
     return digest.hexdigest()
 
 
-def test_manifest_declares_the_constant_block_and_no_service(tmp_path):
+def test_manifest_declares_the_constant_block_and_the_grooming_service(tmp_path):
     world = World(tmp_path, None)
     manifest = world.ok(tmp_path, "manifest", "--json")
     assert set(manifest["contribution"]) == {"markdown"}
@@ -45,8 +45,15 @@ def test_manifest_declares_the_constant_block_and_no_service(tmp_path):
     for words in ("No entries yet", "--since", "newest written", "_Rendered", "memory render"):
         assert words not in block
     assert not any(line.startswith("#") for line in block.splitlines())
-    assert "service" not in manifest
-    assert manifest["tables"] is True and manifest["state"] is False
+    service = manifest["service"]
+    assert service["placement"] == "shared" and service["verbs"] == ["run", "status", "doctor"]
+    assert service["machine"] == {
+        "schema": "capabilities.service.machine.v1",
+        "command": ["memory", "service", "run", "--machine"],
+        "doctor": ["memory", "service", "doctor", "--machine"],
+        "projects": "$XDG_CONFIG_HOME/memory/service/projects.json",
+        "state": "$XDG_STATE_HOME/capabilities/machine/memory", "join": "enabled"}
+    assert manifest["tables"] is True and manifest["state"] is True
     assert manifest["docs"]["topics"] == sorted(manifest["docs"]["topics"])
 
 
@@ -214,7 +221,7 @@ def test_export_and_inventory(world, tmp_path):
     before = tree(root)
     inventory = world.ok(root, "inventory")
     assert inventory["metrics"] == [] and inventory["items"] == []
-    assert inventory["service"] is None
+    assert inventory["service"]["state"] == "stopped"
     assert tree(root) == before
 
 

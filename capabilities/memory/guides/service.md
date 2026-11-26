@@ -1,6 +1,6 @@
 # Consolidating memory
 
-How a project's memory is consolidated as it grows, how to schedule the grooming pass that does it, and how to review what a pass did.
+How a project's memory is consolidated as it grows, the service that runs the grooming pass that does it, and how to review what a pass did.
 
 ## The block does not change
 
@@ -10,20 +10,15 @@ The block a session reads is constant: it says how to record and how to search, 
 
 A project's memory grows by appends. The window is its recent, unpinned entries, and it fits while it stays within the entry count and the characters the settings allow. When it no longer fits, one grooming pass for the project consolidates it: an agent turn reads the entries and proposes merges of related or contradicting entries and drops of entries that no longer hold, and the capability checks every proposal before applying any of it. Pinned entries are never touched, quotations survive word for word, and nothing is deleted.
 
-## Scheduling the pass
+## The service that runs the pass
 
-`memory groom --if-due` runs a pass only when one is due: consolidation is on, the window no longer fits, no pass ran for the project within the configured interval on any machine, nothing was written for the quiet period, no other pass holds the project, and the profile's harness is installed and logged in headless. Otherwise it exits successfully and says why not, spending no model turn, so it is safe to run often.
+Nobody schedules grooming. Memory bundles a long-lived service whose only work is to start `memory groom --if-due` in a served agent's folder, as the agent would run it: soon after the agent is admitted, again after its memory changes in the store, and on its own recurring timer, so a pass that falls due by time alone still runs. One pass per agent runs at a time, and only a few at once on the machine.
 
-Schedule it as an automation of the project, hourly for instance, from inside the project:
+`memory groom --if-due` keeps deciding whether a pass is due: consolidation is on, the window no longer fits, no pass ran for the project within the configured interval on any machine, nothing was written for the quiet period, no other pass holds the project, and the profile's harness is installed and logged in headless. Otherwise it exits successfully and says why not, spending no model turn, so the service may ask often and a person may run it by hand at any time.
 
-```sh
-printf '#!/bin/sh\nexec memory groom --if-due\n' > memory-groom.sh
-automations set memory-groom --body memory-groom.sh \
-    --schedule "0 * * * *" --timezone UTC \
-    --description "consolidate memory when its window no longer fits"
-```
+In machine mode one process on a node serves every agent there that has memory enabled, whether enabled for the agent itself or inherited from the global default; the node manager puts each such agent on the service's list with no placement needed, and keeping the process running is the manager's (`capabilities node supervise memory`). Before every action for an agent the service checks again that the agent is on the list, still has memory enabled, that memory is not quarantined on the machine, and that the folder's project id has not changed. An agent it cannot serve is reported with the reason and the others are served. `memory service status` shows each agent, the next ask and the last pass, and `memory service doctor` whether the process runs and reaches its stores; `memory help service run` gives the whole contract.
 
-The body is kept in the store and runs wherever the project's automations service runs. More than one machine may run it: the store's lease keeps a second pass out, and the interval counts passes on every machine. A project that wants no passes turns consolidation off in its settings; `memory doctor` says whether consolidation is on and why not. Keeping the automations service running is the deployment capability's domain: start at `deployment help`.
+More than one machine may serve the same agent: the store's lease keeps a second pass out, and the interval counts passes on every machine. A project that wants no passes turns consolidation off in its settings; `memory doctor` says whether consolidation is on and why not.
 
 ## Reviewing a pass
 

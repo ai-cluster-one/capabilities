@@ -20,4 +20,4 @@ Applying enables memory for each project that does not already decide for itself
 
 ## Afterwards
 
-Check the project with `memory status` and `memory doctor`; to have its memory consolidated as it grows, schedule the grooming pass as `memory guide service` describes. The folder itself is left exactly as it was; removing it, and whatever in the project still writes to it, is the project's own change to make once its memory reads from the store on every machine it runs on.
+Check the project with `memory status` and `memory doctor`; its memory is consolidated as it grows by memory's own service, as `memory guide service` describes. The folder itself is left exactly as it was; removing it, and whatever in the project still writes to it, is the project's own change to make once its memory reads from the store on every machine it runs on.

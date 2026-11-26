@@ -45,11 +45,18 @@ READING  (plain lines by default, the stable structured answer as JSON on
 
 CONSOLIDATION
   memory groom                  one grooming pass: a dry run, applied, run
-                                when due on a schedule, or undone
+                                only when due, or undone
 
-  Schedule the pass as an automation of the project, hourly for instance;
-  `memory help groom` gives the automation and `memory guide service` walks
-  it through.
+SERVICE  (bundled; it grooms every agent with no schedule set up)
+  memory service run            the service in the foreground, for a supervisor
+  memory service status         whether it runs, and each agent it serves
+  memory service doctor         the process, the stores, each agent
+
+  Its only work is to start a grooming pass that runs only when due in a
+  served agent's folder soon after the agent is admitted, after its memory
+  changes in the store, and on a recurring timer. In machine mode it serves
+  every agent on the node that has memory enabled; `memory help service
+  run` says how.
 
 MOVING IN AND OUT
   memory adopt [ROOT...]        carry existing memory folders into the store
@@ -78,7 +85,9 @@ EXIT CODES
   5 store or harness - unreachable, busy, or a model turn that failed
   6 input - a malformed argument, invalid settings, no store configured, no
     project identity, an entry not in the state the verb needs
-  7 busy - another grooming pass holds the project
+  7 busy - another grooming pass holds the project; for `service doctor`, no
+    process serves it
+  8 another service process already holds this state root
 """
 
 import argparse
@@ -183,10 +192,33 @@ WRITE_VERBS = {"add", "supersede", "drop", "pin", "unpin", "groom", "adopt"}
 WRITE_DEFAULT = True
 DOCS_BASE = ("https://raw.githubusercontent.com/ai-cluster-one/capabilities/"
              "main/capabilities/memory/guides/")
-STATE = False       # nothing of memory's own is kept on this machine; entries are the store's
+STATE = True        # the service's pid, status and logs on this machine; entries are the store's
 TABLES = True       # memory_* tables in the project's store, built by _tables()
 INVENTORY = {"network": "optional"}   # the entries are the store's, reached over the network
 POST_INSTALL: list[dict] = []
+# The manager level that accepts `service.machine.join`.
+REQUIRES_MANAGER = 2
+SERVICE = {
+    # A pass holds the store's lease that keeps a second pass for the agent out
+    # on every machine, so any node the service runs on may run it beside the others.
+    "placement": "shared",
+    "name": "memory",
+    "summary": ("Starts `memory groom --if-due` in a served agent's folder soon after it is "
+                "admitted, after its memory changes in the store, and on a recurring timer, "
+                "so every agent is groomed with no schedule set up; once per machine for "
+                "every agent that has memory enabled, or in one project."),
+    "verbs": ["run", "status", "doctor"],
+    "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/memory",
+    "machine": {
+        "schema": "capabilities.service.machine.v1",
+        "command": ["memory", "service", "run", "--machine"],
+        "doctor": ["memory", "service", "doctor", "--machine"],
+        "projects": "$XDG_CONFIG_HOME/memory/service/projects.json",
+        "state": "$XDG_STATE_HOME/capabilities/machine/memory",
+        # Having memory enabled - explicitly or inherited - is joining.
+        "join": "enabled",
+    },
+}
 # The block the manager composes after the stub line in every session's
 # context, carried whole in the declaration. It is constant - no entry, count
 # or moment is in it - so a context built from it is the same in every session
@@ -266,6 +298,43 @@ I/O
   exits 4 when memory is not enabled in the project; an argument the parser
   refuses exits 6 `invalid_arguments`.
 """
+_HELP_SERVICE = """
+  --machine   machine mode: every agent on the machine list, instead of the
+              project the command runs in
+
+  Its only work is to start `memory groom --if-due` as a child in a served
+  agent's folder, with that agent's .env and .env.local over the machine's
+  environment, as the agent would run it: soon after the agent is admitted,
+  again after its memory changes in the store (it follows the channel
+  memory_changed in the store's change versions about once a second, and
+  listens where the store names its transaction address apart), and every
+  30 minutes on its own timer, so a pass that falls due by time alone still
+  runs. `--if-due` decides whether a pass is due; the service decides only
+  when to ask. One pass per agent at a time, and at most 2 at once on the
+  machine; groom.log in the state directory holds each pass's output.
+
+  Before every action for an agent it checks that the agent is still on
+  the list (machine mode), that memory is enabled for it - explicitly or
+  inherited from the global default -, that memory is not quarantined on
+  the machine, and that the folder's project id is the one it joined with.
+
+  Project mode serves the project it runs in from
+  $XDG_STATE_HOME/capabilities/projects/<slug>/memory (daemon.pid,
+  daemon.json, daemon.log, daemon.lock, groom.log). Machine mode serves
+  every agent on $XDG_CONFIG_HOME/memory/service/projects.json, keyed by
+  project id, from $XDG_STATE_HOME/capabilities/machine/memory; it loads no
+  project's environment itself, and holds each project's daemon.lock, so
+  one process serves a project at a time: a listed project's own `run`
+  exits 4 `joined_to_machine_service`. An agent it cannot serve is
+  reported `refused` or `error` with the reason, and the others are
+  served. The node manager writes the list (`capabilities node supervise
+  memory --machine`): every agent on this node that has memory enabled is
+  on it, with no placement needed; memory only reads it. A list that does
+  not read as {"version": 1, "projects": {...}} is logged by the service
+  and reported by `service status`, and serves no one. Every log line
+  reads `<moment> memory service [<slug>]: <what happened>`. Nothing the
+  service holds is reloaded: it reads no declaration.
+"""
 HELP_VERBS = {
     "doctor": """\
 For memory:
@@ -318,8 +387,8 @@ For memory:
     "guide": """\
 For memory:
   How-to guides: adoption (moving a memory folder into the store with
-  `memory adopt`), service (consolidating memory and scheduling the grooming
-  pass), writing (writing memory entries).
+  `memory adopt`), service (consolidating memory, and the service that runs
+  the grooming pass), writing (writing memory entries).
 
   Example: memory guide service
 """,
@@ -583,11 +652,11 @@ memory groom [--apply | --if-due | --undo <pass>] [--trigger TEXT]
                     6 `already_undone`, 3 `not_found` for no such pass); not
                     with --apply or --if-due (exit 6 `input`)
   --trigger TEXT    records why the pass ran on its trail event
-  --if-due          the scheduled form, below
+  --if-due          a pass only when one is due, below
 
   memory groom --if-due
-      The scheduled form: a pass applied as --apply applies it, run only when
-      one is due, and otherwise exit 0 with {"due": false, "why", "window"}
+      A pass applied as --apply applies it, run only when one is due, and
+      otherwise exit 0 with {"due": false, "why", "window"}
       naming the reason and the window's measure. A pass is due when
       consolidate is true, the window no longer fits (`memory help
       settings`), no pass ran for the project within groom_interval_hours on
@@ -598,14 +667,11 @@ memory groom [--apply | --if-due | --undo <pass>] [--trigger TEXT]
       another reason. Entries that age out of the window are not touched:
       they stay active and searchable.
 
-  Schedule the scheduled form as an automation of the project, hourly for
-  instance; `memory guide service` walks it through:
-    printf '#!/bin/sh\\nexec memory groom --if-due\\n' > memory-groom.sh
-    automations set memory-groom --body memory-groom.sh \\
-        --schedule "0 * * * *" --timezone UTC \\
-        --description "consolidate memory when its window no longer fits"
-  Every machine may run it: the store's lease keeps a second pass out, and
-  the interval counts passes on every machine.
+  Nothing needs scheduling: memory's own service (`memory help service
+  run`) starts `memory groom --if-due` for every agent it serves, and it is
+  safe to run by hand at any time. Every machine may run it: the store's
+  lease keeps a second pass out, and the interval counts passes on every
+  machine.
 
   --apply, --if-due and --undo are writes: refused, exit 4
   `read_only_switch`, under CAPABILITIES_READ_ONLY.
@@ -677,6 +743,70 @@ memory export [--out PATH] [--project ID]
 """ + _HELP_STORE + """
   Example: memory export --out memory-export.json
 """ + _HELP_TAIL,
+    "service run": """\
+memory service run [--machine]
+
+  The service in the foreground, for a supervisor. Project-mode `run` needs
+  memory enabled for the project itself (`capabilities enable memory
+  --project`), not only globally, and the read-only switch refuses it in
+  both modes. Keeping it running is the manager's: `capabilities node
+  supervise memory` runs it as this node's gate places it.
+""" + _HELP_SERVICE + """
+  Output: nothing on stdout; it runs until it is stopped, each log line
+  written to daemon.log in its state directory and to stderr.
+
+  Exit codes: 4 `joined_to_machine_service` where this project is on the
+  machine service's list, or policy; 5 the store does not answer; 6
+  `store_not_configured`, no project (`no_project`) or project identity
+  (`no_project_identity`); 8 `service_running` where another service
+  process holds this state root (`memory service status` names it).
+
+  Example: memory service run --machine
+""" + _HELP_TAIL,
+    "service status": """\
+memory service status [--machine]
+
+  Whether it runs, and each agent it serves. Local only: it reads this
+  machine's state files and changes nothing.
+
+  --machine   the machine service and every agent on its list, instead of
+              this project's service (the machine's where this project is
+              on its list)
+
+  Output, for this project: {"mode": "project"|"machine", "joined",
+  "running", "pid", "state_dir", "stores", "log", "project": {"state",
+  "reason", ...}}. With --machine: {"mode": "machine", "running", "pid",
+  "state_dir", "started_at", "published_at", "max_passes", "grooming",
+  "stores", "list": {"path", "joined", "error"?}, "projects": [{"project",
+  "project_id", "root", "joined_at", "joined_by", "present", "state",
+  "reason", ...}], "log"}. A served agent's entry carries "grooming" (the
+  pass running now, {pid, started_at}, or null), "next_ask_in" and
+  "next_ask_why" (the next `memory groom --if-due` and what asked for it),
+  "timer_in" (the recurring ask) and "last_groom" ({exit, at} of the last
+  one). "state" is `served`, `refused` or `error`, with the reason.
+
+  Example: memory service status --machine
+""" + _HELP_TAIL,
+    "service doctor": """\
+memory service doctor [--machine]
+
+  The process, the stores, each agent: for this project, its store and its
+  tables, and whether a process serves it; with --machine, whether the
+  machine service runs and reaches its stores, and every agent on its list.
+
+  --machine   the machine service, instead of this project's
+
+  Output: {"ok", "store"?: {"ok", "setting", "tables", ...} or {"ok",
+  "code", "error"}, "process": {"ok", ...}, "projects"? (with --machine)};
+  a process that does not run carries its "error" and a "hint".
+
+  Exit codes: 0 every check holds; 5 the store, or every store the machine
+  service holds, does not answer; 6 the store setting is missing or
+  refused, or the tables do not match this version; 7 no process serves
+  it, or it does not serve this project.
+
+  Example: memory service doctor --machine
+""" + _HELP_TAIL,
 }
 
 # The shared capability code is the capabilities-contract library's, bound here
@@ -699,16 +829,39 @@ def _inventory(network: bool) -> dict:
 
     They are the store's, reached over the network, so a bare run names the
     count as deferred and opens nothing; --network counts them as `memory
-    status` does. Outside a project there is no project to count for."""
+    status` does. Outside a project there is no project to count for. The
+    service that grooms them is reported from this machine's files alone."""
+    service = _inventory_service()
     if not network:
         return {"deferred": [{"label": "entries",
-                              "note": "kept in the project's store; run with --network"}]}
+                              "note": "kept in the project's store; run with --network"}],
+                "service": service}
     if _project_root() is None or not _project_id(write=False):
-        return {"deferred": [{"label": "entries", "note": "no project here to count for"}]}
+        return {"deferred": [{"label": "entries", "note": "no project here to count for"}],
+                "service": service}
     project = _project(write=False)
     with _guarded(), _open_store(_root()) as store:
         active = store.counts(project)["entries"]["active"]
-    return {"metrics": [_tile("documents", active, "entries")]}
+    return {"metrics": [_tile("documents", active, "entries")], "service": service}
+
+
+def _inventory_service() -> dict:
+    """The service that grooms this project, as this machine's state files say
+    it: running or stopped, and whether it serves the project."""
+    try:
+        view = _status_view(False)
+    except (SystemExit, Exception):
+        return {"state": "stopped", "detail": "no project here for a service to serve"}
+    service = {"state": "running" if view.get("running") else "stopped"}
+    if view.get("running"):
+        service["detail"] = f"pid {view['pid']}" + (" (machine service)"
+                                                     if view.get("joined") else "")
+        project = view.get("project") or {}
+        if project.get("state") not in (None, "served"):
+            service.update(ok=False, problem=f"{project.get('state')}: {project.get('reason')}")
+        elif project.get("state") == "served":
+            service["ok"] = True
+    return service
 
 
 # ── the engine, the project, the store ──────────────────────────────────────
@@ -764,9 +917,9 @@ def _store_refused(exc) -> NoReturn:
 
 
 def _manifest() -> dict:
-    """The contract's manifest, with the context contribution this capability
-    declares."""
-    return {**_manifest_core(), "contribution": CONTRIBUTION}
+    """The contract's manifest, with the service this capability bundles and
+    the context contribution it declares."""
+    return {**_manifest_core(), "service": SERVICE, "contribution": CONTRIBUTION}
 
 
 def _root() -> Path:
@@ -1701,6 +1854,339 @@ def cmd_doctor() -> None:
         sys.exit(fail)
 
 
+# ── the service ─────────────────────────────────────────────────────────────
+
+_SERVICE_ENGINE = None
+
+
+def _service_engine():
+    """The bundled service loop, loaded once from the installed bundle."""
+    global _SERVICE_ENGINE
+    if _SERVICE_ENGINE is None:
+        path = _bundle_dir() / "service" / "engine.py"
+        spec = importlib.util.spec_from_file_location("memory_service_engine", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["memory_service_engine"] = module
+        spec.loader.exec_module(module)
+        _SERVICE_ENGINE = module
+    return _SERVICE_ENGINE
+
+
+def _machine_projects_path() -> Path:
+    return _CONFIG_HOME / NAME / "service" / "projects.json"
+
+
+def _machine_state_dir() -> Path:
+    return _STATE_HOME / "capabilities" / "machine" / NAME
+
+
+def _project_state_dir(slug: str) -> Path:
+    return _STATE_HOME / "capabilities" / "projects" / slug / NAME
+
+
+def _read_projects() -> dict:
+    """The machine list, every agent on it by its id. No file is an empty
+    list."""
+    path = _machine_projects_path()
+
+    def refuse(sentence: str) -> NoReturn:
+        raise _engine().Refusal(
+            6, "projects_invalid", f"{path}: {sentence}",
+            f"the node manager writes it (`capabilities node supervise {NAME} --machine`) "
+            f"from the agents on this node that have {NAME} enabled; remove it and the "
+            "node manager writes it again")
+
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        refuse(f"it does not read as JSON: {exc}")
+    if not isinstance(raw, dict) or raw.get("version") != 1:
+        refuse('it is {"version": 1, "projects": {...}}')
+    projects = raw.get("projects") or {}
+    if not isinstance(projects, dict):
+        refuse("its `projects` maps project ids to entries")
+    listed = {}
+    for project, entry in projects.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("root"), str) \
+                or not Path(entry["root"]).is_absolute() or not entry.get("slug"):
+            refuse(f"its entry {project!r} is {{root, slug, joined_at, joined_by}}")
+        listed[str(project)] = {k: entry.get(k) for k in ("root", "slug", "joined_at",
+                                                          "joined_by")}
+    return listed
+
+
+def _identity_here() -> tuple[str, str]:
+    """This project's id and slug, or the refusal that says why it has none."""
+    root = _root()
+    project = _project_id(write=True, refuse=False)
+    if not project:
+        raise _engine().Refusal(6, "no_project_identity",
+                                f"{root} is bound to no durable id (CAPABILITIES_PROJECT_ID)",
+                                "run `capabilities init` in the project")
+    try:
+        slug = _project_slug(root)
+    except StoreError as exc:
+        raise _engine().Refusal(5 if exc.slug in STORE_ENVIRONMENT_SLUGS else 6,
+                                exc.slug, exc.message, exc.hint) from None
+    return str(project), str(slug or project)
+
+
+def _joined_here() -> dict | None:
+    if _project_root() is None:
+        return None
+    try:
+        project, _slug = _identity_here()
+        entry = _read_projects().get(project)
+    except _engine().Refusal:
+        return None
+    return {**entry, "id": project} if entry else None
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_pid(state: Path) -> int | None:
+    try:
+        return int((state / _service_engine().PID_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _read_status(state: Path) -> dict:
+    try:
+        found = json.loads((state / _service_engine().STATUS_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return found if isinstance(found, dict) else {}
+
+
+def _admission(project_id: str, machine: bool) -> tuple[str, str] | None:
+    """Why this process may not act for the project it stands in now, or
+    None. Asked inside the project's scope. Memory counts as enabled for the
+    project explicitly or inherited from the global default: every agent that
+    has memory is groomed."""
+    if _machine_state() == "quarantined":
+        return ("refused", f"{NAME} is quarantined on this machine")
+    policy = _policy_state()
+    if "error" in policy:
+        error = policy["error"] or {}
+        return ("error", f"{error.get('code') or 'policy_unreadable'}: "
+                f"{error.get('message') or 'the policy does not read'}")
+    if policy.get("effective") != "enabled":
+        return ("refused", f"{NAME} is not enabled for this project "
+                f"({policy.get('source') or 'default'})")
+    project, _slug = _identity_here()
+    if project != project_id:
+        return ("refused", f"the project's id is now {project}, not the {project_id} it "
+                "joined with; the node manager writes the new one on its next reconcile")
+    if machine and project_id not in _read_projects():
+        return ("refused", "the project left the machine service")
+    return None
+
+
+class _Host:
+    """What the service loop asks of this executable, every project question
+    answered inside that project's own resolution."""
+
+    name = NAME
+
+    def __init__(self, mode: str, entry: dict | None = None):
+        self.mode = mode
+        self.entry = entry
+        self.channel = _engine().CHANNEL
+
+    def db(self):
+        return _engine().database()
+
+    def ledger(self):
+        return _tables()
+
+    def node(self) -> str:
+        return node_name()
+
+    def entries(self) -> dict:
+        if self.mode == "project":
+            return {self.entry["id"]: self.entry}
+        return _read_projects()
+
+    def list_witness(self):
+        if self.mode == "project":
+            return "project"
+        try:
+            seen = os.stat(_machine_projects_path())
+        except OSError:
+            return None
+        return (seen.st_mtime_ns, seen.st_size, seen.st_ino)
+
+    def lock_path(self, slug: str) -> Path:
+        return _project_state_dir(slug) / _service_engine().LOCK_FILE
+
+    def admit(self, agent_id: str, root: Path, machine: bool):
+        """(why the process may not serve the agent now, or None; the store
+        setting its folder resolves where it may)."""
+        engine = _engine()
+
+        def question():
+            found = _admission(agent_id, machine)
+            return found, (None if found else engine.resolve_store(root))
+        try:
+            return _ask_in_project(root, question)
+        except engine.Refusal as exc:
+            return ("refused" if exc.exit_code == 4 else "error",
+                    f"{exc.code}: {exc.message}"), None
+        except engine.StoreUnavailable as exc:
+            return ("error", f"{exc.slug}: {exc.message}"), None
+        except Exception as exc:
+            return ("error", getattr(exc, "message", None)
+                    or f"{type(exc).__name__}: {exc}"), None
+
+    def groom_command(self, root: Path) -> tuple[list[str], dict]:
+        """`memory groom --if-due` as the agent would run it: this executable on
+        its own interpreter, in the agent's folder, with its .env and .env.local
+        over the machine's environment."""
+        env = {k: v for k, v in os.environ.items() if k not in _PROJECT_POINTERS}
+        env.update(_parse_env_file(root / ".env"))
+        env.update(_parse_env_file(root / ".env.local"))
+        env["CLAUDE_PROJECT_DIR"] = str(root)
+        return [sys.executable, str(Path(__file__).resolve()), "groom", "--if-due"], env
+
+
+def _project_entry_here() -> dict:
+    root = _root()
+    try:
+        project, slug = _identity_here()
+    except _engine().Refusal as exc:
+        _refused(exc)
+    return {"id": project, "root": str(root), "slug": slug}
+
+
+def cmd_service_run(machine: bool) -> None:
+    loop = _service_engine()
+    if machine:
+        runner = loop.Service(_Host("machine"), mode="machine", state_dir=_machine_state_dir())
+    else:
+        root = _root()
+        if _joined_here():
+            _die(4, "joined_to_machine_service",
+                 f"this project is joined to the machine {NAME} service, which serves it",
+                 f"the machine service grooms every agent on this node that has {NAME} "
+                 "enabled; stop it there to serve this project in project mode")
+        entry = _project_entry_here()
+        engine = _engine()
+        try:
+            engine.resolve_store(root)
+        except engine.StoreUnavailable as exc:
+            _store_refused(exc)
+        runner = loop.Service(_Host("project", entry), mode="project",
+                              state_dir=_project_state_dir(entry["slug"]), tag=entry["slug"])
+    try:
+        runner.run()
+    except loop.Busy as exc:
+        _die(8, "service_running", f"another {NAME} service process holds {exc}",
+             f"`{NAME} service status{' --machine' if machine else ''}` names it")
+
+
+def _service_target(machine: bool) -> tuple[Path, dict | None, bool]:
+    if machine:
+        return _machine_state_dir(), None, True
+    entry = _project_entry_here()
+    joined = _joined_here()
+    return (_machine_state_dir() if joined else _project_state_dir(entry["slug"])), entry, \
+        bool(joined)
+
+
+def _status_view(machine: bool) -> dict:
+    state, entry, by_machine = _service_target(machine)
+    pid = _read_pid(state)
+    running = _pid_alive(pid)
+    status = _read_status(state) if running else {}
+    log = str(state / _service_engine().LOG_FILE)
+    if machine:
+        try:
+            listed, list_error = _read_projects(), None
+        except _engine().Refusal as exc:
+            listed, list_error = {}, exc.message
+        rows = {p.get("project_id"): p for p in status.get("projects") or []}
+        projects = []
+        for project, joined in sorted(listed.items(), key=lambda kv: kv[1].get("slug") or ""):
+            row = {"project": joined.get("slug"), "project_id": project,
+                   "root": joined.get("root"), "joined_at": joined.get("joined_at"),
+                   "joined_by": joined.get("joined_by"),
+                   "present": Path(joined["root"]).is_dir()}
+            row.update(rows.get(project) or {
+                "state": None, "reason": "the machine service is not running"
+                if not running else "not yet taken up"})
+            projects.append(row)
+        return {"mode": "machine", "running": running, "pid": pid if running else None,
+                "state_dir": str(state), "started_at": status.get("started_at"),
+                "published_at": status.get("published_at"),
+                "max_passes": status.get("max_passes"), "grooming": status.get("grooming"),
+                "stores": status.get("stores"),
+                "list": {"path": str(_machine_projects_path()), "joined": len(listed),
+                         **({"error": list_error} if list_error else {})},
+                "projects": projects, "log": log}
+    row = next((p for p in status.get("projects") or []
+                if p.get("project_id") == entry["id"]), None)
+    return {"mode": "machine" if by_machine else "project", "joined": by_machine,
+            "running": running, "pid": pid if running else None, "state_dir": str(state),
+            "stores": status.get("stores"), "log": log,
+            "project": row or {"state": None, "reason": "no process serves this project"
+                               if not running else "not yet taken up"}}
+
+
+def cmd_service_doctor(machine: bool) -> None:
+    findings: dict = {}
+    fail = 0
+
+    def note(key: str, row: dict) -> None:
+        nonlocal fail
+        findings[key] = row
+        if not row.get("ok") and not fail:
+            fail = row.get("category") or 6
+        row.pop("category", None)
+
+    view = _status_view(machine)
+    if not machine:
+        note("store", _doctor_store(_root()))
+    if not view["running"]:
+        note("process", {"ok": False, "category": 7,
+                         "error": ("the machine service is not running" if machine
+                                   else "no process serves this project"),
+                         "hint": (f"its supervisor runs `{NAME} service run --machine`; "
+                                  f"`capabilities node supervise {NAME}` runs it as this "
+                                  "node's gate places it" if machine
+                                  else f"the machine service serves every agent on this "
+                                       f"node that has {NAME} enabled; `{NAME} service run` "
+                                       "serves this project in the foreground")})
+    else:
+        stores = view.get("stores") or []
+        broken = [s for s in stores if not s.get("connected")]
+        if machine:
+            note("process", {"ok": not (stores and len(broken) == len(stores)), "category": 5,
+                             "pid": view["pid"], "stores": stores})
+            findings["projects"] = view["projects"]
+        else:
+            project = view["project"] or {}
+            note("process", {"ok": project.get("state") == "served" and not broken,
+                             "category": 7, "pid": view["pid"], "mode": view["mode"],
+                             "state": project.get("state"), "reason": project.get("reason"),
+                             "stores": stores})
+    _emit({"ok": fail == 0, **findings})
+    if fail:
+        sys.exit(fail)
+
+
 # ── the command line ─────────────────────────────────────────────────────────
 
 class _Parser(argparse.ArgumentParser):
@@ -1792,6 +2278,11 @@ def _parser() -> _Parser:
     export.add_argument("--out")
     export.add_argument("--project")
 
+    service = sub.add_parser("service")
+    ssub = service.add_subparsers(dest="action", required=True, parser_class=_Parser)
+    for verb in ("run", "status", "doctor"):
+        ssub.add_parser(verb).add_argument("--machine", action="store_true")
+
     return parser
 
 
@@ -1821,6 +2312,13 @@ def main() -> None:
     }
     if cmd == "doctor":
         cmd_doctor()
+    elif cmd == "service":
+        if args.action == "run":
+            cmd_service_run(args.machine)
+        elif args.action == "status":
+            _emit(_status_view(args.machine))
+        else:
+            cmd_service_doctor(args.machine)
     else:
         handlers[cmd](args)
 
