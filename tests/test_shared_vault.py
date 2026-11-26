@@ -272,6 +272,48 @@ def test_migration_reseals_old_vaults_loses_nothing_and_stops_where_copies_disag
     assert all(a["resealed"] == [] for a in again["agents"])
 
 
+def test_migration_settles_two_shared_connections_that_name_one_key_each_on_its_own(lab):
+    """Two shared connections whose secrets use the same key name, each granted to
+    its own agent with its own value: each is compared among its own grantees and
+    gets its own copy, and neither is listed as disagreeing."""
+    _import(lab)
+    _global_rows_in_force(lab)
+    _ok(_manager(lab, "key", "generate"))
+    peer = _peer(lab)
+    _ok(_manager(peer, "key", "generate"))
+    _install(lab, "coolify")
+    _ok(_feed(lab, json.dumps({"secret_env": "seed-0000"}), COOLIFY, "connection", "add",
+              "personal", "--global", "--field", f"base_url={lab['url']}", "--stdin"))
+    _sql(lab, "INSERT INTO connections (capability, label, spec) SELECT capability, "
+              "'work', spec FROM connections WHERE label = 'personal'")
+    [(first,)] = _sql(lab, "SELECT id FROM connections WHERE label = 'personal'")
+    [(second,)] = _sql(lab, "SELECT id FROM connections WHERE label = 'work'")
+    here = _here(lab)
+    _sql(lab, "INSERT INTO nodes (id, label, kind) VALUES (%s, 'lab-node', 'mac') "
+              "ON CONFLICT (id) DO NOTHING", (here,))
+    mine, theirs = vault.parse_key(_key_text(lab)), vault.parse_key(_key_text(peer))
+    for agent, folder, key, cid, value in (
+            (PROJECT_ID, lab["project"], mine, first, "first-value-aaaa"),
+            (PEER_ID, peer["project"], theirs, second, "second-value-bbbb")):
+        _sql(lab, "INSERT INTO grants (agent_id, capability, connection_id, enabled) "
+                  "VALUES (%s, 'coolify', %s, true)", (agent, cid))
+        _sql(lab, "INSERT INTO agent_nodes (agent_id, node, folder) VALUES (%s, %s, %s) "
+                  "ON CONFLICT DO NOTHING", (agent, here, str(folder)))
+        with lab["cluster"].admin(lab["database"]) as conn:
+            conn.execute("SET search_path TO lab")
+            vault.put_row(conn, agent, NAME,
+                          vault.seal_for(vault.public_key(key), agent, NAME, value),
+                          vault.fingerprint(key))
+    found = _ok(_manager(lab, "secrets", "migrate"))
+    assert found["disagreeing"] == [] and "hint" not in found
+    assert sorted((c["connection"], c["name"], c["from"]) for c in found["platform_copies"]) == \
+        sorted([(first, NAME, [PROJECT_ID]), (second, NAME, [PEER_ID])])
+    assert _show(lab, NAME) == "first-value-aaaa" and _show(peer, NAME) == "second-value-bbbb"
+    again = _ok(_manager(lab, "secrets", "migrate"))
+    assert again["disagreeing"] == [] and again["platform_copies"] == []
+    assert sorted(c["connection"] for c in again["already_copied"]) == sorted([first, second])
+
+
 def test_a_grant_before_migration_keeps_what_an_older_release_delivered(lab):
     """The first grant on a machine makes the platform key and pins the agent before
     `secrets migrate` ran: what an older release delivered (format 2) is sealed again

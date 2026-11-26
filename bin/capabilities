@@ -10255,11 +10255,6 @@ def _secrets_migrate(root: Path, picks: dict) -> dict:
             if held is not None:
                 kept.append(row)
                 continue
-            if len(claims.get(name, ())) > 1:
-                disagree.append({**row, "reason": "another shared connection names the same "
-                                                  "key, so it is the connection's own to "
-                                                  "neither", "copies": []})
-                continue
             pick = picks.pop((cid, name), None)
             if len(by_value) == 1:
                 value = next(iter(by_value))
@@ -37778,7 +37773,9 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         platform takes its copy of each of the agent's own entries. Each
         connection the store shares that agents here are granted gets the
         platform's copy from the vault copies they hold, and the platform
-        delivers it to every agent granted it, on other nodes too. Where the
+        delivers it to every agent granted it, on other nodes too. Copies are
+        compared within one connection, also where another shared connection
+        names the same key. Where the
         copies of one connection's key disagree nothing is chosen for it:
         disagreeing lists each copy with its last characters only and the
         agents holding it, and only an explicit --pick, naming an agent that
