@@ -70,6 +70,10 @@ TOPIC_KEYS = {"project", "profile", "context", "context_file", "context_mode"}
 CAPABILITY_RULE_KEYS = {"allow", "deny", "enabled", "scope", "verbs", "connections"}
 CONNECTION_GRANT_KEYS = {"allow_write"}
 AUTHORITY_POLICY_KEYS = {"allowed_capabilities", "capabilities"}
+# A role may also name the profile its turns run on, in place of the channel's,
+# so a participant can run on a narrower worker than a supervisor in the same
+# room. Only a role: a person's or a group's authority names none.
+AUTHORITY_ROLE_KEYS = AUTHORITY_POLICY_KEYS | {"profile"}
 AUTHORITY_KEYS = {"default", "roles"}
 CONTROL_KEYS = {"roles"}
 CONTROL_RULE_KEYS = {"commands"}
@@ -425,7 +429,12 @@ def _authority(value, path):
         roles = _object(value["roles"], f"{path}.roles")
         for role, policy in roles.items():
             _string(role, f"{path}.roles key", nonempty=True)
-            _authority_policy(policy, f"{path}.roles.{role}")
+            policy = _object(policy, f"{path}.roles.{role}")
+            _unknown(policy, AUTHORITY_ROLE_KEYS, f"{path}.roles.{role}")
+            if "profile" in policy:
+                _profile(policy["profile"], f"{path}.roles.{role}.profile")
+            _authority_policy({k: v for k, v in policy.items() if k != "profile"},
+                              f"{path}.roles.{role}")
 
 
 def _control_rule(value, path):
@@ -1145,7 +1154,11 @@ def json_schema():
         "delegation": _ref("delegation"),
         "media_log_level": _js_enum(MEDIA_LOG_LEVELS),
     }, description="What every channel takes where its own entry names nothing.")
-    roles = _js_map(_ref("authorityPolicy"), "role")
+    roles = _js_map(_js_object(AUTHORITY_ROLE_KEYS, {
+        "allowed_capabilities": _ref("capabilities"),
+        "capabilities": _ref("capabilities"),
+        "profile": {**profile, "description": "the profile a turn this role asks for "
+                    "runs on, in place of the channel's; unset, the channel's"}}), "role")
     properties = {
         "connection": _js_text(nonempty=True, nullable=True,
                                description="the connection the service runs on"),

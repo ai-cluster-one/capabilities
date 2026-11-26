@@ -727,13 +727,14 @@ Every telegram profile is named `telegram-<something>`; a name without the prefi
 
 A room names its profile by name, and a turn runs on the first of:
 
-1. the channel's own `/set profile` - a direct chat, a group, or one forum topic, whose `/set` is its own and does not inherit its group's;
-2. `allowed_groups.<chat_id>.topics.<topic_id>.profile`, for a forum topic;
-3. `allowed_groups.<chat_id>.profile` in a group, `allowed_users.<user_id>.profile` in a direct chat;
-4. `defaults.profile`, or the environment's `TELEGRAM_SERVICE_PROFILE` in its place, so a deployed node chooses without editing its settings;
-5. nothing, which is `stub`: the reserved name that answers in process and runs no harness.
+1. `authority.roles.<role>.profile`, where the requester's role names one (see Tool Authority), so a participant can run on a narrower worker than a supervisor in the same room;
+2. the channel's own `/set profile` - a direct chat, a group, or one forum topic, whose `/set` is its own and does not inherit its group's;
+3. `allowed_groups.<chat_id>.topics.<topic_id>.profile`, for a forum topic;
+4. `allowed_groups.<chat_id>.profile` in a group, `allowed_users.<user_id>.profile` in a direct chat;
+5. `defaults.profile`, or the environment's `TELEGRAM_SERVICE_PROFILE` in its place, so a deployed node chooses without editing its settings;
+6. nothing, which is `stub`: the reserved name that answers in process and runs no harness.
 
-A call's task and the post-call summary run on `defaults.voice_agent.profile`, then the default of step 4, then `stub`. A group member has no position: a member's turn runs in the group's channel. A registered job runs on the profile recorded on its row, pinned when it was registered from the profile the registering turn ran on (or, from a terminal, `--profile`, else `defaults.profile`, else `stub`); its engine is that profile's harness, because a session continues only on the harness it began on, so a row whose profile has since moved to the other harness ends `model_refused` naming both. A row registered before rooms named profiles has none and runs on `telegram-<engine>` with its recorded model laid over it.
+A call's task and the post-call summary run on `defaults.voice_agent.profile`, then the default of step 5, then `stub`. A group member has no position of its own: a member's turn runs in the group's channel, on its role's profile where the role names one. A registered job runs on the profile recorded on its row, pinned when it was registered from the profile the registering turn ran on (or, from a terminal, `--profile`, else `defaults.profile`, else `stub`); its engine is that profile's harness, because a session continues only on the harness it began on, so a row whose profile has since moved to the other harness ends `model_refused` naming both. A row registered before rooms named profiles has none and runs on `telegram-<engine>` with its recorded model laid over it.
 
 The name is resolved on every turn, so a profile saved a moment ago is the one the next turn runs on; a store that cannot be read leaves the bundled profiles. `service start` and `service run` resolve and fit every name the settings reach and refuse with exit 6 `profile_refused`, naming the position, the name and the problem; a reload is refused the same way and keeps what runs; `service doctor` reports each name `resolved` or `failed` with why, and `service doctor --live` with the harness's verdict on one live turn. A turn whose profile stops resolving fails as a refused model does, naming the profile and the problem. Codex runs through its app-server: there is no git-repository check to skip, and trusting the project to run its hooks also loads the project's `.codex/config.toml`.
 
@@ -792,7 +793,21 @@ Service control commands are handled by the daemon before a worker job exists, s
 
 The service creates a per-job `CAPABILITIES_AUTH_CONTEXT` file for workers when `settings.json` declares an `authority` policy. Capability CLIs read this file before resolving credentials; an unlisted capability exits with policy refusal (`exit 4`) for every verb but its reference commands `help`, `guide`, `stub` and `manifest`, which read it and act on nothing. This is a fail-closed authorization gate on the supported capability path, while `context.md` remains soft behavioral guidance. It is not an OS sandbox: a hostile process with the same unrestricted Unix access can bypass the supported path. Capability policy and connection `allow_write` remain the hard gates for external writes.
 
-Role policies live under `authority.roles.<role>.allowed_capabilities`:
+Role policies live under `authority.roles.<role>.allowed_capabilities`. A role may also name the profile its turns run on, `authority.roles.<role>.profile`, in place of the channel's. That is what decides whether a turn holds a shell at all: `allowed_capabilities` decides which capabilities answer, and the profile decides which tools the worker is launched holding. A role that names no profile runs on the channel's, exactly as before; nothing is narrowed unless the settings say so. A job a turn registers is pinned to the profile that turn ran on, so delegating does not leave it.
+
+For example, a participant role can be put on a profile with no tools and no MCP servers, while the supervisor in the same room keeps the channel's full worker. Save the profile once, `telegram profiles save telegram-claude-participant -`:
+
+```toml
+harness = "claude"
+model = "opus"
+permission_mode = "bypassPermissions"
+tools = []
+strict_mcp = true
+mcp_config = { mcpServers = {} }
+timeout_seconds = 3600
+```
+
+and name it on the role:
 
 ```json
 {
@@ -802,15 +817,17 @@ Role policies live under `authority.roles.<role>.allowed_capabilities`:
         "allowed_capabilities": { "*": true }
       },
       "group_member": {
+        "profile": "telegram-claude-participant",
         "allowed_capabilities": {
-          "telegram": { "scope": "current_chat" },
-          "routine": true
+          "telegram": { "scope": "current_chat", "verbs": ["read", "search", "topics"] }
         }
       }
     }
   }
 }
 ```
+
+Such a turn still answers in its chat: the daemon posts what it returns. Its grant also leaves out the verbs that take a path on this machine - `send-media`, `export` with its `--out`, `transcribe` - so a later profile that opens a shell to this role does not open them with it. This is an example; no existing role changes until its settings name a profile.
 
 For group members, keep personal or administrative capabilities such as `mailbox`, `coolify`, or external write tools absent unless the project has a deliberate reason to expose them. The bundled worker `telegram` wrapper also honors `scope: current_chat` for chat-addressed Telegram commands.
 

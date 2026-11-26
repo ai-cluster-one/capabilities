@@ -9302,6 +9302,68 @@ class RoomProfileTests(unittest.IsolatedAsyncioTestCase):
                              ("telegram-node", "TELEGRAM_SERVICE_PROFILE"))
             self.assertEqual(daemon.channel_profile({}, "777")[0], "telegram-user")
 
+    def test_a_role_may_name_a_profile_and_nothing_else_may(self):
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            root = Path(td)
+
+            def validated(document):
+                return daemon.validate_settings({"connection": "test", **document}, root, root)
+
+            validated({"authority": {"roles": {"group_member": {
+                "profile": "telegram-x", "allowed_capabilities": {"telegram": True}}}}})
+            for document, place in (
+                    ({"authority": {"default": {"profile": "telegram-x"}}},
+                     r"authority\.default\.profile: unsupported property"),
+                    ({"allowed_users": {"1": {"authority": {"profile": "telegram-x"}}}},
+                     r"allowed_users\.1\.authority\.profile: unsupported property"),
+                    ({"authority": {"roles": {"r": {"profile": ""}}}},
+                     r"authority\.roles\.r\.profile: must not be empty"),
+                    ({"authority": {"roles": {"r": {"other": 1}}}},
+                     r"authority\.roles\.r\.other: unsupported property")):
+                with self.subTest(place=place), self.assertRaisesRegex(ValueError, place):
+                    validated(document)
+
+    async def test_a_role_profile_runs_that_roles_turns_and_unset_changes_nothing(self):
+        """A requester whose role names a profile runs on it; a supervisor whose
+        role names none, and every requester where no role names one, runs on
+        the channel's profile as before."""
+        def document(role_profile, sender_role):
+            base = settings()
+            if sender_role:
+                base["allowed_users"] = {"777": {"name": "Owner", "role": sender_role}}
+            roles = {"supervisor": {"allowed_capabilities": {"*": True}},
+                     "direct_user": {"allowed_capabilities": {"telegram": True}}}
+            if role_profile:
+                roles["direct_user"]["profile"] = role_profile
+            base["authority"] = {"roles": roles}
+            return base
+
+        for role_profile, sender_role, ran in (
+                ("telegram-claude", None, "claude"),
+                ("telegram-claude", "supervisor", None),
+                (None, None, None),
+                (None, "supervisor", None)):
+            with self.subTest(role_profile=role_profile, sender_role=sender_role), \
+                    tempfile.TemporaryDirectory() as td:
+                daemon = import_daemon(Path(td), document(role_profile, sender_role))
+                harness = FakeHarness()
+                daemon.harness_run = harness
+                message = Message(420, text="Assistant, hello")
+                client = FakeClient([message])
+                task = asyncio.create_task(daemon.run_session(client))
+                await client.started.wait()
+                await client.handler(Event(message))
+                if ran:
+                    await wait_until(lambda: harness.calls, timeout=10)
+                    self.assertEqual(harness.calls[0]["profile"].harness, ran)
+                else:
+                    await wait_until(lambda: any("[harness-stub]" in item["text"]
+                                                 for item in client.sent), timeout=10)
+                    self.assertEqual(harness.calls, [])
+                client.disconnected.set()
+                await asyncio.wait_for(task, timeout=10)
+
     def test_the_prompt_states_the_profile_its_harness_model_and_effort(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(profile="telegram-fast"))

@@ -125,6 +125,9 @@ class SchemaTest(unittest.TestCase):
                          schema.PARTICIPANT_KEYS | schema.MEMBER_KEYS)
         self.assertEqual(set(document["properties"]["defaults"]["properties"]),
                          schema.DEFAULTS_KEYS)
+        role = document["properties"]["authority"]["properties"]["roles"]
+        self.assertEqual(set(role["additionalProperties"]["properties"]),
+                         schema.AUTHORITY_ROLE_KEYS)
         timeout = document["properties"]["defaults"]["properties"]["worker_timeout"]
         self.assertEqual((timeout["minimum"], timeout["maximum"]),
                          schema.DEFAULTS_NUMBERS["worker_timeout"][:2])

@@ -177,6 +177,14 @@ class Implicit(unittest.TestCase):
             profiles.implicit("stub", {}, [], None)
         self.assertEqual(caught.exception.code, "profile_name_refused")
 
+    def test_a_role_that_names_a_profile_is_reached(self):
+        settings = {"authority": {"roles": {
+            "group_member": {"profile": "telegram-participant"},
+            "supervisor": {"allowed_capabilities": {"*": True}}}}}
+        self.assertEqual(profiles.reached(settings, {}),
+                         [{"position": "settings.authority.roles.group_member.profile",
+                           "profile": "telegram-participant"}])
+
     def test_the_positions_settings_reach(self):
         settings = {
             "defaults": {"profile": "telegram-claude",

@@ -5481,9 +5481,10 @@ _HELP_SERVICE_PROFILES = """
   Every worker turn - dialogue, job, voice task, call summary - runs through
   callva-harness-runner on the profile its room names: the channel's /set
   profile, a forum topic's, group's or direct user's `profile`, then
-  `defaults.profile` (over it, TELEGRAM_SERVICE_PROFILE), else `stub`; a call's
-  task and the call summary run on `defaults.voice_agent.profile`, then the
-  default.
+  `defaults.profile` (over it, TELEGRAM_SERVICE_PROFILE), else `stub`; a
+  dialogue turn whose requester's role names `authority.roles.<role>.profile`
+  runs on that instead, and a job it registers keeps it; a call's task and the
+  call summary run on `defaults.voice_agent.profile`, then the default.
 """
 _HELP_SERVICE_REFUSALS = """
   `start` and `run` refuse with exit 6 profile_refused when a name the settings

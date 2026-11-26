@@ -3803,6 +3803,16 @@ def refuse_old_register(reg):
         raise SettingsError(old_names_sentence(places))
 
 
+def role_profile(role):
+    """The profile a turn asked for by `role` runs on in place of its
+    channel's: `authority.roles.<role>.profile`, else None, which leaves the
+    channel's. It lets a participant run on a narrower worker than a supervisor
+    in the same room, and only where the settings say so."""
+    roles = _as_mapping(_as_mapping(SETTINGS.get("authority")).get("roles"))
+    name = _as_mapping(roles.get(str(role or ""))).get("profile")
+    return str(name) if name else None
+
+
 def channel_profile(reg, key):
     """The profile name this channel's turns run on, and the position that
     named it: the channel's own `/set profile`, then its forum topic's entry,
@@ -7529,7 +7539,10 @@ async def run_session(client):
         job["attempts"] = current_attempts + 1
         save_register(reg)
         await refresh_turn_profiles()
-        s, turn_profile = settings_on_profile(s)
+        # The role the authority below resolves to names the profile, so the worker
+        # and the capabilities a requester reaches are settled by one role.
+        s, turn_profile = settings_on_profile(s, role_profile(
+            job.get("sender_role") or ("direct_user" if is_direct else "group_member")))
 
         proc_key = proc_key_for(key, job)
         future = None

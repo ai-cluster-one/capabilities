@@ -389,8 +389,9 @@ def default_profile(settings: dict | None, environ=None) -> tuple[str | None, st
 def reached(settings: dict | None, environ=None) -> list[dict]:
     """Every profile name the settings name, each with the position naming it:
     the default (TELEGRAM_SERVICE_PROFILE or `defaults.profile`), the voice
-    default, and every direct user, group and forum topic that names one. The
-    stub is listed too; it runs in process and resolves to nothing."""
+    default, every direct user, group and forum topic that names one, and every
+    authority role that names the profile its turns run on. The stub is listed
+    too; it runs in process and resolves to nothing."""
     settings = settings if isinstance(settings, dict) else {}
 
     def mapping(value):
@@ -419,6 +420,11 @@ def reached(settings: dict | None, environ=None) -> list[dict]:
                 rows.append({"position":
                              f"settings.allowed_groups.{chat_id}.topics.{topic_id}.profile",
                              "profile": str(topic["profile"])})
+    roles = mapping(mapping(settings.get("authority")).get("roles"))
+    for role, policy in roles.items():
+        if mapping(policy).get("profile"):
+            rows.append({"position": f"settings.authority.roles.{role}.profile",
+                         "profile": str(policy["profile"])})
     return rows
 
 
