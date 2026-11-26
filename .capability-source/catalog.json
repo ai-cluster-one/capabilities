@@ -858,9 +858,8 @@
       ],
       "icon": true,
       "level": 0,
-      "lucide_icon": "phone",
       "path": "capabilities/lkagent",
-      "payload_sha256": "0fdc4e689675f898c45bae45c4129c7806981569640890d79bd6d594c7e335ba",
+      "payload_sha256": "217aaa9fb901e756d989799a55549f4f13d9ef8a507d18e4fc66ee43b79ec3f5",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's own phone line on a LiveKit server - GPT Live is the voice and hands each turn it delegates to the agent's own harness session in its folder; takes calls on its configured numbers, places outgoing ones, and records each call.",
@@ -876,7 +875,7 @@
           "title": "LiveKit Agent"
         }
       },
-      "version": "2026-11-26 — lkagent: an agent's own phone line on LiveKit, GPT Live as the voice and the agent's own harness session as the backend"
+      "version": "2026-11-26 — LiveKit Agent shows LiveKit's mark, not a phone glyph"
     },
     "macmail": {
       "executable": [

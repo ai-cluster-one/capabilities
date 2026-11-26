@@ -61,7 +61,9 @@ def test_the_connection_is_livekit_only_and_the_openai_key_is_the_machines(cli):
 
 
 def test_its_name_title_and_icon(cli):
-    assert (cli.NAME, cli.TITLE, cli.LUCIDE_ICON) == ("lkagent", "LiveKit Agent", "phone")
+    # Its icon is LiveKit's brand mark, so it declares no Lucide glyph (SHEBANG.md, lucide_icon).
+    assert (cli.NAME, cli.TITLE) == ("lkagent", "LiveKit Agent")
+    assert not hasattr(cli, "LUCIDE_ICON")
     assert {lang: t["title"] for lang, t in cli.TRANSLATIONS.items()} == {
         "ru": "LiveKit Agent", "et": "LiveKit Agent"}
     assert all(t["description"] != cli.SUMMARY for t in cli.TRANSLATIONS.values())

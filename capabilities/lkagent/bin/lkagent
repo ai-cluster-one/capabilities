@@ -162,7 +162,6 @@ HELP_VERBS = {
 
 NAME = "lkagent"
 TITLE = "LiveKit Agent"
-LUCIDE_ICON = "phone"
 SUMMARY = ("An agent's own phone line on a LiveKit server - GPT Live is the voice and hands "
            "each turn it delegates to the agent's own harness session in its folder; takes "
            "calls on its configured numbers, places outgoing ones, and records each call.")

@@ -1,5 +1,9 @@
 # lkagent — change log
 
+## 2026-11-26 — LiveKit Agent shows LiveKit's mark, not a phone glyph
+
+`lkagent` declared the Lucide icon `phone` beside its `icon.png`, and a reader that draws a declared Lucide glyph before the capability's own picture showed a plain outlined phone. Its icon is LiveKit's brand mark, and a capability whose icon is a brand mark declares no Lucide icon, so `lkagent` no longer declares `LUCIDE_ICON`: the manifest and the catalogue entry carry `icon: true` and no `lucide_icon`, and `icon.png` is unchanged. Nothing else changes.
+
 ## 2026-11-26 — lkagent: an agent's own phone line on LiveKit, GPT Live as the voice and the agent's own harness session as the backend
 
 A new capability, `lkagent`, titled LiveKit Agent. `lkagent service run` registers a LiveKit worker under the line's agent name (the `agent_name` setting, else `lkagent-<connection id>`) and answers the calls dispatched to it, one at a time. GPT Live, under client delegation, is the voice; each turn it hands over is written at once into one live Claude process kept for the whole call (or a resumed Codex session), and the backend's steps reach the voice as thinking notes while it works. The call opens as `agent_speaks_first`, `greeting_type` and the greeting settings say, ends at `max_duration_seconds` or on silence, and a silent line is a backend turn told its instruction first and then what was said, all through callva-livekit, which also reports each call to `webhook_url`.
