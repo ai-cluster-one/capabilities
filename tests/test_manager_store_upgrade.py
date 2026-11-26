@@ -769,6 +769,11 @@ def test_a_node_seen_before_the_crossing_reads_unreachable_and_takes_no_request(
     assert unread["store_major"] == STORE and unread["since"] and unread["last_seen_at"]
     assert f"schema major {STORE}" in unread["message"] and unread["command"]
     assert state[NODE_SILENT]["reachable"] is False
+    # agent list gives every agent's nodes the same verdict, in one call.
+    listed = {node["node"]: node for agent in machine.ok("agent", "list")["agents"]
+              for node in agent["nodes"]}
+    assert {k: (n["reachable"], n["cannot_read_store"]) for k, n in listed.items()} \
+        == {k: (n["reachable"], n["cannot_read_store"]) for k, n in state.items()}
 
     code, error = machine.refused("node", "update", "--node", "old-node")
     assert (code, error["code"]) == (6, "node_cannot_read_store")

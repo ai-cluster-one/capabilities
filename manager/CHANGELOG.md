@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-25 — `agent list` gives every agent's nodes their `node state` verdict, in a number of queries that does not grow with the agents
+
+Each node `capabilities agent list` lists now carries `reachable` and `cannot_read_store` exactly as `node state` gives them for that agent, computed by the same code from the same store rows, so one call answers which of every agent's nodes are unreachable or cannot read the store, instead of `node state` and `node list` run in each agent's folder. It reads the agents, their node links with when each node was registered, the nodes' state rows and the store's major in five statements whatever the number of agents or nodes, where it read two per agent before; the store's major and since when are read in two round trips rather than four, by `node state` and `node update --node` as well, with the same answer. On a store 55 ms away with 16 agents and 22 node links `agent list` went from about 3.2 s to about 1.2 s, and the per-folder `node state` and `node list` it replaces took about 20 s. `agent list --archived` is unchanged. Only fields are added; no verb, flag, existing field or exit code changes.
+
 ## 2026-11-25 — `init --template` makes no Git repository
 
 Creating an agent from a template no longer runs `git init`: the new agent's folder holds no `.git`, as an agent created by `init` already does not. Everything else the creation writes - to the folder and to the store - is unchanged. The answer keeps its `git` key, now `{present: false, initialized: false, checkpoint: {required: false, created: false}}`; a folder that already held a `.git` is answered as before, `present: true` with its `path`. `bootstrap` still makes its repository and checkpoint. No verb, flag or exit code changes.

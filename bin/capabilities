@@ -11034,28 +11034,72 @@ def _agent_list(archived: bool = False) -> dict:
     conn, setting = _kernel_open(_project_root())
     import psycopg
     try:
+        if not archived:
+            agents = _agents_with_nodes(conn, setting.schema)
+            return {"ok": True, "agents": agents, "store": _kernel_store_report(setting)}
         ids = [row[0] for row in conn.execute(
             "SELECT id FROM agents a WHERE (to_jsonb(a) ->> 'archived_at' IS NOT NULL) = %s "
             "ORDER BY slug NULLS LAST, name NULLS LAST, id", (archived,))]
         agents = []
-        here = _node_id_or(None) if archived else None
+        here = _node_id_or(None)
         for agent_id in ids:
             agent = _agent_row(conn, agent_id)
-            if archived:
-                folder = _agent_folder_here(agent_id, _node_rows(conn, agent_id), here)
-                agents.append({"id": agent_id, "name": agent["name"], "slug": agent["slug"],
-                               "has_icon": bool(agent["icon_bytes"]),
-                               **_agent_archived_mark(conn, agent_id),
-                               "folder": str(folder) if folder else None})
-                continue
-            agent["nodes"] = _node_rows(conn, agent_id)
-            agents.append(agent)
+            folder = _agent_folder_here(agent_id, _node_rows(conn, agent_id), here)
+            agents.append({"id": agent_id, "name": agent["name"], "slug": agent["slug"],
+                           "has_icon": bool(agent["icon_bytes"]),
+                           **_agent_archived_mark(conn, agent_id),
+                           "folder": str(folder) if folder else None})
     except psycopg.Error as exc:
         _die(5, "store_unreachable", f"cannot read the agent registry: {exc}",
              "check the database setting with `capabilities store doctor`")
     finally:
         conn.close()
     return {"ok": True, "agents": agents, "store": _kernel_store_report(setting)}
+
+
+def _agents_with_nodes(conn, schema: str) -> list[dict]:
+    """Every agent the store holds that is not archived, as `_agent_row` reads
+    it, with its nodes as `_node_rows` reads them, each carrying the verdict
+    `node state` gives it (`_node_verdict`) - in a number of queries that does
+    not grow with the agents or their nodes. `schema` is the one the
+    connection is bound to."""
+    stamp = _store_module()._stamp
+    rows = conn.execute(
+        f"SELECT {', '.join(AGENT_COLUMNS)}, octet_length(icon) FROM agents a "
+        "WHERE to_jsonb(a) ->> 'archived_at' IS NULL "
+        "ORDER BY slug NULLS LAST, name NULLS LAST, id").fetchall()
+    agents = []
+    for row in rows:
+        agent = dict(zip(AGENT_COLUMNS, row[:-1]))
+        for key in ("migrating_since", "migrated_at", "created_at", "updated_at"):
+            agent[key] = stamp(agent[key])
+        agent["icon_bytes"] = row[-1]
+        agent["nodes"] = []
+        agents.append(agent)
+    if not agents:
+        return agents
+    by_id = {agent["id"]: agent for agent in agents}
+    # Each link with when its node was registered (`_nodes_created`), read in
+    # the same statement.
+    linked = conn.execute(
+        "SELECT l.agent_id, n.created_at, " + NODE_SELECT.removeprefix("SELECT ")
+        + "WHERE l.agent_id = ANY (%s) ORDER BY n.label, l.node",
+        (list(by_id),)).fetchall()
+    nodes = []
+    for row in linked:
+        entry = dict(zip(NODE_COLUMNS, row[2:]))
+        entry["last_seen_at"] = stamp(entry["last_seen_at"])
+        entry["disabled_at"] = stamp(entry["disabled_at"])
+        by_id[row[0]]["nodes"].append(entry)
+        nodes.append((entry, row[1]))
+    if nodes:
+        states = {r["node"]: r for r in _store_module().node_states(
+            conn, sorted({entry["node"] for entry, _created in nodes}))}
+        major, since = _store_major_since(conn, schema)
+        for entry, created in nodes:
+            entry.update(_node_verdict(entry, states.get(entry["node"]) or {}, major, since,
+                                       created))
+    return agents
 
 
 def _agent_state(ref: str) -> dict:
@@ -17787,12 +17831,10 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
                 ("node", *store.NODE_STATE_COLUMNS, *store.NODE_UPDATE_OFFER_COLUMNS,
                  "uptime_seconds"))
             state = {**state, **_node_state_logins(store, logins, node["node"])}
-            unread = _node_store_unread(node, state, major, since,
-                                        created.get(node["node"]))
             entry = {"node": node["node"], "label": node["label"],
                      "disabled_at": node["disabled_at"],
-                     "reachable": bool(state.pop("reachable", False)) and unread is None,
-                     "cannot_read_store": unread}
+                     **_node_verdict(node, state, major, since, created.get(node["node"]))}
+            state.pop("reachable", None)
             entry["update"] = {"available": state.pop("update_available", None),
                                "checked_at": store._stamp(state.pop("update_checked_at",
                                                                     None)),
@@ -21842,19 +21884,23 @@ def _store_major_since(conn, schema: str) -> tuple[int | None, object]:
     knows was applied, else, above major 1, when the store last recorded the
     core's version - None where it is major 1 or unknown."""
     from psycopg import sql
-    if conn.execute("SELECT to_regclass(%s)",
-                    (f'"{schema}".schema_version',)).fetchone()[0] is None:
+    versions, ledger = conn.execute(
+        "SELECT to_regclass(%s), to_regclass(%s)",
+        (f'"{schema}".schema_version', f'"{schema}".schema_ledger')).fetchone()
+    if versions is None:
         return None, None
-    rows = conn.execute(sql.SQL("SELECT owner, major, updated_at FROM {}.schema_version")
-                        .format(sql.Identifier(schema))).fetchall()
-    core = next((row for row in rows if row[0] == "core"), None)
     steps = _core_major_steps()
-    since = None
-    if core is not None and steps and conn.execute(
-            "SELECT to_regclass(%s)", (f'"{schema}".schema_ledger',)).fetchone()[0] is not None:
-        since = conn.execute(sql.SQL(
-            "SELECT max(applied_at) FROM {}.schema_ledger WHERE owner = 'core' "
-            "AND step = ANY (%s)").format(sql.Identifier(schema)), (steps,)).fetchone()[0]
+    # Two round trips whatever the store holds: the ledger is read beside the
+    # versions, where it exists, rather than after them.
+    applied = sql.SQL("NULL")
+    if ledger is not None and steps:
+        applied = sql.SQL("(SELECT max(applied_at) FROM {}.schema_ledger WHERE owner = 'core' "
+                          "AND step = ANY (%s))").format(sql.Identifier(schema))
+    rows = conn.execute(sql.SQL("SELECT owner, major, updated_at, {} FROM {}.schema_version")
+                        .format(applied, sql.Identifier(schema)),
+                        (steps,) if ledger is not None and steps else None).fetchall()
+    core = next((row for row in rows if row[0] == "core"), None)
+    since = core[3] if core is not None else None
     return _major_since(bool(rows), core and (core[1], core[2]), since)
 
 
@@ -21897,6 +21943,17 @@ def _nodes_created(conn, ids: list[str]) -> dict:
         return {}
     return dict(conn.execute("SELECT id, created_at FROM nodes WHERE id = ANY (%s)",
                              (list(ids),)).fetchall())
+
+
+def _node_verdict(node: dict, state: dict, major: int | None, since, created=None) -> dict:
+    """{reachable, cannot_read_store} of one of an agent's nodes, as `node
+    state` and `agent list` answer them, from its registry row (`node`), its
+    state row (`state`, empty where it wrote none), the store's major and since,
+    and when the node was registered: a node that cannot read the store is
+    unreachable whatever its row says."""
+    unread = _node_store_unread(node, state, major, since, created)
+    return {"reachable": bool(state.get("reachable", False)) and unread is None,
+            "cannot_read_store": unread}
 
 
 def _node_store_unread(node: dict, state: dict, major: int | None, since,
@@ -37266,8 +37323,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         Every agent the store holds that is not archived - the project's
         store inside a project, else the one this machine resolves - each as
         `agent show` answers it with its nodes as `node list` answers them,
-        the folder it lives in on each node among them: {ok, agents [{id,
-        slug, name, ..., nodes [{node, kind, ..., folder}]}], store}.
+        the folder it lives in on each node among them, and each node's
+        verdict as `node state` gives it, reachable and cannot_read_store:
+        {ok, agents [{id, slug, name, ..., nodes [{node, kind, ..., folder,
+        reachable, cannot_read_store}]}], store}. It reads the store in a
+        number of queries that does not grow with the agents or their nodes.
         --archived lists the archived agents instead, each {id, name, slug,
         has_icon, archived_at, archived_by, folder}, folder being the one it
         lives in on this machine and is still bound to, else null. Needs no
