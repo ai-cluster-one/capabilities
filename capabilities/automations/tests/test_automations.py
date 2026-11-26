@@ -1690,6 +1690,103 @@ environments = ["production"]
         self.assertIsNotNone(rows[0]["definition_id"])
 
     @needs_store
+    def test_an_outage_spanning_slots_is_said_once_and_each_missed_slot_is_skipped(self) -> None:
+        # The store fails mid-statement on a connection that still looks open, as
+        # a network error leaves one busy, with an error text that grows on every
+        # attempt. The scheduler lets that connection go, asks for a fresh one on
+        # each retry, says the outage once and its end once, and records each
+        # firing it missed as skipped; nothing runs late.
+        import psycopg
+        self.define("beat", script_path="capabilities/automations/scripts/job.py",
+                    schedule="* * * * *", node=self.node)
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        said: list[str] = []
+        daemon = RUNTIME.Daemon(self.root, config_path, self.root / "outage-state", log=said.append)
+        daemon.dispatch = lambda limit=None: 0
+        link = daemon.runs.link
+        clock = {"now": datetime(2026, 7, 20, 8, 10, 15, tzinfo=timezone.utc)}
+        opened: list[bool] = []
+        fault = {"text": "SSL SYSCALL error: Can't assign requested address"}
+
+        def failing(_sql, _params=()):
+            fault["text"] += " another command is already in progress"
+            raise psycopg.OperationalError(fault["text"])
+
+        def refused():
+            opened.append(True)
+            raise RUNTIME.StoreUnavailable("store_unreachable", fault["text"], None)
+
+        try:
+            with unittest.mock.patch.object(RUNTIME, "utc_now", lambda: clock["now"]):
+                daemon.tick()
+                # The firing before the outage ran, so the one after it is not
+                # held back by the overlap policy.
+                first = RUNTIME.list_runs(self.root, self.loaded(), limit=5)[0]
+                daemon.runs.update(first["id"], status="succeeded", finished_at=RUNTIME.iso())
+                held = link.conn
+                daemon.runs._execute = failing
+                link.open = refused
+                for minute in range(11, 15):
+                    for second in (5, 25, 45):
+                        clock["now"] = datetime(2026, 7, 20, 8, minute, second,
+                                                tzinfo=timezone.utc)
+                        daemon._reopen_at = 0.0
+                        daemon.tick()
+                self.assertTrue(held.closed)
+                self.assertEqual(len(opened), 12)
+                self.assertEqual(daemon._reopen_delay, RUNTIME.RECONNECT_LONGEST_SECONDS)
+                del daemon.runs._execute
+                del link.open
+                clock["now"] = datetime(2026, 7, 20, 8, 15, 10, tzinfo=timezone.utc)
+                daemon._reopen_at = 0.0
+                daemon.tick()
+                daemon.tick()
+        finally:
+            daemon.runs.close()
+        # The definitions are read again after the store came back, as after any
+        # reconnect; nothing else is said.
+        self.assertEqual([line.split(",")[0] for line in said[2:]], ["reloaded"], said)
+        self.assertIn("lost the store connection", said[0])
+        self.assertIn("the store answers again", said[1])
+        self.assertLessEqual(len(RUNTIME.log_line("p", said[0])), RUNTIME.LOG_LINE_LONGEST + 200)
+        rows = {row["scheduled_for"][11:16]: row
+                for row in RUNTIME.list_runs(self.root, self.loaded(), limit=20)}
+        self.assertEqual(sorted(rows), ["08:10", "08:11", "08:12", "08:13", "08:14", "08:15"])
+        for minute in ("08:11", "08:12", "08:13", "08:14"):
+            self.assertEqual(rows[minute]["status"], "skipped")
+            self.assertEqual(rows[minute]["summary"], RUNTIME.MISSED_SUMMARY)
+            self.assertIsNotNone(rows[minute]["finished_at"])
+        self.assertEqual(rows["08:10"]["status"], "succeeded")
+        self.assertEqual(rows["08:15"]["status"], "pending")
+
+    @needs_store
+    def test_a_paused_scheduler_records_no_missed_slot(self) -> None:
+        # A firing held back on purpose was not missed.
+        self.define("beat", script_path="capabilities/automations/scripts/job.py",
+                    schedule="* * * * *", node=self.node)
+        config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
+        state_dir = self.root / "pause-state"
+        daemon = RUNTIME.Daemon(self.root, config_path, state_dir, log=lambda _m: None)
+        daemon.dispatch = lambda limit=None: 0
+        clock = {"now": datetime(2026, 7, 20, 9, 0, 15, tzinfo=timezone.utc)}
+        try:
+            with unittest.mock.patch.object(RUNTIME, "utc_now", lambda: clock["now"]):
+                daemon.tick()
+                first = RUNTIME.list_runs(self.root, self.loaded(), limit=5)[0]
+                daemon.runs.update(first["id"], status="succeeded", finished_at=RUNTIME.iso())
+                (state_dir / RUNTIME.PAUSE_FILE).write_text("{}")
+                clock["now"] = datetime(2026, 7, 20, 9, 2, 15, tzinfo=timezone.utc)
+                daemon.tick()
+                (state_dir / RUNTIME.PAUSE_FILE).unlink()
+                clock["now"] = datetime(2026, 7, 20, 9, 4, 15, tzinfo=timezone.utc)
+                daemon.tick()
+        finally:
+            daemon.runs.close()
+        rows = RUNTIME.list_runs(self.root, self.loaded(), limit=20)
+        self.assertEqual(sorted((row["scheduled_for"][11:16], row["status"]) for row in rows),
+                         [("09:00", "succeeded"), ("09:04", "pending")])
+
+    @needs_store
     def test_startup_recovery_requeues_by_policy(self) -> None:
         config_path = self.root / "capabilities" / "automations" / "service" / "config.toml"
         state_dir = self.root / "capabilities" / "automations" / "state"

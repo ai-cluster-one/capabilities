@@ -369,3 +369,114 @@ def test_a_store_at_major_1_keeps_every_row_under_the_agent_names(runtime, monke
         link.close()
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+def test_a_log_line_is_cut_at_its_longest(runtime):
+    line = runtime.log_line("alpha", "x" * (runtime.LOG_LINE_LONGEST + 500))
+    assert len(line) < runtime.LOG_LINE_LONGEST + 200
+    assert line.endswith("(500 more characters)\n")
+    assert runtime.log_line("alpha", "short").endswith("[alpha]: short\n")
+
+
+def test_a_log_that_reaches_its_bound_keeps_its_last_part_and_starts_again(runtime, tmp_path):
+    log = tmp_path / "daemon.log"
+    log.write_bytes(b"a" * 50 + b"b" * 100)
+    with log.open("a") as writer:
+        runtime.bound_log(log, longest=100)
+        writer.write("after\n")
+        writer.flush()
+    assert (tmp_path / "daemon.log.1").read_bytes() == b"b" * 100
+    assert log.read_text() == "after\n"
+    runtime.bound_log(log, longest=100)
+    assert log.read_text() == "after\n"
+
+
+class _Info:
+    def __init__(self, status):
+        self.transaction_status = status
+
+
+class _Conn:
+    def __init__(self, status):
+        self.closed = False
+        self.broken = False
+        self.info = _Info(status)
+
+    def close(self):
+        self.closed = True
+
+
+def test_a_connection_left_mid_command_is_lost(runtime):
+    from psycopg import pq
+    link = runtime.StoreLink(setting=None)
+    link.conn = _Conn(pq.TransactionStatus.ACTIVE)
+    assert link.lost()
+    link.conn = _Conn(pq.TransactionStatus.IDLE)
+    assert not link.lost()
+
+
+class _Host:
+    def __init__(self, state_dir):
+        self.state_dir = state_dir
+
+
+def test_the_machine_says_an_outage_once_and_asks_each_time_on_a_fresh_connection(
+        runtime, tmp_path, monkeypatch):
+    """A statement that fails on a connection that still looks open lets that
+    connection go; every retry opens a new one, on a doubling interval, and
+    the outage is said once when it starts and once when it ends, whatever the
+    store says in between."""
+    import psycopg
+    from psycopg import pq
+    machine = runtime.MachineService(_Host(tmp_path))
+    said: list[str] = []
+    monkeypatch.setattr(machine, "log", said.append)
+    link = runtime.StoreLink(setting=None)
+    held = link.conn = _Conn(pq.TransactionStatus.IDLE)
+    machine.links["store"] = link
+    opened, failed = [], []
+
+    def refused():
+        opened.append(True)
+        raise runtime.StoreUnavailable("store_unreachable", "refused " * len(opened), None)
+
+    monkeypatch.setattr(link, "open", refused)
+    slot = type("Slot", (), {"link": link, "fail": lambda self, exc: failed.append(exc)})()
+
+    def statement():
+        raise psycopg.OperationalError("another command is already in progress")
+
+    assert machine._guard(slot, statement) is False
+    assert held.closed and link.lost() and not failed
+    assert machine.sleep_seconds() > 0.5
+    for _ in range(20):
+        link.retry_at = 0.0
+        machine._reconnect(link, "the store connection is closed")
+    assert len(opened) == 21
+    assert link.retry_delay == runtime.RECONNECT_LONGEST_SECONDS
+    monkeypatch.undo()
+    monkeypatch.setattr(machine, "log", said.append)
+
+    def answers():
+        link.conn = _Conn(pq.TransactionStatus.IDLE)
+        return link
+
+    monkeypatch.setattr(link, "open", answers)
+    link.retry_at = 0.0
+    machine._reconnect(link, "the store connection is closed")
+    assert not link.lost() and link.error is None and link.down_since is None
+    assert len(said) == 2, said
+    assert said[0].startswith("lost the store connection")
+    assert "answers again" in said[1]
+
+
+def test_a_project_fault_is_said_once_however_its_text_grows(runtime, tmp_path):
+    said: list[str] = []
+    slot = runtime.ProjectSlot.__new__(runtime.ProjectSlot)
+    slot.tick_error = slot.tick_fault = None
+    slot.log = said.append
+    for size in range(1, 6):
+        slot.fail(ValueError("x" * size))
+    assert len(said) == 1 and slot.tick_error == "ValueError: xxxxx"
+    slot.fail(KeyError("other"))
+    assert len(said) == 2

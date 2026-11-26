@@ -229,7 +229,7 @@
       "level": 0,
       "lucide_icon": "zap",
       "path": "capabilities/automations",
-      "payload_sha256": "9dd84b78dde8f5069c7589bbde564c59c4d26baf1a420b8cfb7a1f126e280049",
+      "payload_sha256": "f50a139b886c111fd85be21a4a78bf93668ba12efdbc53176d26b6fda2fe3d41",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
@@ -245,7 +245,7 @@
           "title": "Автоматизации"
         }
       },
-      "version": "2026-11-24 — `automations inventory` marks its two counts as tile counts, and the icon is `zap`"
+      "version": "2026-11-26 — A store outage is said once and its end once, every retry takes a fresh connection, and each firing it swallowed is recorded skipped"
     },
     "calcomc": {
       "executable": [

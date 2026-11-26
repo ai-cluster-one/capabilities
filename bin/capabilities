@@ -13027,6 +13027,10 @@ NODE_LAUNCHD_FOREIGN_SLUG = "machine"
 # A machine service's one job on this Mac: capabilities.node-machine.<capability>.
 NODE_LAUNCHD_MACHINE_SLUG = "node-machine"
 NODE_AGENT_MARK = "<!-- written by `capabilities node install`, which rewrites it -->"
+# launchd appends a job's stdout and stderr to the files its agent names and
+# never rotates them, so the Mac's node manager does: a log that reaches this
+# size keeps its last part as `<name>.1` and starts again empty.
+NODE_LAUNCHD_LOG_LONGEST_BYTES = 10 * 1024 * 1024
 # What a job carries over from the node manager's own environment: launchd
 # hands a job none, and these decide which node, home and tools it runs as.
 NODE_JOB_ENV = ("PATH", "AGENT_NODE_ID", "AGENT_NODE_NAME", "CAPABILITIES_HOME",
@@ -13183,6 +13187,25 @@ def _launchd_unload(label: str) -> tuple[bool, str]:
         return True, ""
     code, said = _launchctl("bootout", f"{_launchd_domain()}/{label}")
     return code == 0 or not _launchd_loaded(label), said
+
+
+def _bound_log_file(path: Path, longest: int = NODE_LAUNCHD_LOG_LONGEST_BYTES) -> None:
+    """Rotate the log at `path` once it holds `longest` bytes: its last
+    `longest` bytes become `<name>.1`, replacing the one before, and the log is
+    emptied in place, so launchd, which holds it open for appending, carries on
+    at its new end. The log and its one generation never pass twice `longest`."""
+    try:
+        size = path.stat().st_size
+        if size < longest:
+            return
+        spare = path.with_name(f".{path.name}.1.{os.getpid()}")
+        with path.open("rb") as source, spare.open("wb") as kept:
+            source.seek(max(0, size - longest))
+            shutil.copyfileobj(source, kept)
+        os.replace(spare, path.with_name(f"{path.name}.1"))
+        os.truncate(path, 0)
+    except OSError:
+        return
 
 
 def _launchd_document(body: dict, mark: str) -> str:
@@ -14812,6 +14835,10 @@ class _NodeManager:
             self.restart_self = True
             stopping["now"] = True
 
+    def tend_logs(self) -> None:
+        """Keep the jobs' logs bounded where this node writes them. Supervisor
+        hands every job's output to its own, so on a server there is none."""
+
     def tend_update(self) -> None:
         """Start the update a row asks for, else the check once it is due;
         one child at a time, never an update no row asked for, and neither on
@@ -14885,6 +14912,7 @@ class _NodeManager:
             elif (self.moved or self.probed() or (self.probe_asked and self.probe is None)
                   or time.monotonic() >= self.state_due):
                 self.report_state()
+            self.tend_logs()
             deadline = time.monotonic() + NODE_RUN_FOLLOW_SECONDS
             while not stopping["now"] and time.monotonic() < deadline:
                 time.sleep(0.2)
@@ -14918,6 +14946,12 @@ class _LaunchdNodeManager(_NodeManager):
 
     def job_path(self, name: str) -> Path:
         return self.include / f"{name}.plist"
+
+    def tend_logs(self) -> None:
+        """Every log launchd appends to in this node's folder - each job's
+        and the node manager's own - rotated once it reaches its bound."""
+        for path in sorted(self.home.glob("*.log")):
+            _bound_log_file(path)
 
     def job_text(self, job: dict) -> str:
         return _node_launchd_job_text(job, self.home / job["name"], self.home)

@@ -131,3 +131,24 @@ def test_handover_finds_every_loaded_agent_of_the_folder_whatever_compiled_it(ma
     assert loaded == {"legacy.backup", "elsewhere.telegram", "capabilities.node"}
     assert not (library / "legacy.telegram.plist").exists()
     assert (launchers / "legacy.telegram.plist.handed-over").is_file()
+
+
+def test_the_mac_node_manager_rotates_every_job_log_launchd_appends_to(tmp_path):
+    """launchd never rotates a job's stdout or stderr, so the node manager
+    keeps each bounded: past its bound a log keeps its last part as `.1` and
+    starts again empty under the writer that holds it open."""
+    flooded = tmp_path / "capabilities.node-machine.automations.err.log"
+    quiet = tmp_path / "capabilities.node.err.log"
+    flooded.write_bytes(b"old" + b"x" * M.NODE_LAUNCHD_LOG_LONGEST_BYTES)
+    quiet.write_text("one line\n")
+    manager = M._LaunchdNodeManager.__new__(M._LaunchdNodeManager)
+    manager.home = tmp_path
+    with flooded.open("a") as launchd:
+        manager.tend_logs()
+        launchd.write("next\n")
+    kept = tmp_path / f"{flooded.name}.1"
+    assert kept.stat().st_size == M.NODE_LAUNCHD_LOG_LONGEST_BYTES
+    assert not kept.read_bytes().startswith(b"old")
+    assert flooded.read_text() == "next\n"
+    assert quiet.read_text() == "one line\n"
+    assert not (tmp_path / f"{quiet.name}.1").exists()

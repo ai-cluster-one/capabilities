@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-26 — A Mac's node manager keeps every launchd job log bounded
+
+launchd appends a job's stdout and stderr to the files its agent names and never rotates them, so a service that wrote without pause could fill the disk. `capabilities node run --launchd` now checks every `*.log` in its folder (`~/.local/state/capabilities/node/launchd`, each job's and its own) on each pass: one that reaches 10 MiB keeps its last 10 MiB as `<name>.1`, replacing the one before, and is emptied in place, so launchd carries on writing at its new end. A job and its log paths are unchanged, and a server node, whose Supervisor takes every job's output, is unchanged. No verb, flag or JSON key changes.
+
 ## 2026-11-26 — `secrets migrate` settles two shared connections whose keys share a name each on its own
 
 `capabilities secrets migrate` compares each shared connection's key among the agents granted that connection, so a connection whose copies agree gets the platform's copy even where another shared connection names the same key. Before, every such connection was listed under `disagreeing` with no copies, and `--pick` could not settle it. Copies of one connection's key that disagree are still listed with their last characters and still wait for `--pick`. No verb, flag or JSON key changes.

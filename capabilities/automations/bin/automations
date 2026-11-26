@@ -190,6 +190,10 @@ _HELP_DEFINITIONS = """
   timezone, or none (manual only). The ticker only registers due runs and
   dispatches subprocesses; job logic never runs inside the ticker. A firing
   that finds a run of the automation active on any node is recorded skipped.
+  A firing whose minute passed while the scheduler could not register it -
+  its store away, the scheduler held up - is recorded skipped as missed once
+  it can again, up to a day back, and is not run late; a firing held back by
+  a pause or a refusal is not recorded.
 """
 _HELP_NOT_IMPORTED = """
   While config.toml still declares [[automations]], every command that reads
@@ -642,8 +646,10 @@ automations service run --machine
   project it serves keeps its runs in the store resolved for that project's
   root (Run ledger), resolved as it is admitted; a project that resolves none
   is refused with the reason and asked again. It holds one store connection
-  for each distinct store, shared by every project on it, reconnects a lost
-  one every pass while the projects on other stores go on, and lists them in
+  for each distinct store, shared by every project on it, lets a connection
+  the store failed on go and asks for a fresh one on an interval doubling up
+  to 30s, saying the outage once when it starts and once when it ends, while
+  the projects on other stores go on, and lists them in
   `status --machine` as `stores`. It follows the list without a reload: a
   project put on it is
   served from the first pass at which it can be. For each project it serves it
@@ -831,7 +837,9 @@ automations service logs --machine [--project <id-or-slug>] [--tail 100]
   Every line the service writes, in either mode, reads `<moment> automations
   service [<project-slug>]: <what happened>`. The machine process tags its own
   lines `[machine]`, writes every line to its log, and writes a project's
-  lines to that project's daemon.log too.
+  lines to that project's daemon.log too. A line's message is cut at 2000
+  characters, and a daemon.log that reaches 10 MiB keeps its last 10 MiB as
+  daemon.log.1 and starts again empty.
 
   Output: {"log_file", "lines": [...]}; with --project also "project".
   Exit codes: 0; 3 `logs_not_found` where the log does not exist yet; 6

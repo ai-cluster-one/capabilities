@@ -15,7 +15,7 @@ import time
 import tomllib
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections.abc import Sequence
 from typing import Any
@@ -1301,6 +1301,11 @@ class StoreLink:
         self.generation = 0
         self.follower = None
         self._polled_at: float | None = None
+        # While the link is down: when it went, and when it is asked for next,
+        # on an interval doubled after each attempt that fails.
+        self.down_since: str | None = None
+        self.retry_at = 0.0
+        self.retry_delay = RECONNECT_FIRST_SECONDS
 
     @property
     def name(self) -> str:
@@ -1390,12 +1395,50 @@ class StoreLink:
 
     def lost(self) -> bool:
         """Whether the connection is gone, so the next statement cannot succeed
-        on it whatever it is."""
-        return self.conn is None or self.conn.closed or self.conn.broken
+        on it whatever it is: closed, broken, or left mid-command by a network
+        error, where every statement after is refused as another command already
+        in progress."""
+        if self.conn is None or self.conn.closed or self.conn.broken:
+            return True
+        from psycopg import pq
+        return self.conn.info.transaction_status in (pq.TransactionStatus.ACTIVE,
+                                                     pq.TransactionStatus.UNKNOWN)
 
     def reopen(self) -> None:
+        """A fresh connection in place of the one held, which is closed first
+        and never asked again."""
         self.close()
         self.open()
+
+    def went_down(self) -> bool:
+        """Note that the link is down, closing its connection: true the first
+        time, so the outage is said once, and false while it lasts. The first
+        attempt to reach the store again is due at once."""
+        self.close()
+        if self.down_since is not None:
+            return False
+        self.down_since = iso()
+        self.retry_at, self.retry_delay = 0.0, RECONNECT_FIRST_SECONDS
+        return True
+
+    def try_again(self) -> bool | None:
+        """One attempt to reach the store again, while the link is down and
+        the attempt is due: None when not due, else whether it answered. One
+        that does not answer puts the next off by the doubled interval, and
+        records why in `error`; one that does ends the outage."""
+        now = time.monotonic()
+        if now < self.retry_at:
+            return None
+        try:
+            self.reopen()
+        except StoreUnavailable as exc:
+            self.error = exc.message
+            self.retry_at = now + self.retry_delay
+            self.retry_delay = min(self.retry_delay * 2, RECONNECT_LONGEST_SECONDS)
+            return False
+        self.error, self.down_since = None, None
+        self.retry_at, self.retry_delay = 0.0, RECONNECT_FIRST_SECONDS
+        return True
 
 
 def wait_for_changes(links: Sequence["StoreLink"], seconds: float) -> bool:
@@ -1610,10 +1653,13 @@ class RunLedger:
               trigger: str, scheduled_for: str | None = None,
               dedupe_key: str | None = None, attempt: int = 1,
               parent_run_id: str | None = None, node: str | None = None,
-              definition_id: str | None = None) -> dict[str, Any] | None:
+              definition_id: str | None = None,
+              skipped: str | None = None) -> dict[str, Any] | None:
         """Take one firing, or find it already taken, for `node`, this one's
         unless named. The log path is this machine's until the run starts,
-        when the machine that starts it writes its own.
+        when the machine that starts it writes its own. With `skipped`, the
+        firing is recorded finished as skipped, that its summary, in the same
+        insert, so nothing can ever start it.
 
         The key is the only conflict the insert treats as someone else's win.
         Anything else is a schema the code no longer matches, and a run that
@@ -1625,12 +1671,15 @@ class RunLedger:
             inserted = self._execute(
                 "INSERT INTO automations_runs (id, agent_id, automation_slug, "
                 "trigger, scheduled_for, dedupe_key, status, attempt, "
-                "parent_run_id, queued_at, log_path, host, node, definition_id) "
-                "VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s) "
+                "parent_run_id, queued_at, log_path, host, node, definition_id, "
+                "finished_at, summary) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                 "ON CONFLICT (agent_id, dedupe_key) DO NOTHING",
                 (run_id, self.project_id, slug, trigger,
-                 scheduled_for, dedupe_key, attempt, parent_run_id, iso(),
-                 str(log_path), self.host, node, definition_id)).rowcount
+                 scheduled_for, dedupe_key, "pending" if skipped is None else "skipped",
+                 attempt, parent_run_id, iso(),
+                 str(log_path), self.host, node, definition_id,
+                 None if skipped is None else iso(), skipped)).rowcount
         if not inserted:
             return None
         return self.get(run_id)
@@ -1886,20 +1935,75 @@ LONGEST_SLEEP_SECONDS = 1.0
 # that fails, up to the longest.
 RECONNECT_FIRST_SECONDS = 1.0
 RECONNECT_LONGEST_SECONDS = 30.0
+# The longest message a log line carries: a store's error text can grow without
+# bound, and the rest of it says nothing the first part did not.
+LOG_LINE_LONGEST = 2000
+# The size a service log reaches before it is rotated: its last part is kept
+# as `<name>.1`, replacing the one before, and the log starts again empty.
+LOG_FILE_LONGEST_BYTES = 10 * 1024 * 1024
+# How far back a scheduler that could not register its firings for a while
+# records each one it missed as skipped once it can again.
+MISSED_LOOKBACK_SECONDS = 24 * 3600
+MISSED_SUMMARY = "missed: the scheduler could not register it at its time; not run late"
 
 
 def log_line(project: str, message: str) -> str:
     """One service log line, `<moment> automations service [<project>]:
     <message>`, the project named by its slug. A message that spans lines, as a
-    store's error may, is written on one, so every line names its project."""
+    store's error may, is written on one, so every line names its project; one
+    longer than LOG_LINE_LONGEST is cut there, saying how much was left out."""
     message = " ".join(part.strip() for part in str(message).splitlines() if part.strip())
+    if len(message) > LOG_LINE_LONGEST:
+        message = (f"{message[:LOG_LINE_LONGEST]} ... "
+                   f"({len(message) - LOG_LINE_LONGEST} more characters)")
     return f"{iso()} automations service [{project}]: {message}\n"
 
 
+def bound_log(path: Path, longest: int = LOG_FILE_LONGEST_BYTES) -> None:
+    """Rotate the log at `path` once it holds `longest` bytes: its last
+    `longest` bytes become `<name>.1` and it is emptied in place, so a writer
+    holding it open for appending, as a supervisor holds its stderr, carries on
+    at its new end. The log and its one generation never pass twice `longest`."""
+    path = Path(path)
+    with contextlib.suppress(OSError):
+        size = path.stat().st_size
+        if size < longest:
+            return
+        spare = path.with_name(f".{path.name}.1.{os.getpid()}")
+        with path.open("rb") as source, spare.open("wb") as kept:
+            source.seek(max(0, size - longest))
+            shutil.copyfileobj(source, kept)
+        os.replace(spare, path.with_name(f"{path.name}.1"))
+        os.truncate(path, 0)
+
+
 def append_line(path: Path, line: str) -> None:
+    bound_log(path)
     with contextlib.suppress(OSError):
         with Path(path).open("a", encoding="utf-8") as handle:
             handle.write(line)
+
+
+def _stderr_is(path: Path) -> bool:
+    """Whether this process's stderr is the file at `path`."""
+    try:
+        mine, found = os.fstat(sys.stderr.fileno()), os.stat(path)
+    except (OSError, ValueError, AttributeError):
+        return False
+    return (mine.st_dev, mine.st_ino) == (found.st_dev, found.st_ino)
+
+
+def store_fault(exc: BaseException) -> bool:
+    """Whether `exc` says the store connection cannot be used: the store did not
+    answer, or the driver failed on the connection. A connection such a fault
+    leaves behind is never asked again; the next attempt takes a fresh one."""
+    if isinstance(exc, StoreUnavailable):
+        return True
+    try:
+        import psycopg
+    except ImportError:
+        return False
+    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError))
 
 
 def write_atomic(path: Path, text: str) -> None:
@@ -2065,9 +2169,17 @@ class Daemon:
         self.archived: str | None = None
         self._generation = -1
         self._placement_read_at = 0.0
-        # A lost store is asked for again on a doubling interval, not on every tick.
+        # While the store is away: since when, and when it is asked for next,
+        # on an interval doubled after each attempt that fails.
+        self._down_since: str | None = None
         self._reopen_at = 0.0
         self._reopen_delay = RECONNECT_FIRST_SECONDS
+        # The last minute, in UTC, whose firings this scheduler registered: a
+        # minute after it and before the current one passed while it could not
+        # register them, and each firing in it is recorded skipped. None while
+        # it registers nothing by choice - paused, refused, not yet started -
+        # since a firing held back on purpose was not missed.
+        self.scheduled_through: datetime | None = None
         # The file's part is read first, so a declaration that does not load is
         # refused before the store is opened for it.
         file_config = self._load_file()
@@ -2133,6 +2245,10 @@ class Daemon:
         if self._log is not None:
             self._log(message)
             return
+        # `service start` hands the daemon its log as its stderr.
+        log_path = self.state_dir / LOG_FILE
+        if _stderr_is(log_path):
+            bound_log(log_path)
         sys.stderr.write(log_line(self.slug, message))
         sys.stderr.flush()
 
@@ -2204,17 +2320,41 @@ class Daemon:
             self.log("resumed")
         self.pause = pause
 
+    def _missed_minutes(self, minute: datetime) -> list[datetime]:
+        """The minutes, in UTC, after the last one registered and before
+        `minute`, at most MISSED_LOOKBACK_SECONDS of them."""
+        since = self.scheduled_through
+        if since is None:
+            return []
+        first = max(since + timedelta(minutes=1),
+                    minute - timedelta(seconds=MISSED_LOOKBACK_SECONDS))
+        count = int((minute - first).total_seconds() // 60)
+        return [first + timedelta(minutes=step) for step in range(max(0, count))]
+
     def schedule_due(self, now: datetime) -> None:
         """Register the firings due now of the automations this node schedules.
         One run of an automation at a time holds across every node: a firing
         that finds one active anywhere is recorded skipped, once another
-        node's run past its timeout and grace is closed for it."""
+        node's run past its timeout and grace is closed for it.
+
+        A firing whose minute passed while this scheduler could not register
+        it - its store away, or the scheduler itself held up - is recorded
+        skipped as missed under its own key, and is not run late."""
         grace = self.config["engine"]["shutdown_grace_seconds"]
+        minute = now.astimezone(timezone.utc).replace(second=0, microsecond=0)
+        missed = self._missed_minutes(minute)
         for item in self.config["automations"]:
             if not scheduled_here(item, self.node, self.config.get("placed_on")) \
                     or not item["schedule"]:
                 continue
-            local = now.astimezone(ZoneInfo(item["timezone"]))
+            zone = ZoneInfo(item["timezone"])
+            for passed in missed:
+                if cron_matches(item["schedule"], passed.astimezone(zone)):
+                    scheduled_text = iso(passed)
+                    self._claim(item["id"], trigger="schedule", scheduled_for=scheduled_text,
+                                dedupe_key=f"{item['id']}:{scheduled_text}",
+                                definition_id=item["version"], skipped=MISSED_SUMMARY)
+            local = now.astimezone(zone)
             if not cron_matches(item["schedule"], local):
                 continue
             scheduled_text = iso(local.replace(second=0, microsecond=0))
@@ -2225,6 +2365,7 @@ class Daemon:
                 continue
             self._claim(item["id"], trigger="schedule", scheduled_for=scheduled_text,
                         dedupe_key=dedupe, definition_id=item["version"])
+        self.scheduled_through = minute
 
     def _insert_skipped(self, item: dict[str, Any], scheduled: str, dedupe: str,
                         reason: str) -> None:
@@ -2623,6 +2764,8 @@ class Daemon:
         self.take_pause()
         if self.pause is None:
             self.schedule_due(utc_now())
+        else:
+            self.scheduled_through = None
 
     def tick(self) -> None:
         """Reap, schedule and dispatch once.
@@ -2642,22 +2785,27 @@ class Daemon:
         except AgentArchived:
             raise
         except Exception as exc:
-            if not self.runs.lost():
+            if not (self.runs.lost() or store_fault(exc)):
                 raise
             now = time.monotonic()
+            if self._down_since is None:
+                self._down_since = iso()
+                self._reopen_at, self._reopen_delay = 0.0, RECONNECT_FIRST_SECONDS
+                self.log(f"lost the store connection, asking again on an interval doubling "
+                         f"up to {RECONNECT_LONGEST_SECONDS:g}s and saying nothing more "
+                         f"until it answers: {_why(exc)}")
             if now < self._reopen_at:
                 return
-            self.log(f"lost the store connection, reconnecting: {exc}")
             try:
+                # A fresh connection: the one the fault left is closed first.
                 self.runs.reopen()
-            except StoreUnavailable as again:
-                self.log(f"the store is still unavailable, asking again in "
-                         f"{self._reopen_delay:g}s: {again.message}")
+            except StoreUnavailable:
                 self._reopen_at = now + self._reopen_delay
                 self._reopen_delay = min(self._reopen_delay * 2, RECONNECT_LONGEST_SECONDS)
-            else:
-                self._reopen_at = 0.0
-                self._reopen_delay = RECONNECT_FIRST_SECONDS
+                return
+            self.log(f"the store answers again, unavailable since {self._down_since}")
+            self._down_since = None
+            self._reopen_at, self._reopen_delay = 0.0, RECONNECT_FIRST_SECONDS
 
 
 # --- machine mode ----------------------------------------------------------------
@@ -2682,6 +2830,9 @@ class ProjectSlot:
         self.recovered = False
         self.load_error: str | None = None
         self.tick_error: str | None = None
+        # What kind of fault `tick_error` is, by which a fault is said once
+        # while it lasts however its text changes.
+        self.tick_fault: str | None = None
         self.refusal: tuple[str, str] | None = None
         self.next_tick = 0.0
         self.leaving: str | None = None
@@ -2771,13 +2922,16 @@ class ProjectSlot:
         daemon.reap()
         daemon.follow_definitions()
         if self.leaving or not self.check():
+            daemon.scheduled_through = None
             return
         daemon.take_pause()
         if daemon.pause is None:
             daemon.schedule_due(utc_now())
+        else:
+            daemon.scheduled_through = None
         if self.tick_error is not None:
             self.log("served again")
-            self.tick_error = None
+            self.tick_error = self.tick_fault = None
 
     def can_start(self) -> bool:
         return (self.daemon is not None and self.recovered and not self.leaving
@@ -2785,10 +2939,13 @@ class ProjectSlot:
                 and self.daemon.pause is None and self.daemon.archived is None)
 
     def fail(self, exc: BaseException) -> None:
+        """Say the project's fault once while it lasts: a fault of the same
+        kind whose text changes from one tick to the next is not said again."""
         reason = _why(exc)
-        if reason != self.tick_error:
+        kind = exc.slug if isinstance(exc, StoreUnavailable) else type(exc).__name__
+        if kind != self.tick_fault:
             self.log(f"error: {reason}; the other projects are served")
-        self.tick_error = reason
+        self.tick_error, self.tick_fault = reason, kind
 
     def state(self) -> tuple[str, str | None]:
         if self.load_error is not None:
@@ -2897,11 +3054,7 @@ class MachineService:
         self._write(line)
 
     def _stderr_is_log(self) -> bool:
-        try:
-            mine, log = os.fstat(sys.stderr.fileno()), os.stat(self._log_path)
-        except (OSError, ValueError, AttributeError):
-            return False
-        return (mine.st_dev, mine.st_ino) == (log.st_dev, log.st_ino)
+        return _stderr_is(self._log_path)
 
     def slots(self) -> list[ProjectSlot]:
         return [entry["slot"] for _, entry in sorted(self.entries.items())
@@ -3013,8 +3166,12 @@ class MachineService:
             self._lock = None
 
     def sleep_seconds(self) -> float:
+        """Until the next project tick, or the next attempt at a store that is
+        down; a project whose store is down waits on its store, not its tick."""
         now = time.monotonic()
-        waits = [slot.next_tick - now for slot in (*self.slots(), *self.draining)]
+        waits = [slot.next_tick - now for slot in (*self.slots(), *self.draining)
+                 if not slot.link.lost()]
+        waits += [link.retry_at - now for link in self.links.values() if link.lost()]
         return max(0.02, min([LONGEST_SLEEP_SECONDS, *waits]))
 
     def reload(self) -> None:
@@ -3072,15 +3229,16 @@ class MachineService:
 
     def _guard(self, slot: ProjectSlot, action):
         """Run one project's action; a fault of the project's stays the
-        project's, and a lost store link is its store's, reconnected at once and
-        otherwise every pass. A project whose link is down is asked nothing."""
+        project's, and a fault of its store link is its store's: the link's
+        connection is let go and the store asked for again at once, then on a
+        doubling interval. A project whose link is down is asked nothing."""
         if slot.link.lost():
             return False
         try:
             return action()
         except Exception as exc:
-            if slot.link.lost():
-                self._reconnect(slot.link, exc)
+            if slot.link.lost() or store_fault(exc):
+                self._reconnect(slot.link, _why(exc))
             else:
                 slot.fail(exc)
             return False
@@ -3124,28 +3282,30 @@ class MachineService:
             try:
                 link.open()
             except StoreUnavailable as exc:
+                link.went_down()
                 link.error = exc.message
-                self.log(f"the store {link.name} is unavailable, asking again every "
-                         f"pass: {exc.slug}: {exc.message}")
+                link.retry_at = time.monotonic() + link.retry_delay
+                link.retry_delay = min(link.retry_delay * 2, RECONNECT_LONGEST_SECONDS)
+                self.log(f"the store {link.name} is unavailable, asking again on an interval "
+                         f"doubling up to {RECONNECT_LONGEST_SECONDS:g}s and saying nothing "
+                         f"more until it answers: {exc.slug}: {exc.message}")
             else:
                 for warning in link.warnings:
                     self.log(warning)
         return link
 
     def _reconnect(self, link: StoreLink, why) -> None:
-        if link.error is None:
-            self.log(f"lost the store connection to {link.name}, reconnecting every "
-                     f"pass: {why}")
-        try:
-            link.reopen()
-        except StoreUnavailable as again:
-            if again.message != link.error:
-                self.log(f"the store {link.name} is unavailable: {again.slug}: "
-                         f"{again.message}")
-            link.error = again.message
-            return
-        self.log(f"the store {link.name} answers again")
-        link.error = None
+        """Ask a link that is down for its store again, when that is due. The
+        outage is said once when it starts and once when it ends, and nothing
+        in between, however often it is asked and whatever the store says."""
+        if link.went_down():
+            self.log(f"lost the store connection to {link.name}, asking again on an "
+                     f"interval doubling up to {RECONNECT_LONGEST_SECONDS:g}s and saying "
+                     f"nothing more until it answers: {why}")
+            link.error = str(why)[:LOG_LINE_LONGEST]
+        since = link.down_since
+        if link.try_again():
+            self.log(f"the store {link.name} answers again, unavailable since {since}")
 
     def _drop_unused_links(self) -> None:
         """Close the link of a store no project served or letting go is on."""
@@ -3357,9 +3517,12 @@ def _daemon_when_the_store_answers(make) -> "Daemon":
         except StoreUnavailable as exc:
             if exc.slug not in ("store_unreachable", "store_busy"):
                 raise
-            if exc.message != said:
+            if said is None:
                 said = exc.message
-                sys.stderr.write(log_line(tag, f"the store is unavailable, asking again: "
+                sys.stderr.write(log_line(tag, f"the store is unavailable, asking again on an "
+                                               f"interval doubling up to "
+                                               f"{RECONNECT_LONGEST_SECONDS:g}s and saying "
+                                               f"nothing more until it answers: "
                                                f"{exc.slug}: {exc.message}"))
                 sys.stderr.flush()
             time.sleep(delay)
