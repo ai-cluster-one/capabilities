@@ -1993,17 +1993,31 @@ def _stderr_is(path: Path) -> bool:
     return (mine.st_dev, mine.st_ino) == (found.st_dev, found.st_ino)
 
 
+# The SQLSTATEs a store sends as it ends the session: the connection is gone
+# after them, as it is after an error that carries no SQLSTATE at all.
+SESSION_ENDED_STATES = ("57P01", "57P02", "57P03")
+
+
 def store_fault(exc: BaseException) -> bool:
     """Whether `exc` says the store connection cannot be used: the store did not
-    answer, or the driver failed on the connection. A connection such a fault
-    leaves behind is never asked again; the next attempt takes a fresh one."""
+    answer, the driver failed on the connection, the network gave way below any
+    answer of the store's, or the store ended the session. An error the store
+    answers on a connection that stays usable - a statement timeout, a deadlock,
+    a full disk - is not one: it stays the fault of whatever asked. A connection
+    a store fault leaves behind is never asked again; the next attempt takes a
+    fresh one."""
     if isinstance(exc, StoreUnavailable):
         return True
     try:
         import psycopg
     except ImportError:
         return False
-    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError))
+    if isinstance(exc, psycopg.InterfaceError):
+        return True
+    if not isinstance(exc, psycopg.OperationalError):
+        return False
+    state = getattr(exc, "sqlstate", None)
+    return not state or state in SESSION_ENDED_STATES or state.startswith("08")
 
 
 def write_atomic(path: Path, text: str) -> None:

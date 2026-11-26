@@ -470,6 +470,36 @@ def test_the_machine_says_an_outage_once_and_asks_each_time_on_a_fresh_connectio
     assert "answers again" in said[1]
 
 
+def test_an_error_the_store_answers_on_a_usable_connection_stays_the_projects(
+        runtime, tmp_path, monkeypatch):
+    """A statement timeout, a deadlock or a full disk is answered by a store
+    that is there, on a connection that stays usable: the project is marked in
+    fault, as before, and the link is neither let go nor said to be down. An
+    error with no SQLSTATE, or the store ending the session, is the store's."""
+    import psycopg
+    from psycopg import errors, pq
+    machine = runtime.MachineService(_Host(tmp_path))
+    said: list[str] = []
+    monkeypatch.setattr(machine, "log", said.append)
+    link = runtime.StoreLink(setting=None)
+    held = link.conn = _Conn(pq.TransactionStatus.IDLE)
+    machine.links["store"] = link
+    failed = []
+    slot = type("Slot", (), {"link": link, "fail": lambda self, exc: failed.append(exc)})()
+    for answered in (errors.QueryCanceled, errors.DeadlockDetected, errors.DiskFull,
+                     errors.LockNotAvailable):
+        def statement(answered=answered):
+            raise answered("answered by the store")
+        for _ in range(3):
+            assert machine._guard(slot, statement) is False
+    assert len(failed) == 12 and not said
+    assert not held.closed and not link.lost() and link.down_since is None
+    assert not runtime.store_fault(errors.QueryCanceled("canceling statement"))
+    assert runtime.store_fault(errors.AdminShutdown("terminating connection"))
+    assert runtime.store_fault(psycopg.OperationalError("server closed the connection"))
+    assert runtime.store_fault(psycopg.InterfaceError("the connection is closed"))
+
+
 def test_a_project_fault_is_said_once_however_its_text_grows(runtime, tmp_path):
     said: list[str] = []
     slot = runtime.ProjectSlot.__new__(runtime.ProjectSlot)

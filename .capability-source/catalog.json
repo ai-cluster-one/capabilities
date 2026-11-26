@@ -229,7 +229,7 @@
       "level": 0,
       "lucide_icon": "zap",
       "path": "capabilities/automations",
-      "payload_sha256": "f50a139b886c111fd85be21a4a78bf93668ba12efdbc53176d26b6fda2fe3d41",
+      "payload_sha256": "d44ec907e599a30c7567ad805a77dbf8a88480af715f184514ad4389c5cf2e60",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Project-local scheduler and subprocess runner with versioned config, store-backed run history, concurrency, retries, timeouts, and cancellation.",
