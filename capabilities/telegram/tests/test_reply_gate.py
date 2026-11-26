@@ -800,7 +800,7 @@ class GateSession(unittest.IsolatedAsyncioTestCase):
             service = group_settings(gate_block={"enabled": True, "mode": "live"},
                                      profile="telegram-claude", debounce=0.3)
             answering = Answering({"action": "reply", "target_message_id": 1, "emoji": None,
-                                   "reason": "q"}, turn="ok")
+                                   "reason": "q"}, turn="=== REPLY ===\nok")
             async with Session(self, td, service, answering=answering) as s:
                 await s.send(group_message(1, "how do I rerun it?"))
                 await s.send(group_message(2, "Helper, ping"))

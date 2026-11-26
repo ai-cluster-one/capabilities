@@ -1590,7 +1590,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/telegram",
-      "payload_sha256": "bd1914539b46e3e925fae2918c878d759e0dd856f00380e805d78ec46c079e36",
+      "payload_sha256": "121ac10c8591034233a0fe7dd7ced4bcbd629971c988338c6204db3d98e9c6ad",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Telegram CLI over a personal MTProto account — read/search a chat, list a forum's topics, send text/media and reactions into a chat or one of its topics, export history to JSON, transcribe voice/audio. Stateful — run `telegram doctor` first.",
@@ -1606,7 +1606,7 @@
           "title": "Telegram"
         }
       },
-      "version": "2026-11-26 — An authority role can name the profile its turns run on, so a participant's turn can run with no shell while a supervisor's in the same room keeps the full worker"
+      "version": "2026-11-26 — A worker reply that forgets its reply marker is silence"
     },
     "telegrambot": {
       "executable": [

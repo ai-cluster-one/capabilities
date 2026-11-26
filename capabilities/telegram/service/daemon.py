@@ -5543,7 +5543,9 @@ class WorkerRun:
 
 def worker_stub(chat, tail, state=None, procs=None):
     last = tail[-1]["text"] if tail else ""
-    reply = f"[harness-stub] tail {len(tail)} msgs, last: «{last[:80]}»."
+    # The stub answers the way the seeded prompt asks a worker to: its message
+    # under the reply marker, which a dialogue turn needs to send anything.
+    reply = f"=== REPLY ===\n[harness-stub] tail {len(tail)} msgs, last: «{last[:80]}»."
     return {"reply": reply, "meta": {"harness": "stub", "model": None, "is_error": False,
                                      "tokens": {}, "cost_usd": None, "duration_ms": None,
                                      "session_id": None}}
@@ -6060,8 +6062,9 @@ WORKERS = {STUB: worker_stub, "claude": worker_harness, "codex": worker_harness}
 #
 # A declaration, not a guess: nothing about where an opening ended is inferred
 # from the text, so a worker that reasons in the language it answers in is read
-# exactly like one that does not. A worker that never writes the line is left
-# with the reply it wrote, which is what the daemon does today.
+# exactly like one that does not. A worker whose prompt asks for the line and
+# that leaves it out sends nothing: its working-out and its message cannot be
+# told apart, and posting both is the leak the line exists to prevent.
 REPLY_MARKER_LINE = "=== REPLY ==="
 REPLY_MARKER = re.compile(r"^[ \t]*=== REPLY ===[ \t]*$", re.M)
 
@@ -6082,8 +6085,10 @@ def cut_at_reply_marker(reply):
     smaller harm; delivering the reply whole posts the working-out the marker
     exists to keep home.
 
-    Text is dropped only on the `marked` and `silent` paths, both of which the
-    worker declared; an unmarked reply comes back untouched."""
+    Text is dropped here only on the `marked` and `silent` paths, both of which
+    the worker declared; an unmarked reply comes back untouched, and what it
+    means is the dispatch's to decide, since that knows which prompt the turn
+    ran on."""
     matches = list(REPLY_MARKER.finditer(reply))
     if not matches:
         return reply, "unmarked"
@@ -6105,7 +6110,12 @@ def worker_turn(loop, worker, key, tail, state, procs):
 
     A reply the cut empties comes back as the workers' own silent result, so
     every consumer takes the path it already takes for a turn that returned
-    nothing."""
+    nothing. So does an unmarked reply on a turn whose prompt asks for the
+    marker - a dialogue turn or a voice task, both of which read the dialogue's
+    context: a forgotten marker means silence, because the working-out above
+    where the message would have begun cannot be told from the message. A job
+    worker reads its own prompt, which asks for no marker, so its unmarked
+    result is still delivered as written."""
     run_worker = WORKERS.get(worker, worker_harness)
     if isinstance(state.get("profile"), BaseException):
         # A profile that does not resolve or fit ends the turn naming it,
@@ -6130,7 +6140,13 @@ def worker_turn(loop, worker, key, tail, state, procs):
                     # How often the convention is forgotten is the only honest
                     # measure of whether it holds, and it should not have to be
                     # guessed at.
-                    log(f"{key}: reply carried no {REPLY_MARKER_LINE} marker")
+                    if (state.get("registered_job") or {}).get("id"):
+                        log(f"{key}: reply carried no {REPLY_MARKER_LINE} marker")
+                    else:
+                        result["reply"] = ""
+                        result["silent"] = True
+                        log(f"{key}: reply carried no {REPLY_MARKER_LINE} marker; "
+                            f"sent nothing")
                 elif outcome == "silent":
                     result["silent"] = True
                     log(f"{key}: reply put nothing under its {REPLY_MARKER_LINE} "

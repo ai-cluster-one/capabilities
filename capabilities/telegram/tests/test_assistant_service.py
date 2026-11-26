@@ -592,8 +592,10 @@ async def wait_until(predicate, timeout=3):
 
 
 def successful_result(reply="done"):
+    """A worker's answer as a worker following the seeded prompt writes it:
+    a message in words under the reply marker, and nothing for silence."""
     return {
-        "reply": reply,
+        "reply": f"=== REPLY ===\n{reply}" if reply else reply,
         "meta": {
             "harness": "stub",
             "model": None,
@@ -4378,7 +4380,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
             def capture_worker(chat, tail, state=None, procs=None):
                 captured_tail.append(tail)
                 # Return a reply with blockquote formatting
-                return {"reply": "You said:\n<blockquote>voice content</blockquote>",
+                return {"reply": "=== REPLY ===\nYou said:\n<blockquote>voice content</blockquote>",
                         "meta": {"harness": "stub", "model": None, "is_error": False,
                                  "tokens": {}, "cost_usd": None, "duration_ms": None, "session_id": None}}
             daemon.WORKERS["stub"] = capture_worker
@@ -4496,7 +4498,7 @@ class AssistantServiceTests(unittest.IsolatedAsyncioTestCase):
 
             # Worker returns a normal text reply
             def stub_worker(chat, tail, state=None, procs=None):
-                return {"reply": "Hello there!", "meta": {"harness": "stub", "model": None,
+                return {"reply": "=== REPLY ===\nHello there!", "meta": {"harness": "stub", "model": None,
                                                           "is_error": False, "tokens": {},
                                                           "cost_usd": None, "duration_ms": None,
                                                           "session_id": None}}
@@ -8699,8 +8701,8 @@ class ReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
     The daemon used to deliver a worker's opening reasoning along with its
     answer, because nothing told it where one ended and the other began.
     Nothing guesses that now either: the worker writes `=== REPLY ===` above
-    its message, and a reply that carries no such line is delivered exactly as
-    it was written — which is what the daemon already did."""
+    its message, and a reply that carries no such line sends nothing, because
+    its working-out cannot be told from its message."""
 
     async def stop_session(self, client, task):
         client.disconnected.set()
@@ -8714,7 +8716,8 @@ class ReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
         daemon = import_daemon(Path(td), settings())
 
         def worker(_chat, _tail, state=None, _procs=None):
-            return successful_result(reply)
+            # Exactly as written: these cases are about the marker itself.
+            return {**successful_result(""), "reply": reply}
 
         daemon.WORKERS["stub"] = worker
         message = Message(140, text="Assistant, answer this")
@@ -8758,19 +8761,20 @@ class ReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(sent[0]["text"], "Рад помочь.")
 
-    async def test_a_reply_without_the_marker_is_delivered_exactly_as_written(self):
-        """The floor: a worker that forgets is no worse off than before."""
+    async def test_a_reply_without_the_marker_sends_nothing(self):
+        """A forgotten marker is silence: a missed answer can be asked again,
+        working-out posted to a group cannot be taken back."""
         with tempfile.TemporaryDirectory() as td:
-            reply = ("The message is just a thank-you. Nothing to check.\n\n"
+            reply = ("Another message would only repeat it, so I send nothing.\n\n"
                      "Glad it helped.")
             sent, logs = await self.delivered(td, reply)
 
-            self.assertEqual(sent[0]["text"], reply)
+            self.assertEqual(sent, [])
             # How often it is forgotten is the only honest measure of whether
             # the convention holds, so it is on the record rather than guessed.
             self.assertEqual(
                 self.marker_logs(logs),
-                ["123: reply carried no === REPLY === marker"])
+                ["123: reply carried no === REPLY === marker; sent nothing"])
 
     async def test_a_marker_with_nothing_under_it_sends_nothing(self):
         """A worker that declared an empty message chose to say nothing.
@@ -9698,7 +9702,7 @@ class HarnessTurnTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_dialogue_turn_runs_on_its_profile_and_delivers_the_answer(self):
         with tempfile.TemporaryDirectory() as td:
             daemon = import_daemon(Path(td), settings(profile="telegram-codex-high"))
-            fake = FakeHarness(answer="the answer", session_id="thread-3",
+            fake = FakeHarness(answer="=== REPLY ===\nthe answer", session_id="thread-3",
                                tokens={"input": 11, "output": 7, "cache_read": 3})
             daemon.harness_run = fake
             self.enterContext(held(daemon, {"telegram-codex-high": {
@@ -9840,7 +9844,7 @@ class VoiceTaskHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stages_the_thread_and_a_compaction_come_from_the_run(self):
         with tempfile.TemporaryDirectory() as td:
-            fake = FakeHarness(answer="found it", session_id="thread-7", seconds=1.0,
+            fake = FakeHarness(answer="=== REPLY ===\nfound it", session_id="thread-7", seconds=1.0,
                                events=[CODEX_EVENTS[name] for name in (
                                    "turn_started", "command_started", "own_progress_started",
                                    "own_send_started", "reasoning_started", "web_search_started",
@@ -9867,7 +9871,7 @@ class VoiceTaskHarnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_carried_thread_is_resumed_on_the_next_task(self):
         with tempfile.TemporaryDirectory() as td:
-            fake = FakeHarness(answer="again", session_id="thread-7")
+            fake = FakeHarness(answer="=== REPLY ===\nagain", session_id="thread-7")
             daemon, client, session_task, run_task = await self.answered_call(td, fake)
             lane = daemon.WorkerLane()
             lane.pin("thread-7")
@@ -9886,7 +9890,7 @@ class VoiceTaskHarnessTests(unittest.IsolatedAsyncioTestCase):
         frame and the whole call on every hand-over, so it held the same frame
         many times over. After the first it is handed what was said since."""
         with tempfile.TemporaryDirectory() as td:
-            fake = FakeHarness(answer="found it", session_id="thread-7")
+            fake = FakeHarness(answer="=== REPLY ===\nfound it", session_id="thread-7")
             daemon, client, session_task, run_task = await self.answered_call(td, fake)
             session = self.Session.instances[-1]
             said = [{"id": 1, "sender": "Caller", "is_assistant": False,
@@ -10170,7 +10174,7 @@ class FakeConversation:
             self._end()
             return runner_result("claude", ok=False, kind="cancelled", answer="",
                                  session_id=self.session_id, message="turn cancelled")
-        return runner_result("claude", answer=f"answer {len(self.sent)}",
+        return runner_result("claude", answer=f"=== REPLY ===\nanswer {len(self.sent)}",
                              session_id=self.session_id)
 
     def _end(self):
@@ -10214,7 +10218,7 @@ class HotWorkerTests(unittest.IsolatedAsyncioTestCase):
                                          "voice_agent": {"mode": "enabled"}}}
         daemon = import_daemon(Path(td), base, voice_context="Answer briefly.",
                                project_env={"GOOGLE_API_KEY": "test-key"})
-        fake = FakeHarness(answer="from a process of its own")
+        fake = FakeHarness(answer="=== REPLY ===\nfrom a process of its own")
         daemon.harness_run = fake
         # A session the caller carried from before: a call in this mode does
         # not take it up.

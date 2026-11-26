@@ -1718,7 +1718,7 @@ class CallTaskLedgerTests(unittest.IsolatedAsyncioTestCase):
     def child_harness(seconds):
         """A codex harness running a real child for `seconds`, answering
         "found it" in thread-9."""
-        return FakeHarness(answer="found it", session_id="thread-9", seconds=seconds)
+        return FakeHarness(answer="=== REPLY ===\nfound it", session_id="thread-9", seconds=seconds)
 
     @staticmethod
     def call_rows(register, caller="777"):
