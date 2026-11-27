@@ -197,6 +197,10 @@ def test_the_session_records_only_when_recording_is_on(worker, monkeypatch):
     asyncio.run(worker.start_session(off, "agent", "room"))
     assert off.kwargs == {"agent": "agent", "room": "room", "record": False}
     monkeypatch.setitem(worker.SETTINGS, "recording", True)
+    unkept = Session()   # on, but `service run` found no storage to keep it in
+    asyncio.run(worker.start_session(unkept, "agent", "room"))
+    assert unkept.kwargs["record"] is False
+    monkeypatch.setitem(worker.LINE, "recording", {"on": True})
     on = Session()
     asyncio.run(worker.start_session(on, "agent", "room"))
     assert on.kwargs["record"] is True

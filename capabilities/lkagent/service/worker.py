@@ -786,8 +786,12 @@ def sip_participant(ctx: JobContext) -> Any | None:
 
 
 async def start_session(session: Any, agent: Any, room: Any) -> None:
-    """Start the call's session; it records only where the line's `recording` is on."""
-    await session.start(agent=agent, room=room, record=line.recording(SETTINGS))
+    """Start the call's session; it records only where the line's `recording` is on and
+    `service run` found its storage and folder complete (`LINE["recording"]["on"]`), so
+    callva-livekit is never left with a recording and nowhere to put it."""
+    planned = (LINE.get("recording") or {}).get("on") is True
+    await session.start(agent=agent, room=room,
+                        record=line.recording(SETTINGS) and planned)
 
 
 @server.rtc_session(agent_name=AGENT_NAME, on_session_end=on_session_end)

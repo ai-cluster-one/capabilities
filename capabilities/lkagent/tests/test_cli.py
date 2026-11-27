@@ -42,10 +42,16 @@ def refusal(capsys) -> dict:
 
 # ── what it declares ────────────────────────────────────────────────────────
 
-def test_the_connection_is_livekit_only_and_the_openai_key_is_the_machines(cli):
-    assert [f["key"] for f in cli.CONN_FIELDS] == ["url", "api_key_env", "secret_env"]
+def test_the_connection_is_livekit_and_its_recording_storage_and_the_openai_key_is_the_machines(
+        cli):
+    assert [f["key"] for f in cli.CONN_FIELDS] == [
+        "url", "api_key_env", "secret_env", "recording_bucket", "recording_endpoint",
+        "recording_region", "recording_access_key_id_env", "recording_secret_access_key_env"]
     assert [f["env"] for f in cli.CONN_FIELDS if f.get("secret")] == [
-        "LKAGENT_{ID}_API_KEY", "LKAGENT_{ID}_API_SECRET"]
+        "LKAGENT_{ID}_API_KEY", "LKAGENT_{ID}_API_SECRET",
+        "LKAGENT_{ID}_RECORDING_ACCESS_KEY_ID", "LKAGENT_{ID}_RECORDING_SECRET_ACCESS_KEY"]
+    assert not any(f.get("required") for f in cli.CONN_FIELDS
+                   if f["key"].startswith("recording_"))
     assert cli.SETUP_FIELDS == [{
         "key": "OPENAI_API_KEY", "label": "OpenAI API key", "type": "string", "secret": True,
         "required": True, "shared": "OPENAI_API_KEY",
@@ -54,6 +60,7 @@ def test_the_connection_is_livekit_only_and_the_openai_key_is_the_machines(cli):
     keys = {k["key"]: k for k in cli.SETTINGS["keys"]}
     assert keys["agent_name"]["default"] == "" and keys["outbound_trunk"]["default"] == ""
     assert keys["recording"]["type"] == "boolean" and keys["recording"]["default"] is False
+    assert keys["recording_folder"]["default"] == "calls/lkagent"
     assert keys["numbers"]["type"] == "object" and keys["numbers"]["default"] == {}
     for gone in ("openai_key_env", "max_calls", "allowed_capabilities", "read_only",
                  "sip_trunk_id"):
@@ -149,6 +156,57 @@ def test_the_voice_is_given_the_openai_base_url_the_cascade_holds(cli, monkeypat
     values["OPENAI_BASE_URL"] = "https://eu.api.openai.com/v1"
     env, _line = cli._service_plan(None)
     assert env["OPENAI_BASE_URL"] == "https://eu.api.openai.com/v1"
+
+
+RECORDING_SECRETS = {"LKAGENT_C1_RECORDING_ACCESS_KEY_ID": "AKIDplaceholder",
+                     "LKAGENT_C1_RECORDING_SECRET_ACCESS_KEY": "s3-secret-placeholder"}
+STORAGE = {"recording_bucket": "recordings", "recording_endpoint": "https://s3.example",
+           "recording_region": "auto",
+           "recording_access_key_id_env": "LKAGENT_C1_RECORDING_ACCESS_KEY_ID",
+           "recording_secret_access_key_env": "LKAGENT_C1_RECORDING_SECRET_ACCESS_KEY"}
+
+
+def _planned(cli, monkeypatch, storage, settings):
+    values = {"LKAGENT_C1_API_KEY": "APIkey", "LKAGENT_C1_API_SECRET": "secret-value",
+              "OPENAI_API_KEY": "sk-test-placeholder", **RECORDING_SECRETS}
+    entry = {"url": "wss://lk.example", "api_key_env": "LKAGENT_C1_API_KEY",
+             "secret_env": "LKAGENT_C1_API_SECRET", **storage}
+    monkeypatch.setattr(cli, "_connection", lambda wanted: ("c1", dict(entry)))
+    monkeypatch.setattr(cli, "_resolve_env_key",
+                        lambda key: (values.get(key), "env" if key in values else None, None))
+    monkeypatch.setattr(cli, "_line_settings", lambda: dict(settings))
+    monkeypatch.setattr(cli, "_project_root", lambda: None)
+    return cli._service_plan(None)
+
+
+def test_a_recorded_line_hands_callva_livekit_its_own_storage_under_the_folder(
+        cli, monkeypatch):
+    env, line = _planned(cli, monkeypatch, STORAGE,
+                         {"recording": True, "recording_folder": "/calls/lkagent/"})
+    assert {k: v for k, v in env.items() if k.startswith("RECORDING_S3_")} == {
+        "RECORDING_S3_BUCKET": "recordings", "RECORDING_S3_ENDPOINT_URL": "https://s3.example",
+        "RECORDING_S3_REGION": "auto", "RECORDING_S3_ACCESS_KEY_ID": "AKIDplaceholder",
+        "RECORDING_S3_SECRET_ACCESS_KEY": "s3-secret-placeholder",
+        "RECORDING_S3_PREFIX": "calls/lkagent"}
+    assert line["recording"] == {"on": True, "bucket": "recordings",
+                                 "folder": "calls/lkagent", "missing": [], "error": None}
+    assert "placeholder" not in json.dumps(line)   # the line is no secret's home
+
+
+def test_recording_without_its_storage_or_folder_is_refused_never_the_bucket_root(
+        cli, monkeypatch):
+    for storage, settings, missing in (
+            ({}, {"recording": True, "recording_folder": "calls/lkagent"},
+             ["recording_bucket", "recording_access_key_id_env",
+              "recording_secret_access_key_env"]),
+            (STORAGE, {"recording": True, "recording_folder": " / "}, ["recording_folder"])):
+        env, line = _planned(cli, monkeypatch, storage, settings)
+        assert not any(k.startswith("RECORDING_S3_") for k in env)
+        assert line["recording"]["on"] is False and line["recording"]["missing"] == missing
+        assert "recording is on but nothing can be kept" in line["recording"]["error"]
+    env, line = _planned(cli, monkeypatch, STORAGE, {"recording": False})
+    assert not any(k.startswith("RECORDING_S3_") for k in env)
+    assert line["recording"]["on"] is False and line["recording"]["error"] is None
 
 
 def test_service_status_and_logs_read_the_state_directory(cli, monkeypatch, tmp_path):
@@ -248,11 +306,11 @@ def test_no_rule_routing_to_the_agent_is_a_warning(cli):
     assert "SIP service did not answer" in said[0]
 
 
-def _wired(cli, monkeypatch, fake, settings=None):
+def _wired(cli, monkeypatch, fake, settings=None, storage=None, secrets=None):
     entry = {"url": "wss://livekit.example.com", "api_key_env": "LKAGENT_C1_API_KEY",
-             "secret_env": "LKAGENT_C1_API_SECRET", "allow_write": True}
+             "secret_env": "LKAGENT_C1_API_SECRET", "allow_write": True, **(storage or {})}
     values = {"LKAGENT_C1_API_KEY": "APIkey", "LKAGENT_C1_API_SECRET": "secret-value",
-              "OPENAI_API_KEY": "sk-test-placeholder"}
+              "OPENAI_API_KEY": "sk-test-placeholder", **(secrets or {})}
     monkeypatch.setattr(cli, "_doctor_gate", lambda report, wanted: None)
     monkeypatch.setattr(cli, "_connections_registry",
                         lambda: ({"connections": {"c1": entry}, "default": None}, None))
@@ -287,6 +345,31 @@ def test_doctor_reports_the_routing_and_warns_when_nothing_routes(cli, monkeypat
     report = json.loads(capsys.readouterr().out)
     assert report["checks"]["sip"]["numbers"] == ["+15550100", "+15550111"]
     assert report["warnings"] == []
+
+
+def test_doctor_refuses_recording_without_its_storage_and_prints_no_secret(
+        cli, monkeypatch, capsys):
+    rules, trunks = _protos()
+    _wired(cli, monkeypatch, FakeLiveKit(rules, trunks),
+           {"numbers": [{"number": "+15550100"}], "recording": True,
+            "recording_folder": "calls/lkagent"})
+    with pytest.raises(SystemExit) as ended:
+        cli.cmd_doctor(None, offline=True)
+    assert ended.value.code == 2
+    report = json.loads(capsys.readouterr().out)
+    assert report["ok"] is False and report["checks"]["recording"]["ok"] is False
+    assert "recording_bucket" in report["checks"]["recording"]["missing"]
+
+    _wired(cli, monkeypatch, FakeLiveKit(rules, trunks),
+           {"numbers": [{"number": "+15550100"}], "recording": True,
+            "recording_folder": "calls/lkagent"}, storage=STORAGE, secrets=RECORDING_SECRETS)
+    cli.cmd_doctor(None, offline=True)
+    out = capsys.readouterr().out
+    report = json.loads(out)
+    assert report["ok"] and report["checks"]["recording"] == {
+        "ok": True, "on": True, "bucket": "recordings", "folder": "calls/lkagent",
+        "missing": [], "error": None}
+    assert "placeholder" not in out
 
 
 def test_inventory_reaches_livekit_only_under_network(cli, monkeypatch, tmp_path):

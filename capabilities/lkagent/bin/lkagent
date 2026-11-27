@@ -4,7 +4,7 @@
 # dependencies = [
 #     "capabilities-contract>=0.50,<1",
 #     "callva-harness-runner==0.13.1",
-#     "callva-livekit>=0.1.72",
+#     "callva-livekit[s3]>=0.1.74",
 #     "livekit-agents>=1.8.5,<2",
 #     "livekit-api>=1.2.2,<2",
 #     "livekit-plugins-openai>=1.8.5,<2",
@@ -49,6 +49,14 @@ MODEL
   Each finished call is a row of lkagent_calls in the project's store: who, which way,
   when, how it ended, the whole transcript and the call.ended body the webhook gets.
   A project with no store records nothing and says so once on the service log.
+
+  A recorded call (the `recording` setting) leaves its stereo audio and its session
+  report in the S3-compatible bucket the connection's own recording_* fields name,
+  under the folder the `recording_folder` setting names (default calls/lkagent), never
+  in the bucket's root; the call's row keeps both object keys (audio_key and
+  session_report_key). Nothing is taken from another capability's storage. With
+  recording on and that storage incomplete nothing is recorded, and `lkagent doctor`
+  refuses it.
 
 COMMANDS
   Readiness
@@ -95,6 +103,16 @@ _HELP_SETTINGS = """
     lkagent settings set numbers '{"+15550100": {"instructions": "Answer for the front desk.", "allowed_capabilities": ["tasks"], "read_only": false}}'
     lkagent settings set outbound_trunk ST_<id>
     lkagent settings set recording true
+    lkagent settings set recording_folder calls/lkagent
+
+  Where recordings go is the connection's, beside the LiveKit server: recording_bucket,
+  recording_endpoint and recording_region, and the keys recording_access_key_id_env and
+  recording_secret_access_key_env, whose values go on stdin and into the agent's vault
+  (--replace adds them to a connection that exists, keeping its other fields):
+    lkagent connection add <id> --replace --stdin <<< '{"recording_bucket": "<bucket>",
+      "recording_endpoint": "https://<account>.r2.cloudflarestorage.com",
+      "recording_region": "auto", "recording_access_key_id_env": "<key id>",
+      "recording_secret_access_key_env": "<secret>"}'
 """
 
 HELP_VERBS = {
@@ -105,8 +123,10 @@ HELP_VERBS = {
       (rooms listed) and the SIP dispatch rules that route to the line's agent name,
       with the phone numbers they route. Read-only; never prints a secret.
 
-  Output: {ok, checks: {connection, openai_key, backend, line, livekit?, sip?},
-  warnings: [...]}. `sip` is {agent_name, rules: [{id, name, kind, trunk_ids,
+  Output: {ok, checks: {connection, openai_key, backend, line, recording, livekit?,
+  sip?}, warnings: [...]}. `recording` is {on, bucket, folder, missing, error}: with the
+  `recording` setting on, it fails while the connection's recording storage (bucket and
+  both keys) or the `recording_folder` is missing, and the line then records nothing. `sip` is {agent_name, rules: [{id, name, kind, trunk_ids,
   numbers}], numbers, rules_read, inbound_trunks_read}; it reads LiveKit's SIP service
   (ListSIPDispatchRule, ListSIPInboundTrunk). A rule routes to the line when its room
   configuration dispatches the line's agent name; its numbers are its own, else those of
@@ -183,8 +203,10 @@ HELP_VERBS = {
       no secret printed.
 
   Output: {ok, agent_name, url, openai_base_url, agent_root, state_dir, settings,
-  connection, outbound, numbers, calls_recorded: {recorded, reason}}; openai_base_url
-  is null where GPT Live reaches api.openai.com.
+  connection, outbound, numbers, calls_recorded: {recorded, reason}, recording: {on,
+  bucket, folder, missing, error}}; openai_base_url is null where GPT Live reaches
+  api.openai.com. recording.on is whether calls are recorded; a refused recording is
+  error, and the worker still takes calls.
   Exit 0 / 2 credentials missing / 6 input.
 """,
     "settings": _HELP_SETTINGS,
@@ -223,6 +245,29 @@ CONN_FIELDS = [
     {"key": "secret_env", "label": "API secret", "type": "string", "secret": True,
      "required": True, "env": "LKAGENT_{ID}_API_SECRET",
      "help": "The LiveKit API secret."},
+    # Where the line's recordings go: lkagent's own S3-compatible storage, set for it alone
+    # and never taken from another capability's. Optional; recording needs the bucket and
+    # both keys, and the folder is the `recording_folder` setting.
+    {"key": "recording_bucket", "label": "Recording bucket", "type": "string",
+     "required": False,
+     "help": "The S3-compatible bucket call recordings are kept in, under the "
+             "recording_folder setting."},
+    {"key": "recording_endpoint", "label": "Recording endpoint", "type": "url",
+     "required": False,
+     "help": "The bucket's S3 API URL, e.g. https://<account>.r2.cloudflarestorage.com; "
+             "empty for AWS S3."},
+    {"key": "recording_region", "label": "Recording region", "type": "string",
+     "required": False,
+     "help": "The region requests are signed for: auto for Cloudflare R2, the bucket's "
+             "region for AWS S3."},
+    {"key": "recording_access_key_id_env", "label": "Recording access key id",
+     "type": "string", "secret": True, "required": False,
+     "env": "LKAGENT_{ID}_RECORDING_ACCESS_KEY_ID",
+     "help": "The S3 access key id recordings are written with."},
+    {"key": "recording_secret_access_key_env", "label": "Recording secret access key",
+     "type": "string", "secret": True, "required": False,
+     "env": "LKAGENT_{ID}_RECORDING_SECRET_ACCESS_KEY",
+     "help": "The S3 secret access key recordings are written with."},
 ]
 SETUP_FIELDS = [
     {"key": "OPENAI_API_KEY", "label": "OpenAI API key", "type": "string", "secret": True,
@@ -260,8 +305,14 @@ SETTINGS = {
          "help": "The outbound SIP trunk id (ST_...) outgoing calls dial through."},
         {"key": "recording", "label": "Record calls", "type": "boolean", "default": False,
          "scope": "project", "apply": "restart",
-         "help": "Record each call's session; off, nothing is recorded. A recording "
-                 "travels only to the object storage callva-livekit is given."},
+         "help": "Record each call: its stereo audio and session report go to the "
+                 "connection's recording bucket, under recording_folder. Off, nothing is "
+                 "recorded; on without that storage, nothing is recorded and doctor fails."},
+        {"key": "recording_folder", "label": "Recording folder", "type": "string",
+         "default": "calls/lkagent", "scope": "project", "apply": "restart",
+         "help": "The folder in the recording bucket each call's files go under, "
+                 "<folder>/<call id>.ogg and <folder>/<call id>.session.json; never empty, "
+                 "so recordings never land in the bucket's root."},
         {"key": "voice", "label": "Voice", "type": "enum", "choices": VOICES,
          "default": "marin", "scope": "project", "apply": "restart",
          "help": "The GPT Live voice the line speaks in."},
@@ -391,7 +442,7 @@ _contract_bind(globals(), "connections")
 
 from capabilities_contract.db import Step  # noqa: E402  (bound with the tiers above)
 
-TABLES_MAJOR, TABLES_MINOR = 1, 0
+TABLES_MAJOR, TABLES_MINOR = 1, 1
 TABLE_STEPS = [
     # 1.0: one row per call, written when it ends. A row is the agent's own and goes with
     # it (ON DELETE CASCADE): its calls are nobody else's record.
@@ -465,6 +516,16 @@ TABLE_STEPS = [
     COMMENT ON COLUMN lkagent_calls.body IS
         'The whole call.ended body, the same body the webhook gets.';
     """, core=(4, 0)),
+    # 1.1: where a recorded call's files are, as callva-livekit's call.ended body names them.
+    Step("0002-call-recording-keys", """
+    ALTER TABLE lkagent_calls
+        ADD COLUMN audio_key           text CHECK (audio_key <> ''),
+        ADD COLUMN session_report_key  text CHECK (session_report_key <> '');
+    COMMENT ON COLUMN lkagent_calls.audio_key IS
+        'The object key of the call''s stereo audio (<folder>/<call id>.ogg) in the line''s recording bucket; null where the call was not recorded.';
+    COMMENT ON COLUMN lkagent_calls.session_report_key IS
+        'The object key of the call''s session report (<folder>/<call id>.session.json) in the line''s recording bucket; null where the call was not recorded.';
+    """, core=(4, 0)),
 ]
 
 
@@ -531,6 +592,52 @@ def _livekit_env(cid: str, entry: dict) -> tuple[dict, list]:
         else:
             missing.append(field)
     return env, missing
+
+
+RECORDING_STORAGE = (("recording_bucket", "RECORDING_S3_BUCKET", False),
+                     ("recording_endpoint", "RECORDING_S3_ENDPOINT_URL", False),
+                     ("recording_region", "RECORDING_S3_REGION", False),
+                     ("recording_access_key_id_env", "RECORDING_S3_ACCESS_KEY_ID", True),
+                     ("recording_secret_access_key_env", "RECORDING_S3_SECRET_ACCESS_KEY",
+                      True))
+"""The connection's recording fields and the callva-livekit variable each one becomes;
+the third is whether the field names a secret's env key."""
+RECORDING_NEEDS = ("recording_bucket", "recording_access_key_id_env",
+                   "recording_secret_access_key_env")
+
+
+def _recording(entry: dict, settings: dict) -> tuple[dict, dict]:
+    """RECORDING_S3_* for callva-livekit, and what the line says of its recording.
+
+    The environment is filled only where the `recording` setting is on and the connection's
+    own storage and the folder are complete, so callva-livekit is never handed a bucket
+    without a folder; otherwise it is empty and the report names what is missing."""
+    on = _line_module().recording(settings)
+    folder = settings.get("recording_folder")
+    folder = folder.strip().strip("/") if isinstance(folder, str) else ""
+    report = {"on": False, "bucket": entry.get("recording_bucket") or None,
+              "folder": folder or None, "missing": [], "error": None}
+    if not on:
+        return {}, report
+    env = {}
+    for field, var, secret in RECORDING_STORAGE:
+        value = _resolved(entry, field) if secret else entry.get(field)
+        if isinstance(value, str) and value.strip():
+            env[var] = value.strip()
+        elif field in RECORDING_NEEDS:
+            report["missing"].append(field)
+    if not folder:
+        report["missing"].append("recording_folder")
+    if report["missing"]:
+        report["error"] = (
+            "recording is on but nothing can be kept: " + ", ".join(report["missing"])
+            + " not set; set the storage on the connection (`" + NAME + " help settings`) "
+            "and the folder with `" + NAME + " settings set recording_folder <folder>`, "
+            "or turn recording off")
+        return {}, report
+    env["RECORDING_S3_PREFIX"] = folder
+    report["on"] = True
+    return env, report
 
 
 def _agent_name(cid: str, settings: dict) -> str:
@@ -783,6 +890,8 @@ def cmd_doctor(wanted: str | None, offline: bool) -> None:
           liveness=bool(settings.get("user_silence_timeout_seconds")
                         and settings.get("max_prompt_attempts")),
           webhook=bool(settings.get("webhook_url")))
+    recording = _recording(entry or {}, settings)[1]
+    check("recording", recording["error"] is None, **recording)
     if not numbers:
         report["warnings"].append(f"the line has no numbers, so it takes no call; `{NAME} help "
                                   "settings` shows how to add one")
@@ -958,6 +1067,8 @@ def _service_plan(wanted: str | None, migrate: bool = False) -> tuple[dict, dict
             "state_dir": str(_state_dir()), "agent_id": agent_id,
             "calls": _calls_store(agent_id, migrate)}
     env["LKAGENT_AGENT_NAME"] = _agent_name(cid, settings)
+    storage, line["recording"] = _recording(entry, settings)
+    env.update(storage)
     return env, line
 
 
@@ -1068,7 +1179,7 @@ def cmd_service(args, wanted: str | None) -> None:
                "outbound": bool(settings.get("outbound_trunk")),
                "numbers": [n["number"]
                            for n in _line_module().entries(settings.get("numbers"))],
-               "calls_recorded": line["calls"]})
+               "calls_recorded": line["calls"], "recording": line["recording"]})
         return
     os.environ.update(env)
     os.environ["LKAGENT_LINE"] = json.dumps(line)
@@ -1077,6 +1188,11 @@ def cmd_service(args, wanted: str | None) -> None:
     if not line["calls"]["recorded"]:
         print(json.dumps({"warning": f"calls are not recorded: {line['calls']['reason']}"}),
               file=sys.stderr)
+    if line["recording"]["error"]:
+        import logging
+
+        logging.getLogger(NAME).warning(line["recording"]["error"])
+        print(json.dumps({"warning": line["recording"]["error"]}), file=sys.stderr)
     sys.path.insert(0, str(_BUNDLE / "service"))
     import worker  # noqa: PLC0415 - heavy, and only for the running service
 

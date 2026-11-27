@@ -93,8 +93,20 @@ def test_a_row_is_read_from_the_call_ended_body():
     assert row["outcome"] == "success" and row["tags"] == ["booked"]
     assert row["backend_session_id"] == "sess-1" and row["task"] == "Confirm the slot"
     assert row["scheduled_at"] is None and row["recording_url"] is None
+    assert row["audio_key"] is None and row["session_report_key"] is None
     assert row["body"] is body
     assert set(row) == set(calls.COLUMNS)
+
+
+def test_a_recorded_call_keeps_where_its_files_are():
+    body = ended_body()
+    body["recording"] = {"delivery": "storage", "audio_key": "calls/lkagent/c-1.ogg",
+                         "session_report_key": "calls/lkagent/c-1.session.json"}
+    row = calls.row(body, agent_id="a")
+    assert (row["audio_key"], row["session_report_key"]) == (
+        "calls/lkagent/c-1.ogg", "calls/lkagent/c-1.session.json")
+    body["recording"]["audio_key"] = None   # a session that made no audio
+    assert calls.recording_keys(body) == (None, "calls/lkagent/c-1.session.json")
 
 
 def test_a_call_nobody_took_is_no_answer_and_says_why():
@@ -146,7 +158,8 @@ def test_the_table_migrates_and_takes_a_row_once(tmp_path, monkeypatch):
     conn = db.connect(application_name="lkagent-test", project_root=tmp_path, transaction=True)
     try:
         done = db.migrate(conn, "lkagent", steps, major=major, minor=minor)
-        assert done.applied == ["0001-calls"] and (done.major, done.minor) == (1, 0)
+        assert done.applied == ["0001-calls", "0002-call-recording-keys"]
+        assert (done.major, done.minor) == (1, 1)
         again = db.migrate(conn, "lkagent", steps, major=major, minor=minor)
         assert again.applied == []
     finally:
@@ -155,6 +168,8 @@ def test_the_table_migrates_and_takes_a_row_once(tmp_path, monkeypatch):
     with psycopg.connect(dsn, autocommit=True) as admin:
         admin.execute(f"INSERT INTO {schema}.agents (id, kind) VALUES (%s, 'agent')", (agent,))
     body = ended_body()
+    body["recording"] = {"delivery": "storage", "audio_key": "calls/lkagent/c-1.ogg",
+                         "session_report_key": "calls/lkagent/c-1.session.json"}
     recorder = calls.Recorder(str(tmp_path), agent)
     assert recorder.record(body, backend_session_id="sess-1", task=None)["call_id"]
     assert recorder.record(body) is not None   # the same call again changes nothing
@@ -162,14 +177,15 @@ def test_the_table_migrates_and_takes_a_row_once(tmp_path, monkeypatch):
         admin.execute(f"SET search_path TO {schema}")
         rows = admin.execute(
             "SELECT agent_id, call_id, direction, status, ended_by, duration_seconds, "
-            "started_at, transcript, body->'call'->>'id', backend_session_id "
-            "FROM lkagent_calls").fetchall()
+            "started_at, transcript, body->'call'->>'id', backend_session_id, audio_key, "
+            "session_report_key FROM lkagent_calls").fetchall()
         assert len(rows) == 1
         got = rows[0]
         assert got[0] == agent and got[1] == body["call"]["id"] and got[8] == got[1]
         assert (got[2], got[3], got[4], float(got[5])) == ("inbound", "completed", "user", 42.5)
         assert got[6].astimezone(datetime.timezone.utc).isoformat() == "2026-09-21T14:13:20+00:00"
         assert [t["role"] for t in got[7]] == ["assistant", "user"] and got[9] == "sess-1"
+        assert got[10:] == ("calls/lkagent/c-1.ogg", "calls/lkagent/c-1.session.json")
         with pytest.raises(psycopg.errors.CheckViolation):
             admin.execute("INSERT INTO lkagent_calls (agent_id, call_id, direction, status, body)"
                           " VALUES (%s, 'c2', 'inbound', 'busy', '{}')", (agent,))

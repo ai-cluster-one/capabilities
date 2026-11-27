@@ -27,7 +27,7 @@ NOT_ANSWERED = frozenset({"no_answer", "rejected", "canceled"})
 COLUMNS = ("agent_id", "call_id", "direction", "from_number", "caller_name", "to_number",
            "started_at", "ended_at", "duration_seconds", "status", "ended_by",
            "failure_reason", "transcript", "outcome", "tags", "backend_session_id", "task",
-           "scheduled_at", "recording_url", "body")
+           "scheduled_at", "recording_url", "audio_key", "session_report_key", "body")
 JSON_COLUMNS = frozenset({"transcript", "body"})
 
 
@@ -68,6 +68,16 @@ def transcript(body: dict) -> list:
     return said
 
 
+def recording_keys(body: dict) -> tuple[str | None, str | None]:
+    """Where callva-livekit put the call's audio and session report: the keys its
+    `call.ended` body names under `recording`, or (None, None) for a call not recorded."""
+    recording = body.get("recording")
+    if not isinstance(recording, dict) or recording.get("delivery") != "storage":
+        return None, None
+    keys = (recording.get("audio_key"), recording.get("session_report_key"))
+    return tuple(k if isinstance(k, str) and k else None for k in keys)
+
+
 def row(body: dict, *, agent_id: str, backend_session_id: str | None = None,
         task: str | None = None) -> dict:
     """The `lkagent_calls` row for a finished call, from its `call.ended` body."""
@@ -77,6 +87,7 @@ def row(body: dict, *, agent_id: str, backend_session_id: str | None = None,
     tagged = body.get("tags") or {}
     ended_by = call.get("ended_by")
     tags = [t for t in (tagged.get("tags") or []) if isinstance(t, str)]
+    audio_key, session_report_key = recording_keys(body)
     return {
         "agent_id": agent_id,
         "call_id": call.get("id") or body.get("id"),
@@ -97,6 +108,8 @@ def row(body: dict, *, agent_id: str, backend_session_id: str | None = None,
         "task": task,
         "scheduled_at": None,
         "recording_url": None,
+        "audio_key": audio_key,
+        "session_report_key": session_report_key,
         "body": body,
     }
 
