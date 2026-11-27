@@ -30,6 +30,20 @@ def test_a_number_is_matched_on_its_digits():
     assert line.number_entry([FRONT], None) is None and line.number_entry(None, "+1") is None
 
 
+def test_numbers_keyed_by_the_number_read_as_the_list_did():
+    keyed = line.keyed([FRONT, SALES])
+    assert keyed == {"+15550100": {k: v for k, v in FRONT.items() if k != "number"},
+                     "+15550111": {k: v for k, v in SALES.items() if k != "number"}}
+    assert line.keyed(keyed) is keyed and line.keyed(None) == {}
+    assert line.number_entry(keyed, "+1 555 0100")["instructions"] == FRONT["instructions"]
+    assert line.number_entry(keyed, "+15550199") is None
+    assert [e["number"] for e in line.entries(keyed)] == ["+15550100", "+15550111"]
+    assert line.numbers_problems(keyed) == []
+    found = line.numbers_problems({"15550100": {}, "+15550122": {"read_only": "no"}})
+    assert any("E.164" in p for p in found)
+    assert any("numbers['+15550122'].read_only" in p for p in found)
+
+
 def test_the_called_number_is_the_sip_trunk_number_inbound_and_the_dispatched_one_outbound():
     attrs = {"sip.trunkPhoneNumber": "+15550100", "sip.phoneNumber": "+15550123"}
     assert line.line_number("inbound", attrs, None) == "+15550100"

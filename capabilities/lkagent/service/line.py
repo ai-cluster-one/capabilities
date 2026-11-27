@@ -758,41 +758,84 @@ def digits(number: Any) -> str:
     return re.sub(r"\D", "", number) if isinstance(number, str) else ""
 
 
+def number_key(number: Any) -> str:
+    """A number as `numbers` keys it, E.164: + and its digits alone; empty where none."""
+    found = digits(number)
+    return f"+{found}" if found else ""
+
+
+def keyed(numbers: Any) -> dict:
+    """`numbers` keyed by the number, each entry without the number it is keyed by. The
+    list form a line kept before - [{number, ...}] - comes back keyed, nothing in it lost."""
+    if isinstance(numbers, dict):
+        return numbers
+    out: dict = {}
+    for entry in numbers if isinstance(numbers, list) else []:
+        if isinstance(entry, dict) and number_key(entry.get("number")):
+            out[number_key(entry["number"])] = {k: v for k, v in entry.items() if k != "number"}
+    return out
+
+
+def entries(numbers: Any) -> list[dict]:
+    """The line's numbers as entries, each {number, instructions, allowed_capabilities,
+    read_only}, from the keyed form or the list form a line kept before."""
+    if isinstance(numbers, list):
+        return [n for n in numbers if isinstance(n, dict)]
+    if not isinstance(numbers, dict):
+        return []
+    return [{**(entry if isinstance(entry, dict) else {}), "number": number}
+            for number, entry in numbers.items()]
+
+
 def number_entry(numbers: Any, number: str | None) -> dict | None:
     """The `numbers` entry for `number`, or None where the line has no entry for it."""
     wanted = digits(number)
-    if not wanted or not isinstance(numbers, list):
+    if not wanted:
         return None
-    for entry in numbers:
-        if isinstance(entry, dict) and digits(entry.get("number")) == wanted:
+    for entry in entries(numbers):
+        if digits(entry.get("number")) == wanted:
             return entry
     return None
 
 
 def numbers_problems(numbers: Any) -> list[str]:
-    """What is wrong with a `numbers` setting, as a person would fix it; empty when nothing."""
+    """What is wrong with a `numbers` setting, as a person would fix it; empty when nothing.
+    The list form a line kept before is read as it always was, until `service run` keys it."""
     if numbers is None:
         return []
-    if not isinstance(numbers, list):
-        return ["numbers is a list of {number, instructions, allowed_capabilities, read_only}"]
+    if isinstance(numbers, list):
+        return _entry_problems((f"numbers[{i}]", entry, True)
+                               for i, entry in enumerate(numbers))
+    if not isinstance(numbers, dict):
+        return ["numbers is an object keyed by the number, +<country code><number>: "
+                "{instructions, allowed_capabilities, read_only}"]
+    problems = [f"numbers key {number!r} is a number in E.164, +<country code><number>"
+                for number in numbers
+                if not re.fullmatch(r"\+[1-9]\d{3,14}", str(number))]
+    problems += _entry_problems((f"numbers[{number!r}]", entry, False)
+                                for number, entry in numbers.items())
+    return problems
+
+
+def _entry_problems(items) -> list[str]:
     problems: list[str] = []
     seen: set[str] = set()
-    for i, entry in enumerate(numbers):
-        where = f"numbers[{i}]"
+    for where, entry, listed in items:
         if not isinstance(entry, dict):
-            problems.append(f"{where} is an object with a number")
+            problems.append(f"{where} is an object" + (" with a number" if listed else ""))
             continue
-        extra = sorted(set(entry) - NUMBER_KEYS)
+        extra = sorted(set(entry) - (NUMBER_KEYS if listed else NUMBER_KEYS - {"number"}))
         if extra:
             problems.append(f"{where} has keys this line does not read: {', '.join(extra)}")
-        number = entry.get("number")
-        if not (isinstance(number, str) and re.fullmatch(r"\+?[\d\s().-]{4,}", number.strip())
-                and digits(number)):
-            problems.append(f"{where}.number is a phone number, +<country code><number>")
-        elif digits(number) in seen:
-            problems.append(f"{where}.number {number} is configured twice")
-        else:
-            seen.add(digits(number))
+        if listed:
+            number = entry.get("number")
+            if not (isinstance(number, str)
+                    and re.fullmatch(r"\+?[\d\s().-]{4,}", number.strip()) and digits(number)):
+                problems.append(f"{where}.number is a phone number, +<country code><number>")
+            elif digits(number) in seen:
+                problems.append(f"{where}.number {number} is configured twice")
+            else:
+                seen.add(digits(number))
         if not isinstance(entry.get("instructions", ""), str):
             problems.append(f"{where}.instructions is text")
         allowed = entry.get("allowed_capabilities", [])

@@ -1,5 +1,13 @@
 # lkagent — change log
 
+## 2026-11-27 — lkagent's line runs under the node supervisor, reads its log, keys its numbers by the number, and reaches OpenAI where the key's project is served
+
+`capabilities node supervise lkagent` refused the line with `no_service` (`lkagent's service declares no deploy command`), so a node ran it only where somebody started it by hand and nothing brought it back after a restart. The service now declares `service.deploy`: `lkagent service run` is its command and `lkagent service doctor` its doctor, so the node's supervisor runs it where the node's gate places it. The service gains `service status` (whether the recorded worker is alive, and since when) and `service logs [--tail N]` (the end of `service.log` in the line's state directory, which `service run` appends everything the worker and its calls log to); `service logs` answered `invalid choice: logs` before.
+
+The `numbers` setting is an object keyed by the number in E.164 - `{"+15550100": {instructions, allowed_capabilities, read_only}}` - so a number's configuration is found by the number itself. A line that kept its numbers as the list they were kept as before is read as it was, and `service run` writes that list keyed once, every entry whole; a list the line's own check refuses is left as it is. `lkagent settings set numbers` takes the keyed form.
+
+The voice reached OpenAI only at api.openai.com, so a key of a project served elsewhere - an EU project, served at `https://eu.api.openai.com/v1` - was refused and the call dropped. `service run` now resolves `OPENAI_BASE_URL` through the credential cascade, the agent's vault first, and gives it to GPT Live beside the key; `service doctor` shows it as `openai_base_url`. Unset, nothing changes.
+
 ## 2026-11-26 — LiveKit Agent shows LiveKit's mark, not a phone glyph
 
 `lkagent` declared the Lucide icon `phone` beside its `icon.png`, and a reader that draws a declared Lucide glyph before the capability's own picture showed a plain outlined phone. Its icon is LiveKit's brand mark, and a capability whose icon is a brand mark declares no Lucide icon, so `lkagent` no longer declares `LUCIDE_ICON`: the manifest and the catalogue entry carry `icon: true` and no `lucide_icon`, and `icon.png` is unchanged. Nothing else changes.

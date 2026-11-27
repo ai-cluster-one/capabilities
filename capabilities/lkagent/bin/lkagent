@@ -39,7 +39,8 @@ MODEL
   up in LiveKit and the carrier (`lkagent guide twilio-number`); this capability reads
   them and never changes them.
 
-  The line's numbers are its settings (`numbers`). A call is taken only on one of them -
+  The line's numbers are its settings (`numbers`, keyed by the number). A call is taken
+  only on one of them -
   an inbound call on the number it called, an outbound one on the number it is placed
   from - and the backend runs under that number's instructions and rights: the
   capabilities it may run and whether it is read-only. A call on any other number is
@@ -59,6 +60,8 @@ COMMANDS
 
   The worker
     lkagent service run            run the worker in the foreground until stopped
+    lkagent service status         whether the worker is running, and since when
+    lkagent service logs           the end of the worker's log
 
 THE WRITE GATE
   `call` reaches a person outside the system, so it needs the connection's write grant
@@ -73,19 +76,23 @@ EXIT CODES
 
 _HELP_SETTINGS = """
   The line's settings are read when the worker starts; restart it after a change.
-  Rights have one home, the number: `numbers` is a list of objects
-    {"number": "+<country><number>", "instructions": "<text>",
-     "allowed_capabilities": ["<capability>", ...] or ["*"], "read_only": true|false}
-  A call on a number is bound by that entry: its instructions are added to the backend's
+  Rights have one home, the number: `numbers` is an object keyed by the number in E.164
+    {"+<country><number>": {"instructions": "<text>",
+       "allowed_capabilities": ["<capability>", ...] or ["*"], "read_only": true|false}}
+  A call on a number is bound by its entry: its instructions are added to the backend's
   system prompt after backend_prompt, allowed_capabilities is what the backend session
   may run (none when empty, every one with "*"), and read_only puts it under the
-  read-only switch. A number is matched on its digits.
+  read-only switch. A number is matched on its digits. A line that kept its numbers as
+  the list it was kept as before, [{"number": ..., ...}], is read as it was, and
+  `service run` writes it keyed once, every entry whole.
 
   The OpenAI key GPT Live runs on is the machine's OPENAI_API_KEY (`lkagent help setup`),
-  resolved from the agent's vault first; it is no setting.
+  resolved from the agent's vault first; it is no setting. OPENAI_BASE_URL, resolved the
+  same way, is where GPT Live reaches OpenAI when the key's project is served elsewhere
+  (https://eu.api.openai.com/v1 for an EU project); unset, it is api.openai.com.
 
   Examples:
-    lkagent settings set numbers '[{"number": "+15550100", "instructions": "Answer for the front desk.", "allowed_capabilities": ["tasks"], "read_only": false}]'
+    lkagent settings set numbers '{"+15550100": {"instructions": "Answer for the front desk.", "allowed_capabilities": ["tasks"], "read_only": false}}'
     lkagent settings set outbound_trunk ST_<id>
     lkagent settings set recording true
 """
@@ -142,8 +149,30 @@ HELP_VERBS = {
       --dev runs LiveKit's development mode (reload on change, verbose logs).
 
   Needs the project to enable lkagent explicitly, the connection, OPENAI_API_KEY, and
-  a `claude` or `codex` the backend runs on. Settings are read as it starts.
+  a `claude` or `codex` the backend runs on. Settings are read as it starts, and
+  numbers kept in the list form are written keyed by the number first. Everything the
+  worker logs is also appended to service.log in the state directory, which
+  `service logs` reads. This is the deploy command: `capabilities node supervise
+  lkagent` runs it where the node's gate places the service.
   Exit 0 stopped / 2 credentials missing / 4 not enabled in this project / 6 input.
+""",
+    "service status": """\
+  lkagent service status
+      Whether the worker is running in this agent's folder: the pid it recorded and
+      whether that process is alive, when it started, and where its log is. Local.
+
+  Output: {running, state, pid, started_at, state_dir, log}; state is running or
+  stopped. Exit 0.
+""",
+    "service logs": """\
+  lkagent service logs [--tail N]
+      The last N lines (default 200) of the worker's log, service.log in the state
+      directory, which `service run` appends everything the worker logs to. Local.
+
+  Output: {log, lines: [...]}; no log yet is an empty list. Exit 0 / 6 a bad --tail.
+
+  Example:
+    lkagent service logs --tail 50
 """,
     "service doctor": """\
   lkagent service doctor [--connection <id>]
@@ -153,8 +182,9 @@ HELP_VERBS = {
       calls are recorded (the store resolves and the project has an agent id). Local;
       no secret printed.
 
-  Output: {ok, agent_name, url, agent_root, state_dir, settings, connection, outbound,
-  numbers, calls_recorded: {recorded, reason}}.
+  Output: {ok, agent_name, url, openai_base_url, agent_root, state_dir, settings,
+  connection, outbound, numbers, calls_recorded: {recorded, reason}}; openai_base_url
+  is null where GPT Live reaches api.openai.com.
   Exit 0 / 2 credentials missing / 6 input.
 """,
     "settings": _HELP_SETTINGS,
@@ -215,11 +245,12 @@ VOICES = ["alloy", "ash", "aster", "ballad", "beacon", "bossa", "cedar", "cinder
 SETTINGS = {
     "homes": [{"scope": "project", "path": "settings.json", "format": "json"}],
     "keys": [
-        {"key": "numbers", "label": "Numbers", "type": "list", "default": [],
+        {"key": "numbers", "label": "Numbers", "type": "object", "default": {},
          "scope": "project", "apply": "restart",
-         "help": "The line's numbers, each {number, instructions, allowed_capabilities, "
-                 "read_only}: a call is taken only on one of them and runs under its "
-                 "instructions and rights; `lkagent help settings` shows the shape."},
+         "help": "The line's numbers, keyed by the number in E.164 (+<country><number>), "
+                 "each {instructions, allowed_capabilities, read_only}: a call is taken "
+                 "only on one of them and runs under its instructions and rights; "
+                 "`lkagent help settings` shows the shape."},
         {"key": "agent_name", "label": "Agent name", "type": "string", "default": "",
          "scope": "project", "apply": "restart",
          "help": "The dispatch name the worker registers under, which dispatch rules and "
@@ -320,8 +351,25 @@ SERVICE = {
                 "harness session answers its delegations under the number's rights and "
                 "meets a silent line, callva-livekit ends the call on its limits and "
                 "reports it to the webhook, and each call is recorded in the store."),
-    "verbs": ["run", "doctor"],
+    "verbs": ["run", "doctor", "status", "logs"],
     "state": "$XDG_STATE_HOME/capabilities/projects/<project-slug>/lkagent",
+    "deploy": {
+        "schema": "capabilities.service.deploy.v1",
+        "default_policy": "auto",
+        "command": ["lkagent", "service", "run"],
+        "environment": {
+            "required": [],
+            "optional": [{"key": "OPENAI_API_KEY"}, {"key": "OPENAI_BASE_URL"}],
+        },
+        "mounts": [
+            {"name": "lkagent_state", "kind": "state",
+             "target": "{agent_home}/.local/state/capabilities/projects"},
+            {"name": "claude_state", "kind": "shared", "target": "{agent_home}/.claude"},
+            {"name": "codex_state", "kind": "shared", "target": "{agent_home}/.codex"},
+        ],
+        "restart": "unless-stopped",
+        "doctor": ["lkagent", "service", "doctor"],
+    },
 }
 
 _CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config"))
@@ -632,7 +680,7 @@ def _inventory(network: bool) -> dict:
     except SystemExit:
         settings = {}
         deferred.append({"label": "numbers", "note": "the line's settings could not be read"})
-    numbers = [n for n in (settings.get("numbers") or []) if isinstance(n, dict)]
+    numbers = _line_module().entries(settings.get("numbers"))
     metrics.append({"label": "numbers", "value": len(numbers)})
     for entry in numbers:
         allowed = entry.get("allowed_capabilities") or []
@@ -724,7 +772,7 @@ def cmd_doctor(wanted: str | None, offline: bool) -> None:
               effort=profile.effort, version=probe_.version, error=probe_.error)
     except Exception as exc:
         check("backend", False, error=f"{type(exc).__name__}: {exc}")
-    numbers = [n for n in (settings.get("numbers") or []) if isinstance(n, dict)]
+    numbers = _line_module().entries(settings.get("numbers"))
     check("line", True, numbers=[{"number": n.get("number"),
                                   "allowed_capabilities": n.get("allowed_capabilities") or [],
                                   "read_only": n.get("read_only") is True} for n in numbers],
@@ -811,7 +859,8 @@ def cmd_call(wanted: str | None, number: str, task: str | None, caller: str | No
     if not number.strip().lstrip("+").isdigit():
         _die(6, "bad_number", f"{number!r} is not a phone number", "give it as +<digits>")
     settings = _line_settings()
-    line_number = _caller_number(settings.get("numbers") or [], caller)["number"]
+    line_number = _caller_number(_line_module().entries(settings.get("numbers")),
+                                 caller)["number"]
     config_file = _state_dir() / "call-config.json"
     try:
         config = json.loads(config_file.read_text())
@@ -897,6 +946,11 @@ def _service_plan(wanted: str | None, migrate: bool = False) -> tuple[dict, dict
              "store it in the agent's vault: capabilities secrets set OPENAI_API_KEY, or "
              f"`{NAME} setup set --stdin`")
     env["OPENAI_API_KEY"] = key
+    # Where GPT Live reaches OpenAI: a key of a project served elsewhere (an EU project's
+    # eu.api.openai.com) is refused at api.openai.com, the plugin's default.
+    base_url = _resolve_env_key("OPENAI_BASE_URL")[0]
+    if base_url:
+        env["OPENAI_BASE_URL"] = base_url
     root = _project_root()
     agent_id = _project_id(write=True, refuse=False) if root is not None else None
     line = {"settings": settings, "connection": cid,
@@ -907,16 +961,113 @@ def _service_plan(wanted: str | None, migrate: bool = False) -> tuple[dict, dict
     return env, line
 
 
+SERVICE_LOG_KEEP = 5 * 1024 * 1024   # past this the log moves to service.log.1 at start
+
+
+def _service_log() -> Path:
+    return _state_dir() / "service.log"
+
+
+def _key_numbers() -> list[str]:
+    """Write `numbers` keyed by the number in every home that still keeps it as the list it
+    was kept as before, every entry whole; the scopes rewritten. A list the line's own
+    check refuses is left as it is, so nothing in it is lost."""
+    line, done = _line_module(), []
+    for home in _settings_homes():
+        where, document, error = _settings_read(home)
+        numbers = (document or {}).get("numbers") if isinstance(document, dict) else None
+        if error or not isinstance(numbers, list) or line.numbers_problems(numbers):
+            continue
+        if _settings_in_rows(home):
+            _settings_rows_write(home, home["scope"],
+                                 lambda d: {**d, "numbers": line.keyed(d.get("numbers"))})
+        else:
+            _settings_write(home, where, {**document, "numbers": line.keyed(numbers)})
+        done.append(home["scope"])
+    return done
+
+
+def _log_to_file(log: Path) -> None:
+    """Everything the worker logs - its own lines, LiveKit's, and each call's, which the
+    job processes hand back to this one - also appended to `log`, and an exception that
+    ends it with them."""
+    import logging
+
+    log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if log.exists() and log.stat().st_size > SERVICE_LOG_KEEP:
+        log.replace(log.with_name(log.name + ".1"))
+    handler = logging.FileHandler(log, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.getLogger().addHandler(handler)
+    logging.getLogger().setLevel(logging.INFO)
+    hook = sys.excepthook
+
+    def ended(kind, value, tb):
+        logging.getLogger(NAME).critical("the worker ended", exc_info=(kind, value, tb))
+        hook(kind, value, tb)
+
+    sys.excepthook = ended
+
+
+def _service_status() -> dict:
+    """Whether the worker recorded in this agent's state directory is alive."""
+    pid, started = None, None
+    try:
+        pid = int(_pid_file().read_text().strip())
+        started = _pid_file().stat().st_mtime
+        os.kill(pid, 0)
+        cmdline = Path(f"/proc/{pid}/cmdline")
+        running = (not cmdline.exists()) or NAME.encode() in cmdline.read_bytes()
+    except (OSError, ValueError):
+        running = False
+    import datetime as _dt
+
+    return {"running": running, "state": "running" if running else "stopped",
+            "pid": pid if running else None,
+            "started_at": (_dt.datetime.fromtimestamp(started, _dt.timezone.utc)
+                           .isoformat(timespec="seconds") if running and started else None),
+            "state_dir": str(_state_dir()), "log": str(_service_log())}
+
+
+def _service_logs(tail: int) -> dict:
+    if tail < 1:
+        _die(6, "input", "--tail is a whole number of lines, at least 1")
+    log = _service_log()
+    try:
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()[-tail:]
+    except OSError:
+        lines = []
+    return {"log": str(log), "lines": lines}
+
+
 def cmd_service(args, wanted: str | None) -> None:
+    if args.service_cmd == "status":
+        _emit(_service_status())
+        return
+    if args.service_cmd == "logs":
+        _emit(_service_logs(args.tail))
+        return
+    if args.service_cmd == "run":
+        _log_to_file(_service_log())
+        try:
+            keyed = _key_numbers()
+        except SystemExit:
+            keyed = []
+            print(json.dumps({"warning": "the line's numbers could not be written keyed by "
+                                         "the number; they are read as they are"}),
+                  file=sys.stderr)
+        if keyed:
+            print(json.dumps({"numbers_keyed": keyed}), file=sys.stderr)
     env, line = _service_plan(wanted, migrate=args.service_cmd == "run")
     settings = line["settings"]
     if args.service_cmd == "doctor":
         _emit({"ok": True, "agent_name": env["LKAGENT_AGENT_NAME"], "url": env["LIVEKIT_URL"],
+               "openai_base_url": env.get("OPENAI_BASE_URL"),
                "agent_root": line["agent_root"], "state_dir": line["state_dir"],
                "settings": settings, "connection": line["connection"],
                "outbound": bool(settings.get("outbound_trunk")),
-               "numbers": [n.get("number") for n in settings.get("numbers") or []
-                           if isinstance(n, dict)],
+               "numbers": [n["number"]
+                           for n in _line_module().entries(settings.get("numbers"))],
                "calls_recorded": line["calls"]})
         return
     os.environ.update(env)
@@ -949,6 +1100,9 @@ def _parser() -> argparse.ArgumentParser:
     r = ss.add_parser("run", allow_abbrev=False)
     r.add_argument("--dev", action="store_true")
     ss.add_parser("doctor", allow_abbrev=False)
+    ss.add_parser("status", allow_abbrev=False)
+    lg = ss.add_parser("logs", allow_abbrev=False)
+    lg.add_argument("--tail", type=int, default=200)
     return p
 
 

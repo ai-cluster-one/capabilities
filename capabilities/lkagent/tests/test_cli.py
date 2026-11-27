@@ -54,7 +54,7 @@ def test_the_connection_is_livekit_only_and_the_openai_key_is_the_machines(cli):
     keys = {k["key"]: k for k in cli.SETTINGS["keys"]}
     assert keys["agent_name"]["default"] == "" and keys["outbound_trunk"]["default"] == ""
     assert keys["recording"]["type"] == "boolean" and keys["recording"]["default"] is False
-    assert keys["numbers"]["type"] == "list" and keys["numbers"]["default"] == []
+    assert keys["numbers"]["type"] == "object" and keys["numbers"]["default"] == {}
     for gone in ("openai_key_env", "max_calls", "allowed_capabilities", "read_only",
                  "sip_trunk_id"):
         assert gone not in keys
@@ -91,6 +91,75 @@ def test_the_openai_key_resolves_through_the_cascade_vault_first(cli, tmp_path, 
 def test_a_settings_document_with_a_bad_number_is_refused(cli):
     assert cli._settings_check("project", {"numbers": [{"number": "+15550100"}]}) == []
     assert cli._settings_check("project", {"numbers": [{"number": "front"}]})
+    assert cli._settings_check("project", {"numbers": {"+15550100": {"read_only": True}}}) == []
+    assert cli._settings_check("project", {"numbers": {"front": {}}})
+    assert cli._settings_check("project", {"numbers": {"+15550100": {"number": "+1"}}})
+
+
+def test_the_service_is_one_the_node_supervisor_runs(cli):
+    deploy = cli.SERVICE["deploy"]
+    assert deploy["command"] == ["lkagent", "service", "run"]
+    assert deploy["doctor"] == ["lkagent", "service", "doctor"]
+    assert {"run", "doctor", "status", "logs"} <= set(cli.SERVICE["verbs"])
+    assert {"service status", "service logs"} <= set(cli.HELP_VERBS)
+
+
+def _file_settings(cli, tmp_path, monkeypatch, document):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps(document))
+    monkeypatch.setattr(cli, "_settings_home_path", lambda home: path)
+    monkeypatch.setattr(cli, "_settings_in_rows", lambda home: False)
+    monkeypatch.setattr(cli, "_records", lambda: type("R", (), {
+        "guard_write": staticmethod(lambda *a: None)})())
+    return path
+
+
+def test_numbers_kept_as_a_list_are_written_keyed_once_and_nothing_is_lost(
+        cli, tmp_path, monkeypatch):
+    listed = {"number": "+1 555 0142", "instructions": "Answer as the line.",
+              "allowed_capabilities": ["tasks", "memory"], "read_only": False}
+    path = _file_settings(cli, tmp_path, monkeypatch, {"numbers": [listed], "voice": "ash"})
+    assert cli._key_numbers() == ["project"]
+    written = json.loads(path.read_text())
+    assert written == {"voice": "ash", "numbers": {"+15550142": {
+        "instructions": "Answer as the line.", "allowed_capabilities": ["tasks", "memory"],
+        "read_only": False}}}
+    assert cli._key_numbers() == []                      # once: keyed stays as it is
+    assert cli._line_module().number_entry(written["numbers"], "+15550142")["read_only"] is False
+
+
+def test_a_list_the_check_refuses_is_not_rewritten(cli, tmp_path, monkeypatch):
+    kept = {"numbers": [{"number": "front desk"}]}
+    path = _file_settings(cli, tmp_path, monkeypatch, kept)
+    assert cli._key_numbers() == [] and json.loads(path.read_text()) == kept
+
+
+def test_the_voice_is_given_the_openai_base_url_the_cascade_holds(cli, monkeypatch, tmp_path):
+    values = {"LKAGENT_C1_API_KEY": "APIkey", "LKAGENT_C1_API_SECRET": "secret-value",
+              "OPENAI_API_KEY": "sk-test-placeholder"}
+    entry = {"url": "wss://lk.example", "api_key_env": "LKAGENT_C1_API_KEY",
+             "secret_env": "LKAGENT_C1_API_SECRET"}
+    monkeypatch.setattr(cli, "_connection", lambda wanted: ("c1", dict(entry)))
+    monkeypatch.setattr(cli, "_resolve_env_key",
+                        lambda key: (values.get(key), "env" if key in values else None, None))
+    monkeypatch.setattr(cli, "_line_settings", lambda: {})
+    monkeypatch.setattr(cli, "_project_root", lambda: None)
+    env, _line = cli._service_plan(None)
+    assert "OPENAI_BASE_URL" not in env
+    values["OPENAI_BASE_URL"] = "https://eu.api.openai.com/v1"
+    env, _line = cli._service_plan(None)
+    assert env["OPENAI_BASE_URL"] == "https://eu.api.openai.com/v1"
+
+
+def test_service_status_and_logs_read_the_state_directory(cli, monkeypatch, tmp_path):
+    monkeypatch.setattr(cli, "_state_dir", lambda: tmp_path)
+    assert cli._service_status()["state"] == "stopped"
+    assert cli._service_logs(10) == {"log": str(tmp_path / "service.log"), "lines": []}
+    (tmp_path / "worker.pid").write_text(str(os.getpid()))
+    status = cli._service_status()
+    assert status["running"] is True and status["pid"] == os.getpid()
+    (tmp_path / "service.log").write_text("".join(f"line {i}\n" for i in range(5)))
+    assert cli._service_logs(2)["lines"] == ["line 3", "line 4"]
 
 
 # ── what LiveKit routes to the line ─────────────────────────────────────────

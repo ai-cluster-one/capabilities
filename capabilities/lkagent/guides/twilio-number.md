@@ -55,11 +55,11 @@ Create an outbound trunk that dials through the Twilio termination URI with the 
 Name the number, what the backend is told on its calls and what it may do, and the outbound trunk:
 
 ```sh
-lkagent settings set numbers '[{"number": "+1XXXXXXXXXX", "instructions": "<what calls on this number are for>", "allowed_capabilities": ["<capability>"], "read_only": false}]'
+lkagent settings set numbers '{"+1XXXXXXXXXX": {"instructions": "<what calls on this number are for>", "allowed_capabilities": ["<capability>"], "read_only": false}}'
 lkagent settings set outbound_trunk ST_<outbound trunk id>
 ```
 
-Set `agent_name` too where the dispatch rule names another name than the default. A call to a number with no entry in `numbers` is hung up at once and recorded as failed, and `lkagent call` dials only from a number listed there (`--from`). Settings are read when the worker starts, so restart `lkagent service run` after changing them.
+Set `agent_name` too where the dispatch rule names another name than the default. `numbers` is keyed by the number in E.164. A call to a number with no entry in `numbers` is hung up at once and recorded as failed, and `lkagent call` dials only from a number listed there (`--from`). Settings are read when the worker starts, so restart `lkagent service run` after changing them. On a node, `capabilities node supervise lkagent` keeps the worker running where the node's gate places it; `lkagent service status` and `lkagent service logs` read it.
 
 ## 7. Check it
 

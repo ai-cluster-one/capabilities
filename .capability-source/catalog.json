@@ -859,7 +859,7 @@
       "icon": true,
       "level": 0,
       "path": "capabilities/lkagent",
-      "payload_sha256": "217aaa9fb901e756d989799a55549f4f13d9ef8a507d18e4fc66ee43b79ec3f5",
+      "payload_sha256": "56185351c010a3acf438685813093efada56a06573a17274ec0bf7cbf28680f3",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's own phone line on a LiveKit server - GPT Live is the voice and hands each turn it delegates to the agent's own harness session in its folder; takes calls on its configured numbers, places outgoing ones, and records each call.",
@@ -875,7 +875,7 @@
           "title": "LiveKit Agent"
         }
       },
-      "version": "2026-11-26 — LiveKit Agent shows LiveKit's mark, not a phone glyph"
+      "version": "2026-11-27 — lkagent's line runs under the node supervisor, reads its log, keys its numbers by the number, and reaches OpenAI where the key's project is served"
     },
     "macmail": {
       "executable": [
