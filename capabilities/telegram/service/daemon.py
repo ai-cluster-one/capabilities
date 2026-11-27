@@ -3900,6 +3900,24 @@ def call_task_description(text, tail=None):
 
 # What a call's backend is told about ending the call, beside the project's own
 # backend prose; the command itself is a fact of the run (`voice_hangup_line`).
+# The reply marker is the daemon's convention, not a project's: the dispatch
+# cuts at it and a dialogue or voice reply without it is silence (see
+# `worker_turn`), so the daemon states it on every such turn rather than
+# trusting a project's prose to carry it. A project seeded before the marker
+# existed, or a channel whose own prose is exclusive, is told it all the same,
+# and it comes after the prose so it is the last word on how a reply is read.
+REPLY_MARKER_INSTRUCTION = (
+    "## Sending a reply\n\n"
+    "Put a line containing exactly `=== REPLY ===` immediately above the message "
+    "you send, every time you answer in words. Only what follows the last such "
+    "line reaches the chat; everything above it is discarded, so working-out "
+    "belongs above it. A reply without the line sends nothing, and so does the "
+    "line with nothing under it. This holds whatever the prose above says.")
+REPLY_MARKER_REMINDER = (
+    "Reply marker: put a line containing exactly `=== REPLY ===` above the "
+    "message; a reply without it sends nothing.")
+
+
 VOICE_HANGUP_INSTRUCTION = (
     "## Ending the call\n\n"
     "You can end this call with the Hang-up command in the channel state. Use it "
@@ -4893,6 +4911,11 @@ def resumed_prompt(st, tail=None):
         lines.append(voice_hangup_line(st))
     if _woken_by_gate(st):
         lines.append(_woken_by_gate(st))
+    # A thread anchored before the daemon stated the marker never heard it, and
+    # a missing marker is silence, so the one rule that silences a turn is
+    # restated in a line rather than left to what the thread holds.
+    if not (st.get("registered_job") or {}).get("id"):
+        lines.append(REPLY_MARKER_REMINDER)
     if lines:
         lines.append("")
     lines.append(req.get("text") or "")
@@ -4966,6 +4989,8 @@ def build_prompt(tail, state=None):
             delegation = read_delegation_context()
             if delegation:
                 context = f"{context}\n\n{delegation}" if context else delegation
+        context = (f"{context}\n\n{REPLY_MARKER_INSTRUCTION}" if context
+                   else REPLY_MARKER_INSTRUCTION)
         channel_context = (st.get("channel_context") or "").strip()
     if channel_context:
         channel_context = "--- Channel-specific context ---\n" + channel_context + "\n\n"

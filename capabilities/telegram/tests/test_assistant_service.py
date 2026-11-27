@@ -8731,6 +8731,24 @@ class ReplyMarkerTests(unittest.IsolatedAsyncioTestCase):
         await self.stop_session(client, task)
         return client.sent, logs
 
+    async def test_the_daemon_states_the_marker_whatever_the_project_prose_says(self):
+        """A missing marker is silence, so the rule is the daemon's to state:
+        a project whose own prose never mentions it, an exclusive channel, and
+        a thread resumed from before the rule existed are all told. A job
+        worker's prompt asks for no marker and is not told."""
+        with tempfile.TemporaryDirectory() as td:
+            daemon = import_daemon(Path(td), settings())
+            marker = "=== REPLY ==="
+            for state in ({"chat_id": 5},
+                          {"chat_id": 5, "context_exclusive": True,
+                           "channel_context": "lane prose"},
+                          {"chat_id": 5, "voice_task": "voice-1"},
+                          {"chat_id": 5, "resume_session": "thread-1",
+                           "current_request": {"text": "next"}}):
+                self.assertIn(marker, daemon.build_prompt([], state))
+            self.assertNotIn(marker, daemon.build_prompt(
+                [], {"chat_id": 5, "registered_job": {"id": "job-1"}}))
+
     def marker_logs(self, logs):
         return [line for line in logs
                 if "carried no" in line or "put nothing under" in line]
