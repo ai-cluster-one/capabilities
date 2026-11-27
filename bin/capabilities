@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #     "httpx>=0.27",
-#     "capabilities-contract>=0.54,<1",
+#     "capabilities-contract>=0.58,<1",
 #     "packaging>=23",
 # ]
 # ///
@@ -395,7 +395,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.57.0"
+CONTRACT_LIBRARY_RELEASE = "0.58.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -11100,26 +11100,31 @@ def _agents_with_nodes(conn, schema: str) -> list[dict]:
     if not agents:
         return agents
     by_id = {agent["id"]: agent for agent in agents}
-    # Each link with when its node was registered (`_nodes_created`), read in
-    # the same statement.
     linked = conn.execute(
-        "SELECT l.agent_id, n.created_at, " + NODE_SELECT.removeprefix("SELECT ")
+        "SELECT l.agent_id, " + NODE_SELECT.removeprefix("SELECT ")
         + "WHERE l.agent_id = ANY (%s) ORDER BY n.label, l.node",
         (list(by_id),)).fetchall()
     nodes = []
     for row in linked:
-        entry = dict(zip(NODE_COLUMNS, row[2:]))
+        entry = dict(zip(NODE_COLUMNS, row[1:]))
         entry["last_seen_at"] = stamp(entry["last_seen_at"])
         entry["disabled_at"] = stamp(entry["disabled_at"])
         by_id[row[0]]["nodes"].append(entry)
-        nodes.append((entry, row[1]))
+        nodes.append((entry, row[0]))
     if nodes:
-        states = {r["node"]: r for r in _store_module().node_states(
-            conn, sorted({entry["node"] for entry, _created in nodes}))}
-        major, since = _store_major_since(conn, schema)
-        for entry, created in nodes:
-            entry.update(_node_verdict(entry, states.get(entry["node"]) or {}, major, since,
-                                       created))
+        store = _store_module()
+        states = {r["node"]: r for r in store.node_states(
+            conn, sorted({entry["node"] for entry, _agent in nodes}))}
+        found = conn.execute(
+            f"SELECT agent_id, {', '.join(store.NODE_HEALTH_COLUMNS)} FROM "
+            f"{store.NODE_HEALTH_VIEW} WHERE agent_id = ANY (%s)", (list(by_id),)).fetchall()
+        healths = {(row[0], row[1]): dict(zip(store.NODE_HEALTH_COLUMNS, row[1:]))
+                   for row in found}
+        for entry, agent_id in nodes:
+            health = healths.get((agent_id, entry["node"])) or {}
+            entry.update(_node_verdict(entry, health,
+                                       (states.get(entry["node"]) or {}).get("image_version")))
+            entry["health"] = health.get("health") or "red"
     return agents
 
 
@@ -13293,6 +13298,15 @@ NODE_CPU_SAMPLE_SECONDS = 0.25
 # keeps its own bound of them (the contract's NODE_LOG_LINES).
 NODE_LOG_KEEP_LINES = 200
 NODE_STATE_PROBE_SECONDS = 60
+# How often `node run` asks each capability with connections not bound to a
+# device whether each connection it uses works here (its own doctor), so a
+# refused credential shows on the node's health even where nothing used it.
+NODE_CONNECTION_CHECK_SECONDS = 900
+# How often `node run` asks its supervisor whether each job runs, writing the
+# row of one that stopped, crashed or cannot start at once, and how often it
+# writes such a row again while it stays so.
+NODE_SERVICE_POLL_SECONDS = 5
+NODE_SERVICE_CHECK_SECONDS = 60
 NODE_STATE_TOOL_TIMEOUT = 15
 NODE_STATE_SESSION_TIMEOUT = 60
 # What an agent-node image says of itself: the file holding its version, and
@@ -13633,6 +13647,69 @@ def _device_bound_capabilities() -> list[str]:
     return found
 
 
+def _connection_capabilities() -> list[str]:
+    """The installed capabilities that carry connections whose health is not
+    bound to the device they are linked on: each is checked by its own
+    doctor, on the quiet cadence."""
+    found = []
+    for name in _installed():
+        manifest = _read_json(CAP_HOME / name / "manifest.json")
+        connections = manifest.get("connections") if isinstance(manifest, dict) else None
+        if isinstance(connections, dict) and connections.get("device_bound") is not True:
+            found.append(name)
+    return found
+
+
+def _node_connection_checks(folders: dict[str, Path]) -> dict[tuple[str, str], list | None]:
+    """For each agent's folder here and each installed capability with
+    connections not bound to a device, the capability's own answer of whether
+    each connection it uses works on this node: {(agent, capability):
+    [(connection, live, reason, reason_keys)]}. Its `connections` names the
+    connections and the required keys that do not resolve here (key_missing);
+    its `doctor` proves the rest at once where it exits 0, else one by one,
+    exit 2 being credentials refused (not_signed_in). A connection whose
+    doctor settles neither is left out, so what was said of it last stands;
+    None where the capability could not list its connections."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
+    out: dict[tuple[str, str], list | None] = {}
+    for capability in _connection_capabilities():
+        script = _script_path(capability)
+        for agent_id, folder in sorted(folders.items()):
+            def ask(*args: str) -> tuple[int, str]:
+                rc, stdout, _err = _run_script(script, list(args), cwd=folder, env=env,
+                                               timeout=NODE_STATE_SESSION_TIMEOUT)
+                return rc, stdout
+            rc, stdout = ask("connections", "--json")
+            try:
+                report = json.loads(stdout) if rc == 0 else None
+            except ValueError:
+                report = None
+            conns = report.get("connections") if isinstance(report, dict) else None
+            if not isinstance(conns, dict):
+                out[(agent_id, capability)] = None
+                continue
+            rows, rest = [], []
+            for cid, entry in sorted(conns.items()):
+                keys = entry.get("keys") if isinstance(entry, dict) else None
+                missing = [k["key"] for k in keys if isinstance(k, dict) and k.get("required")
+                           and not k.get("set") and isinstance(k.get("key"), str)
+                           and k["key"]] if isinstance(keys, list) else []
+                if missing:
+                    rows.append((cid, False, "key_missing", missing))
+                else:
+                    rest.append(cid)
+            if rest and ask("doctor")[0] == 0:
+                rows += [(cid, True, None, None) for cid in rest]
+            else:
+                for cid in rest:
+                    code = ask("doctor", "--connection", cid)[0]
+                    if code in (0, 2):
+                        rows.append((cid, code == 0, None if code == 0 else "not_signed_in",
+                                     None))
+            out[(agent_id, capability)] = sorted(rows)
+    return out
+
+
 def _node_device_sessions(folders: dict[str, Path]) -> dict[tuple[str, str], list | None]:
     """For each agent's folder here and each device-bound capability, the
     capability's own answer of whether each connection holds a live session
@@ -13756,14 +13833,19 @@ def _node_agent_folder(root: Path, own: str | None, agent_id: str,
 
 def _node_state_write(conn, here: str, facts: dict, logins: dict | None,
                       sessions: dict | None, agents: list[str],
-                      needed: dict[str, list[str]] | None = None) -> dict:
+                      needed: dict[str, list[str]] | None = None,
+                      checks: dict | None = None) -> dict:
     """Write this node's state row, the tools' sign-ins for each of `agents` -
     the agents whose folder here is bound for this process - with the tools
     its placed services need (`needed`), and, where `sessions` holds them,
     the sessions their device-bound capabilities answered, dropping those of
     a capability no longer asked. What the store holds of an agent no longer
     linked here goes too; another manager's agents on the same machine keep
-    theirs. Answers {reported_at, fresh_until}."""
+    theirs. `checks`, where given, are the connections the quiet check
+    answered (`_node_connection_checks`), each written beside the others of
+    its capability, and one its capability no longer lists dropped; the
+    sessions of every installed capability with connections are kept, as
+    those of a device-bound one are. Answers {reported_at, fresh_until}."""
     store = _store_module()
     stamp = store.node_state_put(conn, here, **facts)
     if logins is not None:
@@ -13775,8 +13857,21 @@ def _node_state_write(conn, here: str, facts: dict, logins: dict | None,
             if rows is not None:
                 store.node_sessions_put(conn, agent_id, here, capability,
                                         _node_stored_sessions(conn, capability, rows))
+    for (agent_id, capability), rows in sorted((checks or {}).items()):
+        if rows is None or agent_id not in agents:
+            continue
+        stored = _node_stored_sessions(conn, capability, rows)
+        for connection, live, reason, keys in stored:
+            store.node_session_put(conn, agent_id, here, capability, connection, live,
+                                   reason=reason, reason_keys=keys)
+        listed = {connection for connection, *_rest in stored}
+        conn.execute("DELETE FROM node_sessions WHERE agent_id = %s AND node = %s "
+                     "AND capability = %s AND NOT coalesce(connection_id, file_connection) "
+                     "= ANY (%s)", (agent_id, here, capability, sorted(listed)))
+    kept = set(sessions or {}) | {(agent_id, capability) for agent_id in agents
+                                  for capability in _connection_capabilities()}
     store.node_agents_prune(conn, here, agents if sessions is not None else [],
-                            sorted(sessions or {}))
+                            sorted(kept))
     return stamp
 
 
@@ -13981,6 +14076,18 @@ class _NodeManager:
         self.probe_asked = False
         self.logins: dict | None = None
         self.sessions: dict | None = None
+        # The quiet check of the connections not bound to a device, in a
+        # thread of its own once its cadence has passed, so a long one never
+        # holds the probe back, and what it answered, to be written.
+        self.checks_due = 0.0
+        self.check: tuple | None = None
+        self.checks: dict | None = None
+        # Each job its supervisor says does not run, by job name: (its state
+        # there, what it says, since when), and when that was asked and last
+        # written.
+        self.jobs_down: dict[str, tuple] = {}
+        self.services_due = 0.0
+        self.services_written_due = 0.0
         # What each agent's placed services need signed in here, asked with
         # the tools; a harness command that cannot answer keeps its last.
         self.placed: list[tuple] = []
@@ -14695,6 +14802,25 @@ class _NodeManager:
         if "needed" in answer:
             self.needed, self.harness = answer["needed"], answer["harness"]
 
+    def start_check(self) -> None:
+        """Ask each capability with connections not bound to a device, in each
+        agent's folder here, whether each connection it uses works here
+        (`_node_connection_checks`), in a thread of its own."""
+        import threading
+        self.checks_due = time.monotonic() + NODE_CONNECTION_CHECK_SECONDS
+        folders, answer = dict(self.folders), {}
+
+        def ask() -> None:
+            answer["checks"] = _node_connection_checks(folders)
+
+        thread = threading.Thread(target=ask, name="node-connection-check", daemon=True)
+        self.check = (thread, answer)
+        thread.start()
+
+    def checked(self) -> bool:
+        """Whether a quiet check has answered since it was last taken."""
+        return self.check is not None and not self.check[0].is_alive()
+
     def report_state(self) -> None:
         """Write this node's state row, and once the detail cadence has passed,
         a reconcile changed a job or a probe answered, the rest with it: what
@@ -14704,12 +14830,17 @@ class _NodeManager:
         comes. A write that fails is said once and changes nothing else."""
         now = time.monotonic()
         self.state_due = now + NODE_STATE_BEAT_SECONDS
-        whole = self.moved or self.probed() or now >= self.detail_due
+        whole = self.moved or self.probed() or self.checked() or now >= self.detail_due
         self.moved = False
         self.take_probe()
+        if self.checked():
+            self.checks = self.check[1].get("checks")
+            self.check = None
         if self.probe is None and (now >= self.probe_due or self.probe_asked):
             self.probe_asked = False
             self.start_probe()
+        if self.check is None and self.read_once and now >= self.checks_due:
+            self.start_check()
         try:
             conn = self._connect()
         except Exception as exc:
@@ -14726,7 +14857,8 @@ class _NodeManager:
                     self.store.node_state_put(conn, self.here, **_node_facts())
                 else:
                     _node_state_write(conn, self.here, _node_facts(), self.logins,
-                                      self.sessions, sorted(self.folders), self.needed)
+                                      self.sessions, sorted(self.folders), self.needed,
+                                      self.checks)
                     self.write_logs(conn, lines)
         except Exception as exc:
             if lines is not None:
@@ -14741,6 +14873,7 @@ class _NodeManager:
             self.detail_due = now + NODE_STATE_DETAIL_SECONDS
             # Sessions written once are not written again until they are asked again.
             self.sessions = None
+            self.checks = None
         if self.said.get("state") is not None:
             self.say("writes this node's state again")
         self.said["state"] = None
@@ -14765,6 +14898,95 @@ class _NodeManager:
             if agent_id in keepers:
                 kept.add(self.store.NODE_LOG_MANAGER)
             self.store.node_logs_prune(conn, agent_id, self.here, sorted(kept))
+
+    def job_states(self) -> dict[str, tuple[str, str]] | None:
+        """Each job's state as the node's supervisor says it - RUNNING,
+        STARTING, BACKOFF, EXITED, FATAL, STOPPED and the like - with what it
+        says beside it, by job name; None where it cannot say."""
+        try:
+            done = subprocess.run(["supervisorctl", "-s", self.url, "status"],
+                                  stdin=subprocess.DEVNULL, capture_output=True,
+                                  text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        states: dict[str, tuple[str, str]] = {}
+        for line in done.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) >= 2 and parts[1].isalpha() and parts[1].isupper():
+                states[parts[0]] = (parts[1], parts[2].strip() if len(parts) > 2 else "")
+        return states if states or done.returncode in (0, 3) else None
+
+    def tend_services(self) -> None:
+        """Ask the supervisor whether each job runs, and write the row of each
+        placed service whose job does not - stopped, crashed or unable to
+        start - as failing with what the supervisor says, at once when a job
+        stops or starts, and again every NODE_SERVICE_CHECK_SECONDS while it
+        stays down. A running job's row is its own supervisor's to write. A
+        supervisor that cannot say changes nothing."""
+        now = time.monotonic()
+        if self.disabled or not self.read_once or now < self.services_due:
+            return
+        self.services_due = now + NODE_SERVICE_POLL_SECONDS
+        states = self.job_states() if self.jobs else {}
+        if states is None:
+            return
+        down: dict[str, tuple] = {}
+        for name in sorted(self.jobs):
+            state, said = states.get(name, (None, ""))
+            if state is None or state in ("RUNNING", "STARTING"):
+                continue
+            before = self.jobs_down.get(name)
+            since = before[2] if before and before[0] == state else _supervise_now_iso()
+            down[name] = (state, said, since)
+        moved = {n: v[:2] for n, v in down.items()} != {
+            n: v[:2] for n, v in self.jobs_down.items() if n in self.jobs}
+        if not moved and (not down or now < self.services_written_due):
+            self.jobs_down = down
+            return
+        if down and not self.write_down(down):
+            return
+        self.jobs_down = down
+        self.services_written_due = now + NODE_SERVICE_CHECK_SECONDS
+
+    def write_down(self, down: dict[str, tuple]) -> bool:
+        """Write the row of every agent each job in `down` serves as failing;
+        whether it was written. An archived agent's row is refused and the
+        others are written all the same."""
+        try:
+            conn = self._connect()
+        except Exception as exc:
+            self.say_once("services", type(exc).__name__,
+                          "cannot record the services whose jobs do not run: "
+                          f"{getattr(exc, 'message', exc)}")
+            return False
+        try:
+            with conn.transaction():
+                for name, (state, said, since) in sorted(down.items()):
+                    job = self.jobs[name]
+                    why = (f"its job {name} is {state} under this node's supervisor"
+                           + (f": {said}" if said else ""))
+                    for agent_id in job.get("agents") or [job["agent_id"]]:
+                        try:
+                            with conn.transaction():
+                                self.store.service_instance_put(
+                                    conn, agent_id, job["capability"], self.here,
+                                    state="failing", last_error=why, last_error_at=since)
+                        except Exception as exc:
+                            if not _archived_refusal(exc):
+                                raise
+        except Exception as exc:
+            self.say_once("services", type(exc).__name__,
+                          "cannot record the services whose jobs do not run: "
+                          + " ".join(f"{type(exc).__name__}: {exc}".split())[:300])
+            return False
+        finally:
+            conn.close()
+        self.said.pop("services", None)
+        for name, (state, _said, _since) in sorted(down.items()):
+            if self.jobs_down.get(name, (None,))[0] != state:
+                self.say(f"job {name} is {state} under this node's supervisor, so its "
+                         "service is recorded failing")
+        return True
 
     def manager_target(self) -> str | None:
         """The file the manager on PATH runs now, through its link."""
@@ -14953,9 +15175,12 @@ class _NodeManager:
             self.follow_release(stopping)
             if self.disabled:
                 self.moved = False
-            elif (self.moved or self.probed() or (self.probe_asked and self.probe is None)
+            elif (self.moved or self.probed() or self.checked()
+                  or (self.probe_asked and self.probe is None)
                   or time.monotonic() >= self.state_due):
                 self.report_state()
+            if not self.disabled:
+                self.tend_services()
             self.tend_logs()
             deadline = time.monotonic() + NODE_RUN_FOLLOW_SECONDS
             while not stopping["now"] and time.monotonic() < deadline:
@@ -15065,6 +15290,12 @@ class _LaunchdNodeManager(_NodeManager):
                               f"launchd did not load job {name}, tried again next "
                               f"reconcile: {said[:300]}")
         self.pending_apply = bool(failed)
+
+    def job_states(self) -> dict[str, tuple[str, str]] | None:
+        # launchd keeps each job alive itself, and says nothing here this
+        # manager reads as a job's state: its services' rows stay their
+        # supervisors' own.
+        return None
 
     def restart(self, name: str) -> None:
         if name not in self.jobs:
@@ -16377,6 +16608,22 @@ class _SuperviseInstance(_SuperviseStore):
         return found
 
 
+def _service_restart_settings(capability: str) -> list[str]:
+    """The settings keys the installed capability declares a running service
+    takes only on a restart (`apply` restart, on the key or its home), from
+    its manifest snapshot; none where it declares none."""
+    manifest = _read_json(CAP_HOME / capability / "manifest.json")
+    settings = manifest.get("settings") if isinstance(manifest, dict) else None
+    if not isinstance(settings, dict):
+        return []
+    homes = {home.get("scope"): home for home in settings.get("homes") or []
+             if isinstance(home, dict)}
+    return sorted({key["key"] for key in settings.get("keys") or []
+                   if isinstance(key, dict) and isinstance(key.get("key"), str) and key["key"]
+                   and (key.get("apply") or (homes.get(key.get("scope")) or {}).get("apply"))
+                   == "restart"})
+
+
 def _supervise_record_path(root: Path, name: str) -> Path:
     return _supervise_state_dir(root) / f"{name}.json"
 
@@ -16594,6 +16841,8 @@ class _Supervisor:
                          else None)
         self.instance_failing: str | None = None
         self.payload_sha256: str | None = None
+        # The settings keys the running service takes only when it starts.
+        self.restart_settings: list[str] | None = None
         self.probe: dict | None = None
         self.probe_at: float | None = None
         self.failure: dict | None = None
@@ -16738,6 +16987,7 @@ class _Supervisor:
         self.child_started_at = _supervise_now_iso()
         self.restart_at = None
         self.payload_sha256 = _supervise_payload_sha256(self.name)
+        self.restart_settings = _service_restart_settings(self.name)
         self.probe = None
         self.probe_at = self.child_started + SUPERVISE_PROBE_GRACE_SECONDS
         self.say(f"started {shlex.join(self.command)} as pid {self.child.pid} on {self.node}")
@@ -16845,7 +17095,8 @@ class _Supervisor:
                "host": socket.gethostname() if running else None,
                "started_at": self.child_started_at if running else None,
                "last_exit_code": failure.get("code"), "last_error": failure.get("error"),
-               "last_error_at": failure.get("at")}
+               "last_error_at": failure.get("at"),
+               "restart_settings": self.restart_settings if running else None}
         holder = self.lease_state.get("holder")
         # Whether the service's last exit was a failure: a start that failed or
         # an exit other than 0, and not a stop the supervisor made.
@@ -18173,48 +18424,46 @@ def cmd_service(args: list[str]) -> None:
     verbs[sub](args[1:])
 
 
-def _node_expected(entry: dict, node: str, words: dict, placed: set[str],
-                   disabled: bool = False) -> None:
-    """Fill a `node state` entry with what the node is expected to have and
-    whether it has it. A sign-in is expected where the owner's word says so,
-    else where a service the agent places on the node needs it; a device
-    session where the owner's word says so, else where the agent places its
-    capability's service there. An expected sign-in that is not signed in, or
-    an expected session that is not live or not reported, needs attention and
-    makes the node yellow; a node that is not reachable is red. Nothing that
-    is not expected is raised. A disabled node expects nothing and reads
-    disabled."""
-    attention: list[dict] = []
-    said = {w["tool"]: w["expected"] for w in words["sign_ins"] if w["node"] == node}
+def _node_expected(entry: dict, health: dict) -> None:
+    """Fill a `node state` entry with what the node is expected to have,
+    whether it has it, its colour and what needs action there, as the store's
+    view of the agent's health on the node (`agent_nodes_health`, read through
+    the contract's `node_health`) says them - the one place that rule lives.
+    `attention` names each expected sign-in or session that is down, as it
+    always has; `actions` every item the view raises, with when its fact was
+    checked; a session only the owner's word names is added to `sessions`."""
+    sign_ins = {said["tool"]: said for said in health.get("sign_ins") or []}
     for tool in NODE_STATE_SIGN_IN_TOOLS:
-        needed = bool(entry.pop(f"{tool}_needed", None))
-        override = said.get(tool)
-        expected = not disabled and (needed if override is None else override)
-        entry.update({f"{tool}_needed": needed, f"{tool}_override": override,
-                      f"{tool}_expected": expected})
-        login = entry.get(f"{tool}_login")
-        if expected and login in (None, "signed_out", "absent"):
-            attention.append({"kind": "sign_in", "tool": tool,
-                              "reason": login or "not_reported"})
-    said = {(w["capability"], w["connection"]): w["expected"]
-            for w in words["sessions"] if w["node"] == node}
+        said = sign_ins.get(tool) or {}
+        entry.pop(f"{tool}_needed", None)
+        entry.update({f"{tool}_needed": bool(said.get("needed")),
+                      f"{tool}_override": said.get("override"),
+                      f"{tool}_expected": bool(said.get("expected"))})
+    viewed = {(said["capability"], said["connection"]): said
+              for said in health.get("sessions") or []}
     reported = {(s["capability"], s["connection"]) for s in entry["sessions"]}
     entry["sessions"] += [{"capability": capability, "connection": connection, "live": None,
                            "account": None, "reason": None, "reason_keys": None,
                            "checked_at": None}
-                          for capability, connection in sorted(set(said) - reported)]
+                          for (capability, connection), said in sorted(viewed.items())
+                          if not said.get("reported") and (capability, connection)
+                          not in reported]
     for session in entry["sessions"]:
-        key = (session["capability"], session["connection"])
-        needed = key in reported and session["capability"] in placed
-        override = said.get(key)
-        expected = not disabled and (needed if override is None else override)
-        session.update({"needed": needed, "override": override, "expected": expected})
-        if expected and session["live"] is not True:
-            attention.append({"kind": "session", "capability": key[0], "connection": key[1],
-                              "reason": "not_reported" if key not in reported else "not_live"})
+        said = viewed.get((session["capability"], session["connection"])) or {}
+        session.update({"needed": bool(said.get("needed")), "override": said.get("override"),
+                        "expected": bool(said.get("expected"))})
+    order = {(s["capability"], s["connection"]): n for n, s in enumerate(entry["sessions"])}
+    items = list(health.get("items") or [])
+    attention = [{"kind": "sign_in", "tool": item["tool"], "reason": item["reason"]}
+                 for item in items if item.get("kind") == "sign_in" and item.get("expected")]
+    attention += sorted(
+        ({"kind": "session", "capability": item["capability"],
+          "connection": item["connection"], "reason": item["reason"]}
+         for item in items if item.get("kind") == "session" and item.get("expected")),
+        key=lambda said: order.get((said["capability"], said["connection"]), len(order)))
     entry["attention"] = attention
-    entry["health"] = ("disabled" if disabled else "red" if not entry["reachable"] else
-                       "yellow" if attention else "green")
+    entry["actions"] = items
+    entry["health"] = health.get("health") or "red"
 
 
 def _node_state_answer(row: dict) -> dict:
@@ -18282,25 +18531,19 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
         states = {r["node"]: r for r in store.node_states(conn, ids)}
         logins = store.node_logins(conn, agent_id, ids)
         sessions = [_node_session_answer(s) for s in store.node_sessions(conn, agent_id, ids)]
-        words = store.node_expectations(conn, agent_id, ids)
-        words["sessions"] = [_node_session_answer(w) for w in words.get("sessions") or []]
+        healths = {h["node"]: h for h in store.node_health(conn, agent_id, ids)}
         runs = {r["node"]: r for r in store.node_updates(conn, ids)}
         logs = store.node_logs(conn, agent_id, ids)
-        placed = conn.execute(
-            "SELECT node, capability FROM policies WHERE agent_id = %s "
-            "AND node = ANY (%s) AND enabled AND service", (agent_id, ids)).fetchall()
-        major, since = _store_major_since(
-            conn, conn.execute("SELECT current_schema()").fetchone()[0])
-        created = _nodes_created(conn, ids)
         out = []
         for node in nodes:
             state = states.get(node["node"]) or dict.fromkeys(
                 ("node", *store.NODE_STATE_COLUMNS, *store.NODE_UPDATE_OFFER_COLUMNS,
                  "uptime_seconds"))
             state = {**state, **_node_state_logins(store, logins, node["node"])}
+            health = healths.get(node["node"]) or {}
             entry = {"node": node["node"], "label": node["label"],
                      "disabled_at": node["disabled_at"],
-                     **_node_verdict(node, state, major, since, created.get(node["node"]))}
+                     **_node_verdict(node, health, state.get("image_version"))}
             state.pop("reachable", None)
             entry["update"] = {"available": state.pop("update_available", None),
                                "checked_at": store._stamp(state.pop("update_checked_at",
@@ -18310,9 +18553,7 @@ def _node_state_verb(root: Path, args: list[str]) -> None:
             entry.update({k: v for k, v in _node_state_answer(state).items() if k != "node"})
             entry["sessions"] = [_node_state_answer({k: v for k, v in s.items() if k != "node"})
                                  for s in sessions if s["node"] == node["node"]]
-            _node_expected(entry, node["node"], words,
-                           {c for n, c in placed if n == node["node"]},
-                           node["disabled_at"] is not None)
+            _node_expected(entry, health)
             entry["logs"] = [{"source": r["source"], "lines": r["lines"],
                               "captured_at": store._stamp(r["captured_at"])}
                              for r in logs if r["node"] == node["node"]]
@@ -18808,9 +19049,9 @@ def _node_update_verb(root: Path, args: list[str]) -> None:
             # A node that cannot read the store would leave the request
             # requested; a node merely not running takes it up when it starts.
             state = (store.node_states(conn, [node]) or [{}])[0]
-            unread = _node_store_unread(row, state, *_store_major_since(
-                conn, conn.execute("SELECT current_schema()").fetchone()[0]),
-                _nodes_created(conn, [node]).get(node))
+            unread = _node_store_unread(
+                row, (store.node_health(conn, agent_id, [node]) or [{}])[0],
+                state.get("image_version"))
             if unread is not None:
                 raise _KernelRefusal("node_cannot_read_store",
                                      f"node {node} cannot take the request: "
@@ -23013,50 +23254,30 @@ def _node_reads_store(major: int | None, since, seen) -> bool:
     return seen is not None and seen >= since
 
 
-def _nodes_created(conn, ids: list[str]) -> dict:
-    """When each of `ids` was registered, from the node registry."""
-    if not ids:
-        return {}
-    return dict(conn.execute("SELECT id, created_at FROM nodes WHERE id = ANY (%s)",
-                             (list(ids),)).fetchall())
-
-
-def _node_verdict(node: dict, state: dict, major: int | None, since, created=None) -> dict:
+def _node_verdict(node: dict, health: dict, image_version: object = None) -> dict:
     """{reachable, cannot_read_store} of one of an agent's nodes, as `node
-    state` and `agent list` answer them, from its registry row (`node`), its
-    state row (`state`, empty where it wrote none), the store's major and since,
-    and when the node was registered: a node that cannot read the store is
-    unreachable whatever its row says."""
-    unread = _node_store_unread(node, state, major, since, created)
-    return {"reachable": bool(state.get("reachable", False)) and unread is None,
-            "cannot_read_store": unread}
+    state` and `agent list` answer them, from what the store's view of the
+    agent's health there says (`agent_nodes_health`, `health`; empty where it
+    holds none): a node that cannot read the store is unreachable whatever its
+    row says. `node` is its registry row and `image_version` what its state
+    row says it runs, for the command that brings it up."""
+    return {"reachable": bool(health.get("reachable", False)),
+            "cannot_read_store": _node_store_unread(node, health, image_version)}
 
 
-def _node_store_unread(node: dict, state: dict, major: int | None, since,
-                       created=None) -> dict | None:
-    """Why one of the agent's nodes cannot read the store, or None where it
-    can: {store_major, since, last_seen_at, message, command}, for a node
-    whose last sign of life (its registry row's last_seen_at, its state row's
-    reported_at) is older than the store's move to its major. A node
-    registered (`created`) after that move, by a release of its major, has
-    nothing older to run, and reads it until it shows a sign of life."""
-    import datetime as _dt
-    if created is not None and since is not None and created >= since:
-        return None
-    seen = []
-    for value in (node.get("last_seen_at"), state.get("reported_at")):
-        if isinstance(value, str):
-            try:
-                value = _dt.datetime.fromisoformat(value)
-            except ValueError:
-                value = None
-        if isinstance(value, _dt.datetime):
-            seen.append(value)
-    last = max(seen, default=None)
-    if _node_reads_store(major, since, last):
+def _node_store_unread(node: dict, health: dict, image_version: object = None) -> dict | None:
+    """Why one of the agent's nodes cannot read the store, as the store's view
+    of its health says (`cannot_read_store`), or None where it can:
+    {store_major, since, last_seen_at, message, command}, for a node whose
+    last sign of life (its registry row's last_seen_at, its state row's
+    reported_at) is older than the store's move to its major, and which was
+    registered before that move."""
+    if not health.get("cannot_read_store"):
         return None
     stamp = _store_module()._stamp
-    command = _node_bring_up(node, state.get("image_version"))
+    major, since, last = (health.get("store_major"), health.get("store_since"),
+                          health.get("last_seen_at"))
+    command = _node_bring_up(node, image_version)
     return {"store_major": major, "since": stamp(since), "last_seen_at": stamp(last),
             "message": f"the store moved to schema major {major} at {stamp(since)} and this "
                        f"node was last seen {stamp(last) if last else 'never'}, before it, so "

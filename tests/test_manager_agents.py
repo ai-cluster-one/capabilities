@@ -972,6 +972,14 @@ def _placed_dialer(lab: Lab) -> None:
     (registry / "dialer").chmod(0o755)
 
 
+def _roomy(lab: Lab) -> None:
+    """The node's memory and disk as the test machine's own report would not
+    say them: far from full, so the node's colour says only what the test
+    sets up, whatever load the machine running it is under."""
+    lab.sql(f"UPDATE {SCHEMA}.node_states SET memory_used_bytes = 0, disk_used_bytes = 0 "
+            "RETURNING node")
+
+
 def test_a_node_is_expected_to_have_what_its_placed_services_need_and_the_owner_says(lab):
     lab.ok("node", "add", nid("box-one"), "--label", "box-one", "--kind", "server")
     lab.ok("node", "add", nid("box-two"), "--label", "box-two", "--kind", "server")
@@ -980,6 +988,7 @@ def test_a_node_is_expected_to_have_what_its_placed_services_need_and_the_owner_
 
     # Nothing placed: gh signed out, Codex absent and a dead session raise nothing.
     lab.ok("node", "state", "report", **here)
+    _roomy(lab)
     one = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}[nid("box-one")]
     assert (one["health"], one["attention"]) == ("green", [])
     assert [one[f"{t}_expected"] for t in ("claude", "codex", "gh")] == [False] * 3
@@ -991,13 +1000,20 @@ def test_a_node_is_expected_to_have_what_its_placed_services_need_and_the_owner_
                 "enabled, service) VALUES (%s, %s, %s, true, true) RETURNING capability",
                 (PROJECT_ID, name, nid("box-one")))
     lab.ok("node", "state", "report", **here)
+    _roomy(lab)
     nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
     one, two = nodes[nid("box-one")], nodes[nid("box-two")]
     assert [(one[f"{t}_needed"], one[f"{t}_override"], one[f"{t}_expected"])
             for t in ("claude", "codex", "gh")] == [(True, None, True)] * 3
     assert [(s["connection"], s["needed"], s["expected"]) for s in one["sessions"]] == [
         ("main", True, True), ("spare", True, True)]
-    assert one["health"] == "yellow"
+    # Codex, which its service runs on, is gone and a session its placed
+    # service runs on is down: the agent has stopped there.
+    assert one["health"] == "red"
+    assert [(a["kind"], a["level"], a.get("tool") or a.get("connection"))
+            for a in one["actions"]] == [("sign_in", "red", "codex"),
+                                         ("sign_in", "yellow", "gh"),
+                                         ("session", "red", "spare")]
     assert one["attention"] == [
         {"kind": "sign_in", "tool": "codex", "reason": "absent"},
         {"kind": "sign_in", "tool": "gh", "reason": "signed_out"},
@@ -1063,7 +1079,7 @@ def test_a_disabled_node_stays_on_record_expects_nothing_and_takes_nothing(lab):
     lab.ok("node", "expect", "box-two", "session", "phonelink", "main", "on")
     nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
     assert (nodes[nid("box-one")]["health"], nodes[nid("box-two")]["health"]) == (
-        "yellow", "red")
+        "red", "red")
 
     said = lab.ok("node", "disable", "box-one")
     assert (said["node"]["node"], said["changed"]) == (nid("box-one"), True)
@@ -1093,7 +1109,7 @@ def test_a_disabled_node_stays_on_record_expects_nothing_and_takes_nothing(lab):
     assert (said["changed"], said["node"]["disabled_at"]) == (True, None)
     assert lab.ok("node", "enable", "box-one")["changed"] is False
     nodes = {n["node"]: n for n in lab.ok("node", "state")["nodes"]}
-    assert nodes[nid("box-one")]["health"] == "yellow"
+    assert nodes[nid("box-one")]["health"] == "red"
     assert nodes[nid("box-one")]["gh_expected"] is True
     assert nodes[nid("box-two")]["health"] == "disabled"
 
