@@ -571,6 +571,43 @@ def _read_only_gate(verb: str) -> None:
              f"run in a process without {store.READ_ONLY_ENV}.")
 
 
+# The role a Telegram request carries when the person who runs the assistant
+# sent it: the role the shipped settings give control of the service, and the
+# one `telegram service reload` is reserved for.
+TELEGRAM_OWNER_ROLE = "supervisor"
+
+
+def _secret_print_gate(verb: str) -> None:
+    """Refuse to print a stored secret on a Telegram request somebody other than
+    the assistant's owner sent. The request's authority comes from the service
+    as CAPABILITIES_AUTH_CONTEXT, a file path or inline JSON; a process without
+    one - a terminal, an automation, a task worker, a room turn - is unchanged,
+    and so is an authority some other service wrote. An authority that cannot
+    be read cannot be told apart, so it is refused like the capabilities refuse
+    it."""
+    raw = os.environ.get("CAPABILITIES_AUTH_CONTEXT")
+    if not raw:
+        return
+    try:
+        data = json.loads(raw if raw.lstrip().startswith("{")
+                          else Path(raw).read_text())
+    except (OSError, ValueError) as exc:
+        _die(4, "auth_context_unreadable",
+             "runtime authority context could not be read", f"{raw}: {exc}")
+    if not isinstance(data, dict):
+        _die(4, "auth_context_invalid", "runtime authority context is not an object")
+    if data.get("source") != "telegram":
+        return
+    role = str(data.get("sender_role") or "unknown")
+    if role != TELEGRAM_OWNER_ROLE:
+        _die(4, "secret_print_not_authorized",
+             f"`capabilities {verb}` is refused: this Telegram request was sent by "
+             f"role {role}, and a stored secret is printed only for a request from "
+             f"the {TELEGRAM_OWNER_ROLE}",
+             "Do not look for another way to the value; ask the person who runs "
+             "the assistant.")
+
+
 def _node_id_env_warning() -> dict | None:
     """What `node id` and doctor say while AGENT_NODE_ID is set: a node
     resolves its id itself, so the variable is needed only by a node still
@@ -10417,6 +10454,7 @@ def cmd_secrets(rest: list[str]) -> None:
         if len(args) != 1 or args[0].startswith("--"):
             _die(6, "input", "secrets show needs exactly one name")
         name = name_of(args[0])
+        _secret_print_gate("secrets show")
         key = _vault_require_key(root)
 
         def read_one(conn, agent_id):
@@ -10471,6 +10509,8 @@ def cmd_secrets(rest: list[str]) -> None:
         _die(6, "input", f"secrets raw takes only {VAULT_TEXT_SET_FLAG}")
     if saving:
         _read_only_gate("secrets raw --set")
+    else:
+        _secret_print_gate("secrets raw")
     key = _vault_require_key(root)
     if not saving:
         def read_all(conn, agent_id):
@@ -38160,7 +38200,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
   secrets show <NAME>
         Print the one value on stdout, raw, with a trailing newline and
         nothing else. Exit 3 not_set where the vault holds no NAME, 6
-        secret_unreadable where it was sealed under another key.
+        secret_unreadable where it was sealed under another key, 4
+        secret_print_not_authorized on a Telegram request whose authority
+        (CAPABILITIES_AUTH_CONTEXT) names a sender role other than
+        supervisor; without an authority, or under another service's, it
+        prints as ever.
 """),
     (('secrets set',),
      """\
@@ -38184,7 +38228,9 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         the names no key here opens named on stderr; with --set the text read
         from stdin is saved as a whole - each name set where its value
         changed, each readable name the text leaves out removed - and the
-        unreadable rows are kept and reported (unreadable_kept).
+        unreadable rows are kept and reported (unreadable_kept). Printing is
+        refused as `secrets show` refuses it (exit 4
+        secret_print_not_authorized); --set is not.
 """),
     (('secrets move',),
      """\

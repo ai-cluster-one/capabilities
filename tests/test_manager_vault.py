@@ -170,6 +170,47 @@ def test_the_writing_verbs_are_refused_under_the_read_only_switch(lab):
     assert result.stdout == "tok-1\n"
 
 
+def _telegram(tmp_path, role: str | None) -> str:
+    """A Telegram request's authority as the service hands it to a turn: a file."""
+    path = tmp_path / f"authority-{role}.json"
+    path.write_text(json.dumps({"version": 1, "source": "telegram", "sender_id": "42",
+                                "sender_role": role,
+                                "allowed_capabilities": {"*": True}}))
+    return str(path)
+
+
+def test_a_secret_is_printed_on_telegram_only_for_the_supervisor(lab, tmp_path):
+    lab.ok("key", "generate")
+    _fed(lab, "tok-1", "secrets", "set", "API_TOKEN")
+    for role in ("group_member", "direct_user", None):
+        auth = _telegram(tmp_path, role)
+        for args in (("secrets", "show", "API_TOKEN"), ("secrets", "raw")):
+            result = lab.run(*args, CAPABILITIES_AUTH_CONTEXT=auth)
+            code, error = _error(result)
+            assert (code, error["code"]) == (4, "secret_print_not_authorized"), (role, args)
+            assert "tok-1" not in result.stdout + result.stderr
+    owner = _telegram(tmp_path, "supervisor")
+    assert lab.run("secrets", "show", "API_TOKEN",
+                   CAPABILITIES_AUTH_CONTEXT=owner).stdout == "tok-1\n"
+    assert lab.run("secrets", "raw", CAPABILITIES_AUTH_CONTEXT=owner).stdout == "API_TOKEN=tok-1\n"
+    inline = json.dumps({"source": "telegram", "sender_role": "group_member"})
+    code, error = _error(lab.run("secrets", "show", "API_TOKEN",
+                                 CAPABILITIES_AUTH_CONTEXT=inline))
+    assert (code, error["code"]) == (4, "secret_print_not_authorized")
+    other = json.dumps({"source": "slack", "sender_role": "group_member"})
+    assert lab.run("secrets", "show", "API_TOKEN",
+                   CAPABILITIES_AUTH_CONTEXT=other).stdout == "tok-1\n"
+    code, error = _error(lab.run("secrets", "show", "API_TOKEN",
+                                 CAPABILITIES_AUTH_CONTEXT=str(tmp_path / "gone.json")))
+    assert (code, error["code"]) == (4, "auth_context_unreadable")
+    member = _telegram(tmp_path, "group_member")
+    assert _fed(lab, "tok-2", "secrets", "set", "API_TOKEN")["changed"] == "replaced"
+    assert _feed(lab, "tok-3", "secrets", "set", "API_TOKEN",
+                 CAPABILITIES_AUTH_CONTEXT=member).returncode == 0
+    listed = lab.run("secrets", "list", CAPABILITIES_AUTH_CONTEXT=member)
+    assert listed.returncode == 0 and "tok-3" not in listed.stdout
+
+
 # A capability that reads KEYS through the cascade: the project's .env.local,
 # then .env, read by the library's rule, then - where it reads the vault - the
 # agent's vault, here asked through the manager's own `secrets show`. With
