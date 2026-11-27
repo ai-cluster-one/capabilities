@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-11-27 — Every agent assets serves is told that every file it keeps goes into assets, not its folder
+
+The manifest carries `contribution`, one constant block the capabilities manager composes after this capability's stub line where assets is enabled: every file the work produces or receives and has to keep - not only sessions, plans and research, but documents and PDFs, mail attachments, pages and sites the agent builds, images, exports and data files - goes into assets, markdown with `assets save` and every other file with `assets files add`, and the agent's folder is not a place to keep files. `assets manifest` prints it and `assets help manifest` names it. No verb, flag, answer or exit code changes.
+
 ## 2026-11-27 — `assets --connection ID <verb>` takes the connection before the verb, as after it
 
 `assets --connection ID doctor` refused with exit 6 `invalid_arguments`, naming the id as an unknown verb, because only each verb's own parser carried `--connection`; a connection check that puts the flag before the verb, as every other capability takes it, failed on a working bucket. The flag is now accepted before the verb as well as after it, for the verbs that take it: `doctor`, `import`, `export`, `files add`, `files link`, `files rm` and `files get`. Given in both places, the one after the verb wins. Before a verb that takes no connection it still refuses with exit 6 `invalid_arguments`. No other verb, flag, answer or exit code changes.

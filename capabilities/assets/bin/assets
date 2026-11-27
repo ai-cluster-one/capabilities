@@ -160,6 +160,15 @@ STATE = False
 TABLES = True       # the four assets_* tables, built by _tables()
 INVENTORY = {"network": "optional"}   # what assets holds is in the store, reached over the network
 POST_INSTALL: list[dict] = []
+# The block the manager composes after the stub line in every session's
+# context where assets is enabled (SHEBANG.md, the manifest table): the one
+# rule for where a kept file goes, constant, so the prompt cache holds.
+BLOCK = ("Every file the work produces or receives and has to keep goes into assets - not "
+         "only sessions, plans and research, but documents and PDFs, mail attachments, pages "
+         "and sites the agent builds, images, exports and data files - markdown with "
+         "`assets save` and every other file with `assets files add`; the agent's folder is "
+         "not a place to keep files.\n")
+CONTRIBUTION = {"markdown": BLOCK}
 
 # What a person is asked for (SHEBANG.md, "What a person is asked for"):
 # a file store connection's own fields, which `connection add` writes.
@@ -677,6 +686,13 @@ For assets:
   count in `deferred` and opens no store; --network counts them from the
   store's records and reaches no bucket. Reading them is `assets list` and
   `assets files list`.
+""",
+    "manifest": """\
+For assets:
+  The declaration, with `contribution`: one constant block, as
+  {"markdown": ...}, which the capabilities manager composes after this
+  capability's stub line where assets is enabled: the one rule for where a
+  file the work has to keep goes. `assets manifest` prints it.
 """,
 }
 
@@ -2878,9 +2894,18 @@ def _parser() -> _Parser:
     return parser
 
 
+def _manifest() -> dict:
+    """The contract's manifest, with the context contribution this capability
+    declares."""
+    return {**_manifest_core(), "contribution": CONTRIBUTION}
+
+
 def main() -> None:
     _gate()
     argv = sys.argv[1:]
+    if argv[:1] == ["manifest"]:
+        _emit(_manifest())
+        return
     _contract(argv)
     if not argv or argv[0] == "help":
         _cmd_help()

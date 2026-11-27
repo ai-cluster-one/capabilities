@@ -79,7 +79,7 @@
       "level": 0,
       "lucide_icon": "layout-template",
       "path": "capabilities/agenttemplates",
-      "payload_sha256": "17b8f3623356737fa35186a21db44563e70cb0a57c4a8650c678e9b7f4a85f46",
+      "payload_sha256": "7130578642e2794c7c6516ccb4d55b6e6000b7fb7a215248eaf4eb5695b4c30e",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "The agent templates a new agent is made from - the starter context files and each agent template (its manifest, icon, context, routines) - carried as files in this capability's bundle; list them and show one, and the manager's `templates` and `init --template` read them from here.",
@@ -95,7 +95,7 @@
           "title": "Шаблоны агентов"
         }
       },
-      "version": "2026-11-21 — `agenttemplates help` is the menu, and `agenttemplates help <verb>` one verb's whole contract"
+      "version": "2026-11-27 — The starter Assets document sends every kept file to assets, and loads before keeping one"
     },
     "asana": {
       "executable": [
@@ -186,7 +186,7 @@
       "level": 0,
       "lucide_icon": "archive",
       "path": "capabilities/assets",
-      "payload_sha256": "4250b004f4ef179cfc0c6b9ed70a3d84ba8b167a49344d32ef25b3e62108c305",
+      "payload_sha256": "3db203d186908e6ae53fe51d1c318788bec97cb1f13fb9dcc96e7d6241a0a12f",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder.",
@@ -202,7 +202,7 @@
           "title": "Материалы"
         }
       },
-      "version": "2026-11-27 — `assets --connection ID <verb>` takes the connection before the verb, as after it"
+      "version": "2026-11-27 — Every agent assets serves is told that every file it keeps goes into assets, not its folder"
     },
     "automations": {
       "executable": [
