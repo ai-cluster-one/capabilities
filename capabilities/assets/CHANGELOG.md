@@ -1,5 +1,9 @@
 # assets — change log
 
+## 2026-11-27 — `assets --connection ID <verb>` takes the connection before the verb, as after it
+
+`assets --connection ID doctor` refused with exit 6 `invalid_arguments`, naming the id as an unknown verb, because only each verb's own parser carried `--connection`; a connection check that puts the flag before the verb, as every other capability takes it, failed on a working bucket. The flag is now accepted before the verb as well as after it, for the verbs that take it: `doctor`, `import`, `export`, `files add`, `files link`, `files rm` and `files get`. Given in both places, the one after the verb wins. Before a verb that takes no connection it still refuses with exit 6 `invalid_arguments`. No other verb, flag, answer or exit code changes.
+
 ## 2026-11-24 — `assets inventory` counts this project's assets as a tile, and only with --network
 
 `assets inventory` answered the empty envelope; the capability now declares its inventory `optional`. A bare run still opens no store: it names `assets` in `deferred`, as a count the store keeps. With --network it answers one metric, `assets`, with `kind` `documents` and `glyph` `page`: the documents and the files this project holds that are not retired, together, as `assets list` and `assets files list` read them; a file is counted by its record in the store, so no bucket is reached. Outside a project, or in one with no durable id, --network names the count in `deferred` and reaches no store; with no store configured or none reachable it refuses as every reading verb does, exit 6 `store_not_configured` or exit 5 `store_unreachable`. The capability binds `capabilities-contract` 0.53 or later, which supplies the tile helper. No other verb, flag, answer or exit code changes.

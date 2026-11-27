@@ -186,7 +186,7 @@
       "level": 0,
       "lucide_icon": "archive",
       "path": "capabilities/assets",
-      "payload_sha256": "aa432f9dc2c9b212a682d74a56243681be2107d954449351947cf0671aab8889",
+      "payload_sha256": "4250b004f4ef179cfc0c6b9ed70a3d84ba8b167a49344d32ef25b3e62108c305",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "A project's assets: markdown as versioned documents in the project's PostgreSQL store - plans, research, sessions, meetings, journal, digests and reports saved one version at a time, searched in full text and diffed between versions - and every other file kept byte for byte in an S3-compatible bucket, sha256-checked, both imported from and exported to an agent's assets folder.",
@@ -202,7 +202,7 @@
           "title": "Материалы"
         }
       },
-      "version": "2026-11-24 — `assets inventory` counts this project's assets as a tile, and only with --network"
+      "version": "2026-11-27 — `assets --connection ID <verb>` takes the connection before the verb, as after it"
     },
     "automations": {
       "executable": [

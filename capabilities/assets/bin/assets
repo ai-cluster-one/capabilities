@@ -2800,11 +2800,18 @@ def _limit(value: str) -> int:
     return n
 
 
+CONNECTION_VERBS = frozenset({"doctor", "import", "export", "files add", "files link",
+                              "files rm", "files get"})
+
+
 def _parser() -> _Parser:
     parser = _Parser(prog=NAME)
+    # The contract's --connection is accepted before the verb as well as after it, for the
+    # verbs that take it; SUPPRESS keeps an absent post-verb flag from clobbering it.
+    parser.add_argument("--connection")
     sub = parser.add_subparsers(dest="cmd", required=True, parser_class=_Parser)
     one = sub.add_parser("doctor")
-    one.add_argument("--connection")
+    one.add_argument("--connection", default=argparse.SUPPRESS)
     sub.add_parser("list")
     one = sub.add_parser("show")
     one.add_argument("name")
@@ -2827,31 +2834,31 @@ def _parser() -> _Parser:
     one.add_argument("name")
     one = sub.add_parser("import")
     one.add_argument("dir", nargs="?")
-    one.add_argument("--connection")
+    one.add_argument("--connection", default=argparse.SUPPRESS)
     one = sub.add_parser("export")
     one.add_argument("dir", nargs="?")
-    one.add_argument("--connection")
+    one.add_argument("--connection", default=argparse.SUPPRESS)
     files = sub.add_parser("files").add_subparsers(dest="files_cmd", required=True,
                                                    parser_class=_Parser)
     one = files.add_parser("add")
     one.add_argument("name")
     one.add_argument("--from", dest="source", required=True)
     one.add_argument("--document")
-    one.add_argument("--connection")
+    one.add_argument("--connection", default=argparse.SUPPRESS)
     one = files.add_parser("link")
     one.add_argument("name")
     target = one.add_mutually_exclusive_group(required=True)
     target.add_argument("--document")
     target.add_argument("--none", action="store_true")
-    one.add_argument("--connection")
+    one.add_argument("--connection", default=argparse.SUPPRESS)
     one = files.add_parser("rm")
     one.add_argument("name")
     one.add_argument("--yes", action="store_true")
-    one.add_argument("--connection")
+    one.add_argument("--connection", default=argparse.SUPPRESS)
     one = files.add_parser("get")
     one.add_argument("name")
     one.add_argument("--out", required=True)
-    one.add_argument("--connection")
+    one.add_argument("--connection", default=argparse.SUPPRESS)
     files.add_parser("list")
     one = files.add_parser("log")
     one.add_argument("name", nargs="?")
@@ -2881,6 +2888,9 @@ def main() -> None:
     args = _parser().parse_args(argv)
     verb = (f"files {args.files_cmd}" if args.cmd == "files" else
             f"draft {args.draft_cmd}" if args.cmd == "draft" else args.cmd)
+    if args.connection is not None and verb not in CONNECTION_VERBS:
+        _die(6, "invalid_arguments", f"{NAME}: `{NAME} {verb}` takes no --connection",
+             f"run `{NAME} help`")
     if verb in WRITE_VERBS:
         _read_only_gate(f"`{NAME} {verb}`")
     {"doctor": lambda a: cmd_doctor(a.connection), "list": cmd_list, "show": cmd_show,

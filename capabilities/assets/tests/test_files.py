@@ -254,6 +254,22 @@ def test_doctor_proves_the_bucket(world, gateway):  # noqa: F811
 
 
 @needs_gateway
+def test_the_connection_flag_is_taken_before_the_verb_as_after_it(world, gateway):  # noqa: F811
+    root = connected(world.project(), gateway)
+    for args in (("--connection", "files", "doctor"), ("doctor", "--connection", "files")):
+        checked = world.ok(root, *args)
+        assert checked["ok"] and checked["connections"]["files"]["ok"]
+
+
+def test_the_connection_flag_before_the_verb_is_parsed_for_the_verbs_that_take_it(world):  # noqa: F811
+    root = world.project()
+    unknown = world.run(root, "--connection", "nowhere", "doctor")
+    assert unknown.returncode != 0 and error(unknown)["code"] != "invalid_arguments"
+    refused = world.run(root, "--connection", "files", "list")
+    assert refused.returncode == 6 and error(refused)["code"] == "invalid_arguments"
+
+
+@needs_gateway
 def test_writing_to_the_bucket_is_a_write(world, gateway, tmp_path):  # noqa: F811
     root = connected(world.project(), gateway)
     world.ok(root, "files", "add", "a.bin", "--from", "-", stdin=b"a")
