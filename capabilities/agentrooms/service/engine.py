@@ -664,7 +664,13 @@ WAKE_KINDS = ("mention", "direct", "invite", "marked")
 # room the agent marked is addressed to nobody.
 ADDRESSED_KINDS = ("mention", "direct")
 WORKER_KEYS = ("enabled", "description", "profile", "history", "accepts_from",
-               "invites_from", "wakes_on", "limits", "hooks")
+               "invites_from", "wakes_on", "limits", "hooks", "roles", "authority")
+# The keys of a worker's `authority`: the policy of senders `roles` does not
+# name, and each role's.
+AUTHORITY_KEYS = ("default", "roles")
+# The environment variable the contract preamble of every capability reads a
+# turn's authority from (an object, or a path to one), as telegrambot's roles do.
+AUTH_CONTEXT_ENV = "CAPABILITIES_AUTH_CONTEXT"
 REFUSAL_KEYS = ("description", "limits")
 DEFAULT_PROFILE = "agentrooms-claude"
 DEFAULT_HISTORY = 30
@@ -751,6 +757,115 @@ def _limits(raw, table: dict, wrong: Callable[[str], None]) -> dict:
     return out
 
 
+def normalize_capabilities(value):
+    """A role's `allowed_capabilities` in the shape the contract preamble reads:
+    `*` or true for all, a list of names, or a mapping of name to true, false,
+    a list of verbs or a rule; telegrambot's roles write the same."""
+    def rule(item):
+        if item is True or item == "*":
+            return True
+        if item in (False, None):
+            return False
+        if isinstance(item, list):
+            return {"allow": True, "verbs": item}
+        if isinstance(item, dict):
+            return {"allow": True, **item}
+        return bool(item)
+    if value is True or value == "*":
+        return {"*": True}
+    if isinstance(value, list):
+        return {str(name): True for name in value}
+    if isinstance(value, dict):
+        return {str(name): rule(item) for name, item in value.items()}
+    return {}
+
+
+def _policy(raw, where: str, wrong: Callable[[str], None]) -> dict | None:
+    if not isinstance(raw, dict) or set(map(str, raw)) - {"allowed_capabilities"}:
+        wrong(f"`{where}` is a mapping with `allowed_capabilities`")
+        return None
+    value = raw.get("allowed_capabilities")
+    ok = (value is True or value == "*" or
+          (isinstance(value, list) and all(isinstance(v, str) and v for v in value)) or
+          (isinstance(value, dict) and all(
+              isinstance(item, (bool, dict)) or item == "*" or
+              (isinstance(item, list) and all(isinstance(v, str) for v in item))
+              for item in value.values())))
+    if not ok:
+        wrong(f"`{where}.allowed_capabilities` is `*`, a list of capabilities, or a mapping "
+              "of capability to true, false or a list of verbs")
+        return None
+    return {"allowed_capabilities": normalize_capabilities(value)}
+
+
+def _roles(raw_roles, raw_authority, wrong: Callable[[str], None]) -> tuple[dict, dict | None]:
+    """The worker's per-sender roles and the authority each runs under. Both
+    are opt-in: with no `authority`, no turn carries an authority context."""
+    roles: dict[str, str] = {}
+    if raw_roles is not None:
+        if not isinstance(raw_roles, dict) or not all(
+                isinstance(k, str) and k.startswith("@") and ":" in k
+                and isinstance(v, str) and v.strip() for k, v in raw_roles.items()):
+            wrong("`roles` is a mapping of Matrix user id (`@name:server`) to role name")
+        else:
+            roles = {k: v.strip() for k, v in raw_roles.items()}
+    if raw_authority is None:
+        if roles:
+            wrong("`roles` names roles and `authority` gives none of them an authority")
+        return roles, None
+    if not isinstance(raw_authority, dict):
+        wrong("`authority` is a mapping of default and roles")
+        return roles, None
+    for key in sorted(set(map(str, raw_authority)) - set(AUTHORITY_KEYS)):
+        wrong(f"`authority` names {key!r}, which nothing reads: the keys are "
+              f"{', '.join(AUTHORITY_KEYS)}")
+    default = (_policy(raw_authority["default"], "authority.default", wrong)
+               if raw_authority.get("default") is not None else None)
+    by_role: dict[str, dict] = {}
+    raw_by_role = raw_authority.get("roles") or {}
+    if not isinstance(raw_by_role, dict):
+        wrong("`authority.roles` is a mapping of role name to its authority")
+    else:
+        for role, raw in raw_by_role.items():
+            policy = _policy(raw, f"authority.roles.{role}", wrong)
+            if policy is not None:
+                by_role[str(role)] = policy
+    if isinstance(raw_by_role, dict):
+        for role in sorted(set(roles.values()) - set(map(str, raw_by_role))):
+            wrong(f"`roles` names role {role!r}, which `authority.roles` does not give an "
+                  "authority")
+    return roles, {"default": default, "roles": by_role}
+
+
+def sender_authority(worker: dict, sender: str | None) -> tuple[str | None, dict | None]:
+    """The role a sender has under this worker and the authority its turn runs
+    under, or None: a worker with no `authority`, or a sender `roles` does not
+    name where `authority.default` is not set, runs as before, under the
+    project's own gate alone."""
+    authority = worker.get("authority")
+    if not authority:
+        return None, None
+    role = (worker.get("roles") or {}).get(sender or "")
+    if role is not None:
+        return role, authority["roles"].get(role)
+    return None, authority.get("default")
+
+
+def authority_summary(ctx: dict | None) -> str:
+    caps = (ctx or {}).get("allowed_capabilities") or {}
+    if caps.get("*") is True:
+        return "all capabilities"
+    bits = []
+    for name, item in sorted(caps.items()):
+        if item is False:
+            continue
+        if isinstance(item, dict) and item.get("verbs") is not None:
+            bits.append(f"{name} (verbs: {', '.join(map(str, item['verbs'])) or 'none'})")
+        else:
+            bits.append(name)
+    return ", ".join(bits) if bits else "no capabilities"
+
+
 def read_worker(name: str, spec: dict, body: str, where: str) -> dict:
     """A worker's settings, whole and checked, with every default filled in.
     Raises WorkerInvalid naming every problem at once."""
@@ -804,6 +919,7 @@ def read_worker(name: str, spec: dict, body: str, where: str) -> dict:
                           "the project root")
                     continue
                 hooks[which] = command.strip()
+    roles, authority = _roles(spec.get("roles"), spec.get("authority"), wrong)
     if enabled is True and not accepts and not problems:
         wrong("it is enabled and admits nobody: `accepts_from` names who may wake the agent")
     if problems:
@@ -811,7 +927,7 @@ def read_worker(name: str, spec: dict, body: str, where: str) -> dict:
     return {"name": name, "enabled": enabled, "description": (description or "").strip(),
             "profile": profile.strip(), "history": history, "accepts_from": accepts,
             "invites_from": invites, "wakes_on": wakes_on, "limits": limits, "hooks": hooks,
-            "body": (body or "").strip()}
+            "roles": roles, "authority": authority, "body": (body or "").strip()}
 
 
 def read_refusal(spec: dict, body: str, where: str) -> dict:
@@ -858,12 +974,30 @@ def turn_admits(store, project: str, turn: dict) -> Callable[[dict], bool]:
     """Whether the worker a turn ran under would have answered a wake: its kind
     is one the worker wakes on and its sender one it admits. The version the
     turn recorded, else the shipped default, which records none."""
-    row = store.worker(project, turn["worker"], turn["worker_id"]) if turn["worker_id"] else None
-    worker = (read_worker(row["name"], row["spec"], row["body"],
-                          f"worker {row['name']!r} version {row['id']}")
-              if row else load_default())
+    worker = turn_worker(store, project, turn)
     return lambda wake: (wake["kind"] in worker["wakes_on"]
                          and admits(worker["accepts_from"], wake.get("sender")))
+
+
+def turn_worker(store, project: str, turn: dict) -> dict:
+    """The worker version a turn recorded, else the shipped default, which
+    records none."""
+    row = store.worker(project, turn["worker"], turn["worker_id"]) if turn["worker_id"] else None
+    return (read_worker(row["name"], row["spec"], row["body"],
+                        f"worker {row['name']!r} version {row['id']}")
+            if row else load_default())
+
+
+def turn_defers(store, project: str, turn: dict) -> Callable[[dict], bool]:
+    """Whether a wake waits for a turn of its own rather than joining a running
+    one: its sender's authority under the turn's worker is not the turn's. A
+    worker with no `authority` defers nothing."""
+    worker = turn_worker(store, project, turn)
+    if not worker.get("authority"):
+        return lambda wake: False
+    senders = turn.get("senders") or []
+    own = sender_authority(worker, senders[0] if senders else None)
+    return lambda wake: sender_authority(worker, wake.get("sender")) != own
 
 
 def supervisor_of(content: dict) -> dict | None:
@@ -1474,19 +1608,23 @@ class Store:
 
     def running_turn(self, turn: str) -> dict | None:
         row = self.execute(f"SELECT agent_id, {CONNECTION}, room_id, worker, worker_id, outcome, "
-                           "seen_ts FROM agentrooms_turns WHERE id = %s", (turn,), fetch="one")
+                           "seen_ts, senders FROM agentrooms_turns WHERE id = %s", (turn,),
+                           fetch="one")
         if row is None:
             return None
         return {"turn": turn, "project_id": row[0], "agent": row[1], "room_id": row[2],
                 "worker": row[3], "worker_id": str(row[4]) if row[4] else None,
-                "outcome": row[5], "seen_ts": row[6]}
+                "outcome": row[5], "seen_ts": row[6], "senders": list(row[7] or [])}
 
     def catch_up(self, turn: str, events: list[dict],
-                 admitted: Callable[[dict], bool]) -> list[dict] | None:
+                 admitted: Callable[[dict], bool],
+                 deferred: Callable[[dict], bool] | None = None) -> list[dict] | None:
         """What a running turn took of the room: `events`, the messages after its
         mark. Its mark moves to the newest, their ids are recorded taken, and the
         pending wakes among them that `admitted` passes are claimed by the turn,
-        their senders and kinds counted on it. None when the turn has ended."""
+        their senders and kinds counted on it. A wake `deferred` passes - one
+        whose sender's authority is not the turn's - is neither claimed nor
+        recorded taken, so it starts its own turn. None when the turn has ended."""
         ids = [e["event_id"] for e in events if e.get("event_id")]
         newest = max([e.get("origin_server_ts") or 0 for e in events] or [0])
         with self.transaction() as cur:
@@ -1502,6 +1640,10 @@ class Store:
                         "FOR UPDATE", (project, agent, room_id, ids))
             wakes = [{"key": r[0], "kind": r[1], "event_id": r[2], "sender": r[3]}
                      for r in cur.fetchall()]
+            if deferred is not None:
+                waits = {w["event_id"] for w in wakes if deferred(w)}
+                wakes = [w for w in wakes if w["event_id"] not in waits]
+                ids = [i for i in ids if i not in waits]
             took = [w for w in wakes if admitted(w)]
             if took:
                 cur.execute("UPDATE agentrooms_wakes SET claimed_by = %s WHERE agent_id = %s "
@@ -1935,13 +2077,17 @@ def with_rules(profile, rules: str):
 
 
 def build_prompt(*, room_id: str, room_name: str | None, wakes: list[dict],
-                 events: list[dict], primed: bool, user_id: str | None = None) -> str:
+                 events: list[dict], primed: bool, user_id: str | None = None,
+                 authority: dict | None = None) -> str:
     """The turn's user prompt: what woke the agent and the room's messages. The
     room's rules travel in the system prompt (`room_rules`), not here."""
     kinds = sorted({w["kind"] for w in wakes})
     lines = ["=== This turn ===",
              f"Room: {room_id}" + (f" ({room_name})" if room_name else ""),
              f"Woken by: {', '.join(kinds)}"]
+    if authority is not None:
+        lines.append(f"Tool authority ({authority.get('sender_role')}): "
+                     f"{authority_summary(authority)}; a capability outside it refuses")
     wake_ids = {w["event_id"] for w in wakes if w.get("event_id")}
     if events:
         lines += ["", "=== Room history ===" if primed
@@ -2880,6 +3026,17 @@ class Engine:
         wakes = [w for w in wakes if w.get("sender") not in over]
         if not wakes:
             return
+        if worker.get("authority"):
+            # One turn runs under one authority: the first wake's. The wakes of
+            # senders with another go back for a turn of their own.
+            own = sender_authority(worker, wakes[0].get("sender"))
+            later = [w for w in wakes if sender_authority(worker, w.get("sender")) != own]
+            if later:
+                store.restore(slot.project_id, cid, room_id, turn.id, [w["key"] for w in later])
+                slot.log(f"{cid}: {', '.join(sorted({str(w.get('sender')) for w in later}))} in "
+                         f"{room_id} wait(s) for a turn of their own: another authority under "
+                         f"worker {name!r}")
+                wakes = [w for w in wakes if w not in later]
         senders = sorted({w.get("sender") for w in wakes if w.get("sender")})
         payload = {"agent": cid, "user_id": agent["user_id"], "room_id": room_id,
                    "worker": name, "version": worker.get("version"),
@@ -2968,14 +3125,26 @@ class Engine:
             resumable = bool(row and row.get("session_id") and row.get("node") == self.node
                              and row.get("harness") == harness)
             shown = events
+            role, authority = sender_authority(worker, wakes[0].get("sender"))
             if resumable and row.get("seen_ts"):
-                shown = [e for e in events if (e.get("origin_server_ts") or 0) > row["seen_ts"]]
+                # Under roles a turn's own wakes can be older than the session's
+                # mark: an earlier turn under another authority saw them.
+                own = ({w["event_id"] for w in wakes if w.get("event_id")}
+                       if worker.get("authority") else set())
+                shown = [e for e in events if (e.get("origin_server_ts") or 0) > row["seen_ts"]
+                         or e.get("event_id") in own]
             profile = with_rules(profile, room_rules(
                 self.host.template(slot.entry), agent=agent, room_id=room_id,
                 room_name=room_name, role=worker["body"]))
+            context = None
+            if authority is not None:
+                context = {"version": 1, "source": "agentrooms", "connection": cid,
+                           "chat_id": room_id, "room_id": room_id,
+                           "sender_id": wakes[0].get("sender"), "sender_role": role or "default",
+                           **authority}
             prompt = build_prompt(room_id=room_id, room_name=room_name, wakes=wakes,
                                   events=shown, primed=not resumable,
-                                  user_id=agent["user_id"])
+                                  user_id=agent["user_id"], authority=context)
             runner = self.host.runner()
             session = (runner.Session.resume(row["session_id"]) if resumable
                        else runner.Session.fresh())
@@ -2985,14 +3154,16 @@ class Engine:
             slot.log(f"{cid}: turn in {room_id} ({', '.join(sorted({w['kind'] for w in wakes}))})"
                      f" started by worker {worker['name']!r} on {origin.get('name')} ({harness}), "
                      f"{how}, cwd {slot.entry['root']}")
-            result = self.call_runner(turn, timeout, profile, prompt, session, runner)
+            result = self.call_runner(turn, timeout, profile, prompt, session, runner,
+                                      authority=context)
             if resumable and missing_session(result):
                 slot.log(f"{cid}: session {row['session_id']} is not on this node; "
                          "starting a fresh one primed from the room")
                 prompt = build_prompt(room_id=room_id, room_name=room_name, wakes=wakes,
-                                      events=events, primed=True, user_id=agent["user_id"])
+                                      events=events, primed=True, user_id=agent["user_id"],
+                                      authority=context)
                 result = self.call_runner(turn, timeout, profile, prompt, runner.Session.fresh(),
-                                          runner)
+                                          runner, authority=context)
             session_id = getattr(result, "session_id", None)
             if harness_ran(result):
                 seen = max(seen or 0, store.turn_seen(turn.id) or 0) or None
@@ -3044,16 +3215,18 @@ class Engine:
             with contextlib.suppress(Exception):
                 matrix.close()
 
-    def call_runner(self, turn: Turn, timeout: int, profile, prompt: str, session, runner):
+    def call_runner(self, turn: Turn, timeout: int, profile, prompt: str, session, runner,
+                    authority: dict | None = None):
         timer = threading.Timer(float(timeout), turn.cancel.set)
         timer.daemon = True
         timer.start()
+        extra_env = {"CLAUDE_PROJECT_DIR": turn.slot.entry["root"], TURN_ENV: turn.id}
+        if authority is not None:
+            extra_env[AUTH_CONTEXT_ENV] = json.dumps(authority, ensure_ascii=False)
         try:
             return runner.run(prompt, profile, turn.slot.entry["root"], session=session,
                               environ=self.host.turn_env(turn.slot.entry),
-                              extra_env={"CLAUDE_PROJECT_DIR": turn.slot.entry["root"],
-                                         TURN_ENV: turn.id},
-                              cancel=turn.cancel)
+                              extra_env=extra_env, cancel=turn.cancel)
         finally:
             timer.cancel()
 

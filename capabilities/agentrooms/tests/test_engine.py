@@ -5,6 +5,7 @@ resumes, what is posted, and that a room has one turn at a time."""
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 from pathlib import Path
@@ -264,11 +265,15 @@ class FakeStore:
     def turn_seen(self, turn):
         return self.row(turn)["seen_ts"]
 
-    def catch_up(self, turn, events, admitted):
+    def catch_up(self, turn, events, admitted, deferred=None):
         """What `Store.catch_up` does, for the engine's side of it."""
         row = self.row(turn)
         ids = [e["event_id"] for e in events]
         with self.lock:
+            if deferred is not None:
+                waits = {w["event_id"] for w in self.wakes if w["claimed_by"] is None
+                         and w["event_id"] in ids and deferred(w)}
+                ids = [i for i in ids if i not in waits]
             took = [w for w in self.wakes if w["claimed_by"] is None and w["event_id"] in ids
                     and admitted(w)]
             for w in took:
@@ -1324,3 +1329,112 @@ def test_the_agent_is_taken_up_once(tmp_path):
     agent.take_up()
     assert asked == ["alpha"] and agent.taken_up
     assert "alpha: its card moved" in (tmp_path / engine.LOG_FILE).read_text()
+
+
+# ── per-sender authority ─────────────────────────────────────────────────────
+
+GUEST = "@guest:example.org"
+ROLES = {**WORKER, "accepts_from": ["@b:example.org", GUEST],
+         "roles": {GUEST: "guest"},
+         "authority": {"roles": {"guest": {"allowed_capabilities": {"tasks": ["list", "show"]}}}}}
+
+
+def auth_of(call):
+    raw = call["extra_env"].get(engine.AUTH_CONTEXT_ENV)
+    return json.loads(raw) if raw else None
+
+
+def test_roles_and_authority_are_opt_in_and_checked_whole():
+    plain = engine.read_worker("w", dict(WORKER), "", "w")
+    assert plain["roles"] == {} and plain["authority"] is None
+    assert engine.sender_authority(plain, GUEST) == (None, None)
+    worker = engine.read_worker("w", dict(ROLES), "", "w")
+    assert engine.sender_authority(worker, GUEST) == (
+        "guest", {"allowed_capabilities": {"tasks": {"allow": True, "verbs": ["list", "show"]}}})
+    # A sender no role names, with no default, runs as before.
+    assert engine.sender_authority(worker, "@b:example.org") == (None, None)
+    with_default = engine.read_worker("w", {**ROLES, "authority": {
+        **ROLES["authority"], "default": {"allowed_capabilities": ["agentrooms"]}}}, "", "w")
+    assert engine.sender_authority(with_default, "@b:example.org") == (
+        None, {"allowed_capabilities": {"agentrooms": True}})
+    for spec, said in (({**WORKER, "roles": {GUEST: "guest"}}, "gives none of them"),
+                       ({**ROLES, "roles": {GUEST: "other"}}, "'other'"),
+                       ({**ROLES, "roles": {"guest": "guest"}}, "Matrix user id"),
+                       ({**ROLES, "authority": {"users": {}}}, "'users'"),
+                       ({**ROLES, "authority": {"roles": {"guest": {"allowed_capabilities": 3}}}},
+                        "authority.roles.guest.allowed_capabilities"),
+                       ({**ROLES, "authority": {"roles": {"guest": {"verbs": []}}}},
+                        "authority.roles.guest")):
+        with pytest.raises(engine.WorkerInvalid, match=re.escape(said)):
+            engine.read_worker("w", spec, "", "w")
+
+
+def test_a_senders_role_carries_its_authority_into_the_turn(tmp_path):
+    matrix = FakeMatrix([message("$1", GUEST, f"{ME} list my tasks")])
+    runner = FakeRunner(["done"])
+    eng, slot = make_engine(tmp_path, matrix, runner, workers={"w": (ROLES, "")})
+    slot.store.add("!r", "$1", sender=GUEST)
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    ctx = auth_of(runner.calls[0])
+    assert ctx["source"] == "agentrooms" and ctx["sender_role"] == "guest"
+    assert ctx["sender_id"] == GUEST and ctx["room_id"] == "!r" and ctx["connection"] == "alpha"
+    assert ctx["allowed_capabilities"] == {"tasks": {"allow": True, "verbs": ["list", "show"]}}
+    assert "Tool authority (guest): tasks (verbs: list, show)" in runner.calls[0]["prompt"]
+
+
+def test_a_sender_with_no_role_runs_as_before(tmp_path):
+    matrix = FakeMatrix([message("$1", "@b:example.org", f"{ME} hi")])
+    runner = FakeRunner(["ok"])
+    eng, slot = make_engine(tmp_path, matrix, runner, workers={"w": (ROLES, "")})
+    slot.store.add("!r", "$1")
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert engine.AUTH_CONTEXT_ENV not in runner.calls[0]["extra_env"]
+    assert "Tool authority" not in runner.calls[0]["prompt"]
+
+
+def test_senders_with_different_authorities_are_answered_in_turns_of_their_own(tmp_path):
+    events = [message("$1", "@b:example.org", f"{ME} from b"), message("$2", GUEST, f"{ME} from guest")]
+    matrix = FakeMatrix(events)
+    runner = FakeRunner(["for b", "for guest"])
+    eng, slot = make_engine(tmp_path, matrix, runner, workers={"w": (ROLES, "")})
+    slot.store.add("!r", "$1")
+    slot.store.add("!r", "$2", sender=GUEST)
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 1 and auth_of(runner.calls[0]) is None
+    assert slot.store.turn_log[0]["senders"] == ["@b:example.org"]
+    assert [w["sender"] for w in slot.store.wakes] == [GUEST]
+    assert "wait(s) for a turn of their own" in (tmp_path / engine.LOG_FILE).read_text()
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    second = runner.calls[1]
+    assert auth_of(second)["sender_role"] == "guest"
+    assert second["session"].kind == "resume" and slot.store.turn_log[1]["senders"] == [GUEST]
+    # The resumed session saw the guest's message last turn; this turn shows it
+    # again, as what woke it.
+    assert "from guest" in second["prompt"] and "WOKE YOU" in second["prompt"]
+    assert slot.store.wakes == []
+
+
+def test_catch_up_leaves_another_authoritys_wake_for_its_own_turn(tmp_path):
+    events = [message("$1", GUEST, f"{ME} one")]
+    matrix = FakeMatrix(events)
+
+    def during(turn_id):
+        events.extend([later("$2", "@b:example.org", f"{ME} two", 2),
+                       later("$3", GUEST, f"{ME} three", 3)])
+        slot.store.add("!r", "$2")
+        slot.store.add("!r", "$3", sender=GUEST)
+        turn = {"worker": "w", "worker_id": "v-w", "senders": [GUEST]}
+        new = [e for e in events if e["origin_server_ts"] > slot.store.turn_seen(turn_id)]
+        took = slot.store.catch_up(turn_id, new, engine.turn_admits(slot.store, "prj", turn),
+                                   engine.turn_defers(slot.store, "prj", turn))
+        assert [w["event_id"] for w in took] == ["$3"]
+
+    runner = CatchingUpRunner(["a1", "a2"], during)
+    eng, slot = make_engine(tmp_path, matrix, runner, workers={"w": (ROLES, "")})
+    slot.store.add("!r", "$1", sender=GUEST)
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert [w["event_id"] for w in slot.store.wakes] == ["$2"]
+    eng.turn(engine.Turn(slot, "alpha", "!r"))
+    assert len(runner.calls) == 2 and auth_of(runner.calls[1]) is None
+    assert slot.store.turn_log[1]["senders"] == ["@b:example.org"]
+

@@ -315,6 +315,28 @@ def test_catch_up_takes_the_admitted_wakes_and_a_later_one_is_known_taken(store)
                                 fetch="one")[0]) == ["@b:x", "@c:x", "@s:x"]
 
 
+
+def test_catch_up_neither_takes_nor_records_a_wake_another_authority_waits_for(store):
+    store.acquire("p", ALPHA, "h1", "n1", 1)
+    wake = {"room_id": "!r", "kind": "mention", "sender": "@b:x"}
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b1", [{**wake, "key": "$1", "event_id": "$1"}])
+    store.claim("p", ALPHA, "!r", "t1")
+    store.start_turn("t1", "p", ALPHA, "!r", "w", None, ["@b:x"], ["mention"])
+    assert store.running_turn("t1")["senders"] == ["@b:x"]
+    store.save_sync("p", ALPHA, "@alpha:x", "h1", "b2", [
+        {**wake, "key": "$2", "event_id": "$2"},
+        {**wake, "key": "$3", "event_id": "$3", "sender": "@g:x"}])
+    events = [{"event_id": f"${n}", "origin_server_ts": 100 + n} for n in (2, 3)]
+    took = store.catch_up("t1", events, lambda w: True, lambda w: w["sender"] == "@g:x")
+    assert [w["event_id"] for w in took] == ["$2"]
+    assert store.execute("SELECT taken FROM agentrooms_turns WHERE id = 't1'",
+                         fetch="one")[0] == ["$2"]
+    store.end_turn("t1", "answered")
+    store.finish("p", ALPHA, "!r", "t1")
+    pending = store.claim("p", ALPHA, "!r", "t2")
+    assert [w["event_id"] for w in pending] == ["$3"]
+    assert store.taken_before("p", ALPHA, "!r", pending) == []
+
 def test_a_turn_that_took_nothing_hands_its_taken_wakes_back(store):
     store.acquire("p", ALPHA, "h1", "n1", 1)
     wake = {"room_id": "!r", "kind": "mention", "sender": "@b:x"}

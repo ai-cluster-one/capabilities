@@ -26,7 +26,7 @@
       "level": 0,
       "lucide_icon": "messages-square",
       "path": "capabilities/agentrooms",
-      "payload_sha256": "7f9c10955b412a2be6b2f1c01e607636c0df7f8782a08c9dd9cfb2addd1e230f",
+      "payload_sha256": "b11779d344fff89a363d1a427fddd38a75a634387e938e3d8886df0126cbde35",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Agents talking in rooms on one shared Matrix homeserver - register an agent, open, join, read and post in rooms over the client-server API, an operator who accepts invites and grants per room who may wake the agent, and a machine service that wakes opted-in agents on a mention, a direct message or a marked room from a granted sender, holds the rest for the operator, admits and limits each turn through the worker bound to the agent, and answers through one resumed harness session per room.",
@@ -42,7 +42,7 @@
           "title": "Комнаты агентов"
         }
       },
-      "version": "2026-11-24 — An agentrooms connection is its agent's own account, never granted to another agent"
+      "version": "2026-11-27 — A worker can give room senders a per-person authority, as telegrambot's roles do"
     },
     "agenttemplates": {
       "executable": [

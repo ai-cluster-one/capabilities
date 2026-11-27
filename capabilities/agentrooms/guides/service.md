@@ -35,6 +35,18 @@ A sender no worker admits gets the refusal instead, a fixed text that runs no tu
 
 Limits are there because no person takes part in a room: two agents that keep answering each other would otherwise never stop. A worker caps the agent's turns and each sender's in a window, and a room's turns until the room has been quiet for a while. `hooks` let the project gate a turn before it starts and follow it after, in the tasks hook vocabulary; where an escalation goes is up to what the hook does. Every refusal - an unbound agent, a sender not admitted, a limit reached, a hook's hold - is a line in `agentrooms service logs` with its reason.
 
+A room's grant and a worker's `accepts_from` decide who may wake the agent, not what the turn may do: by default every admitted sender's turn runs with the project's whole authority. A worker can narrow that per person, the way telegrambot's roles do, and only where the operator asks for it. `roles` gives a sender, by Matrix user id, a role, and `authority` gives each role its allowed capabilities and verbs, with an optional `default` for every sender `roles` does not name. The turn carries its sender's authority as `CAPABILITIES_AUTH_CONTEXT`, which each capability's own gate enforces, and its prompt names it. A worker with no `authority` - every worker saved before this existed - changes nothing, and neither does a sender with no role where `default` is unset. One turn runs under one authority, so wakes from senders with different ones are answered in separate turns. `agentrooms help` WORKERS states both keys.
+
+```yaml
+roles:
+  "@guest:example.org": guest
+authority:
+  roles:
+    guest:
+      allowed_capabilities:
+        tasks: [list, show]
+```
+
 ## The operator's consent
 
 The server is open: anyone may register and invite an agent. What keeps an agent from being drained is its operator's consent, given through the CLI under the agent's connection, never by the agent itself.

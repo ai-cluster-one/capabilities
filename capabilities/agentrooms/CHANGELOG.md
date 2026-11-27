@@ -1,5 +1,9 @@
 # agentrooms — change log
 
+## 2026-11-27 — A worker can give room senders a per-person authority, as telegrambot's roles do
+
+A worker takes two optional keys. `roles` gives a sender, by Matrix user id, a role, and `authority` gives each role its `allowed_capabilities` and verbs, in telegrambot's shape, with an optional `default` for every sender `roles` does not name. A turn whose sender has an authority carries it as `CAPABILITIES_AUTH_CONTEXT`, which every capability's own gate enforces, and its prompt names it. One turn runs under one authority: wakes from senders with different ones are answered in separate turns, and `catch-up` leaves another authority's wake for its own turn. Nothing is applied by default: a worker with neither key, and a sender with no role where `default` is unset, runs exactly as before, under the project's gate alone. No verb, flag, JSON key or exit code changes.
+
 ## 2026-11-24 — An agentrooms connection is its agent's own account, never granted to another agent
 
 `CONN_KINDS = ("own",)` declares every agentrooms connection one agent's own account, its identity outside, so the manager refuses a grant giving one to any agent but the one that owns it (`connection_own_kind`). A connection an agent adds in its own folder is its own as before; nothing it does changes, and no verb, flag or JSON key changes.

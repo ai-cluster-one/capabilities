@@ -1121,6 +1121,23 @@ agentrooms workers save NAME FILE|- [--base ID]
                   failed, not_posted, refused), AGENTROOMS_EVENT_ID,
                   AGENTROOMS_SESSION, AGENTROOMS_HARNESS_FAILURE and
                   AGENTROOMS_HARNESS_SAID. before has 30 seconds, after 60.
+    roles         opt-in, as telegrambot's roles: a mapping of Matrix user id
+                  (`@name:server`) to a role name that `authority.roles`
+                  gives an authority. Unset, nobody has a role.
+    authority     opt-in: what a sender's turn may use. `roles.<role>` is
+                  the authority of the senders `roles` names with it, and
+                  `default` that of every sender `roles` does not name; each
+                  is {allowed_capabilities: `*` | [capability] |
+                  {capability: true | false | [verb]}}. The turn carries it
+                  as CAPABILITIES_AUTH_CONTEXT, which every capability's own
+                  gate enforces, and its prompt names it. A sender with no
+                  role where `default` is unset - and every sender of a
+                  worker with no `authority` - runs under the project's gate
+                  alone, as before. One turn runs under one authority, its
+                  first wake's; the wakes of senders with another wait for a
+                  turn of their own, and `catch-up` leaves them for it. A
+                  turn that should act in rooms through this CLI needs
+                  agentrooms in its role's allowed capabilities.
 
   The hooks answer as the tasks hooks do, by their exit: 0 go; 75 hold, until
   the moment its last stdout line names (ISO 8601 with its offset, or a date)
@@ -4083,7 +4100,8 @@ def cmd_catch_up(wanted: str | None, limit: int) -> dict:
         chunk = [e for e in (found or {}).get("chunk") or [] if e.get("type") == "m.room.message"]
         mark = turn["seen_ts"] or 0
         new = [e for e in reversed(chunk) if (e.get("origin_server_ts") or 0) > mark]
-        took = store.catch_up(turn_id, new, engine.turn_admits(store, project, turn))
+        took = store.catch_up(turn_id, new, engine.turn_admits(store, project, turn),
+                              engine.turn_defers(store, project, turn))
         if took is None:
             _die(6, "turn_ended", f"turn {turn_id} has ended")
     finally:
