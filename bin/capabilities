@@ -395,7 +395,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.58.0"
+CONTRACT_LIBRARY_RELEASE = "0.59.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -8749,6 +8749,20 @@ def _load_global(records, names) -> None:
         pass
 
 
+def _load_identifiers(records, names) -> None:
+    """Read the identifiers of every one of `names` in one round trip, so each
+    one's `resolve(name, "identifier")` answers from it. A library before 0.59
+    has no such read and a store that does not answer here leaves them unread:
+    each capability then reads, and reports what it cannot read, on its own."""
+    load = getattr(records, "load_identifiers", None)
+    if load is None:
+        return
+    try:
+        load(list(names))
+    except _store_module().StoreError:
+        pass
+
+
 def _machine_connections(name: str, records) -> int:
     """How many connections this machine's global scope declares for `name`,
     leaving out those whose grant there resolves to disabled: the store's rows
@@ -10605,6 +10619,9 @@ def _is_system_agent(root: Path) -> bool:
     agent_id = _project_id_state(root)["id"]
     if not agent_id:
         return False
+    # Read before borrowing the connection below: it borrows one itself, and
+    # one held here would make it open a second.
+    stored_id = _store_agent_id(root, agent_id)
     db = _db_module()
     try:
         setting = db.resolve_setting(root)
@@ -10615,7 +10632,7 @@ def _is_system_agent(root: Path) -> bool:
     import psycopg
     try:
         conn.read_only = True
-        return _store_module().agent_kind(conn, _store_agent_id(root, agent_id)) == "system"
+        return _store_module().agent_kind(conn, stored_id) == "system"
     except psycopg.Error:
         return False
     finally:
@@ -26201,12 +26218,13 @@ def _context_enabled(root: Path, system: bool | None = None) -> list[str]:
 
 
 def _compose_context(root: Path, build: bool = False,
-                     standing: list[str] | None = None) -> str:
+                     standing: list[str] | None = None, system: bool | None = None) -> str:
     """Deterministic injection body: gate, snapshots, and resolved records;
     with build, the block `build` composes, whose refresh route is itself.
     The blocks enabled capabilities declare for the standing place lead it,
     or, given `standing`, are added to that list, one text per block, for the
-    caller to place ahead of the agent's own doctrine."""
+    caller to place ahead of the agent's own doctrine. `system` is whether
+    the agent is a system agent where the caller has read it already."""
     if _CONTEXT_WITHOUT_STORE:
         try:
             _policy_scopes(root)
@@ -26219,7 +26237,8 @@ def _compose_context(root: Path, build: bool = False,
                 f"this file was written ({exc.slug}); `capabilities context` writes it "
                 "again where the store is, as the session-start hook does.", "",
                 CONTEXT_END]) + "\n"
-    system = _is_system_agent(root)
+    if system is None:
+        system = _is_system_agent(root)
     enabled = _context_enabled(root, system)
     snapshots = {name: _load_snapshots(name) for name in enabled}
     declared = {}
@@ -26249,6 +26268,7 @@ def _compose_context(root: Path, build: bool = False,
         lines += [_context_prompt(root, build, system), ""]
     adapter = _records_for(root)
     try:
+        _load_identifiers(adapter, enabled)
         for name in enabled:
             stub, manifest = snapshots[name]
             lines.append(f"## {name}")
@@ -31429,7 +31449,8 @@ def _ck_in_process(work):
 
 
 def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[str],
-                           store: dict, standing: list[str] | None = None) -> str:
+                           store: dict, standing: list[str] | None = None,
+                           system: bool | None = None) -> str:
     if not (root / capabilities_dir).is_dir():
         warnings.append(f"capability layer not present; add `{capabilities_dir.as_posix()}/` "
                         "or run `capabilities help`")
@@ -31438,7 +31459,7 @@ def _ck_capability_context(root: Path, capabilities_dir: Path, warnings: list[st
     os.environ["CLAUDE_PROJECT_DIR"] = str(root)
     try:
         code, text, err = _ck_in_process(
-            lambda: _compose_context(root, build=True, standing=standing))
+            lambda: _compose_context(root, build=True, standing=standing, system=system))
     finally:
         if held is None:
             os.environ.pop("CLAUDE_PROJECT_DIR", None)
@@ -31682,8 +31703,11 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
     stored_routines = _ck_stored_routines(root, routines_dir, warnings, store)
     routine_index = _ck_routine_index(root, routines_dir, warnings, stored_routines)
     standing: list[str] = []
+    # Read once for the build: the capability context and the global
+    # doctrine below both turn on it.
+    system = _is_system_agent(root)
     capability_context = _ck_capability_context(root, layers["capabilities"], warnings, store,
-                                                standing)
+                                                standing, system)
     if not capability_context:
         standing.clear()
     onboarding = _ck_onboarding(root, binding, warnings, store)
@@ -31706,7 +31730,6 @@ def _ck_compose(root: Path) -> tuple[str, list[str], dict]:
         if (root / context_dir).exists():
             warnings.append(f"context documents are read from the store; the context folder "
                             f"`{context_dir.as_posix()}/` is no longer read and can be removed")
-    system = _is_system_agent(root)
     if system:
         # A system agent's doctrine is its own alone: no global context.
         global_files = []
