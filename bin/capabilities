@@ -13668,8 +13668,8 @@ def _node_connection_checks(folders: dict[str, Path]) -> dict[tuple[str, str], l
     connections and the required keys that do not resolve here (key_missing);
     its `doctor` proves the rest at once where it exits 0, else one by one,
     exit 2 being credentials refused (not_signed_in). A connection whose
-    doctor settles neither is left out, so what was said of it last stands;
-    None where the capability could not list its connections."""
+    doctor settles neither is answered with live None, so what was said of it
+    last stands; None where the capability could not list its connections."""
     env = {k: v for k, v in os.environ.items() if k != "CLAUDE_PROJECT_DIR"}
     out: dict[tuple[str, str], list | None] = {}
     for capability in _connection_capabilities():
@@ -13706,6 +13706,8 @@ def _node_connection_checks(folders: dict[str, Path]) -> dict[tuple[str, str], l
                     if code in (0, 2):
                         rows.append((cid, code == 0, None if code == 0 else "not_signed_in",
                                      None))
+                    else:
+                        rows.append((cid, None, None, None))
             out[(agent_id, capability)] = sorted(rows)
     return out
 
@@ -13843,7 +13845,8 @@ def _node_state_write(conn, here: str, facts: dict, logins: dict | None,
     linked here goes too; another manager's agents on the same machine keep
     theirs. `checks`, where given, are the connections the quiet check
     answered (`_node_connection_checks`), each written beside the others of
-    its capability, and one its capability no longer lists dropped; the
+    its capability where its doctor settled it, one it did not settle kept as
+    it was, and one its capability no longer lists dropped; the
     sessions of every installed capability with connections are kept, as
     those of a device-bound one are. Answers {reported_at, fresh_until}."""
     store = _store_module()
@@ -13862,8 +13865,9 @@ def _node_state_write(conn, here: str, facts: dict, logins: dict | None,
             continue
         stored = _node_stored_sessions(conn, capability, rows)
         for connection, live, reason, keys in stored:
-            store.node_session_put(conn, agent_id, here, capability, connection, live,
-                                   reason=reason, reason_keys=keys)
+            if live is not None:
+                store.node_session_put(conn, agent_id, here, capability, connection, live,
+                                       reason=reason, reason_keys=keys)
         listed = {connection for connection, *_rest in stored}
         conn.execute("DELETE FROM node_sessions WHERE agent_id = %s AND node = %s "
                      "AND capability = %s AND NOT coalesce(connection_id, file_connection) "
