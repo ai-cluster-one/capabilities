@@ -395,7 +395,7 @@ CONTRACT_LIBRARY_RANGE = ">=0.8,<1"
 # installed capability's environments to it where the capability's declared
 # range admits it, so a library release reaches installed capabilities once
 # the package records it here - and marks nothing behind before.
-CONTRACT_LIBRARY_RELEASE = "0.56.0"
+CONTRACT_LIBRARY_RELEASE = "0.57.0"
 # The store schema major this release line reads - the major of the `core`
 # owner in the store's schema_version - and, on a line kept for an older major,
 # the capabilities-contract range that line reads (None on main, which carries
@@ -5926,7 +5926,9 @@ def cmd_list() -> None:
     root = _project_root()
     project_caps, global_caps = _policy_views(root)
     machine = _global_records(root)
-    for name, meta in _installed().items():
+    installed = _installed()
+    _load_global(machine, installed)
+    for name, meta in installed.items():
         stub, manifest = _load_snapshots(name)
         entry: dict = {"name": name,
                        "title": (manifest or {}).get("title"),
@@ -8694,6 +8696,20 @@ def _write_machine(name: str, state: str | None, record: bool = False) -> bool:
         MANAGER_MUTATION_LOCK.chmod(0o600)
         fcntl.flock(mutation, fcntl.LOCK_EX)
         return _write_machine_locked(name, state, record)
+
+
+def _load_global(records, names) -> None:
+    """Read the global layer of every one of `names` in one round trip, so
+    `_machine_connections` answers each from it. A library before 0.57 has no
+    such read and a store that does not answer here leaves it unread: each
+    capability then reads, and reports what it cannot read, on its own."""
+    load = getattr(records, "load_global", None)
+    if load is None:
+        return
+    try:
+        load(list(names))
+    except _store_module().StoreError:
+        pass
 
 
 def _machine_connections(name: str, records) -> int:
