@@ -1928,6 +1928,28 @@ def test_move_places_on_the_new_node_then_moves_each_service_then_leaves_the_old
     assert lab.fake.services == {"tasks": {second}, "automations": {second}}
 
 
+def test_move_to_a_mac_the_agent_lives_on_is_not_placed_there_and_leaves_the_old(
+        lab, monkeypatch, capsys):
+    _agent_key(lab, monkeypatch)
+    mac = _two_nodes(lab)
+    lab.fake.rows[mac].update(kind="mac", coolify_connection=None, coolify_server=None,
+                              coolify_resource=None, address=None, folder="/Users/x/agent")
+    lab.fake.services = {"tasks": {BOX1}}
+    del lab.fake.calls[:]
+    capsys.readouterr()
+    lab.m.cmd_node_move(SimpleNamespace(origin="box1", target="box2", folders=[], wait=30))
+    [moved] = json.loads(capsys.readouterr().out)["agents"]
+    assert moved["ok"] is True and moved["stopped_at"] is None
+    assert moved["folder"] == "/Users/x/agent" and moved["removed"] is True
+    verbs = [c["argv"][1:] for c in lab.fake.of("capabilities")
+             if c["argv"][1] in ("service", "node") and c["argv"][2] not in ("list", "status")]
+    assert verbs == [["service", "move", "tasks", "--node", mac, "--wait", "30"],
+                     ["node", "set", BOX1, "--no-master"],
+                     ["node", "set", mac, "--master", "--may-write"],
+                     ["node", "remove", BOX1]]
+    assert not [c for c in lab.fake.calls if c["argv"][0] == "ssh"]
+
+
 def test_move_stops_at_the_first_step_that_does_not_settle(lab, monkeypatch, capsys):
     _agent_key(lab, monkeypatch)
     _two_nodes(lab)

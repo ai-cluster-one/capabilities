@@ -20421,8 +20421,15 @@ def _agent_node_move(root, origin, target, wait):
     target_id = destination["node"] if destination else target
     if target_id == source["node"]:
         raise NodeFailure("input", f"node {origin} and node {target} are one node", 6)
-    key, fingerprint, in_vault = _agent_node_vault(root)
-    folder = _agent_node_folder(None, slug, destination)
+    # A node the agent already lives on that place cannot reach - a Mac, or a
+    # server not made as a Coolify resource - is not placed on again: the agent
+    # is there already, and its services move to it as to any other.
+    place = destination is None or bool(destination.get("coolify_resource"))
+    if place:
+        key, fingerprint, in_vault = _agent_node_vault(root)
+        folder = _agent_node_folder(None, slug, destination)
+    else:
+        folder = destination.get("folder")
     answer = {"ok": False, "agent_id": project_id, "from": source["node"], "to": target_id,
               "folder": folder, "services": [], "master_moved": False, "removed": False,
               "stopped_at": None}
@@ -20433,11 +20440,12 @@ def _agent_node_move(root, origin, target, wait):
         return failure
 
     # 1. Placed and raised on the new node, with no service yet.
-    try:
-        _agent_node_place(root, target_id, project_id, folder, key, fingerprint, in_vault, [],
-                          wait)
-    except NodeFailure as failure:
-        raise stop("place", failure) from None
+    if place:
+        try:
+            _agent_node_place(root, target_id, project_id, folder, key, fingerprint, in_vault,
+                              [], wait)
+        except NodeFailure as failure:
+            raise stop("place", failure) from None
     # 2. Each service placed on the old node moves. An exclusive one is placed on
     # the new node and unplaced from the old in one transaction (`service move`),
     # the new node taking its lease only once the old one has let it go; a shared
@@ -21107,8 +21115,11 @@ def cmd_node_remove(args):
         others = _agent_node_neighbours(root, node)
         if others:
             raise NodeFailure("node_shared", f"node {node} is also the node of "
-                              + ", ".join(others) + "; move them off it (`capabilities node "
-                              "move`) before deleting it; nothing was deleted", 6)
+                              + ", ".join(others) + "; take each off it first, in its own "
+                              f"folder: `capabilities node move {node} <another of its "
+                              "nodes>`, or unplace its services there and `capabilities "
+                              f"node remove {node}` without --yes, which removes only its "
+                              "link; nothing was deleted", 6)
         try:
             _agent_node_delete(root, target, kind, resource)
             deleted = True
@@ -38831,7 +38842,9 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         move <from> <to> [<agent folder>...]: moves this agent, then the
         agent of each folder named, one after another, in an order that
         never runs one service in two places: placed on <to> as place does,
-        with no service, and raised there; each service placed on <from>
+        with no service, and raised there - unless the agent already lives
+        on <to> and it is not a Coolify resource (a Mac, say), which is not
+        placed on again; each service placed on <from>
         moved (`service move`, or for a shared service `service start` on
         <to> then `service stop` on <from>); waits until `service status`
         shows each running on <to> and none on <from>; where <from> was its
@@ -38879,8 +38892,11 @@ _HELP_PAGES: tuple[tuple[tuple[str, ...], str], ...] = (
         leaves only the row, one not running the image (or, built from a
         repository, its own build) for this agent exits 6
         node_resource_not_own, and one another agent is linked to exits 6
-        node_shared, with nothing deleted. Without --yes and
-        --coolify-stdin, `node remove <node>` is the registry's alone, above.
+        node_shared, with nothing deleted: each other agent leaves first,
+        in its own folder, by `node move <node> <another of its nodes>` or
+        by unplacing its services there and `node remove <node>`. Without
+        --yes and --coolify-stdin, `node remove <node>` is the registry's
+        alone, above.
         exec: runs one command in the node's container with no terminal,
         standard input forwarded, its output byte for byte and its exit code
         (255 is SSH's own).

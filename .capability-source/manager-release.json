@@ -26,7 +26,7 @@
   "level": 2,
   "manager": {
     "path": "bin/capabilities",
-    "sha256": "67fee6d5884066df702d4b8a25a2eb93c619f76837be199c4d4e7d3f3fc3f4a3"
+    "sha256": "a030dc44960e1a283fac34769bf1580ebd9c11ee666ecf15a2bf9be88a5e181a"
   },
   "requires": {
     "teams": 1
