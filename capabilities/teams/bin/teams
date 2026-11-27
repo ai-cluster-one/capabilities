@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
-#     "capabilities-contract>=0.53,<1",
+#     "capabilities-contract>=0.60,<1",
 #     "psycopg[binary]>=3.2",
 # ]
 # ///
@@ -1995,11 +1995,12 @@ def _reach(conn, team: dict, before: int) -> dict:
 
 def _section_rows(agent: str) -> tuple[list[dict], list[dict]] | None:
     """The teams `agent` is a member of and the active version of every
-    enabled document of theirs, read in a read-only transaction that
-    migrates nothing; None where there is no store or no teams tables. On a
-    store that has not yet taken step 0008, a team that was in ordinary mode
-    gives none of its always documents, as before 1.3, so installing this
-    version grows no member's context before the step runs."""
+    enabled document of theirs, each read as a read-only transaction of its
+    own that migrates nothing; None where there is no store or no teams
+    tables. On a store that has not yet taken step 0008, a team that was in
+    ordinary mode gives none of its always documents, as before 1.3, so
+    installing this version grows no member's context before the step runs:
+    the ledger says which, in one read (`db.applied`)."""
     import psycopg
     db = _db()
     try:
@@ -2009,13 +2010,14 @@ def _section_rows(agent: str) -> tuple[list[dict], list[dict]] | None:
             return None
         _db_refused(exc)
     try:
-        conn = db.connect(application_name=NAME, setting=setting, transaction=True)
+        # Read-only by a setting of each transaction rather than `read_only`,
+        # so that each read stands alone: one round trip, its commit with it.
+        conn = db.connect(application_name=NAME, setting=setting, transaction=True,
+                          local_settings={"transaction_read_only": "on"})
     except db.DbError as exc:
         _db_refused(exc)
     try:
-        settled = _LOAD_STEP in db.status(conn, NAME, LEDGER_STEPS, major=LEDGER_MAJOR,
-                                          minor=LEDGER_MINOR).applied
-        conn.read_only = True
+        settled = _LOAD_STEP in db.applied(conn, NAME, LEDGER_STEPS)
         teams = _rows(conn, "SELECT t.id, t.name, t.description, t.always FROM teams_teams t "
                       "JOIN teams_members m ON m.team_id = t.id WHERE m.agent_id = %s "
                       "AND t.retired_at IS NULL ORDER BY t.name", (agent,))

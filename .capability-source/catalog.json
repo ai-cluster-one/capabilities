@@ -1497,7 +1497,7 @@
       "level": 1,
       "lucide_icon": "users",
       "path": "capabilities/teams",
-      "payload_sha256": "566ab1b95a6dc9f532a9757cd50f99c074a52d61cea5ccf288d0eb23ad1b74f9",
+      "payload_sha256": "1fb950e22dae87754be9e5be503e97320496be6c2a5df2d619ea17babddc7a8d",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Teams of agents that share instructions kept in the store - list the teams you are in, read their documents, and create teams, add members and save, rename and retire their versioned documents.",
@@ -1513,7 +1513,7 @@
           "title": "Команды"
         }
       },
-      "version": "2026-11-24 — `teams inventory` counts the teams this agent is in as a tile, and only with --network"
+      "version": "2026-11-27 — `teams section` reads the store in a few round trips rather than about twenty"
     },
     "telegram": {
       "executable": [
