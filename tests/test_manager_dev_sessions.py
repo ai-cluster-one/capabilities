@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO = Path(__file__).resolve().parents[1]
 MANAGER = REPO / "bin" / "capabilities"
 
@@ -451,6 +453,43 @@ def test_dev_install_uses_session_registry_and_refuses_canonical_fallback(tmp_pa
     )
     assert refused.returncode == 6
     assert _error(refused)["code"] == "dev_capability_not_installed"
+
+    _run(env, "dev", "stop", "deployment-test")
+
+
+def test_dev_lane_keeps_the_uv_that_lives_only_in_the_link_dir(tmp_path):
+    """A machine whose only uv sits in the manager's link dir (an agent node
+    whose image ships none elsewhere) still runs uv inside the lane, while the
+    lane reaches none of the capability links beside it."""
+    real_uv = shutil.which("uv")
+    assert real_uv, "the manager runs on uv"
+    elsewhere = [entry for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
+                 if entry and (Path(entry) / "uv").exists()]
+    if any(Path(entry).resolve() in (Path("/usr/bin"), Path("/bin")) for entry in elsewhere):
+        pytest.skip("uv is installed with the system tools, which the lane keeps")
+    source = _source_repo(tmp_path)
+    consumer = _consumer_repo(tmp_path)
+    env = _env(tmp_path)
+    canonical_mailbox = Path(env["CAPABILITIES_HOME"]) / "mailbox"
+    canonical_mailbox.mkdir(parents=True)
+    (canonical_mailbox / "mailbox").write_text("#!/bin/sh\nexit 0\n")
+    (canonical_mailbox / "mailbox").chmod(0o755)
+    outer_bin = Path(env["CAPABILITIES_BIN"])
+    outer_bin.mkdir(parents=True)
+    (outer_bin / "mailbox").symlink_to(canonical_mailbox / "mailbox")
+    (outer_bin / "uv").symlink_to(Path(real_uv).resolve())
+    env["PATH"] = os.pathsep.join(
+        [str(outer_bin)] + [entry for entry in env.get("PATH", os.defpath).split(os.pathsep)
+                            if entry and entry not in elsewhere])
+
+    started = _start(env, source, consumer)
+    probe = _run(
+        env, "dev", "exec", "deployment-test", "--",
+        "sh", "-c",
+        'echo "${PATH%%:*}"; uv --version >/dev/null && echo uv-ok; '
+        'command -v mailbox || echo no-mailbox',
+    ).stdout.splitlines()
+    assert probe == [started["isolated"]["bin"], "uv-ok", "no-mailbox"]
 
     _run(env, "dev", "stop", "deployment-test")
 

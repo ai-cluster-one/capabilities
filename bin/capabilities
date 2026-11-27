@@ -6914,6 +6914,40 @@ def _dev_project_rows(setting, schema: str, agent_id: str, capability: str) -> d
     return counts
 
 
+DEV_RUNTIME_TOOLS = ("uv", "uvx")
+
+
+def _dev_runtime_tools(paths: dict, canonical_bin: Path) -> str | None:
+    """The session's directory linking the runtime tools that sit in the
+    machine's link dir, or None when that dir holds none. A capability link
+    of the same name, which resolves into that capability's registry entry,
+    is never one of them."""
+    found: dict[str, Path] = {}
+    for name in DEV_RUNTIME_TOOLS:
+        cand = canonical_bin / name
+        try:
+            target = cand.resolve()
+            installed = target.is_relative_to(_registry_dir(name).resolve())
+        except (OSError, RuntimeError):
+            continue
+        if installed or not (
+                target.is_file() and os.access(target, os.X_OK)):
+            continue
+        found[name] = target
+    if not found:
+        return None
+    tools = Path(paths["bin"]).parent / "tools"
+    tools.mkdir(parents=True, exist_ok=True)
+    for name, target in found.items():
+        link = tools / name
+        if link.is_symlink() and Path(os.readlink(link)) == target:
+            continue
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(target)
+    return str(tools)
+
+
 def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
     safe_keys = {
         "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR", "USER", "LOGNAME",
@@ -6924,10 +6958,20 @@ def _dev_env(session: dict, inherit: list[str] | None = None) -> dict[str, str]:
            if key in safe_keys or key.startswith("LC_")}
     paths = session["paths"]
     canonical_bin = _bin_dir().resolve()
-    inherited_path = os.pathsep.join(
-        entry for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
-        if entry and Path(entry).expanduser().resolve() != canonical_bin
-    )
+    # The machine's link dir is dropped so the lane reaches no installed
+    # capability, but it can also be the only home of the uv every manager and
+    # capability script runs on. The lane keeps that uv, and only it, through
+    # a directory of its own in the link dir's place on PATH.
+    tools = _dev_runtime_tools(paths, canonical_bin)
+    kept: list[str] = []
+    for entry in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        if not entry:
+            continue
+        if Path(entry).expanduser().resolve() != canonical_bin:
+            kept.append(entry)
+        elif tools is not None and tools not in kept:
+            kept.append(tools)
+    inherited_path = os.pathsep.join(kept)
     env.update({
         "HOME": paths["home"],
         "CAPABILITIES_HOME": paths["registry"],
