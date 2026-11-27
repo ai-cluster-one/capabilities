@@ -235,7 +235,12 @@ def test_the_ledger_creates_the_tables_with_their_indexes_comments_and_guard(lab
     steps = [r[0] for r in lab.sql(
         f"SELECT step FROM {SCHEMA}.schema_ledger WHERE owner = 'context' ORDER BY step")]
     assert steps == ["0001-documents", "0002-versions", "0003-versions-guard", "0004-global",
-                     "0005-enablements", "0006-agent-names", "0007-keys", "0008-drafts"]
+                     "0005-enablements", "0006-agent-names", "0007-keys", "0008-drafts",
+                     "0009-announce"]
+    triggers = {r[0] for r in lab.sql(
+        "SELECT tgname FROM pg_trigger WHERE tgname LIKE %s", ("context\\_%\\_announce",))}
+    assert triggers == {"context_versions_announce", "context_documents_announce",
+                        "context_enablements_announce"}
     indexes = {r[0]: r[1] for r in lab.sql(
         "SELECT indexname, indexdef FROM pg_indexes WHERE schemaname = %s", (SCHEMA,))}
     assert "WHERE active" in indexes["context_versions_active"]
@@ -285,7 +290,8 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypa
     from capabilities_contract import db
     cli = load_module()
     old = [step for step in cli.LEDGER_STEPS
-           if step[0] not in ("0006-agent-names", "0007-keys", "0008-drafts")]
+           if step[0] not in ("0006-agent-names", "0007-keys", "0008-drafts",
+                                "0009-announce")]
     with psycopg.connect(lab.cluster.url(lab.database), autocommit=True) as conn:
         db.migrate(conn, "context", old, major=1, minor=1, schema=SCHEMA)
         conn.execute(f"SET search_path TO {SCHEMA}")
@@ -313,8 +319,9 @@ def test_a_store_at_major_1_is_renamed_in_place_and_keeps_its_rows(lab, monkeypa
         result = db.migrate(conn, "context", cli.LEDGER_STEPS, major=cli.LEDGER_MAJOR,
                             minor=cli.LEDGER_MINOR, schema=SCHEMA)
         monkeypatch.delenv(db.UPGRADE_ENV)
-        assert result.applied == ["0006-agent-names", "0007-keys", "0008-drafts"]
-        assert (result.major, result.minor) == (2, 2)
+        assert result.applied == ["0006-agent-names", "0007-keys", "0008-drafts",
+                                  "0009-announce"]
+        assert (result.major, result.minor) == (2, 3)
         conn.execute(f"SET search_path TO {SCHEMA}")
         assert conn.execute("SELECT name, agent_id, author_agent_id FROM context_documents "
                             "ORDER BY name").fetchall() == [

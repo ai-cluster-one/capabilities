@@ -584,6 +584,7 @@ def test_upgrade_dumps_migrates_a_quarantined_capability_resumes_and_lists_nodes
         ("migrate", None, "started"),
         ("migrate", "core", "started"), ("migrate", "core", "done"),
         ("migrate", "capabilities", "started"), ("migrate", "capabilities", "done"),
+        ("migrate", "manager", "started"), ("migrate", "manager", "done"),
         ("migrate", "probe", "started"), ("migrate", "probe", "failed"),
         ("migrate", None, "failed")]
     assert events[-1]["event"] == "error" and events[-1]["exit"] == 5
@@ -613,6 +614,7 @@ def test_upgrade_dumps_migrates_a_quarantined_capability_resumes_and_lists_nodes
         ("manager", None, "skipped"), ("capabilities", None, "skipped"),
         ("dump", None, "skipped"), ("migrate", None, "started"),
         ("migrate", "core", "skipped"), ("migrate", "capabilities", "skipped"),
+        ("migrate", "manager", "skipped"),
         ("migrate", "probe", "started"), ("migrate", "probe", "done"),
         ("migrate", None, "done")]
     assert events[-1]["event"] == "done"

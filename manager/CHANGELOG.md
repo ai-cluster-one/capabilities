@@ -1,5 +1,9 @@
 # capabilities — change log
 
+## 2026-11-27 — The manager carries Agenium's `manager_pins` table under its own ledger owner `manager`
+
+The manager gains a ledger owner of its own, `manager` (1.0), whose first step `0001-pins` creates `manager_pins`: what each of an agent's capabilities was installed from, one row per agent and capability, keyed to `agents` and `nodes`. The step's SQL is Agenium's own, byte for byte, so both managers run one ledger against one store. The manager applies it wherever it fills a store's core policy (after install and update, after `store set`, and in `migrate --global`), and a store that refuses it keeps that policy; the store survey and `capabilities store upgrade` read the owner beside the core and the service-lease owner. This release reads and writes no row of the table. No verb, flag, answer or exit code changes.
+
 ## 2026-11-27 — `capabilities list` reads every installed capability's machine connections in one round trip
 
 `capabilities list` counted each installed capability's machine connections with a store read of its own - its shared connections and their grants - so a machine with 44 capabilities waited on the store 44 times in a row for them. capabilities-contract 0.57.0 adds `load_global(capabilities)` on the machine's global layer, which reads the shared connections, grants and default pointers of every named capability in one round trip into the same cache each capability's own read answers from, and `list` calls it once before it counts. On this machine `list --json` went from 50 round trips to 7, with the same output byte for byte. Under a library before 0.57, and where the store does not answer that one read, each capability is read on its own as before, with the same warnings. No verb, flag, output or exit code changes. The package ships with capabilities-contract 0.57.0.

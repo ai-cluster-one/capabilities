@@ -435,7 +435,7 @@
       "level": 0,
       "lucide_icon": "book-open",
       "path": "capabilities/context",
-      "payload_sha256": "7f674c8faa0cfdabbcfc19d5bcaa3e81a191b0fc4308e792cecd220b20d107ae",
+      "payload_sha256": "fb63242de882ab189925441feaf85949560cadaedbcc379bf51375f282eeec16",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "An agent's doctrine as versioned documents in the project's PostgreSQL store - list, show, save with a base, history, diff and retire, and import and export the context folder byte for byte.",
@@ -451,7 +451,7 @@
           "title": "Контекст"
         }
       },
-      "version": "2026-11-24 — `context inventory` counts this project's documents as a tile, and only with --network"
+      "version": "2026-11-27 — Every change to an agent's composed context announces the agent on the store, as Agenium's resident part follows it"
     },
     "coolify": {
       "executable": [
@@ -1136,7 +1136,7 @@
       "level": 0,
       "lucide_icon": "scroll",
       "path": "capabilities/routine",
-      "payload_sha256": "c8f12170243a7f4192124e5f2ec90fc780ca031c50da9976a51d8f1d5b09e483",
+      "payload_sha256": "7a902886351cede808e020dffee36e2672497a0622acd9f4d6d88be6177c408d",
       "requires_manager": 0,
       "store_major": 4,
       "summary": "Routine CLI for project repeatable procedures — list, validate, and render `.routines` recipes, and keep routines as versioned documents in the project's store: show, save with a base, history, diff, retire, and import and export the routines folder byte for byte.",
@@ -1152,7 +1152,7 @@
           "title": "Процедуры"
         }
       },
-      "version": "2026-11-24 — `routine inventory` counts the project's routines where it keeps them, and the icon is `scroll`"
+      "version": "2026-11-27 — Every change to an agent's composed routines announces the agent on the store, as Agenium's resident part follows it"
     },
     "signoz": {
       "executable": [

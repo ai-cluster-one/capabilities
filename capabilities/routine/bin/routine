@@ -980,7 +980,7 @@ def cmd_groom(args) -> None:
 # versions reference their routine by a foreign key: both tables are this
 # capability's own and a routine is retired rather than deleted, so the key
 # never blocks a write and refuses only a version of no routine.
-LEDGER_MAJOR, LEDGER_MINOR = 2, 2
+LEDGER_MAJOR, LEDGER_MINOR = 2, 3
 _STORE_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.-]*$"
 # The store's foreign keys (core 4.0): every agent and node column of this
 # owner keyed by what its parent takes with it - owned rows go with it, a
@@ -1220,6 +1220,65 @@ LEDGER_STEPS = [
     COMMENT ON COLUMN routine_drafts.saved_by IS
         'Who saved it last: user@node.';
     """, core=(4, 0)),
+    # Every change to what an agent's composed context shows announces the agent on the
+    # store channel `agenium_context`, in the writer's own transaction: the agent's
+    # version of the channel in schema_channel raised, and a notification carrying its
+    # id, sent as the change commits. Agenium's resident part follows the channel and
+    # builds the agent's folder at once; this release follows nothing on it. A save, an
+    # import or a title adds a version, a retire or an own routine switched off or on
+    # marks the document, and an enable or a disable of a global one adds or deletes an
+    # enablement; a draft announces nothing, since no reader reads it. A global routine
+    # announces every agent that has enabled it. A trigger, so every writer of these
+    # tables announces, whichever release it runs. Agenium's own step, byte for byte,
+    # under this owner's next free number: one store, one ledger. It adds a function
+    # and three triggers and changes no row, so a minor step (2.3).
+    ("0010-announce", """
+    CREATE FUNCTION routine_announce() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        document uuid;
+        agents text[];
+        agent text;
+    BEGIN
+        IF tg_table_name = 'routine_enablements' THEN
+            IF tg_op = 'DELETE' THEN
+                agents := ARRAY[old.agent_id];
+            ELSE
+                agents := ARRAY[new.agent_id];
+            END IF;
+        ELSE
+            IF tg_table_name = 'routine_versions' THEN
+                document := new.document_id;
+            ELSE
+                document := new.id;
+            END IF;
+            EXECUTE format('SELECT array_agg(DISTINCT x.agent_id) FROM ('
+                           'SELECT d.agent_id FROM %1$I.routine_documents d '
+                           'WHERE d.id = $1 AND d.agent_id IS NOT NULL '
+                           'UNION SELECT e.agent_id FROM %1$I.routine_enablements e '
+                           'WHERE e.document_id = $1) x', tg_table_schema)
+                INTO agents USING document;
+        END IF;
+        FOREACH agent IN ARRAY coalesce(agents, ARRAY[]::text[]) LOOP
+            IF to_regclass(format('%I.schema_channel', tg_table_schema)) IS NOT NULL THEN
+                EXECUTE format('INSERT INTO %I.schema_channel AS c (channel, scope, version) '
+                               'VALUES (%L, $1, 1) ON CONFLICT (channel, scope) '
+                               'DO UPDATE SET version = c.version + 1',
+                               tg_table_schema, 'agenium_context')
+                    USING agent;
+            END IF;
+            PERFORM pg_notify('agenium_context', agent);
+        END LOOP;
+        RETURN NULL;
+    END $$;
+    CREATE TRIGGER routine_versions_announce AFTER INSERT ON routine_versions
+        FOR EACH ROW EXECUTE FUNCTION routine_announce();
+    CREATE TRIGGER routine_documents_announce AFTER UPDATE OF retired_at, disabled_at ON routine_documents
+        FOR EACH ROW EXECUTE FUNCTION routine_announce();
+    CREATE TRIGGER routine_enablements_announce AFTER INSERT OR DELETE ON routine_enablements
+        FOR EACH ROW EXECUTE FUNCTION routine_announce();
+    COMMENT ON FUNCTION routine_announce() IS
+        'Announces each agent whose composed context a change of routine documents reaches, on the channel agenium_context, as the change commits.';
+    """),
 ]
 
 

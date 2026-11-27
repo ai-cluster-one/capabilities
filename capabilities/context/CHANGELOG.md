@@ -1,5 +1,9 @@
 # context — change log
 
+## 2026-11-27 — Every change to an agent's composed context announces the agent on the store, as Agenium's resident part follows it
+
+Ledger step `0009-announce` (context tables 2.3) adds `context_announce()` and three triggers: a new version, a retire, and an enablement added or deleted each raise the agent's version of the channel `agenium_context` in `schema_channel` and notify that channel with the agent's id, in the writer's own transaction; a global document announces every agent that has enabled it, and a draft announces nothing. The step's SQL is Agenium's own `0008-announce`, byte for byte, under this owner's next free number, so both managers run one ledger against one store. It adds no table or column and changes no row; a reader at 2.2 keeps working against 2.3. Every verb, flag, answer and exit code is unchanged.
+
 ## 2026-11-24 — `context inventory` counts this project's documents as a tile, and only with --network
 
 `context inventory` answered the empty envelope; the capability now declares its inventory `optional`. A bare run still opens no store: it names `documents` in `deferred`, as a count the store keeps. With --network it answers one metric, `documents`, with `kind` `documents` and `glyph` `page`: the documents this project holds that are not retired, each with its active version, as `context list` reads its own; a global document it enables belongs to no project and is not counted. Outside a project, or in one with no durable id, --network names the count in `deferred` and reaches no store; with no store configured or none reachable it refuses as every reading verb does, exit 6 `store_not_configured` or exit 5 `store_unreachable`. The capability binds `capabilities-contract` 0.53 or later, which supplies the tile helper. No other verb, flag, answer or exit code changes.

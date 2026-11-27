@@ -15841,6 +15841,73 @@ def _supervise_lease_steps() -> list:
     return [*SUPERVISE_LEASE_STEPS, Step(guard_id, guard_sql, core=core)]
 
 
+# The manager's own tables, under its own owner `manager`, which no capability can
+# take. Its one table is Agenium's `manager_pins`: what each of an agent's
+# capabilities was installed from, one row per agent and capability, which Agenium's
+# manager writes when it installs, updates or rolls one back and a node of the agent
+# installs exactly. This release reads and writes no row of it; it carries the step
+# so that both managers run the same steps against one store. The step is Agenium's
+# own, byte for byte, as this owner's first: never edit it once released, since a
+# store holds its checksum.
+MANAGER_OWNER = "manager"
+MANAGER_VERSION = (1, 0)
+MANAGER_PINS_STEP_ID = "0001-pins"
+MANAGER_PINS_SQL = """\
+CREATE TABLE manager_pins (
+ agent_id text NOT NULL CHECK (agent_id <> '')
+  REFERENCES agents (id) ON UPDATE CASCADE ON DELETE CASCADE,
+ capability text NOT NULL CHECK (capability <> ''),
+ kind text NOT NULL CHECK (kind IN ('index', 'git', 'registry', 'folder')),
+ source text CHECK (source <> ''),
+ location text NOT NULL CHECK (location <> ''),
+ token_secret text CHECK (token_secret <> ''),
+ token_user text CHECK (token_user <> ''),
+ version text NOT NULL CHECK (version <> ''),
+ ref text CHECK (ref <> ''),
+ commit_sha text CHECK (commit_sha ~ '^[0-9a-f]{40,64}$'),
+ manifest_sha256 text CHECK (manifest_sha256 ~ '^[0-9a-f]{64}$'),
+ lock_sha256 text CHECK (lock_sha256 ~ '^[0-9a-f]{64}$'),
+ package_sha256 text NOT NULL CHECK (package_sha256 ~ '^[0-9a-f]{64}$'),
+ lock text,
+ node text CHECK (node <> '') REFERENCES nodes (id) ON UPDATE CASCADE ON DELETE SET NULL,
+ pinned_at timestamptz NOT NULL DEFAULT now(),
+ pinned_by text NOT NULL CHECK (pinned_by <> ''),
+ PRIMARY KEY (agent_id, capability),
+ CONSTRAINT manager_pins_git_ref CHECK (kind <> 'git' OR (ref IS NOT NULL AND commit_sha IS NOT NULL)),
+ CONSTRAINT manager_pins_registry_lock CHECK (kind <> 'registry' OR lock IS NOT NULL),
+ CONSTRAINT manager_pins_folder_source CHECK (kind <> 'folder' OR source IS NULL)
+);
+COMMENT ON TABLE manager_pins IS 'What each of an agent''s capabilities was installed from, \
+one row per agent and capability, overwritten in place when the manager installs, updates \
+or rolls it back in the agent''s folder: a node of the agent installs exactly this.';
+COMMENT ON COLUMN manager_pins.kind IS 'index (an agenium.source.v1 index), git (a \
+repository by tag), registry (a PEP 503 package index) or folder (a working folder on one \
+machine, which works only there).';
+COMMENT ON COLUMN manager_pins.source IS 'The name the source was configured under where it \
+was installed; null for a folder.';
+COMMENT ON COLUMN manager_pins.location IS 'The index URL or path, the repository URL, the \
+registry URL, or the folder''s absolute path. Never carries a credential.';
+COMMENT ON COLUMN manager_pins.token_secret IS 'The name of the agent''s vault secret that \
+opens a private source, never its value.';
+COMMENT ON COLUMN manager_pins.token_user IS 'The user name a private source''s token is \
+presented under, where the host needs one.';
+COMMENT ON COLUMN manager_pins.ref IS 'The git tag the version was installed from.';
+COMMENT ON COLUMN manager_pins.commit_sha IS 'The commit the tag pointed to when it was \
+installed: a node refuses the tag once it points elsewhere.';
+COMMENT ON COLUMN manager_pins.package_sha256 IS 'The SHA-256 of the capability''s own wheel.';
+COMMENT ON COLUMN manager_pins.lock IS 'A registry install''s hashed requirements, so a node \
+installs the same wheels.';
+COMMENT ON COLUMN manager_pins.node IS 'The node that holds a folder install''s folder, or \
+that wrote the pin.';
+COMMENT ON COLUMN manager_pins.pinned_by IS 'Who installed it, as user@node.';"""
+
+
+def _manager_steps() -> list:
+    """The manager's own steps, as the library's Step; the library is imported on use."""
+    from capabilities_contract.db import Step
+    return [Step(MANAGER_PINS_STEP_ID, MANAGER_PINS_SQL)]
+
+
 SUPERVISE_STORE_SETTING_SLUGS = frozenset({
     "store_not_configured", "store_not_postgres", "store_setting_unreadable",
     "store_setting_too_new", "bad_store_setting", "sslmode_too_weak",
@@ -23549,7 +23616,8 @@ def _store_upgrade_readers(setting, survey: dict, asked: list | None = None) -> 
     # version of that step and which has no steps of its own.
     manager_owners = (
         (STORE_LEGACY_OWNER, (), _store_legacy_version()),
-        (SUPERVISE_LEASE_OWNER, _supervise_lease_steps(), SUPERVISE_LEASE_VERSION))
+        (SUPERVISE_LEASE_OWNER, _supervise_lease_steps(), SUPERVISE_LEASE_VERSION),
+        (MANAGER_OWNER, _manager_steps(), MANAGER_VERSION))
     for owner, steps, (major, minor) in manager_owners:
         if owner not in survey["owners"]:
             continue
@@ -23687,7 +23755,8 @@ def _store_readers_key(setting, survey: dict, asked: list, identities: list) -> 
                         "steps": repr((store.STORE_OWNER, store.record_table_steps(),
                                        store.STORE_TABLES_VERSION,
                                        SUPERVISE_LEASE_OWNER, _supervise_lease_steps(),
-                                       SUPERVISE_LEASE_VERSION))},
+                                       SUPERVISE_LEASE_VERSION, MANAGER_OWNER,
+                                       _manager_steps(), MANAGER_VERSION))},
             "capabilities": {name: found for (name, _, _), found in zip(asked, identities)}}
     return hashlib.sha256(json.dumps(made, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -24227,6 +24296,8 @@ def _store_upgrade_migrate_once(setting, entry: dict) -> dict:
     elif owner == STORE_LEGACY_OWNER:
         # Moved by the core's step, the one before it.
         steps, (major, minor) = (), _store_legacy_version()
+    elif owner == MANAGER_OWNER:
+        steps, (major, minor) = _manager_steps(), MANAGER_VERSION
     else:
         steps, (major, minor) = _supervise_lease_steps(), SUPERVISE_LEASE_VERSION
     if not steps:
@@ -25026,6 +25097,14 @@ def _core_reconcile(arriving: set[str] = frozenset(),
             for name in written:
                 conn.execute("INSERT INTO policies (agent_id, capability, node, "
                              "enabled) VALUES (NULL, %s, NULL, true)", (name,))
+        # The manager's own owner goes with the core it keys to; a store that
+        # refuses it keeps the policy rows above, and the store survey names
+        # where the owner stands.
+        try:
+            db.migrate(conn, MANAGER_OWNER, _manager_steps(), major=MANAGER_VERSION[0],
+                       minor=MANAGER_VERSION[1])
+        except db.DbError:
+            pass
         return {"written": written, "gate": f"store:{setting.schema}.policies"}
     except (db.DbError, psycopg.Error) as exc:
         return {"written": [], "reason": getattr(exc, "slug", None) or "store_unreachable"}
